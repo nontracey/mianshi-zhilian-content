@@ -15,21 +15,26 @@
 
 ```bash
 npm install
-npm run generate
+npm run generate  # 需要设置 CONTENT_SOURCE_ROOT 环境变量指向原始 Markdown 目录
 npm run validate
 ```
 
-内容规范来自《面试智练内容格式规范》。用户侧知识结构只保留“领域 -> 分类 -> 知识点”，不使用阶段、天数或排期概念。
+内容规范来自《面试智练内容格式规范》。用户侧知识结构只保留"领域 -> 分类 -> 知识点"，不使用阶段、天数或排期概念。
 
-## Cloudflare Pages
+## 部署
 
-内容站已关联 Cloudflare Pages 项目 `mianshi-zhilian-content`，生产分支为 `main`。合并到 `main` 后，Cloudflare 会自动执行：
+内容站通过 GitHub Actions + Wrangler CLI 部署到 Cloudflare Pages。`main` push 时自动触发：
 
-```bash
-npm ci && npm run validate && mkdir -p dist/assets && cp manifest.json staging-manifest.json draft-manifest.json dist/ && cp -R domains topics schemas dist/ && if [ -d assets ]; then cp -R assets dist/; fi
-```
+1. `npm ci && npm run validate` 校验内容
+2. 准备 `dist/` 目录
+3. `wrangler pages deploy dist --project-name=mianshi-zhilian-content` 部署
 
-输出目录为 `dist`，正式内容入口为：
+### 必需配置
+
+- GitHub Secret `CLOUDFLARE_API_TOKEN`：需要 `Cloudflare Pages:Edit` 权限
+- GitHub Variable `CLOUDFLARE_ACCOUNT_ID`：Cloudflare 账号 ID
+
+正式内容入口：
 
 ```text
 https://mianshi-zhilian-content.pages.dev/manifest.json

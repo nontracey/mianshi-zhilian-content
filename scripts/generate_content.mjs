@@ -2,9 +2,9 @@ import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 
-const sourceRoot = "/Users/yingjunchi/Downloads/面试和简历/备战计划";
+const sourceRoot = process.env.CONTENT_SOURCE_ROOT || "./source";
 const repoRoot = process.cwd();
-const today = "2026-05-27";
+const today = new Date().toISOString().slice(0, 10);
 
 const domains = {
   java: {
@@ -178,8 +178,6 @@ function makeTopic(file, index) {
           depth: 15,
         },
       },
-      sourceRef: path.relative(sourceRoot, file),
-      status: "Production",
       updatedAt: today,
     };
   };
