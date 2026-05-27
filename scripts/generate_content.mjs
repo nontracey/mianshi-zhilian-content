@@ -54,6 +54,10 @@ const categoryRules = [
   ["review", "综合复习", "阶段复盘、模拟面试与高频题", ["复习", "模拟", "总结", "面试题", "掌握程度"]],
 ];
 
+const excludedSourceTitlePatterns = [
+  /今日练习与总结/,
+];
+
 async function walk(dir) {
   const entries = await readdir(dir, { withFileTypes: true });
   const files = [];
@@ -63,6 +67,11 @@ async function walk(dir) {
     if (entry.isFile() && entry.name.endsWith(".md")) files.push(full);
   }
   return files;
+}
+
+function shouldIncludeSource(file) {
+  const title = cleanTitle(file);
+  return !excludedSourceTitlePatterns.some((pattern) => pattern.test(title));
 }
 
 function detectDomain(file) {
@@ -190,7 +199,7 @@ async function main() {
   await mkdir(path.join(repoRoot, "topics"), { recursive: true });
 
   const files = (await walk(sourceRoot)).sort();
-  const factories = files.map(makeTopic).filter(Boolean);
+  const factories = files.map((file, index) => (shouldIncludeSource(file) ? makeTopic(file, index) : null)).filter(Boolean);
   const topics = [];
   for (let index = 0; index < factories.length; index += 1) {
     topics.push(await factories[index]());

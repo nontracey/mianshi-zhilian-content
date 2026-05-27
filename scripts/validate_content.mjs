@@ -4,7 +4,7 @@ import Ajv from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 
 const root = process.cwd();
-const forbidden = /(第\s*\d+[a-zA-Z]?\s*天|第\s*\d+[a-zA-Z]?\s*阶段|Day\s*\d+)/i;
+const forbidden = /(第\s*\d+[a-zA-Z]?\s*天|第\s*\d+[a-zA-Z]?\s*阶段|Day\s*\d+|今日练习与总结)/i;
 
 async function readJson(file) {
   return JSON.parse(await readFile(path.join(root, file), "utf8"));
