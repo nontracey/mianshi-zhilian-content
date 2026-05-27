@@ -72,6 +72,15 @@ for (const file of topicFiles) {
   if (!topic.learningCards.some((card) => card.type === "explain")) {
     throw new Error(`${file} must include an explain learning card.`);
   }
+  if (!topic.learningCards.some((card) => card.type === "interviewAnswer")) {
+    throw new Error(`${file} must include an interviewAnswer learning card.`);
+  }
+  if (!topic.learningCards.some((card) => card.type === "checklist")) {
+    throw new Error(`${file} must include a checklist learning card.`);
+  }
+  if (!topic.learningCards.some((card) => ["compareTable", "diagram", "code"].includes(card.type))) {
+    throw new Error(`${file} must include at least one deeper visual, comparison, or code card.`);
+  }
   const weights = topic.rubric.scoreWeights;
   const total = weights.coverage + weights.accuracy + weights.interviewExpression + weights.depth;
   if (total !== 100) throw new Error(`${file} scoreWeights must sum to 100.`);
