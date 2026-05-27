@@ -26,7 +26,7 @@ npm run validate
 内容站已关联 Cloudflare Pages 项目 `mianshi-zhilian-content`，生产分支为 `main`。合并到 `main` 后，Cloudflare 会自动执行：
 
 ```bash
-npm ci && npm run validate && mkdir -p dist && cp manifest.json staging-manifest.json draft-manifest.json dist/ && cp -R domains topics schemas assets dist/
+npm ci && npm run validate && mkdir -p dist/assets && cp manifest.json staging-manifest.json draft-manifest.json dist/ && cp -R domains topics schemas dist/ && if [ -d assets ]; then cp -R assets dist/; fi
 ```
 
 输出目录为 `dist`，正式内容入口为：
