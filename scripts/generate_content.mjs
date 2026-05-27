@@ -255,6 +255,16 @@ function pickCodeSnippet(content) {
 }
 
 function formatCodeSnippet(snippet) {
+  // 检测是否已经有正确的缩进
+  const lines = snippet.split('\n');
+  const hasIndentation = lines.some(line => line.startsWith('    ') || line.startsWith('\t'));
+
+  // 如果已经有缩进，直接返回，不重新格式化
+  if (hasIndentation) {
+    return snippet.trim();
+  }
+
+  // 没有缩进的情况下，尝试基本格式化
   return snippet
     .replace(/\s*(public\s+(?:static\s+)?(?:final\s+)?(?:class|interface|enum|int|long|String|void|boolean|double|float|Object)\b)/g, "\n$1")
     .replace(/\s*(private\s+(?:static\s+)?(?:final\s+)?(?:class|int|long|String|void|boolean|double|float|Object)\b)/g, "\n$1")
@@ -263,7 +273,7 @@ function formatCodeSnippet(snippet) {
     .replace(/\{\s*/g, "{\n")
     .replace(/\}\s*/g, "\n}\n")
     .split("\n")
-    .map((line) => line.trim())
+    .map((line) => line.trimEnd())  // 只移除行尾空格，保留缩进
     .filter(Boolean)
     .join("\n")
     .trim();
