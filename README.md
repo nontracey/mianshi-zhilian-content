@@ -92,6 +92,30 @@ if (remoteVersion != localVersion) {
 - `interviewAnswer`：面试回答模板。
 - `checklist`：学完后应能说清楚的检查项。
 
+### 代码格式要求
+
+代码卡片会保留原始 Markdown 中的缩进格式。确保源文件中的代码块有正确的缩进：
+
+````markdown
+```java
+public class Example {
+    private int count;  // 缩进会被保留
+    
+    public void method() {
+        // 这里的缩进也会保留
+        if (count > 0) {
+            System.out.println("OK");
+        }
+    }
+}
+```
+````
+
+**注意**：
+- 代码块必须用 ` ``` ` 包裹
+- 缩进使用 4 个空格或 Tab
+- 生成脚本会自动检测已有缩进，不会重新格式化
+
 App 每次加载最新 manifest/domain 后会按引用列表裁剪本地缓存，因此从内容平台删除并发布的 topic 会从用户本地缓存中移除。
 
 ## 领域分类规则
