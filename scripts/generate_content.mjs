@@ -56,6 +56,9 @@ const categoryRules = [
 
 const excludedSourceTitlePatterns = [
   /今日练习与总结/,
+  /面试掌握程度/,
+  /复习题$/,
+  /阶段复习/,
 ];
 
 const boxDrawingPattern = /[┌┐└┘├┤┬┴┼│─═╔╗╚╝╠╣╦╩╬]/;
