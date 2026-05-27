@@ -5,6 +5,7 @@ import addFormats from "ajv-formats";
 
 const root = process.cwd();
 const forbidden = /(第\s*\d+[a-zA-Z]?\s*天|第\s*\d+[a-zA-Z]?\s*阶段|Day\s*\d+|今日练习与总结)/i;
+const boxDrawing = /[┌┐└┘├┤┬┴┼│─═╔╗╚╝╠╣╦╩╬]/;
 
 async function readJson(file) {
   return JSON.parse(await readFile(path.join(root, file), "utf8"));
@@ -80,6 +81,11 @@ for (const file of topicFiles) {
   }
   if (!topic.learningCards.some((card) => ["compareTable", "diagram", "code"].includes(card.type))) {
     throw new Error(`${file} must include at least one deeper visual, comparison, or code card.`);
+  }
+  for (const card of topic.learningCards) {
+    if (boxDrawing.test(card.content ?? "")) {
+      throw new Error(`${file} contains box-drawing ASCII art in ${card.type}/${card.title}. Use diagram cards instead.`);
+    }
   }
   const weights = topic.rubric.scoreWeights;
   const total = weights.coverage + weights.accuracy + weights.interviewExpression + weights.depth;

@@ -58,6 +58,10 @@ const excludedSourceTitlePatterns = [
   /今日练习与总结/,
 ];
 
+const boxDrawingPattern = /[┌┐└┘├┤┬┴┼│─═╔╗╚╝╠╣╦╩╬]/;
+const scheduleLinePattern = /^>?\s*(学习时间|预计时长)[:：].*$/gm;
+const scheduleLineTestPattern = /^>?\s*(学习时间|预计时长)[:：]/;
+
 async function walk(dir) {
   const entries = await readdir(dir, { withFileTypes: true });
   const files = [];
@@ -93,8 +97,7 @@ function sanitizeText(text) {
     .replace(/第\s*\d+[a-zA-Z]?\s*阶段[-_：:]?/g, "")
     .replace(/第\s*\d+[a-zA-Z]?\s*天[-_：:]?/g, "")
     .replace(/Day\s*\d+/gi, "")
-    .replace(/^>?\s*学习时间[:：].*$/gm, "")
-    .replace(/^>?\s*预计时长[:：].*$/gm, "")
+    .replace(scheduleLinePattern, "")
     .replace(/\r/g, "")
     .trim();
 }
@@ -113,7 +116,7 @@ function pickSummary(title, content) {
   const line = sanitizeText(content)
     .split("\n")
     .map((item) => item.replace(/^#+\s*/, "").replace(/^[-*]\s*/, "").trim())
-    .find((item) => item.length >= 14 && !item.startsWith("|"));
+    .find((item) => item.length >= 14 && !item.startsWith("|") && !boxDrawingPattern.test(item) && !scheduleLineTestPattern.test(item));
   return line ? line.slice(0, 96) : `理解 ${title} 的核心概念、使用场景、常见误区和面试表达方式。`;
 }
 
@@ -121,7 +124,14 @@ function pickExcerpt(content) {
   const lines = sanitizeText(content)
     .split("\n")
     .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith("|") && !line.startsWith("```"))
+    .filter((line) =>
+      line &&
+      !line.startsWith("|") &&
+      !line.startsWith("```") &&
+      !line.startsWith("---") &&
+      !boxDrawingPattern.test(line) &&
+      !scheduleLineTestPattern.test(line)
+    )
     .slice(0, 18);
   return lines.join("\n").slice(0, 1800);
 }
@@ -130,7 +140,14 @@ function pickKeyPoints(title, content) {
   const points = sanitizeText(content)
     .split("\n")
     .map((line) => line.replace(/^#+\s*/, "").replace(/^[-*]\s*/, "").replace(/^\d+[.)、]\s*/, "").trim())
-    .filter((line) => line.length >= 8 && line.length <= 120 && !line.startsWith("|") && !line.includes("```"))
+    .filter((line) =>
+      line.length >= 8 &&
+      line.length <= 120 &&
+      !line.startsWith("|") &&
+      !line.includes("```") &&
+      !boxDrawingPattern.test(line) &&
+      !scheduleLineTestPattern.test(line)
+    )
     .filter((line) => !/^(---+|要点|示例|代码|答案|解析)$/.test(line))
     .slice(0, 6);
 
@@ -144,20 +161,37 @@ function pickKeyPoints(title, content) {
 
 function pickCodeSnippet(content) {
   const fenced = content.match(/```[a-zA-Z0-9_-]*\n([\s\S]*?)```/);
-  if (fenced?.[1]?.trim()) return fenced[1].trim().slice(0, 1200);
+  if (fenced?.[1]?.trim() && !boxDrawingPattern.test(fenced[1])) return formatCodeSnippet(fenced[1].trim()).slice(0, 1200);
 
   const lines = sanitizeText(content).split("\n");
   const start = lines.findIndex((line) =>
+    !boxDrawingPattern.test(line) &&
     /(public\s+class|class\s+\w+|interface\s+\w+|@\w+|SELECT\s+|SET\s+|ExecutorService|CompletableFuture|if\s*\(|for\s*\(|while\s*\(|try\s*\{|return\s+)/i.test(line),
   );
   if (start < 0) return "";
 
-  return lines
+  const snippet = lines
     .slice(start, start + 18)
     .map((line) => line.trimEnd())
-    .filter(Boolean)
+    .filter((line) => line && !boxDrawingPattern.test(line))
     .join("\n")
     .slice(0, 1200);
+  return formatCodeSnippet(snippet);
+}
+
+function formatCodeSnippet(snippet) {
+  return snippet
+    .replace(/\s*(public\s+(?:static\s+)?(?:final\s+)?(?:class|interface|enum|int|long|String|void|boolean|double|float|Object)\b)/g, "\n$1")
+    .replace(/\s*(private\s+(?:static\s+)?(?:final\s+)?(?:class|int|long|String|void|boolean|double|float|Object)\b)/g, "\n$1")
+    .replace(/\s*(protected\s+(?:static\s+)?(?:final\s+)?(?:class|int|long|String|void|boolean|double|float|Object)\b)/g, "\n$1")
+    .replace(/;\s*/g, ";\n")
+    .replace(/\{\s*/g, "{\n")
+    .replace(/\}\s*/g, "\n}\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
 }
 
 function buildMechanismCard(title, keyPoints) {
@@ -174,6 +208,16 @@ function buildCompareTable(title, categoryTitle) {
 
 function buildDiagramFallback(title, categoryTitle) {
   return `建议用“输入/触发 → 核心流程 → 关键状态 → 输出/风险”的流程图复述 ${title}，并标出它在 ${categoryTitle} 中的位置。`;
+}
+
+function buildDiagramSteps(title, categoryTitle, keyPoints) {
+  const firstPoint = keyPoints.find((point) => !point.includes(title)) ?? `${title} 的核心定义`;
+  return [
+    `定位：${categoryTitle}`,
+    `输入：问题场景或触发条件`,
+    `机制：${firstPoint.slice(0, 42)}`,
+    `输出：面试可讲的结论与取舍`,
+  ];
 }
 
 function makeTopic(file, index) {
@@ -195,9 +239,10 @@ function makeTopic(file, index) {
       { type: "compareTable", title: "对比与边界", content: buildCompareTable(title, categoryTitle) },
       {
         type: "diagram",
-        title: "流程图/示意图提示",
-        content: `${title} 暂未配置正式图片资源，先按下方提示在 App 中展示图示占位，后续可由内容平台补充 asset。`,
+        title: "结构图解",
+        content: `${title} 的学习路径图，用于替代原始 Markdown 中容易变形的 ASCII 图。`,
         fallback: buildDiagramFallback(title, categoryTitle),
+        items: buildDiagramSteps(title, categoryTitle, keyPoints),
       },
       ...(codeSnippet
         ? [{
