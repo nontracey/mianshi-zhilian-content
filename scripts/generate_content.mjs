@@ -127,13 +127,57 @@ function pickExcerpt(content) {
     .filter((line) =>
       line &&
       !line.startsWith("|") &&
-      !line.startsWith("```") &&
       !line.startsWith("---") &&
-      !boxDrawingPattern.test(line) &&
       !scheduleLineTestPattern.test(line)
-    )
-    .slice(0, 18);
-  return lines.join("\n").slice(0, 1800);
+    );
+
+  // 保留完整内容，包括代码块和图形
+  const result = [];
+  let inCodeBlock = false;
+  let skipSection = false;
+  let skipSectionLevel = 0;
+
+  for (const line of lines) {
+    // 处理代码块
+    if (line.startsWith('```')) {
+      inCodeBlock = !inCodeBlock;
+      if (!skipSection) {
+        result.push(line);
+      }
+      continue;
+    }
+
+    // 在代码块内，直接保留
+    if (inCodeBlock) {
+      if (!skipSection) {
+        result.push(line);
+      }
+      continue;
+    }
+
+    // 检测是否是需要跳过的章节
+    if (/^#{1,3}\s*(图解记忆|参考资料|我的笔记|今日练习|八、今日练习|九、参考资料)/.test(line)) {
+      skipSection = true;
+      skipSectionLevel = line.match(/^(#{1,3})/)?.[1]?.length || 2;
+      continue;
+    }
+
+    // 检测是否遇到了新的同级或更高级标题，结束跳过
+    if (skipSection && /^#{1,3}\s/.test(line)) {
+      const currentLevel = line.match(/^(#{1,3})/)?.[1]?.length || 0;
+      if (currentLevel <= skipSectionLevel) {
+        skipSection = false;
+        skipSectionLevel = 0;
+      }
+    }
+
+    // 如果不在跳过章节中，添加内容
+    if (!skipSection) {
+      result.push(line);
+    }
+  }
+
+  return result.join("\n").slice(0, 8000); // 增加到 8000 字符
 }
 
 function pickKeyPoints(title, content) {
