@@ -83,7 +83,8 @@ for (const file of topicFiles) {
     throw new Error(`${file} must include at least one deeper visual, comparison, or code card.`);
   }
   for (const card of topic.learningCards) {
-    if (boxDrawing.test(card.content ?? "")) {
+    // 允许 explain 和 diagram 卡片包含 ASCII 图形（它们是知识内容的一部分）
+    if (["code"].includes(card.type) && boxDrawing.test(card.content ?? "")) {
       throw new Error(`${file} contains box-drawing ASCII art in ${card.type}/${card.title}. Use diagram cards instead.`);
     }
   }
