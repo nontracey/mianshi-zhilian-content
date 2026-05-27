@@ -107,6 +107,34 @@ function sanitizeText(text) {
 
 function detectCategory(file, title, content) {
   const haystack = `${file}\n${title}\n${content.slice(0, 1200)}`;
+  const domain = detectDomain(file);
+
+  // 算法领域使用专门的分类规则
+  if (domain === 'algorithm') {
+    const algorithmCategories = [
+      ["array-list", "数组与链表", "数组、链表与基础数据结构高频题", ["数组", "链表", "数据结构", "两数之和"]],
+      ["tree-graph", "树与图", "二叉树、图算法与设计题", ["二叉树", "图", "最短路径", "设计题", "树"]],
+      ["dynamic-programming", "动态规划", "状态定义、转移方程与空间优化", ["动态规划", "DP", "背包", "最优子结构"]],
+      ["string-search", "字符串、排序与查找", "字符串技巧、排序算法与二分查找", ["字符串", "排序", "二分", "查找"]],
+      ["backtracking", "回溯算法", "回溯、搜索与剪枝", ["回溯", "搜索", "剪枝", "组合", "排列"]],
+      ["review", "综合复习", "阶段复盘、模拟面试与高频题", ["复习", "模拟", "总结", "面试题", "掌握程度", "算法总结"]],
+    ];
+    return algorithmCategories.find(([, , , keywords]) => keywords.some((keyword) => haystack.includes(keyword))) ?? algorithmCategories[0];
+  }
+
+  // Agent 领域使用专门的分类规则
+  if (domain === 'agent') {
+    const agentCategories = [
+      ["llm", "LLM 基础", "Transformer、训练推理与提示工程", ["Transformer", "大模型", "LLM", "Prompt", "注意力机制", "训练", "推理"]],
+      ["rag", "RAG 与向量检索", "RAG、向量数据库、检索增强生成", ["RAG", "向量", "Embedding", "检索", "向量数据库"]],
+      ["agent-architecture", "Agent 架构", "Agent、MCP、Function Calling、多 Agent", ["Agent", "MCP", "Function Calling", "多Agent", "多 Agent", "LangChain"]],
+      ["ai-engineering", "AI 工程化", "评估、观测、安全、合规与项目实践", ["工程化", "评估", "观测", "安全", "合规", "行业", "项目", "简历", "Python", "面试"]],
+      ["review", "综合复习", "阶段复盘、模拟面试与高频题", ["复习", "模拟", "总结", "面试题", "掌握程度", "综合复习"]],
+    ];
+    return agentCategories.find(([, , , keywords]) => keywords.some((keyword) => haystack.includes(keyword))) ?? agentCategories[0];
+  }
+
+  // Java 领域使用通用分类规则
   return categoryRules.find(([, , , keywords]) => keywords.some((keyword) => haystack.includes(keyword))) ?? categoryRules.at(-1);
 }
 
@@ -272,7 +300,7 @@ function makeTopic(file, index) {
   if (!domain) return null;
   return async () => {
     const raw = await readFile(file, "utf8");
-    const title = cleanTitle(file);
+    let title = cleanTitle(file);
     const [categoryId, categoryTitle] = detectCategory(file, title, raw);
     const slug = makeSlug(file, index);
     const summary = pickSummary(title, raw);
@@ -280,6 +308,21 @@ function makeTopic(file, index) {
     const keyPoints = pickKeyPoints(title, raw);
     const codeSnippet = pickCodeSnippet(raw);
     const id = `${domain}.${categoryId}.${slug}`;
+
+    // 如果标题是"高频题目"，根据文件路径生成更具体的标题
+    if (title === '高频题目') {
+      const dirName = path.basename(path.dirname(file));
+      const parentFiles = await readdir(path.dirname(file));
+      const currentIndex = parentFiles.indexOf(path.basename(file));
+      if (currentIndex > 0) {
+        const prevFile = parentFiles[currentIndex - 1];
+        const prevTitle = cleanTitle(path.join(path.dirname(file), prevFile));
+        if (prevTitle && prevTitle !== '高频题目') {
+          title = `${prevTitle}高频题`;
+        }
+      }
+    }
+
     const learningCards = [
       { type: "explain", title: "知识全景", content: excerpt || summary },
       { type: "explain", title: "关键机制拆解", content: buildMechanismCard(title, keyPoints) },
