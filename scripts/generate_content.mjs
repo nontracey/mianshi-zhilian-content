@@ -177,7 +177,7 @@ function pickExcerpt(content) {
     }
   }
 
-  return result.join("\n").slice(0, 8000); // 增加到 8000 字符
+  return result.join("\n"); // 完整输出，不截断
 }
 
 function pickKeyPoints(title, content) {
