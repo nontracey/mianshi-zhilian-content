@@ -21,6 +21,17 @@ npm run validate
 
 内容规范来自《面试智练内容格式规范》。用户侧知识结构只保留"领域 -> 分类 -> 知识点"，不使用阶段、天数或排期概念。
 
+## 内容深度约定
+
+生成脚本会过滤 `今日练习与总结` 这类日程复盘文件，并清理 `学习时间`、`第几天`、`第几阶段` 等排期文案。每个正式 topic 至少包含：
+
+- `explain`：知识全景和关键机制拆解。
+- `compareTable` / `diagram` / `code`：对比边界、图示提示或代码抓手，至少一类深度卡片。
+- `interviewAnswer`：面试回答模板。
+- `checklist`：学完后应能说清楚的检查项。
+
+App 每次加载最新 manifest/domain 后会按引用列表裁剪本地缓存，因此从内容平台删除并发布的 topic 会从用户本地缓存中移除。
+
 ## 部署
 
 内容站通过 GitHub Actions + Wrangler CLI 部署到 Cloudflare Pages。`main` push 时自动触发：

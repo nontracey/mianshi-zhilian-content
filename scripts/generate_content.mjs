@@ -93,6 +93,8 @@ function sanitizeText(text) {
     .replace(/第\s*\d+[a-zA-Z]?\s*阶段[-_：:]?/g, "")
     .replace(/第\s*\d+[a-zA-Z]?\s*天[-_：:]?/g, "")
     .replace(/Day\s*\d+/gi, "")
+    .replace(/^>?\s*学习时间[:：].*$/gm, "")
+    .replace(/^>?\s*预计时长[:：].*$/gm, "")
     .replace(/\r/g, "")
     .trim();
 }
@@ -124,6 +126,56 @@ function pickExcerpt(content) {
   return lines.join("\n").slice(0, 1800);
 }
 
+function pickKeyPoints(title, content) {
+  const points = sanitizeText(content)
+    .split("\n")
+    .map((line) => line.replace(/^#+\s*/, "").replace(/^[-*]\s*/, "").replace(/^\d+[.)、]\s*/, "").trim())
+    .filter((line) => line.length >= 8 && line.length <= 120 && !line.startsWith("|") && !line.includes("```"))
+    .filter((line) => !/^(---+|要点|示例|代码|答案|解析)$/.test(line))
+    .slice(0, 6);
+
+  if (points.length >= 3) return points;
+  return [
+    `${title} 解决什么问题，以及它和相邻概念的边界。`,
+    `${title} 的核心机制、关键流程和主要组成部分。`,
+    `${title} 在面试中常见追问、误区和项目表达方式。`,
+  ];
+}
+
+function pickCodeSnippet(content) {
+  const fenced = content.match(/```[a-zA-Z0-9_-]*\n([\s\S]*?)```/);
+  if (fenced?.[1]?.trim()) return fenced[1].trim().slice(0, 1200);
+
+  const lines = sanitizeText(content).split("\n");
+  const start = lines.findIndex((line) =>
+    /(public\s+class|class\s+\w+|interface\s+\w+|@\w+|SELECT\s+|SET\s+|ExecutorService|CompletableFuture|if\s*\(|for\s*\(|while\s*\(|try\s*\{|return\s+)/i.test(line),
+  );
+  if (start < 0) return "";
+
+  return lines
+    .slice(start, start + 18)
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+    .join("\n")
+    .slice(0, 1200);
+}
+
+function buildMechanismCard(title, keyPoints) {
+  const items = keyPoints
+    .slice(0, 5)
+    .map((point, index) => `${index + 1}. ${point}`)
+    .join("\n");
+  return `先把 ${title} 当成一个可讲清楚的系统来理解：\n\n${items}\n\n学习时重点关注“为什么需要它、它如何工作、什么时候会出问题、面试时怎么结构化表达”。`;
+}
+
+function buildCompareTable(title, categoryTitle) {
+  return `| 对比项 | ${title} | 相邻知识/常见误解 |\n| --- | --- | --- |\n| 解决的问题 | 说明核心目标和使用场景 | 只背定义，忽略为什么需要它 |\n| 核心机制 | 拆成关键角色、流程、边界条件 | 把实现细节和概念边界混在一起 |\n| 面试表达 | 先结论，再机制，再场景和取舍 | 直接罗列术语，缺少层次 |\n| 关联分类 | ${categoryTitle} | 需要能和同类知识做横向比较 |`;
+}
+
+function buildDiagramFallback(title, categoryTitle) {
+  return `建议用“输入/触发 → 核心流程 → 关键状态 → 输出/风险”的流程图复述 ${title}，并标出它在 ${categoryTitle} 中的位置。`;
+}
+
 function makeTopic(file, index) {
   const domain = detectDomain(file);
   if (!domain) return null;
@@ -134,7 +186,37 @@ function makeTopic(file, index) {
     const slug = makeSlug(file, index);
     const summary = pickSummary(title, raw);
     const excerpt = pickExcerpt(raw);
+    const keyPoints = pickKeyPoints(title, raw);
+    const codeSnippet = pickCodeSnippet(raw);
     const id = `${domain}.${categoryId}.${slug}`;
+    const learningCards = [
+      { type: "explain", title: "知识全景", content: excerpt || summary },
+      { type: "explain", title: "关键机制拆解", content: buildMechanismCard(title, keyPoints) },
+      { type: "compareTable", title: "对比与边界", content: buildCompareTable(title, categoryTitle) },
+      {
+        type: "diagram",
+        title: "流程图/示意图提示",
+        content: `${title} 暂未配置正式图片资源，先按下方提示在 App 中展示图示占位，后续可由内容平台补充 asset。`,
+        fallback: buildDiagramFallback(title, categoryTitle),
+      },
+      ...(codeSnippet
+        ? [{
+            type: "code",
+            title: "代码/伪代码抓手",
+            content: codeSnippet,
+          }]
+        : []),
+      {
+        type: "interviewAnswer",
+        title: "面试回答模板",
+        content: `可以按“四段式”回答 ${title}：先用一句话给定义和价值；再拆 ${categoryTitle} 里的关键机制；接着补充适用场景、性能或一致性等取舍；最后用项目排查、优化或设计经验收束。`,
+      },
+      {
+        type: "checklist",
+        title: "学完后应能说清楚",
+        items: [`${title} 的定义和边界`, `${title} 的关键机制`, `${title} 的典型场景和常见追问`, `${title} 在面试中的结构化表达方式`],
+      },
+    ];
     return {
       id,
       domain,
@@ -147,19 +229,7 @@ function makeTopic(file, index) {
       estimatedMinutes: 20,
       order: index * 10,
       recommendWeight: Math.max(60, 100 - (index % 40)),
-      learningCards: [
-        { type: "explain", title: "核心概念", content: excerpt || summary },
-        {
-          type: "interviewAnswer",
-          title: "面试回答模板",
-          content: `面试时可以先说明 ${title} 解决的问题，再拆核心机制、典型场景和常见误区，最后结合项目或排查经验补充一句实践理解。`,
-        },
-        {
-          type: "checklist",
-          title: "学完后应能说清楚",
-          items: [`${title} 的定义和边界`, `${title} 的关键机制`, `${title} 在面试中的表达方式`],
-        },
-      ],
+      learningCards,
       recallPrompts: [
         {
           id: `${id}.recall.1`,
