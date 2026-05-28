@@ -1,0 +1,112 @@
+{
+  "id": "agent.ai-engineering.topic-129-1907ae44",
+  "domain": "agent",
+  "category": "ai-engineering",
+  "group": "ai-engineering",
+  "title": "模型路由与降级方案",
+  "summary": "模型选型策略、自动降级机制、流式处理与高可用架构",
+  "tags": [
+    "Agent",
+    "AI工程化",
+    "模型路由",
+    "降级方案"
+  ],
+  "difficulty": 2,
+  "estimatedMinutes": 20,
+  "order": 110,
+  "recommendWeight": 70,
+  "status": "draft",
+  "learningCards": [
+    {
+      "type": "explain",
+      "title": "知识全景",
+      "content": "# 模型路由与降级方案\n## 模型选型策略\n选择模型需要平衡的三个维度：\n\n| 维度 | 考虑因素 |\n| --- | --- |\n| 能力 | 准确率、推理能力、上下文长度 |\n| 成本 | Token单价、请求频率 |\n| 性能 | 延迟、并发、稳定性 |\n\n### 常见模型矩阵\n```\n┌─────────────┬──────────┬──────────┬──────────┐\n│   模型      │   能力   │   成本   │   速度   │\n├─────────────┼──────────┼──────────┼──────────┤\n│ GPT-4       │   高     │   高     │   慢     │\n│ GPT-3.5     │   中     │   低     │   快     │\n│ Claude-3    │   高     │   中     │   中     │\n│ DeepSeek    │   中高   │   低     │   快     │\n│ 本地小模型  │   低     │   极低   │   极快   │\n└─────────────┴──────────┴──────────┴──────────┘\n```\n\n## 自动降级机制\n当主模型不可用时，自动切换到备用模型：\n\n```\n请求 → GPT-4 → 失败/超时\n         ↓\n      Claude-3 → 失败/超时\n         ↓\n      GPT-3.5 → 失败/超时\n         ↓\n      本地模型 → 返回结果\n```\n\n### 降级触发条件\n1. **超时**：响应时间超过阈值\n2. **错误**：API返回错误（429/500）\n3. **限流**：达到速率限制\n4. **质量**：输出质量低于阈值\n\n## 流式处理\n流式输出的优势：\n- **首字延迟低**：用户更快看到结果\n- **体验好**：打字机效果\n- **可中断**：用户可随时停止\n\n```python\n# 流式调用\nasync def stream_response(query: str):\n    async for chunk in llm.astream(query):\n        yield chunk.content\n\n# SSE返回\n@app.route('/chat')\ndef chat():\n    return Response(\n        stream_response(query),\n        mimetype='text/event-stream'\n    )\n```\n\n## 高可用架构\n```\n┌─────────────────────────────────────┐\n│           负载均衡 (Nginx)           │\n└──────────────────┬──────────────────┘\n                   │\n    ┌──────────────┼──────────────┐\n    ▼              ▼              ▼\n┌───────┐    ┌───────┐    ┌───────┐\n│ App-1 │    │ App-2 │    │ App-3 │\n└───┬───┘    └───┬───┘    └───┬───┘\n    │            │            │\n    └────────────┼────────────┘\n                 ▼\n         ┌──────────────┐\n         │  模型路由层   │\n         │ (自动降级)   │\n         └──────┬───────┘\n                │\n    ┌───────────┼───────────┐\n    ▼           ▼           ▼\n┌───────┐  ┌───────┐  ┌───────┐\n│OpenAI │  │Claude │  │本地   │\n└───────┘  └───────┘  └───────┘\n```"
+    },
+    {
+      "type": "explain",
+      "title": "关键机制拆解",
+      "content": "模型路由与降级的核心是\"确保服务可用\"：\n\n1. 模型选型：根据任务特点选择合适模型\n2. 自动降级：主模型失败时自动切换备用\n3. 流式处理：优化用户体验\n4. 高可用：多实例部署，负载均衡\n\n核心思路：不依赖单一模型，总有兜底方案。"
+    },
+    {
+      "type": "code",
+      "title": "代码示例",
+      "content": "# 模型路由与降级实现\nimport asyncio\nfrom typing import AsyncIterator\nfrom langchain_openai import ChatOpenAI\nfrom langchain_anthropic import ChatAnthropic\n\nclass ModelRouter:\n    def __init__(self):\n        self.models = {\n            \"primary\": ChatOpenAI(model=\"gpt-4\", timeout=30),\n            \"secondary\": ChatAnthropic(model=\"claude-3\", timeout=30),\n            \"fallback\": ChatOpenAI(model=\"gpt-3.5-turbo\", timeout=10),\n            \"local\": ChatOpenAI(model=\"local-model\", base_url=\"http://localhost:8080\")\n        }\n        self.circuit_breaker = {}  # 熔断器\n    \n    async def invoke(self, messages: list, strategy: str = \"cascade\"):\n        \"\"\"调用模型，支持多种策略\"\"\"\n        if strategy == \"cascade\":\n            return await self._cascade_invoke(messages)\n        elif strategy == \"fastest\":\n            return await self._fastest_invoke(messages)\n        elif strategy == \"cheapest\":\n            return await self._cheapest_invoke(messages)\n    \n    async def _cascade_invoke(self, messages: list):\n        \"\"\"级联降级策略\"\"\"\n        for name, model in self.models.items():\n            if self._is_circuit_open(name):\n                continue\n            try:\n                result = await asyncio.wait_for(\n                    model.ainvoke(messages),\n                    timeout=30\n                )\n                return result\n            except Exception as e:\n                self._record_failure(name)\n                continue\n        raise Exception(\"所有模型都不可用\")\n    \n    def _is_circuit_open(self, model_name: str) -> bool:\n        \"\"\"检查熔断器是否打开\"\"\"\n        if model_name not in self.circuit_breaker:\n            return False\n        failures, last_failure = self.circuit_breaker[model_name]\n        if failures >= 3:  # 连续失败3次\n            return True\n        return False\n    \n    def _record_failure(self, model_name: str):\n        \"\"\"记录失败\"\"\"\n        if model_name not in self.circuit_breaker:\n            self.circuit_breaker[model_name] = (0, None)\n        failures, _ = self.circuit_breaker[model_name]\n        self.circuit_breaker[model_name] = (failures + 1, asyncio.get_event_loop().time())\n\n# 流式调用\nasync def stream_with_fallback(router: ModelRouter, messages: list) -> AsyncIterator[str]:\n    \"\"\"带降级的流式调用\"\"\"\n    for name, model in router.models.items():\n        try:\n            async for chunk in model.astream(messages):\n                yield chunk.content\n            return\n        except Exception:\n            continue\n    raise Exception(\"流式调用失败\")\n\n# 使用示例\nrouter = ModelRouter()\n\n# 级联降级\nresult = await router.invoke(messages, strategy=\"cascade\")\n\n# 流式输出\nasync for chunk in stream_with_fallback(router, messages):\n    print(chunk, end=\"\", flush=True)",
+      "language": "python"
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答模板",
+      "content": "模型路由与降级是AI应用高可用的关键。模型选型要平衡能力、成本和性能三个维度，不同任务选择不同模型。自动降级采用级联策略，主模型失败时依次尝试备用模型，触发条件包括超时、错误、限流。用熔断器机制避免频繁调用已失败的模型。流式处理优化用户体验，首字延迟低，支持中断。高可用架构采用多实例部署加负载均衡，确保单点故障不影响服务。"
+    },
+    {
+      "type": "compareTable",
+      "title": "对比与边界",
+      "content": "| 对比项 | 级联降级 | 最快响应 | 最低成本 |\n| --- | --- | --- | --- |\n| 策略 | 按优先级尝试 | 并发调用取最快 | 优先便宜模型 |\n| 延迟 | 高（可能多次尝试） | 低 | 中 |\n| 成本 | 中 | 高 | 低 |\n| 可靠性 | 高 | 中 | 中 |\n| 适用场景 | 可靠性优先 | 体验优先 | 成本优先 |"
+    },
+    {
+      "type": "diagram",
+      "title": "结构图解",
+      "content": "模型路由与降级架构图。",
+      "fallback": "画请求流程：用户请求 → 模型路由 → 主模型 → 成功返回/失败 → 备用模型 → 成功返回/失败 → 兜底模型 → 返回。",
+      "items": [
+        "模型选型：能力、成本、性能三维度",
+        "自动降级：级联策略，熔断器机制",
+        "流式处理：优化首字延迟和用户体验",
+        "高可用：多实例部署，负载均衡"
+      ]
+    },
+    {
+      "type": "checklist",
+      "title": "学完后应能说清楚",
+      "items": [
+        "模型选型的三个维度",
+        "自动降级的触发条件和策略",
+        "熔断器机制的工作原理",
+        "流式处理的实现方式",
+        "高可用架构的设计"
+      ]
+    }
+  ],
+  "recallPrompts": [
+    {
+      "id": "agent.ai-engineering.topic-129-1907ae44.recall.1",
+      "prompt": "请解释模型路由的级联降级策略。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 2
+    },
+    {
+      "id": "agent.ai-engineering.topic-129-1907ae44.recall.2",
+      "prompt": "如果面试官问你\"AI应用如何保证高可用\"，你会怎么回答？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    }
+  ],
+  "rubric": {
+    "mustHave": [
+      "模型选型策略",
+      "自动降级机制",
+      "熔断器原理",
+      "流式处理实现",
+      "高可用架构"
+    ],
+    "goodToHave": [
+      "成本效益分析",
+      "性能监控",
+      "容量规划"
+    ],
+    "commonMistakes": [
+      "只用一个模型没有降级",
+      "降级策略不合理",
+      "忽略流式处理的必要性"
+    ],
+    "scoreWeights": {
+      "coverage": 40,
+      "accuracy": 25,
+      "interviewExpression": 20,
+      "depth": 15
+    }
+  },
+  "updatedAt": "2026-05-28"
+}

@@ -18,28 +18,30 @@
     {
       "type": "explain",
       "title": "知识全景",
-      "content": "# Nacos配置中心\n## 1. Nacos配置管理\nNacos 配置中心用于集中管理微服务的配置信息，支持配置的动态发布、变更推送和版本管理。\n### 要点\n- 配置以 `Data ID + Group + Namespace` 三元组唯一标识\n- Data ID 通常格式：`${spring.application.name}.${file-extension:properties}`\n- Group 默认 `DEFAULT_GROUP`，用于区分不同业务/环境的配置\n- Namespace 用于环境隔离（dev、test、prod），不同 namespace 完全隔离\n- 支持多种格式：properties、yaml、json、xml\n### 配置管理核心模型\n```\nNamespace (命名空间)\n└── Group (分组)\n└── Data ID (配置文件)\n└── 配置内容（key-value）\n示例：\nNamespace: dev\nGroup: DEFAULT_GROUP\nData ID: order-service.yaml\nContent:\nserver.port: 8080\nspring.datasource.url: jdbc:mysql://localhost:3306/order_dev\n```\n### 示例/代码\n```xml\n<!-- pom.xml 添加依赖 -->\n<dependency>\n<groupId>com.alibaba.cloud</groupId>\n<artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId>\n</dependency>\n<dependency>\n<groupId>org.springframework.cloud</groupId>\n<artifactId>spring-cloud-starter-bootstrap</artifactId>\n</dependency>\n```\n```yaml\n# bootstrap.yml - 配置中心连接信息（优先于 application.yml 加载）\nspring:\napplication:\nname: order-service\ncloud:\nnacos:\nconfig:\nserver-addr: 127.0.0.1:8848\nnamespace: dev-namespace-id\ngroup: DEFAULT_GROUP\nfile-extension: yaml\n```\n```java\n// 使用 @Value 读取配置\n@RestController\n@RefreshScope  // 支持动态刷新\npublic class ConfigController {\n    @Value(\"${order.timeout:30}\")\n    private Integer timeout;\n    @Value(\"${order.retry-count:3}\")\n    private Integer retryCount;\n    @GetMapping(\"/config\")\n    public Map<String, Object> getConfig() {\n        Map<String, Object> map = new HashMap<>();\n        map.put(\"timeout\", timeout);\n        map.put(\"retryCount\", retryCount);\n        return map;\n    }\n}\n```\n## 2. 动态配置刷新\n### 要点\n- **@RefreshScope**：标记的 Bean 在配置变更时自动销毁并重建\n- **长轮询机制**：客户端通过长轮询监听配置变更，默认超时 30 秒\n- **变更流程**：配置变更 → 通知客户端 → 拉取最新配置 → 刷新 Environment → 重建 Bean\n- Nacos 2.x 基于 gRPC 实现配置推送，替代 1.x 的 HTTP 长轮询\n### 长轮询机制\n```\n客户端                                    Nacos Server\n```\n### 示例/代码\n```java\n// 方式1: @RefreshScope + @Value\n@RestController\n@RefreshScope\npublic class DynamicConfigController {\n    @Value(\"${feature.enabled:false}\")\n    private Boolean featureEnabled;\n    @GetMapping(\"/feature\")\n    public String checkFeature() {\n        return featureEnabled ? \"Feature is ON\" : \"Feature is OFF\";\n    }\n}\n// 方式2: @ConfigurationProperties（自动刷新，无需 @RefreshScope）\n@ConfigurationProperties(prefix = \"order\")\n@Component\n@Data\npublic class OrderProperties {\n    private Integer timeout = 30;\n    private Integer retryCount = 3;\n    private String payUrl;\n}\n// 方式3: Nacos 原生监听器\n@Component\npublic class NacosConfigChangeListener {\n    @Autowired\n    private NacosConfigManager nacosConfigManager;\n    @PostConstruct\n    public void init() throws NacosException {\n        nacosConfigManager.getConfigService()\n        .addListener(\"order-service.yaml\", \"DEFAULT_GROUP\",\n        new Listener() {\n            @Override\n            public Executor getExecutor() { return null; }\n            @Override\n            public void receiveConfigInfo(String configInfo) {\n                System.out.println(\"配置变更: \" + configInfo);\n            }\n    });\n}\n}\n```\n## 3. 配置分组与命名空间\n### 要点\n- **Namespace**：环境隔离（dev/test/prod），不同 namespace 数据完全隔离\n- **Group**：业务或项目维度的逻辑分组\n- **Data ID**：配置文件唯一标识，建议 `${name}-${profile}.${extension}`\n- 层次关系：Namespace > Group > Data ID\n- 切换环境只需修改 Namespace ID\n### 示例/代码\n```yaml\n# bootstrap.yml - 指定命名空间和分组\nspring:\napplication:\nname: order-service\nprofiles:\nactive: dev\ncloud:\nnacos:\nconfig:\nserver-addr: 127.0.0.1:8848\nnamespace: 7c8a53b1-xxxx-xxxx-xxxx-xxxxxxxxxxxx\ngroup: DEFAULT_GROUP\nfile-extension: yaml\n```\n## 4. 配置共享\n### 要点\n- **shared-configs**：多个服务共享的公共配置（如数据库、Redis 配置）\n- **extension-configs**：扩展配置，优先级高于 shared-configs\n- **优先级**：主配置 > extension-configs > shared-configs\n- shared-configs 支持 `refresh: true` 实现动态刷新\n### 配置优先级（从高到低）\n```\n1. ${spring.application.name}.${extension}        (主配置)\n2. ${spring.application.name}-${profile}.${extension}\n3. extension-configs（按数组顺序，后面的优先）\n4. shared-configs（按数组顺序，后面的优先）\n```\n### 示例/代码\n```yaml\nspring:\ncloud:\nnacos:\nconfig:\nserver-addr: 127.0.0.1:8848\nnamespace: dev-namespace-id\nfile-extension: yaml\nshared-configs:\n- data-id: datasource.yaml\ngroup: SHARED_GROUP\nrefresh: true\n- data-id: redis.yaml\ngroup: SHARED_GROUP\nrefresh: true\nextension-configs:\n- data-id: order-extension.yaml\ngroup: EXTENSION_GROUP\nrefresh: true\n```\n## 5. 配置加密\n### 要点\n- 生产环境敏感配置（数据库密码、密钥等）必须加密存储\n- Nacos 不提供内置加密，需配合 **Jasypt** 或 KMS 方案\n- Jasypt（Java Simplified Encryption）是 Spring Boot 常用的加密方案\n- 最佳实践：使用环境变量或密钥管理服务管理敏感信息\n### 示例/代码\n```xml\n<!-- pom.xml 引入 Jasypt -->\n<dependency>\n<groupId>com.github.ulisesbocchio</groupId>\n<artifactId>jasypt-spring-boot-starter</artifactId>\n<version>3.0.5</version>\n</dependency>\n```\n```yaml\n# application.yml\njasypt:\nencryptor:\npassword: ${JASYPT_PASSWORD:my-secret-key}\nalgorithm: PBEWithMD5AndDES\n# Nacos 中存储加密后的值\nspring:\ndatasource:\npassword: ENC(加密后的密文)\nredis:\npassword: ENC(加密后的密文)\n```\n```java\n// 生成加密密文\n@Component\npublic class EncryptUtil {\n    @Autowired\n    private StringEncryptor stringEncryptor;\n    public String encrypt(String plaintext) {\n        return stringEncryptor.encrypt(plaintext);\n    }\npublic String decrypt(String ciphertext) {\n    return stringEncryptor.decrypt(ciphertext);\n}\n}\n```\n## 6. 面试高频问题\n### Q1：Nacos 配置中心的原理是什么？\n**答**：基于长轮询机制。客户端启动时拉取配置并缓存，同时建立长轮询连接（默认30秒超时）。配置变更时 Server 立即响应，客户端重新拉取最新配置，刷新 Environment 并重建 @RefreshScope Bean。Nacos 2.x 基于 gRPC 推送。\n### Q2：Namespace、Group、Data ID 有什么作用？\n**答**：三级层次结构。Namespace 用于环境隔离（dev/test/prod），Group 用于业务逻辑分组，Data ID 是配置文件唯一标识。三者组合唯一确定一个配置。\n### Q3：如何实现 Nacos 配置的动态刷新？\n**答**：三种方式：(1) @RefreshScope + @Value；(2) @ConfigurationProperties 自动感知；(3) Nacos 原生 Listener 监听。底层通过长轮询或 gRPC 实现实时通知。\n### Q4：配置优先级是怎样的？\n**答**：主配置 > extension-configs > shared-configs。高优先级覆盖低优先级的同名属性。\n### Q5：如何保证配置安全？\n**答**：(1) 开启鉴权（nacos.core.auth.enabled=true）；(2) Jasypt/KMS 加密敏感配置；(3) Namespace 隔离；(4) 版本管理和回滚；(5) 灰度发布。"
+      "content": "# Nacos配置中心\n## 1. Nacos配置管理\nNacos 配置中心用于集中管理微服务的配置信息，支持配置的动态发布、变更推送和版本管理。\n### 要点\n- 配置以 `Data ID + Group + Namespace` 三元组唯一标识\n- Data ID 通常格式：`${spring.application.name}.${file-extension:properties}`\n- Group 默认 `DEFAULT_GROUP`，用于区分不同业务/环境的配置\n- Namespace 用于环境隔离（dev、test、prod），不同 namespace 完全隔离\n- 支持多种格式：properties、yaml、json、xml\n### 配置管理核心模型\n```\nNamespace (命名空间)\n└── Group (分组)\n└── Data ID (配置文件)\n└── 配置内容（key-value）\n示例：\nNamespace: dev\nGroup: DEFAULT_GROUP\nData ID: order-service.yaml\nContent:\nserver.port: 8080\nspring.datasource.url: jdbc:mysql://localhost:3306/order_dev\n```\n### 示例/代码\n```xml\n<!-- pom.xml 添加依赖 -->\n<dependency>\n<groupId>com.alibaba.cloud</groupId>\n<artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId>\n</dependency>\n<dependency>\n<groupId>org.springframework.cloud</groupId>\n<artifactId>spring-cloud-starter-bootstrap</artifactId>\n</dependency>\n```\n```yaml\n# bootstrap.yml - 配置中心连接信息（优先于 application.yml 加载）\nspring:\napplication:\nname: order-service\ncloud:\nnacos:\nconfig:\nserver-addr: 127.0.0.1:8848\nnamespace: dev-namespace-id\ngroup: DEFAULT_GROUP\nfile-extension: yaml\n```\n```java\n// 使用 @Value 读取配置\n@RestController\n@RefreshScope  // 支持动态刷新\npublic class ConfigController {\n    @Value(\"${order.timeout:30}\")\n    private Integer timeout;\n    @Value(\"${order.retry-count:3}\")\n    private Integer retryCount;\n    @GetMapping(\"/config\")\n    public Map<String, Object> getConfig() {\n        Map<String, Object> map = new HashMap<>();\n        map.put(\"timeout\", timeout);\n        map.put(\"retryCount\", retryCount);\n        return map;\n    }\n}\n```\n## 2. 动态配置刷新\n### 要点\n- **@RefreshScope**：标记的 Bean 在配置变更时自动销毁并重建\n- **长轮询机制**：客户端通过长轮询监听配置变更，默认超时 30 秒\n- **变更流程**：配置变更 → 通知客户端 → 拉取最新配置 → 刷新 Environment → 重建 Bean\n- Nacos 2.x 基于 gRPC 实现配置推送，替代 1.x 的 HTTP 长轮询\n### 长轮询机制\n```\n客户端                                    Nacos Server\n```\n### 示例/代码\n```java\n// 方式1: @RefreshScope + @Value\n@RefreshScope\n@RestController\npublic class ConfigController {\n    @Value(\"${order.timeout:30}\")\n    private Integer timeout;\n}\n// 方式2: @ConfigurationProperties\n@Component\n@ConfigurationProperties(prefix = \"order\")\npublic class OrderProperties {\n    private Integer timeout = 30;\n    private Integer retryCount = 3;\n    // getter/setter\n}\n// 方式3: 监听配置变更事件\n@Component\npublic class ConfigListener {\n    @EventListener\n    public void onRefresh(RefreshScopeRefreshedEvent event) {\n        // 配置变更后的处理逻辑\n    }\n}\n```"
     },
     {
       "type": "explain",
       "title": "关键机制拆解",
-      "content": "先把 Nacos配置中心 当成一个可讲清楚的系统来理解：\n\n1. Nacos配置中心\n2. Nacos配置管理\n3. Nacos 配置中心用于集中管理微服务的配置信息，支持配置的动态发布、变更推送和版本管理。\n4. 配置以 `Data ID + Group + Namespace` 三元组唯一标识\n5. Data ID 通常格式：`${spring.application.name}.${file-extension:properties}`\n\n学习时重点关注“为什么需要它、它如何工作、什么时候会出问题、面试时怎么结构化表达”。"
+      "content": "先把 Nacos配置中心 当成一个可讲清楚的系统来理解：\n\n1. Nacos配置中心\n2. Nacos配置管理\n3. Nacos 配置中心用于集中管理微服务的配置信息，支持配置的动态发布、变更推送和版本管理。\n4. 配置以 `Data ID + Group + Namespace` 三元组唯一标识\n5. Data ID 通常格式：`${spring.application.name}.${file-extension:properties}`\n\n学习时重点关注\"为什么需要它、它如何工作、什么时候会出问题、面试时怎么结构化表达\"。"
     },
     {
       "type": "compareTable",
       "title": "对比与边界",
-      "content": "| 对比项 | Nacos配置中心 | 相邻知识/常见误解 |\n| --- | --- | --- |\n| 解决的问题 | 说明核心目标和使用场景 | 只背定义，忽略为什么需要它 |\n| 核心机制 | 拆成关键角色、流程、边界条件 | 把实现细节和概念边界混在一起 |\n| 面试表达 | 先结论，再机制，再场景和取舍 | 直接罗列术语，缺少层次 |\n| 关联分类 | Spring 生态 | 需要能和同类知识做横向比较 |"
+      "content": "| 对比项 | Nacos Config | Apollo | Spring Cloud Config |\n| --- | --- | --- | --- |\n| 开源方 | 阿里巴巴 | 携程 | Spring 官方 |\n| 配置格式 | properties/yaml/json/xml | properties/json/xml/yaml | yaml/properties |\n| 动态刷新 | 长轮询（2.x gRPC推送） | 长轮询 | 手动刷新（/actuator/refresh） |\n| 灰度发布 | 支持（按IP/实例） | 支持 | 不支持 |\n| 权限管理 | 基础ACL | 企业级权限+审计 | 依赖Git权限 |\n| 配置回滚 | 支持版本对比+回滚 | 支持 | 依赖Git版本 |\n| 注册中心 | 内置（Nacos同时是注册中心） | 需外接Eureka等 | 需外接 |\n| 适用场景 | 阿里系微服务、中小项目 | 大型企业级配置管理 | 简单场景、Git友好团队 |"
     },
     {
       "type": "diagram",
       "title": "结构图解",
-      "content": "Nacos配置中心 的学习路径图，用于替代原始 Markdown 中容易变形的 ASCII 图。",
-      "fallback": "建议用“输入/触发 → 核心流程 → 关键状态 → 输出/风险”的流程图复述 Nacos配置中心，并标出它在 Spring 生态 中的位置。",
+      "content": "Nacos配置中心 的核心架构与数据模型。",
+      "fallback": "Nacos配置中心通过Namespace实现环境隔离，Group区分业务线，DataID标识具体配置文件。客户端通过长轮询或gRPC监听配置变更，实现动态刷新。",
       "items": [
-        "定位：Spring 生态",
-        "输入：问题场景或触发条件",
-        "机制：Nacos配置管理",
-        "输出：面试可讲的结论与取舍"
+        "配置三元组：Namespace（环境隔离） + Group（业务分组） + DataID（配置标识）",
+        "客户端启动：bootstrap.yml 优先加载 → 连接Nacos Server → 拉取配置 → 注入Environment",
+        "动态刷新：配置变更 → 长轮询通知（30s超时） → 拉取新配置 → @RefreshScope重建Bean",
+        "版本管理：每次修改自动保存历史版本 → 支持版本对比 → 一键回滚",
+        "灰度发布：按IP或实例标签灰度推送配置，降低变更风险",
+        "高可用：Nacos集群（Raft协议） + 本地快照缓存（容灾兜底）"
       ]
     },
     {
@@ -50,16 +52,19 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答模板",
-      "content": "可以按“四段式”回答 Nacos配置中心：先用一句话给定义和价值；再拆 Spring 生态 里的关键机制；接着补充适用场景、性能或一致性等取舍；最后用项目排查、优化或设计经验收束。"
+      "content": "**Q1：Nacos配置中心的配置是怎么拉取和动态刷新的？**\n\nA：Nacos客户端启动时通过bootstrap.yml中的server-addr、namespace等信息连接Nacos Server，拉取对应三元组（Namespace+Group+DataID）的配置并注入Spring Environment。动态刷新方面，客户端通过长轮询机制（2.x用gRPC）监听配置变更，默认30秒超时。当配置变更时，客户端拉取新配置，刷新Environment，@RefreshScope标记的Bean会被销毁重建。\n\n**Q2：Nacos配置中心的Namespace、Group、DataID分别有什么用？**\n\nA：Namespace用于环境隔离，比如dev、test、prod三个命名空间完全隔离，互不影响。Group用于区分不同业务线或模块，默认是DEFAULT_GROUP。DataID标识具体的配置文件，通常格式是`${spring.application.name}.${file-extension}`。三者组合唯一定位一个配置，Namespace隔离环境，Group分组业务，DataID标识文件。\n\n**Q3：Nacos配置中心挂了怎么办？服务还能读到配置吗？**\n\nA：能。Nacos客户端在首次拉取配置后会在本地生成快照文件（默认在`{user.home}/nacos/config`目录下）。当Nacos Server不可用时，客户端会自动降级读取本地快照，保证服务能正常启动和运行。同时Nacos Server本身支持集群部署（基于Raft协议保证一致性），生产环境建议至少3节点集群。"
     },
     {
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "Nacos配置中心 的定义和边界",
-        "Nacos配置中心 的关键机制",
-        "Nacos配置中心 的典型场景和常见追问",
-        "Nacos配置中心 在面试中的结构化表达方式"
+        "配置三元组（Namespace/Group/DataID）各自的作用和隔离粒度",
+        "@RefreshScope的刷新原理：Bean销毁重建而非简单set新值",
+        "长轮询机制的工作流程和30秒超时含义",
+        "Nacos Server不可用时的本地快照降级策略",
+        "Nacos配置中心与Apollo、Spring Cloud Config的核心区别",
+        "bootstrap.yml优先于application.yml加载的原因",
+        "灰度发布配置的实现方式和适用场景"
       ]
     }
   ],

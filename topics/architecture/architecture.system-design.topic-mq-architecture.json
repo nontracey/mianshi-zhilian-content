@@ -1,0 +1,98 @@
+{
+  "id": "architecture.system-design.topic-mq-architecture",
+  "domain": "architecture",
+  "category": "system-design",
+  "group": "system-design",
+  "title": "消息队列架构设计",
+  "summary": "掌握消息可靠投递、幂等消费、顺序消息、延迟消息和积压处理的核心方案",
+  "tags": ["架构设计", "系统设计", "消息队列", "Kafka", "RocketMQ", "可靠投递"],
+  "difficulty": 2,
+  "estimatedMinutes": 25,
+  "order": 20,
+  "recommendWeight": 85,
+  "status": "draft",
+  "learningCards": [
+    {
+      "type": "explain",
+      "title": "知识全景",
+      "content": "# 消息队列架构设计\n\n## 一、消息可靠投递\n### 1.1 生产者 → Broker\n- **同步发送+重试**：发送失败重试\n- **事务消息**：RocketMQ支持半消息\n- **本地消息表**：业务和消息同事务写入\n\n### 1.2 Broker存储\n- **同步刷盘**：消息写入磁盘才返回成功（可靠但慢）\n- **异步刷盘**：先写内存，异步刷盘（快但可能丢）\n- **主从同步**：同步复制到从节点\n\n### 1.3 Broker → 消费者\n- **手动ACK**：处理成功才确认\n- **重试机制**：消费失败重试\n- **死信队列**：多次重试失败进入死信\n\n## 二、幂等消费\n- **唯一ID+去重表**：消息带唯一ID，消费前查重\n- **数据库唯一约束**：利用唯一索引去重\n- **Redis SETNX**：用消息ID做key\n\n## 三、顺序消息\n### 3.1 全局有序\n- 单分区/单队列\n- 性能差，一般不用\n\n### 3.2 分区有序\n- 同一业务ID的消息发到同一分区\n- 用业务ID做分区key\n- 例：同一订单的消息有序\n\n## 四、延迟消息\n- RocketMQ原生支持\n- Kafka需要自己实现（延迟队列+轮询）\n- 应用：订单超时取消、定时提醒\n\n## 五、积压处理\n- 增加消费者数量\n- 增加分区数\n- 跳过不重要的消息\n- 临时扩容消费能力"
+    },
+    {
+      "type": "code",
+      "title": "代码示例",
+      "content": "// 1. 可靠投递 - 本地消息表\n@Service\npublic class ReliableMessageService {\n    @Transactional\n    public void sendMessage(String topic, Object payload) {\n        // 1. 业务操作\n        doBusiness();\n\n        // 2. 写本地消息表（同一事务）\n        LocalMessage msg = new LocalMessage();\n        msg.setMessageId(UUID.randomUUID().toString());\n        msg.setTopic(topic);\n        msg.setPayload(JSON.toJSONString(payload));\n        msg.setStatus(\"PENDING\");\n        localMessageRepo.save(msg);\n    }\n}\n\n// 后台任务发送\n@Scheduled(fixedDelay = 1000)\npublic void pollAndSend() {\n    List<LocalMessage> msgs = localMessageRepo\n        .findByStatus(\"PENDING\", 100);\n    for (LocalMessage msg : msgs) {\n        try {\n            SendResult result = rocketMQTemplate\n                .syncSend(msg.getTopic(), msg.getPayload());\n            if (result.getSendStatus() == SendStatus.SEND_OK) {\n                msg.setStatus(\"SENT\");\n                localMessageRepo.update(msg);\n            }\n        } catch (Exception e) {\n            msg.setRetryCount(msg.getRetryCount() + 1);\n            localMessageRepo.update(msg);\n        }\n    }\n}\n\n// 2. 幂等消费\n@Component\npublic class IdempotentConsumer {\n    @Autowired\n    private ProcessedMessageRepo processedRepo;\n\n    @RocketMQListener(topic = \"order-topic\")\n    public void handleMessage(OrderMessage msg) {\n        // 去重检查\n        if (processedRepo.exists(msg.getMessageId())) {\n            log.info(\"消息已处理，跳过: {}\", msg.getMessageId());\n            return;\n        }\n\n        try {\n            // 处理消息\n            processOrder(msg);\n            // 标记已处理\n            processedRepo.save(new ProcessedMessage(msg.getMessageId()));\n        } catch (Exception e) {\n            // 消费失败，抛异常触发重试\n            throw new RuntimeException(\"消费失败\", e);\n        }\n    }\n}\n\n// 3. 顺序消息 - 按订单ID分区\npublic void sendOrderly(String orderId, OrderEvent event) {\n    rocketMQTemplate.syncSendOrderly(\n        \"order-topic\",\n        JSON.toJSONString(event),\n        orderId  // 分区key\n    );\n}\n\n// 4. 延迟消息 - 订单超时取消\npublic void sendDelayMessage(String orderId, int delayLevel) {\n    Message<String> message = MessageBuilder\n        .withPayload(orderId)\n        .build();\n    rocketMQTemplate.syncSend(\"order-timeout-topic\",\n        message, 3000, delayLevel);  // delayLevel=3 表示10s\n}",
+      "language": "java"
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答模板",
+      "content": "消息队列架构设计要解决五个核心问题：\n\n**可靠投递**分三段保证。生产者到Broker：同步发送+重试，或者用RocketMQ的事务消息。Broker存储：同步刷盘+主从同步。Broker到消费者：手动ACK，消费成功才确认，失败重试，多次失败进死信队列。\n\n**幂等消费**用唯一ID+去重表。消息带唯一ID，消费前先查Redis或数据库是否已处理。也可以用数据库唯一约束来去重。\n\n**顺序消息**关键在于分区有序。同一业务ID的消息发到同一分区（用业务ID做分区key），同一个分区内消息是有序的。全局有序性能太差，一般用分区有序就够了。\n\n**延迟消息**用于订单超时取消等场景。RocketMQ原生支持延迟消息，Kafka需要自己实现延迟队列+轮询。\n\n**积压处理**的方案：增加消费者数量、增加分区数、跳过不重要消息、临时扩容消费能力。"
+    },
+    {
+      "type": "compareTable",
+      "title": "对比与边界",
+      "content": "| 维度 | Kafka | RocketMQ | RabbitMQ |\n|---|---|---|---|\n| 吞吐量 | 极高(百万级) | 高(十万级) | 中(万级) |\n| 延迟 | 毫秒级 | 毫秒级 | 微秒级 |\n| 顺序消息 | 分区有序 | 队列有序 | 不保证 |\n| 延迟消息 | 不支持 | 支持 | 支持 |\n| 事务消息 | 支持 | 支持 | 不支持 |\n| 语言 | Scala/Java | Java | Erlang |\n\n| 维度 | 同步刷盘 | 异步刷盘 |\n|---|---|---|\n| 可靠性 | 高 | 中 |\n| 性能 | 低 | 高 |\n| 丢消息 | 不会 | 可能 |\n| 适用 | 金融 | 一般业务 |"
+    },
+    {
+      "type": "diagram",
+      "title": "结构图解",
+      "content": "消息可靠投递的完整链路图",
+      "fallback": "Producer →(同步+重试)→ Broker(同步刷盘+主从) →(手动ACK)→ Consumer",
+      "items": ["生产者：同步发送+重试+本地消息表", "Broker：同步刷盘+主从同步复制", "消费者：手动ACK+重试+死信队列", "整体：三端保证消息不丢"]
+    },
+    {
+      "type": "checklist",
+      "title": "学完后应能说清楚",
+      "items": [
+        "消息可靠投递的三段保证：生产者/Broker/消费者",
+        "幂等消费的实现方式：唯一ID+去重表",
+        "顺序消息的实现：分区有序+业务ID做key",
+        "延迟消息的应用场景：订单超时取消",
+        "消息积压的处理方案"
+      ]
+    }
+  ],
+  "recallPrompts": [
+    {
+      "id": "architecture.system-design.topic-mq-architecture.recall.1",
+      "prompt": "请描述消息从生产者到消费者的完整链路，以及每段如何保证消息不丢失？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 2
+    },
+    {
+      "id": "architecture.system-design.topic-mq-architecture.recall.2",
+      "prompt": "如何实现消息的顺序消费？全局有序和分区有序有什么区别？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 2
+    }
+  ],
+  "rubric": {
+    "mustHave": [
+      "消息可靠投递的三段保证机制",
+      "幂等消费的实现方案",
+      "顺序消息的分区有序实现",
+      "延迟消息的应用场景",
+      "消息积压的处理方案"
+    ],
+    "goodToHave": [
+      "RocketMQ事务消息原理",
+      "死信队列的处理",
+      "Kafka与RocketMQ的对比",
+      "消息的顺序与幂等配合"
+    ],
+    "commonMistakes": [
+      "只关注生产者不关注消费者ACK",
+      "不做幂等消费",
+      "顺序消息用全局有序",
+      "消息积压不做预案"
+    ],
+    "scoreWeights": {
+      "coverage": 40,
+      "accuracy": 25,
+      "interviewExpression": 20,
+      "depth": 15
+    }
+  }
+}

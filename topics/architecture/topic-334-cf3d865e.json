@@ -1,0 +1,108 @@
+{
+  "id": "architecture.microservice.topic-idempotent-design",
+  "domain": "architecture",
+  "category": "microservice",
+  "group": "microservice",
+  "title": "幂等性设计",
+  "summary": "保证同一请求多次执行结果一致，是分布式系统的基础能力",
+  "tags": [
+    "架构设计",
+    "微服务设计",
+    "幂等性"
+  ],
+  "difficulty": 3,
+  "estimatedMinutes": 20,
+  "order": 70,
+  "recommendWeight": 95,
+  "status": "draft",
+  "learningCards": [
+    {
+      "type": "explain",
+      "title": "知识全景",
+      "content": "# 幂等性设计\n\n## 一、什么是幂等性\n\n幂等性是指同一个请求执行一次和执行多次的效果完全相同。在分布式系统中，网络超时、重试、消息重复投递等场景下，幂等性是保证数据一致性的基础。\n\n## 二、为什么需要幂等性\n\n- **网络超时重试**：请求发出后超时，客户端重试，服务端可能已执行\n- **消息重复消费**：MQ可能重复投递消息\n- **用户重复提交**：用户快速点击按钮多次\n- **分布式事务回滚重试**：TCC等模式的重试机制\n\n## 三、幂等性实现方案\n\n### 3.1 Token机制\n```\n1. 客户端先获取唯一token\n2. 提交请求时携带token\n3. 服务端校验token存在则执行，执行后删除token\n4. 重复请求时token已不存在，直接返回成功\n```\n\n### 3.2 唯一索引\n利用数据库唯一索引约束，重复插入会报错。\n```sql\n-- 订单表：用户+商品+时间戳 唯一索引\nCREATE UNIQUE INDEX idx_order_unique \nON orders(user_id, product_id, create_time);\n```\n\n### 3.3 状态机\n业务状态只能单向流转，重复操作不会改变状态。\n```java\n// 订单状态：待支付 → 已支付 → 已发货\n// 重复支付时检查状态已是\"已支付\"，直接返回\nif (order.getStatus() == OrderStatus.PAID) {\n    return \"already paid\";\n}\n```\n\n### 3.4 乐观锁\n```sql\nUPDATE stock SET count = count - 1, version = version + 1 \nWHERE product_id = ? AND version = ?;\n```\n\n### 3.5 去重表\n```sql\n-- 请求去重表\nCREATE TABLE request_dedup (\n    request_id VARCHAR(64) PRIMARY KEY,\n    result TEXT,\n    created_at TIMESTAMP\n);\n-- 先查去重表，存在则返回缓存结果\n```"
+    },
+    {
+      "type": "code",
+      "title": "代码示例",
+      "content": "// Token机制实现\n@RestController\npublic class OrderController {\n    @Autowired\n    private RedisTemplate<String, String> redisTemplate;\n    \n    @GetMapping(\"/token\")\n    public String getToken() {\n        String token = UUID.randomUUID().toString();\n        redisTemplate.opsForValue().set(\"idempotent:\" + token, \"1\", 5, TimeUnit.MINUTES);\n        return token;\n    }\n    \n    @PostMapping(\"/order\")\n    public String createOrder(@RequestParam String token, @RequestBody OrderDTO dto) {\n        String key = \"idempotent:\" + token;\n        Boolean exists = redisTemplate.delete(key);\n        if (!exists) {\n            return \"请勿重复提交\";\n        }\n        // 创建订单\n        return orderService.create(dto);\n    }\n}\n\n// 唯一索引方案\n@Service\npublic class PaymentService {\n    @Transactional\n    public void pay(PaymentDTO dto) {\n        try {\n            PaymentRecord record = new PaymentRecord();\n            record.setOrderId(dto.getOrderId());\n            record.setTransId(dto.getTransId()); // 唯一交易号\n            paymentMapper.insert(record);\n        } catch (DuplicateKeyException e) {\n            // 重复支付，直接返回成功\n            log.info(\"重复支付: {}\", dto.getOrderId());\n        }\n    }\n}",
+      "language": "java"
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答模板",
+      "content": "面试官：如何保证接口幂等性？\n\n我会从三个层面回答：\n\n**第一，为什么需要幂等？** 分布式环境下网络超时重试、消息重复消费、用户重复提交都会导致同一操作被执行多次，如果不做幂等处理，可能导致重复扣款、重复下单等问题。\n\n**第二，有哪些实现方案？** 我常用的有5种：\n1. Token机制：适合表单提交防重复\n2. 唯一索引：适合插入操作\n3. 状态机：适合有明确状态流转的业务\n4. 乐观锁：适合更新操作\n5. 去重表：通用方案\n\n**第三，我的实际经验。** 在支付场景中，我用\"唯一交易号+唯一索引\"方案，配合状态机保证支付状态只能单向流转。对于MQ消费场景，我用消息ID做去重表校验。核心思路是：先判断是否重复，再执行业务，两步要在同一个事务中。"
+    },
+    {
+      "type": "compareTable",
+      "title": "对比与边界",
+      "content": "| 维度 | Token机制 | 唯一索引 | 状态机 | 乐观锁 | 去重表 |\n| --- | --- | --- | --- | --- | --- |\n| 适用场景 | 表单防重 | 插入操作 | 状态流转 | 更新操作 | 通用 |\n| 实现复杂度 | 中 | 低 | 低 | 低 | 中 |\n| 性能影响 | Redis读写 | 数据库约束 | 无额外开销 | 版本字段 | 数据库查询 |\n| 局限性 | 需要预获取token | 仅限插入 | 需有明确状态 | 仅限更新 | 需要唯一请求ID |\n| 推荐度 | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ |"
+    },
+    {
+      "type": "diagram",
+      "title": "结构图解",
+      "content": "幂等性设计的5种方案对比图",
+      "fallback": "Token机制→唯一索引→状态机→乐观锁→去重表，按适用场景选择",
+      "items": [
+        "Token机制: 表单防重复提交",
+        "唯一索引: 数据库层面保证唯一",
+        "状态机: 业务状态单向流转",
+        "乐观锁: 版本号控制并发更新",
+        "去重表: 通用请求去重方案"
+      ]
+    },
+    {
+      "type": "checklist",
+      "title": "学完后应能说清楚",
+      "items": [
+        "幂等性的定义和为什么需要",
+        "5种实现方案的适用场景和优缺点",
+        "Token机制的完整流程",
+        "状态机方案的代码实现",
+        "MQ消费幂等的处理方式",
+        "支付场景的幂等设计",
+        "幂等性与防重的区别"
+      ]
+    }
+  ],
+  "recallPrompts": [
+    {
+      "id": "architecture.microservice.topic-idempotent-design.recall.1",
+      "prompt": "请解释什么是幂等性，为什么分布式系统需要它？你会用哪些方案实现？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 2
+    },
+    {
+      "id": "architecture.microservice.topic-idempotent-design.recall.2",
+      "prompt": "在支付场景中如何保证幂等性？如果MQ重复消费怎么处理？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    }
+  ],
+  "rubric": {
+    "mustHave": [
+      "幂等性定义",
+      "5种实现方案",
+      "Token机制流程",
+      "状态机实现",
+      "MQ消费幂等"
+    ],
+    "goodToHave": [
+      "支付场景实战",
+      "幂等与防重区别",
+      "分布式事务中的幂等"
+    ],
+    "commonMistakes": [
+      "混淆幂等和防重",
+      "忽略MQ重复消费",
+      "Token机制不删除token"
+    ],
+    "scoreWeights": {
+      "coverage": 40,
+      "accuracy": 25,
+      "interviewExpression": 20,
+      "depth": 15
+    }
+  }
+}

@@ -22,6 +22,58 @@ npm run validate
 
 内容规范来自《面试智练内容格式规范》。用户侧知识结构只保留"领域 -> 分类 -> 知识点"，不使用阶段、天数或排期概念。
 
+## ⚠️ 创建新领域指南（必读）
+
+### topics 数组必须是文件路径
+
+`domains/{domain}.json` 中每个分类的 `topics` 数组必须包含**相对文件路径**，格式：
+
+```
+topics/{domain}/{filename}.json
+```
+
+**✅ 正确示例：**
+```json
+{
+  "id": "jvm",
+  "title": "JVM",
+  "topics": [
+    "topics/java/topic-001-ebcc71cb.json",
+    "topics/java/topic-002-3bee1565.json"
+  ]
+}
+```
+
+**❌ 常见错误：**
+
+```json
+// 错误1: 存的是topic ID
+"topics": ["java.jvm.topic-001-ebcc71cb"]
+
+// 错误2: 存的是dict对象
+"topics": [{"id": "java.jvm.topic-001", "title": "..."}]
+
+// 错误3: 缺少 topics/ 前缀
+"topics": ["java/topic-001-ebcc71cb.json"]
+```
+
+### 创建新领域的完整步骤
+
+1. 创建领域JSON: `domains/{domain}.json`（categories.topics 先留空 `[]`）
+2. 生成知识点文件: `topics/{domain}/{filename}.json`
+3. **重建topics数组**：扫描 `topics/{domain}/` 目录，按order排序后写回路径
+4. 更新 `manifest.json` 的 topicCount
+5. 运行验证: `python3 scripts/validate_paths.py`
+
+### 自动修复路径脚本
+
+如果发现topics数组格式不对，运行：
+```bash
+python3 scripts/validate_paths.py --fix
+```
+
+---
+
 ## 内容更新流程
 
 ### ⚠️ 重要：更新内容后必须更新版本号
@@ -147,7 +199,54 @@ App 每次加载最新 manifest/domain 后会按引用列表裁剪本地缓存�
 | tree-graph | 树与图 | 二叉树, 图, 最短路径, 设计题 |
 | dynamic-programming | 动态规划 | 动态规划, DP, 背包 |
 | string-search | 字符串、排序与查找 | 字符串, 排序, 二分, 查找 |
+| stack-queue | 栈与队列 | 栈, 队列, 单调栈, 堆, 优先队列 |
+| hash-greedy | 哈希与贪心 | 哈希表, 贪心, 区间调度 |
 | backtracking | 回溯算法 | 回溯, 搜索, 剪枝, 组合, 排列 |
+
+### 设计模式领域
+
+| 分类 ID | 名称 | 关键词 |
+|---------|------|--------|
+| creational | 创建型模式 | 单例, 工厂, 建造者 |
+| structural | 结构型模式 | 代理, 适配器, 装饰器, 门面 |
+| behavioral | 行为型模式 | 策略, 模板方法, 观察者, 责任链, 状态 |
+| principles | 设计原则与实战 | SOLID, 设计模式在Spring中的应用 |
+
+### 前端八股领域
+
+| 分类 ID | 名称 | 关键词 |
+|---------|------|--------|
+| js-fundamentals | JavaScript基础 | 数据类型, 原型链, 闭包, Event Loop, Promise |
+| typescript | TypeScript | 类型系统, 泛型, 类型体操 |
+| css-layout | CSS与布局 | 盒模型, BFC, Flex, Grid |
+| react | React深入 | Fiber, Hooks, 状态管理, 性能优化 |
+| vue | Vue框架 | 响应式, 组合式API, 编译优化 |
+| nodejs | Node.js | 事件循环, 模块系统, Koa, Express |
+| engineering | 前端工程化 | Webpack, Vite, CI/CD, 监控 |
+| frontend-architecture | 前端架构 | 状态管理, 微前端, 性能优化, 路由 |
+| client-dev | 客户端开发 | Electron, React Native, 跨平台 |
+| network-security | 网络与安全 | HTTP, HTTPS, 跨域, XSS, CSRF |
+
+### 架构设计领域
+
+| 分类 ID | 名称 | 关键词 |
+|---------|------|--------|
+| methodology | 架构方法论 | DDD, CQRS, 事件驱动, 六边形架构 |
+| microservice | 微服务设计 | 服务拆分, 分布式事务, 分布式锁, 限流 |
+| system-design | 系统设计 | 秒杀, 消息队列, 缓存, 分库分表 |
+| project-design | 项目架构设计 | 多租户, 低代码, API网关 |
+
+### .NET 开发领域
+
+| 分类 ID | 名称 | 关键词 |
+|---------|------|--------|
+| csharp | C# 语言基础 | 类型系统, LINQ, async/await, 泛型, 反射 |
+| dotnet-core | .NET Core / .NET 8+ | 依赖注入, 中间件, 配置, 日志, GC |
+| aspnet | ASP.NET Core | Web API, 过滤器, 认证授权, SignalR |
+| ef-core | EF Core 与数据库 | ORM, 迁移, 性能, 仓储模式, 多租户 |
+| client | 客户端开发 | WPF, MAUI, Avalonia, XAML绑定 |
+| microservice-dotnet | .NET 微服务 | gRPC, MassTransit, Polly, Ocelot |
+| advanced | 高级主题 | 性能调优, 内存管理, 设计模式, .NET vs Java |
 
 ## 部署
 
