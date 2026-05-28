@@ -10,7 +10,7 @@
     "Spring 生态",
     "分布式事务补充方案"
   ],
-  "difficulty": 3,
+  "difficulty": 4,
   "estimatedMinutes": 20,
   "order": 640,
   "recommendWeight": 76,
@@ -19,11 +19,6 @@
       "type": "explain",
       "title": "知识全景",
       "content": "# 分布式事务补充方案\n> **定位**：生产中最常用的方案，面试高频追问\n## 一、本地消息表 + MQ（生产最常用）\n### 1.1 核心思想\n**将\"业务操作\"和\"消息发送\"绑定在同一个本地事务中**，通过定时任务保证消息一定发出去。\n```\n┌──────────────────────────────────────────────────────────┐\n│                    订单服务                                │\n│                                                          │\n│  BEGIN TRANSACTION                                       │\n│    ① INSERT INTO orders (...)                            │\n│    ② INSERT INTO outbox_messages (event_type, payload)   │  ← 同一个事务\n│  COMMIT                                                  │\n│                                                          │\n│  ③ 定时任务扫描 outbox_messages 表                         │\n│     → 发送到 MQ → 发送成功则标记为已发送                     │\n└───────────────────────┬──────────────────────────────────┘\n│ MQ\n┌───────────────────────▼──────────────────────────────────┐\n│                    库存服务                                │\n│  ④ 消费消息 → 扣减库存 → 幂等处理                           │\n└──────────────────────────────────────────────────────────┘\n```\n### 1.2 代码实现\n```java\n// 1. 本地消息表\nCREATE TABLE outbox_messages (\nid BIGINT PRIMARY KEY AUTO_INCREMENT,\nevent_type VARCHAR(64) NOT NULL,      -- 事件类型\npayload TEXT NOT NULL,                 -- 消息体（JSON）\nstatus TINYINT DEFAULT 0,             -- 0:待发送 1:已发送 2:发送失败\nretry_count INT DEFAULT 0,            -- 重试次数\ncreated_at DATETIME DEFAULT NOW(),\nsent_at DATETIME\n);\n// 2. 业务操作 + 写消息表（同一个事务）\n@Service\npublic class OrderService {\n    @Transactional\n    public void createOrder(CreateOrderCmd cmd) {\n        // 业务操作\n        Order order = new Order(cmd);\n        orderRepo.save(order);\n        // 写本地消息表（同一个事务）\n        OutboxMessage msg = new OutboxMessage();\n        msg.setEventType(\"ORDER_CREATED\");\n        msg.setPayload(JSON.toJSONString(new OrderCreatedEvent(order.getId())));\n        outboxRepo.save(msg);\n    }\n}\n// 3. 定时任务扫描消息表并发送\n@Component\npublic class OutboxPublisher {\n    @Scheduled(fixedDelay = 5000)\n    public void publishPendingMessages() {\n        List<OutboxMessage> messages = outboxRepo.findByStatus(0);\n        for (OutboxMessage msg : messages) {\n            try {\n                rabbitTemplate.convertAndSend(\"order.exchange\", \"order.created\", msg.getPayload());\n                msg.setStatus(1); // 已发送\n                msg.setSentAt(LocalDateTime.now());\n                outboxRepo.save(msg);\n            } catch (Exception e) {\n                msg.setRetryCount(msg.getRetryCount() + 1);\n                if (msg.getRetryCount() > 3) {\n                    msg.setStatus(2); // 发送失败，人工介入\n                }\n                outboxRepo.save(msg);\n            }\n        }\n    }\n}\n```\n## 二、RocketMQ事务消息\n### 2.1 核心思想\nRocketMQ 原生支持事务消息，**将本地事务和消息发送绑定**，比本地消息表更优雅。\n### 2.2 事务消息流程\n```\n1. 发送半消息（Half Message）到 RocketMQ\n   → 消息暂不投递，消费者看不到\n2. 执行本地事务\n3. 根据本地事务结果：\n   成功 → Commit → 消息投递\n   失败 → Rollback → 消息丢弃\n4. 如果没有收到确认（网络问题等）：\n   RocketMQ 回查本地事务状态\n   → 根据回查结果决定 Commit 或 Rollback\n```\n### 2.3 代码实现\n```java\n// 1. 发送事务消息\n@Service\npublic class OrderService {\n    @Autowired\n    private RocketMQTemplate rocketMQTemplate;\n    public void createOrder(CreateOrderCmd cmd) {\n        // 发送半消息（Half Message）\n        rocketMQTemplate.sendMessageInTransaction(\n            \"order-producer\",\n            MessageBuilder.withPayload(new OrderCreatedEvent(order.getId())).build(),\n            cmd  // 传递给本地事务方法\n        );\n    }\n}\n// 2. 本地事务执行器\n@RocketMQTransactionListener\\public class OrderTransactionListener implements RocketMQLocalTransactionListener {\n    @Override\n    public RocketMQLocalTransactionState executeLocalTransaction(Message msg, Object arg) {\n        try {\n            // 执行本地事务：创建订单\n            CreateOrderCmd cmd = (CreateOrderCmd) arg;\n            orderService.createOrderInTransaction(cmd);\n            return RocketMQLocalTransactionState.COMMIT;  // 提交消息\n        } catch (Exception e) {\n            return RocketMQLocalTransactionState.ROLLBACK; // 回滚消息\n        }\n    }\n    @Override\n    public RocketMQLocalTransactionState checkLocalTransaction(Message msg) {\n        // 回查本地事务状态\n        String orderId = ... // 从消息中解析\n        Order order = orderRepo.findById(orderId);\n        if (order != null) {\n            return RocketMQLocalTransactionState.COMMIT;\n        }\n        return RocketMQLocalTransactionState.ROLLBACK;\n    }\n}\n```\n## 三、最大努力通知\n### 3.1 核心思想\n适用于**跨系统、非实时**的场景（如支付结果通知）。上游服务完成操作后，通过MQ通知下游，下游处理失败则上游**定期重试通知**，直到达到最大重试次数。\n### 3.2 流程\n```\n1. 支付服务完成支付\n2. 发送MQ通知订单服务\n3. 订单服务消费消息，更新订单状态\n4. 如果消费失败，支付服务定期重试通知（如1min/5min/30min/1h/6h）\n5. 达到最大重试次数后，人工介入\n```"
-    },
-    {
-      "type": "explain",
-      "title": "关键机制拆解",
-      "content": "先把 分布式事务补充方案 当成一个可讲清楚的系统来理解：\n\n1. 分布式事务补充方案\n2. > **定位**：生产中最常用的方案，面试高频追问\n3. 一、本地消息表 + MQ（生产最常用）\n4. *将\"业务操作\"和\"消息发送\"绑定在同一个本地事务中**，通过定时任务保证消息一定发出去。\n5. // 1. 本地消息表\n\n学习时重点关注\"为什么需要它、它如何工作、什么时候会出问题、面试时怎么结构化表达\"。"
     },
     {
       "type": "compareTable",
@@ -110,5 +105,6 @@
       "depth": 15
     }
   },
-  "updatedAt": "2026-05-27"
+  "updatedAt": "2026-05-27",
+  "status": "production"
 }
