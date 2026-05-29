@@ -14,7 +14,8 @@
 4. 对不符合标准的内容，优先删除、拆分、合并或迁移，不允许为了保留而强行包装。
 5. 修改前先看同领域已有内容，保持分类、标题、难度、频率、正文结构一致。
 6. 判断本次改动属于“JSON 结构契约变更”还是“知识内容更新”，并按 1.1 的跨项目同步约束处理。
-7. 修改后必须运行内容校验，并做人工语义抽查。
+7. 主动站在“从 0 到 1 准备面试的用户”视角检查学习路径、App 首屏顺序、topic 粒度、重复内容和推荐权重，而不是只等待人工指出单个问题。
+8. 修改后必须运行内容校验，并做语义抽查；如果是 AI 审查，必须先自行发现和列出问题，再给出整改计划。
 
 如果本标准与单次任务描述冲突，以本标准为准；除非用户明确要求临时改变内容定位。
 
@@ -71,6 +72,14 @@ JSON 结构契约变更包括但不限于：
 5. 能用结构化语言在面试中复述，而不是只获得零散材料。
 
 内容应服务“从 0 到 1 建立面试八股知识体系”。每个领域都要先覆盖基础高频知识，再覆盖进阶和低频加分项。
+
+AI 或人工审查内容时，不能只看单个 topic 是否写得完整，还必须把自己代入一个真实备考用户，检查：
+
+1. 打开 App 后首屏看到的是否是该领域最基础、最高频、最能建立主线的知识。
+2. 用户是否能按当前顺序从易到难学习，而不是一开始就看到低频扩展、生态工具、产品选型或高级架构。
+3. 同一领域是否存在重复 topic、合集 topic、空泛 topic 或不该单独成为知识点的内容。
+4. 每个 topic 是否真的帮助用户准备面试，而不是只是“看起来有内容”。
+5. 排序、频率、权重和学习路径是否共同服务同一个目标：让用户更高效地通过面试。
 
 ## 3. 什么可以成为知识点
 
@@ -183,6 +192,37 @@ JSON 结构契约变更包括但不限于：
 4. 场景题、综合复习、面试技巧。
 
 分类排序应遵循：基础概念 -> 核心原理 -> 框架机制 -> 工程问题 -> 架构设计 -> 高级扩展。
+
+### 7.1 App 展示顺序与学习路径标准
+
+内容最终会在 App 中被用户按领域、分类和知识点顺序学习，因此顺序本身就是内容质量的一部分。一个 topic 写得再完整，如果把低频扩展排在高频基础前面，也不算整体合格。
+
+每个领域和分类都必须满足：
+
+1. 默认顺序先讲基础概念，再讲核心机制，再讲框架、工程和架构扩展。
+2. 高频基础 topic 不应被低频新特性、生态工具、产品选型或高级扩展挤到后面。
+3. `domains/*.json` 中 `categories[].topics` 的列表顺序必须与 topic 的 `order` 字段一致，除非 App 明确不使用 `order` 排序，并已在文档中说明。
+4. 同一分类内不应出现重复 `order`。重复 order 会让 App 排序不稳定，导致用户看到的顺序不可控。
+5. `interviewFrequency` 与 `recommendWeight` 必须大体一致：high 通常高权重，low 通常低权重。例外必须有明确理由，例如某个 medium topic 是大量后续内容的前置依赖。
+6. low 频扩展 topic 不应出现在分类首屏，除非该分类本身就是扩展专题。
+7. 如果一个 topic 是某领域主线之外的方向，例如 .NET 客户端、前端跨端、Service Mesh、React Native，应放在独立路线或后置扩展中。
+8. 算法领域每个题型分类应先展示题型/数据结构基础，再展示 LeetCode 题。
+
+推荐领域顺序示例：
+
+1. Java：集合/基础 -> JVM -> 并发 -> Spring 核心 -> 数据库 -> 中间件/微服务扩展。
+2. Agent：大模型基础 -> Embedding/向量检索 -> RAG -> Function Calling/工具调用 -> Agent 架构 -> LLMOps。
+3. 前端：JavaScript 基础 -> TypeScript/CSS -> React/Vue 核心 -> 工程化 -> 架构/跨端扩展。
+4. OS：进程线程基础 -> 内存管理 -> IO 模型 -> Linux 基础。
+5. Network：TCP/UDP 基础 -> HTTP/HTTPS -> DNS/CDN -> WebSocket。
+
+禁止的排序现象：
+
+1. Java 基础分类中 `Record`、`Sealed Classes`、`Java 新特性` 排在 `HashMap`、`ArrayList` 前面。
+2. OS 分类中 Linux 命令和文件权限权重高于进程线程、虚拟内存、IO 模型。
+3. 前端分类中微前端、跨端、性能优化全景排在 JS、CSS、React/Vue 核心之前。
+4. Agent 分类中多 Agent、MCP 深度排在 Function Calling、RAG 基础之前。
+5. 算法分类中 LeetCode 题排在该题型基础讲解之前。
 
 ## 8. 正文内容标准
 
@@ -348,12 +388,23 @@ JSON 结构契约变更包括但不限于：
 1. 某 topic 是后续大量内容的前置知识。
 2. 虽然频率 medium，但能串起一类题。
 
+例外提高必须能解释清楚，不能只因为内容“看起来高级”或“写得多”就提高权重。
+
 必须降低的情况：
 
 1. 产品生态型内容。
 2. 单一框架扩展点。
 3. 厂商实现细节。
 4. 热点但不稳定内容。
+5. 低频新版本特性，例如不是多数岗位必问的语法糖或版本增强。
+6. 跨端、客户端、Service Mesh、多 Agent、低代码等方向性扩展，除非当前领域就是这些方向。
+
+权重与频率自检规则：
+
+1. `high` topic 通常不应低于 75；低于 75 时必须检查是否误标 high 或权重过低。
+2. `low` topic 通常不应高于 85；高于 85 时必须检查是否误标 low 或权重过高。
+3. 同一分类首屏不应同时出现多个 low 频 topic。
+4. 如果 App 使用 `recommendWeight` 影响默认展示顺序，必须保证权重不会破坏“从基础到高级”的学习路径。
 
 ## 15. 算法领域例外规则
 
@@ -421,6 +472,9 @@ JSON 结构契约变更包括但不限于：
 7. recallPrompts 是否真实可问。
 8. rubric 是否专属。
 9. 难度、频率、权重是否匹配。
+10. 它在 App 中的展示位置是否合理，是否会挤占更基础、更高频的知识点。
+11. 它是否与同领域其他 topic 重复、重叠或边界不清。
+12. 它是否应该拆分、合并、迁移到学习路径或删除，而不是继续润色。
 
 如果 topic 本身定位错误，优先删除或迁移，而不是只润色正文。
 
@@ -438,8 +492,70 @@ JSON 结构契约变更包括但不限于：
 8. 不允许只改标题不改内容定位。
 9. 不允许跳过 schema 校验和语义抽查。
 10. 不允许在发生 JSON 结构契约变更时只修改内容仓库，而不检查 App、content-studio 及其对应文档。
+11. 不允许只根据用户指出的单个截图或单个 topic 修补局部问题；必须主动扩展检查同领域和相邻领域是否存在同类问题。
+12. 不允许只用关键词扫描证明内容合格；必须做“用户学习路径”和“App 首屏展示”的语义审查。
+13. 不允许让人工逐个指出显而易见的问题。AI 审查时必须自行检查排序、重复、粒度、权重、频率、分类和跨领域污染。
+14. 如果发现标准本身无法约束某类问题，必须提出标准补强建议，而不是继续按不完整标准机械执行。
 
 AI 执行内容生成时，应先输出或内部形成“topic 是否合格”的判断，再修改文件。
+
+### 19.1 AI 主动发现问题流程
+
+当用户要求“评估内容是否符合标准”“检查是否达标”“看看顺序是否合理”“审查内容质量”时，AI 必须主动执行以下流程：
+
+1. 读取 `docs/knowledge-content-standard.md` 和相关 `docs/content-format.md`。
+2. 跑结构校验：`npm run validate`。
+3. 全域扫描 manifest、domain、topic，列出每个领域的分类顺序和每个分类的 topic 顺序。
+4. 检查同一分类内：
+   - topic 列表顺序是否与 `order` 一致。
+   - 是否有重复 `order`。
+   - high 频 topic 是否被低权重压低。
+   - low 频 topic 是否权重过高或排在前面。
+   - 是否有“全景、综合、其他、新特性、实战、最佳实践”等过泛标题。
+   - 是否有标题相近或内容重复 topic。
+5. 站在用户视角检查每个领域首屏：
+   - 新手第一屏看到这些内容，是否能建立面试主线？
+   - 是否从易到难？
+   - 是否先学基础再学高级扩展？
+6. 对发现的问题给出整改计划，按优先级排序，不只列命中关键词。
+7. 如果发现是标准缺失导致问题反复出现，必须同时建议更新标准和校验脚本。
+
+可使用的全域审查脚本：
+
+```bash
+node - <<'NODE'
+const fs = require('fs');
+const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+for (const de of manifest.domains) {
+  const d = JSON.parse(fs.readFileSync(de.entry, 'utf8'));
+  console.log(`\n## ${d.id}`);
+  for (const c of d.categories) {
+    const seen = new Map();
+    let prev = null;
+    for (const ref of c.topics) {
+      const t = JSON.parse(fs.readFileSync(ref, 'utf8'));
+      if (prev && prev.order > t.order) {
+        console.log(`ORDER_DESC ${c.id}: ${prev.title}(${prev.order}) -> ${t.title}(${t.order})`);
+      }
+      if (seen.has(t.order)) {
+        console.log(`DUP_ORDER ${c.id}: ${t.order} ${seen.get(t.order)} / ${t.title}`);
+      }
+      if (t.interviewFrequency === 'low' && t.recommendWeight >= 85) {
+        console.log(`LOW_HIGH_WEIGHT ${c.id}: ${t.title} w=${t.recommendWeight}`);
+      }
+      if (t.interviewFrequency === 'high' && t.recommendWeight < 75) {
+        console.log(`HIGH_LOW_WEIGHT ${c.id}: ${t.title} w=${t.recommendWeight}`);
+      }
+      if (/全景|综合|其他|新特性|实战|最佳实践/.test(t.title)) {
+        console.log(`BROAD_TITLE ${c.id}: ${t.title}`);
+      }
+      seen.set(t.order, t.title);
+      prev = t;
+    }
+  }
+}
+NODE
+```
 
 ## 20. 内容质量验收
 
@@ -449,12 +565,16 @@ AI 执行内容生成时，应先输出或内部形成“topic 是否合格”�
 2. manifest 的 topicCount 与实际文件数一致。
 3. domain 分类引用的 topic 文件存在。
 4. topic 的 `id`、`domain`、`category` 一致。
-5. 没有不该作为 topic 的标题。
-6. 没有模板化废话。
-7. 没有错别字、残句、串入其他领域内容。
-8. 每个新增或大改 topic 都能回答至少 3 个真实面试问题。
-9. 若发生 JSON 结构契约变更，已同步更新内容文档、App 项目、content-studio 项目，以及两个项目对应文档；若当前无法访问相关项目，已明确列出未同步项和后续检查项。
-10. 若只是知识内容更新，已更新 `manifest.json` 的 `contentVersion`，并判断是否需要同步其他项目或文档。
+5. 同一分类内 topic 列表顺序与 `order` 一致，且没有重复 `order`。
+6. `interviewFrequency` 与 `recommendWeight` 大体匹配，没有明显 low 频高权重或 high 频低权重。
+7. App 首屏顺序符合从基础到高级、从高频到低频的学习路径。
+8. 没有不该作为 topic 的标题。
+9. 没有模板化废话。
+10. 没有错别字、残句、串入其他领域内容。
+11. 没有重复 topic 或边界不清的合集 topic。
+12. 每个新增或大改 topic 都能回答至少 3 个真实面试问题。
+13. 若发生 JSON 结构契约变更，已同步更新内容文档、App 项目、content-studio 项目，以及两个项目对应文档；若当前无法访问相关项目，已明确列出未同步项和后续检查项。
+14. 若只是知识内容更新，已更新 `manifest.json` 的 `contentVersion`，并判断是否需要同步其他项目或文档。
 
 建议附加检查关键词：
 
@@ -472,7 +592,96 @@ AI 执行内容生成时，应先输出或内部形成“topic 是否合格”�
 
 出现这些词不一定全部错误，但必须人工确认它们是否违反本标准。
 
-## 21. 最终判断
+## 21. App 展示顺序验收标准
+
+每次内容改动后，除了运行 schema 校验，还必须从"新用户从 0 到 1 准备面试"的视角检查 App 首屏展示顺序。
+
+### 21.1 学习路径顺序原则
+
+每个领域必须遵循：基础概念 -> 核心原理 -> 框架机制 -> 工程问题 -> 架构设计 -> 高级扩展。
+
+具体要求：
+
+1. 高频基础 topic 必须排在低频扩展 topic 前面。
+2. 同一分类内 `domain.categories[].topics` 列表顺序必须与 topic `order` 字段一致。
+3. 如果 App 不按 `order` 排序，必须在标准中明确 App 使用哪个字段排序。
+
+### 21.2 interviewFrequency 与 recommendWeight 一致性
+
+`interviewFrequency` 与 `recommendWeight` 必须大体一致：
+
+| interviewFrequency | recommendWeight 范围 | 说明 |
+|---|---|---|
+| high | 85-100 | 高频核心 topic，应排在首屏 |
+| medium | 70-88 | 常见追问或特定方向 |
+| low | 50-75 | 扩展或加分项 |
+
+可例外提高的情况：
+
+1. 某 topic 是后续大量内容的前置知识（如基础概念 topic）。
+2. 虽然频率 medium，但能串起一类题。
+
+必须降低的情况：
+
+1. 产品生态型内容。
+2. 单一框架扩展点。
+3. 厂商实现细节。
+4. 热点但不稳定内容。
+
+### 21.3 排序硬性规则
+
+以下规则必须满足，否则视为验收不通过：
+
+1. high 频核心 topic 不应低于 75 权重，除非该 topic 是低优先级补充。
+2. low 频扩展 topic 不应高于 85 权重，除非是大量内容的必要前置依赖。
+3. 禁止同一分类内出现重复 `order` 值。
+4. 同一分类内 topic 必须按 `order` 升序排列。
+
+### 21.4 验收检查清单
+
+每次验收必须检查：
+
+1. 每个领域首屏是否从最基础、最高频、最能建立面试主线的内容开始。
+2. 是否存在 low 频高权重、high 频低权重的异常情况。
+3. 是否存在重复 order、列表顺序与 order 冲突的问题。
+4. 是否有低频扩展内容挤到高频核心内容前面。
+5. `npm run validate` 通过。
+
+### 21.5 验收命令
+
+运行全领域顺序/权重异常扫描：
+
+```bash
+node - <<'NODE'
+const fs = require('fs');
+const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+for (const de of manifest.domains) {
+  const d = JSON.parse(fs.readFileSync(de.entry, 'utf8'));
+  for (const c of d.categories) {
+    const topics = c.topics.map(ref => ({ ref, t: JSON.parse(fs.readFileSync(ref, 'utf8')) }));
+    const seen = new Map();
+    for (let i = 0; i < topics.length; i++) {
+      const { ref, t } = topics[i];
+      if (i > 0 && topics[i - 1].t.order > t.order) {
+        console.log(`ORDER_DESC ${d.id}/${c.id}: ${topics[i - 1].t.title}(${topics[i - 1].t.order}) -> ${t.title}(${t.order})`);
+      }
+      if (seen.has(t.order)) {
+        console.log(`DUP_ORDER ${d.id}/${c.id}: ${t.order} ${seen.get(t.order)} / ${t.title}`);
+      }
+      seen.set(t.order, t.title);
+      if (t.interviewFrequency === 'low' && t.recommendWeight >= 85) {
+        console.log(`LOW_HIGH_WEIGHT ${d.id}/${c.id}: ${t.title} w=${t.recommendWeight} ${ref}`);
+      }
+      if (t.interviewFrequency === 'high' && t.recommendWeight < 75) {
+        console.log(`HIGH_LOW_WEIGHT ${d.id}/${c.id}: ${t.title} w=${t.recommendWeight} ${ref}`);
+      }
+    }
+  }
+}
+NODE
+```
+
+## 22. 最终判断
 
 一个内容改动只有同时满足以下条件，才算合格：
 

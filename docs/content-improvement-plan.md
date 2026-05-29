@@ -1,567 +1,648 @@
-# 面试知识内容整改计划
+# 面试知识内容剩余整改计划
 
-> 生成日期：2026-05-29  
+> 更新日期：2026-05-29  
 > 依据标准：`docs/knowledge-content-standard.md`  
-> 目的：让后续 AI 或人工可以按本文件逐条整改 topic 内容，使内容库从“结构校验通过”提升到“语义质量符合标准”。
+> 当前状态：上一轮模板化问题已大面积修复，本文件只保留当前复检仍需要处理的内容。  
 
-## 1. 总体评估结论
+## 1. 当前结论
 
-本次已对 `topics/` 下全部 287 个知识点进行结构和语义扫描。
+已重新检查 `topics/` 下 287 个知识点。
 
-结构层面：当前 `npm run validate` 通过，说明 schema、manifest、domain 引用、基础卡片类型、scoreWeights 合计等硬性契约目前达标。
+结构层面：`npm run validate` 通过，schema、manifest、domain 引用、基础卡片类型、scoreWeights 等硬性契约达标。
 
-语义层面：当前尚未完全达到《面试知识内容判断标准》。扫描发现 230 个 topic 至少命中一个整改项，主要问题是模板化追问、模板化 recall、Agent 早期内容中的“今日笔记/面试话术”残留，以及部分 rubric 不够专属。
+语义层面：上一版计划中的大批模板化问题已修复，不再保留旧的 230 个 topic 整改清单。当前复检从“准备面试的用户能否按合理路径从易到难学习”的角度出发，发现剩余问题集中在：
 
-整改不涉及 JSON 结构契约变更。后续 AI 只应修改现有字段内容，不新增必填字段、不改 schema、不改枚举、不改 topic/domain/manifest 加载协议。
+1. Java 基础分类排序不符合“基础概念 -> 核心原理 -> 高级扩展”的标准。
+2. `Java新特性` 作为独立 topic 粒度过大，且与多个已拆分 topic 重复。
+3. `其他集合` topic 定位、group/tags、recallPrompts 和 followUpQuestions 有串题。
+4. Agent 领域仍有少量 Java/Spring 示例残留。
+5. 多个领域存在 `domain.categories[].topics` 列表顺序、topic `order`、`interviewFrequency`、`recommendWeight` 互相打架的问题。
+6. 部分低频/扩展 topic 权重过高，会在 App 首屏挤掉基础高频内容。
+7. 部分标题过泛、归类不清或疑似重复，会增加学习路径噪音。
+8. 当前标准对“App 展示顺序验收”的要求还不够硬，需要补强。
 
-## 2. 执行原则
+本轮整改属于知识内容更新，不涉及 JSON 结构契约变更。不要改 schema、字段类型、枚举或加载协议。
 
-每次整改前先阅读：
+## 2. 已修复项
+
+以下问题在当前 `topics/` 中未再命中，暂不需要继续处理：
+
+1. `今日笔记`
+2. `面试话术`
+3. `你遇到过什么问题`
+4. `在实际项目中是怎么用的？有什么注意事项？`
+5. `结合项目经验`
+6. `能做对比`
+7. `能说明取舍`
+8. 重复 `followUpQuestions`
+9. 重复 `recallPrompts.id`
+10. `RAG原理与` 截断残句
+
+后续只需防止这些问题回流。
+
+## 3. 剩余整改清单
+
+### A. Java 基础与集合排序不合理
+
+涉及文件：
+
+1. `domains/java.json`
+2. `topics/java/topic-028-905d9b58.json`：HashMap原理
+3. `topics/java/topic-029-2b936689.json`：ArrayList与LinkedList
+4. `topics/java/topic-030-e4f16979.json`：其他集合
+5. `topics/java/topic-032-8b727f38.json`：泛型
+6. `topics/java/topic-033-070d3ba1.json`：反射与注解
+7. `topics/java/topic-lambda.json`：Lambda 表达式与函数式接口
+8. `topics/java/topic-stream-api.json`：Stream API 详解
+9. `topics/java/topic-optional.json`：Optional 类使用
+10. `topics/java/topic-new-datetime.json`：新日期时间 API
+11. `topics/java/topic-record.json`：Record 类（Java 14+）
+12. `topics/java/topic-sealed-classes.json`：Sealed Classes（Java 17+）
+13. `topics/java/topic-pattern-matching.json`：Pattern Matching（Java 17+）
+
+当前问题：
+
+`domains/java.json` 中 `java-fundamentals.topics` 把 `泛型`、`Java新特性`、`Lambda/Stream/Optional/Record/Sealed/Pattern Matching/日期 API` 放在 `HashMap`、`ArrayList与LinkedList`、`其他集合` 前面。App 截图显示这些现代语法特性排在列表顶部，这不符合标准第 7 节“基础概念 -> 核心原理 -> 框架机制 -> 工程问题 -> 高级扩展”的排序要求。
+
+建议顺序：
+
+```text
+HashMap原理
+ArrayList与LinkedList
+其他集合（整改后改名，见 B）
+泛型
+反射与注解
+Lambda 表达式与函数式接口
+Stream API 详解
+Optional 类使用
+新日期时间 API
+Record 类（Java 14+）
+Sealed Classes（Java 17+）
+Pattern Matching（Java 17+）
+```
+
+推荐权重建议：
+
+1. `HashMap原理`：high，recommendWeight 95-100。
+2. `ArrayList与LinkedList`：high 或 medium-high，recommendWeight 88-94。
+3. `其他集合`：medium，recommendWeight 78-86。
+4. `泛型`：high 或 medium-high，recommendWeight 86-92。
+5. `反射与注解`：medium-high，recommendWeight 82-90。
+6. `Lambda`、`Stream`：medium，recommendWeight 75-85。
+7. `Optional`、`新日期时间 API`：medium 或 low-medium，recommendWeight 65-78。
+8. `Record`、`Sealed Classes`、`Pattern Matching`：low 或 medium，recommendWeight 55-72，放在扩展位置。
+
+验收标准：
+
+1. App 中 Java 基础与集合的首屏优先展示集合核心，而不是 Java 8+ 新特性。
+2. `domain.categories[].topics` 顺序与 topic `order` 一致。
+3. `recommendWeight` 不再让低频现代语法特性压过 `HashMap`、`ArrayList`。
+
+### B. `Java新特性` 不应继续作为独立 topic
+
+涉及文件：
+
+1. `topics/java/topic-034-f2553b47.json`
+2. `domains/java.json`
+
+当前问题：
+
+`Java新特性` 是过大的合集型 topic。标准第 5 节明确把 `Java 新特性` 列为“过大，需要拆分”的例子。仓库中已经有独立 topic 覆盖：
+
+1. `Lambda 表达式与函数式接口`
+2. `Stream API 详解`
+3. `Optional 类使用`
+4. `新日期时间 API`
+5. `Record 类（Java 14+）`
+6. `Sealed Classes（Java 17+）`
+7. `Pattern Matching（Java 17+）`
+
+整改方式：
+
+1. 从 `domains/java.json` 的 `java-fundamentals.topics` 中移除 `topics/java/topic-034-f2553b47.json`。
+2. 判断是否删除该 topic 文件：
+   - 如果内容完全被现有 topic 覆盖，删除文件。
+   - 如果仍有少量独有内容，把独有内容合并到对应 topic 后再删除。
+3. 如果删除文件，要检查 manifest 的 `topicCount` 是否需要调整。
+4. 不要把它改名为另一个合集 topic。
+
+验收标准：
+
+1. App 不再展示 `Java新特性` 这个合集知识点。
+2. 对应知识由细粒度 topic 承担。
+3. `npm run validate` 通过。
+
+### C. `其他集合` topic 定位和内容串题
+
+涉及文件：
+
+1. `topics/java/topic-030-e4f16979.json`
+2. `domains/java.json`
+
+当前问题：
+
+1. 标题 `其他集合` 太泛，不像稳定知识点标题。
+2. `group` 是 `concurrency`，tags 里有 `并发编程`，但实际内容是集合框架。
+3. recallPrompts 混入线程安全单例、生产者消费者、自定义线程池，明显串题。
+4. followUpQuestions 仍有泛化表达，例如“线上出现与其他集合相关的问题”。
+5. 内容里有空标题或未展开小节，例如“核心接口说明”“集合选型指南”。
+
+整改方式：
+
+1. 将标题改为更明确的知识点名，例如 `Set、TreeMap 与 Queue 集合`，或拆成两个 topic：
+   - `Set 与有序集合`
+   - `Queue 与 PriorityQueue`
+2. 如果不拆分，至少修正：
+   - `group` 改为 `java-fundamentals`。
+   - tags 去掉 `并发编程`。
+   - summary 改成覆盖 Set、TreeMap、LinkedHashMap、PriorityQueue 的中性描述。
+3. 删除所有并发题 recallPrompts：
+   - `请手写一个线程安全的单例模式（DCL）`
+   - `请手写一个生产者-消费者模型`
+   - `请手写一个自定义线程池的核心逻辑`
+4. recallPrompts 改为集合专属问题，例如：
+   - `HashSet 为什么依赖 hashCode 和 equals？如果只重写 equals 会怎样？`
+   - `TreeSet 与 HashSet 的底层结构、复杂度和适用场景有什么区别？`
+   - `LinkedHashMap 如何基于访问顺序实现 LRU？`
+   - `PriorityQueue 的堆结构如何保证 offer/poll 的复杂度？`
+5. followUpQuestions 改为集合专属追问，不要写泛化线上排查。
+6. 补齐或删除空标题。
+
+验收标准：
+
+1. topic 标题、summary、group、tags 与集合内容一致。
+2. recallPrompts 和 followUpQuestions 不再出现并发题。
+3. 该 topic 能独立回答 Set、TreeMap、LinkedHashMap、PriorityQueue 的面试问题。
+
+### D. Agent 领域仍有 Java/Spring 示例残留
+
+涉及文件：
+
+1. `topics/agent/topic-093-de1a9ab0.json`：MCP协议深度
+2. `topics/agent/topic-106-bf5350b9.json`：RAG原理与实战
+
+当前问题：
+
+`topic-093` 中有 Java/Spring Boot MCP Server 示例。若该 topic 目标是 MCP 协议本身，建议优先使用协议级、Python 或 TypeScript 示例，避免把 Agent 领域内容带成 Java/Spring 实战。
+
+`topic-106` 中仍有 `什么是自动装配`、`Spring Boot` 相关表述。RAG topic 应使用 RAG 自身问题作为样例，例如企业知识库问答、检索召回、引用溯源、幻觉定位。
+
+整改方式：
+
+1. `topic-093`：
+   - 如果保留 Java 示例，必须明确它只是“非官方生态实现思路”，不能成为主示例。
+   - 更推荐替换为 Python/TypeScript MCP Server 或 JSON-RPC 协议交互示例。
+2. `topic-106`：
+   - 将 `什么是自动装配` 替换为 `如何定位 RAG 检索召回不准` 或 `某个知识库问题如何检索并回答`。
+   - 将 `Spring Boot` 相关描述替换为 RAG/Agent 领域中性描述。
+
+验收标准：
+
+1. `rg -n "Spring Boot|Redis缓存穿透|什么是自动装配" topics/agent` 不再命中，除非人工确认该处确实必要且有明确说明。
+2. Agent topic 的示例不再让读者误以为该 topic 属于 Java/Spring。
+
+### E. Java 分类中仍可能有重复/错误归类
+
+涉及文件：
+
+1. `domains/java.json`
+2. `topics/java/topic-065-e2570d70.json`：MySQL 索引原理
+3. `topics/java/topic-084-c3d4e5f6.json`：MySQL索引原理
+4. `topics/java/topic-066-d9e7b897.json`：事务机制
+5. `topics/java/topic-085-d4e5f6a7.json`：MySQL事务与MVCC
+6. `topics/java/topic-068-fd69e227.json`：锁机制
+7. `topics/java/topic-086-e5f6a7b8.json`：MySQL锁机制
+
+当前问题：
+
+数据库分类里存在疑似重复 topic：
+
+1. `MySQL 索引原理` 与 `MySQL索引原理`
+2. `事务机制` 与 `MySQL事务与MVCC`
+3. `锁机制` 与 `MySQL锁机制`
+
+这不是截图里的首要问题，但会影响标准第 17 节“是否和已有 topic 重复”。
+
+整改方式：
+
+1. 对每组重复 topic 做内容对比。
+2. 如果内容高度重复，保留更完整、更高频、更符合面试表达的一个，另一个删除或合并。
+3. 如果一个是总论、一个是细分，标题和 summary 必须明确边界，例如：
+   - `MySQL B+ 树索引与索引失效`
+   - `事务隔离级别与 MVCC`
+   - `MySQL 行锁、间隙锁与 Next-Key Lock`
+4. 更新 `domains/java.json` 引用和 manifest topicCount。
+
+验收标准：
+
+1. 同一分类下没有标题近似、内容重复的 topic。
+2. 每个保留 topic 都有清晰独立边界。
+
+### F. Java Spring/中间件分类混杂
+
+涉及文件：
+
+1. `domains/java.json`
+2. `topics/java/topic-059-a4e73804.json`：Gateway
+3. `topics/java/topic-062-ce26874b.json`：Seata分布式事务
+4. `topics/java/topic-080-3c934d6a.json`：Kafka原理
+5. `topics/java/topic-055-e51532ee.json`：Nacos
+6. `topics/java/topic-058-72ff8a49.json`：OpenFeign
+7. `topics/java/topic-077-0f4a426f.json`：RabbitMQ原理
+8. `topics/java/topic-081-89b01558.json`：RocketMQ与选型
+9. `topics/java/topic-061-7a8c02dc.json`：Sentinel
+10. `topics/java/topic-078-0195276a.json`：可靠性与实战
+
+当前问题：
+
+`Spring 生态` 分类里混入了消息队列、注册配置、网关、熔断、分布式事务等中间件/微服务治理内容。对用户来说，这会造成“Spring 基础还没学完就进入 Spring Cloud / MQ / Seata”的跳跃。
+
+整改方式：
+
+1. 将 `Spring 生态` 收敛为 Spring / Spring Boot / Spring MVC / MyBatis 核心：
+   - IoC容器
+   - Bean生命周期
+   - 循环依赖
+   - AOP原理
+   - 自动装配原理
+   - SpringBoot启动流程
+   - SpringBoot配置体系
+   - SpringMVC原理
+   - MyBatis核心原理
+   - MyBatis-Plus（如保留，放在 MyBatis 之后，权重低于 MyBatis核心原理）
+2. 将 Gateway、Nacos、OpenFeign、Sentinel、Seata 移到一个更合适的分类，例如 `microservice` 或 `spring-cloud`。
+3. 将 Kafka、RabbitMQ、RocketMQ 移到 `middleware` 或新增 `message-queue` 分类。
+4. `可靠性与实战` 标题过泛，需要改为明确知识点，例如 `消息队列可靠性投递`；如果内容无法聚焦，应合并进 MQ topic。
+
+验收标准：
+
+1. `Spring 生态` 首屏不再出现 Kafka/RabbitMQ/RocketMQ/Nacos/OpenFeign/Sentinel/Seata。
+2. 中间件和微服务治理按依赖顺序出现在 Spring 基础之后。
+3. 每个分类标题与其 topic 内容一致。
+
+### G. Agent 领域顺序与分类需要按学习路径重排
+
+涉及文件：
+
+1. `domains/agent.json`
+2. `topics/agent/topic-090-357bf78b.json`：Prompt Engineering
+3. `topics/agent/topic-inference-decoding.json`：推理机制与解码参数
+4. `topics/agent/topic-088-d8088d8c.json`：向量数据库索引与检索
+5. `topics/agent/topic-121-15a0b1b4.json`：向量数据库核心能力对比
+6. `topics/agent/topic-087-81c07ef4.json`：Function Calling 与工具调用
+7. `topics/agent/topic-115-35c5dcec.json`：MCP协议基础
+8. `topics/agent/topic-093-de1a9ab0.json`：MCP协议深度
+9. `topics/agent/topic-107-9a15a561.json`：Agent架构与MCP
+10. `topics/agent/topic-125-30dc0c91.json`：Agent状态管理
+11. `topics/agent/topic-124-6e95a1cd.json`：多Agent协作模式
+12. `topics/agent/topic-091-ee657ad3.json`：AI评估与观测
+13. `topics/agent/topic-094-e03e7524.json`：AI安全与合规
+
+当前问题：
+
+1. 大模型基础中 `推理机制与解码参数` 的 `order=40`，但列表放在 `Prompt Engineering(order=50)` 后面。
+2. Embedding 分类中 `向量数据库核心能力对比(order=40)` 放在 `向量数据库索引与检索(order=50)` 后面。
+3. 工具调用与 Agent 架构中 Function Calling 是高频基础，但被放到后面；Agent状态、多Agent等更高级内容排在前面。
+4. LLMOps 中 AI评估/安全是高频，但被放在语义缓存、模型路由、Fine-tuning 后面。
+
+建议顺序：
+
+```text
+大模型基础：
+Transformer与注意力机制 -> 大模型训练流程 -> 推理机制与解码参数 -> Prompt Engineering
+
+Embedding 与向量检索：
+向量数据库索引与检索 -> 向量数据库核心能力对比
+
+RAG：
+RAG原理与实战 -> 文档分块策略 -> RAG进阶 -> RAG评估与优化
+
+工具调用与 Agent 架构：
+Function Calling 与工具调用 -> MCP协议基础 -> MCP协议深度 -> ReAct与Plan-and-Execute -> Agent架构与MCP -> Agent状态管理 -> 多Agent协作模式
+
+LLMOps：
+AI评估与观测 -> AI安全与合规 -> 语义缓存与成本优化 -> 模型路由与降级方案 -> LLM Fine-tuning 与 LoRA
+```
+
+验收标准：
+
+1. 高频基础内容出现在高级 Agent 架构之前。
+2. 同一分类中的列表顺序与 topic `order` 一致。
+3. `Function Calling` 不应排在 MCP/多 Agent 后面。
+
+### H. 算法领域 order 值不规范，可能影响 App 排序
+
+涉及文件：
+
+1. `domains/algorithm.json`
+2. `topics/algorithm/` 下多个算法 topic
+
+当前问题：
+
+多个算法分类下，基础 topic 放在第一位，但 LeetCode 题的 `order=0`，导致如果 App 按 `order` 排序，题目可能跑到“基础”前面。命中分类包括：
+
+1. 滑动窗口
+2. 栈
+3. 哈希表
+4. 二叉树
+5. 图
+6. 动态规划
+7. 回溯
+8. 贪心
+9. 二分查找
+10. 字符串
+
+整改方式：
+
+1. 统一算法领域排序规则：每个分类先基础 topic，再经典题。
+2. 将基础 topic 的 `order` 设为 10。
+3. 经典题按推荐学习顺序设为 20、30、40...
+4. `domains/algorithm.json` 中列表顺序和 topic `order` 保持一致。
+5. 算法基础 topic 的 `recommendWeight=70` 可以保留为“知识基础”，但如果 App 按权重排序，需要确保基础 topic 不被题目全部压到后面。必要时提高基础 topic 权重到 85 左右，或明确 App 使用 domain 列表顺序。
+
+验收标准：
+
+1. App 每个算法分类首项是该题型基础，而不是 LeetCode 题。
+2. 同一分类没有多个 topic 使用 `order=0`。
+
+### I. 前端领域低频内容权重过高，可能挤压基础主线
+
+涉及文件：
+
+1. `domains/frontend.json`
+2. `topics/frontend/topic-perf-optimization.json`：前端性能优化全景
+3. `topics/frontend/topic-http-https-tcp.json`：HTTP/HTTPS/TCP协议
+4. `topics/frontend/topic-state-arch.json`：前端状态管理架构
+5. `topics/frontend/topic-micro-frontend.json`：微前端架构
+6. `topics/frontend/topic-react-native.json`：React Native核心原理
+7. `topics/frontend/topic-koa-express.json`：Koa/Express框架原理
+8. `topics/frontend/topic-react18-features.json`：React 18+新特性
+9. `topics/frontend/topic-ts-config.json`：TS与JS互操作与工程配置
+10. `topics/frontend/topic-vue-ecosystem.json`：Vue生态（Pinia/Vue Router）
+
+当前问题：
+
+1. 多个 `low` 频 topic 权重达到 85-95，容易在 App 推荐顺序里压过基础内容。
+2. `前端性能优化全景` 标题过大，标准第 5 节明确把“前端性能优化全景”列为过大示例。
+3. `HTTP/HTTPS/TCP协议` 在前端领域是低频但 `recommendWeight=95`，应避免压过 JS、CSS、React/Vue 基础；网络系统性内容应主要由 `network` 领域承担。
+
+整改方式：
+
+1. 重新校准 frontend 中 `low` 频 topic 的 recommendWeight，建议降到 50-75。
+2. `前端性能优化全景` 应拆分或改名聚焦，例如：
+   - `前端加载性能优化`
+   - `运行时性能优化与长任务`
+   - `Core Web Vitals 指标优化`
+   若暂不拆分，至少降低权重并放在架构扩展后段。
+3. `HTTP/HTTPS/TCP协议` 与 network 领域重复度高，建议：
+   - 前端领域保留为 `浏览器网络请求链路` 或 `前端视角的 HTTP 缓存与请求`。
+   - TCP/HTTPS 原理回到 network 领域。
+4. `React 18+新特性`、`React Native核心原理`、`微前端架构`、`Koa/Express框架原理` 保留为低频扩展，不应高权重。
+
+验收标准：
+
+1. 前端首屏和推荐主线优先 JS 基础、异步、原型链、闭包、CSS、React/Vue 核心。
+2. 低频架构/跨端/生态 topic 不抢主线位置。
+3. `前端性能优化全景` 不再作为过大的高权重主线 topic。
+
+### J. 架构领域 API 网关分类位置错误，方法论顺序偏难
+
+涉及文件：
+
+1. `domains/architecture.json`
+2. `topics/architecture/architecture.project-design.topic-api-gateway.json`：API网关设计
+3. `topics/architecture/architecture.methodology.topic-ddd.json`：DDD领域驱动设计
+4. `topics/architecture/architecture.methodology.topic-cqrs.json`：CQRS架构
+5. `topics/architecture/architecture.methodology.topic-event-driven.json`：事件驱动架构
+6. `topics/architecture/architecture.methodology.topic-hexagonal.json`：六边形架构
+7. `topics/architecture/architecture.microservice.topic-service-governance.json`：服务治理全景
+
+当前问题：
+
+1. `API网关设计` 文件名属于 `project-design`，但当前放在 `microservice` 分类里，且与 `分布式锁实现方案` 共用 `order=30`。
+2. 方法论分类把 `DDD` 放在第一个且标 high，容易让初学者一上来进入高抽象内容。架构领域可以高级，但仍应先从系统设计/微服务核心问题建立直觉。
+3. `服务治理全景` 标题偏大，容易成为组件清单合集，需要检查是否能独立复述核心机制。
+
+整改方式：
+
+1. 明确 `API网关设计` 归属：
+   - 如果作为微服务基础组件，文件名、category、domain 引用都统一到 `microservice`。
+   - 如果作为项目设计题，移回 `project-design`。
+2. 调整架构领域学习路径：先系统设计与微服务基础，再 DDD/CQRS/六边形等方法论扩展。
+3. 检查 `服务治理全景` 是否过大；如果只是注册发现、配置中心、负载均衡、熔断等清单，建议拆分或改名为 `服务治理核心组件与链路` 并补充主线。
+
+验收标准：
+
+1. 同一分类中无重复 order。
+2. API 网关的 category 与所在分类一致。
+3. 架构领域的默认顺序从常见系统设计能力开始，而不是先进入高抽象方法论。
+
+### K. OS 与 Network 领域低频高权重和顺序问题
+
+涉及文件：
+
+1. `domains/os.json`
+2. `domains/network.json`
+3. `topics/os/topic-linux-commands.json`
+4. `topics/os/topic-file-permissions.json`
+5. `topics/os/topic-process-management.json`
+6. `topics/os/topic-memory-leak.json`
+7. `topics/network/topic-tcp-vs-udp.json`
+8. `topics/network/topic-dns.json`
+9. `topics/network/topic-cdn.json`
+10. `topics/network/topic-websocket-vs-polling.json`
+
+当前问题：
+
+1. OS 的 Linux 基础内容 `常用命令`、`文件权限`、`进程管理` 都是 low，但权重 93-97，可能挤压进程线程、虚拟内存、IO 模型这些更核心面试内容。
+2. OS 进程线程分类中 `进程与线程的区别` 是 high 且权重最高，但 order=50，排在 IPC/同步/死锁/协程之后；从备考角度应放在最前。
+3. IO 模型中 `阻塞/非阻塞/同步/异步` 是基础概念，但排在 select/poll/epoll 和 Reactor 后面。
+4. Network 中 `TCP 与 UDP 的区别` 是基础高频，但排在 TCP 分类最后。
+5. DNS/CDN 中 `DNS解析流程` 应在 `CDN原理` 前。
+6. WebSocket 中 `WebSocket协议原理` 应在 `WebSocket与长轮询对比` 前。
+
+整改方式：
+
+1. OS 调整顺序：
+   - 进程与线程区别 -> 线程同步 -> 死锁 -> IPC -> 协程
+   - 虚拟内存 -> 分页分段 -> 页面置换 -> 内存泄漏与溢出
+   - 阻塞/非阻塞/同步/异步 -> select/poll/epoll -> Reactor
+   - Linux 基础作为后置补充，并降低低频权重。
+2. Network 调整顺序：
+   - TCP/UDP 区别 -> TCP 三次握手与四次挥手 -> TCP可靠传输 -> 流控拥塞 -> 粘包拆包
+   - HTTP演进 -> 状态码与头部 -> HTTPS -> CORS（或按 App 目标岗位调整）
+   - DNS -> CDN
+   - WebSocket协议 -> WebSocket与长轮询对比
+3. 校准 low 频高权重，除非有明确前置依赖，不应超过 75。
+
+验收标准：
+
+1. OS/Network 首屏符合从基础概念到机制细节的备考路径。
+2. low 频扩展内容不抢 high 频核心内容。
+
+### L. .NET 领域客户端低频内容权重偏高
+
+涉及文件：
+
+1. `domains/dotnet.json`
+2. `topics/dotnet/client-maui.json`
+3. `topics/dotnet/client-xaml-data-binding.json`
+4. `topics/dotnet/client-avalonia.json`
+5. `topics/dotnet/client-architecture-patterns.json`
+6. `topics/dotnet/advanced-dotnet-vs-java.json`
+
+当前问题：
+
+.NET 客户端相关 topic 多数是 low，但权重达到 80-85。若 App 统一按权重推荐，会让客户端/跨平台内容压过 C#、ASP.NET Core、EF Core 等后端面试主线。
+
+整改方式：
+
+1. 如果本领域定位是“.NET 后端面试”，客户端分类整体应后置且降权。
+2. 如果本领域定位包含客户端，则 learningPath 需要拆成 `.NET 后端路线` 与 `.NET 客户端路线`，避免同一主线混排。
+3. `.NET 与 Java 对比` 保留为高级扩展，不应进入基础路径。
+
+验收标准：
+
+1. 默认路线优先 C#、.NET Core、ASP.NET Core、EF Core。
+2. 客户端内容作为独立路线或后置扩展。
+
+### M. 设计模式领域低频高权重与 Spring 应用位置
+
+涉及文件：
+
+1. `domains/design-pattern.json`
+2. `topics/design-pattern/topic-spring-she-ji-mo-shi.json`
+
+当前问题：
+
+`设计模式在Spring中的应用` 是 low，但权重 85，且属于框架应用型内容。它适合作为学完核心模式后的综合应用，不应压过基础设计原则或常见模式。
+
+整改方式：
+
+1. 保留为扩展 topic，但权重建议降到 65-75。
+2. 放在 SOLID、单例、工厂、代理、策略、观察者、责任链等核心模式之后。
+3. 检查它是否与 Java/Spring 领域中的 AOP、IoC、模板方法等内容重复；若重复严重，可迁移到 Java Spring 领域或改为交叉引用。
+
+验收标准：
+
+1. 设计模式主线先学原则和常见模式，再学 Spring 应用。
+2. low 频扩展不抢核心模式位置。
+
+### N. 标准本身需要补强：App 展示顺序验收
+
+涉及文件：
 
 1. `docs/knowledge-content-standard.md`
-2. 本整改计划
-3. 待改 topic 所在领域已有 2 到 3 个高质量 topic
+2. `scripts/validate_content.mjs`
 
-每次整改建议按领域或分类分批，不要一次性重写全部 230 个 topic。每批完成后必须运行：
+当前问题：
+
+现有标准对 topic 是否成立、内容是否模板化写得很清楚，但对 App 实际展示顺序的约束不够可执行。结果是：schema 通过、单 topic 看起来合格，但 App 中低频扩展内容会排到核心内容前面，影响真实备考路径。
+
+建议补充到标准：
+
+1. 每个领域必须提供“默认学习顺序”的人工验收标准。
+2. 同一分类内 `domain.categories[].topics` 顺序必须与 topic `order` 一致；如果 App 不按 `order`，必须在标准中明确 App 排序使用哪个字段。
+3. `interviewFrequency` 与 `recommendWeight` 必须大体一致：
+   - high 通常 85-100
+   - medium 通常 70-88
+   - low 通常 50-75
+   - 例外必须在 topic 或整改说明中写明原因。
+4. high 频核心 topic 不应低于 75 权重，除非该 topic 是低优先级补充。
+5. low 频扩展 topic 不应高于 85 权重，除非是大量内容的必要前置依赖。
+6. 禁止同一分类内出现重复 `order`。
+7. 每次验收必须站在“新用户从 0 到 1 准备面试”的视角检查 App 首屏，不只跑 JSON schema。
+
+建议补充到校验脚本：
+
+1. 检查同一分类内 `order` 是否重复。
+2. 检查 `domain.categories[].topics` 是否按 `order` 升序。
+3. 检查 low 频高权重、high 频低权重。
+4. 输出 warning，不一定立刻 fail；整改完成后再将关键规则改为 fail。
+
+## 4. 推荐执行顺序
+
+1. 先修 `N. 标准本身需要补强`，否则后面仍会反复出现“schema 通过但 App 顺序不合理”。
+2. 修 `D. Agent 领域残留`，这是最小且明确的问题。
+3. 修 `C. 其他集合`，因为它当前在截图首屏，且串题明显。
+4. 修 `B. Java新特性`，删除或迁移合集 topic。
+5. 修 `A. Java 基础与集合排序`，同步调整 `domains/java.json` topic 顺序、topic `order`、`recommendWeight`。
+6. 修 `F. Java Spring/中间件分类混杂` 和 `E. Java 数据库重复 topic`。
+7. 修 `G. Agent 顺序`、`H. 算法 order`、`I. 前端权重`、`J. 架构分类`、`K. OS/Network 顺序`、`L. .NET 路线`、`M. 设计模式权重`。
+8. 最后打开 App 做每个领域首屏人工验收。
+
+## 5. 验收命令
+
+每批修改后运行：
 
 ```bash
 npm run validate
 ```
 
-每批还要额外扫描高风险词：
+高风险词扫描：
 
 ```bash
-rg -n "今日笔记|面试话术|你遇到过什么问题|在实际项目中是怎么用的？有什么注意事项？|结合项目经验|能做对比|能说明取舍" topics
+rg -n "今日笔记|面试话术|你遇到过什么问题|在实际项目中是怎么用的？有什么注意事项？|结合项目经验|能做对比|能说明取舍|回答不够深入|不了解原理" topics
 ```
 
-如果只是知识内容更新，且发布正式内容包，需要按发布流程更新 `manifest.json` 的 `contentVersion`。如果只是生成整改草案或暂不发布，可以先不改版本号。
-
-## 3. 问题编号与整改动作
-
-### P0_TODAY_NOTE
-
-含义：topic 正文中出现“今日笔记”模板。
-
-处理方式：
-
-1. 删除整段“今日笔记”及填空线。
-2. 如果其中有真正有价值的要点，把它们改写进 `checklist.items`。
-3. 不要保留“日期”“今日重点掌握”“最深印象”等学习日志式内容。
-
-验收标准：
-
-1. 文件中不再出现 `今日笔记`。
-2. 正文仍然能回答定义、原理、流程、场景、误区、面试回答。
-
-### P0_INTERVIEW_TALK
-
-含义：topic 中出现“面试话术”标签或包装式表达。
-
-处理方式：
-
-1. 将 `面试话术` 改为自然的知识点解释或 `interviewAnswer` 内容。
-2. 删除虚构项目成绩、泛化项目包装，例如“在我们的项目中提升了 xx%”，除非它是严谨的通用示例且不伪装成真实经历。
-3. 保留“面试回答模板”卡片可以，但内容必须是知识点专属回答。
-
-验收标准：
-
-1. 文件中不再出现 `面试话术`。
-2. 面试回答第一段给结论，第二段讲原理，第三段讲场景、优缺点或坑。
-
-### P0_GENERIC_FOLLOWUP
-
-含义：`interviewAnswer.followUpQuestions` 中出现模板化问题，例如“在实际项目中使用 X 时，你遇到过什么问题？是怎么发现和解决的？”
-
-处理方式：
-
-1. 找到该 topic 的所有 `learningCards[].followUpQuestions`。
-2. 删除泛项目追问。
-3. 用 2 到 3 个专属追问替换，追问应落在机制、边界、对比、故障定位或方案权衡上。
-
-改写模板：
-
-```text
-不要写：
-在实际项目中使用 X 时，你遇到过什么问题？是怎么发现和解决的？
-
-改成：
-如果出现【当前知识点特有问题】，你会从哪些指标、日志或机制判断原因？
-为什么【当前知识点核心机制】会导致【具体边界/坑】？
-在【具体约束】下，X 和 Y 应该如何选择？为什么？
-```
-
-示例：
-
-```text
-观察者模式：
-如果一个事件监听器抛异常，Spring 同步事件发布会发生什么？如何避免影响主流程？
-
-ThreadLocal：
-为什么线程池场景下 ThreadLocal 更容易发生内存泄漏？remove 应该放在哪里？
-
-TCP 粘包拆包：
-为什么 TCP 会粘包，而 UDP 通常不这么讨论？常见拆包协议怎么设计？
-```
-
-验收标准：
-
-1. 文件中不再出现 `在实际项目中使用.*你遇到过什么问题`。
-2. 每个追问都能对应正文中的具体知识点。
-
-### P0_GENERIC_RECALL
-
-含义：`recallPrompts` 中出现模板化问题，例如“在实际项目中是怎么用的？有什么注意事项？”
-
-处理方式：
-
-1. 每个 topic 至少保留 2 个 recallPrompts。
-2. prompt 要模拟真实面试问题，不能只是泛泛复述“有什么注意事项”。
-3. 高优先级 topic 建议有 3 个 recallPrompts：定义/流程题、机制追问题、边界/对比题。
-
-改写模板：
-
-```text
-定义/流程：
-请用 2 分钟讲清楚 X 的核心流程，并说明每一步解决什么问题。
-
-机制追问：
-为什么 X 需要 Y 这个机制？如果没有它会出现什么问题？
-
-对比/边界：
-X 和 Y 的核心区别是什么？分别适合什么场景？
-```
-
-验收标准：
-
-1. 文件中不再出现 `在实际项目中是怎么用的？有什么注意事项？`。
-2. recallPrompts 与 topic 难度一致。
-
-### P1_GENERIC_RUBRIC
-
-含义：rubric 中出现 `结合项目经验`、`能做对比`、`能说明取舍`、`面试表达清晰有条理，能回答追问` 等过泛条目。
-
-处理方式：
-
-1. `mustHave` 写当前知识点必须说出的定义、核心机制、关键流程。
-2. `goodToHave` 写当前知识点的源码细节、边界条件、性能权衡或排查方法。
-3. `commonMistakes` 写当前知识点特有误区。
-4. 不要只写“结合项目经验”“能做对比”“能说明取舍”。
-
-示例：
-
-```text
-不要写：
-能做对比
-
-改成：
-能比较 RAG 与 Fine-tuning 在知识更新、可溯源性、延迟和成本上的差异。
-```
-
-验收标准：
-
-1. rubric 每一项离开当前 topic 就不成立。
-2. 没有泛化评价词充数。
-
-### P1_AI_CROSS_DOMAIN_EXAMPLE
-
-含义：Agent 领域中串入 Java/Spring/Redis 示例，例如 `Spring Boot自动装配`、`Redis缓存穿透`。
-
-处理方式：
-
-1. 如果只是样例数据，把它替换成 Agent/LLMOps/RAG 相关样例。
-2. 如果内容已经偏离 topic，要重写该段。
-3. Java 领域中的 Spring Boot 内容不一定是问题；本项重点处理 Agent 文件里的跨领域残留。
-
-示例替换：
-
-```text
-Spring Boot自动装配的原理是什么？
-改为：
-RAG 检索结果与用户问题不匹配时，如何定位是召回问题还是生成问题？
-```
-
-### P2_FEW_CARDS
-
-含义：learningCards 少于 5 张，或内容覆盖不充分。
-
-处理方式：
-
-1. 先判断 topic 是否应该保留为独立知识点。
-2. 如果保留，补充缺失的 `compareTable`、`diagram`、`code` 或更具体的 `checklist`。
-3. 如果内容过小或和其他 topic 重复，应合并或删除，而不是硬凑卡片。
-
-### P2_TITLE_RISK
-
-含义：标题或摘要含“综合、复习、场景题、话术、简历”等高风险词。
-
-处理方式：
-
-1. 判断它是否仍是稳定知识点。
-2. 如果是算法领域的合法例外，标题应明确为算法模式或题型能力。
-3. 如果不是稳定知识点，迁移到学习路径或补充文档，不进入 topic。
-
-## 4. 推荐整改顺序
-
-### 第一批：Agent 领域 P0 问题
-
-优先修 Agent 领域，因为它同时命中 `P0_TODAY_NOTE`、`P0_INTERVIEW_TALK`、`P0_GENERIC_RECALL`、`P1_AI_CROSS_DOMAIN_EXAMPLE`，问题最集中。
-
-处理顺序：
-
-1. 删除所有“今日笔记”。
-2. 删除或改写“面试话术”。
-3. 替换 Agent 中的 Spring Boot/Redis 样例。
-4. 重写 Agent 的泛 followUpQuestions 和 recallPrompts。
-5. 重写 Agent 的泛 rubric。
-
-### 第二批：Java 领域模板化 recall/rubric
-
-Java 领域大量文件同时命中 `P0_GENERIC_FOLLOWUP`、`P0_GENERIC_RECALL`、`P1_GENERIC_RUBRIC`。建议按分类处理：
-
-1. JVM
-2. 并发
-3. Java 基础
-4. Spring
-5. 数据库
-6. 中间件
-
-### 第三批：全领域泛 followUpQuestions
-
-处理 architecture、design-pattern、dotnet、frontend、network、os 中的 `P0_GENERIC_FOLLOWUP`。
-
-这批通常只需要替换 `interviewAnswer.followUpQuestions` 的第三个泛问题，不需要重写整篇 topic。
-
-### 第四批：P2 内容充实与标题检查
-
-处理少卡片和标题风险：
-
-1. `topics/agent/topic-50e6a78b.json`
-2. `topics/agent/topic-a2c7179e.json`
-3. `topics/algorithm/topic-design-basics.json`
-4. `topics/architecture/topic-41281158.json`
-5. `topics/java/topic-1da2b5c3.json`
-
-## 5. 每个 topic 的整改清单
-
-下面列出所有命中问题的 topic。未列出的 topic 在本次自动语义扫描中未命中高风险项，但仍建议在批量发布前做人工抽样。
-
-### agent
-
-| 文件 | 标题 | 分类 | 问题 |
-| --- | --- | --- | --- |
-| `topics/agent/topic-087-81c07ef4.json` | Function Calling 与工具调用 | `tool-agent` | `P0_TODAY_NOTE`<br>`P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/agent/topic-088-d8088d8c.json` | 向量数据库索引与检索 | `embedding-retrieval` | `P0_TODAY_NOTE`<br>`P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/agent/topic-089-42584852.json` | RAG进阶 | `rag` | `P0_TODAY_NOTE`<br>`P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/agent/topic-090-357bf78b.json` | Prompt Engineering | `llm-foundation` | `P0_TODAY_NOTE`<br>`P0_INTERVIEW_TALK`<br>`P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/agent/topic-091-ee657ad3.json` | AI评估与观测 | `llmops` | `P0_TODAY_NOTE`<br>`P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC`<br>`P1_AI_CROSS_DOMAIN_EXAMPLE` |
-| `topics/agent/topic-093-de1a9ab0.json` | MCP协议深度 | `tool-agent` | `P0_TODAY_NOTE`<br>`P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/agent/topic-094-e03e7524.json` | AI安全与合规 | `llmops` | `P0_TODAY_NOTE`<br>`P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/agent/topic-104-b4f897e0.json` | 大模型训练流程：预训练、SFT、RLHF、DPO | `llm-foundation` | `P0_TODAY_NOTE`<br>`P0_INTERVIEW_TALK`<br>`P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/agent/topic-106-bf5350b9.json` | RAG原理与实战 | `rag` | `P0_TODAY_NOTE`<br>`P0_INTERVIEW_TALK`<br>`P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC`<br>`P1_AI_CROSS_DOMAIN_EXAMPLE` |
-| `topics/agent/topic-107-9a15a561.json` | Agent架构与MCP | `tool-agent` | `P0_TODAY_NOTE`<br>`P0_INTERVIEW_TALK`<br>`P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/agent/topic-115-35c5dcec.json` | MCP协议基础 | `tool-agent` | `P0_GENERIC_FOLLOWUP` |
-| `topics/agent/topic-116-13e5ca40.json` | Transformer与注意力机制 | `llm-foundation` | `P0_GENERIC_FOLLOWUP` |
-| `topics/agent/topic-121-15a0b1b4.json` | 向量数据库核心能力对比 | `embedding-retrieval` | `P0_GENERIC_FOLLOWUP` |
-| `topics/agent/topic-122-194b7dfa.json` | 文档分块策略 | `rag` | `P0_GENERIC_FOLLOWUP` |
-| `topics/agent/topic-123-b51b29dc.json` | ReAct与Plan-and-Execute | `tool-agent` | `P0_GENERIC_FOLLOWUP` |
-| `topics/agent/topic-124-6e95a1cd.json` | 多Agent协作模式 | `tool-agent` | `P0_GENERIC_FOLLOWUP` |
-| `topics/agent/topic-125-30dc0c91.json` | Agent状态管理 | `tool-agent` | `P0_GENERIC_FOLLOWUP` |
-| `topics/agent/topic-127-34123092.json` | 语义缓存与成本优化 | `llmops` | `P0_GENERIC_FOLLOWUP` |
-| `topics/agent/topic-129-1907ae44.json` | 模型路由与降级方案 | `llmops` | `P0_GENERIC_FOLLOWUP` |
-| `topics/agent/topic-50e6a78b.json` | LLM Fine-tuning 与 LoRA | `llmops` | `P0_GENERIC_FOLLOWUP`<br>`P2_FEW_CARDS` |
-| `topics/agent/topic-a2c7179e.json` | RAG 评估与优化 | `rag` | `P0_GENERIC_FOLLOWUP`<br>`P2_FEW_CARDS` |
-| `topics/agent/topic-inference-decoding.json` | 推理机制与解码参数 | `llm-foundation` | `P0_INTERVIEW_TALK` |
-
-### algorithm
-
-| 文件 | 标题 | 分类 | 问题 |
-| --- | --- | --- | --- |
-| `topics/algorithm/topic-design-basics.json` | 设计题基础 | `design` | `P2_FEW_CARDS`<br>`P2_TITLE_RISK` |
-
-### architecture
-
-| 文件 | 标题 | 分类 | 问题 |
-| --- | --- | --- | --- |
-| `topics/architecture/architecture.methodology.topic-cqrs.json` | CQRS架构 | `methodology` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.methodology.topic-ddd.json` | DDD领域驱动设计 | `methodology` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.methodology.topic-event-driven.json` | 事件驱动架构 | `methodology` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.methodology.topic-hexagonal.json` | 六边形架构 | `methodology` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.microservice.topic-distributed-id.json` | 分布式ID生成方案 | `microservice` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.microservice.topic-distributed-lock.json` | 分布式锁实现方案 | `microservice` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.microservice.topic-distributed-transaction.json` | 分布式事务方案选型 | `microservice` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.microservice.topic-rate-limiting.json` | 限流降级熔断策略 | `microservice` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.microservice.topic-service-governance.json` | 服务治理全景 | `microservice` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.microservice.topic-split-principles.json` | 微服务拆分原则 | `microservice` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.project-design.topic-api-gateway.json` | API网关设计 | `microservice` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.project-design.topic-low-code.json` | 低代码平台核心架构 | `project-design` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.project-design.topic-multi-tenant.json` | 多租户SaaS架构设计 | `project-design` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.system-design.topic-cache-architecture.json` | 缓存架构设计 | `system-design` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.system-design.topic-mq-architecture.json` | 消息队列架构设计 | `system-design` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.system-design.topic-read-write-split.json` | 读写分离与数据一致性 | `system-design` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.system-design.topic-seckill.json` | 秒杀系统设计 | `system-design` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/architecture.system-design.topic-sharding.json` | 大数据量分库分表方案 | `system-design` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/topic-334-cf3d865e.json` | 幂等性设计 | `microservice` | `P0_GENERIC_FOLLOWUP` |
-| `topics/architecture/topic-41281158.json` | 服务网格与 Service Mesh | `microservice` | `P0_GENERIC_FOLLOWUP`<br>`P2_FEW_CARDS` |
-
-### design-pattern
-
-| 文件 | 标题 | 分类 | 问题 |
-| --- | --- | --- | --- |
-| `topics/design-pattern/topic-ce-lve-mo-shi.json` | 策略模式 | `behavioral` | `P0_GENERIC_FOLLOWUP` |
-| `topics/design-pattern/topic-dai-li-mo-shi.json` | 代理模式 | `structural` | `P0_GENERIC_FOLLOWUP` |
-| `topics/design-pattern/topic-dan-li-mo-shi.json` | 单例模式 | `creational` | `P0_GENERIC_FOLLOWUP` |
-| `topics/design-pattern/topic-gong-chang-mo-shi.json` | 工厂模式 | `creational` | `P0_GENERIC_FOLLOWUP` |
-| `topics/design-pattern/topic-guan-zhe-zhe-mo-shi.json` | 观察者模式 | `behavioral` | `P0_GENERIC_FOLLOWUP` |
-| `topics/design-pattern/topic-jian-zao-zhe-mo-shi.json` | 建造者模式 | `creational` | `P0_GENERIC_FOLLOWUP` |
-| `topics/design-pattern/topic-men-mian-mo-shi.json` | 门面模式 | `structural` | `P0_GENERIC_FOLLOWUP` |
-| `topics/design-pattern/topic-mu-ban-fang-fa-mo-shi.json` | 模板方法模式 | `behavioral` | `P0_GENERIC_FOLLOWUP` |
-| `topics/design-pattern/topic-shi-pei-qi-mo-shi.json` | 适配器模式 | `structural` | `P0_GENERIC_FOLLOWUP` |
-| `topics/design-pattern/topic-solid-yuan-ze.json` | SOLID原则 | `principles` | `P0_GENERIC_FOLLOWUP` |
-| `topics/design-pattern/topic-spring-she-ji-mo-shi.json` | 设计模式在Spring中的应用 | `principles` | `P0_GENERIC_FOLLOWUP` |
-| `topics/design-pattern/topic-ze-ren-lian-mo-shi.json` | 责任链模式 | `behavioral` | `P0_GENERIC_FOLLOWUP` |
-| `topics/design-pattern/topic-zhuang-shi-qi-mo-shi.json` | 装饰器模式 | `structural` | `P0_GENERIC_FOLLOWUP` |
-| `topics/design-pattern/topic-zhuang-tai-mo-shi.json` | 状态模式 | `behavioral` | `P0_GENERIC_FOLLOWUP` |
-
-### dotnet
-
-| 文件 | 标题 | 分类 | 问题 |
-| --- | --- | --- | --- |
-| `topics/dotnet/advanced-design-patterns.json` | 设计模式在 .NET 中的应用 | `advanced` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/advanced-dotnet-vs-java.json` | .NET 与 Java 对比 | `advanced` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/advanced-performance-diagnostics.json` | 性能调优与诊断 | `advanced` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/aspnet-authentication-authorization.json` | 认证与授权 | `aspnet` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/aspnet-filters-pipeline.json` | 过滤器管道 | `aspnet` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/aspnet-performance-optimization.json` | ASP.NET 性能优化 | `aspnet` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/aspnet-signalr.json` | SignalR 实时通信 | `aspnet` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/aspnet-web-api-design.json` | Web API 设计 | `aspnet` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/client-architecture-patterns.json` | 客户端架构模式 | `client` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/client-avalonia.json` | Avalonia UI | `client` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/client-maui.json` | MAUI 跨平台 | `client` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/client-wpf-core.json` | WPF 核心原理 | `client` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/client-xaml-data-binding.json` | XAML 数据绑定 | `client` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/csharp-async-await.json` | async/await 异步编程 | `csharp` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/csharp-generics-variance.json` | 泛型与协变逆变 | `csharp` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/csharp-linq.json` | LINQ | `csharp` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/csharp-reflection-attributes.json` | 反射与特性 | `csharp` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/csharp-type-system.json` | C# 类型系统 | `csharp` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/dotnet-core-configuration-options.json` | 配置与选项模式 | `dotnet-core` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/dotnet-core-dependency-injection.json` | 依赖注入 | `dotnet-core` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/dotnet-core-logging-monitoring.json` | 日志与监控 | `dotnet-core` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/dotnet-core-middleware-pipeline.json` | 中间件管道 | `dotnet-core` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/dotnet-core-runtime-gc.json` | .NET 运行时与 GC | `dotnet-core` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/ef-core-basics.json` | EF Core 基础 | `ef-core` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/ef-core-multi-database-tenant.json` | 数据库兼容与多租户 | `ef-core` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/ef-core-performance-optimization.json` | EF Core 性能优化 | `ef-core` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/ef-core-repository-uow.json` | 仓储模式与工作单元 | `ef-core` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/microservice-communication.json` | 微服务通信 | `microservice-dotnet` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/microservice-containerization.json` | 容器化与部署 | `microservice-dotnet` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/microservice-grpc-protobuf.json` | gRPC 与 Protobuf | `microservice-dotnet` | `P0_GENERIC_FOLLOWUP` |
-| `topics/dotnet/microservice-message-queue.json` | 消息队列集成 | `microservice-dotnet` | `P0_GENERIC_FOLLOWUP` |
-
-### frontend
-
-| 文件 | 标题 | 分类 | 问题 |
-| --- | --- | --- | --- |
-| `topics/frontend/topic-360-7595a4da.json` | 深拷贝与浅拷贝 | `js-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-607-5ceefc1c.json` | 手写Promise | `js-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-880-2802d4ed.json` | 防抖与节流 | `js-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-bff-fullstack.json` | BFF与全栈架构 | `frontend-architecture` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-box-model-bfc.json` | 盒模型与BFC | `css-layout` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-cicd-deploy.json` | 前端CI/CD与发布 | `engineering` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-closure-scope.json` | 闭包与作用域 | `js-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-cors-request.json` | 跨域与请求方案 | `network-security` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-cross-platform.json` | 跨平台方案对比 | `client-dev` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-data-types.json` | JS数据类型与类型判断 | `js-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-electron.json` | Electron开发 | `client-dev` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-event-loop.json` | Event Loop与异步 | `js-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-flex-grid.json` | Flex与Grid布局 | `css-layout` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-frontend-monitoring.json` | 前端监控与错误追踪 | `engineering` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-frontend-router.json` | 前端路由原理 | `frontend-architecture` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-http-https-tcp.json` | HTTP/HTTPS/TCP协议 | `network-security` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-koa-express.json` | Koa/Express框架原理 | `nodejs` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-micro-frontend.json` | 微前端架构 | `frontend-architecture` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-mobile-adapt.json` | 移动端适配与性能 | `client-dev` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-node-core.json` | Node.js核心概念 | `nodejs` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-node-engineering.json` | Node.js 进程管理与线上排查 | `nodejs` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-node-modules.json` | Node.js模块系统与包管理 | `nodejs` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-perf-optimization.json` | 前端性能优化全景 | `frontend-architecture` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-promise-async.json` | Promise与async/await | `js-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-prototype-chain.json` | 原型链与继承 | `js-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-react-core-fiber.json` | React核心概念与Fiber | `react` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-react-hooks.json` | React Hooks 原理 | `react` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-react-native.json` | React Native核心原理 | `client-dev` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-react-perf.json` | React性能优化 | `react` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-react-router.json` | React路由与数据加载 | `react` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-react-state-mgmt.json` | React状态管理 | `react` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-react18-features.json` | React 18+新特性 | `react` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-responsive-css-eng.json` | 响应式设计与CSS工程化 | `css-layout` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-security.json` | 前端安全防护 | `network-security` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-state-arch.json` | 前端状态管理架构 | `frontend-architecture` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-ts-basic-types.json` | TS基础类型与类型系统 | `typescript` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-ts-config.json` | TS与JS互操作与工程配置 | `typescript` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-ts-generics.json` | 泛型与工具类型 | `typescript` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-ts-type-gymnastics.json` | TypeScript 高级类型编程 | `typescript` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-vite-principle.json` | Vite原理与对比 | `engineering` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-vue-compiler-vdom.json` | Vue编译与虚拟DOM | `vue` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-vue-ecosystem.json` | Vue生态（Pinia/Vue Router） | `vue` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-vue-lifecycle-composition.json` | Vue生命周期与组合式API | `vue` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-vue-reactivity.json` | Vue响应式原理 | `vue` | `P0_GENERIC_FOLLOWUP` |
-| `topics/frontend/topic-webpack-core.json` | Webpack核心原理 | `engineering` | `P0_GENERIC_FOLLOWUP` |
-
-### java
-
-| 文件 | 标题 | 分类 | 问题 |
-| --- | --- | --- | --- |
-| `topics/java/topic-001-ebcc71cb.json` | 运行时数据区概述 | `jvm` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-002-3bee1565.json` | 堆内存详解 | `jvm` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-003-d63af565.json` | 方法区与元空间 | `jvm` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-005-af0a37c3.json` | GC算法 | `jvm` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-006-e97a07bb.json` | GC Roots与引用类型 | `jvm` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-007-e93284f6.json` | 垃圾收集器 | `jvm` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-009-e1efbeeb.json` | 类加载机制 | `jvm` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-010-3574662f.json` | JVM参数与调优 | `jvm` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-011-c6bc7422.json` | 线上问题排查 | `jvm` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-013-cc70cb0e.json` | 并发理论基础 | `concurrency` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-014-880c2a03.json` | synchronized原理 | `concurrency` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-015-45bf8ebd.json` | volatile原理 | `concurrency` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-017-df4531b1.json` | AQS原理 | `concurrency` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-018-01ac6cc3.json` | ReentrantLock | `concurrency` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-019-a5a85fab.json` | 其他锁与并发工具 | `concurrency` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-021-d2222a23.json` | 线程池原理 | `concurrency` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-024-052a3c12.json` | ConcurrentHashMap | `concurrency` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-025-a8370d9d.json` | ThreadLocal | `concurrency` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-026-3990751f.json` | CompletableFuture | `concurrency` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-028-905d9b58.json` | HashMap原理 | `java-fundamentals` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-029-2b936689.json` | ArrayList与LinkedList | `java-fundamentals` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-030-e4f16979.json` | 其他集合 | `java-fundamentals` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-032-8b727f38.json` | 泛型 | `java-fundamentals` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-033-070d3ba1.json` | 反射与注解 | `jvm` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-034-f2553b47.json` | Java新特性 | `java-fundamentals` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-041-d2d1cd02.json` | 自动装配原理 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC`<br>`P1_AI_CROSS_DOMAIN_EXAMPLE` |
-| `topics/java/topic-043-d09a2ea2.json` | IoC容器 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-044-d91e99aa.json` | AOP原理 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-046-75c87cc7.json` | Bean生命周期 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-047-7bfc4e55.json` | 循环依赖 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-049-4a9fa727.json` | SpringMVC原理 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-050-1ab02fab.json` | SpringBoot配置体系 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-052-976f7efa.json` | MyBatis核心原理 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-053-33741484.json` | MyBatis-Plus | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-055-e51532ee.json` | Nacos | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-058-72ff8a49.json` | OpenFeign | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-059-a4e73804.json` | Gateway | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-061-7a8c02dc.json` | Sentinel | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-062-ce26874b.json` | Seata分布式事务 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-064-e7bf33af.json` | 分布式事务补充方案 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-065-e2570d70.json` | MySQL 索引原理 | `database` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-066-d9e7b897.json` | 事务机制 | `database` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-068-fd69e227.json` | 锁机制 | `database` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-069-badbf416.json` | SQL优化 | `database` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-071-7bc711e7.json` | Redis数据结构 | `middleware` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-072-980339ce.json` | 持久化与内存 | `middleware` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-074-160f484e.json` | 高可用架构 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-075-fa1c9279.json` | 缓存问题 | `middleware` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-077-0f4a426f.json` | RabbitMQ原理 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-078-0195276a.json` | 可靠性与实战 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-080-3c934d6a.json` | Kafka原理 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-081-89b01558.json` | RocketMQ与选型 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-083-b2c3d4e5.json` | SpringBoot启动流程 | `spring` | `P0_GENERIC_FOLLOWUP` |
-| `topics/java/topic-084-c3d4e5f6.json` | MySQL索引原理 | `database` | `P0_GENERIC_FOLLOWUP`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-085-d4e5f6a7.json` | MySQL事务与MVCC | `database` | `P0_GENERIC_FOLLOWUP` |
-| `topics/java/topic-086-e5f6a7b8.json` | MySQL锁机制 | `database` | `P0_GENERIC_FOLLOWUP` |
-| `topics/java/topic-087-f6a7b8c9.json` | MySQL慢SQL优化与分库分表 | `database` | `P0_GENERIC_FOLLOWUP`<br>`P1_GENERIC_RUBRIC` |
-| `topics/java/topic-089-b8c9d0e1.json` | Redis集群与高可用 | `middleware` | `P0_GENERIC_FOLLOWUP` |
-| `topics/java/topic-090-c9d0e1f2.json` | 分布式锁(Redis/Zookeeper) | `middleware` | `P0_GENERIC_FOLLOWUP` |
-| `topics/java/topic-093-f2a3b4c5.json` | 设计模式在并发中的应用 | `middleware` | `P0_GENERIC_FOLLOWUP` |
-| `topics/java/topic-1da2b5c3.json` | Spring AOP 深入 | `spring` | `P0_GENERIC_FOLLOWUP`<br>`P2_FEW_CARDS` |
-| `topics/java/topic-lambda.json` | Lambda 表达式与函数式接口 | `java-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/java/topic-new-datetime.json` | 新日期时间 API | `java-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/java/topic-optional.json` | Optional 类使用 | `java-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/java/topic-pattern-matching.json` | Pattern Matching（Java 17+） | `java-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/java/topic-record.json` | Record 类（Java 14+） | `java-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/java/topic-sealed-classes.json` | Sealed Classes（Java 17+） | `java-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/java/topic-stream-api.json` | Stream API 详解 | `java-fundamentals` | `P0_GENERIC_FOLLOWUP` |
-| `topics/java/topic-virtual-threads.json` | Virtual Threads（Java 21+） | `concurrency` | `P0_GENERIC_FOLLOWUP`<br>`P0_GENERIC_RECALL` |
-
-### network
-
-| 文件 | 标题 | 分类 | 问题 |
-| --- | --- | --- | --- |
-| `topics/network/topic-cdn.json` | CDN 原理与应用 | `dns-cdn` | `P0_GENERIC_FOLLOWUP` |
-| `topics/network/topic-cors.json` | 跨域与 CORS | `http-https` | `P0_GENERIC_FOLLOWUP` |
-| `topics/network/topic-dns.json` | DNS 解析流程 | `dns-cdn` | `P0_GENERIC_FOLLOWUP` |
-| `topics/network/topic-http-evolution.json` | HTTP 1.0/1.1/2.0/3.0 演进 | `http-https` | `P0_GENERIC_FOLLOWUP` |
-| `topics/network/topic-http-status-headers.json` | HTTP 状态码与头部字段 | `http-https` | `P0_GENERIC_FOLLOWUP` |
-| `topics/network/topic-https.json` | HTTPS 加密原理 | `http-https` | `P0_GENERIC_FOLLOWUP` |
-| `topics/network/topic-tcp-flow-congestion.json` | TCP 流量控制与拥塞控制 | `tcp-udp` | `P0_GENERIC_FOLLOWUP` |
-| `topics/network/topic-tcp-handshake.json` | TCP 三次握手与四次挥手 | `tcp-udp` | `P0_GENERIC_FOLLOWUP` |
-| `topics/network/topic-tcp-reliable.json` | TCP 可靠传输机制 | `tcp-udp` | `P0_GENERIC_FOLLOWUP` |
-| `topics/network/topic-tcp-sticky-packet.json` | TCP 粘包与拆包 | `tcp-udp` | `P0_GENERIC_FOLLOWUP` |
-| `topics/network/topic-tcp-vs-udp.json` | TCP 与 UDP 的区别 | `tcp-udp` | `P0_GENERIC_FOLLOWUP` |
-| `topics/network/topic-websocket-vs-polling.json` | WebSocket 与长轮询对比 | `websocket` | `P0_GENERIC_FOLLOWUP` |
-| `topics/network/topic-websocket.json` | WebSocket 协议原理 | `websocket` | `P0_GENERIC_FOLLOWUP` |
-
-### os
-
-| 文件 | 标题 | 分类 | 问题 |
-| --- | --- | --- | --- |
-| `topics/os/topic-coroutine.json` | 协程与纤程 | `process-thread` | `P0_GENERIC_FOLLOWUP` |
-| `topics/os/topic-deadlock.json` | 死锁的产生与避免 | `process-thread` | `P0_GENERIC_FOLLOWUP` |
-| `topics/os/topic-file-permissions.json` | 文件权限与用户管理 | `linux-basics` | `P0_GENERIC_FOLLOWUP` |
-| `topics/os/topic-io-models.json` | 阻塞/非阻塞/同步/异步 | `io-model` | `P0_GENERIC_FOLLOWUP` |
-| `topics/os/topic-ipc.json` | 进程间通信方式 | `process-thread` | `P0_GENERIC_FOLLOWUP` |
-| `topics/os/topic-linux-commands.json` | 常用命令 | `linux-basics` | `P0_GENERIC_FOLLOWUP` |
-| `topics/os/topic-memory-leak.json` | 内存泄漏与溢出 | `memory-management` | `P0_GENERIC_FOLLOWUP` |
-| `topics/os/topic-page-replacement.json` | 页面置换算法 | `memory-management` | `P0_GENERIC_FOLLOWUP` |
-| `topics/os/topic-paging-segmentation.json` | 内存分页与分段 | `memory-management` | `P0_GENERIC_FOLLOWUP` |
-| `topics/os/topic-process-management.json` | 进程管理与监控 | `linux-basics` | `P0_GENERIC_FOLLOWUP` |
-| `topics/os/topic-process-vs-thread.json` | 进程与线程的区别 | `process-thread` | `P0_GENERIC_FOLLOWUP` |
-| `topics/os/topic-reactor.json` | Reactor 模式 | `io-model` | `P0_GENERIC_FOLLOWUP` |
-| `topics/os/topic-select-poll-epoll.json` | select/poll/epoll | `io-model` | `P0_GENERIC_FOLLOWUP` |
-| `topics/os/topic-thread-sync.json` | 线程同步机制 | `process-thread` | `P0_GENERIC_FOLLOWUP` |
-| `topics/os/topic-virtual-memory.json` | 虚拟内存原理 | `memory-management` | `P0_GENERIC_FOLLOWUP` |
-
-## 6. 自动化校验补强建议
-
-当前 `scripts/validate_content.mjs` 能保证结构正确，但不能阻止模板化语义问题再次进入。建议在完成第一轮整改后，把以下规则加入校验脚本：
-
-1. `今日笔记`：直接失败。
-2. `面试话术`：直接失败。
-3. `在实际项目中使用.*你遇到过什么问题`：直接失败。
-4. `在实际项目中是怎么用的？有什么注意事项？`：直接失败。
-5. `结合项目经验|能做对比|能说明取舍`：先警告，整改完成后改为失败。
-
-加入校验后运行：
+Agent 跨领域残留扫描：
 
 ```bash
-npm run validate
-rg -n "今日笔记|面试话术|你遇到过什么问题|在实际项目中是怎么用的？有什么注意事项？" topics
+rg -n "Spring Boot|Redis缓存穿透|什么是自动装配" topics/agent
 ```
 
-最终验收时，以上 `rg` 不应再命中 topic 文件。
+Java 基础排序检查：
 
-## 7. 单个 topic 整改模板
-
-后续 AI 可以按这个模板逐个处理：
-
-```text
-任务：整改 <topic 文件路径>
-
-1. 阅读 docs/knowledge-content-standard.md 和 docs/content-improvement-plan.md。
-2. 打开 topic 文件，确认标题、domain、category、difficulty、interviewFrequency、recommendWeight 是否合理。
-3. 按清单处理该文件命中的问题编号。
-4. 不改 JSON 结构，不新增 schema 字段，不改 id/domain/category。
-5. 对 followUpQuestions：
-   - 删除泛项目问题。
-   - 改为 2 到 3 个当前 topic 专属追问。
-   - answer 必须具体，不能写“看情况”“结合项目”。
-6. 对 recallPrompts：
-   - 改成真实面试问题。
-   - 至少覆盖定义/流程、机制追问、对比或边界中的两个。
-7. 对 rubric：
-   - mustHave 写定义、机制、流程。
-   - goodToHave 写源码、边界、性能、排查。
-   - commonMistakes 写当前 topic 特有误区。
-8. 运行 npm run validate。
-9. 运行高风险词 rg。
-10. 汇报改了哪些 topic、还剩哪些问题。
+```bash
+node - <<'NODE'
+const fs = require('fs');
+const domain = JSON.parse(fs.readFileSync('domains/java.json', 'utf8'));
+const cat = domain.categories.find(c => c.id === 'java-fundamentals');
+for (const ref of cat.topics) {
+  const t = JSON.parse(fs.readFileSync(ref, 'utf8'));
+  console.log(`${String(t.order).padStart(4)} | ${t.interviewFrequency}/${t.recommendWeight} | ${t.title} | ${ref}`);
+}
+NODE
 ```
+
+全领域顺序/权重异常扫描：
+
+```bash
+node - <<'NODE'
+const fs = require('fs');
+const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+for (const de of manifest.domains) {
+  const d = JSON.parse(fs.readFileSync(de.entry, 'utf8'));
+  for (const c of d.categories) {
+    const topics = c.topics.map(ref => ({ ref, t: JSON.parse(fs.readFileSync(ref, 'utf8')) }));
+    const seen = new Map();
+    for (let i = 0; i < topics.length; i++) {
+      const { ref, t } = topics[i];
+      if (i > 0 && topics[i - 1].t.order > t.order) {
+        console.log(`ORDER_DESC ${d.id}/${c.id}: ${topics[i - 1].t.title}(${topics[i - 1].t.order}) -> ${t.title}(${t.order})`);
+      }
+      if (seen.has(t.order)) {
+        console.log(`DUP_ORDER ${d.id}/${c.id}: ${t.order} ${seen.get(t.order)} / ${t.title}`);
+      }
+      seen.set(t.order, t.title);
+      if (t.interviewFrequency === 'low' && t.recommendWeight >= 85) {
+        console.log(`LOW_HIGH_WEIGHT ${d.id}/${c.id}: ${t.title} w=${t.recommendWeight} ${ref}`);
+      }
+      if (t.interviewFrequency === 'high' && t.recommendWeight < 75) {
+        console.log(`HIGH_LOW_WEIGHT ${d.id}/${c.id}: ${t.title} w=${t.recommendWeight} ${ref}`);
+      }
+    }
+  }
+}
+NODE
+```
+
+最终人工验收：
+
+1. 每个领域首屏都应从最基础、最高频、最能建立面试主线的内容开始。
+2. Java 基础与集合首屏应先看到核心集合和语言基础，而不是 Java 8+ 现代语法扩展。
+3. `Java新特性` 不再作为独立正式 topic。
+4. `其他集合` 不再出现并发题。
+5. Agent topic 不再串入 Java/Spring 示例。
+6. 全领域没有明显 low 频高权重、high 频低权重、重复 order、列表顺序与 order 冲突的问题。
+7. `npm run validate` 通过。

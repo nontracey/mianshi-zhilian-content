@@ -113,4 +113,70 @@ for (const file of topicFiles) {
   if (!topicRefs.has(file)) throw new Error(`${file} is not referenced by a domain category.`);
 }
 
-console.log(`Validated ${topicFiles.length} topics across ${manifest.domains.length} domains.`);
+// 顺序与权重检查（防止 App 展示顺序异常）
+const orderWeightWarnings = [];
+
+for (const domainEntry of manifest.domains) {
+  const domain = await readJson(domainEntry.entry);
+  for (const category of domain.categories) {
+    const topics = [];
+    for (const ref of category.topics) {
+      if (topicFiles.includes(ref)) {
+        const topic = JSON.parse(await readFile(path.join(root, ref), "utf8"));
+        topics.push({ ref, topic });
+      }
+    }
+
+    const seenOrders = new Map();
+    for (let i = 0; i < topics.length; i++) {
+      const { ref, topic } = topics[i];
+
+      // 检查 order 是否重复
+      if (seenOrders.has(topic.order)) {
+        orderWeightWarnings.push({
+          level: "warning",
+          file: ref,
+          message: `DUP_ORDER ${domain.id}/${category.id}: order=${topic.order} 与 "${seenOrders.get(topic.order).title}" 重复`
+        });
+      }
+      seenOrders.set(topic.order, topic);
+
+      // 检查列表顺序是否与 order 一致
+      if (i > 0 && topics[i - 1].topic.order > topic.order) {
+        orderWeightWarnings.push({
+          level: "warning",
+          file: ref,
+          message: `ORDER_DESC ${domain.id}/${category.id}: "${topics[i - 1].topic.title}"(order=${topics[i - 1].topic.order}) 排在 "${topic.title}"(order=${topic.order}) 前面`
+        });
+      }
+
+      // 检查 low 频高权重
+      if (topic.interviewFrequency === 'low' && topic.recommendWeight >= 85) {
+        orderWeightWarnings.push({
+          level: "warning",
+          file: ref,
+          message: `LOW_HIGH_WEIGHT ${domain.id}/${category.id}: "${topic.title}" 是 low 频但权重 ${topic.recommendWeight}`
+        });
+      }
+
+      // 检查 high 频低权重
+      if (topic.interviewFrequency === 'high' && topic.recommendWeight < 75) {
+        orderWeightWarnings.push({
+          level: "warning",
+          file: ref,
+          message: `HIGH_LOW_WEIGHT ${domain.id}/${category.id}: "${topic.title}" 是 high 频但权重 ${topic.recommendWeight}`
+        });
+      }
+    }
+  }
+}
+
+if (orderWeightWarnings.length > 0) {
+  console.log("\n=== 顺序与权重警告 ===");
+  for (const w of orderWeightWarnings) {
+    console.log(`${w.level.toUpperCase()}: ${w.message}`);
+  }
+  console.log(`共 ${orderWeightWarnings.length} 个警告`);
+}
+
+console.log(`\nValidated ${topicFiles.length} topics across ${manifest.domains.length} domains.`);
