@@ -7,6 +7,16 @@ const root = process.cwd();
 const forbidden = /(第\s*\d+[a-zA-Z]?\s*天|第\s*\d+[a-zA-Z]?\s*阶段|Day\s*\d+|今日练习与总结)/i;
 const boxDrawing = /[┌┐└┘├┤┬┴┼│─═╔╗╚╝╠╣╦╩╬]/;
 
+// 语义质量检查（P0/P1 整改完成后加入，防止模板化问题回流）
+const semanticChecks = [
+  { pattern: /今日笔记/, level: "fail", label: "今日笔记模板残留" },
+  { pattern: /面试话术/, level: "fail", label: "面试话术标签残留" },
+  { pattern: /在实际项目中使用.*你遇到过什么问题/, level: "fail", label: "泛化项目追问" },
+  { pattern: /在实际项目中是怎么用的.*有什么注意事项/, level: "fail", label: "泛化复述提问" },
+  { pattern: /结合项目经验|能做对比|能说明取舍/, level: "fail", label: "泛化 rubric 评价" },
+  { pattern: /面试表达清晰有条理.*能回答追问/, level: "fail", label: "泛化 rubric 表达" },
+];
+
 async function readJson(file) {
   return JSON.parse(await readFile(path.join(root, file), "utf8"));
 }
@@ -86,6 +96,15 @@ for (const file of topicFiles) {
     // 允许 explain 和 diagram 卡片包含 ASCII 图形（它们是知识内容的一部分）
     if (["code"].includes(card.type) && boxDrawing.test(card.content ?? "")) {
       throw new Error(`${file} contains box-drawing ASCII art in ${card.type}/${card.title}. Use diagram cards instead.`);
+    }
+  }
+  // 语义质量检查
+  const topicStr = JSON.stringify(topic);
+  for (const check of semanticChecks) {
+    if (check.pattern.test(topicStr)) {
+      const msg = `${file} ${check.label}: matches "${check.pattern}"`;
+      if (check.level === "fail") throw new Error(msg);
+      console.warn(`WARNING: ${msg}`);
     }
   }
   const weights = topic.rubric.scoreWeights;
