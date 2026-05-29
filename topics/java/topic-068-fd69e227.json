@@ -18,7 +18,12 @@
     {
       "type": "explain",
       "title": "知识全景",
-      "content": "# 锁机制\n## 1. 锁的分类\nMySQL 中的锁用于控制并发访问，保证数据一致性。不同存储引擎支持不同的锁粒度。\n### 要点\n- **按粒度**：表锁、页锁（BDB引擎）、行锁（InnoDB）\n- **按类型**：共享锁（S锁/读锁）、排他锁（X锁/写锁）、意向锁（IS/IX）\n- **行锁细分**：Record Lock（记录锁）、Gap Lock（间隙锁）、Next-Key Lock（临键锁）\n- **按思想**：乐观锁（CAS/版本号）、悲观锁（数据库锁）\n- MyISAM 只支持表锁，InnoDB 支持行锁（默认）+ 表锁\n### 锁分类总览\n```\nMySQL 锁\n├── 按粒度\n│   ├── 表锁：锁整张表，并发度低，开销小\n│   ├── 页锁：锁一页数据（BDB引擎，已淘汰）\n│   └── 行锁：锁一行数据，并发度高，开销大\n├── 按类型\n│   ├── 共享锁（S）：读锁，多个事务可同时持有\n│   ├── 排他锁（X）：写锁，独占，其他事务不能读写\n│   └── 意向锁（IS/IX）：表级锁，标识事务打算加行级S/X锁\n└── 行锁细分（InnoDB）\n├── Record Lock：锁住索引记录\n├── Gap Lock：锁住索引记录之间的间隙\n└── Next-Key Lock：Record Lock + Gap Lock\n```\n## 2. InnoDB行锁实现\n### 要点\n- InnoDB 行锁是通过给**索引记录**加锁实现的，不是锁行数据\n- 如果 SQL 没有使用索引，InnoDB 会退化为表锁（因为需要扫描所有行）\n- **Record Lock（记录锁）**：锁住索引记录本身，阻止其他事务修改/删除\n- **Gap Lock（间隙锁）**：锁住索引记录之间的间隙，阻止其他事务在间隙中插入\n- **Next-Key Lock（临键锁）**：Record Lock + Gap Lock，锁住记录及其前面的间隙\n- InnoDB 默认使用 Next-Key Lock，在可重复读级别下防止幻读\n### 加锁规则（RR级别）\n```\nNext-Key Lock = Record Lock + Gap Lock\n加锁规则：\n1. 等值查询（唯一索引）：命中 → Record Lock；未命中 → Gap Lock\n2. 等值查询（非唯一索引）：命中 → Next-Key Lock + 后一个 Gap Lock\n3. 范围查询（唯一索引）：对范围内的记录加 Next-Key Lock\n4. 范围查询（非唯一索引）：对范围内的记录加 Next-Key Lock\n```\n### 示例/代码\n```sql\n-- 表结构和数据\nCREATE TABLE t (\nid INT PRIMARY KEY,\nage INT,\nname VARCHAR(10),\nINDEX idx_age (age)\n) ENGINE=InnoDB;\n-- 数据: id=[1,5,10,15,20], age=[10,20,30,40,50]\n-- 1. Record Lock 示例\n-- 事务A\nSELECT * FROM t WHERE id = 5 FOR UPDATE;\n-- 加 Record Lock: 锁住 id=5 的记录\n-- 事务B 无法修改/删除 id=5，但可以插入 id=6\n-- 2. Gap Lock 示例\n-- 事务A\nSELECT * FROM t WHERE id = 8 FOR UPDATE;\n-- id=8 不存在，加 Gap Lock: 锁住 (5, 10) 的间隙\n-- 事务B 无法插入 id=6,7,8,9 的记录\n-- 3. Next-Key Lock 示例\n-- 事务A\nSELECT * FROM t WHERE age >= 20 AND age < 40 FOR UPDATE;\n-- 加 Next-Key Lock: (10,20], (20,30], (30,40]\n-- 事务B 无法在这些范围内插入新记录\n-- 4. 非唯一索引的加锁\n-- 事务A\nSELECT * FROM t WHERE age = 30 FOR UPDATE;\n-- 在 idx_age 上加 Next-Key Lock: (20, 30]\n-- 加 Gap Lock: (30, 40]\n-- 在主键上加 Record Lock: id=10\n```\n## 3. 表锁\n### 要点\n- **表锁**：锁住整张表，开销小但并发度低\n- **表锁类型**：表读锁（LOCK TABLES t READ）、表写锁（LOCK TABLES t WRITE）\n- **意向锁（IS/IX）**：表级锁，标识事务打算在表中加行级S锁或X锁\n- 意向锁之间不冲突，意向锁与表锁的兼容性需要单独判断\n- MDL（Metadata Lock）：DDL操作自动加MDL读锁，DML操作自动加MDL写锁\n### 意向锁作用\n```\n场景：事务A想加表锁，如何快速判断表中是否有行锁？\n没有意向锁：需要逐行扫描检查 → 效率低\n有意向锁：事务B加行锁前先加意向锁 → 事务A检查意向锁即可 → O(1)\n```\n## 4. 乐观锁与悲观锁\n### 要点\n- **悲观锁**：假设会冲突，先加锁再操作。数据库的S锁/X锁都是悲观锁\n- **乐观锁**：假设不冲突，提交时检查是否被修改。通过版本号或CAS实现\n- 乐观锁适用于读多写少场景，悲观锁适用于写多冲突多场景\n### 乐观锁实现\n```sql\n-- 版本号方式\n-- 1. 查询时获取版本号\nSELECT id, name, version FROM product WHERE id = 1;  -- version = 1\n-- 2. 更新时检查版本号\nUPDATE product SET name = 'new_name', version = version + 1\nWHERE id = 1 AND version = 1;\n-- 3. 如果 affected_rows = 0，说明被其他事务修改，需要重试\n```"
+      "content": "# 锁机制\n## 1. 锁的分类\nMySQL 中的锁用于控制并发访问，保证数据一致性。不同存储引擎支持不同的锁粒度。\n### 要点\n- **按粒度**：表锁、页锁（BDB引擎）、行锁（InnoDB）\n- **按类型**：共享锁（S锁/读锁）、排他锁（X锁/写锁）、意向锁（IS/IX）\n- **行锁细分**：Record Lock（记录锁）、Gap Lock（间隙锁）、Next-Key Lock（临键锁）\n- **按思想**：乐观锁（CAS/版本号）、悲观锁（数据库锁）\n- MyISAM 只支持表锁，InnoDB 支持行锁（默认）+ 表锁\n### 锁分类总览\n```\nMySQL 锁\n├── 按粒度\n│   ├── 表锁：锁整张表，并发度低，开销小\n│   ├── 页锁：锁一页数据（BDB引擎，已淘汰）\n│   └── 行锁：锁一行数据，并发度高，开销大\n├── 按类型\n│   ├── 共享锁（S）：读锁，多个事务可同时持有\n│   ├── 排他锁（X）：写锁，独占，其他事务不能读写\n│   └── 意向锁（IS/IX）：表级锁，标识事务打算加行级S/X锁\n└── 行锁细分（InnoDB）\n├── Record Lock：锁住索引记录\n├── Gap Lock：锁住索引记录之间的间隙\n└── Next-Key Lock：Record Lock + Gap Lock\n```\n## 2. InnoDB行锁实现\n### 要点\n- InnoDB 行锁是通过给**索引记录**加锁实现的，不是锁行数据\n- 如果 SQL 没有使用索引，InnoDB 会退化为表锁（因为需要扫描所有行）\n- **Record Lock（记录锁）**：锁住索引记录本身，阻止其他事务修改/删除\n- **Gap Lock（间隙锁）**：锁住索引记录之间的间隙，阻止其他事务在间隙中插入\n- **Next-Key Lock（临键锁）**：Record Lock + Gap Lock，锁住记录及其前面的间隙\n- InnoDB 默认使用 Next-Key Lock，在可重复读级别下防止幻读\n### 加锁规则（RR级别）\n```\nNext-Key Lock = Record Lock + Gap Lock\n加锁规则：\n1. 等值查询（唯一索引）：命中 → Record Lock；未命中 → Gap Lock\n2. 等值查询（非唯一索引）：命中 → Next-Key Lock + 后一个 Gap Lock\n3. 范围查询（唯一索引）：对范围内的记录加 Next-Key Lock\n4. 范围查询（非唯一索引）：对范围内的记录加 Next-Key Lock\n```\n### 示例/代码\n```sql\n-- 表结构和数据\nCREATE TABLE t (\nid INT PRIMARY KEY,\nage INT,\nname VARCHAR(10),\nINDEX idx_age (age)\n) ENGINE=InnoDB;\n-- 数据: id=[1,5,10,15,20], age=[10,20,30,40,50]\n-- 1. Record Lock 示例\n-- 事务A\nSELECT * FROM t WHERE id = 5 FOR UPDATE;\n-- 加 Record Lock: 锁住 id=5 的记录\n-- 事务B 无法修改/删除 id=5，但可以插入 id=6\n-- 2. Gap Lock 示例\n-- 事务A\nSELECT * FROM t WHERE id = 8 FOR UPDATE;\n-- id=8 不存在，加 Gap Lock: 锁住 (5, 10) 的间隙\n-- 事务B 无法插入 id=6,7,8,9 的记录\n-- 3. Next-Key Lock 示例\n-- 事务A\nSELECT * FROM t WHERE age >= 20 AND age < 40 FOR UPDATE;\n-- 加 Next-Key Lock: (10,20], (20,30], (30,40]\n-- 事务B 无法在这些范围内插入新记录\n-- 4. 非唯一索引的加锁\n-- 事务A\nSELECT * FROM t WHERE age = 30 FOR UPDATE;\n-- 在 idx_age 上加 Next-Key Lock: (20, 30]\n-- 加 Gap Lock: (30, 40]\n-- 在主键上加 Record Lock: id=10\n```"
+    },
+    {
+      "type": "explain",
+      "title": "深入理解",
+      "content": "## 3. 表锁\n### 要点\n- **表锁**：锁住整张表，开销小但并发度低\n- **表锁类型**：表读锁（LOCK TABLES t READ）、表写锁（LOCK TABLES t WRITE）\n- **意向锁（IS/IX）**：表级锁，标识事务打算在表中加行级S锁或X锁\n- 意向锁之间不冲突，意向锁与表锁的兼容性需要单独判断\n- MDL（Metadata Lock）：DDL操作自动加MDL读锁，DML操作自动加MDL写锁\n### 意向锁作用\n```\n场景：事务A想加表锁，如何快速判断表中是否有行锁？\n没有意向锁：需要逐行扫描检查 → 效率低\n有意向锁：事务B加行锁前先加意向锁 → 事务A检查意向锁即可 → O(1)\n```\n## 4. 乐观锁与悲观锁\n### 要点\n- **悲观锁**：假设会冲突，先加锁再操作。数据库的S锁/X锁都是悲观锁\n- **乐观锁**：假设不冲突，提交时检查是否被修改。通过版本号或CAS实现\n- 乐观锁适用于读多写少场景，悲观锁适用于写多冲突多场景\n### 乐观锁实现\n```sql\n-- 版本号方式\n-- 1. 查询时获取版本号\nSELECT id, name, version FROM product WHERE id = 1;  -- version = 1\n-- 2. 更新时检查版本号\nUPDATE product SET name = 'new_name', version = version + 1\nWHERE id = 1 AND version = 1;\n-- 3. 如果 affected_rows = 0，说明被其他事务修改，需要重试\n```"
     },
     {
       "type": "compareTable",
@@ -51,12 +56,16 @@
       "content": "**Q1：InnoDB的行锁有哪几种？分别什么作用？**\n\nA：InnoDB有三种行锁。Record Lock锁住索引记录本身，阻止其他事务修改或删除这条记录。Gap Lock锁住索引记录之间的间隙，阻止其他事务在间隙中插入新记录，主要用来防止幻读。Next-Key Lock是Record Lock和Gap Lock的组合，锁住记录及其前面的间隙，左开右闭区间。InnoDB在可重复读级别下默认使用Next-Key Lock。行锁是通过给索引记录加锁实现的，如果SQL没走索引，会退化为表锁。\n\n**Q2：什么情况下行锁会退化为表锁？**\n\nA：当SQL没有使用索引时，InnoDB无法确定要锁哪些行，只能对所有行加锁，相当于表锁。比如`UPDATE t SET name='x' WHERE age=30`，如果age列没有索引，InnoDB会扫描全表，对每一行都加锁。所以加锁的列一定要有索引，否则并发性能急剧下降。另外即使有索引，如果MySQL优化器判断全表扫描更快（比如数据量很小），也可能不走索引导致表锁。\n\n**Q3：乐观锁和悲观锁怎么选？**\n\nA：悲观锁假设会冲突，先加锁再操作，适合写多冲突多的场景，比如`SELECT ... FOR UPDATE`。乐观锁假设不冲突，提交时检查版本号或CAS，适合读多写少的场景。实现上悲观锁用数据库的`FOR UPDATE`或`LOCK IN SHARE MODE`，乐观锁在表中加version字段，UPDATE时带`WHERE version=old_version`，如果affected_rows=0说明被修改了需要重试。高并发秒杀场景推荐乐观锁，因为悲观锁会长时间持有锁导致其他事务等待。",
       "followUpQuestions": [
         {
-          "question": "能详细说说要点的具体原理吗？",
-          "answer": "关于要点，关键要理解它的底层机制。同时要注意和锁分类总览的区别。在实际开发中，这直接影响到我们如何选择合适的方案。"
+          "question": "锁机制的底层存储结构是什么？查询优化的关键在哪里？",
+          "answer": "这个问题可以从几个层面来回答。准确解释1. 锁的分类的定义和作用。能结合实际场景说明锁机制的应用。行锁三种类型（Record/Gap/Next-Key Lock）的锁定范围和作用。把这些要点串起来，就能给面试官一个有深度的回答。"
         },
         {
-          "question": "在实际项目中，你一般怎么选择？有什么经验？",
-          "answer": "在项目中做选择时，我通常会考虑几个维度：性能需求、团队熟悉度、维护成本。没有绝对的最优解，关键是能说清楚为什么选了当前方案，以及它的局限性在哪里。"
+          "question": "实际项目中，Record Lock和Gap Lock你会怎么选？能结合具体场景说说吗？",
+          "answer": "选型要看具体场景。以锁定对象为例，锁定对象：索引记录本身 vs 索引记录之间的间隙；锁定范围：精确一行 vs 开区间（不包含记录）；防止操作：修改/删除该记录 vs 在间隙中插入。关键不是哪个绝对更好，而是根据业务场景的约束条件做出合理选择，并能说清楚trade-off。"
+        },
+        {
+          "question": "有人说\"只背概念不理解锁机制的底层原理\"，这种说法对吗？为什么？",
+          "answer": "面试官确实喜欢从这个角度追问。常见误区有：只背概念不理解锁机制的底层原理；忽略锁机制的适用场景和局限性。回答时不要只是说\"这是错的\"，要解释为什么错、正确的做法是什么，最好能结合具体代码或场景。"
         }
       ]
     },
@@ -109,10 +118,10 @@
       "缺少实际案例支撑，回答空洞"
     ],
     "scoreWeights": {
-      "coverage": 40,
-      "accuracy": 25,
+      "coverage": 25,
+      "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 25
     }
   },
   "updatedAt": "2026-05-27",
