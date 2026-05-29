@@ -97,6 +97,9 @@ for (const file of topicFiles) {
     if (["code"].includes(card.type) && boxDrawing.test(card.content ?? "")) {
       throw new Error(`${file} contains box-drawing ASCII art in ${card.type}/${card.title}. Use diagram cards instead.`);
     }
+    if (card.type === "interviewAnswer" && /(^|[：:；;。])\s*1[）)]/.test(card.content ?? "")) {
+      throw new Error(`${file} contains inline numbered list in interviewAnswer/${card.title}. Use Markdown lists instead.`);
+    }
   }
   // 语义质量检查
   const topicStr = JSON.stringify(topic);

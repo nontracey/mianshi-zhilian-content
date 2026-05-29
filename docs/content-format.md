@@ -306,13 +306,13 @@ content-repo/
 
 ### 6.2 interviewAnswer
 
-面试回答模板，包含主回答和追问。
+面试回答模板，包含主回答和追问。`content` 支持 Markdown，涉及多个要点时必须使用 Markdown 有序列表或无序列表，不要写成 `1）...；2）...；3）...` 这种行内编号。App 已兼容 Markdown 渲染，列表拆行后更适合移动端阅读。
 
 ```json
 {
   "type": "interviewAnswer",
   "title": "面试回答模板",
-  "content": "JVM 运行时数据区可以先按线程私有和线程共享来讲……",
+  "content": "**问题：JVM 运行时数据区怎么划分？**\n\nJVM 运行时数据区可以先按线程私有和线程共享来讲。\n\n1. 线程私有区域包括程序计数器、虚拟机栈和本地方法栈。\n2. 线程共享区域包括堆和方法区。\n3. 堆是 GC 主要管理的区域，方法区主要存储类信息、常量和静态变量。",
   "followUpQuestions": [
     {
       "question": "能结合实际项目说说JVM调优经验吗？",
