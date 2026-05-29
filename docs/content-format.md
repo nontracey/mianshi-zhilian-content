@@ -572,100 +572,53 @@ content-repo/
 6. 发布内容仓库。
 7. App 下次同步后自动出现该知识点，不需要发新版 App。
 
-## 12. 内容结构同步规则
+## 12. JSON 结构契约同步规则
 
-当内容结构发生变更时（如新增/删除领域、分类、知识点，修改字段结构等），必须同步更新以下三个项目和相关文档，确保各端一致性：
+这里的“结构变更”只指最终 JSON 契约或 schema 发生变化，不指新增/删除领域、分类、知识点，也不指修改难度、频率、权重、排序、标题、正文等知识内容。
 
-### 12.1 需要同步的项目
+新增知识点、删除知识点、调整领域/分类/排序、修改 difficulty/recommendWeight/interviewFrequency 等，属于内容更新。按 App 部署文档要求更新 `manifest.json` 的 `contentVersion`，运行 schema 校验并发布内容即可；通常不需要发新版 App。
 
-| 项目 | 说明 | 同步内容 |
-|------|------|----------|
-| **内容维护平台** | 内容仓库（本项目） | 内容文件、manifest、schema、文档 |
-| **内容平台** | 独立项目，有 CI 流程 | 内容文件、topics 目录结构、CI 配置 |
-| **App 平台** | 移动端应用 | 内容解析逻辑、缓存机制、版本检测 |
+### 12.1 什么是 JSON 结构契约变更
 
-### 12.2 需要同步的文档
+以下情况才属于结构契约变更：
 
-| 文档 | 位置 | 更新内容 |
-|------|------|----------|
-| **README.md** | 内容维护平台根目录 | 目录结构、字段说明、更新流程 |
-| **content-format.md** | docs/ 目录 | 格式规范、字段定义、示例 |
-| **schema 文件** | schemas/ 目录 | JSON Schema 定义 |
-| **App 文档** | App 项目 | 内容解析逻辑、缓存策略 |
+1. topic、domain、manifest 字段更名、删除字段、增加必填字段。
+2. 新增字段且 App 或 content-studio 需要识别、编辑、筛选、渲染、排序、校验或生成该字段。
+3. 修改字段类型、字段语义、枚举值或嵌套对象结构。
+4. 新增 `learningCards.type`、`recallPrompts.mode` 等需要新渲染或新编辑能力的枚举。
+5. 修改 manifest/domain/topic 的加载入口、文件路径规则、draft/staging/production manifest 规则。
+6. 修改 schemaVersion/minAppVersion 兼容策略，或引入旧 App 不能忽略的新结构。
 
-### 12.3 同步检查清单
+### 12.2 结构契约变更时必须同步的项目
 
-- [ ] 内容维护平台：更新内容文件、manifest、schema
-- [ ] 内容平台：同步内容文件、更新 topics 目录结构
-- [ ] App 平台：更新内容解析逻辑、缓存机制
-- [ ] 文档：更新 README.md、content-format.md、schema 文件
-- [ ] 验证：运行 `npm run validate` 确保内容格式正确
-- [ ] 测试：在各端测试内容加载和显示
+| 项目 | 同步内容 |
+|------|----------|
+| **内容仓库** | `schemas/`、manifest 示例、校验脚本、生成脚本、内容格式文档、判断标准 |
+| **App 项目** | 内容解析模型、缓存/版本兼容逻辑、渲染逻辑、测试、App 对应文档 |
+| **content-studio 项目** | 类型定义、表单编辑器、AI 生成模板、校验流程、预览逻辑、发布流程、对应文档 |
 
-### 12.4 常见同步场景
+最终部署、内容版本、缓存刷新、schemaVersion/minAppVersion 策略，应参考 App 项目的部署文档：`/Users/yingjunchi/code/mianshi-zhilian-app/docs/deploy.md`。
 
-#### 场景一：新增领域
+### 12.3 内容更新检查清单
 
-1. **内容维护平台**
-   - 创建领域 JSON：`domains/{domain}.json`
-   - 生成知识点文件：`topics/{domain}/{filename}.json`
-   - 更新 `manifest.json` 的 `contentVersion`、`topicCount`
-   - 更新 README.md 的领域分类规则
+- [ ] 更新 `manifest.json` 的 `contentVersion`。
+- [ ] 更新相关 `topicCount`、`updatedAt` 和 domain topic 引用。
+- [ ] 运行 `npm run validate`。
+- [ ] 确认字段名、字段类型、枚举值、卡片类型没有变化。
+- [ ] 若只是内容值变化，通常不需要改 App 或 content-studio。
+- [ ] 若实际发现 App 渲染、缓存、content-studio 编辑或生成流程不兼容，再同步修对应项目和文档。
 
-2. **内容平台**
-   - 同步领域文件和知识点文件
-   - 更新 CI 配置（如有新目录）
-   - 更新 topics 目录结构
+### 12.4 结构契约变更检查清单
 
-3. **App 平台**
-   - 确保能正确解析新领域
-   - 测试领域切换和内容加载
-   - 更新缓存清理机制（如有需要）
-
-4. **文档**
-   - 更新 README.md 的领域分类规则
-   - 更新 content-format.md 的示例
-   - 更新 schema 文件（如有新字段）
-
-#### 场景二：修改知识点结构
-
-1. **内容维护平台**
-   - 更新知识点 JSON 文件
-   - 更新 schema 文件
-   - 更新 manifest.json 版本号
-
-2. **内容平台**
-   - 同步知识点文件
-   - 确保 CI 流程兼容新结构
-
-3. **App 平台**
-   - 更新内容解析逻辑
-   - 测试新字段的渲染
-   - 确保向后兼容
-
-4. **文档**
-   - 更新字段说明
-   - 更新示例代码
-   - 更新校验清单
-
-#### 场景三：删除内容
-
-1. **内容维护平台**
-   - 删除文件
-   - 更新 manifest.json
-   - 更新版本号
-
-2. **内容平台**
-   - 同步删除文件
-   - 确保 CI 流程正常
-
-3. **App 平台**
-   - 确保缓存清理机制正常
-   - 测试删除后的内容加载
-
-4. **文档**
-   - 更新相关说明
-   - 移除过时示例
+- [ ] 更新 `schemas/*.schema.json`。
+- [ ] 更新 `docs/content-format.md` 和相关内容标准。
+- [ ] 更新内容校验脚本和生成脚本。
+- [ ] 更新 App 内容解析、渲染、缓存和兼容逻辑。
+- [ ] 更新 App 项目文档，尤其是内容加载、部署和版本兼容说明。
+- [ ] 更新 content-studio 类型、表单、AI 生成模板、校验、预览和发布流程。
+- [ ] 更新 content-studio 对应文档。
+- [ ] 根据兼容性调整 `schemaVersion` 和 `minAppVersion`。
+- [ ] 运行内容仓库、App、content-studio 各自测试或校验。
 
 ### 12.5 同步失败处理
 
