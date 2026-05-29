@@ -47,45 +47,48 @@
 
 - IoC容器
 - Bean生命周期
-- SpringMVC原理
 - 循环依赖
 - AOP原理
 - 自动装配原理
 - SpringBoot启动流程
 - SpringBoot配置体系
-- MyBatis-Plus
+- SpringMVC原理
 - MyBatis核心原理
+- MyBatis-Plus
 - Spring AOP 深入
 
 ### 微服务治理
 
-- Gateway
-- Seata分布式事务
-- 分布式事务补充方案
 - Nacos
 - OpenFeign
+- Gateway
 - Sentinel
+- Seata分布式事务
+- 分布式事务补充方案
 
 ### 数据库
 
 - MySQL 索引原理
 - 事务机制
 - 锁机制
-- 慢SQL排查与容量拆分
+- MySQL MVCC
 - SQL优化
+- 慢SQL排查与容量拆分
 
 ### 中间件
 
-- Redis集群与高可用
 - Redis数据结构
-- 分布式锁(Redis/Zookeeper)
 - 持久化与内存
-- 设计模式在并发中的应用
+- Redis 过期删除与内存淘汰
 - 缓存问题
-- Kafka原理
+- Redis集群与高可用
+- 分布式锁(Redis/Zookeeper)
 - RabbitMQ原理
-- RocketMQ与选型
 - RabbitMQ消息可靠性
+- Kafka原理
+- 消息队列重试消费与幂等设计
+- RocketMQ与选型
+- 设计模式在并发中的应用
 
 ## Agent 开发
 
@@ -95,9 +98,11 @@
 - 大模型训练流程：预训练、SFT、RLHF、DPO
 - 推理机制与解码参数
 - Prompt Engineering
+- Token、上下文窗口与成本
 
 ### Embedding 与向量检索
 
+- Embedding 模型与相似度计算
 - 向量数据库索引与检索
 - 向量数据库核心能力对比
 
@@ -105,6 +110,7 @@
 
 - RAG基本链路
 - RAG进阶
+- RAG 召回策略
 - 文档分块策略
 - RAG 评估与优化
 
@@ -117,6 +123,7 @@
 - Agent架构与MCP
 - Agent状态管理
 - 多Agent协作模式
+- Prompt 注入与越权防护
 
 ### AI 工程化与 LLMOps
 
@@ -166,6 +173,8 @@
 ### 队列
 
 - 队列基础
+- 堆与优先队列基础
+- LeetCode 347: 前 K 个高频元素
 
 ### 哈希表
 
@@ -187,6 +196,8 @@
 - 图基础
 - LeetCode 200: 岛屿数量
 - LeetCode 207: 课程表
+- BFS 与 DFS 模板
+- 并查集基础
 
 ### 动态规划
 
@@ -269,6 +280,7 @@
 - JS数据类型与类型判断
 - 原型链与继承
 - 闭包与作用域
+- 浏览器渲染流程
 - Event Loop与异步
 - Promise与async/await
 - 手写Promise
@@ -291,9 +303,9 @@
 ### React深入
 
 - React核心概念与Fiber
-- React路由与数据加载
 - React Hooks 原理
 - React状态管理
+- React路由与数据加载
 - React性能优化
 - React并发渲染与自动批处理
 
@@ -313,10 +325,11 @@
 
 ### 前端工程化
 
-- Vite原理与对比
 - Webpack核心原理
+- Vite原理与对比
 - 前端CI/CD与发布
 - 前端监控与错误追踪
+- Tree Shaking 与代码分割
 
 ### 前端架构
 
@@ -336,7 +349,9 @@
 ### 网络与安全
 
 - HTTP/HTTPS/TCP协议
+- HTTP 缓存
 - 跨域与请求方案
+- Cookie、Session、Token 与 JWT
 - 前端安全防护
 
 ## 架构设计
