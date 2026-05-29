@@ -87,6 +87,56 @@ App 通过 `manifest.json` 中的 `contentVersion` 字段检测内容是否有�
 3. **验证内容**：`npm run validate`
 4. **提交并推送**
 
+### ⚠️ 内容结构同步规则（必读）
+
+当内容结构发生变更时（如新增/删除领域、分类、知识点，修改字段结构等），必须同步更新以下三个项目和相关文档，确保各端一致性：
+
+#### 需要同步的项目
+
+| 项目 | 说明 | 同步内容 |
+|------|------|----------|
+| **内容维护平台** | 当前工作区（本仓库） | 内容文件、manifest、schema、文档 |
+| **内容平台** | 独立项目，有 CI 流程 | 内容文件、topics 目录结构、CI 配置 |
+| **App 平台** | 移动端应用 | 内容解析逻辑、缓存机制、版本检测 |
+
+#### 需要同步的文档
+
+| 文档 | 位置 | 更新内容 |
+|------|------|----------|
+| **README.md** | 本仓库 | 目录结构、字段说明、更新流程 |
+| **content-format.md** | docs/ 目录 | 格式规范、字段定义、示例 |
+| **schema 文件** | schemas/ 目录 | JSON Schema 定义 |
+| **App 文档** | App 项目 | 内容解析逻辑、缓存策略 |
+
+#### 同步检查清单
+
+- [ ] 内容维护平台：更新内容文件、manifest、schema
+- [ ] 内容平台：同步内容文件、更新 topics 目录结构
+- [ ] App 平台：更新内容解析逻辑、缓存机制
+- [ ] 文档：更新 README.md、content-format.md、schema 文件
+- [ ] 验证：运行 `npm run validate` 确保内容格式正确
+- [ ] 测试：在各端测试内容加载和显示
+
+#### 常见同步场景
+
+1. **新增领域**
+   - 内容维护平台：创建领域 JSON、知识点文件、更新 manifest
+   - 内容平台：同步领域文件、更新 CI 配置
+   - App 平台：确保能正确解析新领域
+   - 文档：更新领域分类规则、示例
+
+2. **修改知识点结构**
+   - 内容维护平台：更新知识点 JSON、schema
+   - 内容平台：同步知识点文件
+   - App 平台：更新内容解析逻辑
+   - 文档：更新字段说明、示例
+
+3. **删除内容**
+   - 内容维护平台：删除文件、更新 manifest
+   - 内容平台：同步删除
+   - App 平台：确保缓存清理机制正常
+   - 文档：更新相关说明
+
 ### 更新版本号
 
 修改 `manifest.json`、`staging-manifest.json`、`draft-manifest.json` 中的 `contentVersion`：
@@ -141,8 +191,15 @@ if (remoteVersion != localVersion) {
 
 - `explain`：知识全景和关键机制拆解。
 - `compareTable` / `diagram` / `code`：对比边界、图示提示或代码抓手，至少一类深度卡片。
-- `interviewAnswer`：面试回答模板。
+- `interviewAnswer`：面试回答模板，含 `followUpQuestions` 追问。
 - `checklist`：学完后应能说清楚的检查项。
+
+每个 topic 推荐包含：
+
+- `prerequisites`：前置依赖知识点 ID，帮助 App 构建学习路径。
+- `interviewFrequency`：面试频率（`high`/`medium`/`low`），帮助学习者优先复习高频考点。
+- `interviewerFocus`：面试官关注点，帮助学习者理解考察方向。
+- `status`：生产状态（`production`/`draft`）。`npm run validate` 只校验 `production` 状态的知识点。
 
 ### 代码格式要求
 

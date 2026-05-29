@@ -1,7 +1,7 @@
 # 面试智练内容格式规范
 
-> 版本：v0.1  
-> 日期：2026-05-27  
+> 版本：v0.2  
+> 日期：2026-05-29  
 > 用途：供后续 AI 或人工编辑扩充“面试智练”知识内容时参考。新增领域、分类、知识点、动画和练习题时，应只修改内容仓库，不修改 App 代码。
 
 ## 1. 核心原则
@@ -98,11 +98,53 @@ content-repo/
       "topics": [
         "topics/java/topic-001-ebcc71cb.json",
         "topics/java/topic-002-3bee1565.json"
+      ],
+      "prerequisites": []
+    }
+  ],
+  "learningPaths": [
+    {
+      "id": "java-backend",
+      "title": "Java 后端面试路线",
+      "description": "从 JVM 基础到中间件，按依赖关系逐步深入",
+      "steps": [
+        {
+          "title": "JVM 基础",
+          "description": "理解内存区域、GC 机制、类加载",
+          "categoryIds": ["jvm"],
+          "estimatedHours": 4
+        },
+        {
+          "title": "并发编程",
+          "description": "线程、锁、线程池、并发容器",
+          "categoryIds": ["concurrency"],
+          "estimatedHours": 5,
+          "prerequisiteSteps": ["JVM 基础"]
+        }
       ]
     }
   ]
 }
 ```
+
+`learningPaths` 字段说明：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `id` | 是 | 学习路径 ID，全局唯一。 |
+| `title` | 是 | 学习路径名称。 |
+| `description` | 是 | 学习路径简介。 |
+| `steps` | 是 | 学习步骤数组，按推荐顺序排列。 |
+
+`steps` 步骤字段说明：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `title` | 是 | 步骤名称。 |
+| `description` | 是 | 步骤简介。 |
+| `categoryIds` | 是 | 该步骤包含的分类 ID 数组。 |
+| `estimatedHours` | 是 | 建议学习时长（小时）。 |
+| `prerequisiteSteps` | 否 | 前置步骤名称数组，例如 `["JVM 基础"]`。 |
 
 领域字段说明：
 
@@ -125,6 +167,7 @@ content-repo/
 | `description` | 是 | 分类简介。 |
 | `order` | 是 | 分类排序，数字越小越靠前。 |
 | `topics` | 是 | 该分类下的知识点 JSON 路径。 |
+| `prerequisites` | 否 | 前置依赖分类 ID 数组，例如 `["jvm", "concurrency"]`。 |
 
 ## 4.1 新领域规划格式
 
@@ -188,6 +231,10 @@ content-repo/
   "estimatedMinutes": 20,
   "order": 10,
   "recommendWeight": 90,
+  "status": "production",
+  "prerequisites": [],
+  "interviewFrequency": "high",
+  "interviewerFocus": "考察对JVM内存管理的理解深度，能否区分线程私有和共享区域",
   "learningCards": [
     {
       "type": "explain",
@@ -236,6 +283,10 @@ content-repo/
 | `recallPrompts` | 是 | 主动复述题。 |
 | `rubric` | 是 | AI 评估标准。 |
 | `sourceRef` | 否 | 内部溯源，不给用户展示。 |
+| `status` | 否 | 生产状态，`production`（正式）或 `draft`（草稿），默认 `draft`。 |
+| `prerequisites` | 否 | 前置依赖知识点 ID 数组，例如 `["java.jvm.runtime-data-area"]`。 |
+| `interviewFrequency` | 否 | 面试频率，`high`（高频）/ `medium`（中频）/ `low`（低频）。 |
+| `interviewerFocus` | 否 | 面试官关注点，说明面试官问这个知识点时真正想考察什么。 |
 
 ## 6. learningCards 类型
 
@@ -255,15 +306,32 @@ content-repo/
 
 ### 6.2 interviewAnswer
 
-面试回答模板。
+面试回答模板，包含主回答和追问。
 
 ```json
 {
   "type": "interviewAnswer",
   "title": "面试回答模板",
-  "content": "JVM 运行时数据区可以先按线程私有和线程共享来讲……"
+  "content": "JVM 运行时数据区可以先按线程私有和线程共享来讲……",
+  "followUpQuestions": [
+    {
+      "question": "能结合实际项目说说JVM调优经验吗？",
+      "answer": "GC调优的核心是理解对象的生命周期。新生代用复制算法，老年代用标记-清除……"
+    },
+    {
+      "question": "和JVM相关的替代方案有哪些？",
+      "answer": "对比方案时，核心是理解各自的适用场景和限制条件……"
+    }
+  ]
 }
 ```
+
+`followUpQuestions` 字段说明：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `question` | 是 | 面试官的追问问题。 |
+| `answer` | 是 | 针对该追问的参考回答，必须针对当前知识点的具体内容，禁止使用模板化回答。 |
 
 ### 6.3 compareTable
 
@@ -482,8 +550,11 @@ content-repo/
 - [ ] `domain` 在 manifest 中存在。
 - [ ] `category` 在领域文件中存在。
 - [ ] `learningCards` 至少包含一个 `explain`。
+- [ ] `interviewAnswer` 卡片的 `followUpQuestions` 至少 2 个，回答必须针对当前知识点。
 - [ ] `recallPrompts` 至少包含一个问题。
 - [ ] `rubric.mustHave` 不为空。
+- [ ] `interviewFrequency` 为 `high`/`medium`/`low` 之一。
+- [ ] `prerequisites` 中引用的知识点 ID 确实存在。 |
 - [ ] 动画类卡片有 `fallback`。
 - [ ] 所有资源路径存在。
 - [ ] `scoreWeights` 总和为 100。
@@ -500,3 +571,108 @@ content-repo/
 5. 运行 schema 校验。
 6. 发布内容仓库。
 7. App 下次同步后自动出现该知识点，不需要发新版 App。
+
+## 12. 内容结构同步规则
+
+当内容结构发生变更时（如新增/删除领域、分类、知识点，修改字段结构等），必须同步更新以下三个项目和相关文档，确保各端一致性：
+
+### 12.1 需要同步的项目
+
+| 项目 | 说明 | 同步内容 |
+|------|------|----------|
+| **内容维护平台** | 内容仓库（本项目） | 内容文件、manifest、schema、文档 |
+| **内容平台** | 独立项目，有 CI 流程 | 内容文件、topics 目录结构、CI 配置 |
+| **App 平台** | 移动端应用 | 内容解析逻辑、缓存机制、版本检测 |
+
+### 12.2 需要同步的文档
+
+| 文档 | 位置 | 更新内容 |
+|------|------|----------|
+| **README.md** | 内容维护平台根目录 | 目录结构、字段说明、更新流程 |
+| **content-format.md** | docs/ 目录 | 格式规范、字段定义、示例 |
+| **schema 文件** | schemas/ 目录 | JSON Schema 定义 |
+| **App 文档** | App 项目 | 内容解析逻辑、缓存策略 |
+
+### 12.3 同步检查清单
+
+- [ ] 内容维护平台：更新内容文件、manifest、schema
+- [ ] 内容平台：同步内容文件、更新 topics 目录结构
+- [ ] App 平台：更新内容解析逻辑、缓存机制
+- [ ] 文档：更新 README.md、content-format.md、schema 文件
+- [ ] 验证：运行 `npm run validate` 确保内容格式正确
+- [ ] 测试：在各端测试内容加载和显示
+
+### 12.4 常见同步场景
+
+#### 场景一：新增领域
+
+1. **内容维护平台**
+   - 创建领域 JSON：`domains/{domain}.json`
+   - 生成知识点文件：`topics/{domain}/{filename}.json`
+   - 更新 `manifest.json` 的 `contentVersion`、`topicCount`
+   - 更新 README.md 的领域分类规则
+
+2. **内容平台**
+   - 同步领域文件和知识点文件
+   - 更新 CI 配置（如有新目录）
+   - 更新 topics 目录结构
+
+3. **App 平台**
+   - 确保能正确解析新领域
+   - 测试领域切换和内容加载
+   - 更新缓存清理机制（如有需要）
+
+4. **文档**
+   - 更新 README.md 的领域分类规则
+   - 更新 content-format.md 的示例
+   - 更新 schema 文件（如有新字段）
+
+#### 场景二：修改知识点结构
+
+1. **内容维护平台**
+   - 更新知识点 JSON 文件
+   - 更新 schema 文件
+   - 更新 manifest.json 版本号
+
+2. **内容平台**
+   - 同步知识点文件
+   - 确保 CI 流程兼容新结构
+
+3. **App 平台**
+   - 更新内容解析逻辑
+   - 测试新字段的渲染
+   - 确保向后兼容
+
+4. **文档**
+   - 更新字段说明
+   - 更新示例代码
+   - 更新校验清单
+
+#### 场景三：删除内容
+
+1. **内容维护平台**
+   - 删除文件
+   - 更新 manifest.json
+   - 更新版本号
+
+2. **内容平台**
+   - 同步删除文件
+   - 确保 CI 流程正常
+
+3. **App 平台**
+   - 确保缓存清理机制正常
+   - 测试删除后的内容加载
+
+4. **文档**
+   - 更新相关说明
+   - 移除过时示例
+
+### 12.5 同步失败处理
+
+如果同步过程中出现问题：
+
+1. **立即回滚**：恢复到上一个正常版本
+2. **检查日志**：查看各项目的错误日志
+3. **逐步排查**：从内容维护平台开始，逐个检查各项目
+4. **测试验证**：在各端测试内容加载和显示
+5. **记录问题**：将问题记录到文档，避免下次再犯
