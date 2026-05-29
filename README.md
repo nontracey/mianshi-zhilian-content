@@ -252,6 +252,8 @@ App 每次加载最新 manifest/domain 后会按引用列表裁剪本地缓存�
 
 内容站通过 GitHub Actions + Wrangler CLI 部署到 Cloudflare Pages。`main` push 时自动触发：
 
+> **⚠️ 提交信息规范**：Cloudflare Pages API 不接受中文顿号 `、` 等特殊 Unicode 字符。请使用英文逗号 `,` 或其他 ASCII 标点替代。
+
 1. `npm ci && npm run validate` 校验内容
 2. 准备 `dist/` 目录
 3. `wrangler pages deploy dist --project-name=mianshi-zhilian-content` 部署
