@@ -247,6 +247,11 @@
 
 ## 设计模式
 
+### 设计原则与框架应用
+
+- SOLID原则
+- 设计模式在Spring中的应用
+
 ### 创建型模式
 
 - 单例模式
@@ -268,11 +273,6 @@
 - 责任链模式
 - 状态模式
 
-### 设计原则与框架应用
-
-- SOLID原则
-- 设计模式在Spring中的应用
-
 ## 前端八股
 
 ### JavaScript基础
@@ -287,18 +287,26 @@
 - 深拷贝与浅拷贝
 - 防抖与节流
 
-### TypeScript
+### 网络与安全
 
-- TS基础类型与类型系统
-- 泛型与工具类型
-- TypeScript 高级类型编程
-- TS与JS互操作与工程配置
+- HTTP/HTTPS/TCP协议
+- HTTP 缓存
+- 跨域与请求方案
+- Cookie、Session、Token 与 JWT
+- 前端安全防护
 
 ### CSS与布局
 
 - 盒模型与BFC
 - Flex与Grid布局
 - 响应式设计与CSS工程化
+
+### TypeScript
+
+- TS基础类型与类型系统
+- 泛型与工具类型
+- TS与JS互操作与工程配置
+- TypeScript 高级类型编程
 
 ### React深入
 
@@ -316,6 +324,14 @@
 - Vue编译与虚拟DOM
 - Vue生态（Pinia/Vue Router）
 
+### 前端工程化
+
+- Webpack核心原理
+- Vite原理与对比
+- Tree Shaking 与代码分割
+- 前端CI/CD与发布
+- 前端监控与错误追踪
+
 ### Node.js
 
 - Node.js核心概念
@@ -323,20 +339,12 @@
 - Koa/Express框架原理
 - Node.js 进程管理与线上排查
 
-### 前端工程化
-
-- Webpack核心原理
-- Vite原理与对比
-- 前端CI/CD与发布
-- 前端监控与错误追踪
-- Tree Shaking 与代码分割
-
 ### 前端架构
 
 - 前端状态管理架构
-- 微前端架构
-- 前端加载性能优化
 - 前端路由原理
+- 前端加载性能优化
+- 微前端架构
 - BFF与全栈架构
 
 ### 客户端开发
@@ -345,14 +353,6 @@
 - 跨平台方案对比
 - React Native核心原理
 - 移动端适配与性能
-
-### 网络与安全
-
-- HTTP/HTTPS/TCP协议
-- HTTP 缓存
-- 跨域与请求方案
-- Cookie、Session、Token 与 JWT
-- 前端安全防护
 
 ## 架构设计
 
@@ -498,3 +498,4 @@
 
 - WebSocket 协议原理
 - WebSocket 与长轮询对比
+

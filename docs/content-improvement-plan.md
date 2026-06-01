@@ -1,16 +1,19 @@
 # 面试知识内容更新计划
 
-> 更新日期：2026-05-29  
+> 更新日期：2026-06-01  
 > 依据标准：`docs/knowledge-content-standard.md`  
 > 当前结论：本轮“小范围统一增强”已完成。现有内容已达到可发布基线，后续优化以定期抽查和少量高频缺口补充为主，不建议再做大规模重写。  
 
 ## 1. 总体判断
 
-当前 `topics/` 下 298 个知识点已经通过结构校验：
+当前 `topics/` 下 298 个知识点已经通过结构校验和结构化质量扫描：
 
 ```text
 npm run validate
 Validated 298 topics across 9 domains.
+
+npm run quality:scan
+Quality scan passed: no template text, generic frontend follow-up, placeholder answer, or unsafe inline numbering found.
 ```
 
 从标准角度看，现有内容满足以下基线：
@@ -52,6 +55,40 @@ Validated 298 topics across 9 domains.
 5. recallPrompts 少于 2 条、summary 冒号结尾、泛化 recall 句式已清零。
 
 ## 3. 本轮执行计划（已完成）
+
+### 2026-06-01 内容质量提升补充 ✅
+
+本轮按《面试智练-知识内容质量提升方案》完成 P0/P1/P2/P3/P5 收口，未修改 JSON 契约。
+
+1. P0 默认学习顺序复查：
+   - 前端学习路径调整为 `JavaScript 基础 -> 网络与安全 -> CSS 与布局 -> TypeScript -> React 深入 -> Vue 框架 -> 前端工程化 -> Node.js -> 前端架构 -> 客户端开发`。
+   - 设计模式 `principles` 分类前置到模式分类之前。
+   - 全领域 order/权重扫描无重复 order、列表倒挂、high 低权重、low 高权重问题。
+
+2. P1 权重与频率校准：
+   - Java 高频核心、网络 TCP/UDP、前端 HTTP/HTTPS/TCP、设计模式适配器、前端扩展、架构低频扩展、.NET 扩展 topic 已按 high/medium/low 区间校准。
+   - LeetCode 题权重按真实面试频率做差异化，不再全部集中在同一权重。
+
+3. P1 文本与格式清理：
+   - 清理 `建议结合实际项目`、`没有银弹`、`理论和实践脱节`、前端 React/Vue 通用追问、占位式追问答案。
+   - 将结构化扫描能确认的正文行内编号改为 Markdown 列表；合法的版本号、比例、代码注释不作为问题处理。
+
+4. P2 高频 topic 精修：
+   - Java 高频 8 个：HashMap、ConcurrentHashMap、线程池、ThreadLocal、MySQL 索引、MySQL MVCC、Redis 数据结构、RabbitMQ 消息可靠性。
+   - 前端 高频 8 个：JS 类型、原型链、闭包、Event Loop、Promise/async、React Hooks、Vue 响应式、跨域。
+   - Agent 高频 7 个：Prompt Engineering、Token/上下文成本、Embedding、RAG 基本链路、RAG 召回策略、Function Calling、Prompt 注入。
+   - 算法基础 8 个：数组、链表、双指针、滑动窗口、二叉树、图、动态规划、回溯。
+   - 网络/OS 高频 7 个：TCP/UDP、TCP 握手挥手、HTTPS、DNS、进程线程、虚拟内存、select/poll/epoll。
+
+5. P2 元数据与边界校准：
+   - 高频 topic 学习时长、tags、recommendWeight、interviewFrequency 已复查。
+   - 前置依赖倒挂扫描无问题。
+   - 低频扩展 topic 保留在扩展分类或后置位置，不通过高权重挤占基础内容。
+
+6. P3 标准固化：
+   - 新增 `scripts/quality_scan.mjs` 和 `npm run quality:scan`。
+   - `scripts/validate_content.mjs` 增加前端通用追问和占位答案防回流规则。
+   - 更新 `docs/content-format.md`、`docs/knowledge-content-standard.md` 和 `docs/knowledge-directory.md`。
 
 ### P1. App 学习顺序微调 ✅
 

@@ -308,6 +308,8 @@ content-repo/
 
 面试回答模板，包含主回答和追问。`content` 支持 Markdown，涉及多个要点时必须使用 Markdown 有序列表或无序列表，不要写成 `1）...；2）...；3）...` 这种行内编号。App 已兼容 Markdown 渲染，列表拆行后更适合移动端阅读。
 
+高频 topic 的 `interviewAnswer.content` 应能明显读出三层结构：先用一小段给 30 秒结论，再用列表解释核心机制，最后补充追问边界、常见坑或方案取舍。可以不机械使用固定标题，但不要只堆清单或代码。
+
 ```json
 {
   "type": "interviewAnswer",

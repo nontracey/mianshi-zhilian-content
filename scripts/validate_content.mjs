@@ -15,6 +15,8 @@ const semanticChecks = [
   { pattern: /在实际项目中是怎么用的.*有什么注意事项/, level: "fail", label: "泛化复述提问" },
   { pattern: /结合项目经验|能做对比|能说明取舍/, level: "fail", label: "泛化 rubric 评价" },
   { pattern: /面试表达清晰有条理.*能回答追问/, level: "fail", label: "泛化 rubric 表达" },
+  { pattern: /回答时要先给出机制结论/, level: "fail", label: "占位式追问答案" },
+  { pattern: /在现代前端框架（React\/Vue）中的应用和注意事项是什么/, level: "fail", label: "前端通用追问模板" },
 ];
 
 async function readJson(file) {
