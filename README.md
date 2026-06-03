@@ -334,7 +334,7 @@ https://mianshi-zhilian-content.pages.dev/manifest.json
 
 https://mianshizhilian-content.nontracey.de5.net/manifest.json
 
-两个域名必须指向同一份 `dist/` 产物，`manifest.json`、`staging-manifest.json`、`draft-manifest.json`、`domains/`、`topics/`、`schemas/`、`assets/` 路径需要保持一致。部署 workflow 会在发布后检查主备 manifest 路径可访问。
+两个域名必须指向同一份 `dist/` 产物，`manifest.json`、`staging-manifest.json`、`draft-manifest.json`、`domains/`、`topics/`、`schemas/`、`assets/` 路径需要保持一致。部署 workflow 会在发布后比较主备 manifest 内容，并抽样检查 domain、topic、schema、asset 深路径可访问。
 ```
 
 ## 常见问题

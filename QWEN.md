@@ -157,7 +157,7 @@ npm ci && npm run validate
 - 主用：<https://mianshi-zhilian-content.pages.dev/manifest.json>
 - 备用：<https://mianshizhilian-content.nontracey.de5.net/manifest.json>
 
-主备域名必须绑定到同一份 Cloudflare Pages 内容产物，所有 manifest、domains、topics、schemas、assets 路径保持一一对应。部署后 workflow 会验证 pages.dev 与 de5.net 的 manifest/staging/draft 三个入口。
+主备域名必须绑定到同一份 Cloudflare Pages 内容产物，所有 manifest、domains、topics、schemas、assets 路径保持一一对应。部署后 workflow 会比较 pages.dev 与 de5.net 的 manifest/staging/draft 内容，并抽样验证 domain、topic、schema、asset 深路径。
 
 **必需配置**（GitHub Secrets）：
 
