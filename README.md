@@ -33,6 +33,7 @@ topics/{domain}/{filename}.json
 ```
 
 **✅ 正确示例：**
+
 ```json
 {
   "id": "jvm",
@@ -68,6 +69,7 @@ topics/{domain}/{filename}.json
 ### 自动修复路径脚本
 
 如果发现topics数组格式不对，运行：
+
 ```bash
 python3 scripts/validate_paths.py --fix
 ```
@@ -93,20 +95,20 @@ App 通过 `manifest.json` 中的 `contentVersion` 字段检测内容是否有�
 
 #### 需要同步的项目
 
-| 项目 | 说明 | 同步内容 |
-|------|------|----------|
-| **内容维护平台** | 当前工作区（本仓库） | 内容文件、manifest、schema、文档 |
-| **内容平台** | 独立项目，有 CI 流程 | 内容文件、topics 目录结构、CI 配置 |
-| **App 平台** | 移动端应用 | 内容解析逻辑、缓存机制、版本检测 |
+| 项目             | 说明                 | 同步内容                           |
+| ---------------- | -------------------- | ---------------------------------- |
+| **内容维护平台** | 当前工作区（本仓库） | 内容文件、manifest、schema、文档   |
+| **内容平台**     | 独立项目，有 CI 流程 | 内容文件、topics 目录结构、CI 配置 |
+| **App 平台**     | 移动端应用           | 内容解析逻辑、缓存机制、版本检测   |
 
 #### 需要同步的文档
 
-| 文档 | 位置 | 更新内容 |
-|------|------|----------|
-| **README.md** | 本仓库 | 目录结构、字段说明、更新流程 |
-| **content-format.md** | docs/ 目录 | 格式规范、字段定义、示例 |
-| **schema 文件** | schemas/ 目录 | JSON Schema 定义 |
-| **App 文档** | App 项目 | 内容解析逻辑、缓存策略 |
+| 文档                  | 位置          | 更新内容                     |
+| --------------------- | ------------- | ---------------------------- |
+| **README.md**         | 本仓库        | 目录结构、字段说明、更新流程 |
+| **content-format.md** | docs/ 目录    | 格式规范、字段定义、示例     |
+| **schema 文件**       | schemas/ 目录 | JSON Schema 定义             |
+| **App 文档**          | App 项目      | 内容解析逻辑、缓存策略       |
 
 #### 同步检查清单
 
@@ -209,7 +211,7 @@ if (remoteVersion != localVersion) {
 ```java
 public class Example {
     private int count;  // 缩进会被保留
-    
+
     public void method() {
         // 这里的缩进也会保留
         if (count > 0) {
@@ -221,6 +223,7 @@ public class Example {
 ````
 
 **注意**：
+
 - 代码块必须用 ` ``` ` 包裹
 - 缩进使用 4 个空格或 Tab
 - 生成脚本会自动检测已有缩进，不会重新格式化
@@ -231,79 +234,79 @@ App 每次加载最新 manifest/domain 后会按引用列表裁剪本地缓存�
 
 ### Java 领域
 
-| 分类 ID | 名称 | 关键词 |
-|---------|------|--------|
-| jvm | JVM | JVM, GC, 类加载, 垃圾回收, 堆内存, 元空间 |
-| concurrency | 并发编程 | 并发, 线程, 锁, AQS, ThreadLocal, volatile, synchronized |
-| collections | 集合与 Java 基础 | 集合, HashMap, ArrayList, 泛型, 反射, 注解 |
-| spring | Spring 生态 | Spring, MyBatis, Nacos, Gateway, OpenFeign, Sentinel |
-| database | 数据库与中间件 | MySQL, Redis, RabbitMQ, Kafka, 事务, 索引, SQL |
+| 分类 ID     | 名称             | 关键词                                                   |
+| ----------- | ---------------- | -------------------------------------------------------- |
+| jvm         | JVM              | JVM, GC, 类加载, 垃圾回收, 堆内存, 元空间                |
+| concurrency | 并发编程         | 并发, 线程, 锁, AQS, ThreadLocal, volatile, synchronized |
+| collections | 集合与 Java 基础 | 集合, HashMap, ArrayList, 泛型, 反射, 注解               |
+| spring      | Spring 生态      | Spring, MyBatis, Nacos, Gateway, OpenFeign, Sentinel     |
+| database    | 数据库与中间件   | MySQL, Redis, RabbitMQ, Kafka, 事务, 索引, SQL           |
 
 ### Agent 领域
 
-| 分类 ID | 名称 | 关键词 |
-|---------|------|--------|
-| llm | LLM 基础 | Transformer, 大模型, LLM, Prompt, 注意力机制 |
-| rag | RAG 与向量检索 | RAG, 向量, Embedding, 检索, 向量数据库 |
-| agent-architecture | Agent 架构 | Agent, MCP, Function Calling, LangChain |
-| ai-engineering | AI 工程化 | 工程化, 评估, 观测, 安全, 合规, 项目, Python |
+| 分类 ID            | 名称           | 关键词                                       |
+| ------------------ | -------------- | -------------------------------------------- |
+| llm                | LLM 基础       | Transformer, 大模型, LLM, Prompt, 注意力机制 |
+| rag                | RAG 与向量检索 | RAG, 向量, Embedding, 检索, 向量数据库       |
+| agent-architecture | Agent 架构     | Agent, MCP, Function Calling, LangChain      |
+| ai-engineering     | AI 工程化      | 工程化, 评估, 观测, 安全, 合规, 项目, Python |
 
 ### Algorithm 领域
 
-| 分类 ID | 名称 | 关键词 |
-|---------|------|--------|
-| array-list | 数组与链表 | 数组, 链表, 数据结构 |
-| tree-graph | 树与图 | 二叉树, 图, 最短路径, 设计题 |
-| dynamic-programming | 动态规划 | 动态规划, DP, 背包 |
-| string-search | 字符串、排序与查找 | 字符串, 排序, 二分, 查找 |
-| stack-queue | 栈与队列 | 栈, 队列, 单调栈, 堆, 优先队列 |
-| hash-greedy | 哈希与贪心 | 哈希表, 贪心, 区间调度 |
-| backtracking | 回溯算法 | 回溯, 搜索, 剪枝, 组合, 排列 |
+| 分类 ID             | 名称               | 关键词                         |
+| ------------------- | ------------------ | ------------------------------ |
+| array-list          | 数组与链表         | 数组, 链表, 数据结构           |
+| tree-graph          | 树与图             | 二叉树, 图, 最短路径, 设计题   |
+| dynamic-programming | 动态规划           | 动态规划, DP, 背包             |
+| string-search       | 字符串、排序与查找 | 字符串, 排序, 二分, 查找       |
+| stack-queue         | 栈与队列           | 栈, 队列, 单调栈, 堆, 优先队列 |
+| hash-greedy         | 哈希与贪心         | 哈希表, 贪心, 区间调度         |
+| backtracking        | 回溯算法           | 回溯, 搜索, 剪枝, 组合, 排列   |
 
 ### 设计模式领域
 
-| 分类 ID | 名称 | 关键词 |
-|---------|------|--------|
-| creational | 创建型模式 | 单例, 工厂, 建造者 |
-| structural | 结构型模式 | 代理, 适配器, 装饰器, 门面 |
-| behavioral | 行为型模式 | 策略, 模板方法, 观察者, 责任链, 状态 |
-| principles | 设计原则与实战 | SOLID, 设计模式在Spring中的应用 |
+| 分类 ID    | 名称           | 关键词                               |
+| ---------- | -------------- | ------------------------------------ |
+| creational | 创建型模式     | 单例, 工厂, 建造者                   |
+| structural | 结构型模式     | 代理, 适配器, 装饰器, 门面           |
+| behavioral | 行为型模式     | 策略, 模板方法, 观察者, 责任链, 状态 |
+| principles | 设计原则与实战 | SOLID, 设计模式在Spring中的应用      |
 
 ### 前端八股领域
 
-| 分类 ID | 名称 | 关键词 |
-|---------|------|--------|
-| js-fundamentals | JavaScript基础 | 数据类型, 原型链, 闭包, Event Loop, Promise |
-| typescript | TypeScript | 类型系统, 泛型, 类型体操 |
-| css-layout | CSS与布局 | 盒模型, BFC, Flex, Grid |
-| react | React深入 | Fiber, Hooks, 状态管理, 性能优化 |
-| vue | Vue框架 | 响应式, 组合式API, 编译优化 |
-| nodejs | Node.js | 事件循环, 模块系统, Koa, Express |
-| engineering | 前端工程化 | Webpack, Vite, CI/CD, 监控 |
-| frontend-architecture | 前端架构 | 状态管理, 微前端, 性能优化, 路由 |
-| client-dev | 客户端开发 | Electron, React Native, 跨平台 |
-| network-security | 网络与安全 | HTTP, HTTPS, 跨域, XSS, CSRF |
+| 分类 ID               | 名称           | 关键词                                      |
+| --------------------- | -------------- | ------------------------------------------- |
+| js-fundamentals       | JavaScript基础 | 数据类型, 原型链, 闭包, Event Loop, Promise |
+| typescript            | TypeScript     | 类型系统, 泛型, 类型体操                    |
+| css-layout            | CSS与布局      | 盒模型, BFC, Flex, Grid                     |
+| react                 | React深入      | Fiber, Hooks, 状态管理, 性能优化            |
+| vue                   | Vue框架        | 响应式, 组合式API, 编译优化                 |
+| nodejs                | Node.js        | 事件循环, 模块系统, Koa, Express            |
+| engineering           | 前端工程化     | Webpack, Vite, CI/CD, 监控                  |
+| frontend-architecture | 前端架构       | 状态管理, 微前端, 性能优化, 路由            |
+| client-dev            | 客户端开发     | Electron, React Native, 跨平台              |
+| network-security      | 网络与安全     | HTTP, HTTPS, 跨域, XSS, CSRF                |
 
 ### 架构设计领域
 
-| 分类 ID | 名称 | 关键词 |
-|---------|------|--------|
-| methodology | 架构方法论 | DDD, CQRS, 事件驱动, 六边形架构 |
-| microservice | 微服务设计 | 服务拆分, 分布式事务, 分布式锁, 限流 |
-| system-design | 系统设计 | 秒杀, 消息队列, 缓存, 分库分表 |
-| project-design | 项目架构设计 | 多租户, 低代码, API网关 |
+| 分类 ID        | 名称         | 关键词                               |
+| -------------- | ------------ | ------------------------------------ |
+| methodology    | 架构方法论   | DDD, CQRS, 事件驱动, 六边形架构      |
+| microservice   | 微服务设计   | 服务拆分, 分布式事务, 分布式锁, 限流 |
+| system-design  | 系统设计     | 秒杀, 消息队列, 缓存, 分库分表       |
+| project-design | 项目架构设计 | 多租户, 低代码, API网关              |
 
 ### .NET 开发领域
 
-| 分类 ID | 名称 | 关键词 |
-|---------|------|--------|
-| csharp | C# 语言基础 | 类型系统, LINQ, async/await, 泛型, 反射 |
-| dotnet-core | .NET Core / .NET 8+ | 依赖注入, 中间件, 配置, 日志, GC |
-| aspnet | ASP.NET Core | Web API, 过滤器, 认证授权, SignalR |
-| ef-core | EF Core 与数据库 | ORM, 迁移, 性能, 仓储模式, 多租户 |
-| client | 客户端开发 | WPF, MAUI, Avalonia, XAML绑定 |
-| microservice-dotnet | .NET 微服务 | gRPC, MassTransit, Polly, Ocelot |
-| advanced | 高级主题 | 性能调优, 内存管理, 设计模式, .NET vs Java |
+| 分类 ID             | 名称                | 关键词                                     |
+| ------------------- | ------------------- | ------------------------------------------ |
+| csharp              | C# 语言基础         | 类型系统, LINQ, async/await, 泛型, 反射    |
+| dotnet-core         | .NET Core / .NET 8+ | 依赖注入, 中间件, 配置, 日志, GC           |
+| aspnet              | ASP.NET Core        | Web API, 过滤器, 认证授权, SignalR         |
+| ef-core             | EF Core 与数据库    | ORM, 迁移, 性能, 仓储模式, 多租户          |
+| client              | 客户端开发          | WPF, MAUI, Avalonia, XAML绑定              |
+| microservice-dotnet | .NET 微服务         | gRPC, MassTransit, Polly, Ocelot           |
+| advanced            | 高级主题            | 性能调优, 内存管理, 设计模式, .NET vs Java |
 
 ## 部署
 
@@ -323,7 +326,15 @@ App 每次加载最新 manifest/domain 后会按引用列表裁剪本地缓存�
 正式内容入口：
 
 ```text
+主用:
+
 https://mianshi-zhilian-content.pages.dev/manifest.json
+
+备用:
+
+https://mianshizhilian-content.nontracey.de5.net/manifest.json
+
+两个域名必须指向同一份 `dist/` 产物，`manifest.json`、`staging-manifest.json`、`draft-manifest.json`、`domains/`、`topics/`、`schemas/`、`assets/` 路径需要保持一致。部署 workflow 会在发布后检查主备 manifest 路径可访问。
 ```
 
 ## 常见问题
@@ -335,12 +346,14 @@ https://mianshi-zhilian-content.pages.dev/manifest.json
 ### Q: 如何强制刷新 App 缓存？
 
 **A:** 两种方式：
+
 1. 更新 `contentVersion` 并重新部署（App 下次启动会自动检测）
 2. 在 App **个人中心 → 知识源配置 → 应用并重载**（立即清空缓存并重新加载）
 
 ### Q: 切换领域后内容没有更新？
 
 **A:** App 按领域独立缓存，切换领域时会检查该领域是否需要刷新：
+
 - 如果内容版本有更新，会从网络重新加载
 - 如果版本没有变化，使用本地缓存
 - 可以点击"应用并重载"强制刷新所有领域

@@ -10,13 +10,13 @@
 
 ## 技术栈
 
-| 技术 | 用途 |
-|------|------|
-| Node.js 22 | 脚本运行环境 |
-| JSON / JSON Schema | 内容格式与校验 (Ajv) |
-| Cloudflare Pages | 静态部署 |
-| GitHub Actions | CI/CD: 验证 + 自动部署 |
-| Wrangler CLI | Pages 部署工具 |
+| 技术               | 用途                   |
+| ------------------ | ---------------------- |
+| Node.js 22         | 脚本运行环境           |
+| JSON / JSON Schema | 内容格式与校验 (Ajv)   |
+| Cloudflare Pages   | 静态部署               |
+| GitHub Actions     | CI/CD: 验证 + 自动部署 |
+| Wrangler CLI       | Pages 部署工具         |
 
 ## 目录结构
 
@@ -76,45 +76,45 @@ manifest.json  (入口，包含领域列表 + 版本号)
 
 每个 topic JSON 文件必须包含：
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | string | 格式 `{domain}.{category}.{slug}` |
-| title | string | 知识点标题 |
-| summary | string | 一句话概述 |
-| difficulty | 1-5 int | 难度等级 |
-| estimatedMinutes | int | 预估学习时长 |
-| order | int | 排序序号 |
-| recommendWeight | 0-100 int | 推荐权重 |
-| learningCards | array | **必须包含**: explain, interviewAnswer, checklist |
-| | | **至少一项**: compareTable / diagram / code |
-| recallPrompts | array | 回顾提醒问题 (至少1个) |
-| rubric | object | 评分标准 (mustHave, goodToHave, commonMistakes, scoreWeights 总和=100) |
+| 字段             | 类型      | 说明                                                                   |
+| ---------------- | --------- | ---------------------------------------------------------------------- |
+| id               | string    | 格式 `{domain}.{category}.{slug}`                                      |
+| title            | string    | 知识点标题                                                             |
+| summary          | string    | 一句话概述                                                             |
+| difficulty       | 1-5 int   | 难度等级                                                               |
+| estimatedMinutes | int       | 预估学习时长                                                           |
+| order            | int       | 排序序号                                                               |
+| recommendWeight  | 0-100 int | 推荐权重                                                               |
+| learningCards    | array     | **必须包含**: explain, interviewAnswer, checklist                      |
+|                  |           | **至少一项**: compareTable / diagram / code                            |
+| recallPrompts    | array     | 回顾提醒问题 (至少1个)                                                 |
+| rubric           | object    | 评分标准 (mustHave, goodToHave, commonMistakes, scoreWeights 总和=100) |
 
 **可选字段**：prerequisites（前置依赖）、interviewFrequency（high/medium/low）、interviewerFocus、status（production/draft）
 
 ### 三个环境入口
 
-| 文件 | 用途 |
-|------|------|
-| `manifest.json` | 生产环境 - 线上 App 正式使用 |
-| `staging-manifest.json` | 测试环境 - 预发布验证 |
-| `draft-manifest.json` | 草稿环境 - 开发中的内容 |
+| 文件                    | 用途                         |
+| ----------------------- | ---------------------------- |
+| `manifest.json`         | 生产环境 - 线上 App 正式使用 |
+| `staging-manifest.json` | 测试环境 - 预发布验证        |
+| `draft-manifest.json`   | 草稿环境 - 开发中的内容      |
 
 staging 和 draft manifest 中的 `environment` 字段标识环境类型。
 
 ### 9 个领域
 
-| 领域 | topic 数 | 分类 |
-|------|---------|------|
-| Java 核心与中间件 | 67 | java-fundamentals, jvm, concurrency, spring, microservice, database, middleware |
-| Agent 开发 | 26 | llm-foundation, embedding-retrieval, rag, agent-architecture, ai-engineering |
-| 算法与数据结构 | 62 | 数组链表/树图/DP/字符串排序/栈队列/哈希贪心/回溯 |
-| 设计模式 | 14 | 创建型/结构型/行为型/原则 |
-| 前端八股 | 49 | JS/TS/CSS/React/Vue/Node.js/工程化/架构/客户端/网络安全 |
-| 架构设计 | 21 | 方法论/微服务/系统设计/项目架构 |
-| .NET 开发 | 31 | C#/.NET Core/ASP.NET/EF Core/客户端/微服务/高级 |
-| 操作系统与 Linux | 15 | 进程线程/内存管理/IO 模型/Linux 基础 |
-| 计算机网络 | 13 | TCP/UDP/HTTP/HTTPS/DNS/WebSocket |
+| 领域              | topic 数 | 分类                                                                            |
+| ----------------- | -------- | ------------------------------------------------------------------------------- |
+| Java 核心与中间件 | 67       | java-fundamentals, jvm, concurrency, spring, microservice, database, middleware |
+| Agent 开发        | 26       | llm-foundation, embedding-retrieval, rag, agent-architecture, ai-engineering    |
+| 算法与数据结构    | 62       | 数组链表/树图/DP/字符串排序/栈队列/哈希贪心/回溯                                |
+| 设计模式          | 14       | 创建型/结构型/行为型/原则                                                       |
+| 前端八股          | 49       | JS/TS/CSS/React/Vue/Node.js/工程化/架构/客户端/网络安全                         |
+| 架构设计          | 21       | 方法论/微服务/系统设计/项目架构                                                 |
+| .NET 开发         | 31       | C#/.NET Core/ASP.NET/EF Core/客户端/微服务/高级                                 |
+| 操作系统与 Linux  | 15       | 进程线程/内存管理/IO 模型/Linux 基础                                            |
+| 计算机网络        | 13       | TCP/UDP/HTTP/HTTPS/DNS/WebSocket                                                |
 
 **总计：298 个知识点**
 
@@ -132,6 +132,7 @@ npm run quality:scan     # 质量扫描：检查模板文本、泛化追问等
 ### 生成脚本说明
 
 `npm run generate` 需要设置 `CONTENT_SOURCE_ROOT` 环境变量，指向原始 Markdown 源目录。脚本会：
+
 1. 扫描 Markdown 文件，按领域规则自动分类
 2. 生成 topic JSON（含 learningCards、recallPrompts、rubric）
 3. 生成 domain JSON 和 manifest JSON（含三个环境）
@@ -140,18 +141,26 @@ npm run quality:scan     # 质量扫描：检查模板文本、泛化追问等
 ### CI/CD — 两个 GitHub Actions 工作流
 
 **validate.yml** — 每次 push/PR 触发：
+
 ```bash
 npm ci && npm run validate
 ```
 
 **deploy-content.yml** — main 分支 push 触发：
+
 1. `npm ci && npm run validate` — 验证内容
 2. 准备 `dist/` 目录（复制 manifest、domains、topics、schemas、assets）
 3. `wrangler pages deploy` — 部署到 Cloudflare Pages
 
-**正式入口**：<https://mianshi-zhilian-content.pages.dev/manifest.json>
+**正式入口**：
+
+- 主用：<https://mianshi-zhilian-content.pages.dev/manifest.json>
+- 备用：<https://mianshizhilian-content.nontracey.de5.net/manifest.json>
+
+主备域名必须绑定到同一份 Cloudflare Pages 内容产物，所有 manifest、domains、topics、schemas、assets 路径保持一一对应。部署后 workflow 会验证 pages.dev 与 de5.net 的 manifest/staging/draft 三个入口。
 
 **必需配置**（GitHub Secrets）：
+
 - `CLOUDFLARE_API_TOKEN` — 需要 `Cloudflare Pages:Edit` 权限
 - `CLOUDFLARE_ACCOUNT_ID` — Cloudflare 账号 ID
 
@@ -166,6 +175,7 @@ npm ci && npm run validate
 ### Topics 路径约定
 
 `domains/{domain}.json` 中分类的 `topics` 数组：
+
 - 必须是**相对文件路径**：`topics/{domain}/{filename}.json`
 - 不能是 topic ID 字符串或 dict 对象
 - 自动修复工具：`python3 scripts/validate_paths.py --fix`
@@ -173,6 +183,7 @@ npm ci && npm run validate
 ### 内容结构同步规则
 
 内容结构变更（新增/删除领域/分类/知识点、修改字段）须同步更新：
+
 1. **内容维护平台**（本仓库）：文件、manifest、schema、文档
 2. **内容平台**（独立项目）：内容文件、topics 目录、CI 配置
 3. **App 平台**（移动端）：内容解析逻辑、缓存机制、版本检测
