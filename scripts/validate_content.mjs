@@ -51,7 +51,7 @@ function assertValid(name, validate, data) {
   }
 }
 
-function assertTopicQuality(file, topic, domainIds, categoryIds) {
+function assertTopicQuality(file, topic, domainIds, categoryIds, expectedStatus) {
   assertValid(file, validateTopic, topic);
   if (forbidden.test(topic.title) || forbidden.test(topic.summary)) {
     throw new Error(`${file} contains schedule wording in title or summary.`);
@@ -69,6 +69,18 @@ function assertTopicQuality(file, topic, domainIds, categoryIds) {
   if (!topic.learningCards.some((card) => card.type === "checklist")) {
     throw new Error(`${file} must include a checklist learning card.`);
   }
+  if (!topic.status) {
+    throw new Error(`${file} must include status.`);
+  }
+  if (topic.status !== expectedStatus) {
+    throw new Error(`${file} status must be ${expectedStatus} for this manifest, got ${topic.status}.`);
+  }
+  if (!topic.interviewerFocus?.trim()) {
+    throw new Error(`${file} must include interviewerFocus.`);
+  }
+  if (!topic.learningCards.some((card) => card.type === "interviewAnswer" && Array.isArray(card.followUpQuestions) && card.followUpQuestions.length > 0)) {
+    throw new Error(`${file} must include interviewAnswer.followUpQuestions.`);
+  }
   if (!topic.learningCards.some((card) => ["compareTable", "diagram", "code"].includes(card.type))) {
     throw new Error(`${file} must include at least one deeper visual, comparison, or code card.`);
   }
@@ -79,6 +91,9 @@ function assertTopicQuality(file, topic, domainIds, categoryIds) {
     }
     if (card.type === "interviewAnswer" && /(^|[：:；;。])\s*1[）)]/.test(card.content ?? "")) {
       throw new Error(`${file} contains inline numbered list in interviewAnswer/${card.title}. Use Markdown lists instead.`);
+    }
+    if (card.type === "code" && !card.language) {
+      throw new Error(`${file} code card ${card.title} must include language.`);
     }
   }
   // 语义质量检查
@@ -97,7 +112,38 @@ function assertTopicQuality(file, topic, domainIds, categoryIds) {
 
 const orderWeightWarnings = [];
 
-async function validateManifestClosure(manifestFile, expectedPrefix) {
+function assertAcyclicPrerequisites(manifestFile, topicsInManifest) {
+  const byId = new Map(topicsInManifest.map(({ file, topic }) => [topic.id, { file, topic }]));
+  const visiting = new Set();
+  const visited = new Set();
+  const stack = [];
+
+  function visit(topicId) {
+    if (visited.has(topicId)) return;
+    if (visiting.has(topicId)) {
+      const start = stack.indexOf(topicId);
+      const cycle = [...stack.slice(start), topicId].join(" -> " );
+      const file = byId.get(topicId)?.file ?? manifestFile;
+      throw new Error(`${file} prerequisite cycle detected in ${manifestFile}: ${cycle}`);
+    }
+
+    visiting.add(topicId);
+    stack.push(topicId);
+
+    const topic = byId.get(topicId)?.topic;
+    for (const prerequisiteId of topic?.prerequisites ?? []) {
+      if (byId.has(prerequisiteId)) visit(prerequisiteId);
+    }
+
+    stack.pop();
+    visiting.delete(topicId);
+    visited.add(topicId);
+  }
+
+  for (const topicId of byId.keys()) visit(topicId);
+}
+
+async function validateManifestClosure(manifestFile, expectedPrefix, expectedStatus) {
   const manifest = await readJson(manifestFile);
   assertValid(manifestFile, validateManifest, manifest);
 
@@ -139,12 +185,27 @@ async function validateManifestClosure(manifestFile, expectedPrefix) {
     }
   }
 
+  const topicsInManifest = [];
   for (const file of topicRefs) {
     const topic = await readJson(file);
     if (topicIds.has(topic.id)) throw new Error(`${manifestFile} duplicate topic id: ${topic.id}`);
     topicIds.add(topic.id);
-    assertTopicQuality(file, topic, domainIds, categoryIds);
+    topicsInManifest.push({ file, topic });
+    assertTopicQuality(file, topic, domainIds, categoryIds, expectedStatus);
   }
+
+  for (const { file, topic } of topicsInManifest) {
+    for (const prerequisiteId of topic.prerequisites ?? []) {
+      if (prerequisiteId === topic.id) {
+        throw new Error(`${file} prerequisite must not reference itself: ${prerequisiteId}`);
+      }
+      if (!topicIds.has(prerequisiteId)) {
+        throw new Error(`${file} references unknown prerequisite topic id: ${prerequisiteId}`);
+      }
+    }
+  }
+
+  assertAcyclicPrerequisites(manifestFile, topicsInManifest);
 
   // 顺序与权重检查（防止 App 展示顺序异常）
   for (const { domain } of domainFiles) {
@@ -204,9 +265,9 @@ async function validateManifestClosure(manifestFile, expectedPrefix) {
   return { manifest, topicRefs };
 }
 
-const production = await validateManifestClosure("manifest.json", "");
-const staging = await validateManifestClosure("staging-manifest.json", "staging/");
-const draft = await validateManifestClosure("draft-manifest.json", "draft/");
+const production = await validateManifestClosure("manifest.json", "", "production");
+const staging = await validateManifestClosure("staging-manifest.json", "staging/", "staging");
+const draft = await validateManifestClosure("draft-manifest.json", "draft/", "draft");
 
 const productionTopicFiles = await listJson("topics");
 for (const file of productionTopicFiles) {
