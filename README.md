@@ -1,6 +1,10 @@
 # 面试智练内容仓库
 
+[![CI](https://github.com/nontracey/mianshi-zhilian-content/actions/workflows/ci.yml/badge.svg)](https://github.com/nontracey/mianshi-zhilian-content/actions/workflows/ci.yml)
+
 面试智练的公共知识内容源。App 通过 `manifest.json` 发现领域、分类、知识点和资源；新增知识不需要修改 App 代码。
+
+> 本仓库是 [面试智练](https://github.com/nontracey/mianshi-zhilian-app) 的知识内容源。面向终端用户的 App 和官网在 [mianshi-zhilian-app](https://github.com/nontracey/mianshi-zhilian-app) 仓库，内容维护工具在 [mianshi-zhilian-studio](https://github.com/nontracey/mianshi-zhilian-studio) 仓库。
 
 ## 目录
 
