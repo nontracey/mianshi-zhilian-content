@@ -1,0 +1,128 @@
+{
+  "id": "architecture.microservice.topic-distributed-transaction",
+  "domain": "architecture",
+  "category": "microservice",
+  "group": "microservice",
+  "title": "分布式事务方案选型",
+  "summary": "掌握2PC、TCC、Saga、本地消息表等分布式事务方案的原理、优缺点和适用场景",
+  "tags": [
+    "架构设计",
+    "微服务",
+    "分布式事务",
+    "TCC",
+    "Saga",
+    "Seata"
+  ],
+  "difficulty": 4,
+  "estimatedMinutes": 15,
+  "order": 20,
+  "recommendWeight": 95,
+  "status": "production",
+  "learningCards": [
+    {
+      "type": "explain",
+      "title": "知识全景",
+      "content": "# 分布式事务方案选型\n\n## 一、为什么需要分布式事务\n微服务架构下，一个业务操作可能涉及多个服务的数据库，本地事务无法保证跨服务的数据一致性。\n\n## 二、核心方案\n### 2.1 两阶段提交（2PC）\n- **准备阶段**：协调者询问所有参与者能否提交\n- **提交阶段**：所有参与者都同意则提交，否则回滚\n- **缺点**：同步阻塞、单点故障、数据不一致风险\n\n### 2.2 TCC（Try-Confirm-Cancel）\n- **Try**：预留资源（冻结库存、冻结余额）\n- **Confirm**：确认提交（扣减冻结的资源）\n- **Cancel**：取消释放（解冻资源）\n- **优点**：不锁数据库行，性能好\n- **缺点**：业务侵入性强，每个操作要写三个方法\n\n### 2.3 Saga\n- 将长事务拆分为多个本地事务\n- 每个本地事务有对应的补偿事务\n- 失败时按逆序执行补偿\n- **两种实现**：编排式（Orchestration）和协同式（Choreography）\n\n### 2.4 本地消息表\n- 业务操作和消息写入在同一个本地事务中\n- 后台任务轮询消息表，发送到MQ\n- 消费者处理成功后删除消息\n- **优点**：实现简单，可靠\n\n### 2.5 Seata\n- 阿里开源的分布式事务框架\n- 支持AT/TCC/Saga/XA四种模式\n- **AT模式**：自动生成反向SQL，对业务无侵入\n- 需要undo_log表\n\n## 三、选型建议\n- **强一致**：2PC/XA（性能差）\n- **高性能**：TCC（侵入性强）\n- **长流程**：Saga（补偿复杂）\n- **最终一致**：本地消息表/可靠消息（推荐）\n- **简单场景**：Seata AT模式"
+    },
+    {
+      "type": "code",
+      "title": "代码示例",
+      "content": "// 1. TCC示例 - 订单扣库存\n// Try: 冻结库存\n@Service\npublic class InventoryTccService {\n    @Transactional\n    public boolean tryDeduct(String skuId, int quantity) {\n        // 检查可用库存\n        Inventory inv = inventoryRepo.selectForUpdate(skuId);\n        if (inv.getAvailable() < quantity) return false;\n        // 冻结库存\n        inv.setAvailable(inv.getAvailable() - quantity);\n        inv.setFrozen(inv.getFrozen() + quantity);\n        inventoryRepo.update(inv);\n        return true;\n    }\n\n    // Confirm: 扣减冻结库存\n    @Transactional\n    public void confirmDeduct(String skuId, int quantity) {\n        Inventory inv = inventoryRepo.findBySkuId(skuId);\n        inv.setFrozen(inv.getFrozen() - quantity);\n        inventoryRepo.update(inv);\n    }\n\n    // Cancel: 解冻库存\n    @Transactional\n    public void cancelDeduct(String skuId, int quantity) {\n        Inventory inv = inventoryRepo.findBySkuId(skuId);\n        inv.setFrozen(inv.getFrozen() - quantity);\n        inv.setAvailable(inv.getAvailable() + quantity);\n        inventoryRepo.update(inv);\n    }\n}\n\n// 2. 本地消息表\n@Service\npublic class OrderService {\n    @Transactional\n    public OrderId createOrder(CreateOrderCmd cmd) {\n        // 1. 创建订单\n        Order order = Order.create(cmd);\n        orderRepo.save(order);\n\n        // 2. 写本地消息表（同一个事务）\n        LocalMessage msg = new LocalMessage();\n        msg.setTopic(\"order-created\");\n        msg.setPayload(JSON.toJSONString(order));\n        msg.setStatus(MessageStatus.PENDING);\n        localMessageRepo.save(msg);\n\n        return order.getId();\n    }\n}\n\n// 后台任务轮询发送\n@Scheduled(fixedDelay = 1000)\npublic void pollAndSend() {\n    List<LocalMessage> messages = localMessageRepo\n        .findByStatus(MessageStatus.PENDING, 100);\n    for (LocalMessage msg : messages) {\n        try {\n            kafkaTemplate.send(msg.getTopic(), msg.getPayload());\n            msg.setStatus(MessageStatus.SENT);\n            localMessageRepo.update(msg);\n        } catch (Exception e) {\n            msg.setRetryCount(msg.getRetryCount() + 1);\n            localMessageRepo.update(msg);\n        }\n    }\n}\n\n// 3. Seata AT模式\n@GlobalTransactional(timeoutMills = 60000, name = \"create-order\")\npublic OrderId createOrder(CreateOrderCmd cmd) {\n    // 本地操作\n    Order order = Order.create(cmd);\n    orderRepo.save(order);\n    // 远程调用（Seata自动管理分布式事务）\n    inventoryClient.deduct(cmd.getItems());\n    return order.getId();\n}",
+      "language": "java"
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答模板",
+      "content": "分布式事务方案主要有四类，各有适用场景：\n\n**2PC/XA**是最传统的方案，由协调者统一决定提交或回滚。优点是对业务无侵入，缺点是同步阻塞、性能差，适合对一致性要求极高但并发不高的场景，比如金融清算。\n\n**TCC**把每个操作拆成Try-Confirm-Cancel三步。Try阶段预留资源，Confirm确认提交，Cancel回滚释放。优点是不锁数据库行、性能好；缺点是业务侵入性强，每个操作要写三个方法。适合高性能场景，比如支付、库存扣减。\n\n**Saga**适合长流程业务。把一个大事务拆成多个本地事务，每个本地事务有对应的补偿操作。失败时逆序执行补偿。实现方式有编排式和协同式两种。\n\n**本地消息表**是我最推荐的最终一致性方案。业务操作和消息写入在同一个本地事务中，后台任务轮询消息表发送到MQ。优点是实现简单、可靠，缺点是只能保证最终一致。\n\n**Seata**是阿里开源的框架，支持AT/TCC/Saga多种模式。AT模式对业务无侵入，自动生成反向SQL，但需要undo_log表。\n\n选型核心原则：能用最终一致就不用强一致，能用简单方案就不用复杂方案。",
+      "followUpQuestions": [
+        {
+          "question": "在你的项目中，分布式事务方案选型是怎么落地的？遇到了什么权衡取舍？",
+          "answer": "分布式事务方案：2PC（强一致但阻塞）、TCC（灵活但侵入大）、Saga（长事务但补偿复杂）、本地消息表（可靠但实现复杂）、RocketMQ事务消息（最终一致性）。实际项目中大部分场景用最终一致性就够了。"
+        },
+        {
+          "question": "分布式事务方案选型 在高并发（万级 QPS）和数据一致性要求高的场景下，有哪些关键设计决策？",
+          "answer": "分布式事务方案选型 在高并发场景下要先识别核心约束，再拆成容量、延迟、一致性、故障隔离和可观测性几个维度设计。回答时应说明关键瓶颈在哪里、哪些链路可以异步或降级、哪些数据必须保持一致，以及出现积压、超时或部分失败时如何恢复。"
+        },
+        {
+          "question": "如果现有系统需要引入 分布式事务方案选型，你会怎么评估改造风险和制定迁移计划？",
+          "answer": "引入 分布式事务方案选型 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。建议分阶段推进：先在非核心模块试点，验证后逐步推广。迁移过程中要做好灰度、回滚、监控，确保业务不受影响。"
+        }
+      ]
+    },
+    {
+      "type": "compareTable",
+      "title": "对比与边界",
+      "content": "| 维度 | 2PC | TCC | Saga | 本地消息表 | Seata AT |\n| --- | --- | --- | --- | --- | --- |\n| 一致性 | 强一致 | 最终一致 | 最终一致 | 最终一致 | 最终一致 |\n| 性能 | 差 | 好 | 好 | 好 | 中 |\n| 侵入性 | 低 | 高 | 中 | 低 | 低 |\n| 实现复杂 | 中 | 高 | 高 | 低 | 低 |\n| 适用场景 | 金融清算 | 支付/库存 | 长流程 | 异步场景 | 通用 |\n| 补偿机制 | 回滚 | Cancel | 补偿事务 | 重试 | undo_log |"
+    },
+    {
+      "type": "diagram",
+      "title": "结构图解",
+      "content": "分布式事务方案的执行流程对比",
+      "fallback": "2PC: Prepare→Commit | TCC: Try→Confirm/Cancel | Saga: T1→T2→T3 | 本地消息: 业务+消息→MQ→消费",
+      "items": [
+        "2PC：协调者发Prepare，参与者回复Yes/No，协调者发Commit/Rollback",
+        "TCC：Try冻结资源，成功则Confirm扣减，失败则Cancel解冻",
+        "Saga：顺序执行T1/T2/T3，失败时逆序执行C2/C1补偿",
+        "本地消息表：业务和消息同事务写入，轮询发送MQ"
+      ]
+    },
+    {
+      "type": "checklist",
+      "title": "学完后应能说清楚",
+      "items": [
+        "2PC的两阶段流程和缺点（同步阻塞、单点故障）",
+        "TCC的三步设计：Try预留/Confirm确认/Cancel取消",
+        "Saga的补偿机制和两种实现方式（编排/协同）",
+        "本地消息表的实现原理和适用场景",
+        "Seata AT模式的工作原理和undo_log的作用"
+      ]
+    }
+  ],
+  "recallPrompts": [
+    {
+      "id": "architecture.microservice.topic-distributed-transaction.recall.1",
+      "prompt": "请对比TCC和本地消息表两种分布式事务方案的优缺点和适用场景。",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 3
+    },
+    {
+      "id": "architecture.microservice.topic-distributed-transaction.recall.2",
+      "prompt": "Saga模式的编排式和协同式实现有什么区别？各自适合什么场景？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    }
+  ],
+  "rubric": {
+    "mustHave": [
+      "2PC的两阶段流程和缺点",
+      "TCC的Try-Confirm-Cancel设计",
+      "Saga的补偿机制",
+      "本地消息表的实现原理",
+      "各方案的适用场景和选型原则"
+    ],
+    "goodToHave": [
+      "Seata AT模式的undo_log机制",
+      "TCC的空回滚和悬挂问题",
+      "可靠消息最终一致性方案",
+      "分布式事务的幂等设计"
+    ],
+    "commonMistakes": [
+      "混淆2PC/TCC/Saga/本地消息表的适用场景",
+      "不清楚Seata AT模式的undo log机制",
+      "所有场景都用强一致性（很多场景最终一致性就够了）"
+    ],
+    "scoreWeights": {
+      "coverage": 25,
+      "accuracy": 25,
+      "interviewExpression": 20,
+      "depth": 30
+    }
+  },
+  "prerequisites": [
+    "architecture.microservice.topic-service-governance"
+  ],
+  "interviewFrequency": "high",
+  "interviewerFocus": "考察系统设计能力，能否结合实际项目规模选择合适的架构方案，理解核心权衡（一致性vs可用性）"
+}

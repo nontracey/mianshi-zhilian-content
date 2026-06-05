@@ -1,0 +1,129 @@
+{
+  "id": "os.io-model.topic-select-poll-epoll",
+  "domain": "os",
+  "category": "io-model",
+  "group": "io-model",
+  "title": "select/poll/epoll",
+  "summary": "深入理解三种 IO 多路复用机制的实现原理、性能差异和适用场景，掌握 epoll 的事件驱动模型",
+  "tags": [
+    "操作系统",
+    "IO 多路复用",
+    "select",
+    "poll",
+    "epoll",
+    "Reactor"
+  ],
+  "difficulty": 4,
+  "estimatedMinutes": 20,
+  "order": 20,
+  "recommendWeight": 95,
+  "learningCards": [
+    {
+      "type": "explain",
+      "title": "知识全景",
+      "content": "# select/poll/epoll\n\n## 一、select\n- 使用 fd_set 位图表示关注的文件描述符\n- 调用时将 fd_set 拷贝到内核，内核遍历检查就绪状态\n- 返回后需要遍历所有 fd 找出就绪的\n- **限制**：fd 数量受 FD_SETSIZE 限制（默认 1024）\n- 每次调用都需要重新设置 fd_set\n\n## 二、poll\n- 使用 pollfd 结构体数组代替位图\n- 没有 fd 数量限制\n- 仍然需要将数组拷贝到内核\n- 返回后仍然需要遍历所有 fd\n- 相比 select 只是解决了数量限制\n\n## 三、epoll\n- 通过 epoll_create 创建实例\n- 通过 epoll_ctl 注册/修改/删除关注的 fd\n- 通过 epoll_wait 等待事件\n- **核心优势**：\n  - 事件驱动：内核维护就绪列表，只返回就绪的 fd\n  - fd 注册一次即可，不需要每次重复传入\n  - 使用红黑树管理 fd，增删改查 O(log n)\n  - 使用回调机制通知就绪事件\n\n### epoll 的工作模式\n- **水平触发（LT, Level Triggered）**：默认模式。只要 fd 处于就绪状态就会通知。编程简单但可能重复通知。\n- **边缘触发（ET, Edge Triggered）**：只在 fd 状态变化时通知一次。必须配合非阻塞 IO 和一次性读完所有数据。性能更高但编程复杂。\n\n## 四、性能对比\n- select/poll：O(n) 遍历所有 fd，n 为监听的 fd 数量\n- epoll：O(1) 获取就绪 fd（就绪列表），O(log n) 增删 fd\n- 当连接数多但活跃连接少时，epoll 优势明显"
+    },
+    {
+      "type": "compareTable",
+      "title": "对比与边界",
+      "content": "| 对比项 | select | poll | epoll |\n| --- | --- | --- | --- |\n| 数据结构 | fd_set 位图 | pollfd 数组 | 红黑树+就绪链表 |\n| fd 数量限制 | FD_SETSIZE(1024) | 无限制 | 无限制 |\n| fd 传递 | 每次拷贝 | 每次拷贝 | 注册一次(epoll_ctl) |\n| 就绪检测 | 遍历 O(n) | 遍历 O(n) | 回调 O(1) |\n| 触发模式 | 水平触发 | 水平触发 | LT 和 ET |\n| 性能(大量连接) | 差 | 差 | 优秀 |\n| 编程复杂度 | 低 | 低 | 中（ET模式高） |"
+    },
+    {
+      "type": "diagram",
+      "title": "结构图解",
+      "content": "epoll 的内部实现结构",
+      "fallback": "epoll 通过红黑树管理 fd，通过就绪链表返回就绪事件，通过回调函数将就绪 fd 加入链表",
+      "items": [
+        "epoll_create: 创建 eventpoll 结构体（红黑树 + 就绪链表）",
+        "epoll_ctl(ADD): 将 fd 插入红黑树，注册回调函数",
+        "回调触发: 网络数据到达 -> 回调将 fd 加入就绪链表",
+        "epoll_wait: 检查就绪链表，有事件则拷贝到用户空间返回",
+        "LT模式: 未读完数据会重复通知",
+        "ET模式: 只通知一次，必须用非阻塞fd一次读完"
+      ]
+    },
+    {
+      "type": "code",
+      "title": "代码示例",
+      "content": "// epoll 服务器示例\n#include <sys/epoll.h>\n#include <fcntl.h>\n#include <stdio.h>\n#include <string.h>\n#include <unistd.h>\n\n#define MAX_EVENTS 1024\n\nvoid set_nonblocking(int fd) {\n    int flags = fcntl(fd, F_GETFL, 0);\n    fcntl(fd, F_SETFL, flags | O_NONBLOCK);\n}\n\nint main() {\n    int epfd = epoll_create1(0);\n    struct epoll_event ev, events[MAX_EVENTS];\n    \n    // 监听标准输入\n    ev.events = EPOLLIN;\n    ev.data.fd = STDIN_FILENO;\n    epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &ev);\n    \n    while (1) {\n        // 等待事件，-1 表示永久阻塞\n        int nfds = epoll_wait(epfd, events, MAX_EVENTS, -1);\n        \n        for (int i = 0; i < nfds; i++) {\n            if (events[i].data.fd == STDIN_FILENO) {\n                char buf[1024];\n                int n = read(STDIN_FILENO, buf, sizeof(buf));\n                if (n > 0) {\n                    buf[n] = '\\0';\n                    printf(\"Read: %s\", buf);\n                }\n            }\n        }\n    }\n    close(epfd);\n    return 0;\n}\n\n// ET 模式设置：EPOLLIN | EPOLLET\n// 必须一次性读完数据\nvoid read_all(int fd) {\n    char buf[4096];\n    while (1) {\n        int n = read(fd, buf, sizeof(buf));\n        if (n < 0) {\n            if (errno == EAGAIN) break; // 数据读完\n            perror(\"read\");\n            break;\n        }\n        if (n == 0) break; // 连接关闭\n        // 处理数据\n    }\n}",
+      "language": "c"
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "标准面试回答",
+      "content": "结论：select、poll、epoll 都是 IO 多路复用机制，用一个线程监听多个 fd 的就绪事件。select/poll 每次调用都需要传入关注集合并线性扫描，epoll 把关注集合维护在内核中，只返回就绪事件，更适合大量连接。\n\n机制上，差异主要体现在：\n1. select 使用 fd_set 位图，fd 数量受限制，并且每次需要拷贝和遍历。\n2. poll 用 pollfd 数组取消固定数量限制，但仍要拷贝和线性遍历。\n3. epoll 通过 epoll_ctl 注册 fd，通过 epoll_wait 获取就绪列表，避免每次重复传入全集。\n4. epoll 适合连接数多、活跃连接少的场景，是 Reactor 网络模型常见基础。\n\n追问边界：epoll 不是所有场景都绝对更快，少量 fd 时差异不明显。ET 模式只在状态变化时通知，必须一次读到 EAGAIN，否则可能丢事件；LT 模式会在条件满足时重复通知，写法更安全。",
+      "followUpQuestions": [
+        {
+          "question": "epoll 为什么适合高并发连接？",
+          "answer": "关注集合常驻内核，事件就绪后进入就绪队列，用户态不必每次扫描全部 fd。"
+        },
+        {
+          "question": "select 的 fd 限制来自哪里？",
+          "answer": "来自 fd_set 位图大小，常见默认 FD_SETSIZE 是 1024。"
+        }
+      ]
+    },
+    {
+      "type": "checklist",
+      "title": "学完后应能说清楚",
+      "items": [
+        "能说明 select 的 fd_set 位图和 1024 限制",
+        "能解释 poll 相对于 select 的改进",
+        "能描述 epoll 的红黑树和就绪链表结构",
+        "能区分 LT 和 ET 触发模式的行为差异",
+        "能说明 ET 模式为什么必须用非阻塞 IO",
+        "能比较三者在大量连接场景下的性能差异",
+        "能解释 epoll_ctl 注册一次的优势"
+      ]
+    }
+  ],
+  "recallPrompts": [
+    {
+      "id": "os.io-model.topic-select-poll-epoll.recall.1",
+      "prompt": "请比较 select、poll、epoll 的数据结构、调用成本和适用场景。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
+      "id": "os.io-model.topic-select-poll-epoll.recall.2",
+      "prompt": "epoll 的 LT 和 ET 模式有什么区别？为什么 ET 要配合非阻塞 IO？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
+    }
+  ],
+  "rubric": {
+    "mustHave": [
+      "select fd_set",
+      "pollfd 数组",
+      "epoll_ctl/epoll_wait",
+      "就绪列表",
+      "LT/ET"
+    ],
+    "goodToHave": [
+      "Reactor",
+      "非阻塞 IO",
+      "EAGAIN",
+      "连接数多活跃少"
+    ],
+    "commonMistakes": [
+      "只说 epoll 是 O(1) 不解释条件",
+      "ET 模式不读到 EAGAIN",
+      "认为 poll 解决了所有 select 问题"
+    ],
+    "scoreWeights": {
+      "coverage": 25,
+      "accuracy": 30,
+      "interviewExpression": 20,
+      "depth": 25
+    }
+  },
+  "updatedAt": "2026-05-29",
+  "status": "production",
+  "prerequisites": [
+    "os.io-model.io-models"
+  ],
+  "interviewFrequency": "high",
+  "interviewerFocus": "考察操作系统基础功底，是否理解进程/线程/内存/IO的核心机制，能否用工具排查问题"
+}

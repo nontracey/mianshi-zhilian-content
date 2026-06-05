@@ -1,0 +1,133 @@
+{
+  "id": "architecture.microservice.topic-api-gateway",
+  "domain": "architecture",
+  "category": "microservice",
+  "group": "project-design",
+  "title": "API网关设计",
+  "summary": "设计API网关的路由、限流、鉴权和灰度发布等核心功能",
+  "tags": [
+    "架构设计",
+    "项目设计",
+    "API网关",
+    "Spring Cloud Gateway",
+    "灰度发布"
+  ],
+  "difficulty": 3,
+  "estimatedMinutes": 25,
+  "order": 90,
+  "recommendWeight": 80,
+  "status": "production",
+  "learningCards": [
+    {
+      "type": "explain",
+      "title": "知识全景",
+      "content": "# API网关设计\n\n## 一、核心职责\n- **路由转发**：根据请求路径转发到对应服务\n- **负载均衡**：多个实例间均衡分配请求\n- **限流熔断**：保护后端服务\n- **认证鉴权**：统一身份验证\n- **灰度发布**：按规则分流到新版本\n- **日志监控**：统一请求日志和指标\n\n## 二、Spring Cloud Gateway\n### 2.1 核心概念\n- **Route（路由）**：一组规则的集合\n- **Predicate（断言）**：匹配条件（路径、Header等）\n- **Filter（过滤器）**：请求/响应处理链\n\n### 2.2 工作流程\n1. 客户端请求到达网关\n2. Gateway Handler Mapping匹配路由\n3. 执行过滤器链（Pre Filter → 代理请求 → Post Filter）\n4. 返回响应\n\n## 三、限流实现\n- **RequestRateLimiter**：基于Redis的令牌桶限流\n- **自定义限流**：按用户/IP/接口限流\n\n## 四、鉴权实现\n- **JWT验证**：解析Token，校验签名和过期时间\n- **权限校验**：检查接口权限\n- **用户信息透传**：将用户信息传给后端服务\n\n## 五、灰度发布\n- **基于Header**：X-Gray: true路由到新版本\n- **基于用户ID**：特定用户路由到新版本\n- **基于比例**：10%流量路由到新版本\n\n## 六、跨域处理\n- 网关统一配置CORS\n- 避免每个服务单独配置"
+    },
+    {
+      "type": "code",
+      "title": "代码示例",
+      "content": "// 1. Gateway路由配置\n// application.yml\n// spring:\n//   cloud:\n//     gateway:\n//       routes:\n//         - id: user-service\n//           uri: lb://user-service\n//           predicates:\n//             - Path=/api/users/**\n//           filters:\n//             - StripPrefix=1\n//             - name: RequestRateLimiter\n//               args:\n//                 redis-rate-limiter.replenishRate: 10\n//                 redis-rate-limiter.burstCapacity: 20\n//                 key-resolver: \"#{@userKeyResolver}\"\n//         - id: order-service\n//           uri: lb://order-service\n//           predicates:\n//             - Path=/api/orders/**\n//           filters:\n//             - StripPrefix=1\n\n// 2. 自定义限流KeyResolver\n@Bean\npublic KeyResolver userKeyResolver() {\n    return exchange -> {\n        // 按用户ID限流\n        String userId = exchange.getRequest()\n            .getHeaders().getFirst(\"X-User-Id\");\n        if (userId != null) {\n            return Mono.just(userId);\n        }\n        // 降级为IP限流\n        String ip = exchange.getRequest()\n            .getRemoteAddress().getAddress().getHostAddress();\n        return Mono.just(ip);\n    };\n}\n\n// 3. JWT鉴权过滤器\n@Component\npublic class AuthFilter implements GlobalFilter, Ordered {\n    @Autowired\n    private JwtUtil jwtUtil;\n\n    @Override\n    public Mono<Void> filter(ServerWebExchange exchange,\n            GatewayFilterChain chain) {\n        String path = exchange.getRequest().getPath().value();\n        // 白名单放行\n        if (isWhitelist(path)) {\n            return chain.filter(exchange);\n        }\n\n        String token = exchange.getRequest()\n            .getHeaders().getFirst(\"Authorization\");\n        if (token == null || !token.startsWith(\"Bearer \")) {\n            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);\n            return exchange.getResponse().setComplete();\n        }\n\n        try {\n            Claims claims = jwtUtil.parseToken(token.substring(7));\n            // 将用户信息透传给后端服务\n            ServerHttpRequest request = exchange.getRequest()\n                .mutate()\n                .header(\"X-User-Id\", claims.getSubject())\n                .header(\"X-User-Role\", claims.get(\"role\", String.class))\n                .build();\n            return chain.filter(exchange.mutate().request(request).build());\n        } catch (Exception e) {\n            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);\n            return exchange.getResponse().setComplete();\n        }\n    }\n\n    @Override\n    public int getOrder() {\n        return -100; // 最高优先级\n    }\n}\n\n// 4. 灰度发布过滤器\n@Component\npublic class GrayReleaseFilter implements GlobalFilter, Ordered {\n    @Autowired\n    private GrayRuleConfig grayRuleConfig;\n\n    @Override\n    public Mono<Void> filter(ServerWebExchange exchange,\n            GatewayFilterChain chain) {\n        String userId = exchange.getRequest()\n            .getHeaders().getFirst(\"X-User-Id\");\n\n        // 基于用户ID灰度\n        if (grayRuleConfig.getGrayUsers().contains(userId)) {\n            ServerHttpRequest request = exchange.getRequest()\n                .mutate()\n                .header(\"X-Gray\", \"true\")\n                .build();\n            return chain.filter(exchange.mutate().request(request).build());\n        }\n\n        // 基于比例灰度\n        if (Math.abs(userId.hashCode()) % 100\n                < grayRuleConfig.getGrayPercent()) {\n            ServerHttpRequest request = exchange.getRequest()\n                .mutate()\n                .header(\"X-Gray\", \"true\")\n                .build();\n            return chain.filter(exchange.mutate().request(request).build());\n        }\n\n        return chain.filter(exchange);\n    }\n\n    @Override\n    public int getOrder() {\n        return -50;\n    }\n}",
+      "language": "java"
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答模板",
+      "content": "API网关是系统的统一入口，核心职责有五个：\n\n**路由转发**是最基本的。Spring Cloud Gateway用Route+Predicate+Filter三要素定义路由规则。Predicate匹配请求条件（路径、Header等），Filter处理请求/响应链。\n\n**限流**用Gateway内置的RequestRateLimiter过滤器，基于Redis实现令牌桶算法。可以按用户ID、IP或接口粒度限流。自定义KeyResolver实现不同维度的限流。\n\n**鉴权**用全局过滤器实现JWT验证。解析Token，校验签名和过期时间，然后将用户ID和角色信息通过Header透传给后端服务。白名单路径（如登录接口）直接放行。\n\n**灰度发布**有三种方式：基于Header（X-Gray: true）、基于用户ID（特定用户路由到新版本）、基于比例（10%流量路由到新版本）。后端服务根据X-Gray Header决定调用新版本还是旧版本。\n\n**跨域处理**在网关统一配置CORS，避免每个服务单独配置。",
+      "followUpQuestions": [
+        {
+          "question": "在你的项目中，API网关设计是怎么落地的？遇到了什么权衡取舍？",
+          "answer": "API网关核心功能：路由转发、认证鉴权、限流熔断、日志监控、协议转换。技术选型：Spring Cloud Gateway（Java生态）、Kong（Nginx+Lua）、Envoy（C++高性能）。和BFF的区别：BFF是面向特定前端的聚合层，网关是统一入口。注意：网关不要放业务逻辑，保持轻量。"
+        },
+        {
+          "question": "API网关 在高并发（万级 QPS）和数据一致性要求高的场景下，有哪些关键设计决策？",
+          "answer": "API网关设计 在高并发场景下要先识别核心约束，再拆成容量、延迟、一致性、故障隔离和可观测性几个维度设计。回答时应说明关键瓶颈在哪里、哪些链路可以异步或降级、哪些数据必须保持一致，以及出现积压、超时或部分失败时如何恢复。"
+        },
+        {
+          "question": "如果现有系统需要引入 API网关，你会怎么评估改造风险和制定迁移计划？",
+          "answer": "引入 API网关 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。建议分阶段推进：先在非核心模块试点，验证后逐步推广。迁移过程中要做好灰度、回滚、监控，确保业务不受影响。"
+        }
+      ]
+    },
+    {
+      "type": "compareTable",
+      "title": "对比与边界",
+      "content": "| 维度 | Spring Cloud Gateway | Zuul | Kong | Nginx |\n| --- | --- | --- | --- | --- |\n| 性能 | 高(Netty) | 中(阻塞IO) | 高(OpenResty) | 极高 |\n| 编程模型 | 响应式 | Servlet | 插件 | 配置 |\n| 限流 | 内置 | 需集成 | 插件 | 模块 |\n| 动态路由 | 支持 | 支持 | 支持 | 需reload |\n| 社区 | 活跃 | 停更 | 活跃 | 活跃 |"
+    },
+    {
+      "type": "compareTable",
+      "title": "维度对比",
+      "content": "| 维度 | 网关限流 | 服务限流 |\n| --- | --- | --- |\n| 层级 | 入口层 | 服务层 |\n| 粒度 | 接口/IP | 方法级 |\n| 实现 | Gateway Filter | Sentinel |\n| 适用 | 全局防护 | 精细化控制 |"
+    },
+    {
+      "type": "diagram",
+      "title": "结构图解",
+      "content": "Spring Cloud Gateway的请求处理流程图",
+      "fallback": "Client → Gateway Handler → Predicate匹配 → Pre Filter → Proxy → Post Filter → Response",
+      "items": [
+        "客户端请求到达网关",
+        "Gateway Handler Mapping匹配路由",
+        "执行Pre过滤器链（鉴权/限流等）",
+        "代理请求到后端服务",
+        "执行Post过滤器链（响应处理）"
+      ]
+    },
+    {
+      "type": "checklist",
+      "title": "学完后应能说清楚",
+      "items": [
+        "Spring Cloud Gateway的三要素：Route/Predicate/Filter",
+        "全局过滤器实现JWT鉴权的流程",
+        "限流的实现方式：RequestRateLimiter + KeyResolver",
+        "灰度发布的三种方式：Header/用户ID/比例",
+        "网关统一处理跨域的优势"
+      ]
+    }
+  ],
+  "recallPrompts": [
+    {
+      "id": "architecture.project-design.topic-api-gateway.recall.1",
+      "prompt": "请描述Spring Cloud Gateway处理请求的完整流程，以及Filter链的执行顺序。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 2
+    },
+    {
+      "id": "architecture.project-design.topic-api-gateway.recall.2",
+      "prompt": "如何在API网关中实现灰度发布？有哪些分流策略？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 2
+    }
+  ],
+  "rubric": {
+    "mustHave": [
+      "Spring Cloud Gateway的核心概念",
+      "全局过滤器实现鉴权",
+      "限流的实现方式",
+      "灰度发布的实现方式",
+      "用户信息透传的实现"
+    ],
+    "goodToHave": [
+      "Gateway与Zuul的对比",
+      "跨域配置",
+      "网关的高可用部署",
+      "自定义过滤器的开发"
+    ],
+    "commonMistakes": [
+      "过度设计或设计不足",
+      "不了解系统设计的核心权衡（CAP、一致性 vs 可用性）",
+      "不能结合实际项目规模选择合适的方案"
+    ],
+    "scoreWeights": {
+      "coverage": 25,
+      "accuracy": 25,
+      "interviewExpression": 20,
+      "depth": 30
+    }
+  },
+  "prerequisites": [
+    "architecture.project-design.topic-low-code"
+  ],
+  "interviewFrequency": "medium",
+  "interviewerFocus": "考察系统设计能力，能否结合实际项目规模选择合适的架构方案，理解核心权衡（一致性vs可用性）"
+}

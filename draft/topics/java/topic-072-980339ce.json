@@ -1,0 +1,135 @@
+{
+  "id": "java.middleware.topic-072-980339ce",
+  "domain": "java",
+  "category": "middleware",
+  "group": "middleware",
+  "title": "持久化与内存",
+  "summary": "RDB（Redis DataBase）是Redis默认的持久化方式，通过生成内存快照（snapshot）保存为二进制文件（dump.rdb）。",
+  "tags": [
+    "Java",
+    "Redis",
+    "RDB",
+    "AOF",
+    "持久化",
+    "内存"
+  ],
+  "difficulty": 3,
+  "estimatedMinutes": 25,
+  "order": 20,
+  "recommendWeight": 75,
+  "learningCards": [
+    {
+      "type": "explain",
+      "title": "知识全景",
+      "content": "# 持久化与内存\n## 一、RDB持久化\nRDB（Redis DataBase）是Redis默认的持久化方式，通过生成内存快照（snapshot）保存为二进制文件（dump.rdb）。\n### 1.1 触发方式\n```bash\n# 手动触发\nSAVE          # 阻塞主线程，生产环境禁用\nBGSAVE        # fork子进程在后台执行，推荐\n# 自动触发（redis.conf配置）\nsave 900 1    # 900秒内至少1个key被修改\nsave 300 10   # 300秒内至少10个key被修改\nsave 60 10000 # 60秒内至少10000个key被修改\n# 其他自动触发场景\n# 1. 执行shutdown命令时（且未开启AOF）\n# 2. 主从复制时，主节点执行BGSAVE\n```\n### 1.2 BGSAVE执行流程\n```\n┌──────────────────────────────────────────────────────────────┐\n│                   BGSAVE执行流程                              │\n├──────────────────────────────────────────────────────────────┤\n│  1. 主进程fork()创建子进程                                    │\n│     ↓                                                        │\n│  2. 子进程开始将内存数据写入临时RDB文件                        │\n│     ↓                                                        │\n│  3. 写入完成后，用临时文件替换旧的dump.rdb                     │\n│     ↓                                                        │\n│  4. 子进程退出，主进程继续处理请求                             │\n└──────────────────────────────────────────────────────────────┘\n```\n### 1.3 Copy-On-Write（写时复制）\nfork子进程时，操作系统使用COW机制：\n```\n┌─────────────────────────────────────────────────────────────┐\n│                    COW写时复制机制                            │\n├─────────────────────────────────────────────────────────────┤\n│  fork时：父子进程共享同一份物理内存（只读共享）               │\n│                                                             │\n│  写入时：当主进程修改某个page时，操作系统复制该page           │\n│         子进程继续读取原始page，主进程修改新复制的page        │\n│                                                             │\n│  结果：子进程看到的是fork时刻的内存快照                       │\n│       主进程正常处理写请求                                    │\n└─────────────────────────────────────────────────────────────┘\n```\n**COW的问题**：\n- 如果fork后有大量写操作，会占用额外内存（最多翻倍）\n- fork操作本身需要时间，数据量大时可能阻塞主线程\n- 可通过`info stats`查看`latest_fork_usec`了解fork耗时\n### 1.4 RDB配置详解\n```bash\n# redis.conf\nsave 900 1\nsave 300 10\nsave 60 10000\ndbfilename dump.rdb          # RDB文件名\ndir /var/lib/redis            # RDB文件目录\nrdbcompression yes            # 是否压缩（LZF算法）\nrdbchecksum yes               # 是否校验\nstop-writes-on-bgsave-error yes  # BGSAVE出错时是否停止写入\n```\n### 1.5 RDB优缺点\n## 二、AOF持久化\nAOF（Append Only File）通过记录每个写操作命令来实现持久化，类似MySQL的binlog。\n### 2.1 AOF开启与配置\n```bash\n# redis.conf\nappendonly yes                    # 开启AOF\nappendfilename \"appendonly.aof\"   # AOF文件名\n# AOF文件同步策略（三种）\n# appendfsync always    # 每次写命令都同步到磁盘\n# appendfsync everysec  # 每秒同步一次（推荐）\n# appendfsync no        # 由操作系统决定何时同步\n```\n### 2.2 三种写回策略对比\n```\n┌─────────────────────────────────────────────────────────────┐\n│                   AOF写回策略对比                            │\n├──────────┬──────────┬──────────┬─────────────────────────────┤\n│  策略    │ 写回时机  │ 数据安全  │ 性能                       │\n├──────────┼──────────┼──────────┼─────────────────────────────┤\n│ always   │ 每次命令  │ 最高     │ 最差（每次fsync）           │\n│ everysec │ 每秒      │ 可能丢1s │ 较好（折中方案，推荐）      │\n│ no       │ OS决定    │ 不确定   │ 最好                        │\n└──────────┴──────────┴──────────┴─────────────────────────────┘\n```\n### 2.3 AOF重写机制\n随着写操作增多，AOF文件会越来越大。AOF重写（rewrite）通过合并冗余命令来压缩文件。\n**重写原理**：\n```\n┌──────────────────────────────────────────────────────────────┐\n│                   AOF重写流程                                 │\n├──────────────────────────────────────────────────────────────┤\n│  旧AOF：SET a 1 → SET a 2 → SET a 3 → DEL a → SET a 4       │\n│  重写后：SET a 4（只保留最终状态）                             │\n│                                                              │\n│  重写过程：                                                   │\n│  1. 主进程fork()创建子进程                                    │\n│  2. 子进程遍历数据库，生成新的AOF文件                         │\n│  3. 主进程继续处理请求，新写入的命令写入AOF缓冲区+重写缓冲区   │\n│  4. 子进程完成重写后，通知主进程                              │\n│  5. 主进程将重写缓冲区的内容追加到新AOF文件                   │\n│  6. 替换旧AOF文件                                            │\n└──────────────────────────────────────────────────────────────┘\n```\n**触发方式**：\n```bash\n# 手动触发\nBGREWRITEAOF\n# 自动触发（redis.conf）\nauto-aof-rewrite-percentage 100   # AOF文件比上次重写后增长100%\nauto-aof-rewrite-min-size 64mb    # AOF文件至少64MB才触发重写\n```\n### 2.4 AOF文件格式\n```bash\n# AOF文件内容（RESP协议格式）\n*3\\r\\n$3\\r\\nSET\\r\\n$3\\r\\nkey\\r\\n$5\\r\\nvalue\\r\\n\n# 等价于：SET key value\n# 重写后的AOF直接存储当前值\nSELECT 0\nSET key1 value1\nSET key2 value2\n...\n```\n## 三、RDB vs AOF 对比\n## 四、混合持久化（Redis 4.0+）\nRedis 4.0引入混合持久化，结合RDB和AOF的优势。\n### 4.1 配置与原理\n```bash\n# redis.conf\naof-use-rdb-preamble yes   # 开启混合持久化（Redis 4.0+默认开启）\n```\n**重写后的AOF文件结构**：\n```\n┌──────────────────────────────────────────────────────────────┐\n│               混合持久化AOF文件结构                           │\n├──────────────────────────────────────────────────────────────┤\n│  ┌──────────────────────┐                                    │\n│  │  RDB格式（快照部分）  │ ← 重写时刻的全量数据               │\n│  ├──────────────────────┤                                    │\n│  │  AOF格式（增量部分）  │ ← 重写期间新增的写命令             │\n│  └──────────────────────┘                                    │\n│                                                              │\n│  恢复时：先加载RDB部分（快），再重放AOF部分（保证数据完整性） │\n└──────────────────────────────────────────────────────────────┘\n```\n### 4.2 三种持久化方式选择建议\n```\n┌─────────────────────────────────────────────────────────────┐\n│                   持久化方案选择                             │\n├─────────────────────────────────────────────────────────────┤\n│  数据安全性要求高 → 开启混合持久化（推荐）                   │\n│  允许丢失几分钟数据 → 只用RDB                                │\n│  做主从复制 → 主节点可关闭持久化，从节点开启                  │\n│  纯缓存场景 → 可以关闭持久化                                 │\n└─────────────────────────────────────────────────────────────┘\n```"
+    },
+    {
+      "type": "explain",
+      "title": "深入理解",
+      "content": "## 五、内存淘汰策略\nRedis内存不足时（达到maxmemory限制），需要淘汰一些key来腾出空间。\n### 5.1 八种淘汰策略\n```\n┌─────────────────────────────────────────────────────────────┐\n│                   Redis内存淘汰策略                          │\n├────────────────────────┬────────────────────────────────────┤\n│  noeviction（默认）    │ 不淘汰，内存满时写入报错            │\n├────────────────────────┼────────────────────────────────────┤\n│  allkeys-lru           │ 所有key中，淘汰最近最少使用的       │\n│  allkeys-lfu           │ 所有key中，淘汰最不经常使用的       │\n│  allkeys-random        │ 所有key中，随机淘汰                 │\n├────────────────────────┼────────────────────────────────────┤\n│  volatile-lru          │ 设了过期时间的key中，淘汰LRU        │\n│  volatile-lfu          │ 设了过期时间的key中，淘汰LFU        │\n│  volatile-random       │ 设了过期时间的key中，随机淘汰        │\n│  volatile-ttl          │ 设了过期时间的key中，淘汰TTL最小的   │\n└────────────────────────┴────────────────────────────────────┘\n```\n### 5.2 LRU vs LFU\n**Redis的近似LRU实现**：\n- 不是真正的LRU（需要维护双向链表，内存开销大）\n- 随机采样N个key（maxmemory-samples，默认5），淘汰其中最久未访问的\n- 增大采样数可以更接近真正的LRU\n**Redis的LFU实现（4.0+）**：\n- 每个key维护一个8bit的LFU计数器\n- 使用Morris计数器算法，按对数递增\n- 同时记录访问时间（16bit），用于衰减计数\n### 5.3 配置\n```bash\n# redis.conf\nmaxmemory 4gb                    # 最大内存限制\nmaxmemory-policy allkeys-lru     # 淘汰策略\nmaxmemory-samples 5              # LRU/LFU采样数\n# 运行时修改\nCONFIG SET maxmemory-policy allkeys-lru\n```\n## 六、内存优化技巧\n### 6.1 键名优化\n```bash\n# 不推荐：长键名\nSET user:profile:information:username:1001 \"张三\"\n# 推荐：短键名\nSET u:p:n:1001 \"张三\"\n# 建议：用冒号分隔层级，保持可读性\nSET user:1001:name \"张三\"\n```\n### 6.2 编码优化\n```bash\n# 查看key的编码\nOBJECT ENCODING key\n# Hash优化：控制field数量在ziplist阈值内\n# 配置\nhash-max-ziplist-entries 512    # field数量阈值\nhash-max-ziplist-value 64       # value长度阈值\n# ZSet优化\nzset-max-ziplist-entries 128\nzset-max-ziplist-value 64\n# Set优化\nset-max-intset-entries 512\n# List优化\nlist-max-ziplist-size -2        # 每个节点最大8KB\n```\n### 6.3 内存分析\n```bash\n# 查看Redis内存使用\nINFO memory\n# used_memory: Redis分配的内存总量\n# used_memory_rss: 操作系统分配的物理内存\n# mem_fragmentation_ratio: 内存碎片率（>1.5需要关注）\n# 查看key的内存占用\nMEMORY USAGE key\n# 大key扫描\nredis-cli --bigkeys\n# 内存碎片整理（Redis 4.0+）\nCONFIG SET activedefrag yes\nCONFIG SET active-defrag-threshold-lower 10    # 碎片率超过10%时开始整理\nCONFIG SET active-defrag-threshold-upper 100   # 碎片率超过100%时全力整理\n```\n### 6.4 其他优化建议\n- **设置合理的过期时间**：避免大量key同时过期\n- **使用Hash代替多个String**：存储对象时Hash更省内存（ziplist编码时）\n- **使用整数集合**：当Set只存整数时，intset编码非常省内存\n- **避免存储大key**：String不超过10KB，Hash/Set/ZSet的元素不超过5000个\n- **开启惰性删除**：`lazyfree-lazy-eviction yes`，异步删除大key\n## 七、面试高频问题\n### Q1: RDB和AOF的区别？如何选择？\n**答**：\n- **RDB**：内存快照，文件小，恢复快，但可能丢失数据\n- **AOF**：命令追加，数据安全（最多丢1秒），但文件大、恢复慢\n- **选择**：生产环境推荐同时开启两者（Redis 4.0+用混合持久化），或用主从复制保证HA\n### Q2: BGSAVE的原理？为什么不会阻塞主线程？\n**答**：\n1. 主进程调用fork()创建子进程\n2. 操作系统使用Copy-On-Write（写时复制）机制\n3. fork时父子进程共享内存页，标记为只读\n4. 主进程有写操作时，OS复制被修改的内存页，主进程修改副本\n5. 子进程继续读取原始数据，写入RDB文件\n6. 整个过程中主进程正常处理请求，只有fork瞬间有短暂阻塞\n### Q3: AOF重写期间新写入的数据会丢失吗？\n**答**：不会。AOF重写期间：\n1. 主进程正常处理请求\n2. 新写入的命令同时写入AOF缓冲区和AOF重写缓冲区\n3. 子进程完成重写后，主进程将重写缓冲区的内容追加到新AOF文件\n4. 最后替换旧AOF文件，保证数据完整性\n### Q4: Redis的8种内存淘汰策略分别是什么？生产环境用哪种？\n**答**：\n- **noeviction**：不淘汰，写入报错（默认）\n- **allkeys-lru**：所有key中淘汰LRU\n- **allkeys-lfu**：所有key中淘汰LFU\n- **allkeys-random**：所有key中随机淘汰\n- **volatile-lru/lfu/random/ttl**：只在设了过期时间的key中淘汰\n- **生产建议**：\n- 纯缓存场景用`allkeys-lru`（热点数据不容易被淘汰）\n- 有明确冷热区分时用`allkeys-lfu`\n- 部分key必须保留时用`volatile-lru`（不设过期时间的key不会被淘汰）\n### Q5: Redis内存碎片率过高怎么办？\n**答**：\n- **mem_fragmentation_ratio** = used_memory_rss / used_memory\n- **正常范围**：1.0 ~ 1.5\n- **> 1.5**：碎片率过高，内存浪费\n- **< 1.0**：使用了swap，性能严重下降\n- **解决方案**：\n1. 开启内存碎片整理：`CONFIG SET activedefrag yes`\n2. 升级到Redis 4.0+（支持在线碎片整理）\n3. 重启Redis（重新分配内存，碎片自然消除）\n4. 使用jemalloc分配器（Redis默认，对碎片友好）\n## 八、参考资料\n- Redis持久化详解：https://redis.io/docs/management/persistence/\n- 《Redis设计与实现》黄健宏\n- Redis内存优化：https://redis.io/docs/management/optimization/memory-optimization/"
+    },
+    {
+      "type": "compareTable",
+      "title": "对比与边界",
+      "content": "| 对比项 | RDB | AOF |\n| --- | --- | --- |\n| 原理 | fork子进程生成内存快照 | 追加写命令到日志文件 |\n| 触发方式 | SAVE/BGSAVE/配置自动 | always/everysec/no |\n| 数据安全性 | 可能丢失最后一次快照后的数据 | 最多丢失1秒数据(everysec) |\n| 恢复速度 | 快（直接加载二进制文件） | 慢（重放所有命令） |\n| 文件大小 | 小（压缩的二进制） | 大（文本命令，可重写压缩） |\n| 对性能影响 | fork时可能阻塞 | 刷盘策略影响写性能 |\n| 适用场景 | 备份、灾难恢复 | 数据安全性要求高 |"
+    },
+    {
+      "type": "diagram",
+      "title": "结构图解",
+      "content": "持久化与内存的核心结构图解。",
+      "items": [
+        "RDB触发：SAVE(阻塞)/BGSAVE(fork子进程)/配置自动",
+        "BGSAVE流程：fork → 子进程写RDB → 替换旧文件",
+        "COW机制：父子进程共享内存页，写时复制",
+        "AOF写入：命令追加 → 缓冲区 → 刷盘策略",
+        "AOF重写：合并冗余命令，减小文件体积",
+        "混合持久化：RDB全量 + AOF增量",
+        "内存淘汰：8种策略，LRU/LFU/TTL/随机"
+      ]
+    },
+    {
+      "type": "code",
+      "title": "代码/伪代码抓手",
+      "content": "# 手动触发\nSAVE          # 阻塞主线程，生产环境禁用\nBGSAVE        # fork子进程在后台执行，推荐\n# 自动触发（redis.conf配置）\nsave 900 1    # 900秒内至少1个key被修改\nsave 300 10   # 300秒内至少10个key被修改\nsave 60 10000 # 60秒内至少10000个key被修改\n# 其他自动触发场景\n# 1. 执行shutdown命令时（且未开启AOF）\n# 2. 主从复制时，主节点执行BGSAVE",
+      "language": "java"
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答模板",
+      "content": "**问题1：Redis的RDB和AOF持久化有什么区别？**\n\nRDB是快照方式，通过fork子进程生成内存快照保存为dump.rdb文件。优点是恢复速度快、文件紧凑；缺点是有数据丢失风险，fork时可能阻塞主线程。\n\nAOF是日志追加方式，记录每个写命令。优点是数据安全性高，可以配置always/everysec/no三种刷盘策略；缺点是文件较大，恢复速度慢。\n\nRedis 4.0之后支持混合持久化，RDB作为全量，AOF记录增量，兼顾两者优势。生产环境建议同时开启RDB和AOF，用AOF恢复数据（更安全），RDB作为备份。\n\n**问题2：RDB的Copy-On-Write机制有什么问题？**\n\nfork子进程时，操作系统使用COW机制，父子进程共享物理内存页。当主进程修改某个page时，操作系统会复制该page给主进程修改，子进程继续读原始page。\n\n问题是：如果fork后有大量写操作，会占用额外内存，最坏情况下内存翻倍。fork本身也需要时间，数据量大时可能阻塞主线程。可以通过`info stats`查看`latest_fork_usec`了解fork耗时。所以生产环境要控制Redis实例内存大小，避免fork耗时过长。",
+      "followUpQuestions": [
+        {
+          "question": "在生产环境中，持久化与内存有哪些常见的坑和最佳实践？",
+          "answer": "Redis 持久化要围绕 RDB、AOF 和混合持久化回答。RDB 是内存快照，恢复快、文件小，但两次快照之间的数据可能丢失；AOF 记录写命令，数据丢失窗口由 fsync 策略决定，但文件更大、恢复更慢；混合持久化用 RDB 做基线，再追加 AOF 增量。"
+        },
+        {
+          "question": "持久化与内存 的核心数据结构或底层原理是什么？为什么这样设计？",
+          "answer": "追问重点是 fork、COW 和 fsync。BGSAVE/BGREWRITEAOF 都可能因为 fork 阻塞主线程，写入压力大会带来额外 COW 内存；AOF everysec 通常最多丢 1 秒数据，always 安全但吞吐低。生产上要结合内存水位、磁盘 IO、重写阈值和恢复时间目标配置。"
+        },
+        {
+          "question": "如果 持久化与内存 出现性能抖动或数据不一致，你会怎么排查？",
+          "answer": "排查 持久化与内存 问题的思路：先检查监控指标（QPS、延迟、内存、连接数），再看日志和慢查询。Redis 场景关注 bigkey、热点 key、内存碎片；MQ 场景关注消费积压、消息丢失、重复消费。定位后针对性优化配置或代码。"
+        }
+      ]
+    },
+    {
+      "type": "checklist",
+      "title": "学完后应能说清楚",
+      "items": [
+        "能说出RDB的三种触发方式和BGSAVE执行流程",
+        "能解释Copy-On-Write机制及其内存影响",
+        "能说出AOF的三种刷盘策略和数据安全性差异",
+        "能解释AOF重写的作用和触发条件",
+        "能说明混合持久化的原理和优势",
+        "能说出Redis的8种内存淘汰策略",
+        "能解释为什么生产环境建议同时开启RDB和AOF"
+      ]
+    }
+  ],
+  "recallPrompts": [
+    {
+      "id": "java.concurrency.topic-072-980339ce.recall.1",
+      "prompt": "RDB 的 fork 子进程和 COW 机制是什么？AOF 的 always/everysec/no 三种策略各有什么风险？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 2
+    },
+    {
+      "id": "java.middleware.topic-072-980339ce.recall.1",
+      "prompt": "持久化与内存 在高可用和高性能方面有哪些设计？如何权衡？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 2
+    }
+  ],
+  "rubric": {
+    "mustHave": [
+      "准确解释一、RDB持久化的定义和作用",
+      "说清1.1 触发方式和1.2 BGSAVE执行流程的关键机制",
+      "能说清 持久化与内存 的核心机制和关键流程",
+      "能说出RDB的三种触发方式和BGSAVE执行流程"
+    ],
+    "goodToHave": [
+      "能说出 持久化与内存 的底层数据结构和关键配置参数",
+      "能解释 持久化与内存 在集群和高可用场景下的行为"
+    ],
+    "commonMistakes": [
+      "对分布式中间件的理解停留在使用层面",
+      "不清楚中间件的核心架构和工作原理",
+      "不知道如何排查生产环境的中间件问题"
+    ],
+    "scoreWeights": {
+      "coverage": 35,
+      "accuracy": 30,
+      "interviewExpression": 20,
+      "depth": 15
+    }
+  },
+  "updatedAt": "2026-05-27",
+  "status": "production",
+  "prerequisites": [
+    "java.middleware.redis-data-structures"
+  ],
+  "interviewFrequency": "medium",
+  "interviewerFocus": "考察对分布式中间件的理解深度，是否了解核心架构、一致性保证、常见坑和最佳实践"
+}

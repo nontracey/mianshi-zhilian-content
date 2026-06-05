@@ -51,33 +51,11 @@ function assertValid(name, validate, data) {
   }
 }
 
-const manifest = await readJson("manifest.json");
-assertValid("manifest.json", validateManifest, manifest);
-
-const domainIds = new Set(manifest.domains.map((domain) => domain.id));
-const categoryIds = new Map();
-const topicRefs = new Set();
-
-for (const domainEntry of manifest.domains) {
-  const domain = await readJson(domainEntry.entry);
-  assertValid(domainEntry.entry, validateDomain, domain);
-  if (!domainIds.has(domain.id)) throw new Error(`Domain ${domain.id} is missing from manifest.`);
-  categoryIds.set(domain.id, new Set(domain.categories.map((category) => category.id)));
-  for (const category of domain.categories) {
-    for (const topic of category.topics) topicRefs.add(topic);
-  }
-}
-
-const topicFiles = await listJson("topics");
-const seenIds = new Set();
-for (const file of topicFiles) {
-  const topic = await readJson(file);
+function assertTopicQuality(file, topic, domainIds, categoryIds) {
   assertValid(file, validateTopic, topic);
   if (forbidden.test(topic.title) || forbidden.test(topic.summary)) {
     throw new Error(`${file} contains schedule wording in title or summary.`);
   }
-  if (seenIds.has(topic.id)) throw new Error(`Duplicate topic id: ${topic.id}`);
-  seenIds.add(topic.id);
   if (!domainIds.has(topic.domain)) throw new Error(`${file} references unknown domain ${topic.domain}`);
   if (!categoryIds.get(topic.domain)?.has(topic.category)) {
     throw new Error(`${file} references unknown category ${topic.domain}/${topic.category}`);
@@ -115,65 +93,124 @@ for (const file of topicFiles) {
   const weights = topic.rubric.scoreWeights;
   const total = weights.coverage + weights.accuracy + weights.interviewExpression + weights.depth;
   if (total !== 100) throw new Error(`${file} scoreWeights must sum to 100.`);
-  if (!topicRefs.has(file)) throw new Error(`${file} is not referenced by a domain category.`);
 }
 
-// 顺序与权重检查（防止 App 展示顺序异常）
 const orderWeightWarnings = [];
 
-for (const domainEntry of manifest.domains) {
-  const domain = await readJson(domainEntry.entry);
-  for (const category of domain.categories) {
-    const topics = [];
-    for (const ref of category.topics) {
-      if (topicFiles.includes(ref)) {
-        const topic = JSON.parse(await readFile(path.join(root, ref), "utf8"));
-        topics.push({ ref, topic });
-      }
+async function validateManifestClosure(manifestFile, expectedPrefix) {
+  const manifest = await readJson(manifestFile);
+  assertValid(manifestFile, validateManifest, manifest);
+
+  const domainIds = new Set(manifest.domains.map((domain) => domain.id));
+  const categoryIds = new Map();
+  const topicRefs = new Set();
+  const topicIds = new Set();
+  const domainFiles = [];
+
+  for (const domainEntry of manifest.domains) {
+    if (expectedPrefix && !domainEntry.entry.startsWith(expectedPrefix)) {
+      throw new Error(`${manifestFile} domain ${domainEntry.id} must use ${expectedPrefix} entry, got ${domainEntry.entry}`);
+    }
+    if (!expectedPrefix && domainEntry.entry.startsWith("staging/")) {
+      throw new Error(`${manifestFile} must not reference staging domain entry ${domainEntry.entry}`);
+    }
+    if (!expectedPrefix && domainEntry.entry.startsWith("draft/")) {
+      throw new Error(`${manifestFile} must not reference draft domain entry ${domainEntry.entry}`);
     }
 
-    const seenOrders = new Map();
-    for (let i = 0; i < topics.length; i++) {
-      const { ref, topic } = topics[i];
-
-      // 检查 order 是否重复
-      if (seenOrders.has(topic.order)) {
-        orderWeightWarnings.push({
-          level: "warning",
-          file: ref,
-          message: `DUP_ORDER ${domain.id}/${category.id}: order=${topic.order} 与 "${seenOrders.get(topic.order).title}" 重复`
-        });
-      }
-      seenOrders.set(topic.order, topic);
-
-      // 检查列表顺序是否与 order 一致
-      if (i > 0 && topics[i - 1].topic.order > topic.order) {
-        orderWeightWarnings.push({
-          level: "warning",
-          file: ref,
-          message: `ORDER_DESC ${domain.id}/${category.id}: "${topics[i - 1].topic.title}"(order=${topics[i - 1].topic.order}) 排在 "${topic.title}"(order=${topic.order}) 前面`
-        });
-      }
-
-      // 检查 low 频高权重
-      if (topic.interviewFrequency === 'low' && topic.recommendWeight >= 85) {
-        orderWeightWarnings.push({
-          level: "warning",
-          file: ref,
-          message: `LOW_HIGH_WEIGHT ${domain.id}/${category.id}: "${topic.title}" 是 low 频但权重 ${topic.recommendWeight}`
-        });
-      }
-
-      // 检查 high 频低权重
-      if (topic.interviewFrequency === 'high' && topic.recommendWeight < 75) {
-        orderWeightWarnings.push({
-          level: "warning",
-          file: ref,
-          message: `HIGH_LOW_WEIGHT ${domain.id}/${category.id}: "${topic.title}" 是 high 频但权重 ${topic.recommendWeight}`
-        });
+    const domain = await readJson(domainEntry.entry);
+    assertValid(domainEntry.entry, validateDomain, domain);
+    if (!domainIds.has(domain.id)) throw new Error(`Domain ${domain.id} is missing from ${manifestFile}.`);
+    categoryIds.set(domain.id, new Set(domain.categories.map((category) => category.id)));
+    domainFiles.push({ entry: domainEntry, domain });
+    for (const category of domain.categories) {
+      for (const topic of category.topics) {
+        if (expectedPrefix && !topic.startsWith(expectedPrefix)) {
+          throw new Error(`${domainEntry.entry} topic ref must use ${expectedPrefix}, got ${topic}`);
+        }
+        if (!expectedPrefix && topic.startsWith("staging/")) {
+          throw new Error(`${domainEntry.entry} must not reference staging topic ${topic}`);
+        }
+        if (!expectedPrefix && topic.startsWith("draft/")) {
+          throw new Error(`${domainEntry.entry} must not reference draft topic ${topic}`);
+        }
+        topicRefs.add(topic);
       }
     }
   }
+
+  for (const file of topicRefs) {
+    const topic = await readJson(file);
+    if (topicIds.has(topic.id)) throw new Error(`${manifestFile} duplicate topic id: ${topic.id}`);
+    topicIds.add(topic.id);
+    assertTopicQuality(file, topic, domainIds, categoryIds);
+  }
+
+  // 顺序与权重检查（防止 App 展示顺序异常）
+  for (const { domain } of domainFiles) {
+    for (const category of domain.categories) {
+      const topics = [];
+      for (const ref of category.topics) {
+        if (topicRefs.has(ref)) {
+          const topic = JSON.parse(await readFile(path.join(root, ref), "utf8"));
+          topics.push({ ref, topic });
+        }
+      }
+
+      const seenOrders = new Map();
+      for (let i = 0; i < topics.length; i++) {
+        const { ref, topic } = topics[i];
+
+        // 检查 order 是否重复
+        if (seenOrders.has(topic.order)) {
+          orderWeightWarnings.push({
+            level: "warning",
+            file: ref,
+            message: `DUP_ORDER ${domain.id}/${category.id}: order=${topic.order} 与 "${seenOrders.get(topic.order).title}" 重复`
+          });
+        }
+        seenOrders.set(topic.order, topic);
+
+        // 检查列表顺序是否与 order 一致
+        if (i > 0 && topics[i - 1].topic.order > topic.order) {
+          orderWeightWarnings.push({
+            level: "warning",
+            file: ref,
+            message: `ORDER_DESC ${domain.id}/${category.id}: "${topics[i - 1].topic.title}"(order=${topics[i - 1].topic.order}) 排在 "${topic.title}"(order=${topic.order}) 前面`
+          });
+        }
+
+        // 检查 low 频高权重
+        if (topic.interviewFrequency === 'low' && topic.recommendWeight >= 85) {
+          orderWeightWarnings.push({
+            level: "warning",
+            file: ref,
+            message: `LOW_HIGH_WEIGHT ${domain.id}/${category.id}: "${topic.title}" 是 low 频但权重 ${topic.recommendWeight}`
+          });
+        }
+
+        // 检查 high 频低权重
+        if (topic.interviewFrequency === 'high' && topic.recommendWeight < 75) {
+          orderWeightWarnings.push({
+            level: "warning",
+            file: ref,
+            message: `HIGH_LOW_WEIGHT ${domain.id}/${category.id}: "${topic.title}" 是 high 频但权重 ${topic.recommendWeight}`
+          });
+        }
+      }
+    }
+  }
+
+  return { manifest, topicRefs };
+}
+
+const production = await validateManifestClosure("manifest.json", "");
+const staging = await validateManifestClosure("staging-manifest.json", "staging/");
+const draft = await validateManifestClosure("draft-manifest.json", "draft/");
+
+const productionTopicFiles = await listJson("topics");
+for (const file of productionTopicFiles) {
+  if (!production.topicRefs.has(file)) throw new Error(`${file} is not referenced by a production domain category.`);
 }
 
 if (orderWeightWarnings.length > 0) {
@@ -184,4 +221,5 @@ if (orderWeightWarnings.length > 0) {
   console.log(`共 ${orderWeightWarnings.length} 个警告`);
 }
 
-console.log(`\nValidated ${topicFiles.length} topics across ${manifest.domains.length} domains.`);
+const totalRefs = production.topicRefs.size + staging.topicRefs.size + draft.topicRefs.size;
+console.log(`\nValidated ${totalRefs} referenced topics across 3 manifests.`);

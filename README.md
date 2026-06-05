@@ -9,6 +9,8 @@
 - `draft-manifest.json`：草稿内容入口。
 - `domains/`：领域与分类定义。
 - `topics/`：知识点 JSON。
+- `staging/domains/`、`staging/topics/`：测试环境隔离内容副本。
+- `draft/domains/`、`draft/topics/`：草稿环境隔离内容副本。
 - `schemas/`：内容 schema。
 - `scripts/`：内容生成与校验脚本。
 
@@ -17,6 +19,7 @@
 ```bash
 npm install
 npm run generate  # 需要设置 CONTENT_SOURCE_ROOT 环境变量指向原始 Markdown 目录
+npm run sync:env  # 从正式内容同步生成 staging/draft 隔离副本
 npm run validate
 ```
 
@@ -201,7 +204,7 @@ if (remoteVersion != localVersion) {
 - `prerequisites`：前置依赖知识点 ID，帮助 App 构建学习路径。
 - `interviewFrequency`：面试频率（`high`/`medium`/`low`），帮助学习者优先复习高频考点。
 - `interviewerFocus`：面试官关注点，帮助学习者理解考察方向。
-- `status`：生产状态（`production`/`draft`）。`npm run validate` 只校验 `production` 状态的知识点。
+- `status`：内容状态（`production`/`staging`/`draft`）。`npm run validate` 会按 `manifest.json`、`staging-manifest.json`、`draft-manifest.json` 分别校验各环境引用的知识点。
 
 ### 代码格式要求
 
@@ -334,8 +337,18 @@ https://mianshi-zhilian-content.pages.dev/manifest.json
 
 https://mianshizhilian-content.nontracey.de5.net/manifest.json
 
-两个域名必须指向同一份 `dist/` 产物，`manifest.json`、`staging-manifest.json`、`draft-manifest.json`、`domains/`、`topics/`、`schemas/`、`assets/` 路径需要保持一致。部署 workflow 会在发布后比较主备 manifest 内容，并抽样检查 domain、topic、schema、asset 深路径可访问。
+两个域名必须指向同一份 `dist/` 产物，`manifest.json`、`staging-manifest.json`、`draft-manifest.json`、`domains/`、`topics/`、`staging/`、`draft/`、`schemas/`、`assets/` 路径需要保持一致。部署 workflow 会在发布后比较主备 manifest 内容，并抽样检查 domain、topic、schema、asset 深路径可访问。
 ```
+
+### 内容环境隔离规则
+
+三个 manifest 入口路径保持不变，但它们指向不同的 domain/topic 文件：
+
+- `manifest.json` 指向 `domains/` 和 `topics/`，面向正式用户。
+- `staging-manifest.json` 指向 `staging/domains/` 和 `staging/topics/`，面向测试 App 和测试预览。
+- `draft-manifest.json` 指向 `draft/domains/` 和 `draft/topics/`，面向内容工作台草稿维护。
+
+调用方必须按 `manifest.domains[].entry` 加载 domain，并按 `domain.categories[].topics[]` 加载 topic；不要硬编码 `/domains/{id}.json` 或 `/topics/{domain}/{file}.json`。这样草稿和测试编辑不会覆盖正式内容。
 
 ## 常见问题
 

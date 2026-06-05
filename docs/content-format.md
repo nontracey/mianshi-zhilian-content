@@ -18,6 +18,8 @@
 ```text
 content-repo/
   manifest.json
+  staging-manifest.json
+  draft-manifest.json
   schemas/
     domain.schema.json
     topic.schema.json
@@ -42,11 +44,23 @@ content-repo/
       rag-pipeline.json
     algorithm/
       dp-basic.json
+  staging/
+    domains/
+      java.json
+    topics/
+      java/
+        jvm-runtime-data-area.json
+  draft/
+    domains/
+      java.json
+    topics/
+      java/
+        jvm-runtime-data-area.json
 ```
 
 ## 3. manifest.json
 
-`manifest.json` 是内容入口。App 启动或同步时先读取它。
+`manifest.json` 是正式内容入口。测试和草稿分别使用 `staging-manifest.json`、`draft-manifest.json`。App 或工作台启动/同步时先读取对应环境的 manifest。
 
 ```json
 {
@@ -76,6 +90,16 @@ content-repo/
 | `minAppVersion` | 是 | 加载该内容所需最低 App 版本。 |
 | `defaultDomain` | 是 | 默认学习领域 ID。 |
 | `domains` | 是 | 领域列表，App 根据它生成领域卡片和切换入口。 |
+
+环境隔离规则：
+
+| 入口 | 领域路径 | 知识点路径 | 使用者 |
+| --- | --- | --- | --- |
+| `manifest.json` | `domains/` | `topics/` | 正式用户 App |
+| `staging-manifest.json` | `staging/domains/` | `staging/topics/` | 测试 App、测试预览 |
+| `draft-manifest.json` | `draft/domains/` | `draft/topics/` | 内容工作台 |
+
+调用方必须使用 `manifest.domains[].entry` 加载领域文件，并使用 `domain.categories[].topics[]` 加载知识点文件；不能根据 domainId 或 topicId 自行拼接固定路径。
 
 ## 4. 领域文件
 
@@ -283,7 +307,7 @@ content-repo/
 | `recallPrompts` | 是 | 主动复述题。 |
 | `rubric` | 是 | AI 评估标准。 |
 | `sourceRef` | 否 | 内部溯源，不给用户展示。 |
-| `status` | 否 | 生产状态，`production`（正式）或 `draft`（草稿），默认 `draft`。 |
+| `status` | 否 | 内容状态，`production`（正式）、`staging`（测试）或 `draft`（草稿），默认 `draft`。状态字段用于工作台流程，真正的环境隔离以 manifest 指向的文件路径为准。 |
 | `prerequisites` | 否 | 前置依赖知识点 ID 数组，例如 `["java.jvm.runtime-data-area"]`。 |
 | `interviewFrequency` | 否 | 面试频率，`high`（高频）/ `medium`（中频）/ `low`（低频）。 |
 | `interviewerFocus` | 否 | 面试官关注点，说明面试官问这个知识点时真正想考察什么。 |

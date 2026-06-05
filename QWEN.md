@@ -90,7 +90,7 @@ manifest.json  (入口，包含领域列表 + 版本号)
 | recallPrompts    | array     | 回顾提醒问题 (至少1个)                                                 |
 | rubric           | object    | 评分标准 (mustHave, goodToHave, commonMistakes, scoreWeights 总和=100) |
 
-**可选字段**：prerequisites（前置依赖）、interviewFrequency（high/medium/low）、interviewerFocus、status（production/draft）
+**可选字段**：prerequisites（前置依赖）、interviewFrequency（high/medium/low）、interviewerFocus、status（production/staging/draft）
 
 ### 三个环境入口
 

@@ -1,0 +1,139 @@
+{
+  "id": "architecture.microservice.topic-rate-limiting",
+  "domain": "architecture",
+  "category": "microservice",
+  "group": "microservice",
+  "title": "限流降级熔断策略",
+  "summary": "掌握令牌桶、漏桶、滑动窗口等限流算法，以及降级策略和熔断状态机",
+  "tags": [
+    "架构设计",
+    "微服务",
+    "限流",
+    "降级",
+    "熔断",
+    "Sentinel"
+  ],
+  "difficulty": 4,
+  "estimatedMinutes": 20,
+  "order": 40,
+  "recommendWeight": 85,
+  "status": "production",
+  "learningCards": [
+    {
+      "type": "explain",
+      "title": "知识全景",
+      "content": "# 限流降级熔断策略\n\n## 一、限流算法\n### 1.1 令牌桶（Token Bucket）\n- 以固定速率向桶中放入令牌\n- 请求需要消耗令牌，桶空则拒绝\n- 允许突发流量（桶中可积攒令牌）\n- Guava RateLimiter实现\n\n### 1.2 漏桶（Leaky Bucket）\n- 请求进入桶中，以固定速率流出处理\n- 桶满则拒绝新请求\n- 强制平滑速率，不允许突发\n\n### 1.3 固定窗口\n- 将时间划分为固定窗口，每个窗口有计数器\n- 缺点：窗口边界处可能突发2倍流量\n\n### 1.4 滑动窗口\n- 将窗口划分为多个小格子，统计所有格子的总数\n- 解决固定窗口的边界突发问题\n- Sentinel使用滑动窗口"
+    },
+    {
+      "type": "explain",
+      "title": "深入理解",
+      "content": "## 二、限流粒度\n- **集群限流**：整个集群共享配额（需Redis）\n- **单机限流**：每个实例独立计数\n- **接口限流**：针对特定API\n- **用户限流**：针对特定用户\n\n## 三、降级策略\n- **返回默认值**：返回缓存数据或默认响应\n- **调用备用服务**：主服务不可用时切换到备用\n- **异步降级**：同步改异步，先返回成功\n- **功能降级**：关闭非核心功能\n\n## 四、熔断器（Circuit Breaker）\n### 4.1 状态机\n- **关闭（Closed）**：正常状态，统计失败率\n- **打开（Open）**：失败率超阈值，直接拒绝请求\n- **半开（Half-Open）**：等待一段时间后，放少量请求试探\n\n### 4.2 熔断条件\n- 错误率超过阈值（如50%）\n- 慢调用比例超过阈值\n- 异常数超过阈值\n\n## 五、Sentinel vs Hystrix\n- Sentinel：阿里开源，功能丰富，支持集群限流\n- Hystrix：Netflix，已停止维护\n- Resilience4j：轻量级，函数式API"
+    },
+    {
+      "type": "code",
+      "title": "代码示例",
+      "content": "// 1. Guava RateLimiter - 令牌桶\n@Service\npublic class RateLimitService {\n    private final RateLimiter limiter = RateLimiter.create(100); // 100 QPS\n\n    public String process(String request) {\n        if (!limiter.tryAcquire(100, TimeUnit.MILLISECONDS)) {\n            throw new RateLimitException(\"请求过于频繁\");\n        }\n        return doProcess(request);\n    }\n}\n\n// 2. Redis集群限流 - 滑动窗口\n@Service\npublic class RedisRateLimiter {\n    private final StringRedisTemplate redis;\n\n    public boolean isAllowed(String key, int limit, int windowSeconds) {\n        long now = System.currentTimeMillis();\n        long windowStart = now - windowSeconds * 1000L;\n\n        String luaScript = \"redis.call('zremrangebyscore', KEYS[1], 0, ARGV[1]) \" +\n            \"local count = redis.call('zcard', KEYS[1]) \" +\n            \"if count < tonumber(ARGV[3]) then \" +\n            \"redis.call('zadd', KEYS[1], ARGV[2], ARGV[2]) \" +\n            \"redis.call('expire', KEYS[1], ARGV[4]) \" +\n            \"return 1 else return 0 end\";\n\n        Long result = redis.execute(\n            new DefaultRedisScript<>(luaScript, Long.class),\n            Collections.singletonList(\"rate:\" + key),\n            String.valueOf(windowStart),\n            String.valueOf(now),\n            String.valueOf(limit),\n            String.valueOf(windowSeconds)\n        );\n        return Long.valueOf(1L).equals(result);\n    }\n}\n\n// 3. Sentinel限流配置\n// @SentinelResource注解\n@SentinelResource(\n    value = \"createOrder\",\n    blockHandler = \"createOrderBlock\",\n    fallback = \"createOrderFallback\"\n)\npublic OrderId createOrder(CreateOrderCmd cmd) {\n    return orderService.create(cmd);\n}\n\n// 限流降级方法\npublic OrderId createOrderBlock(CreateOrderCmd cmd, BlockException ex) {\n    throw new RateLimitException(\"系统繁忙，请稍后重试\");\n}\n\n// 熔断降级方法\npublic OrderId createOrderFallback(CreateOrderCmd cmd, Throwable t) {\n    return OrderId.pending(); // 返回待处理状态\n}\n\n// 4. Resilience4j熔断器\n@Service\npublic class CircuitBreakerService {\n    private final CircuitBreaker circuitBreaker = CircuitBreaker.ofDefaults(\"orderService\");\n    private final Supplier<OrderDTO> decoratedSupplier = CircuitBreaker\n        .decorateSupplier(circuitBreaker, () -> orderClient.getOrder(\"123\"));\n\n    public OrderDTO getOrderWithFallback() {\n        Try<OrderDTO> result = Try.ofSupplier(decoratedSupplier)\n            .recover(CallNotPermittedException.class, e -> OrderDTO.degraded())\n            .recover(Exception.class, e -> OrderDTO.error());\n        return result.get();\n    }\n}\n\n// 5. 降级策略 - 返回缓存数据\n@Service\npublic class DegradeService {\n    public UserProfile getUserProfile(String userId) {\n        try {\n            return userClient.getProfile(userId); // 远程调用\n        } catch (Exception e) {\n            // 降级：返回缓存数据\n            UserProfile cached = cacheManager.get(\"user:\" + userId);\n            if (cached != null) return cached;\n            // 降级：返回默认值\n            return UserProfile.defaultProfile(userId);\n        }\n    }\n}",
+      "language": "java"
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答模板",
+      "content": "限流降级熔断是微服务高可用的三板斧。\n\n**限流**控制进入系统的请求量。常用的算法有四种：令牌桶允许突发流量，漏桶强制平滑速率，固定窗口简单但有边界问题，滑动窗口最精确。我项目中用的是Sentinel的滑动窗口，它把时间窗口分成多个小格子，统计所有格子的总数，解决了固定窗口边界处突发2倍流量的问题。\n\n限流粒度可以是集群级别（Redis计数）、单机级别、接口级别或用户级别。\n\n**降级**是在系统压力大时，主动关闭非核心功能或返回兜底数据。策略有：返回缓存数据、调用备用服务、同步改异步、关闭非核心功能。关键是要有明确的降级预案。\n\n**熔断器**是防止级联故障的机制。有三个状态：关闭（正常统计失败率）、打开（失败率超阈值，直接拒绝）、半开（试探恢复）。我用Sentinel的@SentinelResource注解配置熔断规则，设置慢调用比例和错误率阈值。\n\n核心思想是**快速失败**，不让请求堆积，保护下游服务。",
+      "followUpQuestions": [
+        {
+          "question": "在你的项目中，限流降级熔断策略是怎么落地的？遇到了什么权衡取舍？",
+          "answer": "限流算法：固定窗口→滑动窗口→漏桶→令牌桶。降级：非核心服务暂时关闭，保证核心链路可用。熔断：错误率超阈值→断路器打开→快速失败→半开探测。Sentinel/Gateway集成限流，Hystrix/Resilience4j实现熔断。"
+        },
+        {
+          "question": "限流降级熔断策略 在高并发（万级 QPS）和数据一致性要求高的场景下，有哪些关键设计决策？",
+          "answer": "限流降级熔断策略 在高并发场景下要先识别核心约束，再拆成容量、延迟、一致性、故障隔离和可观测性几个维度设计。回答时应说明关键瓶颈在哪里、哪些链路可以异步或降级、哪些数据必须保持一致，以及出现积压、超时或部分失败时如何恢复。"
+        },
+        {
+          "question": "如果现有系统需要引入 限流降级熔断策略，你会怎么评估改造风险和制定迁移计划？",
+          "answer": "引入 限流降级熔断策略 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。建议分阶段推进：先在非核心模块试点，验证后逐步推广。迁移过程中要做好灰度、回滚、监控，确保业务不受影响。"
+        }
+      ]
+    },
+    {
+      "type": "compareTable",
+      "title": "对比与边界",
+      "content": "| 维度 | 令牌桶 | 漏桶 | 固定窗口 | 滑动窗口 |\n| --- | --- | --- | --- | --- |\n| 突发处理 | 允许 | 不允许 | 允许（有问题） | 精确控制 |\n| 平滑度 | 中 | 高 | 低 | 高 |\n| 实现复杂 | 中 | 中 | 低 | 高 |\n| 代表实现 | Guava | 自实现 | Redis | Sentinel |"
+    },
+    {
+      "type": "compareTable",
+      "title": "维度对比",
+      "content": "| 维度 | Sentinel | Hystrix | Resilience4j |\n| --- | --- | --- | --- |\n| 维护状态 | 活跃 | 停止 | 活跃 |\n| 集群限流 | 支持 | 不支持 | 不支持 |\n| 熔断策略 | 多种 | 线程池/信号量 | 多种 |\n| 流控规则 | 动态推送 | 配置文件 | 配置文件 |\n| 语言 | Java | Java | Java |"
+    },
+    {
+      "type": "diagram",
+      "title": "结构图解",
+      "content": "熔断器状态机转换图",
+      "fallback": "Closed →(失败率超阈值)→ Open →(等待时间到)→ Half-Open →(试探成功)→ Closed",
+      "items": [
+        "Closed：正常状态，统计失败率",
+        "Open：失败率超阈值，直接拒绝所有请求",
+        "Half-Open：等待一段时间后放少量请求试探",
+        "试探成功回到Closed，失败回到Open"
+      ],
+      "asset": "assets/diagrams/18-rate-limit-circuit-breaker.svg"
+    },
+    {
+      "type": "checklist",
+      "title": "学完后应能说清楚",
+      "items": [
+        "令牌桶和漏桶的核心区别：是否允许突发流量",
+        "滑动窗口如何解决固定窗口的边界问题",
+        "降级的四种策略：默认值/备用服务/异步/功能降级",
+        "熔断器的三个状态和转换条件",
+        "Sentinel的核心功能和使用方式"
+      ]
+    }
+  ],
+  "recallPrompts": [
+    {
+      "id": "architecture.microservice.topic-rate-limiting.recall.1",
+      "prompt": "请对比令牌桶和漏桶两种限流算法的区别和适用场景。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 2
+    },
+    {
+      "id": "architecture.microservice.topic-rate-limiting.recall.2",
+      "prompt": "熔断器的三个状态是什么？如何从打开状态恢复到关闭状态？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 2
+    }
+  ],
+  "rubric": {
+    "mustHave": [
+      "令牌桶和漏桶的核心区别",
+      "滑动窗口的原理",
+      "降级的策略和实现方式",
+      "熔断器的三态模型",
+      "Sentinel的使用方式"
+    ],
+    "goodToHave": [
+      "Redis集群限流的Lua脚本实现",
+      "限流的粒度选择",
+      "Sentinel与Hystrix的对比",
+      "熔断与降级的配合"
+    ],
+    "commonMistakes": [
+      "混淆限流、降级、熔断三个概念",
+      "限流算法选择不当（固定窗口有临界问题）",
+      "熔断器状态转换不理解（Closed→Open→Half-Open）"
+    ],
+    "scoreWeights": {
+      "coverage": 25,
+      "accuracy": 25,
+      "interviewExpression": 20,
+      "depth": 30
+    }
+  },
+  "prerequisites": [
+    "architecture.microservice.topic-distributed-lock"
+  ],
+  "interviewFrequency": "high",
+  "interviewerFocus": "考察系统设计能力，能否结合实际项目规模选择合适的架构方案，理解核心权衡（一致性vs可用性）"
+}
