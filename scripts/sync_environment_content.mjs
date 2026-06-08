@@ -49,6 +49,7 @@ async function syncEnvironment(env) {
     for (const category of domain.categories) {
       for (const topicPath of category.topics) {
         const topic = await readJson(topicPath);
+        topic.status = env;
         await writeJson(withEnvPrefix(env, topicPath), topic);
       }
     }
