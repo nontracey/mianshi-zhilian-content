@@ -5,14 +5,100 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: write
+  pull-requests: read
+
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+
       - run: npm ci
+
+      - name: Check contentVersion is current (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          today=$(date +%Y.%m.%d)
+          today_num=$(date +%Y%m%d)
+          for manifest in manifest.json staging-manifest.json draft-manifest.json; do
+            cv=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$manifest','utf8')).contentVersion)")
+            cv_num=$(echo "$cv" | tr -d '.')
+            if [ "$cv_num" -lt "$today_num" ]; then
+              echo "ERROR: $manifest contentVersion ($cv) is older than today ($today)."
+              echo "Rebase on main and the auto-set workflow will update it."
+              exit 1
+            fi
+            echo "OK: $manifest contentVersion = $cv"
+          done
+
+      - name: Check PR scope (fork only)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          changed_files=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          for file in $changed_files; do
+            if [[ "$file" != draft/* ]]; then
+              echo "ERROR: Fork PRs can only modify files under draft/."
+              echo "Offending file: $file"
+              exit 1
+            fi
+          done
+          echo "All changed files are under draft/ — OK"
+
       - run: npm run validate
+
+      - name: Auto-set contentVersion (main push only)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          today=$(date +%Y.%m.%d)
+          updated=false
+          for manifest in manifest.json staging-manifest.json draft-manifest.json; do
+            cv=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$manifest','utf8')).contentVersion)")
+            if [ "$cv" != "$today" ]; then
+              node -e "
+                const m = JSON.parse(require('fs').readFileSync('$manifest','utf8'));
+                m.contentVersion = '$today';
+                m.updatedAt = '$(date +%Y-%m-%d)';
+                require('fs').writeFileSync('$manifest', JSON.stringify(m, null, 2) + '\n');
+              "
+              echo "Updated $manifest: $cv -> $today"
+              updated=true
+            fi
+          done
+          if [ "$updated" = "true" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add manifest.json staging-manifest.json draft-manifest.json
+            git commit -m "chore: auto-set contentVersion to $today"
+            git push
+          else
+            echo "All manifests already at $today — no update needed"
+          fi
+
+      - name: Trigger site rebuild on spec/docs change (main push only)
+        if: github.ref == 'refs/heads/main' && secrets.SITE_TRIGGER_TOKEN != ''
+        run: |
+          changed=$(git diff --name-only ${{ github.event.before }}...${{ github.sha }})
+          spec_changed=false
+          if echo "$changed" | grep -qE '^docs/|^schemas/'; then
+            spec_changed=true
+          fi
+          if [ "$spec_changed" = "true" ]; then
+            curl -s -X POST \
+              -H "Authorization: Bearer ${{ secrets.SITE_TRIGGER_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Content-Type: application/json" \
+              -d '{"event_type":"spec-updated","client_payload":{"sha":"${{ github.sha }}","ref":"${{ github.ref }}"}}' \
+              "https://api.github.com/repos/nontracey/mianshi-zhilian-site/dispatches"
+            echo "Triggered site rebuild (spec/docs changed)"
+          else
+            echo "No spec/docs changes — skipping site trigger"
+          fi

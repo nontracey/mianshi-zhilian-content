@@ -1,6 +1,6 @@
 # 面试智练内容仓库
 
-[![CI](https://github.com/nontracey/mianshi-zhilian-content/actions/workflows/ci.yml/badge.svg)](https://github.com/nontracey/mianshi-zhilian-content/actions/workflows/ci.yml)
+[![Validate content](https://github.com/nontracey/mianshi-zhilian-content/actions/workflows/validate.yml/badge.svg)](https://github.com/nontracey/mianshi-zhilian-content/actions/workflows/validate.yml)
 
 面试智练的公共知识内容源。App 通过 `manifest.json` 发现领域、分类、知识点和资源；新增知识不需要修改 App 代码。
 
@@ -83,18 +83,24 @@ python3 scripts/validate_paths.py --fix
 
 ---
 
+## 贡献指南
+
+本项目欢迎社区贡献！详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+- **Fork PR**：仅允许修改 `draft/` 目录下的文件。修改内容后创建 Pull Request，CI 会自动验证。
+- **同仓库 PR**：无目录限制，但建议先讨论变更方案。
+- `main` push 时 CI 会自动设置 `contentVersion` 为当天日期，无需手动修改。
+
 ## 内容更新流程
 
-### ⚠️ 重要：更新内容后必须更新版本号
-
-App 通过 `manifest.json` 中的 `contentVersion` 字段检测内容是否有更新。如果修改了内容但没有更新版本号，App 会继续使用本地缓存的旧内容！
+`main` 分支推送时 CI 会自动更新三个 manifest 的 `contentVersion` 为当天日期，无需手动操作。
 
 ### 更新步骤
 
-1. **修改内容**（知识点、分类、领域等）
-2. **更新版本号**（必须！）
-3. **验证内容**：`npm run validate`
-4. **提交并推送**
+1. **修改内容**（知识点、分类、领域等），或在 [内容工作台](https://github.com/nontracey/mianshi-zhilian-studio) 编辑
+2. **验证内容**：`npm run validate`
+3. **提交 Pull Request**（fork PR 仅限 `draft/` 目录）
+4. **合并到 `main`** 后自动部署并更新版本号
 
 ### ⚠️ 内容结构同步规则（必读）
 
@@ -146,37 +152,16 @@ App 通过 `manifest.json` 中的 `contentVersion` 字段检测内容是否有�
    - App 平台：确保缓存清理机制正常
    - 文档：更新相关说明
 
-### 更新版本号
+### contentVersion（自动管理）
 
-修改 `manifest.json`、`staging-manifest.json`、`draft-manifest.json` 中的 `contentVersion`：
+**无需手动修改**。`main` 分支 push 时 CI 会自动将三个 manifest 的 `contentVersion` 设为当天日期（`YYYY.MM.DD`）。如果当前已经是当天日期则跳过。
 
 ```json
 {
   "schemaVersion": "1.0.0",
-  "contentVersion": "2026.05.28",  // ← 改为今天的日期
+  "contentVersion": "2026.06.08",  // CI 自动管理
   ...
 }
-```
-
-或使用脚本批量更新：
-
-```bash
-# 更新所有 manifest 的版本号
-python3 -c "
-import json
-from datetime import date
-version = date.today().strftime('%Y.%m.%d')
-for f in ['manifest.json', 'staging-manifest.json', 'draft-manifest.json']:
-    try:
-        with open(f, 'r') as file:
-            data = json.load(file)
-        data['contentVersion'] = version
-        with open(f, 'w') as file:
-            json.dump(data, file, ensure_ascii=False, indent=2)
-        print(f'已更新 {f} -> {version}')
-    except Exception as e:
-        print(f'跳过 {f}: {e}')
-"
 ```
 
 ### App 缓存机制
