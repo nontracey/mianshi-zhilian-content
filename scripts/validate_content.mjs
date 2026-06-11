@@ -1,4 +1,5 @@
 import { readFile, readdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import Ajv from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
@@ -6,6 +7,103 @@ import addFormats from "ajv-formats";
 const root = process.cwd();
 const forbidden = /(第\s*\d+[a-zA-Z]?\s*天|第\s*\d+[a-zA-Z]?\s*阶段|Day\s*\d+|今日练习与总结)/i;
 const boxDrawing = /[┌┐└┘├┤┬┴┼│─═╔╗╚╝╠╣╦╩╬]/;
+
+// 图解卡资源/占位/mermaid 语法检查
+// 背景：图解卡渲染优先级 mermaid > asset(SVG) > SmartDiagram(items)。
+// 历史问题：asset 指向不存在的 SVG → App 只显示 fallback；fallback 又是"建议用…"
+// 占位文字；以及 mermaid 用了 App 轻量解析器不支持的语法被静默丢弃。下面三条把这些挡住。
+const placeholderText = /建议(用|改用|使用)/; // fallback/content 不得是"建议用…"占位
+const mermaidLabeledDotted = /-\.\s*\S[^\n]*?\.-+>/; // 带标签虚线边 -.标签.-> ，App 不支持
+const mermaidUnsupportedKeyword =
+  /^(subgraph|end|classDef|class\s|style\s|linkStyle|click\s|direction\s)/i;
+const mermaidLabeledEdge = /(.+?)\s*--\s*([^>-]+?)\s*--?>\s*(.+)/;
+const mermaidPlainEdge = /(.+?)\s*(-\.->|==>|-->|---)\s*(.+)/;
+
+function isMermaidCard(card) {
+  if ((card.format || "").toLowerCase() === "mermaid") return true;
+  const first =
+    (card.content || "")
+      .replace(/\\n/g, "\n")
+      .trim()
+      .split("\n")
+      .map((l) => l.trim())
+      .find((l) => l) || "";
+  return /^(flowchart|graph)\s+(TB|TD|BT|LR|RL)\b/i.test(first);
+}
+
+// 校验单张 diagram 卡：资源存在性、占位文字、mermaid 语法（与 App 解析器对齐）。
+function assertDiagramCard(file, card) {
+  const mermaid = isMermaidCard(card);
+
+  // 1) 引用的图片资源必须存在——缺图会让 App 只显示 fallback 占位文字
+  const asset = card.svgPath || card.asset;
+  if (asset && !mermaid && !card.svg) {
+    if (!existsSync(path.join(root, asset))) {
+      throw new Error(
+        `${file} 图解卡 "${card.title}" 引用了不存在的资源 ${asset}（请补资源，或改用 format:"mermaid" 流程图）`,
+      );
+    }
+  }
+
+  // 2) fallback/content 不能是"建议用…"占位文字，必须是真实的文本形流程/结构
+  for (const field of ["fallback", "content"]) {
+    const v = card[field];
+    if (typeof v === "string" && placeholderText.test(v)) {
+      throw new Error(
+        `${file} 图解卡 "${card.title}" 的 ${field} 是占位文字（"${v.slice(0, 30)}…"），请写真实的文本形流程/结构`,
+      );
+    }
+  }
+
+  // 3) mermaid 只能用 App 轻量解析器（MermaidDiagramData）支持的语法
+  if (mermaid) {
+    let src = (card.content || "").replace(/\\n/g, "\n").trim();
+    if (src.startsWith("```")) {
+      const lines = src.split("\n");
+      lines.shift();
+      if (lines[lines.length - 1]?.trim() === "```") lines.pop();
+      src = lines.join("\n").trim();
+    }
+    const statements = src
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("%%"))
+      .flatMap((l) => l.split(";"))
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (
+      !statements.length ||
+      !/^(?:flowchart|graph)\s+([A-Za-z]{2})\b/i.test(statements[0])
+    ) {
+      throw new Error(
+        `${file} mermaid 卡 "${card.title}" 缺少 "flowchart TD/LR" 方向头`,
+      );
+    }
+    let edges = 0;
+    for (const st of statements.slice(1)) {
+      if (mermaidUnsupportedKeyword.test(st)) {
+        throw new Error(
+          `${file} mermaid 卡 "${card.title}" 含不支持的语法 "${st}"（subgraph/classDef/style 等会被 App 丢弃）`,
+        );
+      }
+      if (mermaidLabeledDotted.test(st)) {
+        throw new Error(
+          `${file} mermaid 卡 "${card.title}" 含带标签虚线边 "${st}"（App 不支持，边会丢失；请改用 A -->|标签| B）`,
+        );
+      }
+      if (mermaidLabeledEdge.test(st) || mermaidPlainEdge.test(st)) {
+        edges++;
+      } else {
+        throw new Error(
+          `${file} mermaid 卡 "${card.title}" 含无法解析为边的语句 "${st}"（请把节点写进边，如 A[..] --> B[..]）`,
+        );
+      }
+    }
+    if (edges === 0) {
+      throw new Error(`${file} mermaid 卡 "${card.title}" 没有可渲染的边`);
+    }
+  }
+}
 
 // 语义质量检查（P0/P1 整改完成后加入，防止模板化问题回流）
 const semanticChecks = [
@@ -94,6 +192,9 @@ function assertTopicQuality(file, topic, domainIds, categoryIds, expectedStatus)
     }
     if (card.type === "code" && !card.language) {
       throw new Error(`${file} code card ${card.title} must include language.`);
+    }
+    if (card.type === "diagram") {
+      assertDiagramCard(file, card);
     }
   }
   // 语义质量检查
