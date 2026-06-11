@@ -8,7 +8,8 @@
 - 设计模式面试路线：设计原则 -> 创建型模式 -> 结构型模式 -> 行为型模式
 - 前端面试路线：JavaScript 基础 -> 网络与安全 -> CSS 与布局 -> TypeScript -> React 深入 -> Vue 框架 -> 前端工程化 -> Node.js -> 前端架构 -> 客户端开发
 - 架构设计面试路线：架构方法论 -> 微服务设计 -> 系统设计 -> 项目架构设计
-- .NET 开发面试路线：C# 语言基础 -> .NET Core / .NET 8+ -> ASP.NET Core -> EF Core 与数据库 -> 客户端开发 -> .NET 微服务 -> 高级主题
+- Python 开发面试路线：Python 基础入门 -> Python 进阶特性 -> 面向对象 -> 并发与异步 -> 工程实践 -> Web 开发 -> 编码面试
+- .NET 开发面试路线：C# 语言基础 -> .NET 8/9/10 -> ASP.NET Core -> EF Core 与数据库 -> 客户端开发 -> .NET 微服务 -> 高级主题
 - 操作系统面试路线：进程与线程 -> 内存管理 -> IO 模型 -> Linux 基础
 - 计算机网络面试路线：TCP/UDP 协议 -> HTTP/HTTPS -> DNS 与 CDN -> WebSocket
 
@@ -68,6 +69,7 @@
 - MyBatis核心原理
 - MyBatis-Plus
 - Spring AOP 深入
+- Spring 事务传播与失效场景
 
 ### 微服务治理
 
@@ -161,6 +163,7 @@
 - LeetCode 206: 反转链表
 - LeetCode 21: 合并两个有序链表
 - LeetCode 141: 环形链表
+- LeetCode 25: K 个一组翻转链表
 
 ### 双指针
 
@@ -401,6 +404,52 @@
 - 多租户SaaS架构设计
 - 低代码平台核心架构
 
+## Python 开发
+
+### Python 基础入门
+
+- 数据类型与变量
+- 控制流与函数
+- 容器类型
+- 字符串与正则
+
+### Python 进阶特性
+
+- 装饰器
+- 生成器与迭代器
+- 上下文管理器
+- 闭包与作用域
+
+### Python 面向对象
+
+- 类与继承
+- 魔术方法
+- MRO、描述符与元类
+
+### 并发与异步编程
+
+- GIL 与线程
+- multiprocessing 多进程
+- asyncio 协程
+
+### Python 工程实践
+
+- 模块与包管理
+- 类型注解
+- 测试策略
+- 性能优化
+- Python 内存管理与 GC
+
+### Python Web 开发
+
+- Flask 与 FastAPI
+- ORM 与数据库
+
+### Python 编码面试
+
+- Pythonic 编程
+- 内置函数与标准库
+
 ## .NET 开发
 
 ### C# 语言基础
@@ -411,7 +460,7 @@
 - 泛型与协变逆变
 - 反射与特性
 
-### .NET Core / .NET 8+
+### .NET 8/9/10
 
 - 依赖注入
 - 中间件管道

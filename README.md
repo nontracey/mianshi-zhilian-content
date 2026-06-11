@@ -293,7 +293,7 @@ App 每次加载最新 manifest/domain 后会按引用列表裁剪本地缓存�
 | 分类 ID             | 名称                | 关键词                                     |
 | ------------------- | ------------------- | ------------------------------------------ |
 | csharp              | C# 语言基础         | 类型系统, LINQ, async/await, 泛型, 反射    |
-| dotnet-core         | .NET Core / .NET 8+ | 依赖注入, 中间件, 配置, 日志, GC           |
+| dotnet-core         | .NET 8/9/10         | 依赖注入, 中间件, 配置, 日志, GC           |
 | aspnet              | ASP.NET Core        | Web API, 过滤器, 认证授权, SignalR         |
 | ef-core             | EF Core 与数据库    | ORM, 迁移, 性能, 仓储模式, 多租户          |
 | client              | 客户端开发          | WPF, MAUI, Avalonia, XAML绑定              |

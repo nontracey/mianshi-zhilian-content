@@ -23,6 +23,64 @@ function stripCodeFences(text) {
   return text.replace(/```[\s\S]*?```/g, "");
 }
 
+function normalizeComparableText(text) {
+  return stripCodeFences(text ?? "")
+    .replace(/\s+/g, "")
+    .replace(/[，。；：、,.!！?？()[\]（）【】#*_`|>~\-]/g, "")
+    .toLowerCase();
+}
+
+function findEmptyMarkdownHeadings(text) {
+  const lines = (text ?? "").split(/\r?\n/);
+  const headings = [];
+  let inFence = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+
+    const heading = line.match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (!heading) continue;
+
+    const level = heading[1].length;
+    let hasContent = false;
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      const next = lines[cursor];
+      if (/^\s*```/.test(next)) {
+        hasContent = true;
+        break;
+      }
+
+      const nextHeading = next.match(/^(#{1,6})\s+(.+?)\s*$/);
+      if (nextHeading && nextHeading[1].length <= level) break;
+      if (nextHeading && nextHeading[1].length > level) {
+        hasContent = true;
+        break;
+      }
+      if (!nextHeading && next.trim()) {
+        hasContent = true;
+        break;
+      }
+    }
+
+    if (!hasContent) headings.push({ line: index + 1, title: heading[2] });
+  }
+
+  return headings;
+}
+
+function countMarkdownFenceLines(text) {
+  return (text ?? "").split(/\r?\n/).filter((line) => /^\s*```/.test(line)).length;
+}
+
+function hasMarkdownFenceLine(text) {
+  return /^\s*```/m.test(text ?? "");
+}
+
 function normalizeCodeContent(text) {
   return (text ?? "").replace(/\\n/g, "\n").trim();
 }
@@ -126,14 +184,55 @@ const checks = [
     code: "MCP_LEGACY_TRANSPORT_ONLY",
     pattern: /stdio\s*和\s*SSE\s*两种传输|stdio和SSE两种传输/,
   },
+  {
+    code: "JAVA_HASHMAP_RECALL_TEMPLATE",
+    pattern: /的底层数据结构是什么？扩容机制和哈希冲突处理方式有什么区别？/,
+  },
+  {
+    code: "JAVA_DCL_RECALL_TEMPLATE",
+    pattern: /请手写一个线程安全的单例模式（DCL）/,
+  },
+  {
+    code: "RUBRIC_MACHINE_SPLICE",
+    pattern: /准确解释(?:\d+\.|[一二三四五六七八九十]+[、.．])|定义的定义/,
+  },
+  {
+    code: "STALE_MODEL_CONTEXT_TABLE",
+    pattern: /GPT-4o 为 128K|Claude 3\.5 为 200K|Gemini 1\.5 Pro/,
+  },
+  {
+    code: "STALE_DOTNET_VERSION_TEMPLATE",
+    pattern: /\.NET Core\/8\+|\.NET Core\s*\/\s*\.NET 8\+|\.NET 6\/7\/8/,
+  },
 ];
 
 const issues = [];
-for (const file of await listJson("topics")) {
+for (const topicRoot of ["topics", "staging/topics", "draft/topics"]) {
+for (const file of await listJson(topicRoot)) {
   const topic = await readJson(file);
   const fields = [];
 
   for (const card of topic.learningCards ?? []) {
+    if (typeof card.content === "string") {
+      const fenceCount = countMarkdownFenceLines(card.content);
+      if (fenceCount % 2 !== 0) {
+        issues.push({
+          code: "UNBALANCED_MARKDOWN_FENCE",
+          file,
+          title: topic.title,
+          field: `learningCards.${card.type}.${card.title}`,
+        });
+      }
+      if (card.type === "code" && hasMarkdownFenceLine(card.content)) {
+        issues.push({
+          code: "CODE_CARD_MARKDOWN_FENCE",
+          file,
+          title: topic.title,
+          field: `learningCards.code.${card.title}`,
+        });
+      }
+    }
+
     if (card.type === "code") {
       const languageIssue = detectCodeLanguageIssue(card);
       if (languageIssue) {
@@ -148,6 +247,14 @@ for (const file of await listJson("topics")) {
     }
 
     if (typeof card.content === "string") {
+      for (const emptyHeading of findEmptyMarkdownHeadings(card.content)) {
+        issues.push({
+          code: "EMPTY_MARKDOWN_HEADING",
+          file,
+          title: topic.title,
+          field: `learningCards.${card.type}.${card.title}:L${emptyHeading.line}:${emptyHeading.title}`,
+        });
+      }
       fields.push([`learningCards.${card.type}.${card.title}`, stripCodeFences(card.content)]);
     }
     for (const item of card.items ?? []) {
@@ -178,8 +285,25 @@ for (const file of await listJson("topics")) {
   }
 
   const explainTitles = new Set();
+  const explainContents = new Map();
   for (const card of topic.learningCards ?? []) {
     if (card.type !== "explain") continue;
+    if (/^\s*\/\//.test(card.title ?? "")) {
+      issues.push({
+        code: "CODE_COMMENT_EXPLAIN_TITLE",
+        file,
+        title: topic.title,
+        field: `learningCards.explain.${card.title}`,
+      });
+    }
+    if (/[（(]?续[）)]?|第\s*\d+\s*部分/.test(card.title ?? "")) {
+      issues.push({
+        code: "CONTINUATION_EXPLAIN_TITLE",
+        file,
+        title: topic.title,
+        field: `learningCards.explain.${card.title}`,
+      });
+    }
     if (explainTitles.has(card.title)) {
       issues.push({
         code: "DUPLICATE_EXPLAIN_TITLE",
@@ -189,7 +313,22 @@ for (const file of await listJson("topics")) {
       });
     }
     explainTitles.add(card.title);
+
+    const comparableContent = normalizeComparableText(card.content);
+    if (comparableContent.length >= 120) {
+      const previousTitle = explainContents.get(comparableContent);
+      if (previousTitle) {
+        issues.push({
+          code: "DUPLICATE_EXPLAIN_CONTENT",
+          file,
+          title: topic.title,
+          field: `learningCards.explain.${previousTitle} / ${card.title}`,
+        });
+      }
+      explainContents.set(comparableContent, card.title);
+    }
   }
+}
 }
 
 if (issues.length > 0) {
@@ -198,5 +337,5 @@ if (issues.length > 0) {
   }
   process.exitCode = 1;
 } else {
-  console.log("Quality scan passed: no template text, duplicated explain titles, unsafe code-language labels, generic frontend follow-up, placeholder answer, or unsafe inline numbering found.");
+  console.log("Quality scan passed: no template text, duplicated explain titles/content, unsafe code-language labels, broken markdown fences, generic frontend follow-up, placeholder answer, or unsafe inline numbering found.");
 }
