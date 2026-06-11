@@ -20,8 +20,18 @@
   "learningCards": [
     {
       "type": "explain",
-      "title": "知识全景",
-      "content": "# select/poll/epoll\n\n## 一、select\n- 使用 fd_set 位图表示关注的文件描述符\n- 调用时将 fd_set 拷贝到内核，内核遍历检查就绪状态\n- 返回后需要遍历所有 fd 找出就绪的\n- **限制**：fd 数量受 FD_SETSIZE 限制（默认 1024）\n- 每次调用都需要重新设置 fd_set\n\n## 二、poll\n- 使用 pollfd 结构体数组代替位图\n- 没有 fd 数量限制\n- 仍然需要将数组拷贝到内核\n- 返回后仍然需要遍历所有 fd\n- 相比 select 只是解决了数量限制\n\n## 三、epoll\n- 通过 epoll_create 创建实例\n- 通过 epoll_ctl 注册/修改/删除关注的 fd\n- 通过 epoll_wait 等待事件\n- **核心优势**：\n  - 事件驱动：内核维护就绪列表，只返回就绪的 fd\n  - fd 注册一次即可，不需要每次重复传入\n  - 使用红黑树管理 fd，增删改查 O(log n)\n  - 使用回调机制通知就绪事件\n\n### epoll 的工作模式\n- **水平触发（LT, Level Triggered）**：默认模式。只要 fd 处于就绪状态就会通知。编程简单但可能重复通知。\n- **边缘触发（ET, Edge Triggered）**：只在 fd 状态变化时通知一次。必须配合非阻塞 IO 和一次性读完所有数据。性能更高但编程复杂。\n\n## 四、性能对比\n- select/poll：O(n) 遍历所有 fd，n 为监听的 fd 数量\n- epoll：O(1) 获取就绪 fd（就绪列表），O(log n) 增删 fd\n- 当连接数多但活跃连接少时，epoll 优势明显"
+      "title": "select/poll 的三个老问题",
+      "content": "三者都是“一个线程同时盯多个 fd”的多路复用，理解 epoll 先得看清 select/poll 差在哪。\n\n## select\n- 用 `fd_set` **位图**表示关注的 fd，每次调用都要把整个位图从用户态**拷到内核**。\n- 内核**遍历所有 fd** 逐个查就绪状态；返回后用户还要**再遍历一遍**才知道哪个就绪。\n- 受 `FD_SETSIZE` 限制，默认只能盯 **1024** 个 fd；且每次调用都要重设位图。\n\n## poll\n- 用 `pollfd` 数组代替位图，**去掉了 1024 的数量限制**。\n- 但本质没变：仍要**整个数组拷进内核**、内核**仍 O(n) 遍历**、返回后**仍要遍历**找就绪。\n\n## 三个共同痛点\n1. 每次调用都重复**拷贝**全部 fd 进内核；2. 内核每次都 **O(n) 遍历**全部 fd；3. 返回后用户还要 **O(n) 扫一遍**。连接数一大、活跃的又少时，绝大部分遍历都白做。"
+    },
+    {
+      "type": "explain",
+      "title": "epoll 为什么高效：红黑树 + 就绪链表 + 回调",
+      "content": "epoll 用三个机制一次性解决上面三个痛点：\n\n- **fd 只注册一次**：`epoll_create` 建实例，`epoll_ctl` 把 fd 注册进内核的一棵**红黑树**（增删改查 O(log n)）。之后 `epoll_wait` 不用再重复传入全部 fd——**避免了每次拷贝**。\n- **回调维护就绪链表**：每个注册的 fd 挂一个回调，当网卡数据到达、该 fd 就绪时，回调把它加入内核的**就绪链表**。`epoll_wait` 只需看这个链表空不空——**不再遍历全部 fd**。\n- **只返回就绪的 fd**：`epoll_wait` 直接把就绪链表里的 fd 拷给用户，用户拿到的就是就绪集合，**不用再自己扫一遍**。\n\n所以 `epoll_wait` 的开销只和**活跃连接数**有关，与总连接数无关。这就是它能撑十万级长连接（C10K）的根本原因。"
+    },
+    {
+      "type": "explain",
+      "title": "LT vs ET 与性能对比",
+      "content": "## 两种触发模式\n- **水平触发 LT（默认）**：只要 fd **还有数据没读完**，每次 `epoll_wait` 都会**重复通知**。编程简单、不容易漏数据，一次没读完下次还会提醒。\n- **边缘触发 ET**：只在 fd **状态发生变化时通知一次**（来了新数据才提醒）。必须**配合非阻塞 IO，并在一次通知里循环读到 `EAGAIN`**（把数据读干净），否则剩下的数据要等下次新数据到达才再被通知，可能“饿死”。性能略高、系统调用更少，但编程更易出错。\n\n## 性能对比一句话\n- select/poll：每次 **O(n)** 遍历全部 fd，n 是监听总数。\n- epoll：`epoll_wait` 约 **O(就绪数)**，注册/删除 fd 是 O(log n)。\n- **结论**：连接多但活跃少（典型长连接服务）时 epoll 碾压；如果只盯少量、且几乎全活跃的 fd，select/poll 差距不大、甚至更省事。这也是 Redis、Nginx 用 epoll 的原因。"
     },
     {
       "type": "compareTable",
@@ -119,11 +129,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-05-29",
+  "updatedAt": "2026-06-11",
   "status": "draft",
   "prerequisites": [
     "os.io-model.topic-io-models"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察操作系统基础功底，是否理解进程/线程/内存/IO的核心机制，能否用工具排查问题"
+  "interviewerFocus": "考察是否能围绕「select/poll/epoll」说清select fd_set、pollfd 数组，并放到操作系统与 Linux 排查场景中解释关键流程、边界条件和出错后的处理思路。"
 }

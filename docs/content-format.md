@@ -481,6 +481,8 @@ content-repo/
 | `expectedMinutes` | 否 | 建议回答时间。 |
 | `difficulty` | 否 | 题目难度 1-5。 |
 
+> **规则：第一条 recallPrompt 必须是该 topic 最核心、可直接模拟面试的问题。** App 会在复述练习、模拟面试、追问跟练等入口按练习轮次轮换消费多条 `recallPrompts`，因此每一条都不能是泛化模板或跨 topic 复制的通用题；第一条仍必须是最核心问题，用于首轮练习和旧版本兼容。
+
 ## 8. rubric
 
 `rubric` 用于 AI 评估，不要写太泛。

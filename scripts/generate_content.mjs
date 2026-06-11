@@ -284,7 +284,7 @@ function buildMechanismCard(title, keyPoints) {
     .slice(0, 5)
     .map((point, index) => `${index + 1}. ${point}`)
     .join("\n");
-  return `先把 ${title} 当成一个可讲清楚的系统来理解：\n\n${items}\n\n学习时重点关注“为什么需要它、它如何工作、什么时候会出问题、面试时怎么结构化表达”。`;
+  return `先把 ${title} 当成一个可运行的机制来理解：\n\n${items}\n\n学习时重点关注“为什么需要它、它如何工作、状态如何变化、边界为什么存在”。`;
 }
 
 function buildCompareTable(title, categoryTitle) {
@@ -354,7 +354,7 @@ function makeTopic(file, index) {
       {
         type: "interviewAnswer",
         title: "面试回答模板",
-        content: `可以按“四段式”回答 ${title}：先用一句话给定义和价值；再拆 ${categoryTitle} 里的关键机制；接着补充适用场景、性能或一致性等取舍；最后用项目排查、优化或设计经验收束。`,
+        content: `回答 ${title} 时，先给出它解决的问题，再说明 ${categoryTitle} 中的关键机制，随后补充适用边界、常见风险和一个具体落地场景。`,
       },
       {
         type: "checklist",
@@ -394,7 +394,11 @@ function makeTopic(file, index) {
       rubric: {
         mustHave: ["定义准确", "关键机制", "适用场景", "常见误区", "面试表达结构"],
         goodToHave: ["结合项目经验", "能做对比", "能说明取舍"],
-        commonMistakes: ["只背概念不讲原因", "忽略边界条件", "缺少面试化表达"],
+        commonMistakes: [
+          `只背 ${title} 的定义，讲不清它在 ${categoryTitle} 中解决的具体问题`,
+          `把 ${title} 的适用场景和不适用边界混在一起`,
+          `无法说明 ${title} 出现异常或效果不佳时应该观察哪些信号`,
+        ],
         scoreWeights: {
           coverage: 40,
           accuracy: 25,

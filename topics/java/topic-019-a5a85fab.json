@@ -4,7 +4,7 @@
   "category": "concurrency",
   "group": "concurrency",
   "title": "CountDownLatch、CyclicBarrier与Semaphore",
-  "summary": "三个并发工具类的原理、区别和使用场景：CountDownLatch倒计数、CyclicBarrier循环屏障、Semaphore信号量",
+  "summary": "理解 CountDownLatch、CyclicBarrier 与 Semaphore 的同步语义、底层实现差异和典型使用场景。",
   "tags": [
     "Java",
     "并发编程",
@@ -17,140 +17,115 @@
   "learningCards": [
     {
       "type": "explain",
-      "title": "核心概念",
-      "content": "# 其他锁与并发工具\n\n## 1. ReadWriteLock（读写锁）\n`ReentrantReadWriteLock` 将锁分为读锁和写锁，读锁可以被多个线程同时持有，写锁是独占的。适用于\"读多写少\"的场景。"
+      "title": "三个同步工具分别解决什么问题",
+      "content": "CountDownLatch、CyclicBarrier 和 Semaphore 都是基于“计数状态”组织线程协作，但语义不同。CountDownLatch 是一次性倒计时门闩，适合主线程等待多个子任务完成；CyclicBarrier 是可复用屏障，适合同一批线程在阶段边界互相等待；Semaphore 是许可证模型，适合限制同时访问某个资源的线程数。理解它们时不要先背 API，而要先看谁在等待谁、计数何时变化、能不能复用。"
     },
     {
       "type": "explain",
-      "title": "深入理解",
-      "content": "### 1.1 基本用法\n```java\nimport java.util.concurrent.locks.ReentrantReadWriteLock;\nimport java.util.concurrent.locks.ReadWriteLock;\npublic class ReadWriteLockDemo {\n    private final ReadWriteLock rwLock = new ReentrantReadWriteLock();\n    private final ReentrantReadWriteLock.ReadLock readLock = rwLock.readLock();\n    private final ReentrantReadWriteLock.WriteLock writeLock = rwLock.writeLock();\n    private final Map<String, String> cache = new HashMap<>();\n    // 读操作：多个线程可以同时读\n    public String get(String key) {\n        readLock.lock();\n        try {\n            return cache.get(key);\n        } finally {\n            readLock.unlock();\n        }\n}\n// 写操作：独占，写的时候不能读也不能写\npublic void put(String key, String value) {\n    writeLock.lock();\n    try {\n        cache.put(key, value);\n    } finally {\n        writeLock.unlock();\n    }\n}\n}\n```\n\n### 1.2 锁降级（写锁降级为读锁）\n```java\n/**\n* 锁降级：持有写锁的线程可以在不释放写锁的情况下获取读锁，然后释放写锁\n* 这样就从写锁降级为读锁\n*/\npublic class LockDowngradeDemo {\n    private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();\n    private final ReentrantReadWriteLock.ReadLock readLock = rwLock.readLock();\n    private final ReentrantReadWriteLock.WriteLock writeLock = rwLock.writeLock();\n    private String data;\n    public void processData() {\n        writeLock.lock(); // 获取写锁\n        try {\n            data = \"updated\";\n            readLock.lock(); // 在持有写锁时获取读锁（锁降级的关键步骤）\n        } finally {\n            writeLock.unlock(); // 释放写锁，此时还持有读锁\n        }\n    try {\n        // 使用读锁读取数据\n        System.out.println(\"Data: \" + data);\n    } finally {\n        readLock.unlock(); // 释放读锁\n    }\n}\n}\n```\n\n### 1.3 注意事项\n```java\n/**\n* 读锁不支持升级为写锁！\n* 下面的代码会导致死锁：\n*/\npublic class LockUpgradeDemo {\n    private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();\n    public void wrongUpgrade() {\n        rwLock.readLock().lock();\n        try {\n            // 尝试获取写锁 → 死锁！\n            // 因为读锁被当前线程持有，写锁需要等所有读锁释放\n            rwLock.writeLock().lock(); // 永远获取不到！\n        } finally {\n            rwLock.readLock().unlock();\n        }\n}\n}\n```\n\n### 要点\n- 读锁共享：多个线程可以同时持有读锁\n- 写锁独占：写锁和读锁、写锁和写锁都互斥\n- 支持锁降级（写→读），不支持锁升级（读→写，会死锁）\n- 适用于读多写少的场景（如缓存）\n\n## 2. StampedLock\nJava 8 引入的高性能读写锁，支持三种模式：写锁、悲观读锁、乐观读。\n\n### 2.1 三种模式\n```java\nimport java.util.concurrent.locks.StampedLock;\npublic class StampedLockDemo {\n    private final StampedLock sl = new StampedLock();\n    private double x, y;\n    // 写锁\n    public void move(double deltaX, double deltaY) {\n        long stamp = sl.writeLock(); // 获取写锁，返回一个 stamp\n        try {\n            x += deltaX;\n            y += deltaY;\n        } finally {\n            sl.unlockWrite(stamp); // 用 stamp 释放写锁\n        }\n}\n// 悲观读锁（与 ReentrantReadWriteLock 类似）\npublic double distancePessimistic() {\n    long stamp = sl.readLock(); // 获取悲观读锁\n    try {\n        return Math.sqrt(x * x + y * y);\n    } finally {\n        sl.unlockRead(stamp);\n    }\n}\n// 乐观读（不加锁，通过 validate 校验数据一致性）\npublic double distanceOptimistic() {\n    long stamp = sl.tryOptimisticRead(); // 乐观读，不加锁\n    double curX = x, curY = y;\n    if (!sl.validate(stamp)) {\n        // 数据被修改，升级为悲观读锁\n        stamp = sl.readLock();\n        try {\n            curX = x;\n            curY = y;\n        } finally {\n            sl.unlockRead(stamp);\n        }\n}\nreturn Math.sqrt(curX * curX + curY * curY);\n}\n}\n```\n\n### 要点\n- StampedLock 不是可重入锁！在同一线程中重复获取会死锁\n- 乐观读不加锁，性能最高，适合读多写少且冲突很少的场景\n- StampedLock 不支持 Condition\n- 乐观读后需要 validate 校验，失败则升级为悲观读锁\n\n## 3. CountDownLatch（倒计时门闩）\nCountDownLatch 允许一个或多个线程等待其他线程完成操作后再继续执行。\n\n### 3.1 典型用法：等待N个线程完成\n```java\nimport java.util.concurrent.CountDownLatch;\npublic class CountDownLatchDemo {\n    public static void main(String[] args) throws InterruptedException {\n        final int threadCount = 5;\n        CountDownLatch latch = new CountDownLatch(threadCount);\n        for (int i = 0; i < threadCount; i++) {\n            final int taskId = i;\n            new Thread(() -> {\n                try {\n                    System.out.println(\"任务 \" + taskId + \" 开始执行\");\n                    Thread.sleep((long) (Math.random() * 2000));\n                    System.out.println(\"任务 \" + taskId + \" 执行完毕\");\n                } catch (InterruptedException e) {\n                    e.printStackTrace();\n                } finally {\n                    latch.countDown(); // 计数减 1\n                }\n        }).start();\n}\nlatch.await(); // 等待计数减到 0\nSystem.out.println(\"所有任务执行完毕，主线程继续\");\n}\n}\n```\n\n### 3.2 典型用法：N个线程同时开始\n```java\n/**\n* 模拟并发测试：让 N 个线程同时开始执行\n*/\npublic class ConcurrentStartDemo {\n    public static void main(String[] args) throws InterruptedException {\n        final int threadCount = 10;\n        CountDownLatch startLatch = new CountDownLatch(1); // 主线程发令\n        CountDownLatch endLatch = new CountDownLatch(threadCount); // 等待所有线程完成\n        for (int i = 0; i < threadCount; i++) {\n            final int id = i;\n            new Thread(() -> {\n                try {\n                    startLatch.await(); // 所有线程在此等待\n                    System.out.println(\"线程 \" + id + \" 开始执行，时间: \" + System.currentTimeMillis());\n                    Thread.sleep(1000);\n                } catch (InterruptedException e) {\n                    e.printStackTrace();\n                } finally {\n                    endLatch.countDown();\n                }\n        }).start();\n}\nThread.sleep(100);\nSystem.out.println(\"发令枪响！\");\nstartLatch.countDown(); // 所有线程同时开始\nendLatch.await();\nSystem.out.println(\"所有线程执行完毕\");\n}\n}\n```\n\n### 要点\n- CountDownLatch 是**一次性**的，计数归零后不能重置\n- countDown() 可以在任何线程调用，不限于创建它的线程\n- await() 会阻塞直到计数归零\n- 典型场景：等待多个服务启动完成、并发测试"
-    },
-    {
-      "type": "explain",
-      "title": "CyclicBarrier（循环栅栏）",
-      "content": "## 4. CyclicBarrier（循环栅栏）\nCyclicBarrier 让一组线程互相等待，直到所有线程都到达栅栏点后再一起继续执行。\n\n### 4.1 基本用法\n```java\nimport java.util.concurrent.CyclicBarrier;\npublic class CyclicBarrierDemo {\n    public static void main(String[] args) {\n        final int parties = 3;\n        // 所有线程到达栅栏后执行 barrierAction\n        CyclicBarrier barrier = new CyclicBarrier(parties, () -> {\n            System.out.println(\"所有线程已到达栅栏，一起出发！\");\n        });\n    for (int i = 0; i < parties; i++) {\n        final int id = i;\n        new Thread(() -> {\n            try {\n                System.out.println(\"线程 \" + id + \" 正在准备...\");\n                Thread.sleep((long) (Math.random() * 2000));\n                System.out.println(\"线程 \" + id + \" 到达栅栏\");\n                barrier.await(); // 等待其他线程\n                System.out.println(\"线程 \" + id + \" 通过栅栏，继续执行\");\n            } catch (Exception e) {\n                e.printStackTrace();\n            }\n    }).start();\n}\n}\n}\n```\n\n### 4.2 可重复使用\n```java\n/**\n* CyclicBarrier 可以重复使用（CountDownLatch 不行）\n* 模拟多轮比赛\n*/\npublic class CyclicBarrierReusableDemo {\n    public static void main(String[] args) {\n        final int parties = 3;\n        CyclicBarrier barrier = new CyclicBarrier(parties);\n        for (int i = 0; i < parties; i++) {\n            final int id = i;\n            new Thread(() -> {\n                for (int round = 1; round <= 3; round++) {\n                    try {\n                        System.out.println(\"线程 \" + id + \" 完成第 \" + round + \" 轮\");\n                        barrier.await(); // 每轮都等待其他线程\n                    } catch (Exception e) {\n                        e.printStackTrace();\n                    }\n            }\n    }).start();\n}\n}\n}\n```\n\n## 5. Semaphore（信号量）\nSemaphore 用于控制同时访问某个资源的线程数量，常用于限流和资源池管理。\n\n### 5.1 基本用法\n```java\nimport java.util.concurrent.Semaphore;\npublic class SemaphoreDemo {\n    // 模拟停车场只有 3 个车位\n    private static final Semaphore semaphore = new Semaphore(3);\n    public static void main(String[] args) {\n        for (int i = 0; i < 10; i++) {\n            final int carId = i;\n            new Thread(() -> {\n                try {\n                    semaphore.acquire(); // 获取许可（车位）\n                    System.out.println(\"车辆 \" + carId + \" 停入车位\");\n                    Thread.sleep(2000);\n                    System.out.println(\"车辆 \" + carId + \" 离开车位\");\n                } catch (InterruptedException e) {\n                    e.printStackTrace();\n                } finally {\n                    semaphore.release(); // 释放许可\n                }\n        }).start();\n}\n}\n}\n```\n\n### 5.2 限流应用\n```java\n/**\n* 使用 Semaphore 实现数据库连接池\n*/\npublic class ConnectionPool<T> {\n    private final Semaphore semaphore;\n    private final Queue<T> pool;\n    private final int maxSize;\n    public ConnectionPool(int maxSize) {\n        this.maxSize = maxSize;\n        this.semaphore = new Semaphore(maxSize);\n        this.pool = new ConcurrentLinkedQueue<>();\n        // 初始化连接池\n        for (int i = 0; i < maxSize; i++) {\n            pool.offer(createConnection());\n        }\n}\npublic T getConnection() throws InterruptedException {\n    semaphore.acquire(); // 获取许可，超出数量的线程会阻塞\n    return pool.poll();\n}\npublic void releaseConnection(T connection) {\n    pool.offer(connection);\n    semaphore.release(); // 归还许可\n}\n@SuppressWarnings(\"unchecked\")\nprivate T createConnection() {\n    return (T) new Object(); // 实际场景中创建数据库连接\n}\n}\n```\n\n### 5.3 公平与非公平\n```java\n// 非公平（默认）\nSemaphore unfair = new Semaphore(3);\n// 公平\nSemaphore fair = new Semaphore(3, true);\n```\n\n### 要点\n- `acquire()`：获取一个许可，如果没有可用许可则阻塞\n- `release()`：释放一个许可\n- `tryAcquire()`：非阻塞尝试获取许可\n- `availablePermits()`：返回当前可用许可数\n- 典型场景：限流、连接池、资源池、并发控制\n\n## 面试高频问题\n\n### Q1: ReadWriteLock的读锁和写锁的关系？\n**答**：读锁共享：多个线程可以同时持有读锁。写锁独占：写锁与读锁、写锁与写锁都互斥。支持锁降级（写→读），不支持锁升级（读→写会死锁，因为获取写锁需要等待所有读锁释放，而当前线程已经持有读锁）。\n\n### Q2: CountDownLatch和CyclicBarrier的区别？\n**答**：(1) CountDownLatch 是一次性的，CyclicBarrier 可重复使用；(2) CountDownLatch 是一个或多个线程等待其他线程完成，CyclicBarrier 是所有线程互相等待；(3) CountDownLatch 的计数由外部线程调用 countDown()，CyclicBarrier 由线程自己调用 await()；(4) CyclicBarrier 支持 barrierAction（最后一个到达的线程执行）。\n\n### Q3: Semaphore的使用场景？\n**答**：Semaphore 用于控制并发访问资源的线程数量。典型场景：(1) 限流，如限制同时访问某个接口的请求数；(2) 资源池，如数据库连接池、线程池；(3) 并发控制，如限制同时下载的文件数。acquire() 获取许可，release() 释放许可。\n\n### Q4: StampedLock和ReadWriteLock的区别？\n**答**：(1) StampedLock 支持乐观读模式，不加锁，通过 validate 校验数据一致性，性能更高；(2) StampedLock 不是可重入锁，重复获取会死锁；(3) StampedLock 不支持 Condition；(4) 读多写少且冲突很少时 StampedLock 性能最好。\n\n### Q5: 如何选择合适的并发工具？\n**答**：\n- 需要互斥锁 → synchronized 或 ReentrantLock\n- 读多写少 → ReadWriteLock 或 StampedLock\n- 等待其他线程完成 → CountDownLatch\n- 多线程互相等待 → CyclicBarrier\n- 限制并发数量 → Semaphore\n- 需要高级功能（公平、中断、超时、多条件） → ReentrantLock"
+      "title": "底层机制与边界条件",
+      "content": "CountDownLatch 和 Semaphore 都依赖 AQS 的共享模式：前者的 state 表示剩余计数，countDown 递减到 0 后释放所有等待线程；后者的 state 表示可用许可证，acquire 递减、release 递增。CyclicBarrier 主要用 ReentrantLock 和 Condition 维护 parties、count 和 generation，当最后一个线程到达时唤醒本代所有等待者并进入下一代。常见边界是：CountDownLatch 不能重置；CyclicBarrier 任一等待线程中断或超时会打破屏障；Semaphore 必须保证 acquire/release 成对出现，否则会泄漏许可证。"
     },
     {
       "type": "compareTable",
       "title": "对比与边界",
-      "content": "| 对比项 | CountDownLatch | CyclicBarrier | Semaphore |\n| --- | --- | --- | --- |\n| 用途 | 等待多个线程完成 | 多线程同时开始 | 控制并发数量 |\n| 计数方式 | 一次性 | 可重复使用 | 可重复获取释放 |\n| 触发条件 | 计数归零 | 所有线程到达 | 获取许可 |\n| 等待对象 | 主线程等待 | 所有线程互相等待 | 线程获取许可 |\n| 实现原理 | AQS | ReentrantLock | AQS |\n| 典型应用 | 并行任务汇总 | 多线程并行计算 | 资源池、限流 |"
-    },
-    {
-      "type": "diagram",
-      "title": "结构图解",
-      "content": "其他锁与并发工具的结构化要点图解",
-      "fallback": "建议用思维导图或流程图展示其他锁与并发工具的核心结构和关键要素",
-      "items": [
-        "ReadWriteLock：读锁(共享) + 写锁(独占)",
-        "读写锁互斥：读-读不互斥，读-写互斥，写-写互斥",
-        "CountDownLatch：计数归零触发，一次性使用",
-        "CyclicBarrier：所有线程到达触发，可重复使用",
-        "Semaphore：控制并发数量，acquire/release",
-        "锁降级：写锁可降级为读锁，读锁不能升级",
-        "并发工具选择：根据场景选择合适的同步器"
-      ]
+      "content": "| 对比项 | CountDownLatch | CyclicBarrier | Semaphore |\n| --- | --- | --- | --- |\n| 核心语义 | 等多个任务完成 | 多线程阶段对齐 | 限制并发访问量 |\n| 等待关系 | 一个或多个线程等待计数归零 | 所有参与线程互相等待 | 线程等待许可证 |\n| 是否可复用 | 不可复用 | 可复用 | 可反复 acquire/release |\n| 典型实现 | AQS 共享模式 | ReentrantLock + Condition | AQS 共享模式 |\n| 常见场景 | 启动加载、任务汇总 | 分阶段计算、批处理栅栏 | 连接池、限流、资源配额 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "import java.util.concurrent.locks.ReentrantReadWriteLock;\nimport java.util.concurrent.locks.ReadWriteLock;\n\npublic class ReadWriteLockDemo {\n    private final ReadWriteLock rwLock = new ReentrantReadWriteLock();\n    private final ReentrantReadWriteLock.ReadLock readLock = rwLock.readLock();\n    private final ReentrantReadWriteLock.WriteLock writeLock = rwLock.writeLock();\n    private final Map<String, String> cache = new HashMap<>();\n\n    // 读操作：多个线程可以同时读\n    public String get(String key) {\n        readLock.lock();\n        try {\n            return cache.get(key);\n        } finally {\n            readLock.unlock();\n        }\n    }\n\n    // 写操作：独占，写的时候不能读也不能写\n    public void put(String key, String value) {\n        writeLock.lock();\n        try {\n            cache.put(key, value);\n        } finally {\n            writeLock.unlock();\n        }\n    }\n}",
-      "language": "java"
+      "title": "三个工具的典型用法",
+      "language": "java",
+      "content": "CountDownLatch latch = new CountDownLatch(3);\nfor (int i = 0; i < 3; i++) {\n    executor.submit(() -> {\n        try {\n            loadPart();\n        } finally {\n            latch.countDown();\n        }\n    });\n}\nlatch.await(); // 等三个任务全部完成\n\nCyclicBarrier barrier = new CyclicBarrier(3, () -> mergeResult());\nexecutor.submit(() -> {\n    phaseOne();\n    barrier.await();\n    phaseTwo();\n});\n\nSemaphore pool = new Semaphore(10);\npool.acquire();\ntry {\n    useLimitedResource();\n} finally {\n    pool.release();\n}"
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答模板",
-      "content": "**高频问题1：ReadWriteLock的实现原理是什么？**\n\nReadWriteLock(读写锁)通过分离读锁和写锁提高并发性能：\n\n1. 读锁：共享锁，多个线程可以同时持有读锁\n2. 写锁：独占锁，同一时刻只有一个线程可以持有写锁\n3. 互斥关系：读锁和写锁互斥，写锁和写锁互斥，读锁和读锁不互斥\n4. 实现原理：使用AQS的state变量的高16位表示读锁状态，低16位表示写锁状态\n5. 锁降级：写锁可以降级为读锁，但读锁不能升级为写锁。\n\n**高频问题2：CountDownLatch和CyclicBarrier有什么区别？**\n\nCountDownLatch和CyclicBarrier的区别：\n\n1. 计数方式：CountDownLatch的计数只能使用一次，CyclicBarrier可以重复使用\n2. 触发条件：CountDownLatch是计数归零时触发，CyclicBarrier是所有线程到达屏障时触发\n3. 等待对象：CountDownLatch是主线程等待，CyclicBarrier是所有线程互相等待\n4. 异常处理：CountDownLatch不会处理异常，CyclicBarrier可以处理异常\n5. 应用场景：CountDownLatch适用于等待多个线程完成，CyclicBarrier适用于多线程同时开始。\n\n**高频问题3：Semaphore的使用场景是什么？**\n\nSemaphore(信号量)用于控制同时访问特定资源的线程数量：\n\n1. 核心方法：acquire()获取许可，release()释放许可\n2. 使用场景：数据库连接池、限流、资源池管理\n3. 实现原理：基于AQS，state表示可用许可数量\n4. 公平性：支持公平和非公平模式\n5. 示例：限制同时访问数据库的线程数量为10，使用new Semaphore(10)创建。Semaphore可以用于实现资源池、限流器等。",
+      "content": "这三个工具都用计数来协调线程，但关注点不同。CountDownLatch 是“主线程等别人完成”，计数减到 0 后一次性放行；CyclicBarrier 是“一组线程在阶段边界互相等”，到齐后可进入下一轮；Semaphore 是“许可证控制并发量”，适合资源池和限流。底层上 CountDownLatch、Semaphore 依赖 AQS 共享模式，CyclicBarrier 依赖 ReentrantLock 和 Condition。回答时要补边界：Latch 不可复用，Barrier 可能 broken，Semaphore 要防许可证泄漏。",
       "followUpQuestions": [
         {
-          "question": "在高并发场景下，其他锁与并发工具有哪些需要注意的坑？能举一个实际踩坑案例吗？",
-          "answer": "其他锁与并发工具的核心是理解Java内存模型(JMM)和并发原语。关键要点：原子性（CAS/synchronized）、可见性（volatile）、有序性（happens-before）。建议通过画时序图、debug源码来理解线程间的交互。"
+          "question": "CountDownLatch 为什么不能复用，而 CyclicBarrier 可以复用？",
+          "answer": "CountDownLatch 的 state 只会从初始计数递减到 0，没有重置 generation 的语义；CyclicBarrier 在一代线程到齐后会唤醒等待者并创建下一代 generation，所以能在分阶段任务里重复使用。"
         },
         {
-          "question": "其他锁与并发工具 在高并发场景下的性能瓶颈通常在哪里？有哪些优化思路？",
-          "answer": "高并发下 其他锁与并发工具 的瓶颈通常在锁竞争和内存可见性。优化思路包括减小锁粒度、使用无锁数据结构、合理设置线程池参数、利用 volatile/CAS 等机制减少锁开销。"
-        },
-        {
-          "question": "如果多个线程同时操作 其他锁与并发工具 导致数据不一致，你会怎么定位和修复？",
-          "answer": "定位并发问题的思路：先用 jstack 查看线程状态和锁持有情况，再用 Arthas 的 watch/trace 命令追踪方法调用。常见原因包括锁竞争激烈、死锁、ABA 问题等，需要根据具体场景选择合适的并发工具。"
+          "question": "Semaphore 用来限流时最容易出什么问题？",
+          "answer": "最常见是 acquire 后异常路径没有 release，导致许可证泄漏，最终所有请求都阻塞。实际编码要把 release 放在 finally，并明确公平/非公平模式对吞吐和等待时间的影响。"
         }
+      ]
+    },
+    {
+      "type": "diagram",
+      "title": "同步语义图",
+      "content": "从等待关系看三者：Latch 是多个 worker countDown 后唤醒 waiter；Barrier 是所有 parties 到达同一屏障后一起继续；Semaphore 是线程先获取 permit 才能进入受限资源区。",
+      "fallback": "CountDownLatch：worker -> countDown -> await 放行；CyclicBarrier：party -> await -> 全员到齐；Semaphore：acquire permit -> 使用资源 -> release permit。",
+      "items": [
+        "CountDownLatch：倒计时归零后一次性放行",
+        "CyclicBarrier：参与者到齐后进入下一代",
+        "Semaphore：许可证数量决定并发上限"
       ]
     },
     {
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释ReadWriteLock的读写锁机制",
-        "能说出读写锁的互斥关系",
-        "能比较CountDownLatch和CyclicBarrier的区别",
-        "能解释Semaphore的使用场景",
-        "能说明锁降级的实现原理",
-        "能说出各并发工具的适用场景",
-        "能根据需求选择合适的并发工具"
+        "三者各自是谁等待谁",
+        "计数状态何时变化以及是否可复用",
+        "CountDownLatch/Semaphore 与 AQS 的关系",
+        "CyclicBarrier broken 的触发条件",
+        "Semaphore 许可证泄漏的排查方式"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "java.concurrency.topic-019-a5a85fab.recall.1",
-      "prompt": "CountDownLatch、CyclicBarrier、Semaphore 各自的底层实现机制和适用场景区别是什么？",
+      "prompt": "CountDownLatch、CyclicBarrier、Semaphore 的等待关系分别是什么？请各举一个使用场景。",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 2
+      "expectedMinutes": 4,
+      "difficulty": 3
     },
     {
       "id": "java.concurrency.topic-019-a5a85fab.recall.2",
-      "prompt": "CountDownLatch、CyclicBarrier与Semaphore 在什么场景下会导致死锁或性能问题？如何预防？",
+      "prompt": "为什么 CountDownLatch 不能复用，而 CyclicBarrier 可以进入下一轮？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
     },
     {
       "id": "java.concurrency.topic-019-a5a85fab.recall.3",
-      "prompt": "CountDownLatch、CyclicBarrier 和 Semaphore 的状态变化、可复用性和典型使用场景有什么区别？",
-      "mode": "code",
-      "expectedMinutes": 10,
+      "prompt": "用 Semaphore 写资源池限流时，为什么 release 必须放在 finally？",
+      "mode": "text",
+      "expectedMinutes": 3,
       "difficulty": 3
-    },
-    {
-      "id": "java.concurrency.topic-019-a5a85fab.recall.4",
-      "prompt": "请手写一个生产者-消费者模型",
-      "mode": "code",
-      "expectedMinutes": 10,
-      "difficulty": 3
-    },
-    {
-      "id": "java.concurrency.topic-019-a5a85fab.recall.5",
-      "prompt": "请手写一个自定义线程池的核心逻辑",
-      "mode": "code",
-      "expectedMinutes": 10,
-      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能准确解释 ReadWriteLock 的读写互斥规则、锁降级和适用场景",
-      "能说清 其他锁与并发工具 的核心机制和关键流程",
-      "能解释ReadWriteLock的读写锁机制"
+      "能区分三者的等待关系和复用语义",
+      "能说明 CountDownLatch/Semaphore 的 AQS 共享模式",
+      "能解释 CyclicBarrier 的 parties、generation 和 broken 状态",
+      "能说出典型使用场景和异常边界"
     ],
     "goodToHave": [
-      "能解释 其他锁与并发工具 的源码实现或底层机制（如 AQS、CAS、内存屏障）",
-      "能说出 其他锁与并发工具 在高并发场景下的性能特征和常见陷阱"
+      "能对比公平/非公平 Semaphore",
+      "能说明中断、超时对 await/acquire 的影响",
+      "能结合资源池或批处理任务说明排查思路"
     ],
     "commonMistakes": [
-      "对其他锁与并发工具的并发机制理解不深入",
-      "不能画出线程状态转换图",
-      "不知道如何排查死锁和线程安全问题"
+      "把 CountDownLatch 当成可重置屏障使用",
+      "忘记 Semaphore 异常路径 release 导致许可证泄漏",
+      "说不清 CyclicBarrier broken 后为什么后续线程会失败"
     ],
     "scoreWeights": {
-      "coverage": 25,
-      "accuracy": 30,
+      "coverage": 30,
+      "accuracy": 35,
       "interviewExpression": 20,
-      "depth": 25
+      "depth": 15
     }
   },
-  "updatedAt": "2026-05-27",
+  "updatedAt": "2026-06-11",
   "status": "production",
-  "prerequisites": [],
+  "prerequisites": [
+    "java.concurrency.topic-017-df4531b1"
+  ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察并发编程能力，是否理解线程安全、锁、JUC 工具和底层同步机制。"
+  "interviewerFocus": "考察是否能围绕「CountDownLatch、CyclicBarrier与Semaphore」说清线程等待关系、计数状态变化、AQS/Condition 实现差异，以及异常路径下的复用和许可证泄漏问题。"
 }

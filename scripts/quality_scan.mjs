@@ -139,6 +139,35 @@ function detectCodeLanguageIssue(card) {
   return null;
 }
 
+const genericHighlightPatterns = [
+  /入口\/结构行/,
+  /关键行/,
+  /关键分支/,
+  /状态变化行/,
+  /循环主路径/,
+  /异步边界/,
+  /讲解锚点/,
+  /输出语义/,
+  /承担的职责，再展开内部流程/,
+  /复述时要说明条件成立后的状态变化/,
+];
+
+const exactDuplicateBuckets = new Map();
+const longDuplicateBuckets = new Map();
+
+function canonicalContentFile(file) {
+  return file.replace(/^(staging|draft)\//, "");
+}
+
+function rememberDuplicate(bucket, keyPrefix, text, entry, minComparableLength) {
+  const comparable = normalizeComparableText(text);
+  if (comparable.length < minComparableLength) return;
+  const key = `${keyPrefix}\t${comparable}`;
+  const entries = bucket.get(key) ?? [];
+  entries.push({ ...entry, canonicalFile: canonicalContentFile(entry.file) });
+  bucket.set(key, entries);
+}
+
 const checks = [
   {
     code: "TEMPLATE_EMPTY",
@@ -177,8 +206,36 @@ const checks = [
     pattern: /容器化（Docker\/K8s）环境下有什么特殊考虑/,
   },
   {
+    code: "OS_KERNEL_RECALL_TEMPLATE",
+    pattern: /内核实现机制是什么？用户态和内核态如何交互？/,
+  },
+  {
+    code: "NETWORK_PACKET_RECALL_TEMPLATE",
+    pattern: /协议报文格式是什么？关键字段有哪些含义？/,
+  },
+  {
+    code: "LINUX_TOOL_FOLLOWUP_TEMPLATE",
+    pattern: /相关的排查工具有哪些？能举一个实际排查案例吗？/,
+  },
+  {
+    code: "GENERIC_ONLINE_EXCEPTION_TEMPLATE",
+    pattern: /如果线上出现与\s*.+?\s*相关的异常/,
+  },
+  {
+    code: "GENERIC_ONLINE_PERF_TEMPLATE",
+    pattern: /如果线上服务出现与\s*.+?\s*相关的性能瓶颈或异常/,
+  },
+  {
     code: "FOUR_STEP_TEMPLATE",
     pattern: /四段式/,
+  },
+  {
+    code: "EXPLAIN_LEARNING_SCAFFOLD",
+    pattern: /学透这题的抓手|追问落点|复述校验|必须讲透的主线/,
+  },
+  {
+    code: "GENERIC_COMMON_MISTAKE",
+    pattern: /理解不深入|不能手写|不知道如何排查|不清楚和Java\/Spring的异同|不能结合实际项目说明应用场景|只背概念不讲原因|忽略边界条件|缺少面试化表达/,
   },
   {
     code: "MCP_LEGACY_TRANSPORT_ONLY",
@@ -211,6 +268,14 @@ for (const topicRoot of ["topics", "staging/topics", "draft/topics"]) {
 for (const file of await listJson(topicRoot)) {
   const topic = await readJson(file);
   const fields = [];
+  if (typeof topic.interviewerFocus === "string") {
+    fields.push(["interviewerFocus", topic.interviewerFocus]);
+    rememberDuplicate(exactDuplicateBuckets, "DUPLICATE_INTERVIEWER_FOCUS", topic.interviewerFocus, {
+      file,
+      title: topic.title,
+      field: "interviewerFocus",
+    }, 20);
+  }
 
   for (const card of topic.learningCards ?? []) {
     if (typeof card.content === "string") {
@@ -234,6 +299,16 @@ for (const file of await listJson(topicRoot)) {
     }
 
     if (card.type === "code") {
+      for (const highlight of card.highlights ?? []) {
+        if (genericHighlightPatterns.some((pattern) => pattern.test(highlight.note ?? ""))) {
+          issues.push({
+            code: "GENERIC_CODE_HIGHLIGHT",
+            file,
+            title: topic.title,
+            field: `learningCards.code.${card.title}.highlights.line${highlight.line ?? "?"}`,
+          });
+        }
+      }
       const languageIssue = detectCodeLanguageIssue(card);
       if (languageIssue) {
         issues.push({
@@ -273,10 +348,23 @@ for (const file of await listJson(topicRoot)) {
   for (const key of ["mustHave", "goodToHave", "commonMistakes"]) {
     for (const item of topic.rubric?.[key] ?? []) {
       fields.push([`rubric.${key}`, item]);
+      if (key === "commonMistakes") {
+        rememberDuplicate(exactDuplicateBuckets, "DUPLICATE_COMMON_MISTAKE", item, {
+          file,
+          title: topic.title,
+          field: `rubric.${key}`,
+        }, 12);
+      }
     }
   }
 
   for (const [name, text] of fields) {
+    rememberDuplicate(longDuplicateBuckets, "DUPLICATE_LONG_TEXT", text, {
+      file,
+      title: topic.title,
+      field: name,
+    }, 100);
+
     for (const check of checks) {
       if (check.pattern.test(text)) {
         issues.push({ code: check.code, file, title: topic.title, field: name });
@@ -314,6 +402,19 @@ for (const file of await listJson(topicRoot)) {
     }
     explainTitles.add(card.title);
 
+    const titleSegments = (card.title ?? "")
+      .split(/[：:、，,]/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 2);
+    if (titleSegments.some((s, i) => titleSegments.indexOf(s) !== i)) {
+      issues.push({
+        code: "REPEATED_TITLE_SEGMENT",
+        file,
+        title: topic.title,
+        field: `learningCards.explain.${card.title}`,
+      });
+    }
+
     const comparableContent = normalizeComparableText(card.content);
     if (comparableContent.length >= 120) {
       const previousTitle = explainContents.get(comparableContent);
@@ -329,6 +430,26 @@ for (const file of await listJson(topicRoot)) {
     }
   }
 }
+}
+
+for (const bucket of [exactDuplicateBuckets, longDuplicateBuckets]) {
+  for (const [key, entries] of bucket.entries()) {
+    const uniqueEntries = Array.from(
+      new Map(entries.map((entry) => [`${entry.canonicalFile}:${entry.field}`, entry])).values(),
+    );
+    if (uniqueEntries.length < 3) continue;
+    const [code] = key.split("\t");
+    const sample = uniqueEntries
+      .slice(0, 5)
+      .map((entry) => `${entry.file}:${entry.field}`)
+      .join(", ");
+    issues.push({
+      code,
+      file: uniqueEntries[0].file,
+      title: uniqueEntries[0].title,
+      field: `${uniqueEntries.length} repeated fields; examples: ${sample}`,
+    });
+  }
 }
 
 if (issues.length > 0) {
