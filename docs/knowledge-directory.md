@@ -28,6 +28,7 @@
 - Record 类（Java 14+）
 - Sealed Classes（Java 17+）
 - Pattern Matching（Java 17+）
+- Java IO/NIO 体系与 Netty
 
 ### JVM
 
@@ -41,6 +42,7 @@
 - 反射与注解
 - 垃圾收集器
 - 线上问题排查
+- ZGC/Shenandoah 与现代低延迟 GC 选型
 
 ### 并发编程
 
@@ -70,6 +72,7 @@
 - MyBatis-Plus
 - Spring AOP 深入
 - Spring 事务传播与失效场景
+- Java SPI 与 Spring 扩展机制
 
 ### 微服务治理
 
@@ -113,6 +116,7 @@
 - 推理机制与解码参数
 - Prompt Engineering
 - Token、上下文窗口与成本
+- 推理模型与 test-time compute
 
 ### Embedding 与向量检索
 
@@ -127,6 +131,7 @@
 - RAG 召回策略
 - 文档分块策略
 - RAG 评估与优化
+- 高级 RAG：Rerank / GraphRAG / Self-RAG
 
 ### 工具调用与 Agent 架构
 
@@ -138,6 +143,7 @@
 - Agent状态管理
 - 多Agent协作模式
 - Prompt 注入与越权防护
+- 结构化输出与约束解码
 
 ### AI 工程化与 LLMOps
 
@@ -146,6 +152,7 @@
 - AI安全与合规
 - 模型路由与降级方案
 - LLM Fine-tuning 与 LoRA
+- 推理服务化：vLLM / PagedAttention / Continuous Batching
 
 ## 算法与数据结构
 
@@ -156,6 +163,7 @@
 - LeetCode 15: 三数之和
 - LeetCode 11: 盛最多水的容器
 - LeetCode 53: 最大子数组和
+- LeetCode 56: 合并区间
 
 ### 链表
 
@@ -164,12 +172,17 @@
 - LeetCode 21: 合并两个有序链表
 - LeetCode 141: 环形链表
 - LeetCode 25: K 个一组翻转链表
+- LeetCode 142: 环形链表 II
+- LeetCode 160: 相交链表
+- LeetCode 19: 删除链表的倒数第 N 个结点
+- LeetCode 23: 合并 K 个升序链表
 
 ### 双指针
 
 - 双指针技巧
 - LeetCode 27: 移除元素
 - LeetCode 125: 验证回文串
+- LeetCode 42: 接雨水
 
 ### 滑动窗口
 
@@ -221,6 +234,7 @@
 - LeetCode 300: 最长递增子序列
 - LeetCode 322: 零钱兑换
 - LeetCode 198: 打家劫舍
+- LeetCode 72: 编辑距离
 
 ### 回溯
 
@@ -272,6 +286,7 @@
 - 单例模式
 - 工厂模式
 - 建造者模式
+- 原型模式
 
 ### 结构型模式
 
@@ -287,6 +302,7 @@
 - 观察者模式
 - 责任链模式
 - 状态模式
+- 命令模式
 
 ## 前端八股
 
@@ -315,6 +331,7 @@
 - 盒模型与BFC
 - Flex与Grid布局
 - 响应式设计与CSS工程化
+- 现代 CSS：容器查询 / :has / View Transitions
 
 ### TypeScript
 
@@ -346,6 +363,7 @@
 - Tree Shaking 与代码分割
 - 前端CI/CD与发布
 - 前端监控与错误追踪
+- 新一代构建工具：Rspack / Turbopack / Rolldown
 
 ### Node.js
 
@@ -361,6 +379,7 @@
 - 前端加载性能优化
 - 微前端架构
 - BFF与全栈架构
+- SSR 与 Next.js App Router
 
 ### 客户端开发
 
@@ -377,6 +396,8 @@
 - CQRS架构
 - 事件驱动架构
 - 六边形架构
+- 整洁架构（Clean Architecture）
+- 事件溯源（Event Sourcing）
 
 ### 微服务设计
 
@@ -419,6 +440,7 @@
 - 生成器与迭代器
 - 上下文管理器
 - 闭包与作用域
+- 异常处理与 ExceptionGroup
 
 ### Python 面向对象
 
@@ -439,6 +461,7 @@
 - 测试策略
 - 性能优化
 - Python 内存管理与 GC
+- 现代 Python 工具链：uv / ruff / pyproject
 
 ### Python Web 开发
 
@@ -459,6 +482,7 @@
 - async/await 异步编程
 - 泛型与协变逆变
 - 反射与特性
+- C# 12/13/14 现代语言特性
 
 ### .NET 8/9/10
 
@@ -467,6 +491,8 @@
 - 配置与选项模式
 - 日志与监控
 - .NET 运行时与 GC
+- Native AOT 与启动性能
+- .NET Aspire 云原生编排
 
 ### ASP.NET Core
 
@@ -475,6 +501,7 @@
 - 认证与授权
 - SignalR 实时通信
 - ASP.NET 性能优化
+- Blazor 组件模型与渲染模式
 
 ### EF Core 与数据库
 
@@ -513,6 +540,8 @@
 - 死锁的产生与避免
 - 进程间通信方式
 - 协程与纤程
+- 系统调用与用户态/内核态切换
+- CPU 调度算法与 CFS
 
 ### 内存管理
 
@@ -526,6 +555,8 @@
 - 阻塞/非阻塞/同步/异步
 - select/poll/epoll
 - Reactor 模式
+- 零拷贝技术
+- io_uring 异步 IO
 
 ### Linux 基础
 
@@ -542,6 +573,7 @@
 - TCP 可靠传输机制
 - TCP 流量控制与拥塞控制
 - TCP 粘包与拆包
+- gRPC 与 Protobuf
 
 ### HTTP/HTTPS
 
@@ -549,6 +581,8 @@
 - HTTP 状态码与头部字段
 - HTTPS 加密原理
 - 跨域与 CORS
+- 从输入 URL 到页面展示发生了什么
+- HTTP/3 与 QUIC
 
 ### DNS 与 CDN
 

@@ -1,0 +1,122 @@
+{
+  "id": "os.io-model.topic-zero-copy",
+  "domain": "os",
+  "category": "io-model",
+  "group": "io-model",
+  "title": "零拷贝技术",
+  "summary": "理解传统 read+write 的多次拷贝与切换，以及 mmap/sendfile/DMA gather 如何减少拷贝。",
+  "tags": [
+    "操作系统",
+    "零拷贝",
+    "sendfile",
+    "mmap"
+  ],
+  "difficulty": 3,
+  "estimatedMinutes": 16,
+  "order": 40,
+  "recommendWeight": 85,
+  "learningCards": [
+    {
+      "type": "explain",
+      "title": "传统拷贝的开销",
+      "content": "## 场景：把磁盘文件发到网络（如静态文件服务）\n传统 `read()` + `write()` 要经历 **4 次数据拷贝 + 4 次上下文切换**：\n```\n1. DMA：磁盘 → 内核 Page Cache         （读）\n2. CPU：内核 Page Cache → 用户缓冲区     （read 返回）\n3. CPU：用户缓冲区 → Socket 缓冲区       （write 进入）\n4. DMA：Socket 缓冲区 → 网卡             （发送）\n```\n- 2 次系统调用（read/write）各带来 2 次用户态/内核态切换 = 4 次切换。\n- 其中第 2、3 次是 **CPU 拷贝**，数据在内核和用户态之间来回搬，纯属浪费（应用并不修改数据，只是转发）。\n\n## 优化目标\n去掉无意义的 CPU 拷贝和多余的上下文切换。"
+    },
+    {
+      "type": "explain",
+      "title": "mmap / sendfile / DMA gather",
+      "content": "## mmap + write\n`mmap` 把内核 Page Cache **映射到用户空间**，省掉“内核→用户”这次 CPU 拷贝（用户和内核共享同一份）。仍有 write 把数据 CPU 拷到 Socket 缓冲区 → **3 次拷贝、4 次切换**。\n\n## sendfile\n`sendfile()` 让数据**直接在内核内**从 Page Cache 送到 Socket，不经过用户态 → **2 次切换**；数据：DMA 入 Page Cache、(CPU) Page Cache→Socket、DMA→网卡 = **3 次拷贝**（少 1 次且不经用户态）。\n\n## sendfile + DMA gather（真零拷贝）\n网卡支持 **scatter-gather DMA** 时，sendfile 只把 Page Cache 的**描述符（地址+长度）**给 Socket，网卡直接从 Page Cache 取数据 → **0 次 CPU 拷贝**，只剩 2 次 DMA。这才是“零拷贝”。\n\n## splice\n通过管道在两个 fd 间移动数据，同样避免用户态拷贝。\n\n## 应用\n- **Kafka**：消费者拉消息用 sendfile，日志文件直接发网卡，吞吐极高。\n- **Netty**：FileRegion/transferTo 走 sendfile；CompositeByteBuf 做用户态“逻辑零拷贝”。"
+    },
+    {
+      "type": "compareTable",
+      "title": "拷贝方式对比",
+      "content": "| 方式 | CPU 拷贝次数 | 上下文切换 | 说明 |\n| --- | --- | --- | --- |\n| read+write | 2 | 4 | 数据进出用户态各一次 |\n| mmap+write | 1 | 4 | 映射省去内核→用户拷贝 |\n| sendfile | 1(或0) | 2 | 内核内直传，不经用户态 |\n| sendfile+DMA gather | 0 | 2 | 真零拷贝，只剩 DMA |"
+    },
+    {
+      "type": "diagram",
+      "title": "sendfile 零拷贝数据流",
+      "content": "sendfile + DMA gather 数据流",
+      "items": [
+        "DMA：磁盘 → 内核 Page Cache",
+        "sendfile：仅把 Page Cache 描述符(地址+长度)传给 Socket",
+        "网卡 scatter-gather DMA：直接从 Page Cache 读数据",
+        "全程 0 次 CPU 拷贝、2 次切换",
+        "Kafka/Netty 用它实现高吞吐文件/日志发送"
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "标准面试回答",
+      "content": "结论：传统 read+write 发文件有 4 次拷贝、4 次切换，其中 2 次 CPU 拷贝在内核和用户态之间来回搬数据是浪费。零拷贝就是去掉这些无意义拷贝：mmap 省 1 次拷贝，sendfile 让数据在内核内直传不经用户态，sendfile + 网卡 DMA gather 实现 0 次 CPU 拷贝。\n\n之所以能省，是因为转发场景应用并不修改数据，没必要把数据搬进用户缓冲区。Kafka 消费、Netty 文件传输都用 sendfile 获得高吞吐。\n\n追问边界：零拷贝适合“原样转发”的场景；如果需要在用户态加工数据（加密、压缩、协议改写）就必须把数据拷到用户态，无法零拷贝。",
+      "followUpQuestions": [
+        {
+          "question": "为什么需要在用户态处理数据时就用不了零拷贝？",
+          "answer": "零拷贝的前提是数据原样从磁盘/Page Cache 送到网卡，应用不碰数据。一旦要加密、压缩、改协议头，就必须把数据拷进用户空间处理再写回，这正是被零拷贝省掉的那次拷贝，所以无法零拷贝（除非用内核态/硬件卸载）。"
+        },
+        {
+          "question": "Kafka 为什么能用零拷贝，它的消息是怎么存的？",
+          "answer": "Kafka 把消息以与网络协议兼容的格式顺序追加到日志文件；消费者拉取时服务端用 sendfile 直接把文件中对应区间从 Page Cache 送到 socket，不经用户态、不做格式转换，所以能零拷贝、吞吐极高。"
+        }
+      ]
+    },
+    {
+      "type": "checklist",
+      "title": "学完后应能说清楚",
+      "items": [
+        "能数清 read+write 的 4 次拷贝和 4 次切换并指出哪两次是浪费",
+        "能说明 mmap 省了哪次拷贝",
+        "能解释 sendfile 为何不经用户态、DMA gather 为何是 0 CPU 拷贝",
+        "能举出 Kafka/Netty 的零拷贝应用",
+        "能说明需要在用户态加工数据时为何无法零拷贝"
+      ]
+    }
+  ],
+  "recallPrompts": [
+    {
+      "id": "os.io-model.topic-zero-copy.recall.1",
+      "prompt": "画出传统 read+write 发送文件的拷贝与上下文切换次数，指出哪些是可以省掉的。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "os.io-model.topic-zero-copy.recall.2",
+      "prompt": "对比 mmap、sendfile、sendfile+DMA gather 的拷贝次数，并说明 Kafka 如何利用零拷贝。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    }
+  ],
+  "rubric": {
+    "mustHave": [
+      "read+write 的 4 拷贝/4 切换",
+      "哪两次 CPU 拷贝是浪费",
+      "sendfile 内核内直传",
+      "DMA gather 真零拷贝"
+    ],
+    "goodToHave": [
+      "mmap 省一次拷贝",
+      "Kafka/Netty 应用",
+      "splice",
+      "需用户态加工则无法零拷贝"
+    ],
+    "commonMistakes": [
+      "把 mmap 当成零拷贝(仍有 1 次)",
+      "认为 sendfile 一定 0 拷贝(无 gather 时仍 1 次)",
+      "说不清切换次数",
+      "以为任何场景都能零拷贝"
+    ],
+    "scoreWeights": {
+      "coverage": 30,
+      "accuracy": 30,
+      "interviewExpression": 15,
+      "depth": 25
+    }
+  },
+  "updatedAt": "2026-06-11",
+  "status": "staging",
+  "interviewFrequency": "high",
+  "interviewerFocus": "考察传统拷贝开销与 mmap/sendfile/DMA gather 的零拷贝原理及其适用边界（Kafka/Netty）。",
+  "prerequisites": [
+    "os.io-model.topic-io-models"
+  ]
+}
