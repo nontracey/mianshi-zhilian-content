@@ -222,6 +222,19 @@ function countPattern(text, pattern) {
   return [...String(text).matchAll(new RegExp(pattern.source, flags))].length;
 }
 
+function clamp(value, min = 0, max = 1) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function scaledScore(value, target, points) {
+  if (!target) return 0;
+  return clamp(value / target) * points;
+}
+
+function booleanScore(condition, points) {
+  return condition ? points : 0;
+}
+
 function mermaidEdgeCount(content = "") {
   const statements = mermaidStatements(content);
   return statements.slice(1).filter((statement) => mermaidEdgePattern.test(statement)).length;
@@ -253,6 +266,19 @@ function diagramHumanSignals(card, topic) {
       genericCount / Math.max(1, labels.length) <= 0.35 &&
       textLength(fallbackText) >= 24,
   };
+}
+
+function isGoodCompareCard(card) {
+  if (Array.isArray(card.columns) && card.columns.length >= 3 && Array.isArray(card.rows) && card.rows.length >= 3) {
+    return true;
+  }
+  const content = card.content ?? "";
+  const tableRows = String(content)
+    .split("\n")
+    .filter((line) => /^\s*\|.+\|\s*$/.test(line));
+  if (tableRows.length < 4) return false;
+  const headerCells = tableRows[0].split("|").map((cell) => cell.trim()).filter(Boolean);
+  return headerCells.length >= 3 && /\|\s*-{3,}\s*\|/.test(tableRows[1] ?? "");
 }
 
 const templatePatterns = [
@@ -339,6 +365,22 @@ function expectedMinutesRange(difficulty) {
   if (difficulty === 3) return [20, 40];
   if (difficulty === 4) return [28, 50];
   return [35, 65];
+}
+
+function expertExplainTarget(difficulty, domain) {
+  if (domain === "algorithm") return difficulty <= 2 ? 520 : difficulty === 3 ? 820 : difficulty === 4 ? 980 : 1150;
+  if (difficulty <= 2) return 360;
+  if (difficulty === 3) return 680;
+  if (difficulty === 4) return 900;
+  return 1100;
+}
+
+function expertTotalTarget(difficulty, domain) {
+  if (domain === "algorithm") return difficulty <= 2 ? 1900 : difficulty === 3 ? 2600 : difficulty === 4 ? 3100 : 3600;
+  if (difficulty <= 2) return 1450;
+  if (difficulty === 3) return 1850;
+  if (difficulty === 4) return 2350;
+  return 2850;
 }
 
 function cardOrderRank(type) {
@@ -691,9 +733,7 @@ function scoreTopic(topic, ref) {
   if (lowWeight) deduct(3, "低频 topic 权重高于 75");
 
   const strongDiagramCount = diagramCards.filter((card) => card.type === "diagram" && diagramHumanSignals(card, topic).isStrong).length;
-  const goodCompareCount = compareCards.filter(
-    (card) => Array.isArray(card.columns) && card.columns.length >= 3 && Array.isArray(card.rows) && card.rows.length >= 3,
-  ).length;
+  const goodCompareCount = compareCards.filter(isGoodCompareCard).length;
   const rubricItems = ["mustHave", "goodToHave", "commonMistakes"].flatMap((key) => rubric[key] ?? []);
   const specificRubricItems = rubricItems.filter((item) => {
     if (genericRubricItemPattern.test(item.trim()) || rubricTemplateItemPattern.test(item)) return false;
@@ -730,7 +770,165 @@ function scoreTopic(topic, ref) {
   } else if (excellentSignals.length < requiredForExcellent + 2) {
     capScore(98, `99+ 需要几乎无短板的深度、例子、图示、追问和 rubric 证据 ${excellentSignals.length}/${requiredForExcellent + 2}`);
   }
-  score = Math.min(score, scoreCap);
+
+  const hasMinutesInRange = topic.estimatedMinutes >= minMinutes && topic.estimatedMinutes <= maxMinutes;
+  const hasCleanTitle = !broadTitlePattern.test(topic.title ?? "") && !cjkLatinSpacingPattern.test(topic.title ?? "");
+  const hasGoodSummary = textLength(topic.summary) >= 22 && textLength(topic.summary) <= 120;
+  const hasGoodFocus = textLength(topic.interviewerFocus) >= 28 && matchedTokens(topic.interviewerFocus ?? "", primaryTokens).length > 0;
+  const hasRequiredCards = explainCards.length > 0 && interviewCards.length > 0 && checklistCards.length > 0;
+  const hasExpectedExplainCount =
+    topic.domain === "algorithm" ||
+    (topic.difficulty >= 3 ? explainCards.length >= expectedExplainCards : explainCards.length === expectedExplainCards);
+
+  const expertExplainChars = expertExplainTarget(topic.difficulty, topic.domain);
+  const expertTotalChars = expertTotalTarget(topic.difficulty, topic.domain);
+  const mechanismExplainRatio = explainCards.length
+    ? explainCards.filter((card) => mechanismSignalPattern.test(card.content ?? "")).length / explainCards.length
+    : 0;
+  const hasLowDuplication = !(explainCards.length && interviewCards.length && jaccardSimilarity(
+    explainCards.map((card) => card.content ?? "").join("\n"),
+    interviewCards.map((card) => card.content ?? "").join("\n"),
+  ) > 0.78);
+  const topicAlignmentRatioForScore = primaryTokens.length ? primaryTokenMatches.length / primaryTokens.length : 1;
+  const hasExample = concreteExamplePattern.test(readableText);
+  const hasBoundary = boundarySignalPattern.test(readableText);
+  const hasVerification = verificationSignalPattern.test(readableText) || topic.domain === "algorithm";
+  const hasTradeoff = tradeoffSignalPattern.test(readableText) || topic.difficulty <= 2;
+  const hasFailure = failureSignalPattern.test(readableText) || topic.domain === "algorithm" || topic.difficulty <= 2;
+  const hasDomainEvidence = topicAlignmentRatioForScore >= 0.45 || primaryTokenMatches.length >= 6;
+  const hasNaturalLanguage =
+    !unnaturalLanguagePattern.test(allText) &&
+    countPattern(readableText, proseFillerPattern) < Math.max(14, Math.floor(totalChars / 300));
+  const hasInformativeTitles = (topic.learningCards ?? []).every((card) => {
+    const title = (card.title ?? "").trim();
+    return isAlgorithmProblemIntroCard(topic, card) || (!genericCardTitlePattern.test(title) && !genericCardTitleTextPattern.test(title));
+  });
+  const hasCardOrder = (() => {
+    let previous = 0;
+    for (const card of topic.learningCards ?? []) {
+      const rank = cardOrderRank(card.type);
+      if (rank < previous && !(card.type === "diagram" && previous === cardOrderRank("compareTable"))) return false;
+      previous = Math.max(previous, rank);
+    }
+    return true;
+  })();
+  const hasSpecificChecklist = checklistCards.some((card) => (card.items ?? []).filter((item) => textLength(item) >= 10).length >= 3);
+  const hasStrongDiagram = strongDiagramCount > 0;
+  const hasGoodCompare = goodCompareCount > 0;
+  const allDiagramsReadable = diagramCards.every((card) => card.fallback || card.caption);
+  const interviewHasStructure = interviewCards.some((card) => /结论|先|核心|最后|边界|补充/.test(card.content ?? ""));
+  const interviewHasDepth = interviewChars >= (topic.difficulty >= 4 ? 320 : topic.difficulty >= 3 ? 250 : 180);
+  const followUpDepthCount = interviewCards.reduce(
+    (sum, card) =>
+      sum +
+      (card.followUpQuestions ?? []).filter((followUp) => {
+        const question = followUp.question ?? "";
+        return (
+          textLength(followUp.answer) >= 32 &&
+          (/为什么|如何|怎么|如果|边界|问题|排查|取舍|失败|区别|影响|保证|什么|哪些|关系|作用|原理|流程|机制|场景|时机|代价|瓶颈|优化|架构|特性|工作|性能|应该|一定|导致|解决|验证|检测|避免|关闭/.test(question) ||
+            matchedTokens(question, primaryTokens).length > 0)
+        );
+      }).length,
+    0,
+  );
+  const recallDepthCount = recalls.filter((prompt) =>
+    /为什么|如何|怎么|如果|边界|排查|取舍|失败|区别|保证|解释|说明|设计|定位|判断/.test(prompt.prompt ?? ""),
+  ).length;
+  const rubricCommon = rubric.commonMistakes ?? [];
+  const commonMistakeSpecificRatio = rubricCommon.length
+    ? rubricCommon.filter((item) => textLength(item) >= 10 && !genericRubricItemPattern.test(item.trim()) && !rubricTemplateItemPattern.test(item)).length /
+      rubricCommon.length
+    : 0;
+  const templateHitCount = templatePatterns.filter(([pattern]) => pattern.test(allText)).length;
+  const hasNoTemplatePollution =
+    templateHitCount === 0 &&
+    !algorithmTemplateLeakPattern.test(allText) &&
+    !machineRelationPhrasePattern.test(allText) &&
+    !generatedDiagramTitlePattern.test(allText);
+
+  const dimensionScores = {
+    structure:
+      booleanScore((topic.status ?? "") === "production", 1.5) +
+      booleanScore(hasCleanTitle, 1.5) +
+      booleanScore(hasGoodSummary, 2) +
+      booleanScore(hasGoodFocus, 2) +
+      booleanScore(hasMinutesInRange, 1.5) +
+      booleanScore(hasRequiredCards, 1.5),
+    depth:
+      scaledScore(explainChars, expertExplainChars, 7) +
+      scaledScore(totalChars, expertTotalChars, 4) +
+      booleanScore(hasExpectedExplainCount, 3) +
+      scaledScore(mechanismExplainRatio, 1, 3) +
+      booleanScore(hasLowDuplication, 2) +
+      booleanScore(hasCodeExample(topic) || !new Set(["algorithm", "go"]).has(topic.domain), 1),
+    expertise:
+      scaledScore(topicAlignmentRatioForScore, 0.55, 4) +
+      booleanScore(hasExample, 3) +
+      booleanScore(hasBoundary, 3) +
+      booleanScore(hasVerification, 3) +
+      booleanScore(hasTradeoff, 3) +
+      booleanScore(hasFailure, 2) +
+      booleanScore(hasDomainEvidence, 2),
+    clarity:
+      booleanScore(hasNaturalLanguage, 3) +
+      booleanScore(hasInformativeTitles, 2.5) +
+      booleanScore(hasCardOrder, 2) +
+      booleanScore(hasSpecificChecklist, 2) +
+      booleanScore((topic.learningCards ?? []).length >= (topic.difficulty >= 3 ? 6 : 5), 1.5) +
+      booleanScore(!containsMarkdownList(explainCards.map((card) => card.content ?? "").join("\n")) || topic.difficulty >= 3, 1),
+    visual:
+      booleanScore(hasStrongDiagram, 5) +
+      booleanScore(hasGoodCompare, 3) +
+      booleanScore(allDiagramsReadable && diagramCards.length > 0, 1) +
+      booleanScore(diagramCards.length > 0 || compareCards.length > 0, 1),
+    interview:
+      booleanScore(interviewHasStructure, 2.5) +
+      booleanScore(interviewHasDepth, 3) +
+      scaledScore(followUpDepthCount, topic.difficulty >= 3 ? 2 : 1, 3) +
+      scaledScore(recallDepthCount, topic.difficulty >= 3 ? 2 : 1, 2.5) +
+      booleanScore(topic.interviewFrequency !== "high" || containsMarkdownList(interviewCards.map((card) => card.content ?? "").join("\n")), 1) +
+      booleanScore(recalls.length >= (topic.difficulty >= 3 ? 3 : 2), 2),
+    assessment:
+      booleanScore((rubric.mustHave ?? []).length >= 3, 1.5) +
+      booleanScore((rubric.goodToHave ?? []).length >= 2, 1.2) +
+      booleanScore((rubric.commonMistakes ?? []).length >= 2, 1.2) +
+      scaledScore(rubricSpecificRatio, 0.8, 3.1) +
+      scaledScore(commonMistakeSpecificRatio, 0.9, 2) +
+      booleanScore(Object.values(rubric.scoreWeights ?? {}).reduce((sum, value) => sum + value, 0) === 100, 1),
+    hygiene:
+      booleanScore(hasNoTemplatePollution, 2) +
+      booleanScore(!cjkLatinSpacingPattern.test(topic.title ?? ""), 0.7) +
+      booleanScore(!genericHighlightPattern.test(allText), 0.6) +
+      booleanScore(!generatedDiagramCaptionPattern.test(allText), 0.7),
+  };
+
+  const dimensionMax = {
+    structure: 10,
+    depth: 20,
+    expertise: 20,
+    clarity: 12,
+    visual: 10,
+    interview: 14,
+    assessment: 10,
+    hygiene: 4,
+  };
+
+  function noteDimension(name, label, minRatio) {
+    const ratio = dimensionScores[name] / dimensionMax[name];
+    if (ratio < minRatio) {
+      issues.push(`${label}维度得分不足 ${dimensionScores[name].toFixed(1)}/${dimensionMax[name]}`);
+    }
+  }
+
+  noteDimension("depth", "内容深度", 0.82);
+  noteDimension("expertise", "专家证据", 0.82);
+  noteDimension("visual", "图示/对比", 0.72);
+  noteDimension("interview", "面试可用性", 0.78);
+  noteDimension("assessment", "rubric 评估", 0.8);
+
+  const positiveScore = Object.values(dimensionScores).reduce((sum, value) => sum + value, 0);
+  const legacyScore = Math.max(0, score);
+  score = Math.min(positiveScore, legacyScore, scoreCap);
 
   return {
     ref,
@@ -755,9 +953,14 @@ function scoreTopic(topic, ref) {
       cardCount: topic.learningCards?.length ?? 0,
       excellentSignals: excellentSignals.length,
       scoreCap,
+      legacyScore: Math.round(legacyScore),
+      positiveScore: Number(positiveScore.toFixed(1)),
       strongDiagrams: strongDiagramCount,
       rubricSpecificRatio: Number(rubricSpecificRatio.toFixed(2)),
       topicAlignmentRatio: Number(topicAlignmentRatio.toFixed(2)),
+      dimensions: Object.fromEntries(
+        Object.entries(dimensionScores).map(([key, value]) => [key, Number(value.toFixed(1))]),
+      ),
     },
   };
 }
