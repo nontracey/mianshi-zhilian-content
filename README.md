@@ -17,6 +17,8 @@
 - `draft/domains/`、`draft/topics/`：草稿环境隔离内容副本。
 - `schemas/`：内容 schema。
 - `scripts/`：内容生成与校验脚本。
+- `.githooks/`：本地 Git hooks，需要执行 `npm run hooks:install` 后才会生效。
+- `.quality-review/reports/`：LLM 内容质量评审报告，CI 会验证报告是否匹配当前改动。
 
 ## 本地命令
 
@@ -25,6 +27,11 @@ npm install
 npm run generate  # 需要设置 CONTENT_SOURCE_ROOT 环境变量指向原始 Markdown 目录
 npm run sync:env  # 从正式内容同步生成 staging/draft 隔离副本
 npm run validate
+npm run hooks:install  # 每个本地 clone 需要安装一次 Git hooks
+npm run quality:llm:packet
+npm run quality:llm:run -- --cli qwen  # 也可换成 claude/gemini/opencode 等外部 CLI
+npm run quality:llm:prune
+npm run quality:llm:verify
 ```
 
 内容规范来自《面试智练内容格式规范》。用户侧知识结构只保留"领域 -> 分类 -> 知识点"，不使用阶段、天数或排期概念。
@@ -91,8 +98,22 @@ topics/{domain}/{filename}.json
 
 1. **修改内容**（知识点、分类、领域等），或在 [内容工作台](https://github.com/nontracey/mianshi-zhilian-studio) 编辑
 2. **验证内容**：`npm run validate`
-3. **提交 Pull Request**（fork PR 仅限 `draft/` 目录）
-4. **合并到 `main`** 后自动部署并更新版本号
+3. **生成 LLM 评审报告**：先 `git add` 内容改动，再运行 `npm run quality:llm:packet`，然后用 `npm run quality:llm:run -- --cli <外部CLI>` 让维护者选择的非交互 CLI 写入 `.quality-review/reports/<reviewId>.json`
+4. **验证 LLM 报告**：`npm run quality:llm:verify`
+5. **提交 Pull Request**（fork PR 仅限 `draft/` 目录）
+6. **合并到 `main`** 后自动部署并更新版本号
+
+LLM 评审采用默认档：本地 agent 评审，仓库和 CI 只验证结构化报告，不配置任何 LLM key 或 provider。详细流程见 [docs/llm-quality-review.md](docs/llm-quality-review.md)。
+
+### 本地 Git hook
+
+每个本地 clone 必须安装一次 hook：
+
+```bash
+npm run hooks:install
+```
+
+安装后，普通 `git commit` 会触发 `.githooks/pre-commit`，默认校验 staged diff 中的发布态 topic 是否已有匹配的 LLM 评审报告。如果没有安装，本地提交不会触发 hook；CI 仍会在 PR / main push 中运行 `quality:llm:verify` 兜底。
 
 ### ⚠️ 内容结构同步规则（必读）
 

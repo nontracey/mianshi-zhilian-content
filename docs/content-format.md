@@ -641,6 +641,7 @@ Mermaid 约束：
 - [ ] `scoreWeights` 总和为 100。
 - [ ] JSON 能通过 schema 校验。
 - [ ] `npm run quality:audit` 通过，单 topic、单领域和总体质量分均不低于 90。
+- [ ] 发布态 topic 改动已生成并提交 LLM 质量评审报告，`npm run quality:llm:verify` 通过。
 
 ## 11. 新增内容示例流程
 
@@ -652,8 +653,10 @@ Mermaid 约束：
 4. 更新 `manifest.json` 的 `contentVersion`、`topicCount`、`updatedAt`。
 5. 运行 schema 校验。
 6. 运行 `npm run quality:audit`，确认内容质量、深度、图示、追问、rubric 和正向证据达到 90 分门槛；95+ 需要例子、边界、验证、取舍和图文贴合都比较扎实。
-7. 发布内容仓库。
-8. App 下次同步后自动出现该知识点，不需要发新版 App。
+7. 运行 `npm run quality:llm:packet`，再用 `npm run quality:llm:run -- --cli <外部CLI>` 让维护者选择的非交互 CLI 完成事实正确性、讲解顺序和专家口吻评审，并提交 `.quality-review/reports/<reviewId>.json`。
+8. 运行 `npm run quality:llm:verify`。
+9. 发布内容仓库。
+10. App 下次同步后自动出现该知识点，不需要发新版 App。
 
 ## 12. JSON 结构契约同步规则
 
@@ -688,6 +691,7 @@ Mermaid 约束：
 - [ ] 更新相关 `topicCount`、`updatedAt` 和 domain topic 引用。
 - [ ] 运行 `npm run validate`。
 - [ ] 运行 `npm run quality:audit`。
+- [ ] 若改动发布态 topic，运行 `npm run quality:llm:packet` 并提交 `.quality-review/reports/<reviewId>.json`，确认 `npm run quality:llm:verify` 通过。
 - [ ] 确认字段名、字段类型、枚举值、卡片类型没有变化。
 - [ ] 若只是内容值变化，通常不需要改 App 或 studio。
 - [ ] 若实际发现 App 渲染、缓存、studio 编辑或生成流程不兼容，再同步修对应项目和文档。

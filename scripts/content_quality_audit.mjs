@@ -5,6 +5,7 @@ const root = process.cwd();
 const minScoreArg = process.argv.find((arg) => arg.startsWith("--min-score="));
 const minScore = minScoreArg ? Number(minScoreArg.split("=")[1]) : 90;
 const formatJson = process.argv.includes("--json");
+const showDistribution = process.argv.includes("--distribution");
 
 async function readJson(file) {
   return JSON.parse(await readFile(path.join(root, file), "utf8"));
@@ -324,13 +325,9 @@ const mechanismSignalPattern =
 const cjkLatinSpacingPattern = /[\u4e00-\u9fa5][A-Za-z0-9#.+]|[A-Za-z0-9#.+][\u4e00-\u9fa5]/;
 const unnaturalLanguagePattern =
   /的难点在于把「[^」]+」「[^」]+」「[^」]+」连成因果链|「[^」]+ 的核心目标」决定这个知识点的主线|验证理解是否落到真实链路|不能只给工具名|把这几层连起来看，才能|从零理解可以抓住这条主线|深入理解时重点看三个问题|实际使用时，应回到输入规模、执行顺序、依赖状态和可观测证据上验证|到了 .+ 的高阶追问|回答时要给出触发条件、状态变化和验证证据|继续往下看，.+不能只记结论/;
-const duplicateSentencePattern =
-  /从零理解可以抓住这条主线|深入理解时重点看三个问题|它不是一串名词，而是在说明请求、数据或控制权怎样穿过关键组件|把这几层连起来看，才能在遇到容量、故障或安全问题时判断瓶颈落在哪里|补充边界：如果问题落到生产场景，还要说明可观测信号、失败处理和与相邻方案的差异|到了 .+ 的高阶追问|继续往下看，.+不能只记结论/;
 const algorithmTemplateLeakPattern =
   /要先说明题目约束，再给出核心解法和复杂度|先复述输入、输出和限制条件|空输入、重复值、指针越界或状态初始化|给出时间、空间复杂度/;
 const machineRelationPhrasePattern = /能否说清|的定义和核心目标|如何影响[^，。；\n]{2,60}/;
-const repeatedNaturalnessPattern =
-  /补充边界：如果问题落到生产场景|可以先按.+理解整体链路|进一步看，.+要把|先判断触发条件，再说明状态如何变化|这样才能从现象回到机制/;
 const concreteExamplePattern =
   /例如|比如|举例|以[^，。；\n]{1,24}为例|假设|案例|场景|当[^，。；\n]{1,40}时|如果[^，。；\n]{1,40}(?:，|则|就)/;
 const boundarySignalPattern =
@@ -357,6 +354,242 @@ function isAcceptableShortRubricItem(item, topic) {
   if (clean.length >= 2 && topic.title.includes(clean)) return true;
   if ((topic.tags ?? []).some((tag) => tag.includes(clean))) return true;
   return false;
+}
+
+const markdownTableLinePattern = /^\s*\|.*\|\s*$/;
+const placeholderTextPattern =
+  /\bTODO\b|\bFIXME\b|待补充|待完善|此处省略|内容略|lorem ipsum/i;
+const replacementCharPattern = /�/;
+const literalEscapeLeakPattern = /\\n|\\t/;
+const validMermaidHeaderPattern =
+  /^(graph\s+(?:TB|TD|BT|RL|LR)|flowchart\s+(?:TB|TD|BT|RL|LR)|sequenceDiagram|stateDiagram(?:-v2)?|classDiagram|erDiagram|journey|gantt|pie\b|timeline|mindmap)/;
+const concreteFactPattern =
+  /O\([^)]{1,16}\)|\d+(?:\.\d+)?\s*(?:ms|µs|ns|秒|毫秒|分钟|小时|天|%|KB|MB|GB|TB|qps|tps|rps|字节|byte|bit|核|线程|连接|副本|分片|并发|倍)|\bv?\d+\.\d+(?:\.\d+)?\b|JDK\s*\d+|\.NET\s*\d+|HTTP\/[123]|端口\s*\d{2,5}/gi;
+const codePlaceholderPattern =
+  /(?:\/\/|#|--)\s*(?:\.\.\.|…|TODO|省略|略)\s*$|(?:^|\n)\s*(?:\.\.\.|…)\s*(?:$|\n)/m;
+const codeLanguageSignatures = {
+  java: [
+    /\b(?:class|interface|enum|record)\s+\w+|System\.out|import\s+java|void\s+\w+\(|new\s+\w+[<(]/,
+    /\bdef\s+\w+\(|(?:^|\n)\s*func\s+\w+\(|console\.log\(|using\s+System|#include\s*</,
+  ],
+  go: [
+    /\bfunc\s|\bpackage\s|:=|\bchan\b|\bgo\s+\w/,
+    /\bpublic\s+class\b|System\.out|\bdef\s+\w+\(|console\.log\(/,
+  ],
+  python: [
+    /\bdef\s|\bimport\s|\bprint\(|\bclass\s+\w+:|\bself\b/,
+    /\bpublic\s+class\b|System\.out|console\.log\(|using\s+System/,
+  ],
+  csharp: [
+    /using\s+System|\bnamespace\s|\bpublic\s|\bvar\s+\w+\s*=|\bawait\s/,
+    /System\.out|\bpackage\s+main\b|\bdef\s+\w+\(/,
+  ],
+};
+const lexiconStopTokens = new Set([
+  "面试",
+  "原理",
+  "基础",
+  "机制",
+  "性能",
+  "优化",
+  "实践",
+  "架构",
+  "设计",
+  "应用",
+  "核心",
+  "流程",
+  "概念",
+  "场景",
+]);
+
+function stripCodeSegments(text = "") {
+  return String(text)
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/`[^`\n]*`/g, "");
+}
+
+function splitIntoSentences(text = "") {
+  return String(text)
+    .split(/[。！？!?\n]+/)
+    .map((part) => part.trim().replace(/^[#>*\-\d.、\s]+/, ""))
+    .filter(Boolean);
+}
+
+function isTemplateComparableSentence(sentence) {
+  if (markdownTableLinePattern.test(sentence)) return false;
+  if (/^[-|:\s]+$/.test(sentence)) return false;
+  return textLength(sentence) >= 20;
+}
+
+function topicProseFields(topic, { includeMeta = true } = {}) {
+  const fields = [];
+  for (const card of topic.learningCards ?? []) {
+    if (card.type === "code") continue;
+    if (card.type === "diagram" || card.type === "animation") {
+      fields.push(card.caption ?? "", card.fallback ?? "");
+      continue;
+    }
+    fields.push(card.content ?? "");
+    if (Array.isArray(card.items)) fields.push(...card.items);
+    if (Array.isArray(card.columns)) fields.push(card.columns.join(" "));
+    if (Array.isArray(card.rows)) fields.push(...card.rows.map((row) => row.join(" ")));
+    for (const followUp of card.followUpQuestions ?? []) {
+      fields.push(followUp.question ?? "", followUp.answer ?? "");
+    }
+  }
+  if (includeMeta) {
+    fields.push(topic.summary ?? "", topic.interviewerFocus ?? "");
+    for (const prompt of topic.recallPrompts ?? []) fields.push(prompt.prompt ?? "");
+    for (const key of ["mustHave", "goodToHave", "commonMistakes"]) {
+      fields.push(...(topic.rubric?.[key] ?? []));
+    }
+  }
+  return fields.filter(Boolean);
+}
+
+function fingerprintSentences(topic) {
+  const sentences = new Set();
+  for (const field of topicProseFields(topic)) {
+    for (const sentence of splitIntoSentences(stripCodeSegments(field))) {
+      if (isTemplateComparableSentence(sentence)) sentences.add(sentence);
+    }
+  }
+  return sentences;
+}
+
+function collectCardProseText(topic) {
+  const fields = [];
+  for (const card of topic.learningCards ?? []) {
+    fields.push(card.title ?? "");
+    if (card.type === "diagram" || card.type === "animation") {
+      fields.push(card.content ?? "", card.caption ?? "", card.fallback ?? "");
+      continue;
+    }
+    fields.push(card.content ?? "");
+    if (Array.isArray(card.items)) fields.push(...card.items);
+    if (Array.isArray(card.columns)) fields.push(card.columns.join(" "));
+    if (Array.isArray(card.rows)) fields.push(...card.rows.map((row) => row.join(" ")));
+    for (const followUp of card.followUpQuestions ?? []) {
+      fields.push(followUp.question ?? "", followUp.answer ?? "");
+    }
+  }
+  return fields.filter(Boolean).join("\n");
+}
+
+function effectiveTextLength(texts) {
+  const seen = new Set();
+  let chars = 0;
+  for (const text of texts) {
+    for (const part of String(text).split(/[。！？!?\n]+/)) {
+      const key = compact(part);
+      if (!key.length) continue;
+      if (key.length >= 12) {
+        if (seen.has(key)) continue;
+        seen.add(key);
+      }
+      chars += key.length;
+    }
+  }
+  return chars;
+}
+
+function sentenceRepetitionStats(topic) {
+  const counts = new Map();
+  let total = 0;
+  for (const field of topicProseFields(topic, { includeMeta: false })) {
+    for (const sentence of splitIntoSentences(stripCodeSegments(field))) {
+      if (!isTemplateComparableSentence(sentence)) continue;
+      total += 1;
+      counts.set(sentence, (counts.get(sentence) ?? 0) + 1);
+    }
+  }
+  let repeatedExtra = 0;
+  for (const [, count] of counts) if (count >= 2) repeatedExtra += count - 1;
+  return { totalSentences: total, repeatedExtra, ratio: total ? repeatedExtra / total : 0 };
+}
+
+function compareTableCells(card) {
+  if (Array.isArray(card.columns) && Array.isArray(card.rows)) {
+    return {
+      columns: card.columns.map((cell) => String(cell).trim()),
+      rows: card.rows.map((row) => row.map((cell) => String(cell).trim())),
+    };
+  }
+  const lines = String(card.content ?? "")
+    .split("\n")
+    .filter((line) => markdownTableLinePattern.test(line));
+  if (lines.length < 3) return null;
+  const parsed = lines.map((line) =>
+    line
+      .trim()
+      .replace(/^\||\|$/g, "")
+      .split("|")
+      .map((cell) => cell.trim()),
+  );
+  return {
+    columns: parsed[0],
+    rows: parsed.slice(1).filter((cells) => !cells.every((cell) => /^:?-{3,}:?$/.test(cell))),
+  };
+}
+
+function titleEchoTokens(title = "") {
+  const tokens = new Set();
+  for (const run of normalizedText(title).match(/[A-Za-z0-9]{2,}/g) ?? []) tokens.add(run);
+  for (const run of normalizedText(title).match(/[\p{Script=Han}]{2,}/gu) ?? []) {
+    for (let index = 0; index <= run.length - 2; index += 1) tokens.add(run.slice(index, index + 2));
+  }
+  return [...tokens];
+}
+
+const scenarioQuestionPattern =
+  /线上|生产环境|高并发|大流量|故障|压测|突然|遇到|出现[^，。]{0,16}(?:问题|异常|失败|超时|抖动|不一致)|(?:如何|怎么|怎样)(?:预防|避免|应对|处理|保证|排查|定位|优化|选择|设计|降低|提升|解决|权衡|取舍|落地)|怎么办|你会怎么|实际项目|什么场景|哪些场景|场景下/;
+
+function coverageTokens(text) {
+  const lower = String(text).toLowerCase();
+  const tokens = new Set();
+  for (const word of lower.match(/[a-z0-9][a-z0-9_+.#-]{1,}/g) ?? []) tokens.add(word);
+  for (const run of lower.match(/[一-龥]{2,}/g) ?? []) {
+    for (let index = 0; index <= run.length - 2; index += 1) tokens.add(run.slice(index, index + 2));
+  }
+  return tokens;
+}
+
+function coverageRatio(query, sourceLower) {
+  const tokens = [...coverageTokens(query)];
+  if (!tokens.length) return 1;
+  let hits = 0;
+  for (const token of tokens) if (sourceLower.includes(token)) hits += 1;
+  return hits / tokens.length;
+}
+
+function tokenJaccard(left, right) {
+  const a = coverageTokens(left);
+  const b = coverageTokens(right);
+  if (!a.size || !b.size) return 0;
+  let intersection = 0;
+  for (const token of a) if (b.has(token)) intersection += 1;
+  return intersection / (a.size + b.size - intersection);
+}
+
+function buildCorpus(allTopics) {
+  const sentenceTopics = new Map();
+  const domainLexicon = new Map();
+  for (const { topic, ref } of allTopics) {
+    for (const sentence of fingerprintSentences(topic)) {
+      const refs = sentenceTopics.get(sentence) ?? new Set();
+      refs.add(ref);
+      sentenceTopics.set(sentence, refs);
+    }
+    const lexicon = domainLexicon.get(topic.domain) ?? new Set();
+    for (const tag of topic.tags ?? []) {
+      const token = String(tag).trim().toLowerCase();
+      if (token.length >= 2 && !/^\d+$/.test(token) && !lexiconStopTokens.has(token)) {
+        lexicon.add(token);
+      }
+    }
+    domainLexicon.set(topic.domain, lexicon);
+  }
+  return { sentenceTopics, domainLexicon };
 }
 
 function expectedMinutesRange(difficulty) {
@@ -395,22 +628,7 @@ function cardOrderRank(type) {
   }[type] ?? 7;
 }
 
-function collectDuplicateSentences(topic) {
-  const sentences = [];
-  const text = `${topic.summary ?? ""}\n${(topic.learningCards ?? []).map(cardText).join("\n")}`;
-  for (const sentence of text.split(/[。！？!?]\s*/)) {
-    const clean = sentence.trim();
-    if (
-      textLength(clean) >= 24 &&
-      (duplicateSentencePattern.test(clean) || (textLength(clean) >= 38 && repeatedNaturalnessPattern.test(clean)))
-    ) {
-      sentences.push(clean);
-    }
-  }
-  return sentences;
-}
-
-function scoreTopic(topic, ref) {
+function scoreTopic(topic, ref, corpus) {
   const issues = [];
   let score = 100;
   let scoreCap = 100;
@@ -420,12 +638,15 @@ function scoreTopic(topic, ref) {
   const diagramCards = (topic.learningCards ?? []).filter((card) => card.type === "diagram" || card.type === "animation");
   const compareCards = (topic.learningCards ?? []).filter((card) => card.type === "compareTable");
   const checklistCards = (topic.learningCards ?? []).filter((card) => card.type === "checklist");
-  const explainChars = explainCards.reduce((sum, card) => sum + textLength(card.content), 0);
-  const totalChars = (topic.learningCards ?? []).reduce((sum, card) => sum + textLength(cardText(card)), 0);
+  const explainChars = effectiveTextLength(explainCards.map((card) => card.content ?? ""));
+  const totalChars = effectiveTextLength((topic.learningCards ?? []).map(cardText));
   const allText = collectTopicText(topic);
   const readableText = collectReadableTopicText(topic);
+  // 对齐度和专家信号只能在卡片正文里找证据；readableText 含 title/tags/summary，会自己匹配自己。
+  const cardProseText = collectCardProseText(topic);
+  const cardProseLower = cardProseText.toLowerCase();
   const primaryTokens = primaryRelevanceTokens(topic);
-  const primaryTokenMatches = matchedTokens(readableText, primaryTokens);
+  const primaryTokenMatches = matchedTokens(cardProseText, primaryTokens);
 
   function deduct(points, issue) {
     score -= points;
@@ -435,6 +656,47 @@ function scoreTopic(topic, ref) {
   function capScore(maxScore, issue) {
     if (maxScore < scoreCap) scoreCap = maxScore;
     issues.push(`最高 ${maxScore} 分：${issue}`);
+  }
+
+  const sharedSentenceDetails = [];
+  if (corpus) {
+    for (const sentence of fingerprintSentences(topic)) {
+      const spread = corpus.sentenceTopics.get(sentence)?.size ?? 0;
+      if (spread >= 4) sharedSentenceDetails.push({ sentence, spread });
+    }
+  }
+  const isAlgorithmScaffoldSentence = (detail) =>
+    topic.domain === "algorithm" && algorithmTemplateLeakPattern.test(detail.sentence);
+  const scaffoldShared = sharedSentenceDetails.filter(isAlgorithmScaffoldSentence);
+  const hardShared = sharedSentenceDetails
+    .filter((detail) => !isAlgorithmScaffoldSentence(detail))
+    .sort((a, b) => b.spread - a.spread);
+  if (hardShared.length) {
+    const penalty = Math.min(
+      14,
+      hardShared.reduce((sum, detail) => sum + (detail.spread >= 12 ? 4 : detail.spread >= 6 ? 3 : 2), 0),
+    );
+    deduct(
+      penalty,
+      `跨 topic 逐字复用句 ${hardShared.length} 句（最广一句出现在 ${hardShared[0].spread} 个 topic）：${hardShared[0].sentence.slice(0, 40)}…`,
+    );
+  }
+  if (scaffoldShared.length) {
+    deduct(Math.min(3, scaffoldShared.length), `算法答题脚手架句跨题逐字复用 ${scaffoldShared.length} 句，建议按题面改写`);
+  }
+  if (hardShared.length >= 3) {
+    capScore(88, `含 ${hardShared.length} 句跨 topic 模板句，语言不是为本知识点写的`);
+  } else if (hardShared.length === 2) {
+    capScore(92, "含 2 句跨 topic 模板句");
+  } else if (hardShared.length === 1) {
+    capScore(94, "含 1 句跨 topic 复用句，95+ 要求语言完全为本知识点而写");
+  }
+  const repetition = sentenceRepetitionStats(topic);
+  if (repetition.totalSentences >= 12 && repetition.ratio > 0.15) {
+    deduct(Math.min(8, Math.round(repetition.ratio * 30)), `topic 内部句子重复率过高 ${(repetition.ratio * 100).toFixed(0)}%，疑似复制注水`);
+    capScore(89, "内部句子大量重复，正文有效信息量不足");
+  } else if (repetition.totalSentences >= 12 && repetition.ratio > 0.12) {
+    capScore(94, "内部句子重复率偏高，不能进入优秀档");
   }
 
   if ((topic.status ?? "") !== "production") deduct(8, "status 不是 production");
@@ -476,6 +738,11 @@ function scoreTopic(topic, ref) {
     deduct(Math.min(10, Math.ceil((minTotalChars - totalChars) / 100)), `总内容量不足 ${totalChars}/${minTotalChars}`);
   }
 
+  const charsPerMinute = topic.estimatedMinutes ? totalChars / topic.estimatedMinutes : null;
+  if (charsPerMinute !== null && (charsPerMinute < 35 || charsPerMinute > 450)) {
+    deduct(2, `estimatedMinutes 与实际内容量不匹配（约 ${Math.round(charsPerMinute)} 字/分钟），误导学习计划`);
+  }
+
   for (const [pattern, label] of templatePatterns) {
     if (pattern.test(allText)) deduct(12, label);
   }
@@ -484,33 +751,50 @@ function scoreTopic(topic, ref) {
     deduct(10, "非算法 topic 混入算法题回答模板");
   }
   if (primaryTokens.length >= 3 && primaryTokenMatches.length < Math.min(3, primaryTokens.length)) {
-    deduct(5, `正文与标题/标签的专属词呼应不足 ${primaryTokenMatches.length}/${Math.min(3, primaryTokens.length)}`);
+    deduct(5, `卡片正文与标题/标签的专属词呼应不足 ${primaryTokenMatches.length}/${Math.min(3, primaryTokens.length)}`);
   }
-  if (!concreteExamplePattern.test(readableText)) {
+  if (!concreteExamplePattern.test(cardProseText)) {
     deduct(4, "缺少具体例子或场景，读者难以落地理解");
     capScore(92, "没有具体例子/场景支撑，只能算结构合格");
   }
-  if (!boundarySignalPattern.test(readableText)) {
+  if (!boundarySignalPattern.test(cardProseText)) {
     deduct(5, "缺少边界、风险或常见误区");
     capScore(92, "没有边界和误区，难以达到高质量知识");
   }
-  if (topic.difficulty >= 3 && !verificationSignalPattern.test(readableText) && topic.domain !== "algorithm") {
+  if (topic.difficulty >= 3 && !verificationSignalPattern.test(cardProseText) && topic.domain !== "algorithm") {
     deduct(4, "中高难度 topic 缺少验证、排查或可观测证据");
     capScore(94, "缺少验证/排查证据，高分需要能落到真实问题");
   }
-  if (topic.difficulty >= 4 && !tradeoffSignalPattern.test(readableText)) {
+  if (topic.difficulty >= 4 && !tradeoffSignalPattern.test(cardProseText)) {
     deduct(4, "高阶 topic 缺少取舍、成本或权衡");
     capScore(93, "高阶内容没有权衡分析，只能算讲清概念");
   }
-  if (topic.difficulty >= 4 && !failureSignalPattern.test(readableText) && topic.domain !== "algorithm") {
+  if (topic.difficulty >= 4 && !failureSignalPattern.test(cardProseText) && topic.domain !== "algorithm") {
     deduct(4, "高阶 topic 缺少失败模式或风险路径");
     capScore(94, "高阶内容没有失败路径，体感深度不足");
   }
-  const fillerCount = countPattern(readableText, proseFillerPattern);
+  const fillerCount = countPattern(cardProseText, proseFillerPattern);
   if (fillerCount >= 14 && fillerCount > Math.max(8, Math.floor(totalChars / 360))) {
     deduct(4, `连接词/套话密度偏高，语言有拼接感 ${fillerCount}`);
   }
+  const proseWithoutCode = stripCodeSegments(topicProseFields(topic).join("\n"));
+  if (placeholderTextPattern.test(proseWithoutCode)) {
+    deduct(6, "存在 TODO/待补充/占位 文案");
+    capScore(89, "内容仍有占位文案，未完成状态");
+  }
+  if (topic.domain === "algorithm" && !/O\(|复杂度/.test(cardProseText)) {
+    deduct(5, "算法 topic 缺少时间/空间复杂度分析");
+  }
+  const longProse = (topic.learningCards ?? [])
+    .filter((card) => card.type !== "code" && card.type !== "diagram" && card.type !== "animation")
+    .map(cardText)
+    .join("\n");
+  const overlongSentences = splitIntoSentences(longProse).filter((sentence) => textLength(sentence) >= 150);
+  if (overlongSentences.length >= 2) {
+    deduct(2, `存在 ${overlongSentences.length} 个超过 150 字无停顿的长句，影响可读性`);
+  }
 
+  let skeletonExplainCards = 0;
   let previousCardRank = 0;
   for (const card of topic.learningCards ?? []) {
     const rank = cardOrderRank(card.type);
@@ -529,6 +813,21 @@ function scoreTopic(topic, ref) {
     if (!isAlgorithmProblemIntroCard(topic, card) && card.type === "explain" && textLength(title) < 8) {
       deduct(3, `explain 标题过短：${card.title}`);
     }
+    if (
+      card.type !== "diagram" &&
+      card.type !== "animation" &&
+      card.type !== "code" &&
+      literalEscapeLeakPattern.test(stripCodeSegments(cardText(card)))
+    ) {
+      deduct(4, `正文存在未渲染的 \\n/\\t 字面量：${card.title}`);
+    }
+    if (replacementCharPattern.test(cardText(card))) {
+      deduct(4, `存在乱码替换符：${card.title}`);
+    }
+    if (card.type === "explain" || card.type === "interviewAnswer") {
+      const fenceCount = (String(card.content ?? "").match(/^\s*```/gm) ?? []).length;
+      if (fenceCount % 2 === 1) deduct(4, `Markdown 代码围栏未闭合：${card.title}`);
+    }
     if (card.type === "explain") {
       const content = card.content ?? "";
       const hasMechanismSignal = mechanismSignalPattern.test(content);
@@ -536,19 +835,96 @@ function scoreTopic(topic, ref) {
       if (/请回答|复述|评分|面试官|追问/.test(content)) {
         deduct(6, `explain 混入面试训练或评分指令：${card.title}`);
       }
+      if (textLength(content) >= 380 && !content.includes("\n")) {
+        deduct(3, `explain 是无分段长文，阅读负担大：${card.title}`);
+      }
+      if (!isAlgorithmProblemIntroCard(topic, card)) {
+        const echoTokens = titleEchoTokens(title);
+        if (
+          echoTokens.length >= 3 &&
+          matchedTokens(content, echoTokens).length === 0 &&
+          matchedTokens(content, primaryTokens).length === 0
+        ) {
+          deduct(2, `explain 标题与内容缺少呼应，疑似标题包装：${card.title}`);
+        }
+      }
+      if (topic.domain !== "algorithm") {
+        // 标准 §8 禁止“只有清单，没有解释”：成段文字过少且要点全是短标签 = 骨架笔记，零基础读者学不会。
+        let proseChars = 0;
+        let listLines = 0;
+        let substantiveBullets = 0;
+        for (const line of stripCodeSegments(content).split("\n")) {
+          const trimmed = line.trim();
+          if (!trimmed || /^#{1,6}\s/.test(trimmed) || markdownTableLinePattern.test(trimmed)) continue;
+          const bullet = trimmed.match(/^(?:[-*]|\d+\.)\s+(.*)$/);
+          if (bullet) {
+            listLines += 1;
+            if (textLength(bullet[1]) >= 18) substantiveBullets += 1;
+            continue;
+          }
+          proseChars += textLength(trimmed);
+        }
+        if (proseChars < 60 && substantiveBullets <= 2 && listLines >= 5) {
+          skeletonExplainCards += 1;
+          if (skeletonExplainCards <= 2) {
+            deduct(5, `explain 是清单骨架（成段文字 ${proseChars} 字、实质要点 ${substantiveBullets} 条），无法支撑从不会到学会：${card.title}`);
+          }
+        }
+      }
     }
-    if (card.type === "compareTable" && Array.isArray(card.columns) && Array.isArray(card.rows)) {
-      if (card.rows.length < 3) deduct(3, `compareTable 行数不足：${card.title}`);
-      for (const row of card.rows) {
-        if (row.length !== card.columns.length) {
-          deduct(5, `compareTable 列数不一致：${card.title}`);
-          break;
+    if (card.type === "compareTable") {
+      if (Array.isArray(card.columns) && Array.isArray(card.rows)) {
+        if (card.rows.length < 3) deduct(3, `compareTable 行数不足：${card.title}`);
+        for (const row of card.rows) {
+          if (row.length !== card.columns.length) {
+            deduct(5, `compareTable 列数不一致：${card.title}`);
+            break;
+          }
+        }
+      }
+      const table = compareTableCells(card);
+      if (table) {
+        const { rows } = table;
+        if (rows.some((row) => row.some((cell) => !cell))) {
+          deduct(3, `对比表存在空单元格：${card.title}`);
+        }
+        const rowKeys = new Set();
+        let duplicateRow = false;
+        for (const row of rows) {
+          const key = row.join("|");
+          if (rowKeys.has(key)) duplicateRow = true;
+          rowKeys.add(key);
+        }
+        if (duplicateRow) deduct(4, `对比表存在完全重复的行：${card.title}`);
+        let similarRows = false;
+        for (let i = 0; i < rows.length && !similarRows; i += 1) {
+          for (let j = i + 1; j < rows.length; j += 1) {
+            if (jaccardSimilarity(rows[i].join(" "), rows[j].join(" ")) > 0.85) {
+              similarRows = true;
+              break;
+            }
+          }
+        }
+        if (similarRows && !duplicateRow) deduct(3, `对比表两行内容高度相似，缺少真实区分：${card.title}`);
+        const sameValueRows = rows.filter((row) => row.length >= 3 && new Set(row.slice(1).map(compact)).size === 1);
+        if (sameValueRows.length >= 2) {
+          deduct(2, `对比表有 ${sameValueRows.length} 行所有列取值相同，对比信息弱：${card.title}`);
         }
       }
     }
     if (card.type === "code") {
       if (!card.language) deduct(5, `code 卡缺少 language：${card.title}`);
       if (textLength(card.content) < 60) deduct(4, `code 示例过短：${card.title}`);
+      const codeSignature = codeLanguageSignatures[(card.language ?? "").trim().toLowerCase()];
+      const codeContent = String(card.content ?? "");
+      if (codeSignature && !codeSignature[0].test(codeContent) && codeSignature[1].test(codeContent)) {
+        deduct(5, `code 卡 language=${card.language} 与代码内容特征不符：${card.title}`);
+      }
+      const placeholderHits = countPattern(codeContent, codePlaceholderPattern);
+      const codeLineCount = codeContent.split(/\r?\n/).filter((line) => line.trim()).length;
+      if (placeholderHits >= 3 || (placeholderHits >= 1 && codeLineCount < 8)) {
+        deduct(3, `code 以省略/TODO 占位行为主，示例不完整：${card.title}`);
+      }
       if (!Array.isArray(card.highlights) || card.highlights.length === 0) {
         deduct(4, `code 卡缺少 highlights：${card.title}`);
       } else {
@@ -580,11 +956,23 @@ function scoreTopic(topic, ref) {
       }
       if ((card.format ?? "") === "mermaid") {
         const statements = mermaidStatements(card.content ?? "");
+        if (!validMermaidHeaderPattern.test(statements[0] ?? "")) {
+          deduct(4, `Mermaid 首行不是合法图类型声明：${card.title}`);
+        }
         for (const statement of statements.slice(1)) {
           if (isolatedMermaidNodePattern.test(statement) || !mermaidEdgePattern.test(statement)) {
             deduct(5, `Mermaid 图存在孤立节点或非连线语句，需先诊断引用错位、补边、重画或确认已有更好图承接，不能直接删除：${card.title}`);
             break;
           }
+        }
+        const seenEdges = new Set();
+        for (const statement of statements.slice(1)) {
+          if (!mermaidEdgePattern.test(statement)) continue;
+          if (seenEdges.has(statement)) {
+            deduct(2, `Mermaid 存在完全重复的连线：${card.title}`);
+            break;
+          }
+          seenEdges.add(statement);
         }
         if (topic.difficulty >= 3 && diagramSignals.edgeCount < 3) {
           deduct(3, `图示连线过少，难以表达真实关系：${card.title}`);
@@ -677,6 +1065,32 @@ function scoreTopic(topic, ref) {
     deduct(3, "recallPrompts 缺少机制/边界/排查型问题");
     capScore(94, "回忆题没有把用户推向机制和边界，难以达到优秀");
   }
+  // 自包含性：recall 考的内容必须在本 topic 正文里教过，否则用户学完仍答不出。
+  let minRecallCoverage = 1;
+  let lowCoverageRecalls = 0;
+  for (const prompt of recalls) {
+    const ratio = coverageRatio(prompt.prompt ?? "", cardProseLower);
+    minRecallCoverage = Math.min(minRecallCoverage, ratio);
+    if (ratio < 0.25) {
+      lowCoverageRecalls += 1;
+      if (lowCoverageRecalls <= 2) {
+        deduct(2, `recallPrompt 考点未被正文覆盖（覆盖率 ${(ratio * 100).toFixed(0)}%），学完答不出：${(prompt.prompt ?? "").slice(0, 30)}`);
+      }
+    }
+  }
+  // 应用迁移：difficulty>=3 的练习必须有场景型问题，否则只能背诵不能灵活运用。
+  const applicationText = [
+    ...recalls.map((prompt) => prompt.prompt ?? ""),
+    ...interviewCards.flatMap((card) => [
+      card.content ?? "",
+      ...(card.followUpQuestions ?? []).flatMap((followUp) => [followUp.question ?? "", followUp.answer ?? ""]),
+    ]),
+  ].join("\n");
+  const hasScenarioQuestion = scenarioQuestionPattern.test(applicationText);
+  if (topic.difficulty >= 3 && topic.domain !== "algorithm" && !hasScenarioQuestion) {
+    deduct(3, "缺少场景迁移型问题（线上/故障/如何排查/怎么选型），练不出灵活运用");
+    capScore(94, "没有场景化练习，达不到面试灵活运用的优秀档");
+  }
 
   const rubric = topic.rubric ?? {};
   if ((rubric.mustHave ?? []).length < 3) deduct(5, "rubric.mustHave 不足");
@@ -692,6 +1106,16 @@ function scoreTopic(topic, ref) {
   if (rubricTemplateCount >= 2) {
     deduct(Math.min(10, rubricTemplateCount * 3), `rubric 模板化条目过多 ${rubricTemplateCount}`);
     capScore(94, "rubric 仍像生成模板，不能支撑 95+ 的真人体感");
+  }
+  // 可达性：mustHave 要求必须答出的点，正文里必须教过。
+  let lowCoverageMustHave = 0;
+  for (const item of rubric.mustHave ?? []) {
+    if (coverageRatio(item, cardProseLower) < 0.3) {
+      lowCoverageMustHave += 1;
+      if (lowCoverageMustHave <= 2) {
+        deduct(2, `rubric.mustHave 要求的点未被正文覆盖，学完达不到及格线：${item.slice(0, 30)}`);
+      }
+    }
   }
   for (const sectionName of ["mustHave", "goodToHave", "commonMistakes"]) {
     for (const item of rubric[sectionName] ?? []) {
@@ -715,6 +1139,39 @@ function scoreTopic(topic, ref) {
     const interviewText = interviewCards.map((card) => card.content ?? "").join("\n");
     if (jaccardSimilarity(explainText, interviewText) > 0.78) {
       deduct(5, "explain 与 interviewAnswer 内容过度重复");
+    }
+    if (tokenJaccard(explainText, interviewText) < 0.035) {
+      deduct(3, "interviewAnswer 与 explain 几乎无词汇关联，讲与练脱节");
+    }
+  }
+  if (skeletonExplainCards > 0) {
+    capScore(92, `有 ${skeletonExplainCards} 张清单骨架式 explain，缺少成段机制讲解`);
+  }
+  explainPair: for (let i = 0; i < explainCards.length; i += 1) {
+    for (let j = i + 1; j < explainCards.length; j += 1) {
+      if (jaccardSimilarity(explainCards[i].content ?? "", explainCards[j].content ?? "") > 0.7) {
+        deduct(5, `两张 explain 卡内容高度重复：${explainCards[i].title} / ${explainCards[j].title}`);
+        break explainPair;
+      }
+    }
+  }
+  const followUpAnswers = interviewCards.flatMap((card) =>
+    (card.followUpQuestions ?? []).map((followUp) => followUp.answer ?? ""),
+  );
+  followUpPair: for (let i = 0; i < followUpAnswers.length; i += 1) {
+    for (let j = i + 1; j < followUpAnswers.length; j += 1) {
+      if (jaccardSimilarity(followUpAnswers[i], followUpAnswers[j]) > 0.8) {
+        deduct(3, "存在两条高度相似的追问答案");
+        break followUpPair;
+      }
+    }
+  }
+  recallPair: for (let i = 0; i < recalls.length; i += 1) {
+    for (let j = i + 1; j < recalls.length; j += 1) {
+      if (jaccardSimilarity(recalls[i].prompt ?? "", recalls[j].prompt ?? "") > 0.8) {
+        deduct(3, "存在两条高度相似的 recallPrompt");
+        break recallPair;
+      }
     }
   }
 
@@ -742,14 +1199,41 @@ function scoreTopic(topic, ref) {
   });
   const rubricSpecificRatio = rubricItems.length ? specificRubricItems.length / rubricItems.length : 0;
   const topicAlignmentRatio = primaryTokens.length ? primaryTokenMatches.length / primaryTokens.length : 1;
+
+  const lexicon = corpus?.domainLexicon.get(topic.domain);
+  let lexiconHits = 0;
+  let crossLexiconHits = 0;
+  if (lexicon) {
+    const ownTags = new Set((topic.tags ?? []).map((tag) => String(tag).trim().toLowerCase()));
+    const proseLower = cardProseText.toLowerCase();
+    for (const token of lexicon) {
+      if (proseLower.includes(token)) {
+        lexiconHits += 1;
+        if (!ownTags.has(token)) crossLexiconHits += 1;
+      }
+    }
+  }
+  if (lexicon && lexicon.size >= 12 && topic.difficulty >= 3) {
+    if (lexiconHits === 0) {
+      deduct(4, "卡片正文未命中任何本领域术语，疑似跑题或表面化讲解");
+      capScore(92, "正文与领域术语完全脱节");
+    } else if (lexiconHits === 1) {
+      deduct(2, "卡片正文仅命中 1 个领域术语，领域纵深存疑");
+    }
+  }
+  const factCount = countPattern(cardProseText, concreteFactPattern);
+  if (topic.difficulty >= 4 && factCount === 0) {
+    deduct(2, "高阶 topic 没有任何具体数字/复杂度/版本等事实锚点，专家深度存疑");
+  }
+
   const excellentSignals = [];
   const idealExplainChars = Math.round(minExplainChars * (topic.difficulty >= 4 ? 1.22 : topic.difficulty >= 3 ? 1.16 : 1.08));
   if (explainChars >= idealExplainChars) excellentSignals.push("explain 深度超过最低线");
-  if (concreteExamplePattern.test(readableText)) excellentSignals.push("有具体例子/场景");
-  if (boundarySignalPattern.test(readableText)) excellentSignals.push("有边界/误区/风险");
-  if (verificationSignalPattern.test(readableText) || topic.domain === "algorithm") excellentSignals.push("有验证/排查/复杂度证据");
-  if (tradeoffSignalPattern.test(readableText)) excellentSignals.push("有取舍/成本/权衡");
-  if (failureSignalPattern.test(readableText) || topic.domain === "algorithm") excellentSignals.push("有失败/异常路径");
+  if (concreteExamplePattern.test(cardProseText)) excellentSignals.push("有具体例子/场景");
+  if (boundarySignalPattern.test(cardProseText)) excellentSignals.push("有边界/误区/风险");
+  if (verificationSignalPattern.test(cardProseText) || topic.domain === "algorithm") excellentSignals.push("有验证/排查/复杂度证据");
+  if (tradeoffSignalPattern.test(cardProseText)) excellentSignals.push("有取舍/成本/权衡");
+  if (failureSignalPattern.test(cardProseText) || topic.domain === "algorithm") excellentSignals.push("有失败/异常路径");
   if (strongDiagramCount > 0) excellentSignals.push("图示能解释真实关系");
   if (goodCompareCount > 0) excellentSignals.push("对比表能支撑边界理解");
   if (followUps >= 3 || (followUps >= 2 && interviewChars >= 300)) excellentSignals.push("面试回答和追问较扎实");
@@ -761,8 +1245,19 @@ function scoreTopic(topic, ref) {
   if (hasCodeExample(topic) && (topic.domain === "algorithm" || topic.domain === "go" || topic.difficulty >= 3)) {
     excellentSignals.push("有代码或伪代码锚点");
   }
-  const requiredForExcellent = topic.difficulty >= 4 ? 9 : topic.difficulty >= 3 ? 8 : 7;
-  const requiredForStrong = Math.max(5, requiredForExcellent - 2);
+  if (factCount >= 2) excellentSignals.push("有具体数字/复杂度/版本等事实锚点");
+  if (crossLexiconHits >= 6) excellentSignals.push("领域术语网络覆盖广，能关联相邻知识");
+  if (corpus && hardShared.length === 0 && scaffoldShared.length === 0 && repetition.ratio <= 0.05) {
+    excellentSignals.push("语言为本知识点原创，无复制句");
+  }
+  if (recalls.length >= 2 && minRecallCoverage >= 0.45) {
+    excellentSignals.push("回忆题考点全部能从正文学到（自包含）");
+  }
+  if (topic.difficulty <= 2 || topic.domain === "algorithm" || hasScenarioQuestion) {
+    excellentSignals.push("练习包含场景迁移型问题");
+  }
+  const requiredForExcellent = topic.difficulty >= 4 ? 12 : topic.difficulty >= 3 ? 11 : 10;
+  const requiredForStrong = Math.max(6, requiredForExcellent - 2);
   if (excellentSignals.length < requiredForStrong) {
     capScore(92, `正向质量证据不足 ${excellentSignals.length}/${requiredForStrong}，只能证明基本合格`);
   } else if (excellentSignals.length < requiredForExcellent) {
@@ -790,15 +1285,15 @@ function scoreTopic(topic, ref) {
     interviewCards.map((card) => card.content ?? "").join("\n"),
   ) > 0.78);
   const topicAlignmentRatioForScore = primaryTokens.length ? primaryTokenMatches.length / primaryTokens.length : 1;
-  const hasExample = concreteExamplePattern.test(readableText);
-  const hasBoundary = boundarySignalPattern.test(readableText);
-  const hasVerification = verificationSignalPattern.test(readableText) || topic.domain === "algorithm";
-  const hasTradeoff = tradeoffSignalPattern.test(readableText) || topic.difficulty <= 2;
-  const hasFailure = failureSignalPattern.test(readableText) || topic.domain === "algorithm" || topic.difficulty <= 2;
+  const hasExample = concreteExamplePattern.test(cardProseText);
+  const hasBoundary = boundarySignalPattern.test(cardProseText);
+  const hasVerification = verificationSignalPattern.test(cardProseText) || topic.domain === "algorithm";
+  const hasTradeoff = tradeoffSignalPattern.test(cardProseText) || topic.difficulty <= 2;
+  const hasFailure = failureSignalPattern.test(cardProseText) || topic.domain === "algorithm" || topic.difficulty <= 2;
   const hasDomainEvidence = topicAlignmentRatioForScore >= 0.45 || primaryTokenMatches.length >= 6;
   const hasNaturalLanguage =
     !unnaturalLanguagePattern.test(allText) &&
-    countPattern(readableText, proseFillerPattern) < Math.max(14, Math.floor(totalChars / 300));
+    countPattern(cardProseText, proseFillerPattern) < Math.max(14, Math.floor(totalChars / 300));
   const hasInformativeTitles = (topic.learningCards ?? []).every((card) => {
     const title = (card.title ?? "").trim();
     return isAlgorithmProblemIntroCard(topic, card) || (!genericCardTitlePattern.test(title) && !genericCardTitleTextPattern.test(title));
@@ -896,10 +1391,11 @@ function scoreTopic(topic, ref) {
       scaledScore(commonMistakeSpecificRatio, 0.9, 2) +
       booleanScore(Object.values(rubric.scoreWeights ?? {}).reduce((sum, value) => sum + value, 0) === 100, 1),
     hygiene:
-      booleanScore(hasNoTemplatePollution, 2) +
-      booleanScore(!cjkLatinSpacingPattern.test(topic.title ?? ""), 0.7) +
-      booleanScore(!genericHighlightPattern.test(allText), 0.6) +
-      booleanScore(!generatedDiagramCaptionPattern.test(allText), 0.7),
+      booleanScore(hasNoTemplatePollution, 1.5) +
+      booleanScore(!corpus || hardShared.length === 0, 1.5) +
+      booleanScore(!cjkLatinSpacingPattern.test(topic.title ?? ""), 0.4) +
+      booleanScore(!genericHighlightPattern.test(allText), 0.3) +
+      booleanScore(!generatedDiagramCaptionPattern.test(allText), 0.3),
   };
 
   const dimensionMax = {
@@ -926,9 +1422,50 @@ function scoreTopic(topic, ref) {
   noteDimension("interview", "面试可用性", 0.78);
   noteDimension("assessment", "rubric 评估", 0.8);
 
+  // 90+ 不允许任何核心维度存在明显短板：强维度不能补偿弱维度。
+  const dimensionFloors = {
+    structure: 0.6,
+    depth: 0.55,
+    expertise: 0.6,
+    clarity: 0.6,
+    visual: 0.45,
+    interview: 0.6,
+    assessment: 0.55,
+    hygiene: 0.45,
+  };
+  const dimensionLabels = {
+    structure: "结构完整性",
+    depth: "内容深度",
+    expertise: "专家证据",
+    clarity: "讲解清晰度",
+    visual: "图示/对比",
+    interview: "面试可用性",
+    assessment: "rubric 评估",
+    hygiene: "模板与语言卫生",
+  };
+  for (const [name, floor] of Object.entries(dimensionFloors)) {
+    const ratio = dimensionScores[name] / dimensionMax[name];
+    if (ratio < floor) {
+      capScore(
+        89,
+        `${dimensionLabels[name]}维度短板 ${dimensionScores[name].toFixed(1)}/${dimensionMax[name]}（低于 ${Math.round(floor * 100)}% 地板），强项不可补偿`,
+      );
+    }
+  }
+
   const positiveScore = Object.values(dimensionScores).reduce((sum, value) => sum + value, 0);
   const legacyScore = Math.max(0, score);
   score = Math.min(positiveScore, legacyScore, scoreCap);
+
+  if (score < minScore && positiveScore <= legacyScore && positiveScore <= scoreCap) {
+    const gaps = Object.entries(dimensionScores)
+      .map(([name, value]) => ({ name, value, gap: dimensionMax[name] - value }))
+      .sort((a, b) => b.gap - a.gap)
+      .slice(0, 3);
+    issues.push(
+      `正向证据不足是主因，最大缺口：${gaps.map((gap) => `${dimensionLabels[gap.name]} ${gap.value.toFixed(1)}/${dimensionMax[gap.name]}`).join("，")}`,
+    );
+  }
 
   return {
     ref,
@@ -958,6 +1495,15 @@ function scoreTopic(topic, ref) {
       strongDiagrams: strongDiagramCount,
       rubricSpecificRatio: Number(rubricSpecificRatio.toFixed(2)),
       topicAlignmentRatio: Number(topicAlignmentRatio.toFixed(2)),
+      sharedTemplateSentences: hardShared.length,
+      scaffoldSharedSentences: scaffoldShared.length,
+      repetitionRatio: Number(repetition.ratio.toFixed(2)),
+      lexiconHits,
+      crossLexiconHits,
+      factCount,
+      minRecallCoverage: Number(minRecallCoverage.toFixed(2)),
+      hasScenarioQuestion,
+      skeletonExplainCards,
       dimensions: Object.fromEntries(
         Object.entries(dimensionScores).map(([key, value]) => [key, Number(value.toFixed(1))]),
       ),
@@ -977,14 +1523,15 @@ async function main() {
   const normalizedTitleMap = new Map();
   const orderIssues = [];
   const structuralIssues = [];
-  const duplicateSentenceMap = new Map();
 
+  // 第一遍：加载全部 topic 并做结构检查，同时为跨 topic 模板句和领域术语词典建立语料库。
+  const loadedDomains = [];
   for (const domainEntry of manifest.domains) {
     if (!domainEntry.entry.startsWith("domains/")) {
       structuralIssues.push(`${domainEntry.id}: production manifest entry 应指向 domains/，实际为 ${domainEntry.entry}`);
     }
     const domain = await readJson(domainEntry.entry);
-    const domainTopicReports = [];
+    const loadedTopics = [];
     let previousCategoryOrder = -Infinity;
     const seenCategoryOrders = new Map();
 
@@ -1011,19 +1558,7 @@ async function main() {
         if (topic.category !== category.id) {
           structuralIssues.push(`${ref}: topic.category=${topic.category} 与 category=${category.id} 不一致`);
         }
-        const report = scoreTopic(topic, ref);
-        topicReports.push(report);
-        domainTopicReports.push(report);
-        for (const sentence of collectDuplicateSentences(topic)) {
-          const entries = duplicateSentenceMap.get(sentence) ?? [];
-          entries.push(`${topic.domain}:${topic.title}`);
-          duplicateSentenceMap.set(sentence, entries);
-        }
-
-        const normalized = normalizeTitle(topic.title);
-        const bucket = normalizedTitleMap.get(normalized) ?? [];
-        bucket.push(report);
-        normalizedTitleMap.set(normalized, bucket);
+        loadedTopics.push({ topic, ref });
 
         if (topic.order < previousOrder) {
           orderIssues.push(`${domain.id}/${category.id}: topic order 逆序 ${topic.title}`);
@@ -1036,8 +1571,26 @@ async function main() {
       }
     }
 
-    if (domainEntry.topicCount !== domainTopicReports.length) {
-      structuralIssues.push(`${domain.id}: manifest topicCount=${domainEntry.topicCount}，实际引用=${domainTopicReports.length}`);
+    if (domainEntry.topicCount !== loadedTopics.length) {
+      structuralIssues.push(`${domain.id}: manifest topicCount=${domainEntry.topicCount}，实际引用=${loadedTopics.length}`);
+    }
+    loadedDomains.push({ domain, loadedTopics });
+  }
+
+  const corpus = buildCorpus(loadedDomains.flatMap((entry) => entry.loadedTopics));
+
+  // 第二遍：带语料库上下文评分。
+  for (const { domain, loadedTopics } of loadedDomains) {
+    const domainTopicReports = [];
+    for (const { topic, ref } of loadedTopics) {
+      const report = scoreTopic(topic, ref, corpus);
+      topicReports.push(report);
+      domainTopicReports.push(report);
+
+      const normalized = normalizeTitle(topic.title);
+      const bucket = normalizedTitleMap.get(normalized) ?? [];
+      bucket.push(report);
+      normalizedTitleMap.set(normalized, bucket);
     }
 
     const domainScore = Math.round(average(domainTopicReports.map((item) => item.score)));
@@ -1061,12 +1614,13 @@ async function main() {
   }
 
   const duplicateLanguageIssues = [];
-  for (const [sentence, entries] of duplicateSentenceMap.entries()) {
-    const uniqueEntries = [...new Set(entries)];
-    if (uniqueEntries.length >= 4) {
-      duplicateLanguageIssues.push(`${sentence} :: ${uniqueEntries.slice(0, 8).join(" | ")}${uniqueEntries.length > 8 ? ` ... +${uniqueEntries.length - 8}` : ""}`);
+  for (const [sentence, refs] of corpus.sentenceTopics.entries()) {
+    if (refs.size >= 4) {
+      const sample = [...refs].slice(0, 6).join(" | ");
+      duplicateLanguageIssues.push(`${refs.size}x ${sentence} :: ${sample}${refs.size > 6 ? ` ... +${refs.size - 6}` : ""}`);
     }
   }
+  duplicateLanguageIssues.sort((a, b) => Number(b.split("x")[0]) - Number(a.split("x")[0]));
 
   const overall = Math.round(average(topicReports.map((item) => item.score)));
   const failingTopics = topicReports.filter((item) => item.score < minScore);
@@ -1100,6 +1654,30 @@ async function main() {
     console.log(JSON.stringify(result, null, 2));
   } else {
     console.log(`Content quality audit: overall ${result.overallScore}/100 (${result.overallGrade}), topics=${result.topicCount}, failing=${result.failingTopicCount}`);
+    if (showDistribution) {
+      const buckets = new Map();
+      for (const report of topicReports) {
+        const bucket = report.score >= 95 ? "95+" : report.score >= 90 ? "90-94" : report.score >= 85 ? "85-89" : report.score >= 80 ? "80-84" : "<80";
+        buckets.set(bucket, (buckets.get(bucket) ?? 0) + 1);
+      }
+      console.log("\nScore distribution:");
+      for (const key of ["95+", "90-94", "85-89", "80-84", "<80"]) {
+        console.log(`- ${key}: ${buckets.get(key) ?? 0}`);
+      }
+      const dimensionTotals = new Map();
+      for (const report of topicReports) {
+        for (const [name, value] of Object.entries(report.metrics.dimensions)) {
+          const entry = dimensionTotals.get(name) ?? { sum: 0, min: Infinity };
+          entry.sum += value;
+          entry.min = Math.min(entry.min, value);
+          dimensionTotals.set(name, entry);
+        }
+      }
+      console.log("\nDimension averages (avg/min):");
+      for (const [name, entry] of dimensionTotals.entries()) {
+        console.log(`- ${name}: ${(entry.sum / topicReports.length).toFixed(1)} / ${entry.min.toFixed(1)}`);
+      }
+    }
     console.log("\nDomains:");
     for (const domain of domainReports) {
       console.log(`- ${domain.id}: ${domain.score}/100 (${domain.grade}), minTopic=${domain.minTopicScore}, failingTopics=${domain.failingTopics}`);
