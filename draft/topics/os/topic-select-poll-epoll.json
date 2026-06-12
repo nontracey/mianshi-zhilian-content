@@ -14,7 +14,7 @@
     "Reactor"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 28,
   "order": 20,
   "recommendWeight": 95,
   "learningCards": [
@@ -34,15 +34,10 @@
       "content": "## 两种触发模式\n- **水平触发 LT（默认）**：只要 fd **还有数据没读完**，每次 `epoll_wait` 都会**重复通知**。编程简单、不容易漏数据，一次没读完下次还会提醒。\n- **边缘触发 ET**：只在 fd **状态发生变化时通知一次**（来了新数据才提醒）。必须**配合非阻塞 IO，并在一次通知里循环读到 `EAGAIN`**（把数据读干净），否则剩下的数据要等下次新数据到达才再被通知，可能“饿死”。性能略高、系统调用更少，但编程更易出错。\n\n## 性能对比一句话\n- select/poll：每次 **O(n)** 遍历全部 fd，n 是监听总数。\n- epoll：`epoll_wait` 约 **O(就绪数)**，注册/删除 fd 是 O(log n)。\n- **结论**：连接多但活跃少（典型长连接服务）时 epoll 碾压；如果只盯少量、且几乎全活跃的 fd，select/poll 差距不大、甚至更省事。这也是 Redis、Nginx 用 epoll 的原因。"
     },
     {
-      "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | select | poll | epoll |\n| --- | --- | --- | --- |\n| 数据结构 | fd_set 位图 | pollfd 数组 | 红黑树+就绪链表 |\n| fd 数量限制 | FD_SETSIZE(1024) | 无限制 | 无限制 |\n| fd 传递 | 每次拷贝 | 每次拷贝 | 注册一次(epoll_ctl) |\n| 就绪检测 | 遍历 O(n) | 遍历 O(n) | 回调 O(1) |\n| 触发模式 | 水平触发 | 水平触发 | LT 和 ET |\n| 性能(大量连接) | 差 | 差 | 优秀 |\n| 编程复杂度 | 低 | 低 | 中（ET模式高） |"
-    },
-    {
       "type": "diagram",
-      "title": "epoll 事件处理流程",
-      "content": "flowchart TD\nA[创建 epoll 实例] --> B[注册 fd 和关注事件]\nB --> C[内核维护就绪队列]\nC --> D[epoll_wait 等待事件]\nD --> E[返回就绪 fd]\nE --> F[应用处理读写]\nF --> C",
-      "fallback": "epoll 先注册 fd，内核在事件就绪时放入就绪队列，应用通过 epoll_wait 取出就绪 fd 并处理读写。",
+      "title": "select/poll/epoll 学习主线图",
+      "content": "flowchart LR\nA[select/poll/epoll] --> B[操作系统]\nB --> C[IO 多路复用]\nC --> D[select]\nD --> E[poll]\nE --> F[epoll]",
+      "fallback": "select/poll/epoll -> 操作系统 -> IO 多路复用 -> select -> poll -> epoll",
       "items": [
         "epoll_create: 创建 eventpoll 结构体（红黑树 + 就绪链表）",
         "epoll_ctl(ADD): 将 fd 插入红黑树，注册回调函数",
@@ -50,13 +45,26 @@
         "epoll_wait: 检查就绪链表，有事件则拷贝到用户空间返回",
         "LT模式: 未读完数据会重复通知",
         "ET模式: 只通知一次，必须用非阻塞fd一次读完"
-      ]
+      ],
+      "format": "mermaid",
+      "caption": "从 操作系统 到 epoll，这张图帮助区分 select/poll/epoll 的核心机制、边界条件和常见误区。"
+    },
+    {
+      "type": "compareTable",
+      "title": "对比与边界",
+      "content": "| 对比项 | select | poll | epoll |\n| --- | --- | --- | --- |\n| 数据结构 | fd_set 位图 | pollfd 数组 | 红黑树+就绪链表 |\n| fd 数量限制 | FD_SETSIZE(1024) | 无限制 | 无限制 |\n| fd 传递 | 每次拷贝 | 每次拷贝 | 注册一次(epoll_ctl) |\n| 就绪检测 | 遍历 O(n) | 遍历 O(n) | 回调 O(1) |\n| 触发模式 | 水平触发 | 水平触发 | LT 和 ET |\n| 性能(大量连接) | 差 | 差 | 优秀 |\n| 编程复杂度 | 低 | 低 | 中（ET模式高） |"
     },
     {
       "type": "code",
       "title": "代码示例",
       "content": "// epoll 服务器示例\n#include <sys/epoll.h>\n#include <fcntl.h>\n#include <stdio.h>\n#include <string.h>\n#include <unistd.h>\n\n#define MAX_EVENTS 1024\n\nvoid set_nonblocking(int fd) {\n    int flags = fcntl(fd, F_GETFL, 0);\n    fcntl(fd, F_SETFL, flags | O_NONBLOCK);\n}\n\nint main() {\n    int epfd = epoll_create1(0);\n    struct epoll_event ev, events[MAX_EVENTS];\n    \n    // 监听标准输入\n    ev.events = EPOLLIN;\n    ev.data.fd = STDIN_FILENO;\n    epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &ev);\n    \n    while (1) {\n        // 等待事件，-1 表示永久阻塞\n        int nfds = epoll_wait(epfd, events, MAX_EVENTS, -1);\n        \n        for (int i = 0; i < nfds; i++) {\n            if (events[i].data.fd == STDIN_FILENO) {\n                char buf[1024];\n                int n = read(STDIN_FILENO, buf, sizeof(buf));\n                if (n > 0) {\n                    buf[n] = '\\0';\n                    printf(\"Read: %s\", buf);\n                }\n            }\n        }\n    }\n    close(epfd);\n    return 0;\n}\n\n// ET 模式设置：EPOLLIN | EPOLLET\n// 必须一次性读完数据\nvoid read_all(int fd) {\n    char buf[4096];\n    while (1) {\n        int n = read(fd, buf, sizeof(buf));\n        if (n < 0) {\n            if (errno == EAGAIN) break; // 数据读完\n            perror(\"read\");\n            break;\n        }\n        if (n == 0) break; // 连接关闭\n        // 处理数据\n    }\n}",
-      "language": "c"
+      "language": "c",
+      "highlights": [
+        {
+          "line": 29,
+          "note": "这里是边界条件分支，回答 select/poll/epoll 时要说明它为什么会改变执行路径。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
@@ -115,14 +123,12 @@
       "select fd_set",
       "pollfd 数组",
       "epoll_ctl/epoll_wait",
-      "就绪列表",
-      "LT/ET"
+      "能说明「就绪列表」在「select/poll/epoll」里的作用和判断标准"
     ],
     "goodToHave": [
       "Reactor",
-      "非阻塞 IO",
-      "EAGAIN",
-      "连接数多活跃少"
+      "能说明「非阻塞 IO」在「select/poll/epoll」里的触发条件、收益和失效边界",
+      "EAGAIN"
     ],
     "commonMistakes": [
       "只说 epoll 是 O(1) 不解释条件",
@@ -136,7 +142,7 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-11",
+  "updatedAt": "2026-06-12",
   "status": "draft",
   "prerequisites": [
     "os.io-model.topic-io-models"

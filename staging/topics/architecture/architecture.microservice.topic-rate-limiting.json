@@ -14,7 +14,7 @@
     "Sentinel"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 28,
   "order": 40,
   "recommendWeight": 85,
   "status": "staging",
@@ -35,15 +35,46 @@
       "content": "## 二、限流粒度\n- **集群限流**：整个集群共享配额（需Redis）\n- **单机限流**：每个实例独立计数\n- **接口限流**：针对特定API\n- **用户限流**：针对特定用户\n\n## 三、降级策略\n- **返回默认值**：返回缓存数据或默认响应\n- **调用备用服务**：主服务不可用时切换到备用\n- **异步降级**：同步改异步，先返回成功\n- **功能降级**：关闭非核心功能\n\n## 四、熔断器（Circuit Breaker）\n### 4.1 状态机\n- **关闭（Closed）**：正常状态，统计失败率\n- **打开（Open）**：失败率超阈值，直接拒绝请求\n- **半开（Half-Open）**：等待一段时间后，放少量请求试探\n\n### 4.2 熔断条件\n- 错误率超过阈值（如50%）\n- 慢调用比例超过阈值\n- 异常数超过阈值\n\n## 五、Sentinel vs Hystrix\n- Sentinel：阿里开源，功能丰富，支持集群限流\n- Hystrix：Netflix，已停止维护\n- Resilience4j：轻量级，函数式API"
     },
     {
+      "type": "diagram",
+      "title": "限流降级熔断策略 学习主线图",
+      "content": "flowchart LR\nA[限流降级熔断策略] --> B[微服务]\nB --> C[限流]\nC --> D[降级]\nD --> E[熔断]\nE --> F[Sentinel]",
+      "fallback": "限流降级熔断策略 -> 微服务 -> 限流 -> 降级 -> 熔断 -> Sentinel",
+      "items": [
+        "Closed：正常状态，统计失败率",
+        "Open：失败率超阈值，直接拒绝所有请求",
+        "Half-Open：等待一段时间后放少量请求试探",
+        "试探成功回到Closed，失败回到Open"
+      ],
+      "asset": "assets/diagrams/18-rate-limit-circuit-breaker.svg",
+      "format": "mermaid",
+      "caption": "从 微服务 到 Sentinel，这张图帮助区分 限流降级熔断策略 的核心机制、边界条件和常见误区。"
+    },
+    {
+      "type": "compareTable",
+      "title": "对比与边界",
+      "content": "| 维度 | 令牌桶 | 漏桶 | 固定窗口 | 滑动窗口 |\n| --- | --- | --- | --- | --- |\n| 突发处理 | 允许 | 不允许 | 允许（有问题） | 精确控制 |\n| 平滑度 | 中 | 高 | 低 | 高 |\n| 实现复杂 | 中 | 中 | 低 | 高 |\n| 代表实现 | Guava | 自实现 | Redis | Sentinel |"
+    },
+    {
+      "type": "compareTable",
+      "title": "维度对比",
+      "content": "| 维度 | Sentinel | Hystrix | Resilience4j |\n| --- | --- | --- | --- |\n| 维护状态 | 活跃 | 停止 | 活跃 |\n| 集群限流 | 支持 | 不支持 | 不支持 |\n| 熔断策略 | 多种 | 线程池/信号量 | 多种 |\n| 流控规则 | 动态推送 | 配置文件 | 配置文件 |\n| 语言 | Java | Java | Java |"
+    },
+    {
       "type": "code",
       "title": "代码示例",
       "content": "// 1. Guava RateLimiter - 令牌桶\n@Service\npublic class RateLimitService {\n    private final RateLimiter limiter = RateLimiter.create(100); // 100 QPS\n\n    public String process(String request) {\n        if (!limiter.tryAcquire(100, TimeUnit.MILLISECONDS)) {\n            throw new RateLimitException(\"请求过于频繁\");\n        }\n        return doProcess(request);\n    }\n}\n\n// 2. Redis集群限流 - 滑动窗口\n@Service\npublic class RedisRateLimiter {\n    private final StringRedisTemplate redis;\n\n    public boolean isAllowed(String key, int limit, int windowSeconds) {\n        long now = System.currentTimeMillis();\n        long windowStart = now - windowSeconds * 1000L;\n\n        String luaScript = \"redis.call('zremrangebyscore', KEYS[1], 0, ARGV[1]) \" +\n            \"local count = redis.call('zcard', KEYS[1]) \" +\n            \"if count < tonumber(ARGV[3]) then \" +\n            \"redis.call('zadd', KEYS[1], ARGV[2], ARGV[2]) \" +\n            \"redis.call('expire', KEYS[1], ARGV[4]) \" +\n            \"return 1 else return 0 end\";\n\n        Long result = redis.execute(\n            new DefaultRedisScript<>(luaScript, Long.class),\n            Collections.singletonList(\"rate:\" + key),\n            String.valueOf(windowStart),\n            String.valueOf(now),\n            String.valueOf(limit),\n            String.valueOf(windowSeconds)\n        );\n        return Long.valueOf(1L).equals(result);\n    }\n}\n\n// 3. Sentinel限流配置\n// @SentinelResource注解\n@SentinelResource(\n    value = \"createOrder\",\n    blockHandler = \"createOrderBlock\",\n    fallback = \"createOrderFallback\"\n)\npublic OrderId createOrder(CreateOrderCmd cmd) {\n    return orderService.create(cmd);\n}\n\n// 限流降级方法\npublic OrderId createOrderBlock(CreateOrderCmd cmd, BlockException ex) {\n    throw new RateLimitException(\"系统繁忙，请稍后重试\");\n}\n\n// 熔断降级方法\npublic OrderId createOrderFallback(CreateOrderCmd cmd, Throwable t) {\n    return OrderId.pending(); // 返回待处理状态\n}\n\n// 4. Resilience4j熔断器\n@Service\npublic class CircuitBreakerService {\n    private final CircuitBreaker circuitBreaker = CircuitBreaker.ofDefaults(\"orderService\");\n    private final Supplier<OrderDTO> decoratedSupplier = CircuitBreaker\n        .decorateSupplier(circuitBreaker, () -> orderClient.getOrder(\"123\"));\n\n    public OrderDTO getOrderWithFallback() {\n        Try<OrderDTO> result = Try.ofSupplier(decoratedSupplier)\n            .recover(CallNotPermittedException.class, e -> OrderDTO.degraded())\n            .recover(Exception.class, e -> OrderDTO.error());\n        return result.get();\n    }\n}\n\n// 5. 降级策略 - 返回缓存数据\n@Service\npublic class DegradeService {\n    public UserProfile getUserProfile(String userId) {\n        try {\n            return userClient.getProfile(userId); // 远程调用\n        } catch (Exception e) {\n            // 降级：返回缓存数据\n            UserProfile cached = cacheManager.get(\"user:\" + userId);\n            if (cached != null) return cached;\n            // 降级：返回默认值\n            return UserProfile.defaultProfile(userId);\n        }\n    }\n}",
-      "language": "java"
+      "language": "java",
+      "highlights": [
+        {
+          "line": 7,
+          "note": "这里是边界条件分支，回答 限流降级熔断策略 时要说明它为什么会改变执行路径。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
-      "title": "面试回答模板",
-      "content": "限流降级熔断是微服务高可用的三板斧。\n\n**限流**控制进入系统的请求量。常用的算法有四种：令牌桶允许突发流量，漏桶强制平滑速率，固定窗口简单但有边界问题，滑动窗口最精确。我项目中用的是Sentinel的滑动窗口，它把时间窗口分成多个小格子，统计所有格子的总数，解决了固定窗口边界处突发2倍流量的问题。\n\n限流粒度可以是集群级别（Redis计数）、单机级别、接口级别或用户级别。\n\n**降级**是在系统压力大时，主动关闭非核心功能或返回兜底数据。策略有：返回缓存数据、调用备用服务、同步改异步、关闭非核心功能。关键是要有明确的降级预案。\n\n**熔断器**是防止级联故障的机制。有三个状态：关闭（正常统计失败率）、打开（失败率超阈值，直接拒绝）、半开（试探恢复）。我用Sentinel的@SentinelResource注解配置熔断规则，设置慢调用比例和错误率阈值。\n\n核心思想是**快速失败**，不让请求堆积，保护下游服务。",
+      "title": "面试回答思路",
+      "content": "结论：限流降级熔断策略 要先说清它解决什么问题，再展开机制、边界和验证方式。掌握令牌桶、漏桶、滑动窗口等限流算法，以及降级策略和熔断状态机\n\n我会这样回答：\n1. 先定位核心问题：令牌桶和漏桶的核心区别。\n2. 再串起关键机制：滑动窗口的原理，并说明它和 降级的策略和实现方式 的关系。\n3. 接着补充边界和风险：混淆限流、降级、熔断三个概念。\n4. 最后落到验证方式：结合容量、延迟、一致性、故障演练和业务约束验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
       "followUpQuestions": [
         {
           "question": "在你的项目中，限流降级熔断策略是怎么落地的？遇到了什么权衡取舍？",
@@ -58,29 +89,6 @@
           "answer": "引入 限流降级熔断策略 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。建议分阶段推进：先在非核心模块试点，验证后逐步推广。迁移过程中要做好灰度、回滚、监控，确保业务不受影响。"
         }
       ]
-    },
-    {
-      "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | 令牌桶 | 漏桶 | 固定窗口 | 滑动窗口 |\n| --- | --- | --- | --- | --- |\n| 突发处理 | 允许 | 不允许 | 允许（有问题） | 精确控制 |\n| 平滑度 | 中 | 高 | 低 | 高 |\n| 实现复杂 | 中 | 中 | 低 | 高 |\n| 代表实现 | Guava | 自实现 | Redis | Sentinel |"
-    },
-    {
-      "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | Sentinel | Hystrix | Resilience4j |\n| --- | --- | --- | --- |\n| 维护状态 | 活跃 | 停止 | 活跃 |\n| 集群限流 | 支持 | 不支持 | 不支持 |\n| 熔断策略 | 多种 | 线程池/信号量 | 多种 |\n| 流控规则 | 动态推送 | 配置文件 | 配置文件 |\n| 语言 | Java | Java | Java |"
-    },
-    {
-      "type": "diagram",
-      "title": "结构图解",
-      "content": "熔断器状态机转换图",
-      "fallback": "Closed →(失败率超阈值)→ Open →(等待时间到)→ Half-Open →(试探成功)→ Closed",
-      "items": [
-        "Closed：正常状态，统计失败率",
-        "Open：失败率超阈值，直接拒绝所有请求",
-        "Half-Open：等待一段时间后放少量请求试探",
-        "试探成功回到Closed，失败回到Open"
-      ],
-      "asset": "assets/diagrams/18-rate-limit-circuit-breaker.svg"
     },
     {
       "type": "checklist",
@@ -100,14 +108,14 @@
       "prompt": "请对比令牌桶和漏桶两种限流算法的区别和适用场景。",
       "mode": "text",
       "expectedMinutes": 4,
-      "difficulty": 2
+      "difficulty": 4
     },
     {
       "id": "architecture.microservice.topic-rate-limiting.recall.2",
       "prompt": "熔断器的三个状态是什么？如何从打开状态恢复到关闭状态？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 4
     },
     {
       "id": "architecture.microservice.topic-rate-limiting.recall.3",
@@ -122,14 +130,12 @@
       "令牌桶和漏桶的核心区别",
       "滑动窗口的原理",
       "降级的策略和实现方式",
-      "熔断器的三态模型",
-      "Sentinel的使用方式"
+      "熔断器的三态模型"
     ],
     "goodToHave": [
       "Redis集群限流的Lua脚本实现",
       "限流的粒度选择",
-      "Sentinel与Hystrix的对比",
-      "熔断与降级的配合"
+      "Sentinel与Hystrix的对比"
     ],
     "commonMistakes": [
       "混淆限流、降级、熔断三个概念",

@@ -13,7 +13,7 @@
     "库存扣减"
   ],
   "difficulty": 5,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 35,
   "order": 10,
   "recommendWeight": 95,
   "status": "production",
@@ -31,18 +31,49 @@
     {
       "type": "explain",
       "title": "分段库存、异步下单与防刷",
-      "content": "### 3.3 分段库存\n- 将100个库存分成10段，每段10个\n- 不同用户请求路由到不同段\n- 减少热点竞争\n\n## 四、异步下单\n- Redis扣减成功后，发送MQ消息\n- 订单服务异步消费消息创建订单\n- 削峰填谷，保护数据库\n\n## 五、防刷策略\n- 用户限购（每人限1件）\n- 设备指纹/IP限制\n- 黑名单机制\n\n## 六、整体架构\n```\n用户 → CDN → Nginx → Gateway → 秒杀服务 → Redis预扣 → MQ → 订单服务 → DB\n```"
+      "content": "### 3.3 分段库存\n- 将100个库存分成10段，每段10个\n- 不同用户请求路由到不同段\n- 减少热点竞争\n\n## 四、异步下单\n- Redis扣减成功后，发送MQ消息\n- 订单服务异步消费消息创建订单\n- 削峰填谷，保护数据库\n\n## 五、防刷策略\n- 用户限购（每人限1件）\n- 设备指纹/IP限制\n- 黑名单机制\n\n## 六、整体架构\n```\n用户 → CDN → Nginx → Gateway → 秒杀服务 → Redis预扣 → MQ → 订单服务 → DB\n```\n\n把 秒杀系统设计 放到真实场景里看，重点是业务目标、关键组件、故障边界和权衡依据。先确认触发条件，再看状态或数据怎样变化，最后用指标、日志、测试结果或复杂度证明判断。\n\n学习 秒杀系统设计 时，要把业务目标、关键组件、故障边界和权衡依据对应到具体例子里。遇到异常或效果不符合预期时，先定位触发条件，再判断哪一层状态、数据或假设发生偏移。\n\n再进一步，秒杀系统设计 的理解要能落到具体判断：哪些输入或条件会触发变化，哪个环节承担主要成本，失败时能从哪些指标、样例或现象反推原因。这个过程应围绕业务目标、关键组件、故障边界和权衡依据展开。"
+    },
+    {
+      "type": "diagram",
+      "title": "秒杀系统设计 学习主线图",
+      "content": "flowchart LR\nA[秒杀系统设计] --> B[秒杀]\nB --> C[高并发]\nC --> D[库存扣减]\nD --> E[三层限流策略（前端/网关/服务层）]\nE --> F[Redis 预扣库存的 Lua 脚本实现]",
+      "fallback": "秒杀系统设计 -> 秒杀 -> 高并发 -> 库存扣减 -> 三层限流策略（前端/网关/服务层） -> Redis 预扣库存的 Lua 脚本实现",
+      "items": [
+        "前端：验证码+按钮限流",
+        "网关：Nginx限流+Gateway限流",
+        "服务层：Redis预扣库存(Lua脚本)",
+        "异步层：MQ削峰→订单服务→DB扣减"
+      ],
+      "asset": "assets/diagrams/28-seckill-architecture.svg",
+      "format": "mermaid",
+      "caption": "从 秒杀 到 Redis 预扣库存的 Lua 脚本实现，这张图帮助区分 秒杀系统设计 的核心机制、边界条件和常见误区。"
+    },
+    {
+      "type": "compareTable",
+      "title": "对比与边界",
+      "content": "| 维度 | Redis预扣 | 数据库直接扣 | 分段库存 |\n| --- | --- | --- | --- |\n| 性能 | 极高 | 低 | 高 |\n| 超卖风险 | 极低(Lua原子) | 低(行锁) | 极低 |\n| 复杂度 | 中 | 低 | 中 |\n| 适用 | 高并发秒杀 | 低并发 | 超高并发 |"
+    },
+    {
+      "type": "compareTable",
+      "title": "维度对比",
+      "content": "| 维度 | 同步下单 | 异步下单 |\n| --- | --- | --- |\n| 实时性 | 高 | 低（毫秒级延迟） |\n| 数据库压力 | 大 | 小 |\n| 用户体验 | 立即知道结果 | 需轮询 |\n| 适用 | 低并发 | 高并发秒杀 |"
     },
     {
       "type": "code",
       "title": "代码示例",
       "content": "// 1. Redis预扣库存 - Lua脚本\npublic class SeckillService {\n    private final StringRedisTemplate redis;\n    private final KafkaTemplate<String, String> kafka;\n\n    // Lua脚本：检查库存 + 扣减 + 检查限购\n    private static final String SECKILL_SCRIPT =\n        \"local stock = tonumber(redis.call('get', KEYS[1])) \" +\n        \"if stock == nil or stock <= 0 then return -1 end \" +  // 库存不足\n        \"local bought = redis.call('sismember', KEYS[2], ARGV[1]) \" +\n        \"if bought == 1 then return -2 end \" +                 // 已购买\n        \"redis.call('decr', KEYS[1]) \" +                       // 扣减库存\n        \"redis.call('sadd', KEYS[2], ARGV[1]) \" +              // 记录购买\n        \"return 1\";                                             // 成功\n\n    public SeckillResult doSeckill(String userId, String skuId) {\n        String stockKey = \"seckill:stock:\" + skuId;\n        String boughtKey = \"seckill:bought:\" + skuId;\n\n        Long result = redis.execute(\n            new DefaultRedisScript<>(SECKILL_SCRIPT, Long.class),\n            Arrays.asList(stockKey, boughtKey),\n            userId\n        );\n\n        if (result == -1) return SeckillResult.SOLD_OUT;\n        if (result == -2) return SeckillResult.ALREADY_BOUGHT;\n\n        // 发送MQ异步下单\n        kafka.send(\"seckill-order\",\n            JSON.toJSONString(new SeckillMessage(userId, skuId)));\n        return SeckillResult.SUCCESS;\n    }\n}\n\n// 2. 异步下单消费者\n@KafkaListener(topics = \"seckill-order\")\npublic void handleSeckillOrder(String message) {\n    SeckillMessage msg = JSON.parseObject(message, SeckillMessage.class);\n    try {\n        // 数据库扣减库存（最终一致性）\n        boolean success = inventoryMapper.deductStock(\n            msg.getSkuId(), 1);\n        if (success) {\n            // 创建订单\n            orderService.createSeckillOrder(msg.getUserId(), msg.getSkuId());\n        } else {\n            // 库存不足，补偿Redis\n            redisTemplate.opsForValue().increment(\n                \"seckill:stock:\" + msg.getSkuId());\n        }\n    } catch (Exception e) {\n        // 重试或人工处理\n        log.error(\"秒杀下单失败: {}\", msg, e);\n    }\n}\n\n// 3. 数据库扣减SQL\n// UPDATE inventory SET quantity = quantity - 1\n// WHERE sku_id = #{skuId} AND quantity > 0\n\n// 4. 分段库存\npublic class SegmentStockService {\n    private static final int SEGMENT_COUNT = 10;\n\n    public boolean deduct(String skuId, String userId) {\n        // 根据用户ID哈希到不同段\n        int segment = Math.abs(userId.hashCode()) % SEGMENT_COUNT;\n        String stockKey = \"seckill:stock:\" + skuId + \":\" + segment;\n        Long result = redis.opsForValue().decrement(stockKey);\n        if (result != null && result >= 0) {\n            return true;\n        }\n        // 当前段没有库存，尝试其他段\n        if (result != null) {\n            redis.opsForValue().increment(stockKey); // 回补\n        }\n        return false;\n    }\n}",
-      "language": "java"
+      "language": "java",
+      "highlights": [
+        {
+          "line": 9,
+          "note": "这里是边界条件分支，回答 秒杀系统设计 时要说明它为什么会改变执行路径。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
-      "title": "面试回答模板",
-      "content": "秒杀系统的核心是**层层限流 + 异步下单**。\n\n第一层是**前端限流**，按钮置灰、验证码、限制重复提交。第二层是**网关限流**，Nginx做流量整形，网关层做用户级限流。第三层是**服务层限流**，用Redis做集群限流计数。\n\n库存扣减是核心难点。方案是**Redis预扣库存**：秒杀开始前把库存加载到Redis，用Lua脚本原子扣减。Lua脚本里检查库存、检查限购、扣减库存三步是原子的。扣减成功才发MQ进入异步下单流程。\n\n**异步下单**是削峰的关键。Redis扣减成功后发Kafka消息，订单服务异步消费消息，在数据库做最终库存扣减。数据库用`UPDATE SET quantity = quantity - 1 WHERE quantity > 0`防止超卖。\n\n为了进一步减少热点竞争，可以用**分段库存**。把100个库存分成10段，根据用户ID哈希到不同段，减少同一key的竞争。\n\n整个链路：用户 → CDN → Nginx → Gateway → 秒杀服务(Redis预扣) → MQ → 订单服务(DB扣减)。",
+      "title": "面试回答思路",
+      "content": "结论：秒杀系统设计 要先说清它解决什么问题，再展开机制、边界和验证方式。从前端限流到异步下单，设计高并发秒杀系统的完整方案\n\n我会这样回答：\n1. 先定位核心问题：三层限流策略（前端/网关/服务层）。\n2. 再串起关键机制：Redis预扣库存的Lua脚本实现，并说明它和 异步下单的削峰作用 的关系。\n3. 接着补充边界和风险：没有在最前面拦截请求（导致数据库压力过大）。\n4. 最后落到验证方式：结合容量、延迟、一致性、故障演练和业务约束验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
       "followUpQuestions": [
         {
           "question": "在你的项目中，秒杀系统设计是怎么落地的？遇到了什么权衡取舍？",
@@ -57,29 +88,6 @@
           "answer": "引入 秒杀系统 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。建议分阶段推进：先在非核心模块试点，验证后逐步推广。迁移过程中要做好灰度、回滚、监控，确保业务不受影响。"
         }
       ]
-    },
-    {
-      "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | Redis预扣 | 数据库直接扣 | 分段库存 |\n| --- | --- | --- | --- |\n| 性能 | 极高 | 低 | 高 |\n| 超卖风险 | 极低(Lua原子) | 低(行锁) | 极低 |\n| 复杂度 | 中 | 低 | 中 |\n| 适用 | 高并发秒杀 | 低并发 | 超高并发 |"
-    },
-    {
-      "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | 同步下单 | 异步下单 |\n| --- | --- | --- |\n| 实时性 | 高 | 低（毫秒级延迟） |\n| 数据库压力 | 大 | 小 |\n| 用户体验 | 立即知道结果 | 需轮询 |\n| 适用 | 低并发 | 高并发秒杀 |"
-    },
-    {
-      "type": "diagram",
-      "title": "结构图解",
-      "content": "秒杀系统整体架构图",
-      "fallback": "用户 → CDN → Nginx → Gateway → 秒杀服务(Redis) → MQ → 订单服务(DB)",
-      "items": [
-        "前端：验证码+按钮限流",
-        "网关：Nginx限流+Gateway限流",
-        "服务层：Redis预扣库存(Lua脚本)",
-        "异步层：MQ削峰→订单服务→DB扣减"
-      ],
-      "asset": "assets/diagrams/28-seckill-architecture.svg"
     },
     {
       "type": "checklist",
@@ -99,14 +107,14 @@
       "prompt": "请描述秒杀系统从用户点击到下单完成的完整链路，以及每层的限流策略。",
       "mode": "text",
       "expectedMinutes": 5,
-      "difficulty": 3
+      "difficulty": 5
     },
     {
       "id": "architecture.system-design.topic-seckill.recall.2",
       "prompt": "Redis预扣库存的Lua脚本是如何保证原子性的？为什么不用Redis事务？",
       "mode": "text",
       "expectedMinutes": 4,
-      "difficulty": 3
+      "difficulty": 5
     },
     {
       "id": "architecture.system-design.topic-seckill.recall.3",
@@ -121,14 +129,12 @@
       "三层限流策略（前端/网关/服务层）",
       "Redis预扣库存的Lua脚本实现",
       "异步下单的削峰作用",
-      "数据库防超卖的SQL写法",
-      "分段库存的设计思想"
+      "数据库防超卖的SQL写法"
     ],
     "goodToHave": [
       "库存回补机制",
       "用户限购的实现",
-      "CDN静态化策略",
-      "热点商品的特殊处理"
+      "CDN静态化策略"
     ],
     "commonMistakes": [
       "没有在最前面拦截请求（导致数据库压力过大）",

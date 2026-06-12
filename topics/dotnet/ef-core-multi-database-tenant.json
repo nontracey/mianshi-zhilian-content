@@ -3,137 +3,152 @@
   "domain": "dotnet",
   "category": "ef-core",
   "group": "ef-core",
-  "title": "数据库兼容与多租户",
-  "summary": "EF Core 支持多种数据库，并且可以实现多租户架构，满足 SaaS 应用的需求。",
+  "title": "EF Core 多租户与 Provider 兼容",
+  "summary": "理解 EF Core 如何通过 Provider、DbContext 工厂、全局查询过滤器和迁移策略支持多租户应用。",
   "tags": [
     ".NET",
     "EF Core",
-    "多数据库",
+    "Provider",
     "多租户",
     "租户隔离"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 45,
+  "estimatedMinutes": 35,
   "order": 40,
   "recommendWeight": 80,
   "status": "production",
+  "prerequisites": [
+    "dotnet.ef-core.basics"
+  ],
+  "interviewFrequency": "medium",
+  "interviewerFocus": "考察是否能把 EF Core 的 Provider 差异、DbContext 生命周期和多租户隔离策略讲清楚，而不是泛泛讨论数据库选型。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "多数据库提供程序与兼容性",
-      "content": "EF Core 支持多种数据库，并且可以实现多租户架构，满足 SaaS 应用的需求。\n\n## 多数据库支持\n\nEF Core 通过提供者（Provider）支持多种数据库：\n\n**SQL Server**：\n```csharp\noptions.UseSqlServer(connectionString);\n```\n\n**PostgreSQL**：\n```csharp\noptions.UseNpgsql(connectionString);\n```\n\n**MySQL**：\n```csharp\noptions.UseMySql(connectionString, ServerVersion.AutoDetect(connectionString));\n```\n\n**SQLite**：\n```csharp\noptions.UseSqlite(connectionString);\n```\n\n**内存数据库（测试用）**：\n```csharp\noptions.UseInMemoryDatabase(\"TestDb\");\n```\n\n**动态选择数据库**：\n```csharp\npublic class MultiDatabaseDbContext : DbContext\n{\n    private readonly string _databaseProvider;\n\n    public MultiDatabaseDbContext(\n        DbContextOptions<MultiDatabaseDbContext> options,\n        IConfiguration configuration)\n        : base(options)\n    {\n        _databaseProvider = configuration[\"DatabaseProvider\"];\n    }\n\n    protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)\n    {\n        if (!optionsBuilder.IsConfigured)\n        {\n            switch (_databaseProvider)\n            {\n                case \"SqlServer\":\n                    optionsBuilder.UseSqlServer(_connectionString);\n                    break;\n                case \"Postgres\":\n                    optionsBuilder.UseNpgsql(_connectionString);\n                    break;\n                case \"MySql\":\n                    optionsBuilder.UseMySql(_connectionString,\n                        ServerVersion.AutoDetect(_connectionString));\n                    break;\n            }\n        }\n    }\n}\n```\n\n## 数据库兼容性\n\n**通用 SQL**：\n```csharp\n// 使用通用 SQL\nawait _context.Database.ExecuteSqlRawAsync(\n    \"UPDATE Users SET IsActive = 0 WHERE CreatedAt < {0}\",\n    DateTime.UtcNow.AddDays(-30));\n```\n\n**数据库特定功能**：\n```csharp\n// SQL Server 特定\nawait _context.Database.ExecuteSqlRawAsync(\n    \"UPDATE Users SET IsActive = 0 WHERE CreatedAt < DATEADD(day, -30, GETUTCDATE())\");\n\n// PostgreSQL 特定\nawait _context.Database.ExecuteSqlRawAsync(\n    \"UPDATE Users SET IsActive = 0 WHERE CreatedAt < NOW() - INTERVAL '30 days'\");\n```\n\n**条件编译**：\n```csharp\n#if SQLSERVER\n    options.UseSqlServer(connectionString);\n#elif POSTGRES\n    options.UseNpgsql(connectionString);\n#endif\n```"
+      "title": "Provider 兼容是 EF Core 抽象边界",
+      "content": "EF Core 通过 Provider 把 LINQ、模型配置和迁移转换成具体数据库的 SQL 与能力调用。SQL Server、PostgreSQL、MySQL、SQLite 都有各自 Provider，但这不代表所有行为完全一致。\n\n面试里要把它讲成 EF Core 框架边界：同一套实体模型可以适配多个 Provider，但数据库函数、分页语法、JSON 字段、事务特性、迁移 SQL 和执行计划仍可能不同。生产系统如果要跨 Provider，应该避免大量原生 SQL 和数据库特有函数，或者把差异封装在仓储、查询服务或适配层里。\n\n常见误区是把 Provider 兼容理解成“随便切数据库”。实际切换前要验证迁移脚本、字段类型、索引、事务隔离、SQL 翻译和性能。"
     },
     {
       "type": "explain",
-      "title": "多租户架构与租户隔离",
-      "content": "## 多租户架构\n\n**三种隔离策略**：\n\n**1. 数据库隔离（Database per Tenant）**：\n```csharp\npublic class TenantDbContextFactory : IDbContextFactory<AppDbContext>\n{\n    private readonly ITenantService _tenantService;\n\n    public AppDbContext CreateDbContext()\n    {\n        var tenant = _tenantService.GetCurrentTenant();\n        var options = new DbContextOptionsBuilder<AppDbContext>()\n            .UseSqlServer(tenant.ConnectionString)\n            .Options;\n\n        return new AppDbContext(options);\n    }\n}\n```\n\n**2. Schema 隔离**：\n```csharp\npublic class MultiTenantDbContext : DbContext\n{\n    private readonly ITenantService _tenantService;\n\n    protected override void OnModelCreating(ModelBuilder modelBuilder)\n    {\n        var tenant = _tenantService.GetCurrentTenant();\n        \n        modelBuilder.HasDefaultSchema(tenant.SchemaName);\n        \n        // 或者每个实体指定 schema\n        modelBuilder.Entity<User>().ToTable(\"Users\", tenant.SchemaName);\n    }\n}\n```\n\n**3. 行级隔离（Row Level）**：\n```csharp\npublic class MultiTenantDbContext : DbContext\n{\n    private readonly ITenantService _tenantService;\n\n    protected override void OnModelCreating(ModelBuilder modelBuilder)\n    {\n        var tenantId = _tenantService.GetCurrentTenantId();\n\n        // 全局查询过滤器\n        modelBuilder.Entity<User>().HasQueryFilter(u => u.TenantId == tenantId);\n        modelBuilder.Entity<Order>().HasQueryFilter(o => o.TenantId == tenantId);\n    }\n\n    public override int SaveChanges()\n    {\n        // 自动设置 TenantId\n        var tenantId = _tenantService.GetCurrentTenantId();\n        foreach (var entry in ChangeTracker.Entries<ITenantEntity>())\n        {\n            if (entry.State == EntityState.Added)\n            {\n                entry.Entity.TenantId = tenantId;\n            }\n        }\n\n        return base.SaveChanges();\n    }\n}\n\npublic interface ITenantEntity\n{\n    int TenantId { get; set; }\n}\n\npublic class User : ITenantEntity\n{\n    public int Id { get; set; }\n    public string Name { get; set; }\n    public int TenantId { get; set; }\n}\n```\n\n## 租户服务\n\n```csharp\npublic interface ITenantService\n{\n    Tenant GetCurrentTenant();\n    int GetCurrentTenantId();\n}\n\npublic class HttpTenantService : ITenantService\n{\n    private readonly IHttpContextAccessor _httpContextAccessor;\n    private readonly TenantDbContext _tenantContext;\n\n    public HttpTenantService(\n        IHttpContextAccessor httpContextAccessor,\n        TenantDbContext tenantContext)\n    {\n        _httpContextAccessor = httpContextAccessor;\n        _tenantContext = tenantContext;\n    }\n\n    public Tenant GetCurrentTenant()\n    {\n        var tenantId = GetCurrentTenantId();\n        return _tenantContext.Tenants.Find(tenantId);\n    }\n\n    public int GetCurrentTenantId()\n    {\n        // 从 Header、Claim 或子域名获取租户标识\n        var tenantIdentifier = _httpContextAccessor.HttpContext.Request.Headers[\"X-Tenant-Id\"].FirstOrDefault();\n\n        if (int.TryParse(tenantIdentifier, out var tenantId))\n        {\n            return tenantId;\n        }\n\n        // 从子域名获取\n        var host = _httpContextAccessor.HttpContext.Request.Host.Host;\n        var subdomain = host.Split('.')[0];\n\n        return _tenantContext.Tenants\n            .Where(t => t.Subdomain == subdomain)\n            .Select(t => t.Id)\n            .FirstOrDefault();\n    }\n}\n```\n\n## 租户中间件\n\n```csharp\npublic class TenantMiddleware\n{\n    private readonly RequestDelegate _next;\n\n    public TenantMiddleware(RequestDelegate next)\n    {\n        _next = next;\n    }\n\n    public async Task InvokeAsync(HttpContext context, ITenantService tenantService)\n    {\n        var tenant = tenantService.GetCurrentTenant();\n        if (tenant == null)\n        {\n            context.Response.StatusCode = 404;\n            await context.Response.WriteAsync(\"租户不存在\");\n            return;\n        }\n\n        // 设置租户上下文\n        context.Items[\"Tenant\"] = tenant;\n\n        await _next(context);\n    }\n}\n```"
-    },
-    {
-      "type": "explain",
-      "title": "迁移策略与多租户最佳实践",
-      "content": "## 数据库迁移策略\n\n**数据库隔离**：每个租户独立迁移\n```csharp\nforeach (var tenant in tenants)\n{\n    using var context = CreateDbContextForTenant(tenant);\n    await context.Database.MigrateAsync();\n}\n```\n\n**行级隔离**：共享数据库，统一迁移\n```csharp\nusing var context = serviceProvider.GetRequiredService<AppDbContext>();\nawait context.Database.MigrateAsync();\n```\n\n## 最佳实践\n\n1. **选择合适的隔离策略**：根据安全需求和成本选择\n2. **使用全局查询过滤器**：自动过滤租户数据\n3. **自动设置租户 ID**：在 SaveChanges 时自动设置\n4. **租户配置管理**：存储租户特定配置\n5. **数据库连接池**：优化多数据库连接"
-    },
-    {
-      "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Linq;\nusing System.Threading.Tasks;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.EntityFrameworkCore;\nusing Microsoft.Extensions.Configuration;\nusing Microsoft.Extensions.DependencyInjection;\n\nnamespace MultiDatabaseTenantDemo\n{\n    // 租户实体\n    public class Tenant\n    {\n        public int Id { get; set; }\n        public string Name { get; set; }\n        public string Subdomain { get; set; }\n        public string ConnectionString { get; set; }\n        public string SchemaName { get; set; }\n        public bool IsActive { get; set; } = true;\n    }\n\n    // 租户实体接口\n    public interface ITenantEntity\n    {\n        int TenantId { get; set; }\n    }\n\n    // 租户服务接口\n    public interface ITenantService\n    {\n        Tenant GetCurrentTenant();\n        int GetCurrentTenantId();\n    }\n\n    // HTTP 租户服务实现\n    public class HttpTenantService : ITenantService\n    {\n        private readonly IHttpContextAccessor _httpContextAccessor;\n        private readonly TenantDbContext _tenantContext;\n\n        public HttpTenantService(\n            IHttpContextAccessor httpContextAccessor,\n            TenantDbContext tenantContext)\n        {\n            _httpContextAccessor = httpContextAccessor;\n            _tenantContext = tenantContext;\n        }\n\n        public Tenant GetCurrentTenant()\n        {\n            var tenantId = GetCurrentTenantId();\n            return _tenantContext.Tenants.Find(tenantId);\n        }\n\n        public int GetCurrentTenantId()\n        {\n            var context = _httpContextAccessor.HttpContext;\n\n            // 从 Header 获取\n            var tenantIdHeader = context.Request.Headers[\"X-Tenant-Id\"].FirstOrDefault();\n            if (int.TryParse(tenantIdHeader, out var tenantId))\n            {\n                return tenantId;\n            }\n\n            // 从子域名获取\n            var host = context.Request.Host.Host;\n            var subdomain = host.Split('.')[0];\n\n            return _tenantContext.Tenants\n                .Where(t => t.Subdomain == subdomain && t.IsActive)\n                .Select(t => t.Id)\n                .FirstOrDefault();\n        }\n    }\n\n    // 租户 DbContext\n    public class TenantDbContext : DbContext\n    {\n        public DbSet<Tenant> Tenants { get; set; }\n\n        public TenantDbContext(DbContextOptions<TenantDbContext> options)\n            : base(options) { }\n    }\n\n    // 多租户应用 DbContext（行级隔离）\n    public class MultiTenantAppDbContext : DbContext\n    {\n        private readonly ITenantService _tenantService;\n\n        public MultiTenantAppDbContext(\n            DbContextOptions<MultiTenantAppDbContext> options,\n            ITenantService tenantService)\n            : base(options)\n        {\n            _tenantService = tenantService;\n        }\n\n        public DbSet<User> Users { get; set; }\n        public DbSet<Order> Orders { get; set; }\n\n        protected override void OnModelCreating(ModelBuilder modelBuilder)\n        {\n            var tenantId = _tenantService.GetCurrentTenantId();\n\n            // 全局查询过滤器\n            modelBuilder.Entity<User>().HasQueryFilter(u => u.TenantId == tenantId);\n            modelBuilder.Entity<Order>().HasQueryFilter(o => o.TenantId == tenantId);\n\n            // 配置实体\n            modelBuilder.Entity<User>(entity =>\n            {\n                entity.HasKey(e => e.Id);\n                entity.HasIndex(e => new { e.TenantId, e.Email }).IsUnique();\n            });\n\n            modelBuilder.Entity<Order>(entity =>\n            {\n                entity.HasKey(e => e.Id);\n                entity.HasOne(e => e.User)\n                    .WithMany(u => u.Orders)\n                    .HasForeignKey(e => new { e.TenantId, e.UserId });\n            });\n        }\n\n        public override int SaveChanges()\n        {\n            SetTenantId();\n            return base.SaveChanges();\n        }\n\n        public override async Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)\n        {\n            SetTenantId();\n            return await base.SaveChangesAsync(cancellationToken);\n        }\n\n        private void SetTenantId()\n        {\n            var tenantId = _tenantService.GetCurrentTenantId();\n\n            foreach (var entry in ChangeTracker.Entries<ITenantEntity>())\n            {\n                if (entry.State == EntityState.Added)\n                {\n                    entry.Entity.TenantId = tenantId;\n                }\n            }\n        }\n    }\n\n    // 数据库隔离的 DbContext 工厂\n    public class TenantDbContextFactory\n    {\n        private readonly ITenantService _tenantService;\n\n        public TenantDbContextFactory(ITenantService tenantService)\n        {\n            _tenantService = tenantService;\n        }\n\n        public MultiTenantAppDbContext CreateDbContext()\n        {\n            var tenant = _tenantService.GetCurrentTenant();\n            var options = new DbContextOptionsBuilder<MultiTenantAppDbContext>()\n                .UseSqlServer(tenant.ConnectionString)\n                .Options;\n\n            return new MultiTenantAppDbContext(options, _tenantService);\n        }\n    }\n\n    // 多数据库支持的 DbContext\n    public class FlexibleDbContext : DbContext\n    {\n        private readonly string _provider;\n        private readonly string _connectionString;\n\n        public FlexibleDbContext(\n            DbContextOptions<FlexibleDbContext> options,\n            IConfiguration configuration)\n            : base(options)\n        {\n            _provider = configuration[\"Database:Provider\"];\n            _connectionString = configuration[\"Database:ConnectionString\"];\n        }\n\n        public DbSet<User> Users { get; set; }\n\n        protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)\n        {\n            if (!optionsBuilder.IsConfigured)\n            {\n                switch (_provider?.ToLower())\n                {\n                    case \"sqlserver\":\n                        optionsBuilder.UseSqlServer(_connectionString);\n                        break;\n                    case \"postgres\":\n                        optionsBuilder.UseNpgsql(_connectionString);\n                        break;\n                    case \"mysql\":\n                        optionsBuilder.UseMySql(_connectionString,\n                            ServerVersion.AutoDetect(_connectionString));\n                        break;\n                    case \"sqlite\":\n                        optionsBuilder.UseSqlite(_connectionString);\n                        break;\n                    default:\n                        optionsBuilder.UseInMemoryDatabase(\"Default\");\n                        break;\n                }\n            }\n        }\n    }\n\n    // 实体类\n    public class User : ITenantEntity\n    {\n        public int Id { get; set; }\n        public int TenantId { get; set; }\n        public string Name { get; set; }\n        public string Email { get; set; }\n        public ICollection<Order> Orders { get; set; } = new List<Order>();\n    }\n\n    public class Order : ITenantEntity\n    {\n        public int Id { get; set; }\n        public int TenantId { get; set; }\n        public int UserId { get; set; }\n        public User User { get; set; }\n        public decimal Amount { get; set; }\n    }\n\n    // 租户中间件\n    public class TenantMiddleware\n    {\n        private readonly RequestDelegate _next;\n\n        public TenantMiddleware(RequestDelegate next)\n        {\n            _next = next;\n        }\n\n        public async Task InvokeAsync(HttpContext context, ITenantService tenantService)\n        {\n            var tenant = tenantService.GetCurrentTenant();\n            if (tenant == null || !tenant.IsActive)\n            {\n                context.Response.StatusCode = 404;\n                await context.Response.WriteAsync(\"租户不存在或已禁用\");\n                return;\n            }\n\n            context.Items[\"Tenant\"] = tenant;\n            await _next(context);\n        }\n    }\n\n    // 服务注册\n    public static class MultiTenantServiceCollectionExtensions\n    {\n        public static IServiceCollection AddMultiTenant(\n            this IServiceCollection services,\n            IConfiguration configuration)\n        {\n            services.AddHttpContextAccessor();\n            services.AddScoped<ITenantService, HttpTenantService>();\n\n            // 租户配置数据库\n            services.AddDbContext<TenantDbContext>(options =>\n                options.UseSqlServer(configuration.GetConnectionString(\"TenantDb\")));\n\n            // 应用数据库（行级隔离）\n            services.AddDbContext<MultiTenantAppDbContext>((provider, options) =>\n            {\n                var tenantService = provider.GetRequiredService<ITenantService>();\n                var tenant = tenantService.GetCurrentTenant();\n\n                if (tenant != null)\n                {\n                    options.UseSqlServer(tenant.ConnectionString);\n                }\n                else\n                {\n                    options.UseSqlServer(configuration.GetConnectionString(\"Default\"));\n                }\n            });\n\n            // 数据库隔离工厂\n            services.AddScoped<TenantDbContextFactory>();\n\n            return services;\n        }\n    }\n}",
-      "language": "csharp"
-    },
-    {
-      "type": "interviewAnswer",
-      "title": "面试回答模板",
-      "content": "EF Core 通过提供者机制支持多种数据库，包括 SQL Server、PostgreSQL、MySQL、SQLite 等。配置不同的提供者只需要调用对应的扩展方法，比如 UseSqlServer、UseNpgsql 等。\n\n多租户架构有三种隔离策略：数据库隔离每个租户独立数据库，安全性最高但成本也最高；Schema 隔离共享数据库但使用不同 Schema；行级隔离共享数据库和表，通过 TenantId 字段区分租户数据。\n\n行级隔离是最常用的方案，实现方式包括：使用全局查询过滤器自动过滤租户数据，在 SaveChanges 时自动设置 TenantId，通过租户服务获取当前租户信息。\n\n租户服务负责获取当前租户标识，可以从 HTTP Header、JWT Claim 或子域名获取。租户中间件在请求开始时验证租户有效性。\n\n数据库迁移策略取决于隔离方式：数据库隔离需要为每个租户独立迁移，行级隔离只需要统一迁移。\n\n在实际开发中，我会根据安全需求和成本选择合适的隔离策略，使用全局查询过滤器和自动设置 TenantId 简化开发。",
-      "followUpQuestions": [
-        {
-          "question": "面试官追问「数据库兼容与多租户」时，最应该展开哪条机制链？",
-          "answer": "回答「数据库兼容与多租户」时先抓住 了解 EF Core 支持的数据库类型，再展开 理解三种多租户隔离策略。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对.NET 工程里真实机制的理解。"
-        },
-        {
-          "question": "如果「数据库兼容与多租户」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "我会先确认问题是否落在「数据库兼容与多租户」的核心边界上，再看 异常日志、请求耗时、GC/线程池/连接池指标、数据库查询和依赖服务超时。排查时特别避免“只背「数据库兼容与多租户」结论，讲不清了解 EF Core 支持的数据库类型”这个误区，先复现触发条件，再用日志、指标或最小用例验证修复是否真的命中原因。"
-        }
-      ]
-    },
-    {
-      "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | 数据库隔离 | Schema 隔离 | 行级隔离 |\n| --- | --- | --- | --- |\n| 隔离级别 | 最高 | 中 | 最低 |\n| 安全性 | 最高 | 高 | 中 |\n| 成本 | 高（多个数据库） | 中 | 低（共享数据库） |\n| 复杂度 | 高 | 中 | 低 |\n| 迁移策略 | 每个租户独立 | 每个 Schema | 统一迁移 |\n| 适用场景 | 高安全需求 | 中等安全需求 | 大多数 SaaS |"
-    },
-    {
-      "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | SQL Server | PostgreSQL | MySQL | SQLite |\n| --- | --- | --- | --- | --- |\n| EF Core 支持 | 完整 | 完整 | 完整 | 完整 |\n| JSON 支持 | 好 | 最好 | 一般 | 有限 |\n| 全文搜索 | 好 | 好 | 好 | 有限 |\n| 性能 | 高 | 高 | 中 | 低 |\n| 适用场景 | 企业应用 | 现代应用 | Web 应用 | 嵌入式/测试 |"
+      "title": "多租户隔离要先选数据边界",
+      "content": "EF Core 多租户的核心不是写一个 TenantId 字段，而是选择隔离边界。常见三种方案：独立数据库、独立 Schema、共享表行级隔离。\n\n独立数据库隔离强，适合大客户、强合规或可单独迁移备份的场景，但连接、迁移和运维成本最高。独立 Schema 成本居中，但不同数据库对 Schema 的支持和迁移方式不同。行级隔离成本最低，常用全局查询过滤器自动加 TenantId 条件，但必须防止绕过过滤器、原生 SQL 漏条件和后台任务串租户。\n\nEF Core 落地时通常需要 TenantProvider、DbContextFactory、全局 QueryFilter、SaveChanges 自动写 TenantId、租户连接串管理和迁移批处理。\n\n把 EF Core 多租户与 Provider 兼容 放到真实场景里看，重点是框架管线、运行时机制、配置边界和诊断证据。先确认触发条件，再看状态或数据怎样变化，最后用指标、日志、测试结果或复杂度证明判断。"
     },
     {
       "type": "diagram",
-      "title": "结构图解",
-      "content": "多租户架构：\n\n数据库隔离:\nTenant1 → DB1\nTenant2 → DB2\nTenant3 → DB3\n\nSchema 隔离:\nShared DB → Schema1 (Tenant1)\n         → Schema2 (Tenant2)\n         → Schema3 (Tenant3)\n\n行级隔离:\nShared DB → Users Table (TenantId=1, 2, 3...)\n         → Orders Table (TenantId=1, 2, 3...)",
-      "fallback": "三种多租户隔离策略示意图",
-      "items": [
-        "数据库隔离安全性最高",
-        "行级隔离成本最低",
-        "全局查询过滤器自动隔离",
-        "租户服务获取当前租户"
+      "title": "EF Core 多租户请求链路",
+      "format": "mermaid",
+      "content": "flowchart LR\nA[请求进入] --> B[解析租户]\nB --> C[选择 Provider 或连接串]\nC --> D[创建 DbContext]\nD --> E[QueryFilter 注入 TenantId]\nE --> F[执行查询或保存]",
+      "fallback": "EF Core 多租户链路：请求进入后解析租户，再选择 Provider 或连接串，创建 DbContext，使用 QueryFilter 注入 TenantId，最后执行查询或保存。",
+      "caption": "多租户隔离要从请求入口一直传递到 DbContext 和查询条件。"
+    },
+    {
+      "type": "compareTable",
+      "title": "多租户隔离策略对比",
+      "columns": [
+        "策略",
+        "隔离强度",
+        "成本",
+        "EF Core 落点"
+      ],
+      "rows": [
+        [
+          "独立数据库",
+          "最高",
+          "连接、迁移和运维成本高",
+          "按租户选择连接串和 DbContext"
+        ],
+        [
+          "独立 Schema",
+          "中高",
+          "迁移和 Provider 差异较复杂",
+          "模型配置默认 Schema 或动态映射"
+        ],
+        [
+          "共享表行级隔离",
+          "中",
+          "成本低但越权风险高",
+          "全局 QueryFilter + 自动写 TenantId"
+        ],
+        [
+          "混合隔离",
+          "按租户分级",
+          "治理复杂",
+          "大客户独库，普通租户共享表"
+        ]
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答思路",
+      "content": "EF Core 的多数据库和多租户问题，我会先限定在 EF Core 框架层面回答：Provider 负责把模型、LINQ 和迁移适配到具体数据库，但不同数据库能力并不完全一致。\n\n1. Provider 兼容方面，要关注 SQL 翻译、字段类型、迁移脚本、事务行为和数据库特有函数，不能认为换一个 UseSqlServer/UseNpgsql 就完成迁移。\n2. 多租户方面，先选隔离策略：独立数据库隔离最强但成本高，独立 Schema 居中，共享表行级隔离成本最低但最容易出现越权。\n3. EF Core 落地时，要用 TenantProvider 解析租户，用 DbContextFactory 或连接串选择创建上下文，用全局 QueryFilter 自动过滤 TenantId，并在 SaveChanges 时自动写入租户字段。\n\n边界上，行级隔离要特别防止原生 SQL 绕过过滤器、后台任务没有租户上下文，以及 IgnoreQueryFilters 被误用。",
+      "followUpQuestions": [
+        {
+          "question": "EF Core 支持多个 Provider 是否意味着可以无成本切换数据库？",
+          "answer": "不是。Provider 只提供抽象适配，具体数据库的字段类型、函数、迁移 SQL、事务行为和性能计划都可能不同，切换前必须做兼容测试和压测。"
+        },
+        {
+          "question": "行级多租户隔离最容易出什么问题？",
+          "answer": "最容易在原生 SQL、后台任务、IgnoreQueryFilters 或手写查询里漏掉 TenantId 条件，导致跨租户数据访问。需要统一封装查询入口并做安全测试。"
+        }
       ]
     },
     {
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "EF Core 支持的数据库类型",
-        "三种多租户隔离策略的区别",
-        "如何实现行级隔离（查询过滤器、自动设置 TenantId）",
-        "租户服务的设计和实现",
-        "不同隔离策略的迁移策略",
-        "如何选择合适的多租户方案"
+        "能说明 EF Core Provider 兼容的能力和边界",
+        "能比较独立数据库、独立 Schema、共享表行级隔离",
+        "能解释 TenantProvider、DbContextFactory、QueryFilter 的职责",
+        "能指出原生 SQL、后台任务和 IgnoreQueryFilters 的串租户风险"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "dotnet.ef-core.multi-database-tenant.recall.1",
-      "prompt": "请说明 数据库兼容与多租户 的核心机制、典型使用场景和常见坑。",
+      "prompt": "请解释 EF Core Provider 兼容的边界，以及为什么切换数据库不是只换一个 Provider。",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 3
+      "difficulty": 4
     },
     {
       "id": "dotnet.ef-core.multi-database-tenant.recall.2",
-      "prompt": "如何在 EF Core 中实现行级多租户隔离？包括查询过滤和自动设置租户 ID。",
+      "prompt": "EF Core 行级多租户隔离如何设计？全局 QueryFilter 有哪些绕过风险？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 3
+      "difficulty": 4
+    },
+    {
+      "id": "dotnet.ef-core.multi-database-tenant.recall.3",
+      "prompt": "独立数据库、独立 Schema、共享表行级隔离分别适合什么租户场景？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "了解 EF Core 支持的数据库类型",
-      "理解三种多租户隔离策略",
-      "掌握行级隔离的实现方式",
-      "知道全局查询过滤器的使用",
-      "了解租户服务的设计"
+      "Provider 兼容边界",
+      "三种租户隔离策略",
+      "TenantProvider",
+      "DbContextFactory"
     ],
     "goodToHave": [
-      "了解跨数据库查询",
-      "知道数据库兼容性处理",
-      "理解多租户迁移策略"
+      "迁移脚本差异",
+      "原生 SQL 绕过风险",
+      "后台任务租户上下文"
     ],
     "commonMistakes": [
-      "只背「数据库兼容与多租户」结论，讲不清了解 EF Core 支持的数据库类型",
-      "把「数据库兼容与多租户」的适用场景、失效条件和相邻概念混在一起",
-      "遇到.NET 工程里的真实问题时，不能说明「数据库兼容与多租户」应该观察哪些状态、日志或指标"
+      "认为更换 Provider 就能无成本切换数据库",
+      "行级隔离只加 TenantId 字段但没有统一过滤和写入机制",
+      "忽略原生 SQL、后台任务和 IgnoreQueryFilters 的越权风险"
     ],
     "scoreWeights": {
-      "coverage": 25,
-      "accuracy": 30,
+      "coverage": 30,
+      "accuracy": 25,
       "interviewExpression": 20,
       "depth": 25
     }
   },
-  "prerequisites": [
-    "dotnet.ef-core.basics"
-  ],
-  "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「数据库兼容与多租户」说清了解 EF Core 支持的数据库类型、理解三种多租户隔离策略，并放到.NET 工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-11"
+  "updatedAt": "2026-06-12"
 }

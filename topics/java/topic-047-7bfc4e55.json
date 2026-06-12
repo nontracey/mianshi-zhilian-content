@@ -11,18 +11,18 @@
     "循环依赖"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 28,
   "order": 30,
   "recommendWeight": 93,
   "learningCards": [
     {
       "type": "explain",
-      "title": "循环依赖问题",
+      "title": "循环依赖 的核心机制",
       "content": "# 循环依赖\n\n## 一、什么是循环依赖\n循环依赖是指两个或多个Bean之间相互依赖，形成循环引用。\n```java\n// A依赖B\n@Service\npublic class ServiceA {\n    @Autowired\n    private ServiceB serviceB;\n}\n// B依赖A\n@Service\npublic class ServiceB {\n    @Autowired\n    private ServiceA serviceA;\n}\n```\n```\n┌──────────┐         ┌──────────┐\n│ ServiceA │ ──────→ │ ServiceB │\n│          │ ←────── │          │\n└──────────┘         └──────────┘\n相互依赖，形成循环\n```"
     },
     {
       "type": "explain",
-      "title": "三级缓存机制",
+      "title": "循环依赖 的边界与易错点",
       "content": "## 二、三级缓存\nSpring通过三级缓存解决单例Bean的循环依赖问题：\n\n### 2.1 三级缓存结构\n```java\n// DefaultSingletonBeanRegistry 中定义的三级缓存\n/** 一级缓存：存放完全初始化好的Bean（成品） */\nprivate final Map<String, Object> singletonObjects = new ConcurrentHashMap<>(256);\n/** 二级缓存：存放早期暴露的Bean（半成品，已实例化但未填充属性） */\nprivate final Map<String, Object> earlySingletonObjects = new ConcurrentHashMap<>(16);\n/** 三级缓存：存放Bean工厂（ObjectFactory），用于生成早期引用 */\nprivate final Map<String, ObjectFactory<?>> singletonFactories = new HashMap<>(16);\n```\n\n## 三、循环依赖解决流程\n以 ServiceA 和 ServiceB 相互依赖为例：\n```\n步骤1: 创建ServiceA\n│\n├── 1. 实例化ServiceA（调用构造器，得到原始对象）\n│\n├── 2. 将ServiceA的ObjectFactory放入三级缓存\n│       三级缓存: {serviceA → ObjectFactory<ServiceA>}\n│\n├── 3. 填充属性，发现依赖ServiceB\n│       └── 调用getBean(\"serviceB\")\n│\n步骤2: 创建ServiceB\n│\n├── 4. 实例化ServiceB（调用构造器，得到原始对象）\n│\n├── 5. 将ServiceB的ObjectFactory放入三级缓存\n│       三级缓存: {serviceA → ObjectFactory<ServiceA>,\n│                   serviceB → ObjectFactory<ServiceB>}\n│\n├── 6. 填充属性，发现依赖ServiceA\n│       └── 调用getBean(\"serviceA\")\n│\n步骤3: 解决ServiceA的依赖\n│\n├── 7. 从三级缓存获取ServiceA的ObjectFactory\n│       └── 调用ObjectFactory.getObject()获取ServiceA的早期引用\n│           （如果需要AOP代理，此时会创建代理对象）\n│\n├── 8. 将ServiceA的早期引用放入二级缓存，移除三级缓存\n│       二级缓存: {serviceA → ServiceA的早期引用}\n│\n└── 9. ServiceB完成属性填充\nServiceB初始化完成，放入一级缓存\n一级缓存: {serviceB → ServiceB（成品）}\n步骤4: 回到ServiceA的创建\n│\n├── 10. ServiceA完成属性填充（ServiceB已就绪）\n│\n├── 11. ServiceA初始化完成\n│        清除二级缓存中的早期引用\n│        放入一级缓存\n│        一级缓存: {serviceA → ServiceA（成品）,\n│                    serviceB → ServiceB（成品）}\n│\n└── 完成！\n```\n\n## 四、为什么需要三级缓存而不是二级\n\n### 4.1 如果只有二级缓存\n```\n一级缓存: singletonObjects（成品Bean）\n二级缓存: earlySingletonObjects（早期Bean）\n问题：如果ServiceA需要AOP代理，什么时候创建代理？\n```\n\n### 4.2 三级缓存的关键：ObjectFactory\n```java\n// 三级缓存存的是ObjectFactory（lambda表达式）\naddSingletonFactory(beanName, () -> getEarlyBeanReference(beanName, mbd, bean));\n// getEarlyBeanReference 会判断是否需要AOP代理\nprotected Object getEarlyBeanReference(String beanName, RootBeanDefinition mbd, Object bean) {\n    Object exposedObject = bean;\n    // 遍历所有SmartInstantiationAwareBeanPostProcessor\n    for (SmartInstantiationAwareBeanPostProcessor bp : getBeanPostProcessors(...)) {\n        // AbstractAutoProxyCreator.getEarlyBeanReference()\n        // 如果需要代理，提前创建AOP代理\n        exposedObject = bp.getEarlyBeanReference(exposedObject, beanName);\n    }\nreturn exposedObject;\n}\n```\n\n### 4.3 三级缓存的真正意义\n```\n三级缓存的ObjectFactory延迟了代理对象的创建时机：\n- 没有循环依赖时：代理对象在postProcessAfterInitialization阶段创建（正常时机）\n- 有循环依赖时：代理对象通过ObjectFactory提前创建（getEarlyBeanReference）\n如果只用二级缓存，就必须在实例化后立即创建代理，这违背了Spring的设计原则\n（代理应该在初始化后创建）。\n```"
     },
     {
@@ -31,15 +31,10 @@
       "content": "## 五、@Lazy 解决循环依赖\n```java\n@Service\npublic class ServiceA {\n    @Autowired\n    @Lazy  // ★ 延迟注入，注入的是代理对象\n    private ServiceB serviceB;\n    public void doSomething() {\n        serviceB.execute();  // 第一次调用时才真正初始化ServiceB\n    }\n}\n```\n**原理**：`@Lazy` 不会立即注入真实的Bean，而是注入一个**懒加载代理对象**。只有在第一次使用时，代理才会从容器中获取真实的Bean。这样就打破了循环依赖的创建链。\n\n## 六、构造器注入的循环依赖问题\n```java\n// 构造器注入的循环依赖 —— 无法解决！\n@Service\npublic class ServiceA {\n    private final ServiceB serviceB;\n    public ServiceA(ServiceB serviceB) {  // ★ 构造器注入\n        this.serviceB = serviceB;\n    }\n}\n@Service\npublic class ServiceB {\n    private final ServiceA serviceA;\n    public ServiceB(ServiceA serviceA) {  // ★ 构造器注入\n        this.serviceA = serviceA;\n    }\n}\n```\n**为什么无法解决？**\n```\n创建ServiceA → 需要ServiceB → 创建ServiceB → 需要ServiceA → 创建ServiceA → ...\n↑\n死循环！无法跳出\n原因：三级缓存解决循环依赖的前提是\"先实例化，后填充属性\"。\n构造器注入必须在实例化时就拿到依赖，而此时依赖对象还没有创建完成，\n三级缓存中也没有早期引用可用。\n```\n**解决方案**：\n1. 使用 `@Lazy` 注解延迟注入\n2. 改用setter注入或字段注入\n3. 重新设计，消除循环依赖\n\n## 七、循环依赖的Spring版本变化\n```yaml\n# Spring Boot 2.6+ 默认禁止循环依赖；确有遗留场景时才显式开启\nspring:\n  main:\n    allow-circular-references: true\n```\n\n## 八、面试高频问题\n\n### Q1: Spring是如何解决循环依赖的？\n**答**：Spring通过三级缓存解决单例Bean的setter/字段注入循环依赖：\n1. **一级缓存**（singletonObjects）：存放完全初始化好的Bean\n2. **二级缓存**（earlySingletonObjects）：存放早期暴露的Bean（已实例化但未填充属性）\n3. **三级缓存**（singletonFactories）：存放ObjectFactory，用于生成早期引用\n流程：A实例化 → A放入三级缓存 → A填充属性发现依赖B → B实例化 → B放入三级缓存 → B填充属性发现依赖A → 从三级缓存获取A的早期引用 → B完成初始化 → A完成初始化。\n\n### Q2: 为什么需要三级缓存，二级不行吗？\n**答**：三级缓存的ObjectFactory是为了支持AOP代理的延迟创建。如果没有循环依赖，代理对象在初始化后的BeanPostProcessor中正常创建。如果有循环依赖，通过ObjectFactory.getEarlyBeanReference()提前创建代理。如果只用二级缓存，就必须在实例化后立即决定是否创建代理，违背了Spring的设计原则。\n\n### Q3: 哪些情况的循环依赖Spring无法解决？\n**答**：\n1. **构造器注入的循环依赖**：必须在实例化时获取依赖，但此时依赖对象还没创建完成，三级缓存中没有早期引用\n2. **prototype作用域的循环依赖**：Spring不缓存prototype Bean\n3. **@Async注解的循环依赖**：因为@Async会产生额外的代理，可能与AOP代理冲突\n\n### Q4: @Lazy如何解决循环依赖？\n**答**：`@Lazy` 注解会注入一个懒加载代理对象，而不是真实的Bean。只有在第一次使用时，代理才会从容器中获取真实的Bean。这样就打破了循环依赖的创建链，因为注入时不需要立即创建依赖对象。\n\n### Q5: Spring Boot 从哪个版本开始默认禁止循环依赖？\n**答**：从 Spring Boot 2.6 开始，循环依赖默认被禁止；Spring Boot 3.x 延续这一策略。启动时如果出现无法解析的循环依赖，会抛出 `BeanCurrentlyInCreationException`。确有遗留场景时可以显式配置 `spring.main.allow-circular-references=true`，但更推荐重构依赖方向、引入事件或中间服务来消除循环。"
     },
     {
-      "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | 三级缓存方案（Spring） | 提前暴露方案（手动） |\n| --- | --- | --- |\n| 解决方式 | 自动，三级缓存+ObjectFactory | 手动，@Lazy或setter注入破环 |\n| 适用范围 | 单例+setter/字段注入 | 所有场景但需开发者介入 |\n| 是否需要代理 | ObjectFactory自动处理AOP代理 | 需要手动处理代理对象 |\n| 构造器注入 | 无法解决（三级缓存在实例化之后） | 无法解决，只能用@Lazy延迟加载 |\n| Spring版本 | Spring Framework 机制支持部分单例属性注入循环；Spring Boot 2.6+ 默认禁用 | 任意版本都可以手动处理，但推荐重构消除 |"
-    },
-    {
       "type": "diagram",
-      "title": "三级缓存解决循环依赖",
-      "content": "flowchart TD\nA[实例化 Bean A] --> B[放入三级缓存 ObjectFactory]\nB --> C[填充 A 依赖 Bean B]\nC --> D[创建 Bean B]\nD --> E[B 依赖 A]\nE --> F[从三级缓存获取 A 早期引用]\nF --> G[必要时生成代理]\nG --> H[放入二级缓存]\nH --> I[B 初始化完成]\nI --> J[A 注入 B 后初始化完成]\nJ --> K[放入一级缓存单例池]",
-      "fallback": "Spring 先实例化 A 并暴露 ObjectFactory，B 依赖 A 时取到 A 的早期引用，必要时提前生成代理，最终 A/B 初始化完成后进入一级缓存。",
+      "title": "循环依赖 学习主线图",
+      "content": "flowchart LR\nA[循环依赖] --> B[循环依赖的作用与边界]\nB --> C[循环依赖 核心机制]\nC --> D[三级缓存各自存放的内容和作用]\nD --> E[核心目标与适用边界]\nE --> F[Spring生态]",
+      "fallback": "循环依赖 -> 循环依赖的作用与边界 -> 循环依赖 核心机制 -> 三级缓存各自存放的内容和作用 -> 核心目标与适用边界 -> Spring生态",
       "items": [
         "一级缓存singletonObjects：存放完全初始化好的Bean（成品）",
         "二级缓存earlySingletonObjects：存放早期暴露的Bean（半成品）",
@@ -48,18 +43,31 @@
         "ObjectFactory的作用：延迟决定是否需要创建AOP代理",
         "只能解决单例+setter/字段注入的循环依赖",
         "构造器注入的循环依赖无法通过三级缓存解决，需要用@Lazy"
-      ]
+      ],
+      "format": "mermaid",
+      "caption": "从 循环依赖的作用与边界 到 Spring生态，图示用于梳理 循环依赖 的核心流程、边界和验证线索。"
+    },
+    {
+      "type": "compareTable",
+      "title": "对比与边界",
+      "content": "| 对比项 | 三级缓存方案（Spring） | 提前暴露方案（手动） |\n| --- | --- | --- |\n| 解决方式 | 自动，三级缓存+ObjectFactory | 手动，@Lazy或setter注入破环 |\n| 适用范围 | 单例+setter/字段注入 | 所有场景但需开发者介入 |\n| 是否需要代理 | ObjectFactory自动处理AOP代理 | 需要手动处理代理对象 |\n| 构造器注入 | 无法解决（三级缓存在实例化之后） | 无法解决，只能用@Lazy延迟加载 |\n| Spring版本 | Spring Framework 机制支持部分单例属性注入循环；Spring Boot 2.6+ 默认禁用 | 任意版本都可以手动处理，但推荐重构消除 |"
     },
     {
       "type": "code",
       "title": "代码/伪代码抓手",
       "content": "// A依赖B\n@Service\npublic class ServiceA {\n    @Autowired\n    private ServiceB serviceB;\n}\n\n// B依赖A\n@Service\npublic class ServiceB {\n    @Autowired\n    private ServiceA serviceA;\n}",
-      "language": "java"
+      "language": "java",
+      "highlights": [
+        {
+          "line": 3,
+          "note": "这里定义示例的核心入口或结构，后续逻辑都围绕这个职责展开。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
-      "title": "面试回答模板",
-      "content": "**Q1：什么是循环依赖？Spring是如何解决的？**\n循环依赖是指两个或多个Bean相互依赖，如A依赖B，B依赖A。Spring通过**三级缓存**解决单例Bean的setter/字段注入循环依赖：①一级缓存（singletonObjects）存放成品Bean；②二级缓存（earlySingletonObjects）存放早期暴露的半成品Bean；③三级缓存（singletonFactories）存放ObjectFactory。流程：创建A时先实例化并放入三级缓存，填充属性时发现依赖B，去创建B；B填充属性时发现依赖A，从三级缓存拿到A的早期引用（可能是代理对象），B完成初始化放入一级缓存；回到A继续填充属性，完成初始化。\n\n**Q2：三级缓存为什么要三级？二级不够吗？**\n二级缓存可以解决基本的循环依赖，但不能正确处理AOP代理。关键在于第三级缓存存的是**ObjectFactory**而非直接的对象引用。当从三级缓存获取早期引用时，ObjectFactory.getObject()会判断：如果该Bean需要AOP代理，就提前创建代理对象返回；如果不需要代理，就返回原始对象。这样保证了循环依赖中拿到的Bean和最终放入一级缓存的Bean是同一个实例（代理对象）。如果只有二级缓存，要么提前创建所有代理（破坏了Spring延迟创建代理的设计），要么循环依赖中拿到的是原始对象而非代理。\n\n**Q3：哪些场景三级缓存解决不了？**\n①**构造器注入的循环依赖**——因为三级缓存在实例化之后，而构造器注入在实例化阶段就需要依赖，此时Bean还没放入缓存。解决办法：用`@Lazy`注解延迟加载，注入一个代理对象；②**prototype作用域的循环依赖**——prototype每次getBean都创建新实例，无法缓存，Spring直接抛异常；③**@Async等需要二次代理的场景**——可能在循环依赖中拿到原始对象而非代理。",
+      "title": "面试回答思路",
+      "content": "结论：循环依赖 要先说清它解决什么问题，再展开机制、边界和验证方式。循环依赖是指两个或多个Bean之间相互依赖，形成循环引用。\n\n我会这样回答：\n1. 先定位核心问题：循环依赖的作用与边界。\n2. 再串起关键机制：循环依赖 的核心机制和关键流程，并说明它和 三级缓存各自存放的内容和作用 的关系。\n3. 接着补充边界和风险：只给出结论，不能说明能准确解释循环依赖的作用与边界的触发。\n4. 最后落到验证方式：结合代码入口、运行时状态、异常栈、日志或指标验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
       "followUpQuestions": [
         {
           "question": "Spring如何解决循环依赖？三级缓存机制是怎样的？",
@@ -94,14 +102,14 @@
       "prompt": "三级缓存中 earlySingletonObject 和 singletonFactory 的区别是什么？构造器注入为什么无法解决循环依赖？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2,
+      "difficulty": 4,
       "id": "java.spring.topic-047-7bfc4e55.recall.1"
     },
     {
       "prompt": "为什么构造器注入无法解决循环依赖？如何避免？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2,
+      "difficulty": 4,
       "id": "java.spring.topic-047-7bfc4e55.recall.2"
     },
     {
@@ -114,16 +122,18 @@
   ],
   "rubric": {
     "mustHave": [
-      "能准确解释循环依赖的核心概念、作用和适用边界",
-      "能说清 循环依赖 的核心机制和关键流程",
-      "能否说清三级缓存各自存放的内容和作用"
+      "能说明「循环依赖」解决的具体问题，并讲清 循环依赖、Spring生态、@Autowired\n    private ServiceB serviceB; 和 @Autowired\n    private ServiceA serviceA; 的职责边界",
+      "能按 循环依赖、Spring生态、@Autowired\n    private ServiceB serviceB; 和 @Autowired\n    private ServiceA serviceA; 的顺序讲清「循环依赖」的关键链路",
+      "三级缓存各自存放的内容和作用",
+      "能区分「循环依赖」的适用场景、前置条件和不适合直接套用的情况"
     ],
     "goodToHave": [
       "能说出 循环依赖 的源码关键类和扩展点",
-      "能解释 循环依赖 与 Spring 生态其他组件的协作关系"
+      "能解释 循环依赖 与 Spring 生态其他组件的协作关系",
+      "能用具体示例、运行现象或可观测指标验证「循环依赖」的判断"
     ],
     "commonMistakes": [
-      "只背「循环依赖」结论，讲不清能准确解释循环依赖的核心概念、作用和适用边界",
+      "能说明「循环依赖」解决的具体问题，并讲清 循环依赖、Spring生态、@Autowired\n    private ServiceB serviceB; 和 @Autowired\n    private ServiceA serviceA; 的职责边界",
       "把「循环依赖」的适用场景、失效条件和相邻概念混在一起",
       "遇到Java 工程里的真实问题时，不能说明「循环依赖」应该观察哪些状态、日志或指标"
     ],

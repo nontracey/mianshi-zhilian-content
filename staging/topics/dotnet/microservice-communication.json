@@ -14,7 +14,7 @@
     "API网关"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 45,
+  "estimatedMinutes": 40,
   "order": 30,
   "recommendWeight": 85,
   "status": "staging",
@@ -30,25 +30,18 @@
       "content": "## Ocelot API 网关\n\nOcelot 是 .NET 的 API 网关：\n```json\n// ocelot.json\n{\n  \"Routes\": [\n    {\n      \"UpstreamPathTemplate\": \"/api/users/{everything}\",\n      \"UpstreamHttpMethod\": [ \"GET\", \"POST\", \"PUT\", \"DELETE\" ],\n      \"DownstreamPathTemplate\": \"/api/users/{everything}\",\n      \"DownstreamScheme\": \"http\",\n      \"DownstreamHostAndPorts\": [\n        {\n          \"Host\": \"user-service\",\n          \"Port\": 5001\n        }\n      ],\n      \"LoadBalancerOptions\": {\n        \"Type\": \"LeastConnection\"\n      }\n    }\n  ],\n  \"GlobalConfiguration\": {\n    \"BaseUrl\": \"http://localhost:5000\"\n  }\n}\n```\n\n```csharp\n// 配置 Ocelot\nbuilder.Configuration.AddJsonFile(\"ocelot.json\", optional: false, reloadOnChange: true);\nbuilder.Services.AddOcelot();\n\napp.UseOcelot().Wait();\n```\n\n## 负载均衡\n\nOcelot 支持多种负载均衡策略：\n- **LeastConnection**：最少连接\n- **RoundRobin**：轮询\n- **NoLoadBalancer**：不负载均衡\n\n## 限流\n\n```json\n{\n  \"RateLimitOptions\": {\n    \"ClientWhitelist\": [],\n    \"EnableRateLimiting\": true,\n    \"Period\": \"1m\",\n    \"PeriodTimespan\": 60,\n    \"Limit\": 100\n  }\n}\n```\n\n## 身份验证\n\n```json\n{\n  \"AuthenticationProviderKey\": \"Bearer\",\n  \"RouteClaimsRequirement\": {\n    \"Role\": \"Admin\"\n  }\n}\n```\n\n```csharp\nbuilder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)\n    .AddJwtBearer(options =>\n    {\n        options.TokenValidationParameters = new TokenValidationParameters\n        {\n            ValidateIssuer = true,\n            ValidateAudience = true,\n            ValidateLifetime = true,\n            ValidateIssuerSigningKey = true,\n            ValidIssuer = \"your-issuer\",\n            ValidAudience = \"your-audience\",\n            IssuerSigningKey = new SymmetricSecurityKey(\n                Encoding.UTF8.GetBytes(\"your-secret-key\"))\n        };\n    });\n```\n\n## 聚合\n\n```json\n{\n  \"Aggregates\": [\n    {\n      \"RouteKeys\": [\"user\", \"orders\"],\n      \"UpstreamPathTemplate\": \"/api/user-with-orders/{userId}\",\n      \"Aggregator\": \"UserWithOrdersAggregator\"\n    }\n  ]\n}\n```\n\n## 服务网格\n\n对于更复杂的场景，可以考虑服务网格（如 Istio、Linkerd）：\n- 自动服务发现\n- 负载均衡\n- 故障恢复\n- 金丝雀发布\n- 遥测和监控"
     },
     {
-      "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Net.Http;\nusing System.Threading.Tasks;\nusing Consul;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Logging;\nusing Polly;\nusing Polly.CircuitBreaker;\nusing Polly.Extensions.Http;\nusing Polly.Timeout;\n\nnamespace MicroserviceCommunicationDemo\n{\n    // 服务发现\n    public interface IServiceDiscovery\n    {\n        Task<string> GetServiceUrlAsync(string serviceName);\n    }\n\n    public class ConsulServiceDiscovery : IServiceDiscovery\n    {\n        private readonly IConsulClient _consulClient;\n        private readonly ILogger<ConsulServiceDiscovery> _logger;\n\n        public ConsulServiceDiscovery(IConsulClient consulClient, ILogger<ConsulServiceDiscovery> logger)\n        {\n            _consulClient = consulClient;\n            _logger = logger;\n        }\n\n        public async Task<string> GetServiceUrlAsync(string serviceName)\n        {\n            var services = await _consulClient.Health.Service(serviceName, null, true);\n            if (services.Response.Length == 0)\n            {\n                _logger.LogWarning($\"服务 {serviceName} 未找到\");\n                return null;\n            }\n\n            // 简单轮询\n            var service = services.Response[new Random().Next(services.Response.Length)];\n            return $\"http://{service.Service.Address}:{service.Service.Port}\";\n        }\n    }\n\n    // 弹性策略\n    public static class ResiliencePolicies\n    {\n        public static IAsyncPolicy<HttpResponseMessage> GetRetryPolicy(ILogger logger)\n        {\n            return HttpPolicyExtensions\n                .HandleTransientHttpError()\n                .Or<TimeoutRejectedException>()\n                .WaitAndRetryAsync(3,\n                    retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),\n                    onRetry: (outcome, timespan, retryAttempt, context) =>\n                    {\n                        logger.LogWarning($\"第 {retryAttempt} 次重试，等待 {timespan.TotalSeconds} 秒\");\n                    });\n        }\n\n        public static IAsyncPolicy<HttpResponseMessage> GetCircuitBreakerPolicy(ILogger logger)\n        {\n            return HttpPolicyExtensions\n                .HandleTransientHttpError()\n                .CircuitBreakerAsync(\n                    handledEventsAllowedBeforeBreaking: 5,\n                    durationOfBreak: TimeSpan.FromSeconds(30),\n                    onBreak: (outcome, timespan) =>\n                    {\n                        logger.LogWarning($\"熔断器打开，持续 {timespan.TotalSeconds} 秒\");\n                    },\n                    onReset: () =>\n                    {\n                        logger.LogInformation(\"熔断器关闭\");\n                    });\n        }\n\n        public static IAsyncPolicy<HttpResponseMessage> GetTimeoutPolicy()\n        {\n            return Policy.TimeoutAsync<HttpResponseMessage>(TimeSpan.FromSeconds(10));\n        }\n\n        public static IAsyncPolicy<HttpResponseMessage> GetBulkheadPolicy(ILogger logger)\n        {\n            return Policy.BulkheadAsync<HttpResponseMessage>(\n                maxParallelization: 10,\n                maxQueuingActions: 25,\n                onBulkheadRejectedAsync: context =>\n                {\n                    logger.LogWarning(\"请求被隔离策略拒绝\");\n                    return Task.CompletedTask;\n                });\n        }\n    }\n\n    // HttpClient 服务\n    public class UserServiceClient\n    {\n        private readonly HttpClient _httpClient;\n        private readonly ILogger<UserServiceClient> _logger;\n\n        public UserServiceClient(HttpClient httpClient, ILogger<UserServiceClient> logger)\n        {\n            _httpClient = httpClient;\n            _logger = logger;\n        }\n\n        public async Task<User> GetUserAsync(int id)\n        {\n            try\n            {\n                var response = await _httpClient.GetAsync($\"/api/users/{id}\");\n                response.EnsureSuccessStatusCode();\n                return await response.Content.ReadFromJsonAsync<User>();\n            }\n            catch (BrokenCircuitException)\n            {\n                _logger.LogError(\"熔断器已打开，无法获取用户\");\n                throw;\n            }\n        }\n    }\n\n    public class User\n    {\n        public int Id { get; set; }\n        public string Name { get; set; }\n        public string Email { get; set; }\n    }\n\n    // API 网关配置\n    public static class ApiGatewayExtensions\n    {\n        public static IServiceCollection AddApiGatewayServices(this IServiceCollection services)\n        {\n            // Consul 服务发现\n            services.AddSingleton<IConsulClient>(sp =>\n                new ConsulClient(c => c.Address = new Uri(\"http://localhost:8500\")));\n            services.AddSingleton<IServiceDiscovery, ConsulServiceDiscovery>();\n\n            // HttpClient with Polly\n            services.AddHttpClient<UserServiceClient>(\"user-service\")\n                .AddPolicyHandler((sp, request) =>\n                {\n                    var logger = sp.GetRequiredService<ILogger<UserServiceClient>>();\n                    return ResiliencePolicies.GetRetryPolicy(logger);\n                })\n                .AddPolicyHandler((sp, request) =>\n                {\n                    var logger = sp.GetRequiredService<ILogger<UserServiceClient>>();\n                    return ResiliencePolicies.GetCircuitBreakerPolicy(logger);\n                })\n                .AddPolicyHandler(ResiliencePolicies.GetTimeoutPolicy());\n\n            return services;\n        }\n\n        public static async Task RegisterServiceAsync(\n            this IApplicationBuilder app,\n            string serviceName,\n            string serviceId,\n            string address,\n            int port,\n            string healthCheckUrl)\n        {\n            var consulClient = app.ApplicationServices.GetRequiredService<IConsulClient>();\n\n            await consulClient.Agent.ServiceRegister(new AgentServiceRegistration\n            {\n                ID = serviceId,\n                Name = serviceName,\n                Address = address,\n                Port = port,\n                Check = new AgentServiceCheck\n                {\n                    HTTP = healthCheckUrl,\n                    Interval = TimeSpan.FromSeconds(10),\n                    Timeout = TimeSpan.FromSeconds(5)\n                }\n            });\n        }\n\n        public static async Task DeregisterServiceAsync(this IApplicationBuilder app, string serviceId)\n        {\n            var consulClient = app.ApplicationServices.GetRequiredService<IConsulClient>();\n            await consulClient.Agent.ServiceDeregister(serviceId);\n        }\n    }\n\n    // 使用示例\n    public class OrderService\n    {\n        private readonly UserServiceClient _userClient;\n        private readonly ILogger<OrderService> _logger;\n\n        public OrderService(UserServiceClient userClient, ILogger<OrderService> logger)\n        {\n            _userClient = userClient;\n            _logger = logger;\n        }\n\n        public async Task CreateOrderAsync(int userId, OrderItem[] items)\n        {\n            // 获取用户信息（带弹性策略）\n            var user = await _userClient.GetUserAsync(userId);\n            _logger.LogInformation($\"为用户 {user.Name} 创建订单\");\n\n            // 创建订单逻辑\n        }\n    }\n\n    public class OrderItem\n    {\n        public string ProductId { get; set; }\n        public int Quantity { get; set; }\n        public decimal Price { get; set; }\n    }\n\n    // 服务注册扩展\n    public static class ServiceCollectionExtensions\n    {\n        public static IServiceCollection AddMicroserviceServices(this IServiceCollection services)\n        {\n            services.AddApiGatewayServices();\n            services.AddScoped<OrderService>();\n            return services;\n        }\n    }\n}",
-      "language": "csharp"
-    },
-    {
-      "type": "interviewAnswer",
-      "title": "面试回答模板",
-      "content": "服务发现是微服务架构的基础，Consul 是常用的服务发现工具。服务启动时注册到 Consul，调用方从 Consul 获取服务地址。Consul 还提供健康检查，自动剔除不健康的服务。\n\nPolly 是 .NET 的弹性策略库，支持重试、熔断器、超时、隔离等策略。重试策略处理瞬态故障，熔断器防止级联故障，超时策略避免长时间等待。这些策略可以组合使用。\n\nOcelot 是 .NET 的 API 网关，提供路由、负载均衡、限流、身份验证等功能。它将多个微服务聚合为统一的 API 入口，简化客户端调用。\n\n负载均衡策略包括轮询、最少连接等。限流可以保护后端服务不被过载。身份验证可以在网关层统一处理。\n\n在实际开发中，我会使用 Consul 进行服务发现，HttpClient 集成 Polly 弹性策略，Ocelot 作为 API 网关。对于更复杂的场景，可以考虑服务网格。",
-      "followUpQuestions": [
-        {
-          "question": "面试官追问「微服务通信」时，最应该展开哪条机制链？",
-          "answer": "回答「微服务通信」时先抓住 理解服务发现的概念，再展开 掌握 Polly 的重试和熔断器策略。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对.NET 工程里真实机制的理解。"
-        },
-        {
-          "question": "如果「微服务通信」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "我会先确认问题是否落在「微服务通信」的核心边界上，再看 异常日志、请求耗时、GC/线程池/连接池指标、数据库查询和依赖服务超时。排查时特别避免“只背「微服务通信」结论，讲不清理解服务发现的概念”这个误区，先复现触发条件，再用日志、指标或最小用例验证修复是否真的命中原因。"
-        }
-      ]
+      "type": "diagram",
+      "title": "微服务通信 学习主线图",
+      "content": "flowchart LR\nA[微服务通信] --> B[.NET]\nB --> C[微服务]\nC --> D[服务发现]\nD --> E[Polly]\nE --> F[Ocelot]",
+      "fallback": "微服务通信 -> .NET -> 微服务 -> 服务发现 -> Polly -> Ocelot",
+      "items": [
+        "Consul动态服务发现",
+        "Polly处理瞬态故障",
+        "Ocelot统一API入口",
+        "负载均衡分发请求"
+      ],
+      "format": "mermaid",
+      "caption": "从 .NET 到 Ocelot，这张图帮助区分 微服务通信 的核心机制、边界条件和常见误区。"
     },
     {
       "type": "compareTable",
@@ -66,15 +59,30 @@
       "content": "| 维度 | API 网关 | 服务网格 |\n| --- | --- | --- |\n| 部署方式 | 集中 | 分布式（sidecar） |\n| 功能 | 路由、限流、认证 | 流量管理、安全、可观测 |\n| 复杂度 | 中 | 高 |\n| 适用场景 | 中小规模 | 大规模、复杂 |"
     },
     {
-      "type": "diagram",
-      "title": "结构图解",
-      "content": "服务发现：\nService → 注册 → Consul\nClient → 查询 → Consul → 返回地址 → 调用 Service\n\nPolly 弹性策略：\n请求 → 重试 → 熔断器 → 超时 → 服务\n\nAPI 网关：\nClient → Ocelot → Service1\n                → Service2\n                → Service3",
-      "fallback": "服务发现、Polly策略和API网关示意图",
-      "items": [
-        "Consul动态服务发现",
-        "Polly处理瞬态故障",
-        "Ocelot统一API入口",
-        "负载均衡分发请求"
+      "type": "code",
+      "title": "代码示例",
+      "content": "using System;\nusing System.Net.Http;\nusing System.Threading.Tasks;\nusing Consul;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Logging;\nusing Polly;\nusing Polly.CircuitBreaker;\nusing Polly.Extensions.Http;\nusing Polly.Timeout;\n\nnamespace MicroserviceCommunicationDemo\n{\n    // 服务发现\n    public interface IServiceDiscovery\n    {\n        Task<string> GetServiceUrlAsync(string serviceName);\n    }\n\n    public class ConsulServiceDiscovery : IServiceDiscovery\n    {\n        private readonly IConsulClient _consulClient;\n        private readonly ILogger<ConsulServiceDiscovery> _logger;\n\n        public ConsulServiceDiscovery(IConsulClient consulClient, ILogger<ConsulServiceDiscovery> logger)\n        {\n            _consulClient = consulClient;\n            _logger = logger;\n        }\n\n        public async Task<string> GetServiceUrlAsync(string serviceName)\n        {\n            var services = await _consulClient.Health.Service(serviceName, null, true);\n            if (services.Response.Length == 0)\n            {\n                _logger.LogWarning($\"服务 {serviceName} 未找到\");\n                return null;\n            }\n\n            // 简单轮询\n            var service = services.Response[new Random().Next(services.Response.Length)];\n            return $\"http://{service.Service.Address}:{service.Service.Port}\";\n        }\n    }\n\n    // 弹性策略\n    public static class ResiliencePolicies\n    {\n        public static IAsyncPolicy<HttpResponseMessage> GetRetryPolicy(ILogger logger)\n        {\n            return HttpPolicyExtensions\n                .HandleTransientHttpError()\n                .Or<TimeoutRejectedException>()\n                .WaitAndRetryAsync(3,\n                    retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),\n                    onRetry: (outcome, timespan, retryAttempt, context) =>\n                    {\n                        logger.LogWarning($\"第 {retryAttempt} 次重试，等待 {timespan.TotalSeconds} 秒\");\n                    });\n        }\n\n        public static IAsyncPolicy<HttpResponseMessage> GetCircuitBreakerPolicy(ILogger logger)\n        {\n            return HttpPolicyExtensions\n                .HandleTransientHttpError()\n                .CircuitBreakerAsync(\n                    handledEventsAllowedBeforeBreaking: 5,\n                    durationOfBreak: TimeSpan.FromSeconds(30),\n                    onBreak: (outcome, timespan) =>\n                    {\n                        logger.LogWarning($\"熔断器打开，持续 {timespan.TotalSeconds} 秒\");\n                    },\n                    onReset: () =>\n                    {\n                        logger.LogInformation(\"熔断器关闭\");\n                    });\n        }\n\n        public static IAsyncPolicy<HttpResponseMessage> GetTimeoutPolicy()\n        {\n            return Policy.TimeoutAsync<HttpResponseMessage>(TimeSpan.FromSeconds(10));\n        }\n\n        public static IAsyncPolicy<HttpResponseMessage> GetBulkheadPolicy(ILogger logger)\n        {\n            return Policy.BulkheadAsync<HttpResponseMessage>(\n                maxParallelization: 10,\n                maxQueuingActions: 25,\n                onBulkheadRejectedAsync: context =>\n                {\n                    logger.LogWarning(\"请求被隔离策略拒绝\");\n                    return Task.CompletedTask;\n                });\n        }\n    }\n\n    // HttpClient 服务\n    public class UserServiceClient\n    {\n        private readonly HttpClient _httpClient;\n        private readonly ILogger<UserServiceClient> _logger;\n\n        public UserServiceClient(HttpClient httpClient, ILogger<UserServiceClient> logger)\n        {\n            _httpClient = httpClient;\n            _logger = logger;\n        }\n\n        public async Task<User> GetUserAsync(int id)\n        {\n            try\n            {\n                var response = await _httpClient.GetAsync($\"/api/users/{id}\");\n                response.EnsureSuccessStatusCode();\n                return await response.Content.ReadFromJsonAsync<User>();\n            }\n            catch (BrokenCircuitException)\n            {\n                _logger.LogError(\"熔断器已打开，无法获取用户\");\n                throw;\n            }\n        }\n    }\n\n    public class User\n    {\n        public int Id { get; set; }\n        public string Name { get; set; }\n        public string Email { get; set; }\n    }\n\n    // API 网关配置\n    public static class ApiGatewayExtensions\n    {\n        public static IServiceCollection AddApiGatewayServices(this IServiceCollection services)\n        {\n            // Consul 服务发现\n            services.AddSingleton<IConsulClient>(sp =>\n                new ConsulClient(c => c.Address = new Uri(\"http://localhost:8500\")));\n            services.AddSingleton<IServiceDiscovery, ConsulServiceDiscovery>();\n\n            // HttpClient with Polly\n            services.AddHttpClient<UserServiceClient>(\"user-service\")\n                .AddPolicyHandler((sp, request) =>\n                {\n                    var logger = sp.GetRequiredService<ILogger<UserServiceClient>>();\n                    return ResiliencePolicies.GetRetryPolicy(logger);\n                })\n                .AddPolicyHandler((sp, request) =>\n                {\n                    var logger = sp.GetRequiredService<ILogger<UserServiceClient>>();\n                    return ResiliencePolicies.GetCircuitBreakerPolicy(logger);\n                })\n                .AddPolicyHandler(ResiliencePolicies.GetTimeoutPolicy());\n\n            return services;\n        }\n\n        public static async Task RegisterServiceAsync(\n            this IApplicationBuilder app,\n            string serviceName,\n            string serviceId,\n            string address,\n            int port,\n            string healthCheckUrl)\n        {\n            var consulClient = app.ApplicationServices.GetRequiredService<IConsulClient>();\n\n            await consulClient.Agent.ServiceRegister(new AgentServiceRegistration\n            {\n                ID = serviceId,\n                Name = serviceName,\n                Address = address,\n                Port = port,\n                Check = new AgentServiceCheck\n                {\n                    HTTP = healthCheckUrl,\n                    Interval = TimeSpan.FromSeconds(10),\n                    Timeout = TimeSpan.FromSeconds(5)\n                }\n            });\n        }\n\n        public static async Task DeregisterServiceAsync(this IApplicationBuilder app, string serviceId)\n        {\n            var consulClient = app.ApplicationServices.GetRequiredService<IConsulClient>();\n            await consulClient.Agent.ServiceDeregister(serviceId);\n        }\n    }\n\n    // 使用示例\n    public class OrderService\n    {\n        private readonly UserServiceClient _userClient;\n        private readonly ILogger<OrderService> _logger;\n\n        public OrderService(UserServiceClient userClient, ILogger<OrderService> logger)\n        {\n            _userClient = userClient;\n            _logger = logger;\n        }\n\n        public async Task CreateOrderAsync(int userId, OrderItem[] items)\n        {\n            // 获取用户信息（带弹性策略）\n            var user = await _userClient.GetUserAsync(userId);\n            _logger.LogInformation($\"为用户 {user.Name} 创建订单\");\n\n            // 创建订单逻辑\n        }\n    }\n\n    public class OrderItem\n    {\n        public string ProductId { get; set; }\n        public int Quantity { get; set; }\n        public decimal Price { get; set; }\n    }\n\n    // 服务注册扩展\n    public static class ServiceCollectionExtensions\n    {\n        public static IServiceCollection AddMicroserviceServices(this IServiceCollection services)\n        {\n            services.AddApiGatewayServices();\n            services.AddScoped<OrderService>();\n            return services;\n        }\n    }\n}",
+      "language": "csharp",
+      "highlights": [
+        {
+          "line": 35,
+          "note": "这里是边界条件分支，回答 微服务通信 时要说明它为什么会改变执行路径。"
+        }
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答思路",
+      "content": "结论：微服务通信 要先说清它解决什么问题，再展开机制、边界和验证方式。掌握服务发现、Polly 弹性策略以及 Ocelot API 网关\n\n我会这样回答：\n1. 先定位核心问题：理解服务发现的概念。\n2. 再串起关键机制：Polly 的重试和熔断器策略，并说明它和 Ocelot API 网关的配置 的关系。\n3. 接着补充边界和风险：只给出结论，不能说明理解服务发现的概念的触发条件和边界。\n4. 最后落到验证方式：结合请求管线、配置、日志、指标和诊断工具验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
+      "followUpQuestions": [
+        {
+          "question": "面试官追问「微服务通信」时，最应该展开哪条机制链？",
+          "answer": "回答「微服务通信」时先抓住 理解服务发现的概念，再展开 掌握 Polly 的重试和熔断器策略。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对.NET 工程里真实机制的理解。"
+        },
+        {
+          "question": "如果「微服务通信」在线上或编码中出问题，你会优先检查什么？",
+          "answer": "可以先确认现象是否落在「掌握 Polly 的重试和熔断器策略」，再结合日志、指标、输入规模和依赖状态验证。"
+        }
       ]
     },
     {
@@ -96,14 +104,21 @@
       "prompt": "请说明 微服务通信 的核心机制、典型使用场景和常见坑。",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
     },
     {
       "id": "dotnet.microservice-dotnet.communication.recall.2",
       "prompt": "Polly 支持哪些弹性策略？重试和熔断器有什么区别？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.microservice-dotnet.communication.recall.3",
+      "prompt": "微服务通信 和相邻概念或常见替代方案有什么关键区别？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
     }
   ],
   "rubric": {
@@ -111,8 +126,7 @@
       "理解服务发现的概念",
       "掌握 Polly 的重试和熔断器策略",
       "了解 Ocelot API 网关的配置",
-      "知道负载均衡的概念",
-      "了解限流和身份验证"
+      "知道负载均衡的概念"
     ],
     "goodToHave": [
       "了解服务网格",
@@ -120,7 +134,7 @@
       "理解分布式追踪"
     ],
     "commonMistakes": [
-      "只背「微服务通信」结论，讲不清理解服务发现的概念",
+      "只列出 微服务、服务发现、Polly，但说不出触发条件、状态变化和验证证据",
       "把「微服务通信」的适用场景、失效条件和相邻概念混在一起",
       "遇到.NET 工程里的真实问题时，不能说明「微服务通信」应该观察哪些状态、日志或指标"
     ],
@@ -134,5 +148,5 @@
   "prerequisites": [],
   "interviewFrequency": "medium",
   "interviewerFocus": "考察是否能围绕「微服务通信」说清理解服务发现的概念、掌握 Polly 的重试和熔断器策略，并放到.NET 工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-11"
+  "updatedAt": "2026-06-12"
 }

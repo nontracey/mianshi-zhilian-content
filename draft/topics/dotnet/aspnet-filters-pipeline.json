@@ -13,7 +13,7 @@
     "管道"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 45,
+  "estimatedMinutes": 40,
   "order": 20,
   "recommendWeight": 85,
   "status": "draft",
@@ -29,25 +29,18 @@
       "content": "## 内置过滤器\n\n**[Authorize]**：授权过滤器\n```csharp\n[Authorize(Roles = \"Admin\")]\npublic IActionResult AdminOnly() { }\n```\n\n**[ServiceFilter] / [TypeFilter]**：使用依赖注入的过滤器\n```csharp\n[ServiceFilter(typeof(LogActionFilter))]\npublic IActionResult Index() { }\n```\n\n**[ResponseCache]**：响应缓存\n```csharp\n[ResponseCache(Duration = 60)]\npublic IActionResult Get() { }\n```\n\n## 自定义过滤器\n\n**操作过滤器示例**：\n```csharp\npublic class LogActionFilter : IAsyncActionFilter\n{\n    private readonly ILogger<LogActionFilter> _logger;\n\n    public LogActionFilter(ILogger<LogActionFilter> logger)\n    {\n        _logger = logger;\n    }\n\n    public async Task OnActionExecutionAsync(\n        ActionExecutingContext context,\n        ActionExecutionDelegate next)\n    {\n        var stopwatch = Stopwatch.StartNew();\n        \n        _logger.LogInformation($\"操作 {context.ActionDescriptor.DisplayName} 开始执行\");\n        \n        var resultContext = await next();\n        \n        stopwatch.Stop();\n        \n        if (resultContext.Exception != null)\n        {\n            _logger.LogError(resultContext.Exception, \"操作执行失败\");\n        }\n        else\n        {\n            _logger.LogInformation($\"操作执行完成，耗时 {stopwatch.ElapsedMilliseconds}ms\");\n        }\n    }\n}\n```\n\n**异常过滤器示例**：\n```csharp\npublic class GlobalExceptionFilter : IAsyncExceptionFilter\n{\n    private readonly ILogger<GlobalExceptionFilter> _logger;\n\n    public GlobalExceptionFilter(ILogger<GlobalExceptionFilter> logger)\n    {\n        _logger = logger;\n    }\n\n    public async Task OnExceptionAsync(ExceptionContext context)\n    {\n        _logger.LogError(context.Exception, \"未处理的异常\");\n\n        context.Result = new ObjectResult(new\n        {\n            Code = 500,\n            Message = \"服务器内部错误\"\n        })\n        {\n            StatusCode = 500\n        };\n\n        context.ExceptionHandled = true;\n    }\n}\n```\n\n**资源过滤器示例（缓存）**：\n```csharp\npublic class CacheResourceFilter : IAsyncResourceFilter\n{\n    private static readonly Dictionary<string, (object Result, DateTime Expiry)> Cache = new();\n    private readonly int _durationSeconds;\n\n    public CacheResourceFilter(int durationSeconds)\n    {\n        _durationSeconds = durationSeconds;\n    }\n\n    public async Task OnResourceExecutionAsync(\n        ResourceExecutingContext context,\n        ResourceExecutionDelegate next)\n    {\n        var cacheKey = context.HttpContext.Request.Path.ToString();\n\n        if (Cache.TryGetValue(cacheKey, out var cached) && cached.Expiry > DateTime.UtcNow)\n        {\n            context.Result = cached.Result as IActionResult;\n            return; // 短路管道\n        }\n\n        var resultContext = await next();\n\n        if (resultContext.Result is ObjectResult objectResult)\n        {\n            Cache[cacheKey] = (objectResult, DateTime.UtcNow.AddSeconds(_durationSeconds));\n        }\n    }\n}\n```\n\n## 过滤器与中间件的区别\n\n**中间件**：\n- 在请求管道早期执行\n- 全局处理所有请求\n- 不了解 MVC 上下文\n\n**过滤器**：\n- 在 MVC 管道内执行\n- 可以针对特定控制器/操作\n- 可以访问 MVC 上下文（ActionContext）"
     },
     {
-      "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Diagnostics;\nusing System.Threading.Tasks;\nusing Microsoft.AspNetCore.Mvc;\nusing Microsoft.AspNetCore.Mvc.Filters;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Logging;\n\nnamespace FiltersPipelineDemo\n{\n    // 授权过滤器\n    public class CustomAuthorizeFilter : IAsyncAuthorizationFilter\n    {\n        private readonly string _requiredRole;\n\n        public CustomAuthorizeFilter(string requiredRole)\n        {\n            _requiredRole = requiredRole;\n        }\n\n        public Task OnAuthorizationAsync(AuthorizationFilterContext context)\n        {\n            var user = context.HttpContext.User;\n            if (!user.Identity.IsAuthenticated)\n            {\n                context.Result = new UnauthorizedResult();\n                return Task.CompletedTask;\n            }\n\n            if (!user.IsInRole(_requiredRole))\n            {\n                context.Result = new ForbidResult();\n                return Task.CompletedTask;\n            }\n\n            return Task.CompletedTask;\n        }\n    }\n\n    // 资源过滤器 - 请求限流\n    public class RateLimitResourceFilter : IAsyncResourceFilter\n    {\n        private static readonly Dictionary<string, DateTime> LastRequestTime = new();\n        private readonly int _requestsPerMinute;\n\n        public RateLimitResourceFilter(int requestsPerMinute)\n        {\n            _requestsPerMinute = requestsPerMinute;\n        }\n\n        public async Task OnResourceExecutionAsync(\n            ResourceExecutingContext context,\n            ResourceExecutionDelegate next)\n        {\n            var clientIp = context.HttpContext.Connection.RemoteIpAddress?.ToString();\n            var key = $\"{clientIp}:{context.HttpContext.Request.Path}\";\n\n            if (LastRequestTime.TryGetValue(key, out var lastTime))\n            {\n                var elapsed = DateTime.UtcNow - lastTime;\n                if (elapsed.TotalSeconds < 60.0 / _requestsPerMinute)\n                {\n                    context.Result = new ObjectResult(new { Message = \"请求过于频繁\" })\n                    {\n                        StatusCode = 429\n                    };\n                    return;\n                }\n            }\n\n            LastRequestTime[key] = DateTime.UtcNow;\n            await next();\n        }\n    }\n\n    // 操作过滤器 - 日志记录\n    public class LogActionFilter : IAsyncActionFilter\n    {\n        private readonly ILogger<LogActionFilter> _logger;\n\n        public LogActionFilter(ILogger<LogActionFilter> logger)\n        {\n            _logger = logger;\n        }\n\n        public async Task OnActionExecutionAsync(\n            ActionExecutingContext context,\n            ActionExecutionDelegate next)\n        {\n            var actionName = context.ActionDescriptor.DisplayName;\n            var parameters = context.ActionArguments;\n\n            _logger.LogInformation($\"开始执行操作: {actionName}\");\n            _logger.LogInformation($\"参数: {System.Text.Json.JsonSerializer.Serialize(parameters)}\");\n\n            var stopwatch = Stopwatch.StartNew();\n            var resultContext = await next();\n            stopwatch.Stop();\n\n            if (resultContext.Exception != null)\n            {\n                _logger.LogError(resultContext.Exception,\n                    $\"操作 {actionName} 执行失败，耗时 {stopwatch.ElapsedMilliseconds}ms\");\n            }\n            else\n            {\n                _logger.LogInformation(\n                    $\"操作 {actionName} 执行完成，耗时 {stopwatch.ElapsedMilliseconds}ms，\" +\n                    $\"结果类型: {resultContext.Result?.GetType().Name}\");\n            }\n        }\n    }\n\n    // 异常过滤器 - 全局异常处理\n    public class GlobalExceptionFilter : IAsyncExceptionFilter\n    {\n        private readonly ILogger<GlobalExceptionFilter> _logger;\n\n        public GlobalExceptionFilter(ILogger<GlobalExceptionFilter> logger)\n        {\n            _logger = logger;\n        }\n\n        public async Task OnExceptionAsync(ExceptionContext context)\n        {\n            _logger.LogError(context.Exception, \"发生未处理的异常\");\n\n            var statusCode = context.Exception switch\n            {\n                ArgumentException => 400,\n                UnauthorizedAccessException => 401,\n                KeyNotFoundException => 404,\n                _ => 500\n            };\n\n            context.Result = new ObjectResult(new\n            {\n                Code = statusCode,\n                Message = context.Exception.Message,\n                TraceId = Activity.Current?.Id ?? context.HttpContext.TraceIdentifier\n            })\n            {\n                StatusCode = statusCode\n            };\n\n            context.ExceptionHandled = true;\n        }\n    }\n\n    // 结果过滤器 - 响应包装\n    public class ApiResponseResultFilter : IAsyncResultFilter\n    {\n        public async Task OnResultExecutionAsync(\n            ResultExecutingContext context,\n            ResultExecutionDelegate next)\n        {\n            if (context.Result is ObjectResult objectResult)\n            {\n                var wrappedResult = new\n                {\n                    Code = objectResult.StatusCode ?? 200,\n                    Message = \"成功\",\n                    Data = objectResult.Value,\n                    Timestamp = DateTime.UtcNow\n                };\n\n                objectResult.Value = wrappedResult;\n            }\n\n            await next();\n        }\n    }\n\n    // 过滤器特性\n    public class TimingAttribute : ActionFilterAttribute\n    {\n        private Stopwatch _stopwatch;\n\n        public override void OnActionExecuting(ActionExecutingContext context)\n        {\n            _stopwatch = Stopwatch.StartNew();\n        }\n\n        public override void OnActionExecuted(ActionExecutedContext context)\n        {\n            _stopwatch.Stop();\n            context.HttpContext.Response.Headers.Add(\"X-Execution-Time\",\n                $\"{_stopwatch.ElapsedMilliseconds}ms\");\n        }\n    }\n\n    // 使用过滤器的控制器\n    [ApiController]\n    [Route(\"api/[controller]\")]\n    public class ProductsController : ControllerBase\n    {\n        [HttpGet]\n        [Timing]\n        [ServiceFilter(typeof(LogActionFilter))]\n        public IActionResult GetAll()\n        {\n            return Ok(new[] { \"Product1\", \"Product2\" });\n        }\n\n        [HttpGet(\"{id}\")]\n        [Timing]\n        public IActionResult GetById(int id)\n        {\n            if (id <= 0)\n                throw new ArgumentException(\"ID 必须大于 0\");\n\n            if (id > 100)\n                throw new KeyNotFoundException(\"产品不存在\");\n\n            return Ok($\"Product {id}\");\n        }\n    }\n\n    // 注册过滤器\n    public static class ServiceCollectionExtensions\n    {\n        public static IServiceCollection AddCustomFilters(this IServiceCollection services)\n        {\n            services.AddScoped<LogActionFilter>();\n            services.AddScoped<GlobalExceptionFilter>();\n            services.AddScoped<ApiResponseResultFilter>();\n\n            services.AddControllers(options =>\n            {\n                // 全局过滤器\n                options.Filters.AddService<GlobalExceptionFilter>();\n                options.Filters.AddService<ApiResponseResultFilter>();\n                options.Filters.Add(new RateLimitResourceFilter(100));\n            });\n\n            return services;\n        }\n    }\n}",
-      "language": "csharp"
-    },
-    {
-      "type": "interviewAnswer",
-      "title": "面试回答模板",
-      "content": "ASP.NET Core 过滤器提供了在请求管道不同阶段执行代码的能力，用于实现横切关注点。有五种过滤器类型：授权过滤器最先执行，用于验证身份和权限；资源过滤器在授权后执行，可以短路管道，适用于缓存和限流；操作过滤器在操作方法执行前后执行，是最常用的类型；异常过滤器处理未捕获的异常；结果过滤器在结果执行前后执行。\n\n过滤器可以注册为全局、控制器或操作级别。全局过滤器应用于所有控制器和操作，通过 options.Filters.Add 注册。控制器和操作级别通过特性标注。使用 [ServiceFilter] 或 [TypeFilter] 可以注入依赖。\n\n过滤器的执行顺序是固定的：授权 → 资源 → 操作前 → 操作方法 → 操作后 → 结果前 → 结果后 → 资源后。异常过滤器在操作抛出异常时执行。\n\n自定义过滤器需要实现对应的接口，比如 IAsyncActionFilter 实现 OnActionExecutionAsync 方法，通过调用 next() 执行后续管道。资源过滤器可以通过设置 context.Result 短路管道。\n\n在实际开发中，我会用操作过滤器实现日志、验证、性能监控，用异常过滤器实现全局异常处理，用资源过滤器实现缓存和限流。",
-      "followUpQuestions": [
-        {
-          "question": "面试官追问「过滤器管道」时，最应该展开哪条机制链？",
-          "answer": "回答「过滤器管道」时先抓住 理解五种过滤器类型及其执行顺序，再展开 掌握过滤器的注册方式。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对.NET 工程里真实机制的理解。"
-        },
-        {
-          "question": "如果「过滤器管道」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "我会先确认问题是否落在「过滤器管道」的核心边界上，再看 异常日志、请求耗时、GC/线程池/连接池指标、数据库查询和依赖服务超时。排查时特别避免“只背「过滤器管道」结论，讲不清理解五种过滤器类型及其执行顺序”这个误区，先复现触发条件，再用日志、指标或最小用例验证修复是否真的命中原因。"
-        }
-      ]
+      "type": "diagram",
+      "title": "过滤器管道 学习主线图",
+      "content": "flowchart LR\nA[过滤器管道] --> B[.NET]\nB --> C[ASP.NET]\nC --> D[过滤器]\nD --> E[Filter]\nE --> F[管道]",
+      "fallback": "过滤器管道 -> .NET -> ASP.NET -> 过滤器 -> Filter -> 管道",
+      "items": [
+        "授权过滤器最先执行",
+        "资源过滤器可短路管道",
+        "操作过滤器最常用",
+        "异常过滤器处理未捕获异常"
+      ],
+      "format": "mermaid",
+      "caption": "从 .NET 到 管道，这张图帮助区分 过滤器管道 的核心机制、边界条件和常见误区。"
     },
     {
       "type": "compareTable",
@@ -60,15 +53,30 @@
       "content": "| 维度 | 授权过滤器 | 资源过滤器 | 操作过滤器 | 异常过滤器 | 结果过滤器 |\n| --- | --- | --- | --- | --- | --- |\n| 执行时机 | 最先 | 授权后 | 操作前后 | 异常时 | 结果前后 |\n| 典型应用 | 身份验证 | 缓存、限流 | 日志、验证 | 错误处理 | 响应修改 |\n| 短路能力 | 是 | 是 | 是 | 是 | 是 |\n| 接口 | IAuthorizationFilter | IResourceFilter | IActionFilter | IExceptionFilter | IResultFilter |\n| 注册方式 | [Authorize] | 全局/ServiceFilter | [ServiceFilter]/特性 | 全局 | 全局 |"
     },
     {
-      "type": "diagram",
-      "title": "结构图解",
-      "content": "过滤器执行流程：\n\n请求 → 授权过滤器 → 资源过滤器(OnResourceExecuting)\n    ↓ 模型绑定\n    ↓ 操作过滤器(OnActionExecuting) → 操作方法 → 操作过滤器(OnActionExecuted)\n    ↓ 结果过滤器(OnResultExecuting) → 结果执行 → 结果过滤器(OnResultExecuted)\n    ↓ 资源过滤器(OnResourceExecuted)\n响应\n\n异常处理：\n操作方法 → 异常 → 异常过滤器 → 设置结果 → 资源过滤器(OnResourceExecuted)",
-      "fallback": "过滤器执行顺序和异常处理流程图",
-      "items": [
-        "授权过滤器最先执行",
-        "资源过滤器可短路管道",
-        "操作过滤器最常用",
-        "异常过滤器处理未捕获异常"
+      "type": "code",
+      "title": "代码示例",
+      "content": "using System;\nusing System.Diagnostics;\nusing System.Threading.Tasks;\nusing Microsoft.AspNetCore.Mvc;\nusing Microsoft.AspNetCore.Mvc.Filters;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Logging;\n\nnamespace FiltersPipelineDemo\n{\n    // 授权过滤器\n    public class CustomAuthorizeFilter : IAsyncAuthorizationFilter\n    {\n        private readonly string _requiredRole;\n\n        public CustomAuthorizeFilter(string requiredRole)\n        {\n            _requiredRole = requiredRole;\n        }\n\n        public Task OnAuthorizationAsync(AuthorizationFilterContext context)\n        {\n            var user = context.HttpContext.User;\n            if (!user.Identity.IsAuthenticated)\n            {\n                context.Result = new UnauthorizedResult();\n                return Task.CompletedTask;\n            }\n\n            if (!user.IsInRole(_requiredRole))\n            {\n                context.Result = new ForbidResult();\n                return Task.CompletedTask;\n            }\n\n            return Task.CompletedTask;\n        }\n    }\n\n    // 资源过滤器 - 请求限流\n    public class RateLimitResourceFilter : IAsyncResourceFilter\n    {\n        private static readonly Dictionary<string, DateTime> LastRequestTime = new();\n        private readonly int _requestsPerMinute;\n\n        public RateLimitResourceFilter(int requestsPerMinute)\n        {\n            _requestsPerMinute = requestsPerMinute;\n        }\n\n        public async Task OnResourceExecutionAsync(\n            ResourceExecutingContext context,\n            ResourceExecutionDelegate next)\n        {\n            var clientIp = context.HttpContext.Connection.RemoteIpAddress?.ToString();\n            var key = $\"{clientIp}:{context.HttpContext.Request.Path}\";\n\n            if (LastRequestTime.TryGetValue(key, out var lastTime))\n            {\n                var elapsed = DateTime.UtcNow - lastTime;\n                if (elapsed.TotalSeconds < 60.0 / _requestsPerMinute)\n                {\n                    context.Result = new ObjectResult(new { Message = \"请求过于频繁\" })\n                    {\n                        StatusCode = 429\n                    };\n                    return;\n                }\n            }\n\n            LastRequestTime[key] = DateTime.UtcNow;\n            await next();\n        }\n    }\n\n    // 操作过滤器 - 日志记录\n    public class LogActionFilter : IAsyncActionFilter\n    {\n        private readonly ILogger<LogActionFilter> _logger;\n\n        public LogActionFilter(ILogger<LogActionFilter> logger)\n        {\n            _logger = logger;\n        }\n\n        public async Task OnActionExecutionAsync(\n            ActionExecutingContext context,\n            ActionExecutionDelegate next)\n        {\n            var actionName = context.ActionDescriptor.DisplayName;\n            var parameters = context.ActionArguments;\n\n            _logger.LogInformation($\"开始执行操作: {actionName}\");\n            _logger.LogInformation($\"参数: {System.Text.Json.JsonSerializer.Serialize(parameters)}\");\n\n            var stopwatch = Stopwatch.StartNew();\n            var resultContext = await next();\n            stopwatch.Stop();\n\n            if (resultContext.Exception != null)\n            {\n                _logger.LogError(resultContext.Exception,\n                    $\"操作 {actionName} 执行失败，耗时 {stopwatch.ElapsedMilliseconds}ms\");\n            }\n            else\n            {\n                _logger.LogInformation(\n                    $\"操作 {actionName} 执行完成，耗时 {stopwatch.ElapsedMilliseconds}ms，\" +\n                    $\"结果类型: {resultContext.Result?.GetType().Name}\");\n            }\n        }\n    }\n\n    // 异常过滤器 - 全局异常处理\n    public class GlobalExceptionFilter : IAsyncExceptionFilter\n    {\n        private readonly ILogger<GlobalExceptionFilter> _logger;\n\n        public GlobalExceptionFilter(ILogger<GlobalExceptionFilter> logger)\n        {\n            _logger = logger;\n        }\n\n        public async Task OnExceptionAsync(ExceptionContext context)\n        {\n            _logger.LogError(context.Exception, \"发生未处理的异常\");\n\n            var statusCode = context.Exception switch\n            {\n                ArgumentException => 400,\n                UnauthorizedAccessException => 401,\n                KeyNotFoundException => 404,\n                _ => 500\n            };\n\n            context.Result = new ObjectResult(new\n            {\n                Code = statusCode,\n                Message = context.Exception.Message,\n                TraceId = Activity.Current?.Id ?? context.HttpContext.TraceIdentifier\n            })\n            {\n                StatusCode = statusCode\n            };\n\n            context.ExceptionHandled = true;\n        }\n    }\n\n    // 结果过滤器 - 响应包装\n    public class ApiResponseResultFilter : IAsyncResultFilter\n    {\n        public async Task OnResultExecutionAsync(\n            ResultExecutingContext context,\n            ResultExecutionDelegate next)\n        {\n            if (context.Result is ObjectResult objectResult)\n            {\n                var wrappedResult = new\n                {\n                    Code = objectResult.StatusCode ?? 200,\n                    Message = \"成功\",\n                    Data = objectResult.Value,\n                    Timestamp = DateTime.UtcNow\n                };\n\n                objectResult.Value = wrappedResult;\n            }\n\n            await next();\n        }\n    }\n\n    // 过滤器特性\n    public class TimingAttribute : ActionFilterAttribute\n    {\n        private Stopwatch _stopwatch;\n\n        public override void OnActionExecuting(ActionExecutingContext context)\n        {\n            _stopwatch = Stopwatch.StartNew();\n        }\n\n        public override void OnActionExecuted(ActionExecutedContext context)\n        {\n            _stopwatch.Stop();\n            context.HttpContext.Response.Headers.Add(\"X-Execution-Time\",\n                $\"{_stopwatch.ElapsedMilliseconds}ms\");\n        }\n    }\n\n    // 使用过滤器的控制器\n    [ApiController]\n    [Route(\"api/[controller]\")]\n    public class ProductsController : ControllerBase\n    {\n        [HttpGet]\n        [Timing]\n        [ServiceFilter(typeof(LogActionFilter))]\n        public IActionResult GetAll()\n        {\n            return Ok(new[] { \"Product1\", \"Product2\" });\n        }\n\n        [HttpGet(\"{id}\")]\n        [Timing]\n        public IActionResult GetById(int id)\n        {\n            if (id <= 0)\n                throw new ArgumentException(\"ID 必须大于 0\");\n\n            if (id > 100)\n                throw new KeyNotFoundException(\"产品不存在\");\n\n            return Ok($\"Product {id}\");\n        }\n    }\n\n    // 注册过滤器\n    public static class ServiceCollectionExtensions\n    {\n        public static IServiceCollection AddCustomFilters(this IServiceCollection services)\n        {\n            services.AddScoped<LogActionFilter>();\n            services.AddScoped<GlobalExceptionFilter>();\n            services.AddScoped<ApiResponseResultFilter>();\n\n            services.AddControllers(options =>\n            {\n                // 全局过滤器\n                options.Filters.AddService<GlobalExceptionFilter>();\n                options.Filters.AddService<ApiResponseResultFilter>();\n                options.Filters.Add(new RateLimitResourceFilter(100));\n            });\n\n            return services;\n        }\n    }\n}",
+      "language": "csharp",
+      "highlights": [
+        {
+          "line": 24,
+          "note": "这里是边界条件分支，回答 过滤器管道 时要说明它为什么会改变执行路径。"
+        }
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答思路",
+      "content": "ASP.NET Core 过滤器提供了在请求管道不同阶段执行代码的能力，用于实现横切关注点。有五种过滤器类型：授权过滤器最先执行，用于验证身份和权限；资源过滤器在授权后执行，可以短路管道，适用于缓存和限流；操作过滤器在操作方法执行前后执行，是最常用的类型；异常过滤器处理未捕获的异常；结果过滤器在结果执行前后执行。\n\n过滤器可以注册为全局、控制器或操作级别。全局过滤器应用于所有控制器和操作，通过 options.Filters.Add 注册。控制器和操作级别通过特性标注。使用 [ServiceFilter] 或 [TypeFilter] 可以注入依赖。\n\n过滤器的执行顺序是固定的：授权 → 资源 → 操作前 → 操作方法 → 操作后 → 结果前 → 结果后 → 资源后。异常过滤器在操作抛出异常时执行。\n\n自定义过滤器需要实现对应的接口，比如 IAsyncActionFilter 实现 OnActionExecutionAsync 方法，通过调用 next() 执行后续管道。资源过滤器可以通过设置 context.Result 短路管道。\n\n在实际开发中，我会用操作过滤器实现日志、验证、性能监控，用异常过滤器实现全局异常处理，用资源过滤器实现缓存和限流。",
+      "followUpQuestions": [
+        {
+          "question": "面试官追问「过滤器管道」时，最应该展开哪条机制链？",
+          "answer": "回答「过滤器管道」时先抓住 理解五种过滤器类型及其执行顺序，再展开 掌握过滤器的注册方式。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对.NET 工程里真实机制的理解。"
+        },
+        {
+          "question": "如果「过滤器管道」在线上或编码中出问题，你会优先检查什么？",
+          "answer": "可以先确认现象是否落在「掌握过滤器的注册方式」，再结合日志、指标、输入规模和依赖状态验证。"
+        }
       ]
     },
     {
@@ -90,14 +98,21 @@
       "prompt": "请说明 过滤器管道 的核心机制、典型使用场景和常见坑。",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
     },
     {
       "id": "dotnet.aspnet.filters-pipeline.recall.2",
       "prompt": "如何实现一个全局异常过滤器？它与 UseExceptionHandler 中间件有什么区别？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.aspnet.filters-pipeline.recall.3",
+      "prompt": "过滤器管道 和相邻概念或常见替代方案有什么关键区别？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
     }
   ],
   "rubric": {
@@ -105,8 +120,7 @@
       "理解五种过滤器类型及其执行顺序",
       "掌握过滤器的注册方式",
       "能够自定义操作过滤器和异常过滤器",
-      "了解资源过滤器的短路能力",
-      "知道过滤器与中间件的区别"
+      "了解资源过滤器的短路能力"
     ],
     "goodToHave": [
       "了解过滤器的工厂模式",
@@ -114,7 +128,7 @@
       "理解过滤器的性能影响"
     ],
     "commonMistakes": [
-      "只背「过滤器管道」结论，讲不清理解五种过滤器类型及其执行顺序",
+      "只列出 ASP.NET、过滤器、Filter，但说不出触发条件、状态变化和验证证据",
       "把「过滤器管道」的适用场景、失效条件和相邻概念混在一起",
       "遇到.NET 工程里的真实问题时，不能说明「过滤器管道」应该观察哪些状态、日志或指标"
     ],
@@ -130,5 +144,5 @@
   ],
   "interviewFrequency": "medium",
   "interviewerFocus": "考察是否能围绕「过滤器管道」说清理解五种过滤器类型及其执行顺序、掌握过滤器的注册方式，并放到.NET 工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-11"
+  "updatedAt": "2026-06-12"
 }

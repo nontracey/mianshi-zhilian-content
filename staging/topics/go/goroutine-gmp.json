@@ -1,0 +1,166 @@
+{
+  "id": "go.concurrency.goroutine-gmp",
+  "domain": "go",
+  "category": "concurrency",
+  "group": "concurrency",
+  "title": "Goroutine 与 GMP 调度模型",
+  "summary": "理解 Goroutine 轻量并发、GMP 调度器、抢占和阻塞处理机制。",
+  "tags": [
+    "Go",
+    "Goroutine",
+    "GMP",
+    "调度器"
+  ],
+  "difficulty": 4,
+  "estimatedMinutes": 35,
+  "order": 40,
+  "recommendWeight": 94,
+  "status": "staging",
+  "prerequisites": [
+    "go.basics.types"
+  ],
+  "interviewFrequency": "high",
+  "interviewerFocus": "考察是否能解释 Goroutine 为什么轻量，G、M、P 如何协同，阻塞、抢占、work stealing 和泄漏如何影响生产系统。",
+  "learningCards": [
+    {
+      "type": "explain",
+      "title": "Goroutine 轻量来自运行时调度而不是没有成本",
+      "content": "Goroutine 是 Go 运行时管理的用户态任务，初始栈小且可增长。运行时用 GMP 模型把大量 G 调度到有限的 M 上执行，P 提供本地队列、调度资源和可并行执行 Go 代码的名额。\n\n从零理解时先抓住这几个点：\n- G 保存 goroutine 的栈、状态和待执行函数\n- M 是操作系统线程，真正执行机器指令\n- P 持有本地运行队列，M 必须拿到 P 才能执行 Go 代码\n- 阻塞系统调用、网络 IO、抢占和 work stealing 会触发调度调整\n\n容易答浅的地方通常在边界：\n- Goroutine 很轻但不是免费，泄漏会持有栈、channel、timer 或外部资源\n- GOMAXPROCS 控制 P 的数量，不是 goroutine 总数\n- CPU 密集任务仍受核心数和调度公平性限制"
+    },
+    {
+      "type": "explain",
+      "title": "阻塞处理、抢占和泄漏是高阶追问",
+      "content": "当 goroutine 进入网络 IO 时，运行时会配合 netpoller 挂起等待，P 可以继续服务其他 G；当进入可能长时间阻塞的系统调用时，M 可能暂时脱离 P，运行时会把 P 交给其他 M，避免整个调度器被卡住。这个过程说明 Go 并发适合大量 IO，但不代表阻塞可以随意写。\n\nGo 也有抢占调度。早期主要依赖函数调用点，现在运行时能在更多位置插入异步抢占，避免某个长循环长期占住 P。线上排查 goroutine 泄漏时，通常看 goroutine profile、阻塞位置、channel 收发是否成对、Context 是否取消、WaitGroup 是否 Done。\n\n把 Goroutine 与 GMP 调度模型 放到真实场景里看，重点是语言语义、运行时调度、并发边界和工程实践。先确认触发条件，再看状态或数据怎样变化，最后用指标、日志、测试结果或复杂度证明判断。"
+    },
+    {
+      "type": "diagram",
+      "title": "GMP 调度与阻塞处理",
+      "format": "mermaid",
+      "content": "flowchart LR\nA[创建 G] --> B[进入 P 本地队列]\nB[进入 P 本地队列] --> C[M 绑定 P 执行 G]\nC[M 绑定 P 执行 G] --> D[G 发生阻塞或被抢占]\nD[G 发生阻塞或被抢占] --> E[P 继续调度其他 G]\nE[P 继续调度其他 G] --> F[阻塞结束后重新入队]",
+      "fallback": "创建 G -> 进入 P 本地队列 -> M 绑定 P 执行 G -> G 发生阻塞或被抢占 -> P 继续调度其他 G -> 阻塞结束后重新入队",
+      "caption": "P 是调度资源，M 是执行线程，G 是被调度任务；阻塞处理决定并发吞吐。"
+    },
+    {
+      "type": "compareTable",
+      "title": "G、M、P 职责对比",
+      "columns": [
+        "考点",
+        "应该怎么理解",
+        "面试追问",
+        "常见坑"
+      ],
+      "rows": [
+        [
+          "G",
+          "goroutine 任务状态",
+          "为什么轻量",
+          "泄漏不是免费"
+        ],
+        [
+          "M",
+          "操作系统线程",
+          "系统调用如何处理",
+          "线程数仍可能增长"
+        ],
+        [
+          "P",
+          "调度上下文和本地队列",
+          "GOMAXPROCS 控制什么",
+          "不等于 goroutine 数"
+        ],
+        [
+          "work stealing",
+          "空闲 P 偷取其他队列任务",
+          "如何保持负载均衡",
+          "不是业务层负载均衡"
+        ]
+      ]
+    },
+    {
+      "type": "code",
+      "title": "用 Context 防止 Goroutine 泄漏",
+      "language": "go",
+      "content": "package main\n\nimport (\n\t\"context\"\n\t\"time\"\n)\n\nfunc worker(ctx context.Context, jobs <-chan int) {\n\tfor {\n\t\tselect {\n\t\tcase <-ctx.Done():\n\t\t\treturn\n\t\tcase <-jobs:\n\t\t\t// handle job\n\t\t}\n\t}\n}\n\nfunc main() {\n\tctx, cancel := context.WithTimeout(context.Background(), time.Second)\n\tdefer cancel()\n\tjobs := make(chan int)\n\tgo worker(ctx, jobs)\n}",
+      "highlights": [
+        {
+          "line": 11,
+          "note": "这里体现取消信号的传播，说明 Goroutine 与 GMP 调度模型 时要强调任务必须有退出条件。"
+        }
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答思路",
+      "content": "GMP 我会先给结论：Go 用运行时调度器把大量 goroutine 复用到较少线程上执行。\n\n我会按这条线展开：\n1. G 是任务，M 是线程，P 是调度资源和本地队列\n2. M 必须持有 P 才能执行 Go 代码，GOMAXPROCS 决定同时执行 Go 代码的 P 数量\n3. 网络阻塞、系统调用和抢占会让调度器重新安排 G，避免少数阻塞拖垮整体\n4. 生产上要关注 goroutine 生命周期，泄漏会表现为内存、句柄和队列持续增长\n\n最后补一句边界：Goroutine 适合高并发任务拆分，但必须设计退出条件；无限创建 goroutine 并不会自动带来吞吐。",
+      "followUpQuestions": [
+        {
+          "question": "GOMAXPROCS 控制什么？",
+          "answer": "它控制 P 的数量，也就是可同时执行 Go 代码的并行度；它不限制 goroutine 总数，也不等于操作系统线程总数。"
+        },
+        {
+          "question": "怎么定位 goroutine 泄漏？",
+          "answer": "先看 goroutine profile 的数量和栈位置，再检查 channel 收发、Context 取消、定时器、WaitGroup Done 和外部调用是否存在永远等待。"
+        }
+      ]
+    },
+    {
+      "type": "checklist",
+      "title": "学完后应能说清楚",
+      "items": [
+        "能说明 G/M/P 职责",
+        "能解释阻塞系统调用处理",
+        "能说明抢占和 work stealing",
+        "能区分 GOMAXPROCS 和 goroutine 数",
+        "能定位 goroutine 泄漏"
+      ]
+    }
+  ],
+  "recallPrompts": [
+    {
+      "id": "go.concurrency.goroutine-gmp.recall.1",
+      "prompt": "请讲清楚 Go 的 GMP 调度模型，以及 G、M、P 分别负责什么。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "go.concurrency.goroutine-gmp.recall.2",
+      "prompt": "GOMAXPROCS 控制什么？和 goroutine 数量有什么区别？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "go.concurrency.goroutine-gmp.recall.3",
+      "prompt": "Goroutine 泄漏通常怎么产生，如何用 pprof 定位？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    }
+  ],
+  "rubric": {
+    "mustHave": [
+      "G/M/P 职责",
+      "能说明「本地队列」在「Goroutine 与 GMP 调度模型」里的作用和判断标准",
+      "GOMAXPROCS",
+      "能说明「阻塞处理」在「Goroutine 与 GMP 调度模型」里的作用和判断标准"
+    ],
+    "goodToHave": [
+      "work stealing",
+      "netpoller",
+      "goroutine profile 定位泄漏"
+    ],
+    "commonMistakes": [
+      "把 goroutine 等同线程",
+      "认为 GOMAXPROCS 限制协程数",
+      "创建 goroutine 不设计退出条件"
+    ],
+    "scoreWeights": {
+      "coverage": 30,
+      "accuracy": 25,
+      "interviewExpression": 20,
+      "depth": 25
+    }
+  },
+  "updatedAt": "2026-06-12"
+}

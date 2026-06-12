@@ -14,7 +14,7 @@
     "Hub"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 45,
+  "estimatedMinutes": 40,
   "order": 40,
   "recommendWeight": 80,
   "status": "production",
@@ -30,25 +30,18 @@
       "content": "## 连接管理\n\n**连接 ID**：每个连接都有唯一标识\n```csharp\nstring connectionId = Context.ConnectionId;\n```\n\n**分组管理**：\n```csharp\nawait Groups.AddToGroupAsync(connectionId, \"groupName\");\nawait Groups.RemoveFromGroupAsync(connectionId, \"groupName\");\n```\n\n**用户标识**：\n```csharp\nstring userId = Context.UserIdentifier;\n```\n\n## 强类型 Hub\n\n使用接口定义客户端方法：\n```csharp\npublic interface IChatClient\n{\n    Task ReceiveMessage(string user, string message);\n    Task UserConnected(string userId);\n    Task UserDisconnected(string userId);\n}\n\npublic class ChatHub : Hub<IChatClient>\n{\n    public async Task SendMessage(string message)\n    {\n        await Clients.All.ReceiveMessage(Context.UserIdentifier, message);\n    }\n}\n```\n\n## 身份验证和授权\n\n```csharp\n[Authorize]\npublic class SecureHub : Hub\n{\n    [Authorize(Roles = \"Admin\")]\n    public async Task AdminOnlyMethod()\n    {\n        // 只有管理员可以调用\n    }\n}\n```\n\n## 错误处理\n\n```csharp\npublic class ChatHub : Hub\n{\n    public async Task SendMessage(string message)\n    {\n        try\n        {\n            await Clients.All.ReceiveMessage(message);\n        }\n        catch (Exception ex)\n        {\n            // 通知调用者错误\n            await Clients.Caller.SendAsync(\"Error\", ex.Message);\n        }\n    }\n}\n```\n\n## 性能优化\n\n1. **使用强类型 Hub**：编译时检查\n2. **减少消息大小**：只发送必要数据\n3. **使用分组**：避免广播给所有用户\n4. **配置传输方式**：优先使用 WebSocket\n5. **启用消息压缩**：减少带宽\n\n## 与 WebSocket 对比\n\n**SignalR 优点**：\n- 简单易用的 API\n- 自动选择传输方式\n- 内置重连机制\n- 支持远程方法调用\n\n**原生 WebSocket 优点**：\n- 更底层，更灵活\n- 更好的性能\n- 更小的开销\n\n**选择建议**：\n- 需要快速开发：SignalR\n- 需要极致性能：原生 WebSocket\n- 需要兼容性：SignalR（自动降级）"
     },
     {
-      "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Collections.Concurrent;\nusing System.Threading.Tasks;\nusing Microsoft.AspNetCore.Authorization;\nusing Microsoft.AspNetCore.SignalR;\nusing Microsoft.Extensions.Logging;\n\nnamespace SignalRDemo\n{\n    // 强类型接口\n    public interface IChatClient\n    {\n        Task ReceiveMessage(string user, string message, DateTime timestamp);\n        Task UserConnected(string userId, string username);\n        Task UserDisconnected(string userId);\n        Task ReceiveNotification(string message);\n    }\n\n    // 聊天 Hub\n    [Authorize]\n    public class ChatHub : Hub<IChatClient>\n    {\n        private static readonly ConcurrentDictionary<string, string> Users = new();\n        private readonly ILogger<ChatHub> _logger;\n\n        public ChatHub(ILogger<ChatHub> logger)\n        {\n            _logger = logger;\n        }\n\n        public async Task SendMessage(string message)\n        {\n            var userId = Context.UserIdentifier;\n            var username = Users.GetValueOrDefault(userId, \"Unknown\");\n\n            _logger.LogInformation($\"{username} 发送消息: {message}\");\n\n            await Clients.All.ReceiveMessage(username, message, DateTime.UtcNow);\n        }\n\n        public async Task SendToUser(string targetUserId, string message)\n        {\n            var senderId = Context.UserIdentifier;\n            var senderName = Users.GetValueOrDefault(senderId, \"Unknown\");\n\n            await Clients.User(targetUserId).ReceiveMessage(senderName, message, DateTime.UtcNow);\n        }\n\n        public async Task JoinGroup(string groupName)\n        {\n            await Groups.AddToGroupAsync(Context.ConnectionId, groupName);\n            await Clients.Group(groupName).ReceiveNotification(\n                $\"{Users.GetValueOrDefault(Context.UserIdentifier, \"Unknown\")} 加入了群组\");\n        }\n\n        public async Task LeaveGroup(string groupName)\n        {\n            await Groups.RemoveFromGroupAsync(Context.ConnectionId, groupName);\n            await Clients.Group(groupName).ReceiveNotification(\n                $\"{Users.GetValueOrDefault(Context.UserIdentifier, \"Unknown\")} 离开了群组\");\n        }\n\n        public async Task SendToGroup(string groupName, string message)\n        {\n            var username = Users.GetValueOrDefault(Context.UserIdentifier, \"Unknown\");\n            await Clients.Group(groupName).ReceiveMessage(username, message, DateTime.UtcNow);\n        }\n\n        public override async Task OnConnectedAsync()\n        {\n            var userId = Context.UserIdentifier;\n            var username = Context.User?.Identity?.Name ?? userId;\n\n            Users[userId] = username;\n\n            _logger.LogInformation($\"用户 {username} 连接，ConnectionId: {Context.ConnectionId}\");\n\n            await Clients.All.UserConnected(userId, username);\n            await Clients.Caller.ReceiveNotification(\"欢迎加入聊天室！\");\n\n            await base.OnConnectedAsync();\n        }\n\n        public override async Task OnDisconnectedAsync(Exception exception)\n        {\n            var userId = Context.UserIdentifier;\n            var username = Users.GetValueOrDefault(userId, \"Unknown\");\n\n            Users.TryRemove(userId, out _);\n\n            _logger.LogInformation($\"用户 {username} 断开连接\");\n\n            await Clients.All.UserDisconnected(userId);\n\n            await base.OnDisconnectedAsync(exception);\n        }\n    }\n\n    // 通知 Hub\n    public class NotificationHub : Hub\n    {\n        public async Task SendNotification(string userId, string message)\n        {\n            await Clients.User(userId).SendAsync(\"ReceiveNotification\", message);\n        }\n\n        public async Task BroadcastNotification(string message)\n        {\n            await Clients.All.SendAsync(\"ReceiveNotification\", message);\n        }\n    }\n\n    // 进度报告 Hub\n    public class ProgressHub : Hub\n    {\n        public async Task StartLongRunningTask(string taskId)\n        {\n            // 模拟长时间运行的任务\n            for (int i = 0; i <= 100; i += 10)\n            {\n                await Task.Delay(500);\n                await Clients.Caller.SendAsync(\"ProgressUpdate\", taskId, i);\n            }\n\n            await Clients.Caller.SendAsync(\"TaskCompleted\", taskId);\n        }\n    }\n\n    // 配置服务\n    public static class SignalRServiceCollectionExtensions\n    {\n        public static IServiceCollection AddCustomSignalR(this IServiceCollection services)\n        {\n            services.AddSignalR(options =>\n            {\n                options.EnableDetailedErrors = true;\n                options.KeepAliveInterval = TimeSpan.FromSeconds(15);\n                options.ClientTimeoutInterval = TimeSpan.FromSeconds(30);\n                options.MaximumReceiveMessageSize = 1024 * 1024; // 1MB\n            })\n            .AddJsonProtocol(options =>\n            {\n                options.PayloadSerializerOptions.PropertyNamingPolicy =\n                    System.Text.Json.JsonNamingPolicy.CamelCase;\n            });\n\n            return services;\n        }\n    }\n\n    // 配置中间件\n    public static class SignalREndpointRouteBuilderExtensions\n    {\n        public static IEndpointRouteBuilder MapCustomHubs(this IEndpointRouteBuilder endpoints)\n        {\n            endpoints.MapHub<ChatHub>(\"/hubs/chat\");\n            endpoints.MapHub<NotificationHub>(\"/hubs/notification\");\n            endpoints.MapHub<ProgressHub>(\"/hubs/progress\");\n\n            return endpoints;\n        }\n    }\n\n    // JavaScript 客户端示例（注释）\n    /*\n    // 创建连接\n    const connection = new signalR.HubConnectionBuilder()\n        .withUrl(\"/hubs/chat\")\n        .withAutomaticReconnect()\n        .build();\n\n    // 监听方法\n    connection.on(\"ReceiveMessage\", (user, message, timestamp) => {\n        console.log(`${user}: ${message}`);\n    });\n\n    connection.on(\"UserConnected\", (userId, username) => {\n        console.log(`${username} 已连接`);\n    });\n\n    connection.on(\"ReceiveNotification\", (message) => {\n        alert(message);\n    });\n\n    // 启动连接\n    async function start() {\n        try {\n            await connection.start();\n            console.log(\"SignalR 已连接\");\n        } catch (err) {\n            console.error(err);\n            setTimeout(start, 5000);\n        }\n    }\n\n    connection.onclose(async () => {\n        await start();\n    });\n\n    // 调用服务器方法\n    await connection.invoke(\"SendMessage\", \"Hello!\");\n    await connection.invoke(\"JoinGroup\", \"General\");\n    await connection.invoke(\"SendToGroup\", \"General\", \"Group message\");\n    */\n}",
-      "language": "csharp"
-    },
-    {
-      "type": "interviewAnswer",
-      "title": "面试回答模板",
-      "content": "SignalR 是 ASP.NET Core 的实时通信框架，它简化了服务器到客户端的实时推送。SignalR 基于 Hub 模式，Hub 是一个高级管道，允许客户端和服务器互相调用方法。客户端可以调用服务器的公共方法，服务器也可以调用客户端的方法。\n\nSignalR 支持多种传输方式：WebSocket（最优）、Server-Sent Events、Long Polling。它会自动选择最佳的传输方式，如果浏览器不支持 WebSocket，会自动降级到其他方式。\n\n在服务器端，Hub 类定义了客户端可以调用的方法。通过 Clients 属性，可以向特定客户端、所有客户端、特定组或特定用户发送消息。比如 Clients.All.SendAsync 向所有客户端广播，Clients.Group 向特定组发送。\n\n客户端使用 HubConnectionBuilder 建立连接，通过 on 方法监听服务器调用，通过 invoke 方法调用服务器方法。SignalR 内置了重连机制，可以配置自动重连。\n\n身份验证和授权可以通过 [Authorize] 特性实现，支持 JWT、Cookie 等认证方案。还可以使用强类型 Hub，通过接口定义客户端方法，提高类型安全性。\n\n在实际应用中，SignalR 适合聊天应用、实时通知、协作编辑、实时数据监控等场景。",
-      "followUpQuestions": [
-        {
-          "question": "面试官追问「SignalR 实时通信」时，最应该展开哪条机制链？",
-          "answer": "回答「SignalR 实时通信」时先抓住 理解 SignalR 的 Hub 模式，再展开 掌握 Hub 方法的定义和调用。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对.NET 工程里真实机制的理解。"
-        },
-        {
-          "question": "如果「SignalR 实时通信」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "我会先确认问题是否落在「SignalR 实时通信」的核心边界上，再看 异常日志、请求耗时、GC/线程池/连接池指标、数据库查询和依赖服务超时。排查时特别避免“只背「SignalR 实时通信」结论，讲不清理解 SignalR 的 Hub 模式”这个误区，先复现触发条件，再用日志、指标或最小用例验证修复是否真的命中原因。"
-        }
-      ]
+      "type": "diagram",
+      "title": "SignalR 实时通信 学习主线图",
+      "content": "flowchart LR\nA[SignalR 实时通信] --> B[.NET]\nB --> C[ASP.NET]\nC --> D[SignalR]\nD --> E[实时通信]\nE --> F[WebSocket]",
+      "fallback": "SignalR 实时通信 -> .NET -> ASP.NET -> SignalR -> 实时通信 -> WebSocket",
+      "items": [
+        "Hub是通信核心",
+        "自动选择传输方式",
+        "支持远程方法调用",
+        "内置分组和用户管理"
+      ],
+      "format": "mermaid",
+      "caption": "从 .NET 到 WebSocket，这张图帮助区分 SignalR 实时通信 的核心机制、边界条件和常见误区。"
     },
     {
       "type": "compareTable",
@@ -61,15 +54,30 @@
       "content": "| 维度 | 广播 | 组播 | 点对点 |\n| --- | --- | --- | --- |\n| 接收方 | 所有客户端 | 特定组的客户端 | 特定客户端 |\n| API | Clients.All | Clients.Group | Clients.User / Clients.Client |\n| 适用场景 | 系统公告 | 聊天室 | 私聊 |\n| 性能影响 | 高（大量消息） | 中 | 低 |"
     },
     {
-      "type": "diagram",
-      "title": "结构图解",
-      "content": "SignalR 通信流程：\n\n客户端 → 建立连接(HubConnection) → 加入组(可选)\n    ↓\n调用服务器方法: connection.invoke(\"SendMessage\", msg)\n    ↓\n服务器 Hub 方法执行\n    ↓\n调用客户端方法: Clients.All.SendAsync(\"ReceiveMessage\", msg)\n    ↓\n客户端 on(\"ReceiveMessage\") 接收\n\n连接生命周期：\nOnConnectedAsync() → 方法调用 → OnDisconnectedAsync()",
-      "fallback": "SignalR客户端服务器通信流程图",
-      "items": [
-        "Hub是通信核心",
-        "自动选择传输方式",
-        "支持远程方法调用",
-        "内置分组和用户管理"
+      "type": "code",
+      "title": "代码示例",
+      "content": "using System;\nusing System.Collections.Concurrent;\nusing System.Threading.Tasks;\nusing Microsoft.AspNetCore.Authorization;\nusing Microsoft.AspNetCore.SignalR;\nusing Microsoft.Extensions.Logging;\n\nnamespace SignalRDemo\n{\n    // 强类型接口\n    public interface IChatClient\n    {\n        Task ReceiveMessage(string user, string message, DateTime timestamp);\n        Task UserConnected(string userId, string username);\n        Task UserDisconnected(string userId);\n        Task ReceiveNotification(string message);\n    }\n\n    // 聊天 Hub\n    [Authorize]\n    public class ChatHub : Hub<IChatClient>\n    {\n        private static readonly ConcurrentDictionary<string, string> Users = new();\n        private readonly ILogger<ChatHub> _logger;\n\n        public ChatHub(ILogger<ChatHub> logger)\n        {\n            _logger = logger;\n        }\n\n        public async Task SendMessage(string message)\n        {\n            var userId = Context.UserIdentifier;\n            var username = Users.GetValueOrDefault(userId, \"Unknown\");\n\n            _logger.LogInformation($\"{username} 发送消息: {message}\");\n\n            await Clients.All.ReceiveMessage(username, message, DateTime.UtcNow);\n        }\n\n        public async Task SendToUser(string targetUserId, string message)\n        {\n            var senderId = Context.UserIdentifier;\n            var senderName = Users.GetValueOrDefault(senderId, \"Unknown\");\n\n            await Clients.User(targetUserId).ReceiveMessage(senderName, message, DateTime.UtcNow);\n        }\n\n        public async Task JoinGroup(string groupName)\n        {\n            await Groups.AddToGroupAsync(Context.ConnectionId, groupName);\n            await Clients.Group(groupName).ReceiveNotification(\n                $\"{Users.GetValueOrDefault(Context.UserIdentifier, \"Unknown\")} 加入了群组\");\n        }\n\n        public async Task LeaveGroup(string groupName)\n        {\n            await Groups.RemoveFromGroupAsync(Context.ConnectionId, groupName);\n            await Clients.Group(groupName).ReceiveNotification(\n                $\"{Users.GetValueOrDefault(Context.UserIdentifier, \"Unknown\")} 离开了群组\");\n        }\n\n        public async Task SendToGroup(string groupName, string message)\n        {\n            var username = Users.GetValueOrDefault(Context.UserIdentifier, \"Unknown\");\n            await Clients.Group(groupName).ReceiveMessage(username, message, DateTime.UtcNow);\n        }\n\n        public override async Task OnConnectedAsync()\n        {\n            var userId = Context.UserIdentifier;\n            var username = Context.User?.Identity?.Name ?? userId;\n\n            Users[userId] = username;\n\n            _logger.LogInformation($\"用户 {username} 连接，ConnectionId: {Context.ConnectionId}\");\n\n            await Clients.All.UserConnected(userId, username);\n            await Clients.Caller.ReceiveNotification(\"欢迎加入聊天室！\");\n\n            await base.OnConnectedAsync();\n        }\n\n        public override async Task OnDisconnectedAsync(Exception exception)\n        {\n            var userId = Context.UserIdentifier;\n            var username = Users.GetValueOrDefault(userId, \"Unknown\");\n\n            Users.TryRemove(userId, out _);\n\n            _logger.LogInformation($\"用户 {username} 断开连接\");\n\n            await Clients.All.UserDisconnected(userId);\n\n            await base.OnDisconnectedAsync(exception);\n        }\n    }\n\n    // 通知 Hub\n    public class NotificationHub : Hub\n    {\n        public async Task SendNotification(string userId, string message)\n        {\n            await Clients.User(userId).SendAsync(\"ReceiveNotification\", message);\n        }\n\n        public async Task BroadcastNotification(string message)\n        {\n            await Clients.All.SendAsync(\"ReceiveNotification\", message);\n        }\n    }\n\n    // 进度报告 Hub\n    public class ProgressHub : Hub\n    {\n        public async Task StartLongRunningTask(string taskId)\n        {\n            // 模拟长时间运行的任务\n            for (int i = 0; i <= 100; i += 10)\n            {\n                await Task.Delay(500);\n                await Clients.Caller.SendAsync(\"ProgressUpdate\", taskId, i);\n            }\n\n            await Clients.Caller.SendAsync(\"TaskCompleted\", taskId);\n        }\n    }\n\n    // 配置服务\n    public static class SignalRServiceCollectionExtensions\n    {\n        public static IServiceCollection AddCustomSignalR(this IServiceCollection services)\n        {\n            services.AddSignalR(options =>\n            {\n                options.EnableDetailedErrors = true;\n                options.KeepAliveInterval = TimeSpan.FromSeconds(15);\n                options.ClientTimeoutInterval = TimeSpan.FromSeconds(30);\n                options.MaximumReceiveMessageSize = 1024 * 1024; // 1MB\n            })\n            .AddJsonProtocol(options =>\n            {\n                options.PayloadSerializerOptions.PropertyNamingPolicy =\n                    System.Text.Json.JsonNamingPolicy.CamelCase;\n            });\n\n            return services;\n        }\n    }\n\n    // 配置中间件\n    public static class SignalREndpointRouteBuilderExtensions\n    {\n        public static IEndpointRouteBuilder MapCustomHubs(this IEndpointRouteBuilder endpoints)\n        {\n            endpoints.MapHub<ChatHub>(\"/hubs/chat\");\n            endpoints.MapHub<NotificationHub>(\"/hubs/notification\");\n            endpoints.MapHub<ProgressHub>(\"/hubs/progress\");\n\n            return endpoints;\n        }\n    }\n\n    // JavaScript 客户端示例（注释）\n    /*\n    // 创建连接\n    const connection = new signalR.HubConnectionBuilder()\n        .withUrl(\"/hubs/chat\")\n        .withAutomaticReconnect()\n        .build();\n\n    // 监听方法\n    connection.on(\"ReceiveMessage\", (user, message, timestamp) => {\n        console.log(`${user}: ${message}`);\n    });\n\n    connection.on(\"UserConnected\", (userId, username) => {\n        console.log(`${username} 已连接`);\n    });\n\n    connection.on(\"ReceiveNotification\", (message) => {\n        alert(message);\n    });\n\n    // 启动连接\n    async function start() {\n        try {\n            await connection.start();\n            console.log(\"SignalR 已连接\");\n        } catch (err) {\n            console.error(err);\n            setTimeout(start, 5000);\n        }\n    }\n\n    connection.onclose(async () => {\n        await start();\n    });\n\n    // 调用服务器方法\n    await connection.invoke(\"SendMessage\", \"Hello!\");\n    await connection.invoke(\"JoinGroup\", \"General\");\n    await connection.invoke(\"SendToGroup\", \"General\", \"Group message\");\n    */\n}",
+      "language": "csharp",
+      "highlights": [
+        {
+          "line": 119,
+          "note": "这里体现状态推进或遍历过程，需要说明终止条件、复杂度和异常输入。"
+        }
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答思路",
+      "content": "结论：SignalR 实时通信 要先说清它解决什么问题，再展开机制、边界和验证方式。掌握 Hub 的使用、连接管理以及与 WebSocket 的对比\n\n我会这样回答：\n1. 先定位核心问题：理解 SignalR 的 Hub 模式。\n2. 再串起关键机制：Hub 方法的定义和调用，并说明它和 知道如何向不同范围发送消息 的关系。\n3. 接着补充边界和风险：只给出结论，不能说明理解 SignalR 的 Hub 模。\n4. 最后落到验证方式：结合请求管线、配置、日志、指标和诊断工具验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
+      "followUpQuestions": [
+        {
+          "question": "面试官追问「SignalR 实时通信」时，最应该展开哪条机制链？",
+          "answer": "回答「SignalR 实时通信」时先抓住 理解 SignalR 的 Hub 模式，再展开 掌握 Hub 方法的定义和调用。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对.NET 工程里真实机制的理解。"
+        },
+        {
+          "question": "如果「SignalR 实时通信」在线上或编码中出问题，你会优先检查什么？",
+          "answer": "可以先确认现象是否落在「掌握 Hub 方法的定义和调用」，再结合日志、指标、输入规模和依赖状态验证。"
+        }
       ]
     },
     {
@@ -91,14 +99,21 @@
       "prompt": "请说明 SignalR 实时通信 的核心机制、典型使用场景和常见坑。",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
     },
     {
       "id": "dotnet.aspnet.signalr.recall.2",
       "prompt": "SignalR 支持哪些传输方式？它与原生 WebSocket 有什么区别？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.aspnet.signalr.recall.3",
+      "prompt": "SignalR 实时通信 和相邻概念或常见替代方案有什么关键区别？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
     }
   ],
   "rubric": {
@@ -106,8 +121,7 @@
       "理解 SignalR 的 Hub 模式",
       "掌握 Hub 方法的定义和调用",
       "知道如何向不同范围发送消息",
-      "了解连接管理和生命周期",
-      "知道 SignalR 的传输方式"
+      "了解连接管理和生命周期"
     ],
     "goodToHave": [
       "了解强类型 Hub 的使用",
@@ -115,7 +129,7 @@
       "理解 SignalR 的性能优化"
     ],
     "commonMistakes": [
-      "只背「SignalR 实时通信」结论，讲不清理解 SignalR 的 Hub 模式",
+      "只列出 ASP.NET、SignalR、实时通信，但说不出触发条件、状态变化和验证证据",
       "把「SignalR 实时通信」的适用场景、失效条件和相邻概念混在一起",
       "遇到.NET 工程里的真实问题时，不能说明「SignalR 实时通信」应该观察哪些状态、日志或指标"
     ],
@@ -131,5 +145,5 @@
   ],
   "interviewFrequency": "medium",
   "interviewerFocus": "考察是否能围绕「SignalR 实时通信」说清理解 SignalR 的 Hub 模式、掌握 Hub 方法的定义和调用，并放到.NET 工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-11"
+  "updatedAt": "2026-06-12"
 }

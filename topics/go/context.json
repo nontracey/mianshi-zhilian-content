@@ -1,0 +1,166 @@
+{
+  "id": "go.concurrency.context",
+  "domain": "go",
+  "category": "concurrency",
+  "group": "concurrency",
+  "title": "Context 超时、取消与链路传递",
+  "summary": "理解 context 在请求生命周期、超时取消、元数据传递和 Goroutine 退出中的作用。",
+  "tags": [
+    "Go",
+    "Context",
+    "超时",
+    "取消"
+  ],
+  "difficulty": 3,
+  "estimatedMinutes": 28,
+  "order": 60,
+  "recommendWeight": 90,
+  "status": "production",
+  "prerequisites": [
+    "go.concurrency.channel-select"
+  ],
+  "interviewFrequency": "high",
+  "interviewerFocus": "考察是否能解释 Context 的取消传播、超时控制、请求级值传递和资源释放边界。",
+  "learningCards": [
+    {
+      "type": "explain",
+      "title": "Context 管的是请求生命周期，不是业务参数袋",
+      "content": "Context 用来在调用链上传递取消信号、截止时间和请求级元数据。它解决的是“上游已经不需要结果时，下游如何尽快停掉工作”这个工程问题。\n\n从零理解时先抓住这几个点：\n- WithCancel 手动取消一棵调用树\n- WithTimeout/WithDeadline 给请求设置时间边界\n- Done channel 关闭后下游应停止阻塞操作\n- Value 只放请求级元数据，如 trace id，不放必需业务参数\n\n容易答浅的地方通常在边界：\n- 创建带超时的 Context 后忘记调用 cancel 会延迟释放 timer 资源\n- 把 Context 存进结构体会模糊生命周期\n- 用 Value 传业务参数会降低可读性和类型安全"
+    },
+    {
+      "type": "explain",
+      "title": "取消传播要被下游主动观察",
+      "content": "Context 的取消不是强杀 goroutine。它只是关闭 Done channel，并把取消原因暴露给调用者；下游必须在 select、循环、IO 请求或数据库调用中主动检查这个信号。面试表达时要强调“协作式取消”，否则容易让人误以为 Context 能自动终止所有工作。\n\n超时控制也要分层设计：入口请求有整体超时，调用外部服务有更短的子超时，数据库或消息发送要使用支持 Context 的 API。`defer cancel()` 不是可有可无，它能及时释放 timer 和父子关系。\n\n把 Context 超时、取消与链路传递 放到真实场景里看，重点是语言语义、运行时调度、并发边界和工程实践。先确认触发条件，再看状态或数据怎样变化，最后用指标、日志、测试结果或复杂度证明判断。"
+    },
+    {
+      "type": "diagram",
+      "title": "Context 取消传播链路",
+      "format": "mermaid",
+      "content": "flowchart LR\nA[入口创建 Context] --> B[派生子 Context]\nB[派生子 Context] --> C[传入下游调用]\nC[传入下游调用] --> D[上游超时或取消]\nD[上游超时或取消] --> E[Done 关闭]\nE[Done 关闭] --> F[下游停止并释放资源]",
+      "fallback": "入口创建 Context -> 派生子 Context -> 传入下游调用 -> 上游超时或取消 -> Done 关闭 -> 下游停止并释放资源",
+      "caption": "Context 通过树形关系传播取消，真正停止工作依赖下游代码主动响应。"
+    },
+    {
+      "type": "compareTable",
+      "title": "Context 常用能力",
+      "columns": [
+        "考点",
+        "应该怎么理解",
+        "面试追问",
+        "常见坑"
+      ],
+      "rows": [
+        [
+          "WithCancel",
+          "手动停止调用树",
+          "用户断开或主动终止",
+          "忘记 cancel 泄漏资源"
+        ],
+        [
+          "WithTimeout",
+          "设置相对超时",
+          "RPC/DB/HTTP 调用",
+          "超时时间层层放大"
+        ],
+        [
+          "WithDeadline",
+          "设置绝对截止时间",
+          "跨服务共享截止时间",
+          "时钟和预算要统一"
+        ],
+        [
+          "Value",
+          "传请求级元数据",
+          "trace id、租户 id",
+          "滥用成参数容器"
+        ]
+      ]
+    },
+    {
+      "type": "code",
+      "title": "Context 控制下游循环退出",
+      "language": "go",
+      "content": "package main\n\nimport \"context\"\n\nfunc consume(ctx context.Context, input <-chan string) {\n\tfor {\n\t\tselect {\n\t\tcase <-ctx.Done():\n\t\t\treturn\n\t\tcase msg := <-input:\n\t\t\t_ = msg // handle message\n\t\t}\n\t}\n}",
+      "highlights": [
+        {
+          "line": 8,
+          "note": "这里体现取消信号的传播，说明 Context 超时、取消与链路传递 时要强调任务必须有退出条件。"
+        }
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答思路",
+      "content": "Context 我会先说它管理请求生命周期，核心是取消、超时和请求级元数据。\n\n我会按这条线展开：\n1. 上游创建 Context，并把它作为第一个参数一路传下去\n2. 取消和超时通过 Done channel 通知下游，下游要主动 select 或调用支持 Context 的 API\n3. WithTimeout/WithDeadline 用于控制资源占用，cancel 要及时调用\n4. Value 只放跨调用链的元数据，业务必需参数仍应显式传递\n\n最后补一句边界：Context 不能替代错误处理，也不能强制杀掉 goroutine；它只是协作式取消信号。",
+      "followUpQuestions": [
+        {
+          "question": "为什么 WithTimeout 后还要 defer cancel？",
+          "answer": "超时到了会自动取消，但提前调用 cancel 可以及时释放 timer 和父子引用；函数提前返回时尤其重要。"
+        },
+        {
+          "question": "Context.Value 可以传所有业务参数吗？",
+          "answer": "不建议。Value 适合 trace id、认证主体等请求级元数据，业务必需参数应显式写在函数签名里。"
+        }
+      ]
+    },
+    {
+      "type": "checklist",
+      "title": "学完后应能说清楚",
+      "items": [
+        "能解释取消树",
+        "能说明协作式取消",
+        "能使用超时和截止时间",
+        "能解释 defer cancel",
+        "能限制 Value 使用边界"
+      ]
+    }
+  ],
+  "recallPrompts": [
+    {
+      "id": "go.concurrency.context.recall.1",
+      "prompt": "请解释 Context 的取消传播机制，以及下游如何响应。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "go.concurrency.context.recall.2",
+      "prompt": "WithTimeout 后为什么通常要 defer cancel？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "go.concurrency.context.recall.3",
+      "prompt": "Context.Value 适合传什么，不适合传什么？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    }
+  ],
+  "rubric": {
+    "mustHave": [
+      "Context 作为第一个参数",
+      "Done channel",
+      "WithCancel/WithTimeout",
+      "defer cancel"
+    ],
+    "goodToHave": [
+      "分层超时预算",
+      "支持 Context 的 IO API",
+      "取消不是强杀 goroutine"
+    ],
+    "commonMistakes": [
+      "把 Context 存进结构体",
+      "忘记 cancel",
+      "用 Value 传业务必需参数"
+    ],
+    "scoreWeights": {
+      "coverage": 30,
+      "accuracy": 25,
+      "interviewExpression": 20,
+      "depth": 25
+    }
+  },
+  "updatedAt": "2026-06-12"
+}

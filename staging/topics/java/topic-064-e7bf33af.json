@@ -13,14 +13,14 @@
     "事务消息"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 15,
+  "estimatedMinutes": 28,
   "order": 60,
   "recommendWeight": 76,
   "learningCards": [
     {
       "type": "explain",
       "title": "本地消息表 + MQ：最常用的最终一致方案",
-      "content": "> **定位**：生产中最常用的方案，面试高频追问\n\n## 一、本地消息表 + MQ（生产最常用）\n\n### 1.1 核心思想\n**将\"业务操作\"和\"消息发送\"绑定在同一个本地事务中**，通过定时任务保证消息一定发出去。\n```\n┌──────────────────────────────────────────────────────────┐\n│                    订单服务                                │\n│                                                          │\n│  BEGIN TRANSACTION                                       │\n│    ① INSERT INTO orders (...)                            │\n│    ② INSERT INTO outbox_messages (event_type, payload)   │  ← 同一个事务\n│  COMMIT                                                  │\n│                                                          │\n│  ③ 定时任务扫描 outbox_messages 表                         │\n│     → 发送到 MQ → 发送成功则标记为已发送                     │\n└───────────────────────┬──────────────────────────────────┘\n│ MQ\n┌───────────────────────▼──────────────────────────────────┐\n│                    库存服务                                │\n│  ④ 消费消息 → 扣减库存 → 幂等处理                           │\n└──────────────────────────────────────────────────────────┘\n```\n\n### 1.2 代码实现\n```java\n// 1. 本地消息表\nCREATE TABLE outbox_messages (\nid BIGINT PRIMARY KEY AUTO_INCREMENT,\nevent_type VARCHAR(64) NOT NULL,      -- 事件类型\npayload TEXT NOT NULL,                 -- 消息体（JSON）\nstatus TINYINT DEFAULT 0,             -- 0:待发送 1:已发送 2:发送失败\nretry_count INT DEFAULT 0,            -- 重试次数\ncreated_at DATETIME DEFAULT NOW(),\nsent_at DATETIME\n);\n// 2. 业务操作 + 写消息表（同一个事务）\n@Service\npublic class OrderService {\n    @Transactional\n    public void createOrder(CreateOrderCmd cmd) {\n        // 业务操作\n        Order order = new Order(cmd);\n        orderRepo.save(order);\n        // 写本地消息表（同一个事务）\n        OutboxMessage msg = new OutboxMessage();\n        msg.setEventType(\"ORDER_CREATED\");\n        msg.setPayload(JSON.toJSONString(new OrderCreatedEvent(order.getId())));\n        outboxRepo.save(msg);\n    }\n}\n// 3. 定时任务扫描消息表并发送\n@Component\npublic class OutboxPublisher {\n    @Scheduled(fixedDelay = 5000)\n    public void publishPendingMessages() {\n        List<OutboxMessage> messages = outboxRepo.findByStatus(0);\n        for (OutboxMessage msg : messages) {\n            try {\n                rabbitTemplate.convertAndSend(\"order.exchange\", \"order.created\", msg.getPayload());\n                msg.setStatus(1); // 已发送\n                msg.setSentAt(LocalDateTime.now());\n                outboxRepo.save(msg);\n            } catch (Exception e) {\n                msg.setRetryCount(msg.getRetryCount() + 1);\n                if (msg.getRetryCount() > 3) {\n                    msg.setStatus(2); // 发送失败，人工介入\n                }\n                outboxRepo.save(msg);\n            }\n        }\n    }\n}\n```"
+      "content": "> **定位**：生产中最常用的方案，面试高频深入问题\n\n## 一、本地消息表 + MQ（生产最常用）\n\n### 1.1 核心思想\n**将\"业务操作\"和\"消息发送\"绑定在同一个本地事务中**，通过定时任务保证消息一定发出去。\n```\n┌──────────────────────────────────────────────────────────┐\n│                    订单服务                                │\n│                                                          │\n│  BEGIN TRANSACTION                                       │\n│    ① INSERT INTO orders (...)                            │\n│    ② INSERT INTO outbox_messages (event_type, payload)   │  ← 同一个事务\n│  COMMIT                                                  │\n│                                                          │\n│  ③ 定时任务扫描 outbox_messages 表                         │\n│     → 发送到 MQ → 发送成功则标记为已发送                     │\n└───────────────────────┬──────────────────────────────────┘\n│ MQ\n┌───────────────────────▼──────────────────────────────────┐\n│                    库存服务                                │\n│  ④ 消费消息 → 扣减库存 → 幂等处理                           │\n└──────────────────────────────────────────────────────────┘\n```\n\n### 1.2 代码实现\n```java\n// 1. 本地消息表\nCREATE TABLE outbox_messages (\nid BIGINT PRIMARY KEY AUTO_INCREMENT,\nevent_type VARCHAR(64) NOT NULL,      -- 事件类型\npayload TEXT NOT NULL,                 -- 消息体（JSON）\nstatus TINYINT DEFAULT 0,             -- 0:待发送 1:已发送 2:发送失败\nretry_count INT DEFAULT 0,            -- 重试次数\ncreated_at DATETIME DEFAULT NOW(),\nsent_at DATETIME\n);\n// 2. 业务操作 + 写消息表（同一个事务）\n@Service\npublic class OrderService {\n    @Transactional\n    public void createOrder(CreateOrderCmd cmd) {\n        // 业务操作\n        Order order = new Order(cmd);\n        orderRepo.save(order);\n        // 写本地消息表（同一个事务）\n        OutboxMessage msg = new OutboxMessage();\n        msg.setEventType(\"ORDER_CREATED\");\n        msg.setPayload(JSON.toJSONString(new OrderCreatedEvent(order.getId())));\n        outboxRepo.save(msg);\n    }\n}\n// 3. 定时任务扫描消息表并发送\n@Component\npublic class OutboxPublisher {\n    @Scheduled(fixedDelay = 5000)\n    public void publishPendingMessages() {\n        List<OutboxMessage> messages = outboxRepo.findByStatus(0);\n        for (OutboxMessage msg : messages) {\n            try {\n                rabbitTemplate.convertAndSend(\"order.exchange\", \"order.created\", msg.getPayload());\n                msg.setStatus(1); // 已发送\n                msg.setSentAt(LocalDateTime.now());\n                outboxRepo.save(msg);\n            } catch (Exception e) {\n                msg.setRetryCount(msg.getRetryCount() + 1);\n                if (msg.getRetryCount() > 3) {\n                    msg.setStatus(2); // 发送失败，人工介入\n                }\n                outboxRepo.save(msg);\n            }\n        }\n    }\n}\n```"
     },
     {
       "type": "explain",
@@ -33,32 +33,6 @@
       "content": "## 三、最大努力通知\n\n### 3.1 核心思想\n适用于**跨系统、非实时**的场景（如支付结果通知）。上游服务完成操作后，通过MQ通知下游，下游处理失败则上游**定期重试通知**，直到达到最大重试次数。\n\n### 3.2 流程\n```\n1. 支付服务完成支付\n2. 发送MQ通知订单服务\n3. 订单服务消费消息，更新订单状态\n4. 如果消费失败，支付服务定期重试通知（如1min/5min/30min/1h/6h）\n5. 达到最大重试次数后，人工介入\n```"
     },
     {
-      "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | 本地消息表+MQ | RocketMQ事务消息 | 最大努力通知 | Seata AT |\n| --- | --- | --- | --- | --- |\n| 一致性 | 最终一致 | 最终一致 | 最终一致（尽力而为） | 最终一致 |\n| 实现复杂度 | 中（需建消息表+定时任务） | 低（MQ原生支持） | 低 | 低（注解即可） |\n| 对MQ依赖 | 任意MQ均可 | 仅RocketMQ | 任意MQ均可 | 无 |\n| 消息可靠性 | 高（本地事务保证） | 高（半消息+回查） | 中（重试兜底） | 高（undo_log） |\n| 适用场景 | 生产最常用，通用方案 | 已用RocketMQ的项目 | 跨系统通知（如支付回调） | 单库简单CRUD |\n| 性能 | 高（异步解耦） | 高 | 中（定期重试） | 中（全局锁） |\n| 人工介入 | 发送失败超限需介入 | 回查异常需介入 | 重试超限需介入 | 无 |"
-    },
-    {
-      "type": "diagram",
-      "title": "结构图解",
-      "content": "本地消息表+MQ的核心流程和关键保障机制。",
-      "fallback": "本地消息表方案将业务操作和消息写入绑定在同一本地事务中，通过定时任务扫描发送，消费端做幂等处理，保证最终一致性。",
-      "items": [
-        "本地事务绑定：INSERT业务数据 + INSERT消息表 → 同一个数据库事务 → 要么都成功要么都失败",
-        "定时扫描发送：定时任务扫描status=0的消息 → 发送到MQ → 发送成功标记status=1",
-        "重试机制：发送失败 → retry_count++ → 超过阈值标记status=2 → 人工介入",
-        "消费端幂等：消费者用消息ID或业务唯一键做去重 → 防止重复消费导致数据错误",
-        "RocketMQ事务消息：半消息暂不投递 → 执行本地事务 → Commit/Rollback → 超时回查",
-        "最大努力通知：定期重试通知（1min→5min→30min→1h→6h）→ 超限人工介入",
-        "方案选择：通用选本地消息表 → 已有RocketMQ选事务消息 → 跨系统通知选最大努力通知"
-      ]
-    },
-    {
-      "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "@Service\npublic class OrderService {\n    @Transactional\n    public void createOrder(CreateOrderCmd cmd) {\n        // 业务操作\n        Order order = new Order(cmd);\n        orderRepo.save(order);\n        // 写本地消息表（同一个事务）\n        OutboxMessage msg = new OutboxMessage();\n        msg.setEventType(\"ORDER_CREATED\");\n        msg.setPayload(JSON.toJSONString(new OrderCreatedEvent(order.getId())));\n        outboxRepo.save(msg);\n    }\n}\n// 3. 定时任务扫描消息表并发送\n@Component",
-      "language": "java"
-    },
-    {
       "type": "diagram",
       "title": "RocketMQ 事务消息流程",
       "content": "flowchart TD\nA[Producer 发送半消息] --> B[Broker 存储半消息]\nB --> C[执行本地事务]\nC --> D{本地事务结果}\nD -->|提交| E[发送 Commit]\nD -->|回滚| F[发送 Rollback]\nD -->|未知| G[Broker 事务回查]\nE --> H[消息对消费者可见]\nF --> I[删除半消息]\nG --> J[Producer 检查本地事务状态]\nJ --> D",
@@ -66,8 +40,25 @@
       "fallback": "RocketMQ 事务消息流程"
     },
     {
+      "type": "compareTable",
+      "title": "对比与边界",
+      "content": "| 对比项 | 本地消息表+MQ | RocketMQ事务消息 | 最大努力通知 | Seata AT |\n| --- | --- | --- | --- | --- |\n| 一致性 | 最终一致 | 最终一致 | 最终一致（尽力而为） | 最终一致 |\n| 实现复杂度 | 中（需建消息表+定时任务） | 低（MQ原生支持） | 低 | 低（注解即可） |\n| 对MQ依赖 | 任意MQ均可 | 仅RocketMQ | 任意MQ均可 | 无 |\n| 消息可靠性 | 高（本地事务保证） | 高（半消息+回查） | 中（重试兜底） | 高（undo_log） |\n| 适用场景 | 生产最常用，通用方案 | 已用RocketMQ的项目 | 跨系统通知（如支付回调） | 单库简单CRUD |\n| 性能 | 高（异步解耦） | 高 | 中（定期重试） | 中（全局锁） |\n| 人工介入 | 发送失败超限需介入 | 回查异常需介入 | 重试超限需介入 | 无 |"
+    },
+    {
+      "type": "code",
+      "title": "代码/伪代码抓手",
+      "content": "@Service\npublic class OrderService {\n    @Transactional\n    public void createOrder(CreateOrderCmd cmd) {\n        // 业务操作\n        Order order = new Order(cmd);\n        orderRepo.save(order);\n        // 写本地消息表（同一个事务）\n        OutboxMessage msg = new OutboxMessage();\n        msg.setEventType(\"ORDER_CREATED\");\n        msg.setPayload(JSON.toJSONString(new OrderCreatedEvent(order.getId())));\n        outboxRepo.save(msg);\n    }\n}\n// 3. 定时任务扫描消息表并发送\n@Component",
+      "language": "java",
+      "highlights": [
+        {
+          "line": 2,
+          "note": "这里定义示例的核心入口或结构，后续逻辑都围绕这个职责展开。"
+        }
+      ]
+    },
+    {
       "type": "interviewAnswer",
-      "title": "面试回答模板",
+      "title": "面试回答思路",
       "content": "**Q1：本地消息表方案是怎么保证消息一定发出去的？**\n\nA：核心是将业务操作和消息写入绑定在同一个本地事务中。业务操作和INSERT消息表在同一个数据库事务里，要么都成功要么都失败。然后通过定时任务扫描状态为\"待发送\"的消息，发送到MQ后标记为\"已发送\"。如果发送失败，重试次数加一，超过阈值标记为\"发送失败\"供人工介入。因为消息已经持久化到数据库，即使服务重启也不会丢失。\n\n**Q2：RocketMQ事务消息和本地消息表有什么区别？**\n\nA：本质思想相同，都是将本地事务和消息发送绑定。区别在于实现方式：本地消息表需要自己建表、写定时任务、处理重试逻辑，但不挑MQ，任意MQ都能用。RocketMQ事务消息是MQ原生支持的，通过半消息+回查机制实现，不需要额外建表和定时任务，但只能用RocketMQ。如果项目已经用了RocketMQ，优先用事务消息；否则用本地消息表更通用。\n\n**Q3：消费端怎么做幂等处理？**\n\nA：常见方案有三种。第一，用消息唯一ID做去重表，消费前先查去重表，存在则跳过。第二，用业务唯一键做数据库唯一约束，重复插入会报唯一键冲突，catch异常后跳过。第三，用状态机控制，只允许合法的状态转换（如\"待支付→已支付\"），重复消费时状态不满足则跳过。推荐第一种方案，通用性强，与业务逻辑解耦。",
       "followUpQuestions": [
         {
@@ -100,21 +91,21 @@
       "prompt": "本地消息表如何保证业务写入和消息发送的最终一致性？补偿任务要扫描哪些状态？",
       "mode": "text",
       "expectedMinutes": 4,
-      "difficulty": 3
+      "difficulty": 4
     },
     {
       "id": "java.microservice.topic-064-e7bf33af.recall.2",
       "prompt": "RocketMQ 事务消息的半消息、事务回查和最终提交/回滚流程是什么？",
       "mode": "text",
       "expectedMinutes": 4,
-      "difficulty": 3
+      "difficulty": 4
     },
     {
       "id": "java.microservice.topic-064-e7bf33af.recall.3",
       "prompt": "最大努力通知适合什么业务？为什么不能承诺强一致？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 4
     }
   ],
   "rubric": {

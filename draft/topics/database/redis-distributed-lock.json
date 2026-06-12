@@ -1,0 +1,152 @@
+{
+  "id": "database.redis-cache.redis-distributed-lock",
+  "domain": "database",
+  "category": "redis-cache",
+  "group": "redis-cache",
+  "title": "Redis 分布式锁与一致性边界",
+  "summary": "理解 SET NX PX、唯一 token、Lua 释放、锁续期、Redlock 和 fencing token。",
+  "tags": [
+    "数据库",
+    "Redis",
+    "分布式锁",
+    "Lua",
+    "Fencing Token"
+  ],
+  "difficulty": 3,
+  "estimatedMinutes": 30,
+  "order": 120,
+  "recommendWeight": 85,
+  "status": "draft",
+  "prerequisites": [],
+  "interviewFrequency": "high",
+  "interviewerFocus": "考察是否能说明 Redis 锁能解决互斥，但不能天然解决进程暂停、网络分区和外部资源乱序写。",
+  "learningCards": [
+    {
+      "type": "explain",
+      "title": "Redis 分布式锁与一致性边界 的职责边界",
+      "content": "Redis 分布式锁的基础写法是 SET key value NX PX，同时满足不存在才写入和自动过期。释放锁时必须校验 value 再删除，通常用 Lua 保证检查和删除原子执行。\n\n学习 Redis 分布式锁与一致性边界 时，可以先沿「客户端生成 token -> SET NX PX 加锁 -> 执行业务临界区 -> Lua 校验释放 -> fencing token 防旧写」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- SET NX PX 保证加锁和过期时间设置是一个原子命令\n- value 使用唯一 token，释放锁时比较 token 后再删除\n- 续期机制要绑定业务生命周期，避免锁过期后任务仍在执行\n- fencing token 用单调递增版本让下游拒绝旧持有者写入\n\n把这条路径落回 Redis 分布式锁与一致性边界 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+    },
+    {
+      "type": "explain",
+      "title": "Redis 分布式锁与一致性边界 的失败模式与排查",
+      "content": "真正难点在一致性边界：业务执行时间超过 TTL、持锁进程 STW 或网络抖动都可能让锁过期后又继续写外部资源。此时即使用了唯一 token，也只能防止误删别人的锁，不能防止旧持有者继续提交。\n\nRedis 分布式锁与一致性边界 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 锁 TTL 过短会提前过期，过长会降低故障恢复速度\n- Redlock 试图跨多个 Redis 实例降低单点风险，但仍依赖时钟和网络假设\n- Redis 锁只保护进入临界区，外部数据库或消息系统也要校验版本\n- 可重入、公平性和阻塞等待都不是 Redis 简单锁默认提供的能力\n\n排查时不要先猜结论，应把现象映射到 SET NX PX 加锁、执行业务临界区、Lua 校验释放 这些环节，再结合 锁 key TTL、业务耗时、续期日志、下游版本号、重复提交记录 验证。"
+    },
+    {
+      "type": "diagram",
+      "title": "Redis 分布式锁安全释放链路",
+      "format": "mermaid",
+      "content": "flowchart LR\nA[客户端生成 token] --> B[SET NX PX 加锁]\nB[SET NX PX 加锁] --> C[执行业务临界区]\nC[执行业务临界区] --> D[Lua 校验释放]\nD[Lua 校验释放] --> E[fencing token 防旧写]",
+      "fallback": "客户端生成 token -> SET NX PX 加锁 -> 执行业务临界区 -> Lua 校验释放 -> fencing token 防旧写",
+      "caption": "图示强调 token、TTL、Lua 释放和 fencing token 分别解决的风险。"
+    },
+    {
+      "type": "compareTable",
+      "title": "Redis 锁关键机制对比",
+      "columns": [
+        "维度",
+        "核心含义",
+        "适用场景",
+        "常见风险"
+      ],
+      "rows": [
+        [
+          "唯一 token",
+          "标识当前持有者",
+          "安全释放锁",
+          "不能阻止旧持有者写外部资源"
+        ],
+        [
+          "Lua 释放",
+          "比较 value 后删除",
+          "避免误删新锁",
+          "脚本要保持简单"
+        ],
+        [
+          "自动续期",
+          "延长长任务持锁时间",
+          "任务耗时不确定",
+          "续期失败要停止业务"
+        ],
+        [
+          "fencing token",
+          "下游拒绝旧版本写入",
+          "高一致性资源写入",
+          "需要下游存储支持版本校验"
+        ]
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答思路",
+      "content": "结论：Redis 分布式锁可以提供近似互斥，但必须同时讲 token、TTL、Lua 释放和一致性边界。\n\n我会按这几层展开：\n1. 先说明正确加锁使用 SET NX PX，避免 setnx 和 expire 分离\n2. 再说明 value 必须是唯一 token，释放锁用 Lua 原子校验删除\n3. 然后讨论锁过期、续期、进程暂停和网络分区带来的旧持有者问题\n4. 最后补充高一致写入应使用 fencing token 或数据库版本约束兜底\n\n最后补充边界：如果业务要求严格线性一致，单纯 Redis 锁通常不够，需要下游资源参与校验。",
+      "followUpQuestions": [
+        {
+          "question": "为什么释放锁要用 Lua？",
+          "answer": "因为比较 value 和删除 key 必须原子执行，否则比较后锁可能过期并被别人获得，再执行 delete 就会误删别人的锁。"
+        },
+        {
+          "question": "fencing token 解决什么问题？",
+          "answer": "它给每次成功加锁分配递增版本，下游只接受更大的版本，旧持有者即使恢复执行也会因为版本落后被拒绝。"
+        }
+      ]
+    },
+    {
+      "type": "checklist",
+      "title": "学完后应能说清楚",
+      "items": [
+        "能写出 SET NX PX 加锁要点",
+        "能解释唯一 token 与 Lua 释放",
+        "能说明续期和过期边界",
+        "能讲清 fencing token 的价值"
+      ]
+    }
+  ],
+  "recallPrompts": [
+    {
+      "id": "database.redis-cache.redis-distributed-lock.recall.1",
+      "prompt": "Redis 分布式锁的正确加锁和释放流程是什么？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "database.redis-cache.redis-distributed-lock.recall.2",
+      "prompt": "锁自动过期为什么仍可能导致并发写问题？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "database.redis-cache.redis-distributed-lock.recall.3",
+      "prompt": "Redlock 和 fencing token 分别想解决什么风险？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    }
+  ],
+  "rubric": {
+    "mustHave": [
+      "说明 SET NX PX 的原子加锁语义",
+      "讲清唯一 token 与 Lua 释放避免误删",
+      "指出 TTL、STW 和网络分区带来的旧持有者风险",
+      "能说明 fencing token 或版本校验的兜底作用"
+    ],
+    "goodToHave": [
+      "能比较 Redlock 与单实例锁边界",
+      "能说明可重入和公平性不是默认能力",
+      "能结合业务耗时设计续期停止条件"
+    ],
+    "commonMistakes": [
+      "setnx 后再 expire 导致非原子加锁",
+      "释放锁时直接 delete key",
+      "认为 Redis 锁能天然保证外部资源强一致"
+    ],
+    "scoreWeights": {
+      "coverage": 30,
+      "accuracy": 25,
+      "interviewExpression": 20,
+      "depth": 25
+    }
+  },
+  "updatedAt": "2026-06-12"
+}

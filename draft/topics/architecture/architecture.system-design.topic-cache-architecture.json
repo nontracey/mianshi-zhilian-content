@@ -14,7 +14,7 @@
     "缓存一致性"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 28,
   "order": 30,
   "recommendWeight": 85,
   "status": "draft",
@@ -26,24 +26,48 @@
     },
     {
       "type": "explain",
-      "title": "缓存架构设计：延迟双删、订阅Binlog",
+      "title": "缓存架构设计：延迟双删、订阅 Binlog",
       "content": "### 2.2 延迟双删\n- 先删缓存 → 更新DB → 延迟一段时间 → 再删缓存\n- 解决并发读写时的不一致\n\n### 2.3 订阅Binlog\n- 通过Canal监听MySQL Binlog\n- Binlog变更时更新/删除缓存\n- 解耦业务代码"
     },
     {
       "type": "explain",
-      "title": "缓存架构设计：缓存问题、热Key问题",
-      "content": "## 三、缓存问题\n### 3.1 缓存穿透\n- 查询不存在的数据，每次都打到DB\n- 方案：布隆过滤器、缓存空值\n\n### 3.2 缓存击穿\n- 热点key过期，大量请求打到DB\n- 方案：互斥锁、永不过期+异步更新\n\n### 3.3 缓存雪崩\n- 大量key同时过期\n- 方案：过期时间加随机值、多级缓存\n\n## 四、热Key问题\n- 单个key请求量过大\n- 方案：本地缓存、key分散（key_1~key_N）、读写分离\n\n## 五、缓存预热\n- 系统启动时提前加载热点数据\n- 方案：定时任务、启动时加载"
+      "title": "缓存架构设计：缓存问题、热 Key 问题",
+      "content": "## 三、缓存问题\n### 3.1 缓存穿透\n- 查询不存在的数据，每次都打到DB\n- 方案：布隆过滤器、缓存空值\n\n### 3.2 缓存击穿\n- 热点key过期，大量请求打到DB\n- 方案：互斥锁、永不过期+异步更新\n\n### 3.3 缓存雪崩\n- 大量key同时过期\n- 方案：过期时间加随机值、多级缓存\n\n## 四、热Key问题\n- 单个key请求量过大\n- 方案：本地缓存、key分散（key_1~key_N）、读写分离\n\n## 五、缓存预热\n- 系统启动时提前加载热点数据\n- 方案：定时任务、启动时加载\n\n把 缓存架构设计 放到真实场景里看，重点是业务目标、关键组件、故障边界和权衡依据。先确认触发条件，再看状态或数据怎样变化，最后用指标、日志、测试结果或复杂度证明判断。\n\n学习 缓存架构设计 时，要把业务目标、关键组件、故障边界和权衡依据对应到具体例子里。遇到异常或效果不符合预期时，先定位触发条件，再判断哪一层状态、数据或假设发生偏移。"
+    },
+    {
+      "type": "diagram",
+      "title": "Cache Aside 与缓存失效流程",
+      "format": "mermaid",
+      "content": "flowchart TD\nA[读请求] --> B{本地缓存命中}\nB -->|是| C[返回本地缓存]\nB -->|否| D{Redis 命中}\nD -->|是| E[回填本地缓存并返回]\nD -->|否| F[读取数据库]\nF --> G[写入 Redis 和本地缓存]\nG --> H[返回结果]\nI[写请求] --> J[先更新数据库]\nJ --> K[删除缓存]\nK --> L{高一致性要求}\nL -->|是| M[延迟双删或订阅 Binlog]\nL -->|否| N[等待下次读回填]",
+      "caption": "Cache Aside 读写路径、回填和失效流程",
+      "fallback": "Cache Aside 与缓存失效流程"
+    },
+    {
+      "type": "compareTable",
+      "title": "对比与边界",
+      "content": "| 维度 | Cache Aside | Read/Write Through | Write Behind |\n| --- | --- | --- | --- |\n| 读路径 | 先缓存后DB | 缓存代理DB | 缓存代理DB |\n| 写路径 | 先DB后删缓存 | 缓存代理DB | 先缓存异步写DB |\n| 一致性 | 最终一致 | 最终一致 | 弱一致 |\n| 复杂度 | 低 | 中 | 高 |\n| 适用 | 通用 | 简单场景 | 写密集 |"
+    },
+    {
+      "type": "compareTable",
+      "title": "维度对比",
+      "content": "| 维度 | 本地缓存 | 分布式缓存 |\n| --- | --- | --- |\n| 网络开销 | 无 | 有 |\n| 容量 | 小 | 大 |\n| 一致性 | 各实例不同 | 全局一致 |\n| 适用 | 热点数据 | 通用数据 |"
     },
     {
       "type": "code",
       "title": "代码示例",
       "content": "// 1. 多级缓存实现\n@Service\npublic class MultiLevelCacheService {\n    @Autowired\n    private Cache<String, Object> localCache; // Caffeine\n    @Autowired\n    private StringRedisTemplate redis;\n    @Autowired\n    private UserMapper userMapper;\n\n    public UserDTO getUser(String userId) {\n        // L1: 本地缓存\n        UserDTO user = (UserDTO) localCache.getIfPresent(userId);\n        if (user != null) return user;\n\n        // L2: Redis缓存\n        String json = redis.opsForValue().get(\"user:\" + userId);\n        if (json != null) {\n            user = JSON.parseObject(json, UserDTO.class);\n            localCache.put(userId, user); // 回填L1\n            return user;\n        }\n\n        // DB\n        user = userMapper.selectById(userId);\n        if (user != null) {\n            redis.opsForValue().set(\"user:\" + userId,\n                JSON.toJSONString(user), 30, TimeUnit.MINUTES);\n            localCache.put(userId, user);\n        }\n        return user;\n    }\n}\n\n// 2. Cache Aside Pattern\n@Service\npublic class CacheAsideService {\n    @Transactional\n    public void updateUser(String userId, UserUpdateCmd cmd) {\n        // 先更新DB\n        userMapper.updateById(userId, cmd);\n        // 再删除缓存\n        redis.delete(\"user:\" + userId);\n    }\n}\n\n// 3. 延迟双删\n@Service\npublic class DelayDoubleDeleteService {\n    @Async\n    public void updateUserWithDelayDelete(String userId, UserUpdateCmd cmd) {\n        // 第一次删除缓存\n        redis.delete(\"user:\" + userId);\n        // 更新DB\n        userMapper.updateById(userId, cmd);\n        // 延迟第二次删除\n        CompletableFuture.delayedExecutor(500, TimeUnit.MILLISECONDS)\n            .execute(() -> redis.delete(\"user:\" + userId));\n    }\n}\n\n// 4. 防止缓存击穿 - 互斥锁\npublic UserDTO getUserWithLock(String userId) {\n    String json = redis.opsForValue().get(\"user:\" + userId);\n    if (json != null) return JSON.parseObject(json, UserDTO.class);\n\n    // 获取分布式锁\n    String lockKey = \"lock:user:\" + userId;\n    boolean locked = redis.opsForValue()\n        .setIfAbsent(lockKey, \"1\", 10, TimeUnit.SECONDS);\n    if (locked) {\n        try {\n            // 双重检查\n            json = redis.opsForValue().get(\"user:\" + userId);\n            if (json != null) return JSON.parseObject(json, UserDTO.class);\n\n            UserDTO user = userMapper.selectById(userId);\n            redis.opsForValue().set(\"user:\" + userId,\n                JSON.toJSONString(user), 30, TimeUnit.MINUTES);\n            return user;\n        } finally {\n            redis.delete(lockKey);\n        }\n    }\n    // 未获取锁，短暂等待后重试\n    Thread.sleep(50);\n    return getUserWithLock(userId);\n}\n\n// 5. 防止缓存穿透 - 缓存空值\npublic UserDTO getUserNullSafe(String userId) {\n    String json = redis.opsForValue().get(\"user:\" + userId);\n    if (\"NULL\".equals(json)) return null;\n    if (json != null) return JSON.parseObject(json, UserDTO.class);\n\n    UserDTO user = userMapper.selectById(userId);\n    if (user == null) {\n        // 缓存空值，短过期时间\n        redis.opsForValue().set(\"user:\" + userId, \"NULL\",\n            5, TimeUnit.MINUTES);\n    } else {\n        redis.opsForValue().set(\"user:\" + userId,\n            JSON.toJSONString(user), 30, TimeUnit.MINUTES);\n    }\n    return user;\n}",
-      "language": "java"
+      "language": "java",
+      "highlights": [
+        {
+          "line": 14,
+          "note": "这里是边界条件分支，回答 缓存架构设计 时要说明它为什么会改变执行路径。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
-      "title": "面试回答模板",
-      "content": "缓存架构设计要解决四个核心问题：\n\n**多级缓存**提升性能。L1用Caffeine本地缓存，无网络开销；L2用Redis分布式缓存，容量大；最后才查数据库。热点数据命中L1，普通数据命中L2，只有冷数据才打到DB。\n\n**缓存一致性**用Cache Aside Pattern：读的时候先读缓存，miss则读DB并写缓存；写的时候先更新DB再删除缓存。为什么删除而不是更新？因为并发场景下，更新缓存可能导致脏数据。如果对一致性要求更高，可以用延迟双删或订阅Binlog。\n\n**缓存三大问题**：穿透是查不存在的数据，用布隆过滤器或缓存空值解决；击穿是热点key过期，用互斥锁或永不过期+异步更新解决；雪崩是大量key同时过期，用过期时间加随机值解决。\n\n**热Key**问题用本地缓存或key分散方案。把一个key分散成key_1到key_N多个子key，请求随机或哈希到不同子key上。",
+      "title": "面试回答思路",
+      "content": "结论：缓存架构设计 要先说清它解决什么问题，再展开机制、边界和验证方式。设计多级缓存架构，解决缓存一致性、热Key和缓存预热等核心问题\n\n我会这样回答：\n1. 先定位核心问题：多级缓存架构的设计。\n2. 再串起关键机制：Cache Aside Pattern的读写流程，并说明它和 缓存穿透/击穿/雪崩的区别和方案 的关系。\n3. 接着补充边界和风险：混淆穿透、击穿、雪崩三个概念。\n4. 最后落到验证方式：结合容量、延迟、一致性、故障演练和业务约束验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
       "followUpQuestions": [
         {
           "question": "在你的项目中，缓存架构设计是怎么落地的？遇到了什么权衡取舍？",
@@ -58,36 +82,6 @@
           "answer": "引入 缓存架构 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。建议分阶段推进：先在非核心模块试点，验证后逐步推广。迁移过程中要做好灰度、回滚、监控，确保业务不受影响。"
         }
       ]
-    },
-    {
-      "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | Cache Aside | Read/Write Through | Write Behind |\n| --- | --- | --- | --- |\n| 读路径 | 先缓存后DB | 缓存代理DB | 缓存代理DB |\n| 写路径 | 先DB后删缓存 | 缓存代理DB | 先缓存异步写DB |\n| 一致性 | 最终一致 | 最终一致 | 弱一致 |\n| 复杂度 | 低 | 中 | 高 |\n| 适用 | 通用 | 简单场景 | 写密集 |"
-    },
-    {
-      "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | 本地缓存 | 分布式缓存 |\n| --- | --- | --- |\n| 网络开销 | 无 | 有 |\n| 容量 | 小 | 大 |\n| 一致性 | 各实例不同 | 全局一致 |\n| 适用 | 热点数据 | 通用数据 |"
-    },
-    {
-      "type": "diagram",
-      "title": "结构图解",
-      "content": "多级缓存架构的请求链路图",
-      "fallback": "请求 → L1(本地缓存) → L2(Redis) → DB",
-      "items": [
-        "L1本地缓存：Caffeine，无网络开销，容量小",
-        "L2分布式缓存：Redis，容量大，有网络开销",
-        "DB：最后的查询，尽量避免",
-        "回填策略：DB查到后同时写L1和L2"
-      ]
-    },
-    {
-      "type": "diagram",
-      "title": "Cache Aside 与缓存失效流程",
-      "format": "mermaid",
-      "content": "flowchart TD\nA[读请求] --> B{本地缓存命中}\nB -->|是| C[返回本地缓存]\nB -->|否| D{Redis 命中}\nD -->|是| E[回填本地缓存并返回]\nD -->|否| F[读取数据库]\nF --> G[写入 Redis 和本地缓存]\nG --> H[返回结果]\nI[写请求] --> J[先更新数据库]\nJ --> K[删除缓存]\nK --> L{高一致性要求}\nL -->|是| M[延迟双删或订阅 Binlog]\nL -->|否| N[等待下次读回填]",
-      "caption": "Cache Aside 读写路径、回填和失效流程",
-      "fallback": "Cache Aside 与缓存失效流程"
     },
     {
       "type": "checklist",
@@ -107,14 +101,14 @@
       "prompt": "缓存架构设计 解决了什么架构问题？有哪些适用和不适用的场景？",
       "mode": "text",
       "expectedMinutes": 5,
-      "difficulty": 2
+      "difficulty": 4
     },
     {
       "id": "architecture.system-design.topic-cache-architecture.recall.2",
       "prompt": "Cache Aside Pattern为什么是先更新DB再删除缓存，而不是先更新缓存再更新DB？",
       "mode": "text",
       "expectedMinutes": 4,
-      "difficulty": 2
+      "difficulty": 4
     },
     {
       "id": "architecture.system-design.topic-cache-architecture.recall.3",
@@ -129,14 +123,12 @@
       "多级缓存架构的设计",
       "Cache Aside Pattern的读写流程",
       "缓存穿透/击穿/雪崩的区别和方案",
-      "热Key的处理方案",
-      "缓存一致性的保证机制"
+      "热Key的处理方案"
     ],
     "goodToHave": [
       "延迟双删的实现",
       "Canal订阅Binlog",
-      "布隆过滤器的原理",
-      "缓存预热的策略"
+      "布隆过滤器的原理"
     ],
     "commonMistakes": [
       "混淆穿透、击穿、雪崩三个概念",

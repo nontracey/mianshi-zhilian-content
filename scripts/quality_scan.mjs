@@ -150,7 +150,15 @@ const genericHighlightPatterns = [
   /输出语义/,
   /承担的职责，再展开内部流程/,
   /复述时要说明条件成立后的状态变化/,
+  /这段代码围绕/,
+  /如何处理输入、状态变化和边界/,
 ];
+
+const generatedDiagramCaptionPattern =
+  /^这张图把 .+ 的核心对象、状态变化和边界风险串起来，便于按链路解释。$/;
+const algorithmTemplateLeakPattern =
+  /要先说明题目约束，再给出核心解法和复杂度|先复述输入、输出和限制条件|空输入、重复值、指针越界或状态初始化|给出时间、空间复杂度/;
+const machineRelationPhrasePattern = /能否说清|的定义和核心目标|如何影响[^，。；\n]{2,60}/;
 
 const exactDuplicateBuckets = new Map();
 const longDuplicateBuckets = new Map();
@@ -258,6 +266,11 @@ const checks = [
     pattern: /准确解释(?:\d+\.|[一二三四五六七八九十]+[、.．])|定义的定义/,
   },
   {
+    code: "UNNATURAL_PATCH_LANGUAGE",
+    pattern:
+      /从零理解可以抓住这条主线|它不是一串名词|把这几层连起来看|深入理解时重点看三个问题|的难点在于把「[^」]+」「[^」]+」「[^」]+」连成因果链|实际使用时，应回到输入规模、执行顺序、依赖状态和可观测证据上验证|验证理解是否落到真实链路|不能只给工具名|到了 .+ 的高阶追问|回答时要给出触发条件、状态变化和验证证据|继续往下看，.+不能只记结论/,
+  },
+  {
     code: "STALE_MODEL_CONTEXT_TABLE",
     pattern: /GPT-4o 为 128K|Claude 3\.5 为 200K|Gemini 1\.5 Pro/,
   },
@@ -325,6 +338,32 @@ for (const file of await listJson(topicRoot)) {
       continue;
     }
 
+    if (
+      card.type === "diagram" &&
+      /关键链路图$/.test(card.title ?? "") &&
+      generatedDiagramCaptionPattern.test(card.caption ?? "") &&
+      / -> /.test(card.fallback ?? "")
+    ) {
+      issues.push({
+        code: "AUTO_SPLICED_DIAGRAM",
+        file,
+        title: topic.title,
+        field: `learningCards.diagram.${card.title}`,
+      });
+    }
+
+    if (
+      card.type === "diagram" &&
+      machineRelationPhrasePattern.test(`${card.title ?? ""}${card.content ?? ""}${card.fallback ?? ""}${card.caption ?? ""}`)
+    ) {
+      issues.push({
+        code: "MACHINE_RELATION_DIAGRAM",
+        file,
+        title: topic.title,
+        field: `learningCards.diagram.${card.title}`,
+      });
+    }
+
     if (typeof card.content === "string") {
       for (const emptyHeading of findEmptyMarkdownHeadings(card.content)) {
         issues.push({
@@ -374,6 +413,12 @@ for (const file of await listJson(topicRoot)) {
         issues.push({ code: check.code, file, title: topic.title, field: name });
       }
     }
+    if (topic.domain !== "algorithm" && algorithmTemplateLeakPattern.test(text)) {
+      issues.push({ code: "ALGORITHM_TEMPLATE_LEAK", file, title: topic.title, field: name });
+    }
+    if (/^rubric\./.test(name) && machineRelationPhrasePattern.test(text)) {
+      issues.push({ code: "MACHINE_RELATION_RUBRIC", file, title: topic.title, field: name });
+    }
   }
 
   const explainTitles = new Set();
@@ -396,7 +441,7 @@ for (const file of await listJson(topicRoot)) {
         field: `learningCards.explain.${card.title}`,
       });
     }
-    if (/[（(]?续[）)]?|第\s*\d+\s*部分/.test(card.title ?? "")) {
+    if (/(?:（续）|\(续\)|续篇|第\s*\d+\s*部分|(?:^|[：:\s])续(?:$|[：:\s]))/.test(card.title ?? "")) {
       issues.push({
         code: "CONTINUATION_EXPLAIN_TITLE",
         file,

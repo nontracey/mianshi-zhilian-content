@@ -12,7 +12,7 @@
     "Reactor"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 25,
+  "estimatedMinutes": 28,
   "order": 120,
   "recommendWeight": 85,
   "learningCards": [
@@ -27,6 +27,21 @@
       "content": "## 为什么不用裸 NIO\n裸 NIO 的 API 繁琐、有 epoll 空轮询导致 CPU 100% 的 JDK bug、还要自己处理拆包粘包与内存管理。Netty 封装了这些并提供高性能抽象。\n\n## 核心组件\n- **EventLoop**：绑定一个线程 + 一个 Selector，串行处理注册到它的所有 Channel 的 IO 事件与任务，无锁化设计。\n- **Channel + ChannelPipeline**：每个连接一个 Channel，Pipeline 是一条 **ChannelHandler 责任链**，入站/出站事件依次流过各 Handler（编解码、业务逻辑）。\n- **ByteBuf**：替代 NIO ByteBuffer，读写双指针、**池化**复用减少 GC、支持**零拷贝**（CompositeByteBuf、slice、文件区域 transferTo）。\n- **主从 Reactor**：`bossGroup`（少量线程）只负责 `accept` 新连接，`workerGroup` 负责已建立连接的读写。对应 epoll 的分工，充分利用多核。\n\n## 选型\n高并发长连接、自定义协议网关、RPC 框架（Dubbo/gRPC-Java 底层）都用 Netty。"
     },
     {
+      "type": "diagram",
+      "title": "Java IO/NIO 体系与 Netty 学习主线图",
+      "content": "flowchart LR\nA[Java IO/NIO 体系与 Netty] --> B[NIO]\nB --> C[Netty]\nC --> D[Reactor]\nD --> E[BIO/NIO/AIO 区别]\nE --> F[NIO 三件套与多路复用(epoll)]",
+      "items": [
+        "bossGroup（主 Reactor）：只负责 accept 新连接",
+        "新连接注册到 workerGroup 某个 EventLoop",
+        "workerGroup（从 Reactor）：每个 EventLoop 绑定线程+Selector，处理读写",
+        "读写事件经 ChannelPipeline 的 Handler 责任链处理",
+        "ByteBuf 池化复用，编解码 Handler 解决拆包粘包"
+      ],
+      "format": "mermaid",
+      "fallback": "Java IO/NIO 体系与 Netty -> NIO -> Netty -> Reactor -> BIO/NIO/AIO 区别 -> NIO 三件套与多路复用(epoll)",
+      "caption": "从 NIO 到 NIO 三件套与多路复用(epoll)，这张图帮助区分 Java IO/NIO 体系与 Netty 的核心机制、边界条件和常见误区。"
+    },
+    {
       "type": "compareTable",
       "title": "BIO / NIO / AIO 对比",
       "content": "| 对比项 | BIO | NIO | AIO |\n| --- | --- | --- | --- |\n| 阻塞模型 | 同步阻塞 | 同步非阻塞+多路复用 | 异步非阻塞 |\n| 连接:线程 | 1:1 | N:1（Selector） | 回调，无固定绑定 |\n| 底层 | accept/read 阻塞 | epoll/kqueue | Linux 仍 epoll 模拟 |\n| 适用 | 连接少、逻辑简单 | 高并发长连接 | 理论高并发，实践少 |"
@@ -35,24 +50,18 @@
       "type": "code",
       "title": "代码示例",
       "content": "import java.nio.ByteBuffer;\nimport java.nio.channels.*;\nimport java.net.InetSocketAddress;\nimport java.util.Iterator;\n\npublic class NioEchoServer {\n    public static void main(String[] args) throws Exception {\n        Selector selector = Selector.open();\n        ServerSocketChannel ssc = ServerSocketChannel.open();\n        ssc.bind(new InetSocketAddress(8080));\n        ssc.configureBlocking(false);                 // 非阻塞\n        ssc.register(selector, SelectionKey.OP_ACCEPT);\n        while (true) {\n            selector.select();                         // 阻塞直到有就绪事件\n            Iterator<SelectionKey> it = selector.selectedKeys().iterator();\n            while (it.hasNext()) {\n                SelectionKey key = it.next();\n                it.remove();\n                if (key.isAcceptable()) {\n                    SocketChannel ch = ssc.accept();\n                    ch.configureBlocking(false);\n                    ch.register(selector, SelectionKey.OP_READ);\n                } else if (key.isReadable()) {\n                    SocketChannel ch = (SocketChannel) key.channel();\n                    ByteBuffer buf = ByteBuffer.allocate(1024);\n                    if (ch.read(buf) > 0) { buf.flip(); ch.write(buf); }\n                }\n            }\n        }\n    }\n}",
-      "language": "java"
-    },
-    {
-      "type": "diagram",
-      "title": "Netty 主从 Reactor",
-      "content": "主从 Reactor 线程模型",
-      "items": [
-        "bossGroup（主 Reactor）：只负责 accept 新连接",
-        "新连接注册到 workerGroup 某个 EventLoop",
-        "workerGroup（从 Reactor）：每个 EventLoop 绑定线程+Selector，处理读写",
-        "读写事件经 ChannelPipeline 的 Handler 责任链处理",
-        "ByteBuf 池化复用，编解码 Handler 解决拆包粘包"
+      "language": "java",
+      "highlights": [
+        {
+          "line": 14,
+          "note": "这里通过多路等待处理并发分支，重点说明不同事件到达时的状态变化。"
+        }
       ]
     },
     {
       "type": "interviewAnswer",
-      "title": "标准面试回答",
-      "content": "结论：Java 网络编程有 BIO/NIO/AIO 三种模型。BIO 一连接一线程，连接多就线程爆炸；NIO 用 Channel/Buffer/Selector 多路复用，一个线程管大量连接，底层是 epoll；AIO 真异步但 Linux 下仍用 epoll 模拟，生产少用。Netty 是基于 NIO 的高性能网络框架。\n\nNetty 解决了裸 NIO 的 API 复杂、epoll 空轮询 bug、拆包粘包和内存管理。核心是 EventLoop（线程+Selector 串行处理）、ChannelPipeline（Handler 责任链）、ByteBuf（池化+零拷贝）和主从 Reactor（boss 接连接、worker 处理 IO）。\n\n追问边界：Netty 不保证消息边界，需要编解码 Handler（如 LengthFieldBasedFrameDecoder）解决拆包粘包；EventLoop 内不能跑阻塞任务，否则会卡住该线程上所有连接。",
+      "title": "面试回答思路",
+      "content": "结论：Java IO/NIO 体系与 Netty 要先说清它解决什么问题，再展开机制、边界和验证方式。梳理 BIO/NIO/AIO 与 Reactor 模型，理解 Netty 的 EventLoop、Pipeline、ByteBuf 与主从 Reactor。\n\n我会这样回答：\n1. 先定位核心问题：BIO/NIO/AIO 区别。\n2. 再串起关键机制：NIO 三件套与多路复用(epoll)，并说明它和 Netty 主从 Reactor 的关系。\n3. 接着补充边界和风险：把 NIO 当成真异步。\n4. 最后落到验证方式：结合代码入口、运行时状态、异常栈、日志或指标验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
       "followUpQuestions": [
         {
           "question": "Netty 的 EventLoop 里能做耗时阻塞操作吗？",
@@ -109,14 +118,12 @@
     "goodToHave": [
       "epoll 空轮询 bug",
       "拆包粘包解码器",
-      "ByteBuf 池化与零拷贝",
-      "EventLoop 不可阻塞"
+      "ByteBuf 池化与零拷贝"
     ],
     "commonMistakes": [
       "把 NIO 当成真异步",
       "认为 AIO 在 Linux 性能更好",
-      "在 EventLoop 里跑阻塞任务",
-      "忽略 TCP 无消息边界需要解码器"
+      "在 EventLoop 里跑阻塞任务"
     ],
     "scoreWeights": {
       "coverage": 30,

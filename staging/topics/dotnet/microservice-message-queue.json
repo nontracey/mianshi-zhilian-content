@@ -13,7 +13,7 @@
     "事件驱动"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 45,
+  "estimatedMinutes": 40,
   "order": 20,
   "recommendWeight": 80,
   "status": "staging",
@@ -29,25 +29,18 @@
       "content": "## 事件驱动架构\n\n**事件溯源**：\n```csharp\npublic class OrderAggregate\n{\n    private readonly List<IEvent> _events = new();\n\n    public Guid Id { get; private set; }\n    public OrderStatus Status { get; private set; }\n    public decimal TotalAmount { get; private set; }\n\n    public void Submit()\n    {\n        if (Status != OrderStatus.Draft)\n            throw new InvalidOperationException(\"Order is not in draft status\");\n\n        var @event = new OrderSubmitted(Id, TotalAmount);\n        Apply(@event);\n        _events.Add(@event);\n    }\n\n    private void Apply(OrderSubmitted @event)\n    {\n        Status = OrderStatus.Submitted;\n    }\n}\n```\n\n## Saga 模式\n\n```csharp\npublic class OrderStateMachine : MassTransitStateMachine<OrderState>\n{\n    public OrderStateMachine()\n    {\n        InstanceState(x => x.CurrentState);\n\n        Event(() => OrderSubmitted, x => x.CorrelateById(m => m.Message.OrderId));\n        Event(() => PaymentProcessed, x => x.CorrelateById(m => m.Message.OrderId));\n        Event(() => OrderShipped, x => x.CorrelateById(m => m.Message.OrderId));\n\n        Initially(\n            When(OrderSubmitted)\n                .Then(context =>\n                {\n                    context.Saga.OrderId = context.Message.OrderId;\n                    context.Saga.CustomerId = context.Message.CustomerId;\n                })\n                .TransitionTo(Submitted)\n                .Publish(context => new ProcessPayment\n                {\n                    OrderId = context.Message.OrderId,\n                    Amount = context.Message.TotalAmount\n                })\n        );\n\n        During(Submitted,\n            When(PaymentProcessed)\n                .TransitionTo(Paid)\n                .Publish(context => new ShipOrder\n                {\n                    OrderId = context.Saga.OrderId\n                })\n        );\n\n        During(Paid,\n            When(OrderShipped)\n                .TransitionTo(Shipped)\n                .Publish(context => new OrderCompleted\n                {\n                    OrderId = context.Saga.OrderId\n                })\n        );\n    }\n\n    public Event<OrderSubmitted> OrderSubmitted { get; }\n    public Event<PaymentProcessed> PaymentProcessed { get; }\n    public Event<OrderShipped> OrderShipped { get; }\n\n    public State Submitted { get; }\n    public State Paid { get; }\n    public State Shipped { get; }\n}\n\npublic class OrderState : SagaStateMachineInstance\n{\n    public Guid CorrelationId { get; set; }\n    public string CurrentState { get; set; }\n    public Guid OrderId { get; set; }\n    public string CustomerId { get; set; }\n}\n```\n\n## 重试和错误处理\n\n```csharp\nx.UsingRabbitMq((context, cfg) =>\n{\n    cfg.ReceiveEndpoint(\"order-queue\", e =>\n    {\n        e.UseMessageRetry(r => r.Interval(3, TimeSpan.FromSeconds(5)));\n        e.ConfigureConsumer<OrderConsumer>(context);\n    });\n});\n```\n\n## 消息过滤\n\n```csharp\ncfg.ReceiveEndpoint(\"filtered-queue\", e =>\n{\n    e.Consumer<OrderConsumer>();\n    \n    e.UseFilter(new ConsumeFilter<OrderSubmitted>(\n        context => context.Message.TotalAmount > 100));\n});\n```"
     },
     {
-      "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Collections.Generic;\nusing System.Threading.Tasks;\nusing MassTransit;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Logging;\n\nnamespace MessageQueueDemo\n{\n    // 消息定义\n    public record SubmitOrder\n    {\n        public Guid OrderId { get; init; }\n        public string CustomerId { get; init; }\n        public List<OrderItem> Items { get; init; }\n        public decimal TotalAmount { get; init; }\n    }\n\n    public record OrderSubmitted\n    {\n        public Guid OrderId { get; init; }\n        public string CustomerId { get; init; }\n        public decimal TotalAmount { get; init; }\n        public DateTime SubmittedAt { get; init; }\n    }\n\n    public record OrderItem\n    {\n        public string ProductId { get; init; }\n        public int Quantity { get; init; }\n        public decimal Price { get; init; }\n    }\n\n    public record ProcessPayment\n    {\n        public Guid OrderId { get; init; }\n        public decimal Amount { get; init; }\n    }\n\n    public record PaymentProcessed\n    {\n        public Guid OrderId { get; init; }\n        public bool Success { get; init; }\n        public string TransactionId { get; init; }\n    }\n\n    // 消费者\n    public class OrderSubmittedConsumer : IConsumer<OrderSubmitted>\n    {\n        private readonly ILogger<OrderSubmittedConsumer> _logger;\n        private readonly IPublishEndpoint _publishEndpoint;\n\n        public OrderSubmittedConsumer(\n            ILogger<OrderSubmittedConsumer> logger,\n            IPublishEndpoint publishEndpoint)\n        {\n            _logger = logger;\n            _publishEndpoint = publishEndpoint;\n        }\n\n        public async Task Consume(ConsumeContext<OrderSubmitted> context)\n        {\n            var message = context.Message;\n            _logger.LogInformation($\"处理订单 {message.OrderId}，金额: {message.TotalAmount}\");\n\n            // 模拟处理\n            await Task.Delay(1000);\n\n            // 发布支付命令\n            await _publishEndpoint.Publish(new ProcessPayment\n            {\n                OrderId = message.OrderId,\n                Amount = message.TotalAmount\n            });\n\n            _logger.LogInformation($\"订单 {message.OrderId} 处理完成，已发送支付命令\");\n        }\n    }\n\n    public class PaymentProcessedConsumer : IConsumer<PaymentProcessed>\n    {\n        private readonly ILogger<PaymentProcessedConsumer> _logger;\n\n        public PaymentProcessedConsumer(ILogger<PaymentProcessedConsumer> logger)\n        {\n            _logger = logger;\n        }\n\n        public Task Consume(ConsumeContext<PaymentProcessed> context)\n        {\n            var message = context.Message;\n            if (message.Success)\n            {\n                _logger.LogInformation($\"订单 {message.OrderId} 支付成功，交易ID: {message.TransactionId}\");\n            }\n            else\n            {\n                _logger.LogWarning($\"订单 {message.OrderId} 支付失败\");\n            }\n\n            return Task.CompletedTask;\n        }\n    }\n\n    // 服务\n    public class OrderService\n    {\n        private readonly IPublishEndpoint _publishEndpoint;\n        private readonly ILogger<OrderService> _logger;\n\n        public OrderService(IPublishEndpoint publishEndpoint, ILogger<OrderService> logger)\n        {\n            _publishEndpoint = publishEndpoint;\n            _logger = logger;\n        }\n\n        public async Task SubmitOrderAsync(string customerId, List<OrderItem> items)\n        {\n            var orderId = Guid.NewGuid();\n            var totalAmount = items.Sum(i => i.Price * i.Quantity);\n\n            _logger.LogInformation($\"提交订单 {orderId}\");\n\n            await _publishEndpoint.Publish(new OrderSubmitted\n            {\n                OrderId = orderId,\n                CustomerId = customerId,\n                TotalAmount = totalAmount,\n                SubmittedAt = DateTime.UtcNow\n            });\n        }\n    }\n\n    // 消息状态机\n    public class OrderStateMachine : MassTransitStateMachine<OrderState>\n    {\n        public OrderStateMachine()\n        {\n            InstanceState(x => x.CurrentState);\n\n            Event(() => OrderSubmitted, x => x.CorrelateById(m => m.Message.OrderId));\n            Event(() => PaymentProcessed, x => x.CorrelateById(m => m.Message.OrderId));\n\n            Initially(\n                When(OrderSubmitted)\n                    .Then(context =>\n                    {\n                        context.Saga.OrderId = context.Message.OrderId;\n                        context.Saga.CustomerId = context.Message.CustomerId;\n                        context.Saga.TotalAmount = context.Message.TotalAmount;\n                    })\n                    .TransitionTo(Submitted)\n                    .Publish(context => new ProcessPayment\n                    {\n                        OrderId = context.Message.OrderId,\n                        Amount = context.Message.TotalAmount\n                    })\n            );\n\n            During(Submitted,\n                When(PaymentProcessed)\n                    .Then(context =>\n                    {\n                        context.Saga.TransactionId = context.Message.TransactionId;\n                    })\n                    .TransitionTo(Paid)\n            );\n        }\n\n        public Event<OrderSubmitted> OrderSubmitted { get; }\n        public Event<PaymentProcessed> PaymentProcessed { get; }\n\n        public State Submitted { get; }\n        public State Paid { get; }\n    }\n\n    public class OrderState : SagaStateMachineInstance\n    {\n        public Guid CorrelationId { get; set; }\n        public string CurrentState { get; set; }\n        public Guid OrderId { get; set; }\n        public string CustomerId { get; set; }\n        public decimal TotalAmount { get; set; }\n        public string TransactionId { get; set; }\n    }\n\n    // 配置服务\n    public static class MessageQueueServiceCollectionExtensions\n    {\n        public static IServiceCollection AddMessageQueueServices(this IServiceCollection services)\n        {\n            services.AddMassTransit(x =>\n            {\n                x.AddConsumer<OrderSubmittedConsumer>();\n                x.AddConsumer<PaymentProcessedConsumer>();\n                x.AddSagaStateMachine<OrderStateMachine, OrderState>()\n                    .InMemoryRepository();\n\n                x.UsingRabbitMq((context, cfg) =>\n                {\n                    cfg.Host(\"localhost\", \"/\", h =>\n                    {\n                        h.Username(\"guest\");\n                        h.Password(\"guest\");\n                    });\n\n                    cfg.ReceiveEndpoint(\"order-submitted\", e =>\n                    {\n                        e.UseMessageRetry(r => r.Interval(3, TimeSpan.FromSeconds(5)));\n                        e.ConfigureConsumer<OrderSubmittedConsumer>(context);\n                    });\n\n                    cfg.ReceiveEndpoint(\"payment-processed\", e =>\n                    {\n                        e.ConfigureConsumer<PaymentProcessedConsumer>(context);\n                    });\n\n                    cfg.ReceiveEndpoint(\"order-state\", e =>\n                    {\n                        e.ConfigureSaga<OrderState>(context);\n                    });\n                });\n            });\n\n            services.AddMassTransitHostedService();\n\n            services.AddScoped<OrderService>();\n\n            return services;\n        }\n    }\n}",
-      "language": "csharp"
-    },
-    {
-      "type": "interviewAnswer",
-      "title": "面试回答模板",
-      "content": "消息队列是微服务架构中实现异步通信和解耦的关键组件。主要有点对点和发布/订阅两种模式。RabbitMQ 是流行的消息代理，支持 AMQP 协议。\n\nMassTransit 是 .NET 的分布式应用框架，它封装了 RabbitMQ 等消息代理的使用，提供了高级特性如消费者、Saga 状态机、重试策略等。\n\n事件驱动架构通过事件实现服务间通信。事件溯源记录所有状态变化事件，可以重建任意时刻的状态。Saga 模式用于管理跨服务的分布式事务。\n\nMassTransit 的核心概念包括：消息（命令和事件）、消费者（处理消息）、发布端点（发布事件）、发送端点（发送命令）。\n\n错误处理方面，MassTransit 支持重试策略、死信队列和消息过滤。Saga 状态机可以管理复杂的业务流程。\n\n在实际开发中，我会使用 MassTransit 集成 RabbitMQ，通过事件驱动实现服务解耦，使用 Saga 管理分布式事务，配置重试策略提高可靠性。",
-      "followUpQuestions": [
-        {
-          "question": "面试官追问「消息队列集成」时，最应该展开哪条机制链？",
-          "answer": "回答「消息队列集成」时先抓住 理解消息队列的基本概念，再展开 知道 RabbitMQ 的基本使用。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对.NET 工程里真实机制的理解。"
-        },
-        {
-          "question": "如果「消息队列集成」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "我会先确认问题是否落在「消息队列集成」的核心边界上，再看 异常日志、请求耗时、GC/线程池/连接池指标、数据库查询和依赖服务超时。排查时特别避免“只背「消息队列集成」结论，讲不清理解消息队列的基本概念”这个误区，先复现触发条件，再用日志、指标或最小用例验证修复是否真的命中原因。"
-        }
-      ]
+      "type": "diagram",
+      "title": "消息队列集成 学习主线图",
+      "content": "flowchart LR\nA[消息队列集成] --> B[.NET]\nB --> C[消息队列]\nC --> D[RabbitMQ]\nD --> E[MassTransit]\nE --> F[事件驱动]",
+      "fallback": "消息队列集成 -> .NET -> 消息队列 -> RabbitMQ -> MassTransit -> 事件驱动",
+      "items": [
+        "点对点：任务分发",
+        "发布/订阅：事件广播",
+        "事件驱动：服务解耦",
+        "Saga：分布式事务"
+      ],
+      "format": "mermaid",
+      "caption": "从 .NET 到 事件驱动，这张图帮助区分 消息队列集成 的核心机制、边界条件和常见误区。"
     },
     {
       "type": "compareTable",
@@ -65,15 +58,30 @@
       "content": "| 维度 | 直接调用 | 消息队列 |\n| --- | --- | --- |\n| 耦合度 | 高（同步） | 低（异步） |\n| 可用性 | 依赖下游 | 解耦 |\n| 性能 | 实时 | 延迟 |\n| 适用场景 | 查询 | 命令/事件 |"
     },
     {
-      "type": "diagram",
-      "title": "结构图解",
-      "content": "消息队列模式：\n\n点对点：\nProducer → Queue → Consumer\n\n发布/订阅：\nPublisher → Topic → Subscriber1\n                  → Subscriber2\n                  → Subscriber3\n\n事件驱动架构：\nOrderService → OrderSubmitted → EmailService\n                             → InventoryService\n                             → PaymentService",
-      "fallback": "消息队列模式和事件驱动架构示意图",
-      "items": [
-        "点对点：任务分发",
-        "发布/订阅：事件广播",
-        "事件驱动：服务解耦",
-        "Saga：分布式事务"
+      "type": "code",
+      "title": "代码示例",
+      "content": "using System;\nusing System.Collections.Generic;\nusing System.Threading.Tasks;\nusing MassTransit;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Logging;\n\nnamespace MessageQueueDemo\n{\n    // 消息定义\n    public record SubmitOrder\n    {\n        public Guid OrderId { get; init; }\n        public string CustomerId { get; init; }\n        public List<OrderItem> Items { get; init; }\n        public decimal TotalAmount { get; init; }\n    }\n\n    public record OrderSubmitted\n    {\n        public Guid OrderId { get; init; }\n        public string CustomerId { get; init; }\n        public decimal TotalAmount { get; init; }\n        public DateTime SubmittedAt { get; init; }\n    }\n\n    public record OrderItem\n    {\n        public string ProductId { get; init; }\n        public int Quantity { get; init; }\n        public decimal Price { get; init; }\n    }\n\n    public record ProcessPayment\n    {\n        public Guid OrderId { get; init; }\n        public decimal Amount { get; init; }\n    }\n\n    public record PaymentProcessed\n    {\n        public Guid OrderId { get; init; }\n        public bool Success { get; init; }\n        public string TransactionId { get; init; }\n    }\n\n    // 消费者\n    public class OrderSubmittedConsumer : IConsumer<OrderSubmitted>\n    {\n        private readonly ILogger<OrderSubmittedConsumer> _logger;\n        private readonly IPublishEndpoint _publishEndpoint;\n\n        public OrderSubmittedConsumer(\n            ILogger<OrderSubmittedConsumer> logger,\n            IPublishEndpoint publishEndpoint)\n        {\n            _logger = logger;\n            _publishEndpoint = publishEndpoint;\n        }\n\n        public async Task Consume(ConsumeContext<OrderSubmitted> context)\n        {\n            var message = context.Message;\n            _logger.LogInformation($\"处理订单 {message.OrderId}，金额: {message.TotalAmount}\");\n\n            // 模拟处理\n            await Task.Delay(1000);\n\n            // 发布支付命令\n            await _publishEndpoint.Publish(new ProcessPayment\n            {\n                OrderId = message.OrderId,\n                Amount = message.TotalAmount\n            });\n\n            _logger.LogInformation($\"订单 {message.OrderId} 处理完成，已发送支付命令\");\n        }\n    }\n\n    public class PaymentProcessedConsumer : IConsumer<PaymentProcessed>\n    {\n        private readonly ILogger<PaymentProcessedConsumer> _logger;\n\n        public PaymentProcessedConsumer(ILogger<PaymentProcessedConsumer> logger)\n        {\n            _logger = logger;\n        }\n\n        public Task Consume(ConsumeContext<PaymentProcessed> context)\n        {\n            var message = context.Message;\n            if (message.Success)\n            {\n                _logger.LogInformation($\"订单 {message.OrderId} 支付成功，交易ID: {message.TransactionId}\");\n            }\n            else\n            {\n                _logger.LogWarning($\"订单 {message.OrderId} 支付失败\");\n            }\n\n            return Task.CompletedTask;\n        }\n    }\n\n    // 服务\n    public class OrderService\n    {\n        private readonly IPublishEndpoint _publishEndpoint;\n        private readonly ILogger<OrderService> _logger;\n\n        public OrderService(IPublishEndpoint publishEndpoint, ILogger<OrderService> logger)\n        {\n            _publishEndpoint = publishEndpoint;\n            _logger = logger;\n        }\n\n        public async Task SubmitOrderAsync(string customerId, List<OrderItem> items)\n        {\n            var orderId = Guid.NewGuid();\n            var totalAmount = items.Sum(i => i.Price * i.Quantity);\n\n            _logger.LogInformation($\"提交订单 {orderId}\");\n\n            await _publishEndpoint.Publish(new OrderSubmitted\n            {\n                OrderId = orderId,\n                CustomerId = customerId,\n                TotalAmount = totalAmount,\n                SubmittedAt = DateTime.UtcNow\n            });\n        }\n    }\n\n    // 消息状态机\n    public class OrderStateMachine : MassTransitStateMachine<OrderState>\n    {\n        public OrderStateMachine()\n        {\n            InstanceState(x => x.CurrentState);\n\n            Event(() => OrderSubmitted, x => x.CorrelateById(m => m.Message.OrderId));\n            Event(() => PaymentProcessed, x => x.CorrelateById(m => m.Message.OrderId));\n\n            Initially(\n                When(OrderSubmitted)\n                    .Then(context =>\n                    {\n                        context.Saga.OrderId = context.Message.OrderId;\n                        context.Saga.CustomerId = context.Message.CustomerId;\n                        context.Saga.TotalAmount = context.Message.TotalAmount;\n                    })\n                    .TransitionTo(Submitted)\n                    .Publish(context => new ProcessPayment\n                    {\n                        OrderId = context.Message.OrderId,\n                        Amount = context.Message.TotalAmount\n                    })\n            );\n\n            During(Submitted,\n                When(PaymentProcessed)\n                    .Then(context =>\n                    {\n                        context.Saga.TransactionId = context.Message.TransactionId;\n                    })\n                    .TransitionTo(Paid)\n            );\n        }\n\n        public Event<OrderSubmitted> OrderSubmitted { get; }\n        public Event<PaymentProcessed> PaymentProcessed { get; }\n\n        public State Submitted { get; }\n        public State Paid { get; }\n    }\n\n    public class OrderState : SagaStateMachineInstance\n    {\n        public Guid CorrelationId { get; set; }\n        public string CurrentState { get; set; }\n        public Guid OrderId { get; set; }\n        public string CustomerId { get; set; }\n        public decimal TotalAmount { get; set; }\n        public string TransactionId { get; set; }\n    }\n\n    // 配置服务\n    public static class MessageQueueServiceCollectionExtensions\n    {\n        public static IServiceCollection AddMessageQueueServices(this IServiceCollection services)\n        {\n            services.AddMassTransit(x =>\n            {\n                x.AddConsumer<OrderSubmittedConsumer>();\n                x.AddConsumer<PaymentProcessedConsumer>();\n                x.AddSagaStateMachine<OrderStateMachine, OrderState>()\n                    .InMemoryRepository();\n\n                x.UsingRabbitMq((context, cfg) =>\n                {\n                    cfg.Host(\"localhost\", \"/\", h =>\n                    {\n                        h.Username(\"guest\");\n                        h.Password(\"guest\");\n                    });\n\n                    cfg.ReceiveEndpoint(\"order-submitted\", e =>\n                    {\n                        e.UseMessageRetry(r => r.Interval(3, TimeSpan.FromSeconds(5)));\n                        e.ConfigureConsumer<OrderSubmittedConsumer>(context);\n                    });\n\n                    cfg.ReceiveEndpoint(\"payment-processed\", e =>\n                    {\n                        e.ConfigureConsumer<PaymentProcessedConsumer>(context);\n                    });\n\n                    cfg.ReceiveEndpoint(\"order-state\", e =>\n                    {\n                        e.ConfigureSaga<OrderState>(context);\n                    });\n                });\n            });\n\n            services.AddMassTransitHostedService();\n\n            services.AddScoped<OrderService>();\n\n            return services;\n        }\n    }\n}",
+      "language": "csharp",
+      "highlights": [
+        {
+          "line": 92,
+          "note": "这里是边界条件分支，回答 消息队列集成 时要说明它为什么会改变执行路径。"
+        }
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答思路",
+      "content": "消息队列是微服务架构中实现异步通信和解耦的关键组件。主要有点对点和发布/订阅两种模式。RabbitMQ 是流行的消息代理，支持 AMQP 协议。\n\nMassTransit 是 .NET 的分布式应用框架，它封装了 RabbitMQ 等消息代理的使用，提供了高级特性如消费者、Saga 状态机、重试策略等。\n\n事件驱动架构通过事件实现服务间通信。事件溯源记录所有状态变化事件，可以重建任意时刻的状态。Saga 模式用于管理跨服务的分布式事务。\n\nMassTransit 的核心概念包括：消息（命令和事件）、消费者（处理消息）、发布端点（发布事件）、发送端点（发送命令）。\n\n错误处理方面，MassTransit 支持重试策略、死信队列和消息过滤。Saga 状态机可以管理复杂的业务流程。\n\n在实际开发中，我会使用 MassTransit 集成 RabbitMQ，通过事件驱动实现服务解耦，使用 Saga 管理分布式事务，配置重试策略提高可靠性。",
+      "followUpQuestions": [
+        {
+          "question": "面试官追问「消息队列集成」时，最应该展开哪条机制链？",
+          "answer": "回答「消息队列集成」时先抓住 理解消息队列的基本概念，再展开 知道 RabbitMQ 的基本使用。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对.NET 工程里真实机制的理解。"
+        },
+        {
+          "question": "如果「消息队列集成」在线上或编码中出问题，你会优先检查什么？",
+          "answer": "可以先确认现象是否落在「知道 RabbitMQ 的基本使用」，再结合日志、指标、输入规模和依赖状态验证。"
+        }
       ]
     },
     {
@@ -95,14 +103,21 @@
       "prompt": "请说明 消息队列集成 的核心机制、典型使用场景和常见坑。",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
     },
     {
       "id": "dotnet.microservice-dotnet.message-queue.recall.2",
       "prompt": "什么是事件驱动架构？MassTransit 如何支持事件驱动开发？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.microservice-dotnet.message-queue.recall.3",
+      "prompt": "消息队列集成 和相邻概念或常见替代方案有什么关键区别？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
     }
   ],
   "rubric": {
@@ -110,8 +125,7 @@
       "理解消息队列的基本概念",
       "知道 RabbitMQ 的基本使用",
       "掌握 MassTransit 的配置",
-      "理解命令和事件的区别",
-      "了解事件驱动架构"
+      "理解命令和事件的区别"
     ],
     "goodToHave": [
       "了解 Saga 模式",
@@ -119,7 +133,7 @@
       "理解消息过滤"
     ],
     "commonMistakes": [
-      "只背「消息队列集成」结论，讲不清理解消息队列的基本概念",
+      "只列出 消息队列、RabbitMQ、MassTransit，但说不出触发条件、状态变化和验证证据",
       "把「消息队列集成」的适用场景、失效条件和相邻概念混在一起",
       "遇到.NET 工程里的真实问题时，不能说明「消息队列集成」应该观察哪些状态、日志或指标"
     ],
@@ -133,5 +147,5 @@
   "prerequisites": [],
   "interviewFrequency": "medium",
   "interviewerFocus": "考察是否能围绕「消息队列集成」说清理解消息队列的基本概念、知道 RabbitMQ 的基本使用，并放到.NET 工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-11"
+  "updatedAt": "2026-06-12"
 }

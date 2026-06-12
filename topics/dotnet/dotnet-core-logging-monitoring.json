@@ -14,7 +14,7 @@
     "监控"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 45,
+  "estimatedMinutes": 40,
   "order": 40,
   "recommendWeight": 75,
   "status": "production",
@@ -30,25 +30,18 @@
       "content": "## 常用日志接收器\n\n- Console：控制台输出\n- File：文件日志\n- Seq：结构化日志服务器\n- Elasticsearch：日志聚合\n- Application Insights：Azure 监控\n- Serilog.Sinks.MSSqlServer：数据库日志\n\n## HealthCheck\n\n健康检查用于监控应用状态：\n```csharp\n// 注册健康检查\nbuilder.Services.AddHealthChecks()\n    .AddCheck(\"self\", () => HealthCheckResult.Healthy())\n    .AddSqlServer(connectionString)\n    .AddRedis(redisConnection);\n\n// 配置端点\napp.MapHealthChecks(\"/health\");\napp.MapHealthChecks(\"/health/ready\", new HealthCheckOptions\n{\n    Predicate = check => check.Tags.Contains(\"ready\")\n});\napp.MapHealthChecks(\"/health/live\", new HealthCheckOptions\n{\n    Predicate = _ => false\n});\n```\n\n**自定义健康检查**：\n```csharp\npublic class DatabaseHealthCheck : IHealthCheck\n{\n    private readonly string _connectionString;\n\n    public DatabaseHealthCheck(string connectionString)\n    {\n        _connectionString = connectionString;\n    }\n\n    public async Task<HealthCheckResult> CheckHealthAsync(\n        HealthCheckContext context,\n        CancellationToken cancellationToken = default)\n    {\n        try\n        {\n            using var connection = new SqlConnection(_connectionString);\n            await connection.OpenAsync(cancellationToken);\n            return HealthCheckResult.Healthy(\"数据库连接正常\");\n        }\n        catch (Exception ex)\n        {\n            return HealthCheckResult.Unhealthy(\"数据库连接失败\", ex);\n        }\n    }\n}\n```\n\n## 监控集成\n\n**Application Insights**：\n```csharp\nbuilder.Services.AddApplicationInsightsTelemetry();\n```\n\n**Prometheus**：\n```csharp\napp.UseMetricServer();\napp.UseHttpMetrics();\n```\n\n**OpenTelemetry**：\n```csharp\nbuilder.Services.AddOpenTelemetry()\n    .WithTracing(builder => builder\n        .AddAspNetCoreInstrumentation()\n        .AddHttpClientInstrumentation()\n        .AddJaegerExporter());\n```"
     },
     {
-      "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Collections.Generic;\nusing System.Threading;\nusing System.Threading.Tasks;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Diagnostics.HealthChecks;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Diagnostics.HealthChecks;\nusing Microsoft.Extensions.Logging;\nusing Serilog;\nusing Serilog.Events;\n\nnamespace LoggingMonitoringDemo\n{\n    // 自定义健康检查\n    public class MemoryHealthCheck : IHealthCheck\n    {\n        private readonly ILogger<MemoryHealthCheck> _logger;\n\n        public MemoryHealthCheck(ILogger<MemoryHealthCheck> logger)\n        {\n            _logger = logger;\n        }\n\n        public Task<HealthCheckResult> CheckHealthAsync(\n            HealthCheckContext context,\n            CancellationToken cancellationToken = default)\n        {\n            var allocated = GC.GetTotalMemory(forceFullCollection: false);\n            var threshold = 1024L * 1024L * 1024L; // 1GB\n\n            _logger.LogDebug(\"当前内存使用: {Allocated} bytes\", allocated);\n\n            var status = allocated < threshold\n                ? HealthStatus.Healthy\n                : HealthStatus.Degraded;\n\n            var data = new Dictionary<string, object>\n            {\n                { \"allocatedBytes\", allocated },\n                { \"thresholdBytes\", threshold }\n            };\n\n            return Task.FromResult(new HealthCheckResult(\n                status,\n                description: $\"内存使用: {allocated / 1024 / 1024}MB\",\n                data: data));\n        }\n    }\n\n    // 使用日志的服务\n    public class OrderService\n    {\n        private readonly ILogger<OrderService> _logger;\n\n        public OrderService(ILogger<OrderService> logger)\n        {\n            _logger = logger;\n        }\n\n        public async Task ProcessOrderAsync(string orderId)\n        {\n            using var scope = _logger.BeginScope(new Dictionary<string, object>\n            {\n                [\"OrderId\"] = orderId,\n                [\"Operation\"] = \"ProcessOrder\"\n            });\n\n            _logger.LogInformation(\"开始处理订单 {OrderId}\", orderId);\n\n            try\n            {\n                // 模拟处理\n                await Task.Delay(100);\n\n                _logger.LogInformation(\"订单 {OrderId} 处理完成\", orderId);\n            }\n            catch (Exception ex)\n            {\n                _logger.LogError(ex, \"订单 {OrderId} 处理失败\", orderId);\n                throw;\n            }\n        }\n    }\n\n    class Program\n    {\n        static void Main(string[] args)\n        {\n            // 配置 Serilog\n            Log.Logger = new LoggerConfiguration()\n                .MinimumLevel.Information()\n                .MinimumLevel.Override(\"Microsoft\", LogEventLevel.Warning)\n                .Enrich.FromLogContext()\n                .WriteTo.Console(\n                    outputTemplate: \"{Timestamp:HH:mm:ss} [{Level:u3}] {Message:lj}{NewLine}{Exception}\")\n                .WriteTo.File(\"logs/log-.txt\",\n                    rollingInterval: RollingInterval.Day,\n                    retainedFileCountLimit: 7)\n                .CreateLogger();\n\n            try\n            {\n                Log.Information(\"应用启动中...\");\n\n                var builder = WebApplication.CreateBuilder(args);\n\n                // 使用 Serilog\n                builder.Host.UseSerilog();\n\n                // 注册健康检查\n                builder.Services.AddHealthChecks()\n                    .AddCheck<MemoryHealthCheck>(\"memory\",\n                        failureStatus: HealthStatus.Degraded,\n                        tags: new[] { \"ready\" })\n                    .AddCheck(\"self\",\n                        () => HealthCheckResult.Healthy(\"应用运行正常\"),\n                        tags: new[] { \"live\" });\n\n                // 注册服务\n                builder.Services.AddTransient<OrderService>();\n\n                var app = builder.Build();\n\n                // 配置健康检查端点\n                app.MapHealthChecks(\"/health\", new HealthCheckOptions\n                {\n                    ResponseWriter = async (context, report) =>\n                    {\n                        context.Response.ContentType = \"application/json\";\n                        var result = new\n                        {\n                            status = report.Status.ToString(),\n                            checks = report.Entries.Select(e => new\n                            {\n                                name = e.Key,\n                                status = e.Value.Status.ToString(),\n                                description = e.Value.Description,\n                                duration = e.Value.Duration\n                            }),\n                            totalDuration = report.TotalDuration\n                        };\n                        await context.Response.WriteAsJsonAsync(result);\n                    }\n                });\n\n                app.MapHealthChecks(\"/health/ready\", new HealthCheckOptions\n                {\n                    Predicate = check => check.Tags.Contains(\"ready\")\n                });\n\n                app.MapHealthChecks(\"/health/live\", new HealthCheckOptions\n                {\n                    Predicate = check => check.Tags.Contains(\"live\")\n                });\n\n                // 使用日志\n                app.MapGet(\"/\", (ILogger<Program> logger) =>\n                {\n                    logger.LogInformation(\"收到根路径请求\");\n                    return \"Hello World!\";\n                });\n\n                app.MapGet(\"/order/{id}\", async (string id, OrderService orderService) =>\n                {\n                    await orderService.ProcessOrderAsync(id);\n                    return Results.Ok($\"订单 {id} 已处理\");\n                });\n\n                app.Run();\n            }\n            catch (Exception ex)\n            {\n                Log.Fatal(ex, \"应用启动失败\");\n            }\n            finally\n            {\n                Log.CloseAndFlush();\n            }\n        }\n    }\n}",
-      "language": "csharp"
-    },
-    {
-      "type": "interviewAnswer",
-      "title": "面试回答模板",
-      "content": "ASP.NET Core 提供了内置的日志框架，通过 ILogger 接口进行日志记录。日志分为 7 个级别：Trace、Debug、Information、Warning、Error、Critical、None。生产环境通常使用 Information 及以上级别。\n\n结构化日志是现代日志的最佳实践，它将日志参数作为独立的字段保存，便于日志聚合和分析。比如 _logger.LogInformation(\"用户 {UserId} 登录\", userId)，UserId 会作为独立字段存储，可以按 UserId 查询日志。\n\nSerilog 是流行的第三方日志框架，它提供了丰富的接收器（Sink），支持输出到控制台、文件、Seq、Elasticsearch 等。Serilog 的配置灵活，支持日志级别覆盖、丰富器（Enricher）等高级功能。\n\n健康检查（HealthCheck）用于监控应用状态，ASP.NET Core 提供了内置的健康检查框架。我们可以注册多个健康检查，包括自定义检查和第三方库的检查（如数据库、Redis）。健康检查端点通常分为 /health/ready（就绪检查）和 /health/live（存活检查）。\n\n在实际生产环境中，我会结合使用结构化日志和健康检查，配合日志聚合系统（如 ELK、Seq）和监控系统（如 Prometheus、Application Insights）实现全面的应用监控。",
-      "followUpQuestions": [
-        {
-          "question": "面试官追问「日志与监控」时，最应该展开哪条机制链？",
-          "answer": "回答「日志与监控」时先抓住 理解日志级别的概念和使用，再展开 掌握 ILogger 的使用方法。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对.NET 工程里真实机制的理解。"
-        },
-        {
-          "question": "如果「日志与监控」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "我会先确认问题是否落在「日志与监控」的核心边界上，再看 异常日志、请求耗时、GC/线程池/连接池指标、数据库查询和依赖服务超时。排查时特别避免“只背「日志与监控」结论，讲不清理解日志级别的概念和使用”这个误区，先复现触发条件，再用日志、指标或最小用例验证修复是否真的命中原因。"
-        }
-      ]
+      "type": "diagram",
+      "title": "日志与监控 学习主线图",
+      "content": "flowchart LR\nA[日志与监控] --> B[.NET]\nB --> C[日志]\nC --> D[Logging]\nD --> E[Serilog]\nE --> F[HealthCheck]",
+      "fallback": "日志与监控 -> .NET -> 日志 -> Logging -> Serilog -> HealthCheck",
+      "items": [
+        "ILogger 是日志入口",
+        "Serilog 提供多种输出目标",
+        "健康检查监控应用状态",
+        "K8s 使用 readiness/liveness 探针"
+      ],
+      "format": "mermaid",
+      "caption": "从 .NET 到 HealthCheck，这张图帮助区分 日志与监控 的核心机制、边界条件和常见误区。"
     },
     {
       "type": "compareTable",
@@ -61,15 +54,30 @@
       "content": "| 维度 | /health | /health/ready | /health/live |\n| --- | --- | --- | --- |\n| 用途 | 综合健康状态 | 就绪检查 | 存活检查 |\n| 检查内容 | 所有检查项 | 依赖服务是否就绪 | 应用是否存活 |\n| 使用场景 | 通用 | K8s readinessProbe | K8s livenessProbe |\n| 影响流量 | 可能 | 决定是否接收流量 | 决定是否重启 |\n| 典型检查 | 数据库、缓存、磁盘 | 数据库连接、配置加载 | 内存、线程池 |"
     },
     {
-      "type": "diagram",
-      "title": "结构图解",
-      "content": "日志框架架构：\n\n应用代码 → ILogger<T> → 日志提供者\n    ↓\nSerilog → Console Sink\n       → File Sink\n       → Seq Sink\n       → Elasticsearch Sink\n\n健康检查流程：\n\n客户端 → /health → HealthCheckService\n    ↓\n运行所有检查 → 汇总状态 → 返回结果\n    ↓\nHealthy / Degraded / Unhealthy",
-      "fallback": "日志框架和健康检查的工作流程图",
-      "items": [
-        "ILogger 是日志入口",
-        "Serilog 提供多种输出目标",
-        "健康检查监控应用状态",
-        "K8s 使用 readiness/liveness 探针"
+      "type": "code",
+      "title": "代码示例",
+      "content": "using System;\nusing System.Collections.Generic;\nusing System.Threading;\nusing System.Threading.Tasks;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Diagnostics.HealthChecks;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Diagnostics.HealthChecks;\nusing Microsoft.Extensions.Logging;\nusing Serilog;\nusing Serilog.Events;\n\nnamespace LoggingMonitoringDemo\n{\n    // 自定义健康检查\n    public class MemoryHealthCheck : IHealthCheck\n    {\n        private readonly ILogger<MemoryHealthCheck> _logger;\n\n        public MemoryHealthCheck(ILogger<MemoryHealthCheck> logger)\n        {\n            _logger = logger;\n        }\n\n        public Task<HealthCheckResult> CheckHealthAsync(\n            HealthCheckContext context,\n            CancellationToken cancellationToken = default)\n        {\n            var allocated = GC.GetTotalMemory(forceFullCollection: false);\n            var threshold = 1024L * 1024L * 1024L; // 1GB\n\n            _logger.LogDebug(\"当前内存使用: {Allocated} bytes\", allocated);\n\n            var status = allocated < threshold\n                ? HealthStatus.Healthy\n                : HealthStatus.Degraded;\n\n            var data = new Dictionary<string, object>\n            {\n                { \"allocatedBytes\", allocated },\n                { \"thresholdBytes\", threshold }\n            };\n\n            return Task.FromResult(new HealthCheckResult(\n                status,\n                description: $\"内存使用: {allocated / 1024 / 1024}MB\",\n                data: data));\n        }\n    }\n\n    // 使用日志的服务\n    public class OrderService\n    {\n        private readonly ILogger<OrderService> _logger;\n\n        public OrderService(ILogger<OrderService> logger)\n        {\n            _logger = logger;\n        }\n\n        public async Task ProcessOrderAsync(string orderId)\n        {\n            using var scope = _logger.BeginScope(new Dictionary<string, object>\n            {\n                [\"OrderId\"] = orderId,\n                [\"Operation\"] = \"ProcessOrder\"\n            });\n\n            _logger.LogInformation(\"开始处理订单 {OrderId}\", orderId);\n\n            try\n            {\n                // 模拟处理\n                await Task.Delay(100);\n\n                _logger.LogInformation(\"订单 {OrderId} 处理完成\", orderId);\n            }\n            catch (Exception ex)\n            {\n                _logger.LogError(ex, \"订单 {OrderId} 处理失败\", orderId);\n                throw;\n            }\n        }\n    }\n\n    class Program\n    {\n        static void Main(string[] args)\n        {\n            // 配置 Serilog\n            Log.Logger = new LoggerConfiguration()\n                .MinimumLevel.Information()\n                .MinimumLevel.Override(\"Microsoft\", LogEventLevel.Warning)\n                .Enrich.FromLogContext()\n                .WriteTo.Console(\n                    outputTemplate: \"{Timestamp:HH:mm:ss} [{Level:u3}] {Message:lj}{NewLine}{Exception}\")\n                .WriteTo.File(\"logs/log-.txt\",\n                    rollingInterval: RollingInterval.Day,\n                    retainedFileCountLimit: 7)\n                .CreateLogger();\n\n            try\n            {\n                Log.Information(\"应用启动中...\");\n\n                var builder = WebApplication.CreateBuilder(args);\n\n                // 使用 Serilog\n                builder.Host.UseSerilog();\n\n                // 注册健康检查\n                builder.Services.AddHealthChecks()\n                    .AddCheck<MemoryHealthCheck>(\"memory\",\n                        failureStatus: HealthStatus.Degraded,\n                        tags: new[] { \"ready\" })\n                    .AddCheck(\"self\",\n                        () => HealthCheckResult.Healthy(\"应用运行正常\"),\n                        tags: new[] { \"live\" });\n\n                // 注册服务\n                builder.Services.AddTransient<OrderService>();\n\n                var app = builder.Build();\n\n                // 配置健康检查端点\n                app.MapHealthChecks(\"/health\", new HealthCheckOptions\n                {\n                    ResponseWriter = async (context, report) =>\n                    {\n                        context.Response.ContentType = \"application/json\";\n                        var result = new\n                        {\n                            status = report.Status.ToString(),\n                            checks = report.Entries.Select(e => new\n                            {\n                                name = e.Key,\n                                status = e.Value.Status.ToString(),\n                                description = e.Value.Description,\n                                duration = e.Value.Duration\n                            }),\n                            totalDuration = report.TotalDuration\n                        };\n                        await context.Response.WriteAsJsonAsync(result);\n                    }\n                });\n\n                app.MapHealthChecks(\"/health/ready\", new HealthCheckOptions\n                {\n                    Predicate = check => check.Tags.Contains(\"ready\")\n                });\n\n                app.MapHealthChecks(\"/health/live\", new HealthCheckOptions\n                {\n                    Predicate = check => check.Tags.Contains(\"live\")\n                });\n\n                // 使用日志\n                app.MapGet(\"/\", (ILogger<Program> logger) =>\n                {\n                    logger.LogInformation(\"收到根路径请求\");\n                    return \"Hello World!\";\n                });\n\n                app.MapGet(\"/order/{id}\", async (string id, OrderService orderService) =>\n                {\n                    await orderService.ProcessOrderAsync(id);\n                    return Results.Ok($\"订单 {id} 已处理\");\n                });\n\n                app.Run();\n            }\n            catch (Exception ex)\n            {\n                Log.Fatal(ex, \"应用启动失败\");\n            }\n            finally\n            {\n                Log.CloseAndFlush();\n            }\n        }\n    }\n}",
+      "language": "csharp",
+      "highlights": [
+        {
+          "line": 45,
+          "note": "这里给出最终结果或提前退出条件，需要补充空值、失败和边界场景。"
+        }
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答思路",
+      "content": "结论：日志与监控 要先说清它解决什么问题，再展开机制、边界和验证方式。掌握 ILogger 的使用、Serilog 集成以及 HealthCheck 的实现\n\n我会这样回答：\n1. 先定位核心问题：理解日志级别的概念和使用。\n2. 再串起关键机制：ILogger 的使用方法，并说明它和 结构化日志的优势 的关系。\n3. 接着补充边界和风险：只给出结论，不能说明理解日志级别的概念和使用的触发条件和。\n4. 最后落到验证方式：结合请求管线、配置、日志、指标和诊断工具验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
+      "followUpQuestions": [
+        {
+          "question": "面试官追问「日志与监控」时，最应该展开哪条机制链？",
+          "answer": "回答「日志与监控」时先抓住 理解日志级别的概念和使用，再展开 掌握 ILogger 的使用方法。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对.NET 工程里真实机制的理解。"
+        },
+        {
+          "question": "如果「日志与监控」在线上或编码中出问题，你会优先检查什么？",
+          "answer": "可以先确认现象是否落在「掌握 ILogger 的使用方法」，再结合日志、指标、输入规模和依赖状态验证。"
+        }
       ]
     },
     {
@@ -91,14 +99,21 @@
       "prompt": "请说明 日志与监控 的核心机制、典型使用场景和常见坑。",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
     },
     {
       "id": "dotnet.dotnet-core.logging-monitoring.recall.2",
       "prompt": "什么是健康检查？如何实现自定义健康检查？/health/ready 和 /health/live 有什么区别？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.dotnet-core.logging-monitoring.recall.3",
+      "prompt": "日志与监控 和相邻概念或常见替代方案有什么关键区别？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
     }
   ],
   "rubric": {
@@ -106,8 +121,7 @@
       "理解日志级别的概念和使用",
       "掌握 ILogger 的使用方法",
       "了解结构化日志的优势",
-      "知道健康检查的实现方式",
-      "了解 Serilog 的基本配置"
+      "知道健康检查的实现方式"
     ],
     "goodToHave": [
       "了解日志作用域的使用",
@@ -115,7 +129,7 @@
       "理解 OpenTelemetry 的概念"
     ],
     "commonMistakes": [
-      "只背「日志与监控」结论，讲不清理解日志级别的概念和使用",
+      "只列出 日志、Logging、Serilog，但说不出触发条件、状态变化和验证证据",
       "把「日志与监控」的适用场景、失效条件和相邻概念混在一起",
       "遇到.NET 工程里的真实问题时，不能说明「日志与监控」应该观察哪些状态、日志或指标"
     ],
@@ -131,5 +145,5 @@
   ],
   "interviewFrequency": "medium",
   "interviewerFocus": "考察是否能围绕「日志与监控」说清理解日志级别的概念和使用、掌握 ILogger 的使用方法，并放到.NET 工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-11"
+  "updatedAt": "2026-06-12"
 }

@@ -29,25 +29,18 @@
       "content": "## 中间件的执行顺序\n\n中间件的注册顺序非常重要：\n```csharp\n// 正确顺序\napp.UseExceptionHandler(\"/Error\");\napp.UseHsts();\napp.UseHttpsRedirection();\napp.UseStaticFiles();\napp.UseRouting();\napp.UseCors();\napp.UseAuthentication();\napp.UseAuthorization();\napp.UseEndpoints(endpoints => endpoints.MapControllers());\n```\n\n## 短路与分支\n\n**短路**：中间件不调用 next()，直接返回响应\n```csharp\napp.Use(async (context, next) =>\n{\n    if (context.Request.Path == \"/health\")\n    {\n        await context.Response.WriteAsync(\"OK\");\n        return; // 短路\n    }\n    \n    await next();\n});\n```\n\n**分支**：根据条件执行不同的中间件管道\n```csharp\napp.MapWhen(context => context.Request.Method == \"GET\", getApp =>\n{\n    getApp.Run(async context => await context.Response.WriteAsync(\"GET Request\"));\n});\n```"
     },
     {
-      "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Diagnostics;\nusing System.Threading.Tasks;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\n\nnamespace MiddlewarePipelineDemo\n{\n    // 基于类的中间件\n    public class RequestLoggingMiddleware\n    {\n        private readonly RequestDelegate _next;\n        private readonly ILogger<RequestLoggingMiddleware> _logger;\n\n        public RequestLoggingMiddleware(RequestDelegate next, ILogger<RequestLoggingMiddleware> logger)\n        {\n            _next = next;\n            _logger = logger;\n        }\n\n        public async Task InvokeAsync(HttpContext context)\n        {\n            var requestId = Guid.NewGuid().ToString();\n            context.Items[\"RequestId\"] = requestId;\n\n            _logger.LogInformation($\"[{requestId}] 开始处理 {context.Request.Method} {context.Request.Path}\");\n\n            try\n            {\n                await _next(context);\n                _logger.LogInformation($\"[{requestId}] 请求完成，状态码: {context.Response.StatusCode}\");\n            }\n            catch (Exception ex)\n            {\n                _logger.LogError(ex, $\"[{requestId}] 请求处理失败\");\n                throw;\n            }\n        }\n    }\n\n    public class RequestTimingMiddleware\n    {\n        private readonly RequestDelegate _next;\n\n        public RequestTimingMiddleware(RequestDelegate next)\n        {\n            _next = next;\n        }\n\n        public async Task InvokeAsync(HttpContext context)\n        {\n            var stopwatch = Stopwatch.StartNew();\n\n            await _next(context);\n\n            stopwatch.Stop();\n            var duration = stopwatch.ElapsedMilliseconds;\n\n            context.Response.Headers.Add(\"X-Request-Duration\", $\"{duration}ms\");\n\n            if (duration > 1000)\n            {\n                Console.WriteLine($\"警告: 请求 {context.Request.Path} 耗时 {duration}ms\");\n            }\n        }\n    }\n\n    // 中间件扩展方法\n    public static class MiddlewareExtensions\n    {\n        public static IApplicationBuilder UseRequestLogging(this IApplicationBuilder app)\n        {\n            return app.UseMiddleware<RequestLoggingMiddleware>();\n        }\n\n        public static IApplicationBuilder UseRequestTiming(this IApplicationBuilder app)\n        {\n            return app.UseMiddleware<RequestTimingMiddleware>();\n        }\n    }\n\n    class Program\n    {\n        static void Main(string[] args)\n        {\n            var builder = WebApplication.CreateBuilder(args);\n            var app = builder.Build();\n\n            // 注册中间件\n            app.UseRequestLogging();\n            app.UseRequestTiming();\n\n            // 内联中间件示例\n            app.Use(async (context, next) =>\n            {\n                // 添加自定义头\n                context.Response.Headers.Add(\"X-Custom-Header\", \"MiddlewareDemo\");\n                \n                await next();\n            });\n\n            // 路径分支\n            app.Map(\"/api\", apiApp =>\n            {\n                apiApp.Use(async (context, next) =>\n                {\n                    Console.WriteLine(\"API 中间件\");\n                    await next();\n                });\n\n                apiApp.Run(async context =>\n                {\n                    await context.Response.WriteAsync(\"API Response\");\n                });\n            });\n\n            // 条件分支\n            app.MapWhen(\n                context => context.Request.Path.StartsWithSegments(\"/admin\"),\n                adminApp =>\n                {\n                    adminApp.Use(async (context, next) =>\n                    {\n                        // 管理员认证检查\n                        if (!context.User.Identity.IsAuthenticated)\n                        {\n                            context.Response.StatusCode = 401;\n                            return;\n                        }\n                        await next();\n                    });\n\n                    adminApp.Run(async context =>\n                    {\n                        await context.Response.WriteAsync(\"Admin Area\");\n                    });\n                });\n\n            // 终端中间件\n            app.Run(async context =>\n            {\n                await context.Response.WriteAsync(\"Hello World!\");\n            });\n\n            app.Run();\n        }\n    }\n}",
-      "language": "csharp"
-    },
-    {
-      "type": "interviewAnswer",
-      "title": "面试回答模板",
-      "content": "中间件管道是 ASP.NET Core 处理 HTTP 请求的核心机制。每个中间件都是一个处理 HttpContext 的组件，它们按照注册顺序形成管道。请求从前往后经过每个中间件，响应从后往前经过。每个中间件可以选择调用 next() 将请求传递给下一个中间件，或者短路管道直接返回响应。\n\nASP.NET Core 提供了三个主要的扩展方法来注册中间件：Use 用于注册可以调用 next() 的中间件，Map 用于根据路径分支管道，Run 用于注册终端中间件。Use 和 Map 的区别是 Use 可以调用 next() 继续管道，而 Run 是终端中间件，不会调用 next()。\n\n中间件的执行顺序非常重要。比如认证中间件必须在授权中间件之前，静态文件中间件通常在路由之前。错误处理中间件应该在最前面，以捕获后续中间件的异常。\n\n自定义中间件可以基于类实现，通过构造函数注入 RequestDelegate，实现 InvokeAsync 方法。这种方式可以利用依赖注入，更灵活。也可以使用内联中间件，适合简单的逻辑。\n\n在实际开发中，我会注意中间件的执行顺序，合理使用短路和分支，避免在中间件中执行耗时操作。",
-      "followUpQuestions": [
-        {
-          "question": "面试官追问「中间件管道」时，最应该展开哪条机制链？",
-          "answer": "回答「中间件管道」时先抓住 理解中间件管道的执行流程，再展开 掌握 Use、Map、Run 的区别。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对.NET 工程里真实机制的理解。"
-        },
-        {
-          "question": "如果「中间件管道」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "我会先确认问题是否落在「中间件管道」的核心边界上，再看 异常日志、请求耗时、GC/线程池/连接池指标、数据库查询和依赖服务超时。排查时特别避免“不清楚中间件的执行顺序”这个误区，先复现触发条件，再用日志、指标或最小用例验证修复是否真的命中原因。"
-        }
-      ]
+      "type": "diagram",
+      "title": "中间件管道 学习主线图",
+      "content": "flowchart LR\nA[中间件管道] --> B[.NET]\nB --> C[中间件]\nC --> D[Middleware]\nD --> E[管道]\nE --> F[RequestDelegate]",
+      "fallback": "中间件管道 -> .NET -> 中间件 -> Middleware -> 管道 -> RequestDelegate",
+      "items": [
+        "请求从前往后经过中间件",
+        "响应从后往前返回",
+        "中间件可调用 next() 继续管道",
+        "中间件可短路管道直接返回"
+      ],
+      "format": "mermaid",
+      "caption": "从 .NET 到 RequestDelegate，这张图帮助区分 中间件管道 的核心机制、边界条件和常见误区。"
     },
     {
       "type": "compareTable",
@@ -60,15 +53,30 @@
       "content": "| 维度 | 内联中间件 | 基于类的中间件 |\n| --- | --- | --- |\n| 定义方式 | lambda 表达式 | 独立类 |\n| 依赖注入 | 不支持 | 支持（构造函数） |\n| 可重用性 | 低（仅当前应用） | 高（可封装为库） |\n| 复杂度 | 适合简单逻辑 | 适合复杂逻辑 |\n| 测试 | 难以单元测试 | 易于单元测试 |"
     },
     {
-      "type": "diagram",
-      "title": "中间件管道流程",
-      "content": "flowchart LR\nA[HTTP 请求] --> B[异常处理中间件]\nB --> C[路由中间件]\nC --> D[认证授权]\nD --> E[业务中间件]\nE --> F[Endpoint]\nF --> G[响应回传]\nG --> E\nE --> D\nD --> C\nC --> B\nB --> H[HTTP 响应]",
-      "fallback": "ASP.NET Core 中间件按注册顺序处理请求，调用 next 进入后续管道，响应按相反方向回传；任一中间件也可以短路直接返回。",
-      "items": [
-        "请求从前往后经过中间件",
-        "响应从后往前返回",
-        "中间件可调用 next() 继续管道",
-        "中间件可短路管道直接返回"
+      "type": "code",
+      "title": "代码示例",
+      "content": "using System;\nusing System.Diagnostics;\nusing System.Threading.Tasks;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\n\nnamespace MiddlewarePipelineDemo\n{\n    // 基于类的中间件\n    public class RequestLoggingMiddleware\n    {\n        private readonly RequestDelegate _next;\n        private readonly ILogger<RequestLoggingMiddleware> _logger;\n\n        public RequestLoggingMiddleware(RequestDelegate next, ILogger<RequestLoggingMiddleware> logger)\n        {\n            _next = next;\n            _logger = logger;\n        }\n\n        public async Task InvokeAsync(HttpContext context)\n        {\n            var requestId = Guid.NewGuid().ToString();\n            context.Items[\"RequestId\"] = requestId;\n\n            _logger.LogInformation($\"[{requestId}] 开始处理 {context.Request.Method} {context.Request.Path}\");\n\n            try\n            {\n                await _next(context);\n                _logger.LogInformation($\"[{requestId}] 请求完成，状态码: {context.Response.StatusCode}\");\n            }\n            catch (Exception ex)\n            {\n                _logger.LogError(ex, $\"[{requestId}] 请求处理失败\");\n                throw;\n            }\n        }\n    }\n\n    public class RequestTimingMiddleware\n    {\n        private readonly RequestDelegate _next;\n\n        public RequestTimingMiddleware(RequestDelegate next)\n        {\n            _next = next;\n        }\n\n        public async Task InvokeAsync(HttpContext context)\n        {\n            var stopwatch = Stopwatch.StartNew();\n\n            await _next(context);\n\n            stopwatch.Stop();\n            var duration = stopwatch.ElapsedMilliseconds;\n\n            context.Response.Headers.Add(\"X-Request-Duration\", $\"{duration}ms\");\n\n            if (duration > 1000)\n            {\n                Console.WriteLine($\"警告: 请求 {context.Request.Path} 耗时 {duration}ms\");\n            }\n        }\n    }\n\n    // 中间件扩展方法\n    public static class MiddlewareExtensions\n    {\n        public static IApplicationBuilder UseRequestLogging(this IApplicationBuilder app)\n        {\n            return app.UseMiddleware<RequestLoggingMiddleware>();\n        }\n\n        public static IApplicationBuilder UseRequestTiming(this IApplicationBuilder app)\n        {\n            return app.UseMiddleware<RequestTimingMiddleware>();\n        }\n    }\n\n    class Program\n    {\n        static void Main(string[] args)\n        {\n            var builder = WebApplication.CreateBuilder(args);\n            var app = builder.Build();\n\n            // 注册中间件\n            app.UseRequestLogging();\n            app.UseRequestTiming();\n\n            // 内联中间件示例\n            app.Use(async (context, next) =>\n            {\n                // 添加自定义头\n                context.Response.Headers.Add(\"X-Custom-Header\", \"MiddlewareDemo\");\n                \n                await next();\n            });\n\n            // 路径分支\n            app.Map(\"/api\", apiApp =>\n            {\n                apiApp.Use(async (context, next) =>\n                {\n                    Console.WriteLine(\"API 中间件\");\n                    await next();\n                });\n\n                apiApp.Run(async context =>\n                {\n                    await context.Response.WriteAsync(\"API Response\");\n                });\n            });\n\n            // 条件分支\n            app.MapWhen(\n                context => context.Request.Path.StartsWithSegments(\"/admin\"),\n                adminApp =>\n                {\n                    adminApp.Use(async (context, next) =>\n                    {\n                        // 管理员认证检查\n                        if (!context.User.Identity.IsAuthenticated)\n                        {\n                            context.Response.StatusCode = 401;\n                            return;\n                        }\n                        await next();\n                    });\n\n                    adminApp.Run(async context =>\n                    {\n                        await context.Response.WriteAsync(\"Admin Area\");\n                    });\n                });\n\n            // 终端中间件\n            app.Run(async context =>\n            {\n                await context.Response.WriteAsync(\"Hello World!\");\n            });\n\n            app.Run();\n        }\n    }\n}",
+      "language": "csharp",
+      "highlights": [
+        {
+          "line": 62,
+          "note": "这里是边界条件分支，回答 中间件管道 时要说明它为什么会改变执行路径。"
+        }
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答思路",
+      "content": "结论：中间件管道 要先说清它解决什么问题，再展开机制、边界和验证方式。理解 RequestDelegate、Use/Map/Run 的区别以及中间件的执行流程\n\n我会这样回答：\n1. 先定位核心问题：理解中间件管道的执行流程。\n2. 再串起关键机制：Use、Map、Run 的区别，并说明它和 知道中间件注册顺序的重要性 的关系。\n3. 接着补充边界和风险：不清楚中间件的执行顺序。\n4. 最后落到验证方式：结合请求管线、配置、日志、指标和诊断工具验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
+      "followUpQuestions": [
+        {
+          "question": "面试官追问「中间件管道」时，最应该展开哪条机制链？",
+          "answer": "回答「中间件管道」时先抓住 理解中间件管道的执行流程，再展开 掌握 Use、Map、Run 的区别。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对.NET 工程里真实机制的理解。"
+        },
+        {
+          "question": "如果「中间件管道」在线上或编码中出问题，你会优先检查什么？",
+          "answer": "可以先确认现象是否落在「掌握 Use、Map、Run 的区别」，再结合日志、指标、输入规模和依赖状态验证。"
+        }
       ]
     },
     {
@@ -90,14 +98,14 @@
       "prompt": "请说明 中间件管道 的核心机制、典型使用场景和常见坑。",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
     },
     {
       "id": "dotnet.dotnet-core.middleware-pipeline.recall.2",
       "prompt": "Use、Map、MapWhen 和 Run 这四个扩展方法有什么区别？分别在什么场景下使用？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
     },
     {
       "id": "dotnet.dotnet-core.middleware-pipeline.recall.3",
@@ -112,8 +120,7 @@
       "理解中间件管道的执行流程",
       "掌握 Use、Map、Run 的区别",
       "知道中间件注册顺序的重要性",
-      "能够自定义中间件",
-      "了解短路和分支的概念"
+      "能够自定义中间件"
     ],
     "goodToHave": [
       "理解 RequestDelegate 的作用",
@@ -137,5 +144,5 @@
   ],
   "interviewFrequency": "high",
   "interviewerFocus": "考察是否能围绕「中间件管道」说清理解中间件管道的执行流程、掌握 Use、Map、Run 的区别，并放到.NET 工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-11"
+  "updatedAt": "2026-06-12"
 }
