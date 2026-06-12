@@ -316,6 +316,14 @@ content-repo/
 
 `learningCards` 是知识学习页的核心。App 按 `type` 选择渲染方式。
 
+所有卡片都应至少包含：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `type` | 是 | 卡片类型。当前 schema 允许 `explain`、`interviewAnswer`、`compareTable`、`code`、`animation`、`diagram`、`checklist`。 |
+| `title` | 是 | 卡片标题。 |
+| `content` | 否 | Markdown 或纯文本内容。部分卡片可使用结构化字段替代。 |
+
 ### 6.1 explain
 
 普通解释卡片。
@@ -359,9 +367,11 @@ content-repo/
 | `question` | 是 | 面试官的追问问题。 |
 | `answer` | 是 | 针对该追问的参考回答，必须针对当前知识点的具体内容，禁止使用模板化回答。 |
 
+`interviewAnswer` 卡片允许同时包含 `content` 和 `followUpQuestions`。正式内容建议每张 `interviewAnswer` 至少维护 2 条追问，schema 会校验追问对象必须包含 `question` 与 `answer`。
+
 ### 6.3 compareTable
 
-对比表。
+对比表。推荐使用结构化 `columns` + `rows`，App 可以直接渲染为表格；也可使用 `content` 写 Markdown 表格。结构化表格中每一行的列数应与 `columns` 对齐。
 
 ```json
 {
@@ -376,9 +386,17 @@ content-repo/
 }
 ```
 
+`compareTable` 字段说明：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `columns` | 条件必填 | 表头数组。使用结构化表格时必须提供。 |
+| `rows` | 条件必填 | 表格行二维数组。使用结构化表格时必须提供。 |
+| `content` | 条件必填 | Markdown 表格或解释内容；未提供 `columns`/`rows` 时必须提供。 |
+
 ### 6.4 code
 
-代码卡片。
+代码卡片。`language` 必填，值应使用 App 语法高亮可识别的语言 ID，例如 `java`、`python`、`javascript`、`typescript`、`bash`、`sql`、`json`、`yaml`、`c`、`cpp`、`go`、`rust`。
 
 ```json
 {
@@ -394,6 +412,13 @@ content-repo/
   ]
 }
 ```
+
+`highlights` 用于给代码行加讲解锚点。每个对象必须包含：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `line` | 是 | 需要强调的行号，从 1 开始。 |
+| `note` | 是 | 针对该行的说明，必须写具体语义，不要写“关键行”这类泛化占位。 |
 
 ### 6.5 animation
 
@@ -421,7 +446,7 @@ content-repo/
 
 ### 6.6 diagram
 
-静态流程图或结构图。
+静态流程图或结构图。`format` 当前允许 `mermaid`、`svg`、`image`、`text`。
 
 ```json
 {
@@ -431,6 +456,24 @@ content-repo/
   "content": "flowchart LR\nA[文档] --> B[切分] --> C[Embedding] --> D[向量库] --> E[召回] --> F[生成]"
 }
 ```
+
+`diagram` 字段说明：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `format` | 否 | 图示格式；未填时按文本/Markdown 兜底处理。 |
+| `content` | 条件必填 | `format=mermaid` 时必须提供 Mermaid 源码。 |
+| `svgPath` | 否 | SVG 静态资源路径。 |
+| `asset` | 否 | 图片或动画资源路径。 |
+| `svg` | 否 | 内联 SVG 字符串；仅用于受控内容。 |
+| `fallback` | 否 | 图示无法渲染时给用户看的文字说明。 |
+| `caption` | 否 | 图注。 |
+
+Mermaid 约束：
+
+1. `format=mermaid` 的 `content` 必须以 `flowchart` 或 `graph` 开头，并带方向声明，例如 `flowchart LR`、`flowchart TD`、`graph LR`。
+2. 只使用 App 已验证的基础流程图子集：节点、连线、分支、简单标签；不要使用 sequence、classDiagram、stateDiagram、mindmap、复杂样式或外部资源引用。
+3. Mermaid 图应该能用纯文本解释兜底，复杂知识建议同时写 `fallback` 或 `caption`。
 
 ### 6.7 checklist
 
@@ -506,7 +549,7 @@ content-repo/
 1. `mustHave` 写必须覆盖的关键点。
 2. `goodToHave` 写加分点。
 3. `commonMistakes` 写常见错误和混淆点。
-4. `scoreWeights` 四项总和应为 100。
+4. `scoreWeights` 必须包含 `coverage`、`accuracy`、`interviewExpression`、`depth` 四项；每项为 0-100 的整数，总和应为 100。
 
 ## 9. 内容编写规范
 
@@ -582,8 +625,10 @@ content-repo/
 - [ ] `recallPrompts` 至少包含一个问题。
 - [ ] `rubric.mustHave` 不为空。
 - [ ] `interviewFrequency` 为 `high`/`medium`/`low` 之一。
-- [ ] `prerequisites` 中引用的知识点 ID 确实存在。 |
+- [ ] `prerequisites` 中引用的知识点 ID 确实存在。
 - [ ] 动画类卡片有 `fallback`。
+- [ ] `diagram.format=mermaid` 的内容以 `flowchart` 或 `graph` 开头，并只使用 App 可渲染的基础子集。
+- [ ] `code` 卡片必须有 `language`，`highlights` 必须指向具体行。
 - [ ] 所有资源路径存在。
 - [ ] `scoreWeights` 总和为 100。
 - [ ] JSON 能通过 schema 校验。
