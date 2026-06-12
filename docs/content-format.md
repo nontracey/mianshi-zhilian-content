@@ -611,7 +611,7 @@ content-repo/
 以下情况才属于结构契约变更：
 
 1. topic、domain、manifest 字段更名、删除字段、增加必填字段。
-2. 新增字段且 App 或 content-studio 需要识别、编辑、筛选、渲染、排序、校验或生成该字段。
+2. 新增字段且 App 或 studio 需要识别、编辑、筛选、渲染、排序、校验或生成该字段。
 3. 修改字段类型、字段语义、枚举值或嵌套对象结构。
 4. 新增 `learningCards.type`、`recallPrompts.mode` 等需要新渲染或新编辑能力的枚举。
 5. 修改 manifest/domain/topic 的加载入口、文件路径规则、draft/staging/production manifest 规则。
@@ -623,7 +623,7 @@ content-repo/
 |------|----------|
 | **内容仓库** | `schemas/`、manifest 示例、校验脚本、生成脚本、内容格式文档、判断标准 |
 | **App 项目** | 内容解析模型、缓存/版本兼容逻辑、渲染逻辑、测试、App 对应文档 |
-| **content-studio 项目** | 类型定义、表单编辑器、AI 生成模板、校验流程、预览逻辑、发布流程、对应文档 |
+| **studio 项目** | 类型定义、表单编辑器、AI 生成模板、校验流程、预览逻辑、发布流程、对应文档 |
 
 最终部署、内容版本、缓存刷新、schemaVersion/minAppVersion 策略，应参考 App 项目的部署文档：`/Users/yingjunchi/code/mianshi-zhilian-app/docs/deploy.md`。
 
@@ -633,8 +633,8 @@ content-repo/
 - [ ] 更新相关 `topicCount`、`updatedAt` 和 domain topic 引用。
 - [ ] 运行 `npm run validate`。
 - [ ] 确认字段名、字段类型、枚举值、卡片类型没有变化。
-- [ ] 若只是内容值变化，通常不需要改 App 或 content-studio。
-- [ ] 若实际发现 App 渲染、缓存、content-studio 编辑或生成流程不兼容，再同步修对应项目和文档。
+- [ ] 若只是内容值变化，通常不需要改 App 或 studio。
+- [ ] 若实际发现 App 渲染、缓存、studio 编辑或生成流程不兼容，再同步修对应项目和文档。
 
 ### 12.4 结构契约变更检查清单
 
@@ -643,10 +643,10 @@ content-repo/
 - [ ] 更新内容校验脚本和生成脚本。
 - [ ] 更新 App 内容解析、渲染、缓存和兼容逻辑。
 - [ ] 更新 App 项目文档，尤其是内容加载、部署和版本兼容说明。
-- [ ] 更新 content-studio 类型、表单、AI 生成模板、校验、预览和发布流程。
-- [ ] 更新 content-studio 对应文档。
+- [ ] 更新 studio 类型、表单、AI 生成模板、校验、预览和发布流程。
+- [ ] 更新 studio 对应文档。
 - [ ] 根据兼容性调整 `schemaVersion` 和 `minAppVersion`。
-- [ ] 运行内容仓库、App、content-studio 各自测试或校验。
+- [ ] 运行内容仓库、App、studio 各自测试或校验。
 
 ### 12.5 同步失败处理
 

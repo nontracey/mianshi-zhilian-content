@@ -186,6 +186,10 @@ const checks = [
     pattern: /回答时要先给出机制结论/,
   },
   {
+    code: "META_TEMPLATE_ANSWER",
+    pattern: /先给出清晰结论：它解决什么问题|再说明核心机制和关键流程；随后补充复杂度/,
+  },
+  {
     code: "INTERVIEW_GREETING",
     pattern: /面试官您好/,
   },
@@ -376,6 +380,14 @@ for (const file of await listJson(topicRoot)) {
   const explainContents = new Map();
   for (const card of topic.learningCards ?? []) {
     if (card.type !== "explain") continue;
+    if (!(card.content ?? "").trim()) {
+      issues.push({
+        code: "EMPTY_EXPLAIN_CONTENT",
+        file,
+        title: topic.title,
+        field: `learningCards.explain.${card.title}`,
+      });
+    }
     if (/^\s*\/\//.test(card.title ?? "")) {
       issues.push({
         code: "CODE_COMMENT_EXPLAIN_TITLE",

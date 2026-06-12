@@ -71,15 +71,7 @@ topics/{domain}/{filename}.json
 2. 生成知识点文件: `topics/{domain}/{filename}.json`
 3. **重建topics数组**：扫描 `topics/{domain}/` 目录，按order排序后写回路径
 4. 更新 `manifest.json` 的 topicCount
-5. 运行验证: `python3 scripts/validate_paths.py`
-
-### 自动修复路径脚本
-
-如果发现topics数组格式不对，运行：
-
-```bash
-python3 scripts/validate_paths.py --fix
-```
+5. 运行验证: `npm run validate`（会校验 topics 路径引用、schema 和三环境 manifest，路径格式错误会在这一步报出）
 
 ---
 
@@ -320,11 +312,11 @@ App 每次加载最新 manifest/domain 后会按引用列表裁剪本地缓存�
 ```text
 主用:
 
-https://mianshi-zhilian-content.pages.dev/manifest.json
+https://mianshizhilian-content.nontracey.de5.net/manifest.json
 
 备用:
 
-https://mianshizhilian-content.nontracey.de5.net/manifest.json
+https://mianshi-zhilian-content.pages.dev/manifest.json
 
 两个域名必须指向同一份 `dist/` 产物，`manifest.json`、`staging-manifest.json`、`draft-manifest.json`、`domains/`、`topics/`、`staging/`、`draft/`、`schemas/`、`assets/` 路径需要保持一致。部署 workflow 会在发布后比较主备 manifest 内容，并抽样检查 domain、topic、schema、asset 深路径可访问。
 ```

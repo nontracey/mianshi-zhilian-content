@@ -1,6 +1,6 @@
 # 面试知识内容更新计划
 
-> 更新日期：2026-06-01  
+> 更新日期：2026-06-01（文中 topic 数量、领域数量等统计均为该日快照，此后内容已继续演进——例如新增 python 领域；最新规模以 `manifest.json` 与 `npm run validate` 输出为准）  
 > 依据标准：`docs/knowledge-content-standard.md`  
 > 当前结论：本轮“小范围统一增强”已完成。现有内容已达到可发布基线，后续优化以定期抽查和少量高频缺口补充为主，不建议再做大规模重写。  
 
@@ -214,7 +214,7 @@ Quality scan passed: no template text, generic frontend follow-up, placeholder a
 1. 每次新增内容前先读 `docs/knowledge-content-standard.md`，确认 topic 粒度和面试定位。
 2. 新增或删除 topic 时同步更新 domain、manifest topicCount、知识目录和 `contentVersion`。
 3. 每轮内容更新后执行 `npm run validate`，并抽查 App 首屏顺序、low 频 topic 权重、recallPrompts 专属度。
-4. 只有发生 JSON 契约变化时，才同步评估 App 和 content-studio 的解析、编辑、发布流程。
+4. 只有发生 JSON 契约变化时，才同步评估 App 和 studio 的解析、编辑、发布流程。
 
 每批修改后执行：
 
