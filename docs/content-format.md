@@ -300,7 +300,7 @@ content-repo/
 | `summary` | 是 | 一句话摘要。 |
 | `tags` | 是 | 标签，用于搜索和展示。 |
 | `difficulty` | 是 | 难度，建议 1-5。 |
-| `estimatedMinutes` | 是 | 建议学习时长。 |
+| `estimatedMinutes` | 是 | 建议学习时长。口径为**首次阅读理解**所需分钟数，不含反复复述练习与 AI 评估的时间；App 仅作展示（详情页/目录/今日复习卡片），不参与推荐或排期计算。 |
 | `order` | 是 | 领域内默认学习顺序。 |
 | `recommendWeight` | 是 | 推荐权重，0-100。 |
 | `learningCards` | 是 | 学习内容卡片。 |
