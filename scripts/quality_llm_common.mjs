@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
+import { JUDGE_DIMENSIONS } from "./quality_llm_judge.mjs";
 
 export const REVIEW_SCHEMA_VERSION = "1.0.0";
 export const RUBRIC_VERSION = "2026-06-13";
@@ -464,6 +465,8 @@ export function renderReviewPrompt(review) {
       selfContained: 0,
       interviewUsability: 0,
       difficultyFit: 0,
+      learnerClarity: 0,
+      coverage: 0,
     },
     blockingFindings: [],
     reviewedTopics: review.request.targets.map((target) => ({
@@ -472,18 +475,14 @@ export function renderReviewPrompt(review) {
       contentHash: target.contentHash,
       verdict: "pass",
       score: 0,
-      dimensions: {
-        accuracy: 0,
-        cognitiveOrder: 0,
-        expertVoice: 0,
-        selfContained: 0,
-        interviewUsability: 0,
-        difficultyFit: 0,
-      },
+      dimensions: Object.fromEntries(JUDGE_DIMENSIONS.map((dimension) => [dimension, 0])),
       factFindings: [],
       orderFindings: [],
       voiceFindings: [],
       selfContainedFindings: [],
+      clarityFindings: [],
+      coverageFindings: [],
+      followUpFindings: [],
       blockingFindings: [],
       notes: "",
     })),
@@ -520,6 +519,8 @@ export function renderReviewPrompt(review) {
 4. \`selfContained\` 自包含闭环：读者只靠本 topic 正文，是否能回答 \`recallPrompts\` 和 \`rubric.mustHave\`。
 5. \`interviewUsability\` 面试可用性：是否能形成可复述的 30 秒结论、机制主线和追问边界。
 6. \`difficultyFit\` 难度匹配：内容深度与 \`difficulty\` 标注是否一致——difficulty 1-2 不应有入门铺垫注水或论文式展开，difficulty 4-5 必须讲透机制、失败路径和权衡，不能浅尝辄止。
+7. \`learnerClarity\` 可教会零基础：句子是否清晰，术语是否先解释，是否避免把多个概念挤成一个认知跳跃。
+8. \`coverage\` 面试覆盖完整性：按“这个 title / difficulty 的知识点，资深面试官真正会考什么”判断关键面是否讲全；不要只拿本篇自己的 rubric/recallPrompts 当标尺。
 
 ## 证据要求（防止走过场）
 
@@ -529,7 +530,7 @@ export function renderReviewPrompt(review) {
 { "claim": "被核验的事实断言原文或摘述", "verdict": "correct | wrong | suspicious | outdated", "evidence": "核验依据：官方文档结论 / 领域常识推理 / 无法核验的原因" }
 \`\`\`
 
-\`verdict\` 为 \`wrong\` 或 \`outdated\` 的发现必须同时进入 \`blockingFindings\`，并使整体 \`verdict\` 为 \`fail\`；\`suspicious\` 必须写明无法核验的原因。orderFindings / voiceFindings / selfContainedFindings 没有问题时可以为空数组，但 factFindings 不允许为空——评审必须留下核验痕迹。
+\`verdict\` 为 \`wrong\` 或 \`outdated\` 的发现必须同时进入 \`blockingFindings\`，并使整体 \`verdict\` 为 \`fail\`；\`suspicious\` 必须写明无法核验的原因。orderFindings / voiceFindings / selfContainedFindings / clarityFindings / coverageFindings / followUpFindings 没有问题时可以为空数组，但 factFindings 不允许为空——评审必须留下核验痕迹。
 
 ## 阻断规则
 

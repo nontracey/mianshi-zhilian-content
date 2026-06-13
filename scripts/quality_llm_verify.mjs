@@ -11,15 +11,9 @@ import {
   parseArgs,
   readReport,
 } from "./quality_llm_common.mjs";
+import { JUDGE_DIMENSIONS } from "./quality_llm_judge.mjs";
 
-const requiredDimensions = [
-  "accuracy",
-  "cognitiveOrder",
-  "expertVoice",
-  "selfContained",
-  "interviewUsability",
-  "difficultyFit",
-];
+const requiredDimensions = JUDGE_DIMENSIONS;
 const factVerdicts = new Set(["correct", "wrong", "suspicious", "outdated"]);
 
 function fail(message, hints = []) {
@@ -257,4 +251,3 @@ main().catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });
-

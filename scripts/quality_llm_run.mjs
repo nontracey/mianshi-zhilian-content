@@ -13,17 +13,11 @@ import {
   sha256,
   writeReviewPacket,
 } from "./quality_llm_common.mjs";
+import { JUDGE_DIMENSIONS } from "./quality_llm_judge.mjs";
 
 const root = process.cwd();
 const maxConcurrency = 4;
-const requiredDimensions = [
-  "accuracy",
-  "cognitiveOrder",
-  "expertVoice",
-  "selfContained",
-  "interviewUsability",
-  "difficultyFit",
-];
+const requiredDimensions = JUDGE_DIMENSIONS;
 
 function parseRunnerArgs(argv = process.argv.slice(2)) {
   const base = parseArgs(argv);
@@ -232,7 +226,9 @@ ${JSON.stringify({
     "expertVoice": 4,
     "selfContained": 4,
     "interviewUsability": 4,
-    "difficultyFit": 4
+    "difficultyFit": 4,
+    "learnerClarity": 4,
+    "coverage": 4
   },
   "factFindings": [
     { "claim": "被核验的事实断言", "verdict": "correct | wrong | suspicious | outdated", "evidence": "核验依据或无法核验原因" }
@@ -240,6 +236,9 @@ ${JSON.stringify({
   "orderFindings": [],
   "voiceFindings": [],
   "selfContainedFindings": [],
+  "clarityFindings": [],
+  "coverageFindings": [],
+  "followUpFindings": [],
   "blockingFindings": [],
   "notes": ""
 }
@@ -251,6 +250,7 @@ ${JSON.stringify({
 - wrong/outdated 事实必须进入 blockingFindings 且 verdict=fail。
 - 如果正文无法支撑 recallPrompts 或 rubric.mustHave，verdict=fail。
 - 如果语言明显模板化、讲解顺序跳跃、专家口吻不真实，verdict=fail。
+- learnerClarity 要判断零基础读者是否能看懂；coverage 要按资深面试官会考的关键面判断，不要只拿本篇 rubric/recallPrompts 当标尺。
 
 topic JSON：
 ${JSON.stringify(item.topic, null, 2)}
@@ -289,7 +289,9 @@ ${JSON.stringify({
         "expertVoice": 4,
         "selfContained": 4,
         "interviewUsability": 4,
-        "difficultyFit": 4
+        "difficultyFit": 4,
+        "learnerClarity": 4,
+        "coverage": 4
       },
       "factFindings": [
         { "claim": "被核验的事实断言", "verdict": "correct | wrong | suspicious | outdated", "evidence": "核验依据或无法核验原因" }
@@ -297,6 +299,9 @@ ${JSON.stringify({
       "orderFindings": [],
       "voiceFindings": [],
       "selfContainedFindings": [],
+      "clarityFindings": [],
+      "coverageFindings": [],
+      "followUpFindings": [],
       "blockingFindings": [],
       "notes": ""
     }
@@ -311,6 +316,7 @@ ${JSON.stringify({
 - wrong/outdated 事实必须进入该 topic 的 blockingFindings 且 verdict=fail。
 - 如果正文无法支撑 recallPrompts 或 rubric.mustHave，verdict=fail。
 - 如果语言明显模板化、讲解顺序跳跃、专家口吻不真实，verdict=fail。
+- learnerClarity 要判断零基础读者是否能看懂；coverage 要按资深面试官会考的关键面判断，不要只拿本篇 rubric/recallPrompts 当标尺。
 
 topic JSON 列表：
 ${JSON.stringify(
@@ -339,6 +345,9 @@ function normalizeTopicReview(parsed, item) {
     orderFindings: Array.isArray(parsed.orderFindings) ? parsed.orderFindings : [],
     voiceFindings: Array.isArray(parsed.voiceFindings) ? parsed.voiceFindings : [],
     selfContainedFindings: Array.isArray(parsed.selfContainedFindings) ? parsed.selfContainedFindings : [],
+    clarityFindings: Array.isArray(parsed.clarityFindings) ? parsed.clarityFindings : [],
+    coverageFindings: Array.isArray(parsed.coverageFindings) ? parsed.coverageFindings : [],
+    followUpFindings: Array.isArray(parsed.followUpFindings) ? parsed.followUpFindings : [],
     blockingFindings: Array.isArray(parsed.blockingFindings) ? parsed.blockingFindings : [],
     notes: typeof parsed.notes === "string" ? parsed.notes : "",
   };

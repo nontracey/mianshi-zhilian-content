@@ -35,6 +35,11 @@ DEGRADE_AFTER=3
 LIMIT=""
 SELECTED_CLI=""
 MODEL_CHAIN=""
+JUDGE_ENABLED=1
+JUDGE_MODELS=""   # 空 = 跟精修主模型一致
+JUDGE_COUNT=1
+DYNAMIC_SKIP_MIN=85
+JUDGE_BATCH_SIZE=5
 SELECTED_DOMAIN_IDS=()
 SCOPE_ARGS=()
 TOPIC_REF=""
@@ -653,6 +658,85 @@ choose_model_chain() {
   fi
 }
 
+choose_judge_models() {
+  title "选择判官模型（动态语义/事实评审）"
+  info "判官评“静态分查不出的”事实正确性、认知顺序、零基础可读性、面试覆盖。回车=与精修同模型；0=不启用判官（纯静态、最快）。"
+  JUDGE_MODEL_VALUES=()
+  JUDGE_MODEL_LABELS=()
+  local line value label
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    value="${line%%$'\t'*}"
+    if [[ "$line" == *$'\t'* ]]; then label="${line#*$'\t'}"; else label="$value"; fi
+    JUDGE_MODEL_VALUES+=("$value")
+    JUDGE_MODEL_LABELS+=("$label")
+  done < <(discover_models "$SELECTED_CLI")
+
+  local index choice selections selected idx items
+  printf ' 0. 不启用判官（纯静态 keep-best，最快）\n'
+  printf ' d. 与精修同模型（默认）：%s\n' "${MODEL_CHAIN:-CLI默认}"
+  for (( index = 0; index < ${#JUDGE_MODEL_VALUES[@]}; index += 1 )); do
+    printf '%2d. %s\n' "$((index + 1))" "${JUDGE_MODEL_LABELS[$index]}"
+  done
+  printf '\n可多选组成 ensemble（如 1,3）；回车=与精修同模型；0=不启用。\n'
+  while true; do
+    printf '请选择 [d=同精修] %s: ' "$(prompt_suffix)" >&2
+    IFS= read -r choice || exit 1
+    check_nav_input "$choice" || return $?
+    choice="${choice:-d}"
+    if [[ "$choice" == "0" ]]; then
+      JUDGE_ENABLED=0
+      JUDGE_MODELS=""
+      return 0
+    fi
+    if [[ "$choice" == "d" || "$choice" == "D" ]]; then
+      JUDGE_ENABLED=1
+      JUDGE_MODELS="$MODEL_CHAIN"
+      return 0
+    fi
+    selections="$(expand_selection "$choice" "${#JUDGE_MODEL_VALUES[@]}")"
+    if [[ -z "$selections" ]]; then
+      printf '%s\n' "${YELLOW}没有选中有效模型。${RESET}" >&2
+      continue
+    fi
+    items=()
+    while IFS= read -r selected; do
+      [[ -z "$selected" ]] && continue
+      idx=$((selected - 1))
+      items+=("${JUDGE_MODEL_VALUES[$idx]}")
+    done <<< "$selections"
+    JUDGE_ENABLED=1
+    JUDGE_MODELS="$(join_by "," "${items[@]}")"
+    return 0
+  done
+}
+
+choose_judge_count() {
+  # 未启用判官则本步无内容，直接通过（步骤跳转已据 JUDGE_ENABLED 决定是否进入本步）。
+  [[ "$JUDGE_ENABLED" == "1" ]] || return 0
+  title "判官数量与动态免改线"
+  local rc
+  if ask_number "每个判官模型跑几个判官实例（>1 用投票压方差，需模型温度>0）" "$JUDGE_COUNT" 1 8 >/dev/null; then
+    :
+  else
+    rc=$?; return "$rc"
+  fi
+  JUDGE_COUNT="$ASK_VALUE"
+  if ask_number "动态免改线 dynamic-skip-min（低于此分会进入改写；候选接受仍看回归向量）" "$DYNAMIC_SKIP_MIN" 1 100 >/dev/null; then
+    :
+  else
+    rc=$?; return "$rc"
+  fi
+  DYNAMIC_SKIP_MIN="$ASK_VALUE"
+  if ask_number "判官批量大小 judge-batch-size（首轮判前预热，失败会回退单篇）" "$JUDGE_BATCH_SIZE" 1 10 >/dev/null; then
+    :
+  else
+    rc=$?; return "$rc"
+  fi
+  JUDGE_BATCH_SIZE="$ASK_VALUE"
+  return 0
+}
+
 choose_quality_options() {
   title "执行参数"
   local rc
@@ -887,6 +971,13 @@ build_common_refine_args() {
   if [[ -n "$MODEL_CHAIN" ]]; then
     COMMON_ARGS+=(--model-chain "$MODEL_CHAIN")
   fi
+  if [[ "$JUDGE_ENABLED" == "1" ]]; then
+    # 判官 CLI 默认 = 精修 CLI；判官模型空时由 .mjs 默认取精修主模型。
+    [[ -n "$JUDGE_MODELS" ]] && COMMON_ARGS+=(--judge-models "$JUDGE_MODELS")
+    COMMON_ARGS+=(--judge-count "$JUDGE_COUNT" --dynamic-skip-min "$DYNAMIC_SKIP_MIN" --judge-batch-size "$JUDGE_BATCH_SIZE")
+  else
+    COMMON_ARGS+=(--no-judge)
+  fi
 }
 
 run_audit() {
@@ -978,6 +1069,11 @@ run_refine() {
   done
 
   if (( failed == 0 )); then
+    title "发布前结构校验"
+    if ! npm run validate; then
+      printf '%s\n' "${YELLOW}内容结构校验未通过，已跳过 staging/draft 同步。请先修复 validate 报错后重新运行。${RESET}"
+      return 1
+    fi
     title "同步环境内容"
     node scripts/sync_environment_content.mjs "$STAGE_TARGET"
     printf '%s\n' "${GREEN}已同步：${STAGE_LABEL}${RESET}"
@@ -998,6 +1094,13 @@ summary() {
     printf 'CLI：%s\n' "$SELECTED_CLI"
     printf '模型链：%s\n' "${MODEL_CHAIN:-CLI默认}"
     printf '重试：%s 次，超时：%s 秒，降级阈值：%s\n' "$RETRIES" "$TIMEOUT_SECONDS" "$DEGRADE_AFTER"
+  fi
+  if [[ "$RUN_MODE" == "refine" ]]; then
+    if [[ "$JUDGE_ENABLED" == "1" ]]; then
+      printf '判官：%s × %s 实例，动态免改线 %s，batch %s\n' "${JUDGE_MODELS:-同精修模型}" "$JUDGE_COUNT" "$DYNAMIC_SKIP_MIN" "$JUDGE_BATCH_SIZE"
+    else
+      printf '判官：未启用（纯静态 keep-best）\n'
+    fi
   fi
   if [[ "$RUN_MODE" == "preview" ]]; then
     printf '预览 Topic：%s\n' "$TOPIC_REF"
@@ -1036,22 +1139,26 @@ confirm_execution() {
   done
 }
 
+# 步骤：0 阶段 1 模式 2 领域 3 (audit?参数:topic) 4 参数 5 CLI 6 模型链 7 判官模型 8 判官数量 9 确认
+# audit 跳到 9；preview 走到 6 后直接 9（不判官）；refine 走 7、(启用判官?8)、9。
 next_step() {
   case "$1" in
     0) printf '1\n' ;;
     1) printf '2\n' ;;
     2) printf '3\n' ;;
     3)
-      if [[ "$RUN_MODE" == "audit" ]]; then
-        printf '7\n'
-      else
-        printf '4\n'
-      fi
+      if [[ "$RUN_MODE" == "audit" ]]; then printf '9\n'; else printf '4\n'; fi
       ;;
     4) printf '5\n' ;;
     5) printf '6\n' ;;
-    6) printf '7\n' ;;
-    *) printf '7\n' ;;
+    6)
+      if [[ "$RUN_MODE" == "refine" ]]; then printf '7\n'; else printf '9\n'; fi
+      ;;
+    7)
+      if [[ "$JUDGE_ENABLED" == "1" ]]; then printf '8\n'; else printf '9\n'; fi
+      ;;
+    8) printf '9\n' ;;
+    *) printf '9\n' ;;
   esac
 }
 
@@ -1063,11 +1170,17 @@ previous_step() {
     4) printf '3\n' ;;
     5) printf '4\n' ;;
     6) printf '5\n' ;;
-    7)
+    7) printf '6\n' ;;
+    8) printf '7\n' ;;
+    9)
       if [[ "$RUN_MODE" == "audit" ]]; then
         printf '3\n'
-      else
+      elif [[ "$RUN_MODE" == "preview" ]]; then
         printf '6\n'
+      elif [[ "$JUDGE_ENABLED" == "1" ]]; then
+        printf '8\n'
+      else
+        printf '7\n'
       fi
       ;;
     *) printf '0\n' ;;
@@ -1089,7 +1202,9 @@ run_wizard_step() {
     4) choose_quality_options ;;
     5) choose_cli ;;
     6) choose_model_chain ;;
-    7) confirm_execution ;;
+    7) choose_judge_models ;;
+    8) choose_judge_count ;;
+    9) confirm_execution ;;
     *) return 1 ;;
   esac
 }
@@ -1111,7 +1226,7 @@ main() {
   local rc
   while true; do
     if run_wizard_step "$step"; then
-      if [[ "$step" == "7" ]]; then
+      if [[ "$step" == "9" ]]; then
         set +e
         execute_selected_mode
         rc=$?

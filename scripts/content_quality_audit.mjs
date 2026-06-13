@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const root = process.cwd();
 const minScoreArg = process.argv.find((arg) => arg.startsWith("--min-score="));
@@ -1856,7 +1857,13 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+// 导出供精修器在进程内做单篇/keep-best 评分复用（CLI 行为不变，仅在直接运行时才跑 main）。
+export { scoreTopic, buildCorpus };
+
+const isCliEntry = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isCliEntry) {
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

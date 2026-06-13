@@ -25,6 +25,8 @@ npm run quality:refine:interactive
 5. 执行参数：合格分、并发、轮数、limit、重试、超时、降级阈值。
 6. CLI agent：自动扫描本机安装的 `qwen`、`codex`、`claude`、`gemini`、`opencode` 等，优先显示 qwen。
 7. 模型链：只展示所选 CLI 的配置模型；可选择多个模型组成降级链。
+8. 判官模型：默认跟精修模型链一致，也可多选组成 ensemble，或选择不启用判官。
+9. 判官数量与动态免改线：配置每个判官模型的实例数、`dynamic-skip-min`、`judge-batch-size`。
 
 每一步都支持：
 
@@ -36,9 +38,11 @@ npm run quality:refine:interactive
 - 一个 CLI 调用只处理一个 topic。领域或多 topic 选择只是队列，不会把整个领域塞进同一个 prompt。
 - 并发表示同时启动多个“单 topic CLI 子进程”。如果希望绝对串行，把并发设为 `1`。
 - 并发大于 `3` 时，默认启用自适应并发：遇到限流、服务繁忙、超时、非零退出等可用性失败，会把并发逐步降到 `3`，并重试这些失败 topic；内容校验失败不会触发并发降级。
-- 第一轮会把选中的全部 topic 都送 LLM 精修，即使静态审计已经达到 `90` 分。
-- 静态分数只作为上下文和最终验收兜底，不作为跳过 LLM 的依据。
-- 后续轮次只复修仍低于 `min-score` 的 topic，避免已经静态达标的内容反复重写。
+- 启用判官时，第一轮会先对 scope 内 topic 做判前评审，并按 `contentHash` 缓存；全域运行会按 `judge-batch-size` 批量预热缓存，失败再回退单篇判官。
+- 静态分数是地板，判官分数是语义天花板。静态分达标且判官达到 `dynamic-skip-min`、8 维均不低于 4、无 blocking 时，topic 会直接跳过改写。
+- 未达标 topic 才进入逐篇改写；候选会先跑 invariant、静态审计和判后评审，再用回归向量决定整篇接受、保留旧版，或只合并变好的块。
+- 块级合并只吸收被静态检查和块级判官确认更好的块；合并前后会检查重复块回归，候选不得新增同类型同标题重复块，也不得增加同类型语义高度相似的卡片对。
+- 后续轮次只复修仍低于 `min-score` 或判官未达标的 topic，避免已经达标的内容反复重写。
 - 正式精修写回 `topics/`；只有全部目标最终达标时，交互脚本才会按阶段同步到 `staging/`、`draft/`。
 - 测试预览不改仓库内容，产物写入 `.quality-refine/preview/`，并在终端渲染文字版。
 - 执行期间会输出单篇开始、完成/失败和重试信息。正式模式默认每 30 秒输出一条聚合 `[RUNNING]`，不会按每个 CLI 子进程刷屏；测试预览默认显示单篇 `[SPAWN]` / `[WAIT]` / `[DONE]` 细反馈。
@@ -79,6 +83,10 @@ npm run quality:refine -- \
   --heartbeat-seconds 30 \
   --progress-style summary \
   --model-chain minimax-m3,deepseek-v4-pro,glm-5.1 \
+  --judge-models minimax-m3,deepseek-v4-pro \
+  --judge-count 1 \
+  --dynamic-skip-min 85 \
+  --judge-batch-size 5 \
   --min-score 90
 ```
 
@@ -124,12 +132,14 @@ node scripts/sync_environment_content.mjs draft
 
 ```text
 [3/12 ✓2 ✗1 | go | m=minimax-m3] c=3 OK topics/go/context.json
+[4/12 ✓2 ✗1 ★1 ⇄1 ◦1 | go | m=minimax-m3] c=3 MERGED topics/go/interface.json
 ```
 
 含义：
 
 - 当前进度 / 总数。
 - 成功数与失败数。
+- `★` 整篇接受数，`⇄` 块级合并数，`◦` 判前已达标跳过数。
 - 当前领域。
 - 当前模型。
 - 当前并发。
@@ -153,6 +163,7 @@ node scripts/sync_environment_content.mjs draft
 
 - `progress.jsonl`：逐 topic 进度。
 - `summary.json`：最终汇总。
+- `judge-cache/`：按 `contentHash + rubricVersion + judgeSetHash` 缓存判官结果。
 - `*.raw.txt`：每篇 CLI 原始输出，便于排查。
 
 `.quality-refine/` 是本地运行产物，已在 `.gitignore` 中忽略。
