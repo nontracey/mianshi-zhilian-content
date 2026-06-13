@@ -754,6 +754,7 @@ async function runJudgeBatch(items, judge) {
   const byRef = new Map(items.map((item) => [item.ref, []]));
   const prompt = buildJudgeBatchPrompt(items);
   let batchFatal = null; // 批量协议失败时记下，后面降级单篇兜底
+  const errorSamples = [];
   for (const model of judge.models) {
     for (let index = 0; index < judge.count; index += 1) {
       if (shutdownRequested) break;
@@ -766,8 +767,10 @@ async function runJudgeBatch(items, judge) {
         // 单批失败先记下来，整批所有 model × count 跑完后再决定要不要降级到单篇模式。
         batchFatal = batchFatal ?? error;
         const tag = error.judgeProtocolFailure ? "JSON 协议" : "进程";
+        const tagModel = model ?? "默认";
+        if (errorSamples.length < 3) errorSamples.push(`${tagModel} #${index + 1}: ${tag} ${error.message}`);
         console.log(
-          `[JUDGE] 批量评审${tag}失败 m=${model ?? "默认"} #${index + 1}/${judge.count} ` +
+          `[JUDGE] 批量评审${tag}失败 m=${tagModel} #${index + 1}/${judge.count} ` +
             `size=${items.length}：${error.message}`,
         );
       }
@@ -797,10 +800,15 @@ async function runJudgeBatch(items, judge) {
         const agg = await runJudges(item.topic, item.ref, judge);
         if (agg) out.set(item.ref, agg); // writeJudgeCache 已在 runJudges 内部完成
       } catch (error) {
+        if (errorSamples.length < 5) errorSamples.push(`single ${item.ref}: ${error.message}`);
         console.log(`[JUDGE] 单篇兜底仍失败 ${item.ref}：${error.message}`);
       }
     }
   }
+  // 让上层（如 warmJudgeCacheForTargets）能识别“整批 model × count × 单篇兜底全部失败”。
+  out.allFailed = items.length > 0 && out.size === 0 && batchFatal != null;
+  out.firstError = batchFatal;
+  out.errorSamples = errorSamples;
   return out;
 }
 
@@ -858,6 +866,29 @@ async function warmJudgeCacheForTargets(refs, judge, cfg = {}) {
   const stopHeartbeat = useDashboard ? () => {} : startJudgeHeartbeat(state, cfg.heartbeatMs, cfg);
   let cursor = 0;
   let aborted = null;
+  // 防呆：第一批整批失败 / 连续 N 批整批失败 -> 立刻 abort 整个预热。
+  // 避免开局就配错（envKey 缺失、baseURL 不通、模型名错配）后还白跑剩下所有 batch。
+  let firstBatchFailed = false;
+  let consecutiveAllFailed = 0;
+  const maxConsecutiveAllFailed = Math.min(3, batches.length);
+  function buildAbortError(out, batchIdx) {
+    const samples = (out.errorSamples || []).slice(0, 3);
+    const judgeModels = (judge.models || []).map((m) => m ?? "默认").join(", ") || "(默认)";
+    const cliPath = judge.cfg?.cliPath || judge.cfg?.cli || "(未知)";
+    const stem = batchIdx === 0
+      ? "判官预热第一批整批失败"
+      : `判官预热连续 ${consecutiveAllFailed} 批整批失败`;
+    const hint = "请检查：① 模型名是否正确（modelChain）② 对应的 envKey/API Key 是否已设置 ③ baseURL 是否可达 ④ CLI 是否能独立运行";
+    const err = new Error(
+      `${stem}（model × count × 单篇兜底全部失败），中止预热以避免空跑。\n` +
+        `  judge models: ${judgeModels}\n` +
+        `  judge CLI:    ${cliPath}\n` +
+        (samples.length ? `  错误样例:\n    - ${samples.join("\n    - ")}\n` : "") +
+        `  ${hint}`,
+    );
+    err.cause = out.firstError;
+    return err;
+  }
   async function warmWorker() {
     while (true) {
       if (shutdownRequested || aborted) return;
@@ -865,11 +896,26 @@ async function warmJudgeCacheForTargets(refs, judge, cfg = {}) {
       if (idx >= batches.length) return;
       cursor += 1;
       const batch = batches[idx];
+      let result;
       try {
-        await runJudgeBatch(batch, judge);
+        result = await runJudgeBatch(batch, judge);
       } catch (error) {
         aborted = error;
         return;
+      }
+      if (result?.allFailed) {
+        if (idx === 0) firstBatchFailed = true;
+        consecutiveAllFailed += 1;
+        if (firstBatchFailed && idx === 0) {
+          aborted = buildAbortError(result, 0);
+          return;
+        }
+        if (consecutiveAllFailed >= maxConsecutiveAllFailed) {
+          aborted = buildAbortError(result, idx);
+          return;
+        }
+      } else {
+        consecutiveAllFailed = 0;
       }
       state.doneBatches += 1;
       state.doneTopics += batch.length;
@@ -2204,8 +2250,10 @@ class LiveDashboard {
         return ret;
       };
     }
+    // 1s 强制重绘：即便 state 没变，也要刷新顶栏“全程已用”和判官面板的“已用/剩余”等时间字段；
+    // 否则单批长耗（如配错首批超时）阶段，dirty 始终是 false，仪表盘看上去会“卡死”。
     this.repaintTimer = setInterval(() => {
-      if (this.dirty) this.paint();
+      this.paint();
     }, 1000);
     this.repaintTimer.unref?.();
   }

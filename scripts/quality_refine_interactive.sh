@@ -459,7 +459,7 @@ function add(value, label = value, dedupeKey = value) {
   const item = value.trim();
   const display = String(label || item).trim();
   if (!item || item.length < 3 || item.length > 120) return;
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:/@+\-]+$/.test(item)) return;
+  if (/[\x00-\x1f\t\n\r"'`\\]/.test(item)) return;
   const key = String(dedupeKey || item).trim();
   if (!seen.has(key)) {
     seen.add(key);
@@ -495,6 +495,10 @@ function addProviderEntry(protocol, entry, index, objectKey = "") {
   const name = entry.name && entry.name !== id ? entry.name : id;
   const baseUrl = entry.baseUrl || entry.baseURL || entry.url || entry.endpoint || "";
   const host = hostOf(baseUrl);
+  if (kind === "qwen") {
+    add(name, name, `${protocol}:${objectKey || index}:${name}`);
+    return;
+  }
   const label = `${name}${name !== id ? ` [${id}]` : ""} · ${protocol}${host ? ` · ${host}` : ""}`;
   add(id, label, `${protocol}:${objectKey || index}:${id}:${host}:${name}`);
 }
