@@ -18,74 +18,104 @@
   "status": "production",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能说明为什么参数化能防注入，以及动态 SQL、排序字段和权限边界的风险。",
+  "interviewerFocus": "面试官会先让你用一段拼接 SQL 解释注入根因，然后追问预编译为什么能阻断、order by 和 in 子句这类结构位为何不能用占位符、ORM 和 WAF 各自的失守点，以及线上发现疑似注入后如何止血与验证。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "SQL 注入与参数化查询 的职责边界",
-      "content": "SQL 注入来自把用户输入拼进 SQL 语法，使数据变成代码。参数化查询通过预编译语句把 SQL 结构和参数值分离，让输入只作为值参与执行。\n\n学习 SQL 注入与参数化查询 时，可以先沿「用户输入参数 -> SQL 字符串拼接风险 -> 预编译语句结构 -> 参数绑定执行 -> 最小权限和审计」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- 参数化查询：结构和值分离，适合 where 条件、insert/update，风险是 不能绑定字段名和排序方向\n- 白名单：限制结构片段取值，适合 order by、表名选择，风险是 名单维护要严格\n- ORM 查询构造器：减少手写 SQL，适合 常规 CRUD，风险是 原生 SQL 仍有风险\n- 最小权限：限制注入后破坏范围，适合 线上账号，风险是 权限过大容易扩大事故\n\n把这条路径落回 SQL 注入与参数化查询 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "参数化把输入固定在“值”的位置",
+      "content": "SQL 注入发生在应用把用户输入拼进 SQL 文本时：登录框输入 `' OR 1=1 --`，拼出来变成 `select * from user where name = '' OR 1=1 --' and password = '...'`，注释符把后面的密码条件吃掉，WHERE 永真，账号绕过。注入位置常见三类：字符串值（被引号包围）、数字值（无引号，例如 `id=1 union select ...`）、结构位（`order by ${col}`、`limit ${n}`、表名）。\n\n预编译/参数化的关键不是“自动转义”，而是协议层先把 SQL 结构发给数据库 parse + 生成执行计划（MySQL 的 `COM_STMT_PREPARE`、PostgreSQL 的 `Parse`），随后只发送绑定值（`COM_STMT_EXECUTE` / `Bind`）。值在协议里以二进制或带类型的形式传输，根本不会再次进入 SQL 解析器，因此值里的 `'`、`--`、`;`、`union` 都只是普通字符串字面量。\n\n这也解释了为什么参数化只覆盖“值位置”：占位符 `?` / `$1` / `:name` 在 parse 阶段必须能确定语法角色，所以它只能出现在表达式可以接受字面量的位置——WHERE 比较右值、INSERT VALUES、UPDATE SET 右值、LIMIT 数字（部分驱动支持）。表名、列名、`ORDER BY` 字段、`ASC/DESC`、动态 `IN (...)` 的元素个数都属于结构，必须在服务端用枚举白名单映射，例如把前端传来的 `sort=createTime` 翻译成预定义的 `created_at DESC`，绝不直接拼字符串。"
     },
     {
       "type": "explain",
-      "title": "SQL 注入与参数化查询 的失败模式与排查",
-      "content": "难点在边界：参数化不能直接保护表名、列名、排序方向这类 SQL 结构片段；ORM 也可能因为原生 SQL、字符串拼接或 in 子句处理不当留下风险。\n\nSQL 注入与参数化查询 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 「SQL 注入与参数化查询 的核心目标」决定这个知识点的主线，必须先说清触发条件\n- 「用户输入参数、SQL 字符串拼接风险、预编译语句结构 的关系」决定方案能否稳定落地，不能只停留在名称层面\n- 「只记防护名词而不解释攻击路径」是常见失效点，需要提前说明防护或修复方式\n- 可以用「能结合 SQL 日志、WAF 命中、数据库审计、慢查询、异常错误信息 做定位」验证自己是否能说出关键路径\n\n排查时不要先猜结论，应把现象映射到 SQL 字符串拼接风险、预编译语句结构、参数绑定执行 这些环节，再结合 SQL 日志、WAF 命中、数据库审计、慢查询、异常错误信息 验证。"
+      "title": "盲注、二阶注入与 ORM 失守点",
+      "content": "即便页面不回显错误，攻击者也能用布尔盲注（`and substr(password,1,1)='a'` 让结果集为真/假）和时间盲注（`and if(substr(...)='a', sleep(2), 0)` 让响应延迟）一位一位把数据库内容拖出来，所以“关掉报错回显”不是修复，只是降低噪声。二阶注入更隐蔽：第一步用户把 `admin'-- ` 当昵称存进库（此时是普通字符串，安全），第二步后台任务或另一个接口把这个昵称读出来再拼进 `update log set actor='${name}'`，注入在第二步触发；防御点在“出库再使用”的位置同样要用参数化，不能因为来源是数据库就放心拼。\n\nORM 不是免死金牌。MyBatis 里 `#{}` 走 PreparedStatement 安全，`${}` 是字符串替换，等同拼接；JPA/Hibernate 的 `@Query` 用命名参数安全，但 `nativeQuery=true` 加字符串拼接同样危险；Sequelize/TypeORM 的 `where: { name }` 安全，`query()` 原生 SQL 拼模板字符串就回到老路。常见踩坑还有手写 `IN (${ids.join(',')})`（应改成 `IN (?,?,?)` 按数组长度生成占位符）、`like '%${kw}%'`（应把 `%kw%` 作为整体绑定值传入）、动态拼 `where 1=1 and ${cond}`。\n\n防御要分层：参数化 + 结构白名单是“不让注入发生”，最小权限 + WAF + 审计是“注入漏网时限制爆炸半径”。线上账号只给业务必需的 select/insert/update，禁用 `file`、`super`、`drop`、跨库访问；WAF 拦显著特征（`union select`、`sleep(`、注释符堆叠），但对编码绕过、参数污染、JSON 注入有盲区，不能替代代码层修复；数据库审计开启慢日志和 general log 抽样，监控异常的 `union`、`information_schema` 访问、单接口高频 sleep。验收标准：代码审查确认无字符串拼用户输入到 SQL，SQL 日志能看到 `?` 占位符或绑定参数列表，DBA 账号巡检显示业务账号无 DDL 权限。"
     },
     {
       "type": "diagram",
-      "title": "SQL 注入防护链路",
+      "title": "预编译协议把结构和值分两次发送",
       "format": "mermaid",
-      "content": "flowchart LR\nA[用户输入参数] --> B[SQL 字符串拼接风险]\nB[SQL 字符串拼接风险] --> C[预编译语句结构]\nC[预编译语句结构] --> D[参数绑定执行]\nD[参数绑定执行] --> E[最小权限和审计]",
-      "fallback": "用户输入参数 -> SQL 字符串拼接风险 -> 预编译语句结构 -> 参数绑定执行 -> 最小权限和审计",
-      "caption": "图示说明输入如何从危险拼接转为参数绑定，并用权限和审计降低影响。"
+      "content": "flowchart LR\nA[应用代码 select * from user where id = ?] --> B[驱动 PREPARE 阶段]\nB --> C[数据库 parse 生成执行计划]\nD[用户输入 1 OR 1=1] --> E[驱动 EXECUTE 阶段 绑定参数]\nE --> F[数据库按计划执行 输入只作字面量]\nC --> F\nF --> G[结果返回]\nH[order by sort] --> I[服务端枚举白名单]\nI --> J[映射为固定列名 ASC DESC]\nJ --> A",
+      "fallback": "应用发出带 ? 的 SQL → 驱动先 PREPARE → 数据库 parse + 生成执行计划；用户输入在 EXECUTE 阶段作为绑定值传入，不再进入 SQL 解析；order by 这类结构位走服务端白名单映射成固定列后再拼回 SQL。",
+      "caption": "参数化的本质是 PREPARE 和 EXECUTE 两次协议交互，结构在 PREPARE 阶段固定，值在 EXECUTE 阶段绑定；结构位用白名单兜底。"
     },
     {
       "type": "compareTable",
-      "title": "注入防护方式对比",
+      "title": "不同输入位置的防护方式对比",
       "columns": [
-        "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
+        "输入位置",
+        "示例",
+        "正确做法",
+        "反例"
       ],
       "rows": [
         [
-          "参数化查询",
-          "结构和值分离",
-          "where 条件、insert/update",
-          "不能绑定字段名和排序方向"
+          "字符串值",
+          "where name = ?",
+          "PreparedStatement 绑定，引号无需手工转义",
+          "`\"name='\" + input + \"'\"` 直接拼接"
         ],
         [
-          "白名单",
-          "限制结构片段取值",
-          "order by、表名选择",
-          "名单维护要严格"
+          "数字值",
+          "where id = ?",
+          "绑定为 int/long 类型，类型转换失败直接报错",
+          "`\"id=\" + req.getParameter(\"id\")` 不做类型校验"
         ],
         [
-          "ORM 查询构造器",
-          "减少手写 SQL",
-          "常规 CRUD",
-          "原生 SQL 仍有风险"
+          "LIKE 模糊匹配",
+          "where name like ?",
+          "把 `%kw%` 整体作为绑定值，`%` 做转义",
+          "`\"like '%\" + kw + \"%'\"` 拼字符串"
         ],
         [
-          "最小权限",
-          "限制注入后破坏范围",
-          "线上账号",
-          "权限过大容易扩大事故"
+          "IN 子句",
+          "where id in (?,?,?)",
+          "按数组长度动态生成占位符再批量绑定",
+          "`\"in (\" + ids.join(\",\") + \")\"`"
+        ],
+        [
+          "ORDER BY / 字段名",
+          "order by created_at desc",
+          "前端传枚举 key，服务端映射到白名单列与方向",
+          "`\"order by \" + sort + \" \" + dir`"
+        ],
+        [
+          "ORM 原生 SQL",
+          "MyBatis #{} / @Query 命名参数",
+          "用 #{}、命名参数、QueryBuilder 链式 API",
+          "MyBatis ${}、`nativeQuery=true` + 字符串模板"
         ]
       ]
     },
     {
+      "type": "code",
+      "title": "拼接、参数化与 order by 白名单对比",
+      "language": "java",
+      "content": "// 反例 1：字符串拼接 → 经典注入\nString sql = \"select * from user where name = '\" + name + \"' and pwd = '\" + pwd + \"'\";\nstmt.executeQuery(sql); // 输入 name=' OR 1=1 --  即可绕过\n\n// 反例 2：MyBatis ${} 和 order by 拼接\n// <select> select * from goods order by ${sort} ${dir} </select>\n// sort 传入 \"price; drop table goods --\" 即可执行 DDL\n\n// 正例 1：JDBC PreparedStatement，值位置用 ?\nString sql = \"select * from user where name = ? and pwd = ?\";\ntry (PreparedStatement ps = conn.prepareStatement(sql)) {\n    ps.setString(1, name);\n    ps.setString(2, pwd);\n    try (ResultSet rs = ps.executeQuery()) { /* ... */ }\n}\n\n// 正例 2：IN 子句按数组长度生成占位符\nString placeholders = ids.stream().map(i -> \"?\").collect(Collectors.joining(\",\"));\nString sql2 = \"select * from goods where id in (\" + placeholders + \")\";\ntry (PreparedStatement ps = conn.prepareStatement(sql2)) {\n    for (int i = 0; i < ids.size(); i++) ps.setLong(i + 1, ids.get(i));\n}\n\n// 正例 3：order by 走服务端白名单\nMap<String, String> SORT_WHITELIST = Map.of(\n    \"createTime\", \"created_at\",\n    \"price\",      \"price\"\n);\nString col = SORT_WHITELIST.getOrDefault(req.getSort(), \"created_at\");\nString dir = \"asc\".equalsIgnoreCase(req.getDir()) ? \"asc\" : \"desc\";\nString sql3 = \"select * from goods order by \" + col + \" \" + dir + \" limit ?\";\n// 拼回去的 col/dir 都来自服务端常量，用户输入只决定 key,不直接进入 SQL"
+    },
+    {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：SQL 注入与参数化查询 要从目标、关键机制、风险边界和观测验证四层回答。\n\n我会按这几层展开：\n1. 先说明它解决的核心工程问题是  SQL 注入成因、预编译参数绑定、ORM 边界和最小权限防护。\n2. 再沿着 用户输入参数、SQL 字符串拼接风险、预编译语句结构、参数绑定执行、最小权限和审计 说明执行链路\n3. 然后讲清 参数化查询 和 白名单 的适用边界\n4. 最后补充用 SQL 日志、WAF 命中、数据库审计、慢查询、异常错误信息 验证效果和定位异常\n\n最后补充边界：安全防护要按攻击路径逐层设计，单点措施失效时仍应有日志、权限和隔离兜底。",
+      "content": "30 秒结论：SQL 注入的根因是用户输入被当作 SQL 语法的一部分参与解析，预编译/参数化把语句结构和值分两次发送给数据库，让输入只能作为字面量值，因此能阻断绝大多数注入；但表名、列名、order by、in 元素个数这类结构位不能用占位符，要走服务端枚举白名单。\n\n核心机制：预编译时数据库先 parse 出固定执行计划，执行阶段才把绑定值按类型传过去，引号、注释、关键字都不再被 SQL 解析器看到。攻击形态分有回显（union select 拖库）、布尔盲注（true/false 控制结果集）、时间盲注（sleep 控制响应延迟）和二阶注入（先入库后被拼接），所以关闭报错回显只能降噪、不能修复。\n\n边界与追问：参数化防值不防结构，order by、表名、动态 in 必须白名单；ORM 安全的是参数绑定 API，MyBatis ${}、JPA nativeQuery 拼字符串、原生 query() 模板字符串都能绕回老路；WAF 和最小权限是注入漏网时的爆炸半径控制——业务账号禁用 DDL 和 file 权限，WAF 拦截 union/sleep 等显著特征，但都不能替代代码层修复。线上验证三件套：代码审查无字符串拼用户输入、SQL 日志能看到占位符与绑定参数、数据库审计无异常 information_schema 或 sleep 调用。",
       "followUpQuestions": [
         {
-          "question": "SQL 注入与参数化查询 出问题时你先看哪些信号？",
-          "answer": "我会先看 SQL 日志、WAF 命中、数据库审计、慢查询、异常错误信息，把异常定位到 SQL 字符串拼接风险、预编译语句结构、参数绑定执行，再决定是回滚、降级、扩容还是修配置。"
+          "question": "预编译为什么能防注入？协议层发生了什么？",
+          "answer": "驱动会先发 PREPARE 报文（MySQL 的 COM_STMT_PREPARE / PG 的 Parse），数据库把带 ? 的 SQL parse 成固定执行计划；之后 EXECUTE 阶段只发送参数值（按类型编码），值不再进入 SQL 解析器，因此引号、注释、关键字都只是字面量，无法改变语法结构。"
         },
         {
-          "question": "SQL 注入与参数化查询 最容易忽略的边界是什么？",
-          "answer": "最容易忽略的是自动化本身也会放大错误，所以必须保留审批、审计、回滚、灰度和人工接管路径。"
+          "question": "order by 字段、表名、in 子句这种结构位怎么防？",
+          "answer": "这些位置在 parse 阶段必须确定，没法用 ? 绑定。做法是前端只传枚举 key（比如 sort=createTime），服务端用 Map 白名单映射成固定列名和 ASC/DESC；in 子句按数组长度动态生成 ?,?,? 再绑定每个值；表名一般不让用户选，必须选时也用白名单。"
+        },
+        {
+          "question": "用了 ORM 是不是就一定不会注入？举几个翻车场景。",
+          "answer": "不一定。MyBatis 的 ${} 是字符串替换等同拼接；JPA @Query 配 nativeQuery=true 再拼字符串；Sequelize/TypeORM 的 query()、createQueryBuilder().where('name=' + input)；手写 IN(${ids.join(',')})、like '%${kw}%'、动态 where 1=1 and ${cond}。判断标准只有一个——用户输入有没有作为绑定参数，而不是看是否经过 ORM。"
+        },
+        {
+          "question": "页面不回显错误，攻击者还能拖库吗？怎么发现这种盲注？",
+          "answer": "能。布尔盲注用 and substr(pwd,1,1)='a' 让结果集为真/假，根据页面差异逐位猜；时间盲注用 if(条件, sleep(2), 0) 看响应延迟。发现手段：监控同一接口大量参数仅末尾字符变化的请求、单接口响应时间出现规律性 1s/2s 阶梯、SQL 慢日志中 sleep 或 information_schema 访问突增、WAF 命中 sleep(/benchmark(/substring 等特征。"
+        },
+        {
+          "question": "线上发现疑似 SQL 注入，如何止血和验证修复？",
+          "answer": "止血：WAF 临时下发规则拦截 union/sleep/注释符堆叠等可疑 payload，必要时降级或下线受影响接口；回收业务账号高危权限（drop/file/grant），确认无 DDL 能力。定位：从 access log 找异常 payload 对应的接口，diff 出拼接 SQL 的代码点。修复：把值位置改成 PreparedStatement，结构位改成白名单映射；对历史入库数据查是否已被二阶利用。验证：代码审查 + 静态扫描确认无拼接，SQL 日志看到 ? 占位符和绑定参数，DBA 账号体检无异常权限，复现盲注 payload 不再产生时间差或布尔差异。"
         }
       ]
     },
@@ -93,52 +123,59 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 SQL 注入与参数化查询 的目标和边界",
-        "能沿 用户输入参数 -> SQL 字符串拼接风险 -> 预编译语句结构 -> 参数绑定执行 -> 最小权限和审计 讲清链路",
-        "能解释关键配置和失败模式",
-        "能用观测指标验证效果"
+        "用一段拼接 SQL 演示字符串/数字/order by 三类注入位置",
+        "讲清预编译协议中 PREPARE 与 EXECUTE 两阶段，以及为什么值不再进入 SQL 解析",
+        "解释 LIKE、IN、order by、表名为什么不能直接用占位符以及对应的白名单做法",
+        "辨别 MyBatis #{} 与 ${}、JPA nativeQuery、ORM 原生 SQL 的安全边界",
+        "区分布尔盲注、时间盲注、二阶注入的触发位置和发现手段",
+        "说明最小权限、WAF、审计在防御链中的兜底作用而非替代",
+        "给出线上发现注入后的止血、修复、验证三步流程"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "security.web-security.sql-injection.recall.1",
-      "prompt": "请讲一下 SQL 注入与参数化查询 的核心链路和它解决的工程问题。",
+      "prompt": "用一段字符串拼接示例说明 SQL 注入如何发生，并从协议层解释预编译为什么能阻断。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "security.web-security.sql-injection.recall.2",
-      "prompt": "SQL 注入与参数化查询 在生产环境里最常见的失败模式有哪些？",
+      "prompt": "动态 order by、IN 子句、表名选择和 ORM 原生 SQL 各自有哪些注入边界？分别用什么手段防御？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "security.web-security.sql-injection.recall.3",
-      "prompt": "如果 SQL 注入与参数化查询 相关变更上线后异常，你会如何回滚和验证？",
+      "prompt": "线上接口被怀疑存在时间盲注或二阶注入，你会从日志、代码、权限三个维度怎么排查、止血并验证修复？",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "expectedMinutes": 4,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明 SQL 注入与参数化查询 的核心目标",
-      "能讲清 用户输入参数、SQL 字符串拼接风险、预编译语句结构 的关系",
-      "能指出 参数化查询 和 白名单 的差异",
-      "能给出可观测验证和回滚思路"
+      "字符串/数字/order by 三类注入位置与拼接示例",
+      "预编译 PREPARE/EXECUTE 两阶段把结构和值分离的机制",
+      "结构位不能用占位符，需要服务端枚举白名单",
+      "MyBatis ${} vs #{}、JPA nativeQuery 等 ORM 安全边界",
+      "最小权限账号在注入漏网时限制爆炸半径"
     ],
     "goodToHave": [
-      "能结合 SQL 日志、WAF 命中、数据库审计、慢查询、异常错误信息 做定位",
-      "能说明多环境差异和权限边界",
-      "能把自动化、审计和回滚串成闭环"
+      "布尔盲注、时间盲注、二阶注入的具体触发与发现手段",
+      "LIKE 模糊匹配、IN 子句的安全写法",
+      "WAF 规则与数据库审计在事中检测的作用",
+      "线上止血、回收权限、复现验证的完整流程"
     ],
     "commonMistakes": [
-      "只记 SQL 注入与参数化查询 的防护名词，不解释攻击路径和信任边界",
-      "把单点校验当成完整安全方案，忽略 SQL 注入与参数化查询 的绕过方式",
-      "没有把日志审计、密钥或权限治理、应急处置纳入 SQL 注入与参数化查询"
+      "把参数化等同于自动转义，没说清协议层结构与值分离",
+      "认为关闭报错回显或上 WAF 就能替代代码层修复",
+      "把 order by、表名直接当作普通参数说能用 ? 绑定",
+      "笼统说 ORM 安全，不区分 ${}、nativeQuery、原生 query 的拼接风险",
+      "只讲单点防御，不分层讲参数化 + 白名单 + 最小权限 + 审计"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -147,5 +184,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

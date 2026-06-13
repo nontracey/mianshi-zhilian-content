@@ -40,6 +40,7 @@ function parseRunnerArgs(argv = process.argv.slice(2)) {
     preset: base.preset ?? "auto",
     concurrency: Number(base.concurrency ?? 2),
     retries: Number(base.retries ?? 1),
+    batchSize: Number(base["batch-size"] ?? 1),
     timeoutMs: Number(base["timeout-ms"] ?? 600000),
     usePty: Boolean(base["use-pty"]),
     noDefaultExtraArgs: Boolean(base["no-default-extra-args"]),
@@ -256,6 +257,74 @@ ${JSON.stringify(item.topic, null, 2)}
 `;
 }
 
+function batchPrompt(review, items) {
+  return `你是独立内容质量评审 agent。不要复用写作立场，只按事实和学习体验审查。
+
+只返回 JSON，不要解释，不要 Markdown 代码围栏。
+
+请求元信息：
+${JSON.stringify({
+  schemaVersion: REVIEW_SCHEMA_VERSION,
+  rubricVersion: RUBRIC_VERSION,
+  reviewId: review.request.reviewId,
+  env: review.request.env,
+  scope: review.request.scope,
+  sampleSize: review.request.sampleSize,
+  batchSize: items.length,
+}, null, 2)}
+
+请逐篇评审下面这些 topic，输出一个对象，reviews 数组必须与输入 refs 一一对应：
+
+输出 JSON schema：
+{
+  "reviews": [
+    {
+      "ref": "输入 topic 的 ref",
+      "title": "输入 topic 的 title",
+      "verdict": "pass | fail",
+      "score": 85,
+      "dimensions": {
+        "accuracy": 4,
+        "cognitiveOrder": 4,
+        "expertVoice": 4,
+        "selfContained": 4,
+        "interviewUsability": 4,
+        "difficultyFit": 4
+      },
+      "factFindings": [
+        { "claim": "被核验的事实断言", "verdict": "correct | wrong | suspicious | outdated", "evidence": "核验依据或无法核验原因" }
+      ],
+      "orderFindings": [],
+      "voiceFindings": [],
+      "selfContainedFindings": [],
+      "blockingFindings": [],
+      "notes": ""
+    }
+  ]
+}
+
+硬性要求：
+- reviews 必须包含下面每一个 ref，不能遗漏、合并或新增 ref。
+- score 使用 0-100；低于 85 必须 fail。
+- dimensions 使用 1-5 整数；任一低于 4 必须 fail。
+- 每个 topic 的 factFindings 至少 3 条，覆盖定义、机制、边界/失败路径等关键事实；图、表、代码也按事实核验。
+- wrong/outdated 事实必须进入该 topic 的 blockingFindings 且 verdict=fail。
+- 如果正文无法支撑 recallPrompts 或 rubric.mustHave，verdict=fail。
+- 如果语言明显模板化、讲解顺序跳跃、专家口吻不真实，verdict=fail。
+
+topic JSON 列表：
+${JSON.stringify(
+  items.map((item) => ({
+    ref: item.ref,
+    title: item.title,
+    topic: item.topic,
+  })),
+  null,
+  2,
+)}
+`;
+}
+
 function normalizeTopicReview(parsed, item) {
   return {
     ref: item.ref,
@@ -275,9 +344,18 @@ function normalizeTopicReview(parsed, item) {
   };
 }
 
-async function runOneTopic(item, review, cfg, cliPath, outDir) {
-  const taskId = `${item.ref.replace(/[^a-z0-9]+/gi, "-")}-${sha256(item.ref).slice(0, 8)}`;
-  const prompt = topicPrompt(review, item);
+function extractBatchReviews(parsed) {
+  if (Array.isArray(parsed)) return parsed;
+  if (Array.isArray(parsed.reviews)) return parsed.reviews;
+  throw new Error("CLI output did not contain a reviews array");
+}
+
+async function runOneBatch(items, review, cfg, cliPath, outDir) {
+  const taskId =
+    items.length === 1
+      ? `${items[0].ref.replace(/[^a-z0-9]+/gi, "-")}-${sha256(items[0].ref).slice(0, 8)}`
+      : `batch-${sha256(items.map((item) => item.ref).join("\n")).slice(0, 12)}`;
+  const prompt = items.length === 1 ? topicPrompt(review, items[0]) : batchPrompt(review, items);
   const attempts = cfg.retries + 1;
   let lastError = null;
 
@@ -295,26 +373,94 @@ async function runOneTopic(item, review, cfg, cliPath, outDir) {
         const result = await runProcess(cliPath, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] }, cfg.timeoutMs);
         raw = result.stdout;
       }
-      const parsed = normalizeTopicReview(extractJson(raw), item);
+      const extracted = extractJson(raw);
+      const parsedReviews = items.length === 1 ? [extracted] : extractBatchReviews(extracted);
+      const byRef = new Map(parsedReviews.map((parsed) => [parsed.ref, parsed]));
+      const normalized = items.map((item) => {
+        const parsed = byRef.get(item.ref);
+        if (!parsed) throw new Error(`CLI output missing review for ${item.ref}`);
+        return normalizeTopicReview(parsed, item);
+      });
       const rawPath = path.join(outDir, `${taskId}.raw.txt`);
       const jsonPath = path.join(outDir, `${taskId}.json`);
       await writeFile(rawPath, clean(raw) + "\n");
-      await writeFile(jsonPath, JSON.stringify(parsed, null, 2) + "\n");
-      return { ok: true, item, review: parsed, attempts: attempt, output: jsonPath };
+      await writeFile(jsonPath, JSON.stringify(normalized, null, 2) + "\n");
+      return { ok: true, items, reviews: normalized, attempts: attempt, output: jsonPath };
     } catch (error) {
       lastError = error;
       if (attempt < attempts) {
-        console.log(`[RETRY] ${item.ref} attempt ${attempt}/${attempts}: ${error.message}`);
+        console.log(`[RETRY] ${items.map((item) => item.ref).join(", ")} attempt ${attempt}/${attempts}: ${error.message}`);
       }
     } finally {
       await rm(tmp, { recursive: true, force: true });
     }
   }
 
-  return { ok: false, item, attempts, error: lastError?.message ?? "unknown error" };
+  return { ok: false, items, attempts, error: lastError?.message ?? "unknown error" };
+}
+
+async function runOneTopic(item, review, cfg, cliPath, outDir) {
+  const result = await runOneBatch([item], review, cfg, cliPath, outDir);
+  if (result.ok) {
+    return {
+      ok: true,
+      item,
+      review: result.reviews[0],
+      attempts: result.attempts,
+      output: result.output,
+    };
+  }
+  return {
+    ok: false,
+    item,
+    attempts: result.attempts,
+    error: result.error,
+  };
+}
+
+function chunk(items, size) {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += size) chunks.push(items.slice(index, index + size));
+  return chunks;
 }
 
 async function runPool(items, review, cfg, cliPath, outDir) {
+  if (cfg.batchSize <= 1) return runTopicPool(items, review, cfg, cliPath, outDir);
+  const batches = chunk(items, cfg.batchSize);
+  const results = [];
+  let index = 0;
+  async function worker() {
+    while (index < batches.length) {
+      const batch = batches[index++];
+      const result = await runOneBatch(batch, review, cfg, cliPath, outDir);
+      for (const item of batch) {
+        if (result.ok) {
+          const topicReview = result.reviews.find((entry) => entry.ref === item.ref);
+          results.push({
+            ok: Boolean(topicReview),
+            item,
+            review: topicReview,
+            attempts: result.attempts,
+            output: result.output,
+            error: topicReview ? undefined : `batch output missing review for ${item.ref}`,
+          });
+        } else {
+          results.push({
+            ok: false,
+            item,
+            attempts: result.attempts,
+            error: result.error,
+          });
+        }
+      }
+      console.log(`[${result.ok ? "OK" : "FAIL"}] batch ${batch[0].ref} ... ${batch[batch.length - 1].ref} (${batch.length})`);
+    }
+  }
+  await Promise.all(Array.from({ length: cfg.concurrency }, worker));
+  return results.sort((left, right) => left.item.ref.localeCompare(right.item.ref));
+}
+
+async function runTopicPool(items, review, cfg, cliPath, outDir) {
   const results = [];
   let index = 0;
   async function worker() {
@@ -410,6 +556,9 @@ async function main() {
   if (!Number.isInteger(runnerArgs.retries) || runnerArgs.retries < 0 || runnerArgs.retries > 5) {
     throw new Error("--retries must be an integer in [0, 5]");
   }
+  if (!Number.isInteger(runnerArgs.batchSize) || runnerArgs.batchSize < 1 || runnerArgs.batchSize > 10) {
+    throw new Error("--batch-size must be an integer in [1, 10]");
+  }
   if (!Number.isInteger(runnerArgs.timeoutMs) || runnerArgs.timeoutMs < 30000) {
     throw new Error("--timeout-ms must be an integer >= 30000");
   }
@@ -426,7 +575,7 @@ async function main() {
   await mkdir(outDir, { recursive: true });
   console.log(
     `Running external LLM review: cli=${cfg.cli} (${cliPath}), model=${cfg.model || "CLI default configured model"}, ` +
-      `concurrency=${cfg.concurrency}, retries=${cfg.retries}, targets=${review.request.reviewedTargetCount}`,
+      `concurrency=${cfg.concurrency}, retries=${cfg.retries}, batchSize=${cfg.batchSize}, targets=${review.request.reviewedTargetCount}`,
   );
 
   const results = await runPool(review.topics, review, cfg, cliPath, outDir);
@@ -454,6 +603,7 @@ async function main() {
         model: cfg.model || "CLI default configured model",
         concurrency: cfg.concurrency,
         retries: cfg.retries,
+        batchSize: cfg.batchSize,
         timeoutMs: cfg.timeoutMs,
         request: review.request,
         results: results.map((result) => ({

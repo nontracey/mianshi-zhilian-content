@@ -4,13 +4,14 @@
   "category": "platform",
   "group": "platform",
   "title": "Airflow 调度与任务编排",
-  "summary": "理解 DAG、Task、Operator、调度周期、依赖、补数和幂等重跑。",
+  "summary": "讲清 DAG/Task/Operator、Scheduler 触发模型、execution_date 与 data_interval、补数 backfill、SLA 与 retry 的工程含义。",
   "tags": [
     "数据工程",
     "Airflow",
     "DAG",
     "调度",
-    "补数"
+    "Backfill",
+    "SLA"
   ],
   "difficulty": 3,
   "estimatedMinutes": 30,
@@ -19,74 +20,101 @@
   "status": "production",
   "prerequisites": [],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「Airflow 调度与任务编排」讲清定义、核心机制、适用边界、常见误区，并把它用于真实问题定位。",
+  "interviewerFocus": "重点考察 schedule_interval 与 data_interval 的差异、catchup/backfill 的语义、Task 幂等与 retry/SLA 策略、Scheduler 与 Executor（Local/Celery/Kubernetes）的分工，以及与 DolphinScheduler/Dagster 的边界对比。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Airflow 调度与任务编排 的职责边界",
-      "content": "Airflow 用 DAG 描述任务依赖，用 Operator 执行具体动作。调度器根据时间周期和依赖状态触发 Task，执行器负责运行任务实例。\n\n学习 Airflow 调度与任务编排 时，可以先沿「DAG 依赖定义 -> 调度器创建实例 -> Task 执行产出 -> 失败重试告警 -> 历史补数重跑」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- DAG：任务依赖图，适合 数据链路编排，风险是 依赖过复杂难维护\n- Operator：具体执行动作，适合 SQL、Spark、Shell，风险是 副作用要可控\n- Schedule：调度周期，适合 日报、小时任务，风险是 要区分运行时间和数据日期\n- Backfill：历史补数重跑，适合 修复历史数据，风险是 任务必须幂等\n\n把这条路径落回 Airflow 调度与任务编排 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "DAG/Task/Operator 与 Scheduler 的真实分工",
+      "content": "Airflow 的核心是把「依赖定义」「触发决策」「执行环境」三件事拆开，理解清楚就能避开大部分坑。\n\nDAG 是 Python 文件中通过 `with DAG(...)` 定义的有向无环图，描述任务之间的依赖（>> / <<）和调度参数；Task 是 DAG 中一个节点，由 Operator 实例化（PythonOperator、BashOperator、SparkSubmitOperator、KubernetesPodOperator 等），描述「这一步做什么」。Operator 不直接运行——Scheduler 在每个 schedule 周期把 DAG 实例化为一个 DAG Run，把每个 Task 实例化为 Task Instance（TI），然后把 TI 状态机推到 queued，由 Executor 派发到 Worker 真正执行。\n\nScheduler 是常驻进程，每隔 `scheduler_heartbeat_sec`（默认 5s）做一次循环：扫描 DAG 文件夹（dag_dir_list_interval，默认 5min）、写入 SerializedDAG 表、按 schedule 创建新的 DAG Run、检查 TI 依赖（上游成功、Pool 有空、Trigger Rule 满足）后改成 scheduled→queued。Executor 决定 TI 在哪运行：LocalExecutor 在 Scheduler 同进程起子进程；CeleryExecutor 把 TI 推到 Redis/RabbitMQ，由 Celery Worker 拉取；KubernetesExecutor 给每个 TI 起一个 Pod 跑完即销毁。元数据库（一般是 Postgres）是单点真理，所有状态都写在 dag_run、task_instance 表里——Scheduler 重启不丢任务，但元数据库挂了整个调度就停。\n\n面试中容易踩雷的点：把 Operator 的 `__init__` 当执行入口（其实是在 Scheduler 解析 DAG 时跑，不该有重 IO）、把顶层代码放在 DAG 文件里（每次解析都会执行，拖垮 Scheduler）。"
     },
     {
       "type": "explain",
-      "title": "Airflow 调度与任务编排 的失败模式与排查",
-      "content": "难点在数据日期和幂等。任务运行时间不等于数据分区日期，补数会重跑历史区间；如果任务不能覆盖写入或去重，会污染历史数据。\n\nAirflow 调度与任务编排 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 「Airflow 调度与任务编排 的核心目标」决定这个知识点的主线，必须先说清触发条件\n- 「DAG 依赖定义、调度器创建实例、Task 执行产出 的关系」决定方案能否稳定落地，不能只停留在名称层面\n- 「只讲工具名不讲数据语义和链路」是常见失效点，需要提前说明防护或修复方式\n- 可以用「能结合 DAG run、task instance、执行日志、重试次数、数据分区校验 做定位」验证自己是否能说出关键路径\n\n排查时不要先猜结论，应把现象映射到 调度器创建实例、Task 执行产出、失败重试告警 这些环节，再结合 DAG run、task instance、执行日志、重试次数、数据分区校验 验证。"
+      "title": "execution_date / data_interval 与 catchup/backfill 的语义陷阱",
+      "content": "Airflow 调度里最容易出事故的就是「时间到底指什么」。一句话先记住：**Airflow 跑的不是「现在这个时刻」，而是「上一个数据区间」**。\n\n以 `schedule_interval='@daily'`、start_date=2026-06-01 为例：\n- 2026-06-02 00:00 UTC 触发的 DAG Run，它的 `data_interval_start=2026-06-01 00:00`、`data_interval_end=2026-06-02 00:00`，处理的是「6 月 1 日这一天的数据」。\n- 老版本叫 `execution_date`（=data_interval_start），Airflow 2.2+ 推荐用 `data_interval_start/end`、`logical_date`，不要再用 `ds`/`execution_date` 直接当业务时间，遇到非整点 schedule、时区切换会算错。\n- 写分区路径要用 `{{ data_interval_start | ds }}` 或 `{{ ds }}`（=logical_date 的日期部分），不要用 `datetime.now()`——后者会让补数也写到「今天」的分区。\n\n`catchup=True`（默认）的语义：DAG 上线/暂停恢复时，Scheduler 会从 start_date 一路把缺失的 DAG Run 全部补出来，按 max_active_runs 并发跑。常见生产事故：把一个跑了半年的 DAG 暂停几天再打开，Scheduler 一次性塞 100 多个 DAG Run，把 Worker 和下游打爆。生产上日报类 DAG 通常 `catchup=False`，只跑「下一个区间」，历史数据用 `airflow dags backfill -s 2026-01-01 -e 2026-01-31 dag_id` 显式补。\n\nBackfill 命令本质是：按指定区间重新创建/重跑 DAG Run，它**不会**自动清旧产物，所以 Task 必须幂等——典型做法是 Hive/Spark 用 `INSERT OVERWRITE PARTITION(dt='{{ ds }}')`、关系库先 `DELETE WHERE dt=...` 再 `INSERT`、对象存储按 `dt=YYYY-MM-DD/` 前缀整目录覆盖。如果用 `INSERT INTO` 追加，补数就会重复行。"
+    },
+    {
+      "type": "explain",
+      "title": "失败处理：retries、Trigger Rule、SLA 与告警怎么搭",
+      "content": "生产 Airflow 的可靠性靠三层：Task 级 retry、DAG 级 Trigger Rule、平台级 SLA/告警。\n\nTask 重试：每个 Operator 都能配 `retries`（默认 0）、`retry_delay`（timedelta，默认 5min）、`retry_exponential_backoff=True`、`max_retry_delay`、`execution_timeout`。注意 retry 只在 TI 失败（state=failed）时触发，被 SIGKILL 的 zombie task 由 Scheduler 的 `scheduler_zombie_task_threshold` 检测后置成 up_for_retry。retries 不是越多越好——下游是外部 API 时，超过 3 次基本就是真挂了，盲目重试会放大压力。\n\nTrigger Rule 控制下游何时触发，默认 `all_success`（所有上游成功才跑）。常用的还有：`all_done`（不管上下游成功失败都跑，做清理）、`one_failed`（任一失败才跑，做告警）、`none_failed_min_one_success`（容许 skipped 但至少一个成功）。配合 BranchPythonOperator 做条件分支时，下游必须用 `none_failed_min_one_success` 之类，否则会被默认规则跳过。\n\nSLA：在 Task 上设 `sla=timedelta(hours=2)` 表示「相对 data_interval_end，2 小时内必须跑完」，超时不会杀任务，只会写一条 SLA Miss 记录并触发 `sla_miss_callback`。SLA 是「数据按时产出」的承诺，不是「任务超时杀掉」——后者要用 `execution_timeout`。告警通道一般用 `on_failure_callback` / `on_retry_callback` 接钉钉/飞书 webhook，比 Airflow 自带 SMTP 更可控。\n\n常见误区：把 SLA 当 timeout 用、retry_delay 设成 1 秒疯狂打外部接口、on_failure_callback 里抛异常把告警吃了（callback 失败不会再触发）。"
     },
     {
       "type": "diagram",
-      "title": "Airflow DAG 调度链路",
+      "title": "Scheduler / Executor / Worker / Metadata DB 协作链路",
       "format": "mermaid",
-      "content": "flowchart LR\nA[DAG 依赖定义] --> B[调度器创建实例]\nB[调度器创建实例] --> C[Task 执行产出]\nC[Task 执行产出] --> D[失败重试告警]\nD[失败重试告警] --> E[历史补数重跑]",
-      "fallback": "DAG 依赖定义 -> 调度器创建实例 -> Task 执行产出 -> 失败重试告警 -> 历史补数重跑",
-      "caption": "图示展示 DAG 如何按调度周期创建任务实例，并通过重试和补数保障产出。"
+      "content": "flowchart LR\nDAG[DAG 文件 dags/*.py] --> SCH[Scheduler 解析+创建 DAG Run]\nSCH --> META[(Metadata DB dag_run/task_instance)]\nSCH -->|state=queued| EXEC[Executor Celery/K8s/Local]\nEXEC -->|派发| WORKER[Worker / Pod]\nWORKER -->|执行 Operator| EXT[外部系统 Spark/SQL/API]\nWORKER -->|心跳+state| META\nWEB[Webserver / UI] --> META\nMETA -->|SLA Miss| CB[on_failure_callback 钉钉/飞书]",
+      "fallback": "DAG 文件被 Scheduler 解析后写入 Metadata DB，Scheduler 按 schedule 创建 DAG Run，把 Task Instance 状态推到 queued；Executor 把 TI 派发给 Worker（Celery 走 Redis、K8s 起 Pod、Local 起子进程），Worker 执行 Operator 调用外部系统并回写状态；Webserver 从 Metadata DB 读状态展示，SLA Miss 与失败触发 callback 走钉钉飞书。",
+      "caption": "Scheduler 只做依赖判断和状态推进，真正执行在 Worker；Metadata DB 是单点真理，挂了整个调度停。"
     },
     {
       "type": "compareTable",
-      "title": "Airflow 概念对比",
+      "title": "Airflow vs DolphinScheduler vs Dagster 选型边界",
       "columns": [
         "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
+        "Airflow",
+        "DolphinScheduler",
+        "Dagster"
       ],
       "rows": [
         [
-          "DAG",
-          "任务依赖图",
-          "数据链路编排",
-          "依赖过复杂难维护"
+          "DAG 定义方式",
+          "Python 代码（声明式+命令式）",
+          "Web UI 拖拽 + JSON",
+          "Python（asset/op，强类型，IO 与计算分离）"
         ],
         [
-          "Operator",
-          "具体执行动作",
-          "SQL、Spark、Shell",
-          "副作用要可控"
+          "调度模型",
+          "schedule_interval + data_interval + catchup",
+          "Cron + 项目/工作流/任务三层依赖",
+          "schedule + sensor + asset 物化驱动"
         ],
         [
-          "Schedule",
-          "调度周期",
-          "日报、小时任务",
-          "要区分运行时间和数据日期"
+          "Executor",
+          "Local / Celery / Kubernetes / CeleryK8s",
+          "Master + Worker（自研 RPC，Worker 分组）",
+          "DefaultRunLauncher / K8s / Celery，按 op 选"
         ],
         [
-          "Backfill",
-          "历史补数重跑",
-          "修复历史数据",
-          "任务必须幂等"
+          "数据血缘",
+          "弱，靠 lineage 插件或 OpenLineage",
+          "弱，主要看任务依赖图",
+          "强，asset graph 原生表达数据资产"
+        ],
+        [
+          "适合场景",
+          "工程师团队、复杂 Python 编排、大规模 ETL",
+          "国内团队、SQL/Shell 任务多、要 UI 配置",
+          "数据平台/ML pipeline，强调资产和测试"
+        ],
+        [
+          "主要短板",
+          "DAG 解析慢、元数据库瓶颈、UI 弱",
+          "Python 生态薄、社区主要在国内",
+          "学习曲线陡、运行时资源开销大"
         ]
       ]
     },
     {
+      "type": "code",
+      "title": "幂等 DAG 与 backfill 安全写法",
+      "language": "python",
+      "content": "from datetime import datetime, timedelta\nfrom airflow import DAG\nfrom airflow.operators.python import PythonOperator\nfrom airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator\n\ndefault_args = {\n    \"owner\": \"data-platform\",\n    \"retries\": 3,\n    \"retry_delay\": timedelta(minutes=5),\n    \"retry_exponential_backoff\": True,\n    \"max_retry_delay\": timedelta(minutes=30),\n    \"execution_timeout\": timedelta(hours=2),\n    \"sla\": timedelta(hours=3),\n}\n\nwith DAG(\n    dag_id=\"order_daily_etl\",\n    start_date=datetime(2026, 1, 1),\n    schedule_interval=\"0 2 * * *\",   # 每天 02:00 UTC 跑昨天的数据\n    catchup=False,                    # 上线只跑下一个区间，历史用 backfill 命令显式补\n    max_active_runs=1,                # 串行，避免补数把下游打爆\n    default_args=default_args,\n    tags=[\"etl\", \"order\"],\n) as dag:\n\n    # 反例：写 datetime.now() 会让补数也落到今天\n    # 正例：用 Jinja 模板拿 logical_date 对应的业务分区\n    extract = SparkSubmitOperator(\n        task_id=\"extract_order\",\n        application=\"s3://jobs/order_extract.py\",\n        application_args=[\n            \"--dt={{ ds }}\",                          # logical_date 的日期\n            \"--start={{ data_interval_start }}\",      # 区间起点（含）\n            \"--end={{ data_interval_end }}\",          # 区间终点（不含）\n            \"--mode=overwrite\",                       # 关键：INSERT OVERWRITE PARTITION(dt=...)\n        ],\n    )\n\n    def _verify(**ctx):\n        # 校验分区行数，行数为 0 直接抛错触发 retry / 告警\n        from airflow.providers.apache.hive.hooks.hive import HiveServer2Hook\n        ds = ctx[\"ds\"]\n        rows = HiveServer2Hook().get_first(\n            f\"SELECT COUNT(*) FROM dwd.order WHERE dt='{ds}'\"\n        )[0]\n        if rows == 0:\n            raise ValueError(f\"empty partition dt={ds}\")\n\n    verify = PythonOperator(task_id=\"verify_partition\", python_callable=_verify)\n\n    extract >> verify\n\n# 历史补数（命令行）：\n# airflow dags backfill -s 2026-01-01 -e 2026-01-31 \\\n#   --reset-dagruns order_daily_etl\n# 因为 Spark 用 INSERT OVERWRITE PARTITION，重跑会覆盖同一天分区，幂等。"
+    },
+    {
       "type": "interviewAnswer",
-      "title": "面试回答思路",
-      "content": "结论：Airflow 调度与任务编排 要从目标、关键机制、风险边界和观测验证四层回答。\n\n我会按这几层展开：\n1. 先说明它解决的核心工程问题是  DAG、Task、Operator、调度周期、依赖、补数和幂等重跑。\n2. 再沿着 DAG 依赖定义、调度器创建实例、Task 执行产出、失败重试告警、历史补数重跑 说明执行链路\n3. 然后讲清 DAG 和 Operator 的适用边界\n4. 最后补充用 DAG run、task instance、执行日志、重试次数、数据分区校验 验证效果和定位异常\n\n最后补充边界：数据工程方案必须同时关注口径、时效、成本和可追溯性，不能只追求跑通任务。",
+      "title": "面试回答：30 秒结论 + 机制 + 边界",
+      "content": "我会先把 Airflow 定位成「调度编排层」：它管 DAG 依赖、按 schedule 生成 DAG Run、派发 Task、处理 retry 和补数，但真正的计算交给 Spark/SQL/Python/外部 API。Scheduler 是常驻进程做触发和依赖判断，Executor（Local/Celery/Kubernetes）决定 TI 在哪跑，Metadata DB 是单点真理。\n\n机制上要讲清三件事。第一，时间语义：DAG Run 的 `data_interval_start/end` 表示「这次要处理的数据区间」，2026-06-02 触发的 daily DAG 处理的是 6-01 那天的数据；catchup=True 会从 start_date 把缺失的 Run 全补出来，生产一般 catchup=False、用 `airflow dags backfill` 显式补历史。第二，幂等：补数会重跑历史区间，Task 必须用 INSERT OVERWRITE PARTITION 或先 DELETE 再 INSERT，否则会重复行；写路径要用 `{{ ds }}` 而不是 `datetime.now()`。第三，可靠性：Task 级 retries + retry_exponential_backoff 处理瞬时失败，Trigger Rule（all_success/all_done/one_failed）控制下游分支，SLA 是「数据按时产出」的告警而不是 timeout，要用 `execution_timeout` 杀超时。\n\n边界上要避开几个坑：把 SLA 当 timeout、把 `datetime.now()` 当业务时间、把重 IO 写在 DAG 顶层导致 Scheduler 解析慢、暂停几天的 DAG 直接打开触发 catchup 雪崩、CeleryExecutor 下 Worker 时区和 Scheduler 不一致。和 DolphinScheduler 比 Airflow 胜在 Python 生态和复杂依赖表达，输在 UI 配置和国内文档；和 Dagster 比 Airflow 胜在成熟度，输在数据资产和血缘的原生表达。",
       "followUpQuestions": [
         {
-          "question": "Airflow 调度与任务编排 出问题时你先看哪些信号？",
-          "answer": "我会先看 DAG run、task instance、执行日志、重试次数、数据分区校验，把异常定位到 调度器创建实例、Task 执行产出、失败重试告警，再决定是回滚、降级、扩容还是修配置。"
+          "question": "DAG 暂停一周后重新打开，怎么避免 Scheduler 一次性创建几十个 DAG Run 把下游打爆？",
+          "answer": "本质是 catchup 行为。三种做法：1）DAG 设 `catchup=False`，打开后只跑下一个区间，历史用 `airflow dags backfill -s ... -e ...` 显式补，并配 `--max-active-runs 2` 控制并发；2）保留 catchup=True 但设 `max_active_runs=1`、`max_active_tasks_per_dag` 限流，让 Scheduler 串行补；3）打开前先把缺失日期用 `airflow dags next-execution` 推进或手动清掉计划中的 Run。生产建议第一种，最可控。"
         },
         {
-          "question": "Airflow 调度与任务编排 最容易忽略的边界是什么？",
-          "answer": "最容易忽略的是自动化本身也会放大错误，所以必须保留审批、审计、回滚、灰度和人工接管路径。"
+          "question": "为什么不能在 DAG 文件顶层写 `pd.read_csv()` 或调外部 API？",
+          "answer": "因为 DAG 文件每次被 Scheduler/Webserver/Worker 解析时都会从头执行——Scheduler 默认 30 秒扫一次（`min_file_process_interval`），Worker 启动 TI 前也会重新 import DAG 文件。顶层放重 IO 会导致：Scheduler heartbeat 拉长、DAG 解析超时被标记 broken、Worker 启动慢；外部 API 还可能被打爆。正确做法是把 IO 放进 Operator 的 `execute()` 或 PythonOperator 的 callable 里，那才是 TI 运行时才执行的部分。"
+        },
+        {
+          "question": "Airflow、DolphinScheduler、Dagster 该怎么选？",
+          "answer": "看团队和场景。工程师团队、Python 栈深、要复杂依赖和动态 DAG（dynamic task mapping），Airflow 最稳；任务以 SQL/Shell 为主、要 UI 拖拽、运维偏国产化，DolphinScheduler 上手快、Master/Worker 架构对元数据库压力小；做数据平台、强调 asset/血缘/类型化和数据测试（dbt 风格），Dagster 的 software-defined asset 模型更贴合，但运行时开销大、生态比 Airflow 小。三者不是替代关系，很多团队用 Airflow/DolphinScheduler 跑调度，再用 Dagster/dbt 管资产层。"
         }
       ]
     },
@@ -94,31 +122,41 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 Airflow 调度与任务编排 的目标和边界",
-        "能沿 DAG 依赖定义 -> 调度器创建实例 -> Task 执行产出 -> 失败重试告警 -> 历史补数重跑 讲清链路",
-        "能解释关键配置和失败模式",
-        "能用观测指标验证效果"
+        "DAG/Task/Operator/DAG Run/Task Instance 五个概念的关系和生命周期",
+        "Scheduler、Executor（Local/Celery/Kubernetes）、Worker、Metadata DB 各自的职责和故障域",
+        "schedule_interval、data_interval_start/end、logical_date、execution_date 的差异",
+        "catchup=True/False 的行为差异，backfill 命令语义和幂等要求",
+        "retries + retry_exponential_backoff、Trigger Rule、SLA、execution_timeout 各管什么",
+        "为什么 DAG 顶层不能放重 IO，Operator __init__ 在哪个进程跑",
+        "Airflow 与 DolphinScheduler、Dagster 的核心选型差异"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "data-engineering.platform.airflow-scheduling.recall.1",
-      "prompt": "请讲一下 Airflow 调度与任务编排 的核心链路和它解决的工程问题。",
+      "prompt": "2026-06-02 02:00 UTC 触发的 daily DAG，它的 data_interval_start/end 分别是什么？写分区时该用 {{ ds }} 还是 datetime.now()？为什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "data-engineering.platform.airflow-scheduling.recall.2",
-      "prompt": "Airflow 调度与任务编排 在生产环境里最常见的失败模式有哪些？",
+      "prompt": "线上一个 DAG 跑半年了，被暂停 5 天后恢复，Scheduler 一次创建了 5 个 DAG Run 把下游 Spark 集群打爆，怎么从配置层面预防？至少给两种方案。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "data-engineering.platform.airflow-scheduling.recall.3",
+      "prompt": "讲清楚 SLA、execution_timeout、retries 三者的区别和典型用法，配错会出什么事故？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
-      "id": "data-engineering.platform.airflow-scheduling.recall.3",
-      "prompt": "如果 Airflow 调度与任务编排 相关变更上线后异常，你会如何回滚和验证？",
+      "id": "data-engineering.platform.airflow-scheduling.recall.4",
+      "prompt": "如果让你在 Airflow、DolphinScheduler、Dagster 之间给一个 SQL/Spark 为主的数据团队选型，你会怎么决策？说出 3 个判断维度。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -126,20 +164,24 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说明 Airflow 调度与任务编排 的核心目标",
-      "能讲清 DAG 依赖定义、调度器创建实例、Task 执行产出 的关系",
-      "能指出 DAG 和 Operator 的差异",
-      "能给出可观测验证和回滚思路"
+      "区分 DAG / Task / Operator / DAG Run / Task Instance 的关系，说清 Operator 不直接执行而是被 Scheduler 实例化为 TI",
+      "讲清 schedule_interval、data_interval_start/end、logical_date 的语义，知道 Airflow 跑的是「上一个数据区间」",
+      "解释 catchup=True/False 的行为差异，说清 backfill 必须依赖 Task 幂等（INSERT OVERWRITE PARTITION 或先删后写）",
+      "区分 retries（瞬时失败重试）、execution_timeout（杀超时）、SLA（数据按时产出告警）三者职责，不能混用"
     ],
     "goodToHave": [
-      "能结合 DAG run、task instance、执行日志、重试次数、数据分区校验 做定位",
-      "能说明多环境差异和权限边界",
-      "能把自动化、审计和回滚串成闭环"
+      "讲清 LocalExecutor / CeleryExecutor / KubernetesExecutor 的部署差异和故障域",
+      "Trigger Rule（all_success/all_done/one_failed/none_failed_min_one_success）配合 BranchPythonOperator 的写法",
+      "用 Pool、Queue、max_active_tasks_per_dag 控制并发，避免对外部系统造成击穿",
+      "用 sla_miss_callback / on_failure_callback 接钉钉飞书 webhook，比 SMTP 更可控",
+      "动态 DAG（dynamic task mapping，2.3+ 的 .expand()）和 TaskGroup 的使用场景"
     ],
     "commonMistakes": [
-      "只讲 Airflow 调度与任务编排 的工具名，不说明数据语义、状态变化和上下游影响",
-      "忽略 Airflow 调度与任务编排 在重跑、补数、迟到数据或口径变更下的边界",
-      "没有用质量指标、血缘、SLA 或成本数据验证 Airflow 调度与任务编排 的结果"
+      "把 Operator 的 __init__ 当执行入口，把重 IO 写在 DAG 顶层，导致 Scheduler 解析慢甚至 broken",
+      "用 datetime.now() 当业务时间，补数会写到错误分区；应该用 {{ ds }} / data_interval_start",
+      "把 SLA 当 execution_timeout 用，结果 SLA Miss 只发告警不会杀任务，超时任务一直占着 Worker",
+      "Task 不幂等（用 INSERT INTO 而不是 INSERT OVERWRITE），backfill 重跑导致历史分区数据翻倍",
+      "DAG 暂停后直接打开导致 catchup 雪崩，瞬间生成几十个 DAG Run 把下游打爆"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -148,5 +190,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

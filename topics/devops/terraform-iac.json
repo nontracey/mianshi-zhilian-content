@@ -4,13 +4,15 @@
   "category": "platform",
   "group": "platform",
   "title": "Terraform 与基础设施即代码",
-  "summary": "理解声明式资源、state、plan/apply、模块化和漂移治理。",
+  "summary": "用声明式 HCL + state 文件管理云资源，掌握 plan/apply/destroy 流程、远程后端锁、workspace 与 module 复用，识别漂移并对比 Pulumi/CloudFormation。",
   "tags": [
     "DevOps",
     "Terraform",
     "IaC",
     "State",
-    "Drift"
+    "Drift",
+    "Module",
+    "Workspace"
   ],
   "difficulty": 3,
   "estimatedMinutes": 30,
@@ -19,134 +21,201 @@
   "status": "production",
   "prerequisites": [],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能说明 IaC 如何让基础设施可审计、可复现，并处理 state 和漂移风险。",
+  "interviewerFocus": "面试官重点确认候选人能区分声明式与命令式、讲清 state 文件的作用和锁机制、说明 plan/apply/destroy 与 refresh 的执行顺序，并能在多环境下用 workspace 或目录隔离 + module 输入输出做复用。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Terraform 与基础设施即代码 的职责边界",
-      "content": "Terraform 用声明式配置描述基础设施期望状态，通过 plan 计算变更，通过 apply 调用云 API 执行。state 记录资源映射，是 Terraform 判断差异的关键。\n\n学习 Terraform 与基础设施即代码 时，可以先沿「HCL 配置声明 -> State 资源映射 -> Plan 差异预览 -> Apply 调用云 API -> Drift 检测修复」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- 声明式配置：描述期望状态，适合 基础设施版本化，风险是 不适合临时手工修补\n- State：资源 ID 映射，适合 差异计算，风险是 泄漏和冲突风险\n- Plan：执行前预览变更，适合 审批和审计，风险是 复杂变更仍需人工判断\n- 模块：复用基础设施模式，适合 多环境标准化，风险是 抽象过度难排查\n\n把这条路径落回 Terraform 与基础设施即代码 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "声明式 HCL：你写期望状态，Terraform 算 diff",
+      "content": "Terraform 用 HCL 描述「我要一台 t3.medium 的 EC2，挂在某个 VPC 的子网里」这种期望状态，而不是像 shell/Ansible 那样写「先调 RunInstances，再调 AttachVolume」。声明式的关键是幂等：你写 instance_type = \"t3.medium\"，无论当前实例是什么型号，apply 后都收敛到 t3.medium；命令式脚本则要自己判断「现在是 t3.small 就调 ModifyInstanceAttribute」，否则重复执行会出错。\n\nTerraform 的执行模型是三段：refresh 拉云端真实状态写进内存 → 把内存状态和 HCL 期望做 diff，生成 plan → apply 按依赖图（terraform graph）顺序调用 provider 的 Create/Update/Delete。依赖图由资源间的引用自动推导，例如 aws_instance.web 引用了 aws_subnet.public.id，Terraform 就知道子网必须先建。\n\n关键边界：1) 资源不在 HCL 里 = Terraform 认为应当不存在，apply 会删除（destroy 时尤其要看 plan）；2) 某些字段是 ForceNew，比如 EC2 的 availability_zone 改了会先 destroy 后 create，生产库要先用 lifecycle { prevent_destroy = true } 或 create_before_destroy 兜底；3) provider 决定支持的资源粒度，AWS provider 不支持的资源（比如某些 preview 服务）只能用 null_resource + local-exec 兜，但这就回到了命令式，不享受 diff 能力。"
     },
     {
       "type": "explain",
-      "title": "Terraform 与基础设施即代码 的失败模式与排查",
-      "content": "难点在 state 管理。多人协作需要远程 state 和锁，敏感信息要保护，手工改云资源会产生漂移，模块抽象过度会让变更风险难以理解。\n\nTerraform 与基础设施即代码 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 「Terraform 与基础设施即代码 的核心目标」决定这个知识点的主线，必须先说清触发条件\n- 「HCL 配置声明、State 资源映射、Plan 差异预览 的关系」决定方案能否稳定落地，不能只停留在名称层面\n- 「只背工具命令而不讲执行链路」是常见失效点，需要提前说明防护或修复方式\n- 可以用「能结合 plan 输出、state lock、drift diff、云审计日志、模块版本 做定位」验证自己是否能说出关键路径\n\n排查时不要先猜结论，应把现象映射到 State 资源映射、Plan 差异预览、Apply 调用云 API 这些环节，再结合 plan 输出、state lock、drift diff、云审计日志、模块版本 验证。"
+      "title": "state 文件、远程后端与锁：多人协作的真正痛点",
+      "content": "terraform.tfstate 是资源 ID（如 i-0abc...）到 HCL 地址（aws_instance.web）的映射表，外加每个资源最后一次读到的属性快照。没有 state，Terraform 不知道 aws_instance.web 对应云上哪台机器，每次 plan 都会想新建一台。\n\n本地 state 在团队场景必崩：A 同事 apply 完没 push，B 同事在旧 state 上 apply，会看到「资源不存在」要重建，造成线上抖动；state 还包含敏感字段（RDS 密码、access key），明文进 git 是事故。生产标准做法是远程后端，常用 S3 + DynamoDB（或 GCS、Azure Blob、Terraform Cloud、Consul）：S3 存 state（开版本和 SSE 加密），DynamoDB 表存一行 LockID 实现互斥锁。apply 开始时写锁，结束删除；中途 Ctrl+C 会留下死锁，需要 terraform force-unlock <LOCK_ID>，但要先确认对方真的没在跑。\n\n实战风险点：1) state drift——有人在控制台手动改了安全组规则，下次 plan 会显示要「改回去」，要么把改动同步进 HCL，要么用 terraform import / terraform state rm 修正；2) state 里删错了资源，可以 terraform state rm 把它从 state 里摘掉但保留云上资源，再 import 回来；3) 大 state（几千资源）plan 慢，按 blast radius 拆成多个 root module，每个独立 backend；4) 跨 state 引用用 terraform_remote_state data source 或 SSM/Output，不要硬编码 ID。"
+    },
+    {
+      "type": "explain",
+      "title": "workspace、module 与 plan/apply/destroy：怎样复用又不踩坑",
+      "content": "多环境隔离有两条路。terraform workspace 在同一份代码、同一个 backend 下用前缀（env:/dev/、env:/prod/）切 state，适合非常相似的环境；坑是所有 workspace 共享同一份 HCL，prod 想多开一个 NAT 网关就只能塞 count = terraform.workspace == \"prod\" ? 2 : 1，复杂后难维护。生产更常见的是按目录隔离：environments/dev、environments/prod 各自一份 main.tf 和独立 backend，复用通过 module \"vpc\" { source = \"../../modules/vpc\" version = \"1.2.0\" } 引入，prod 升级 module 不影响 dev。\n\nmodule 设计三件套：variables.tf 定义输入（带 type 和 validation）、outputs.tf 暴露下游要用的属性（如 vpc_id）、versions.tf 锁 provider 与 Terraform 版本。source 推荐 git tag 或 Terraform Registry，避免 source = \"../shared\" 这种相对路径——一旦目录搬家全坏。\n\nplan/apply/destroy 的实战节奏：1) plan -out=tfplan 把计划落盘，CI 评审通过后再 apply tfplan，避免「评审时和 apply 时云端状态不一致」；2) -target=aws_instance.web 可以只动一个资源，但官方明确说这是救火工具，会让依赖图不完整，常态用会让 state 慢慢偏离 HCL；3) destroy 前永远先 plan -destroy 看清单，prod 关键资源加 lifecycle { prevent_destroy = true } 让误删直接报错；4) 升级 provider/Terraform 版本要先在 dev workspace 跑 terraform plan，看 schema 变化导致的 diff，再批量推。"
     },
     {
       "type": "diagram",
-      "title": "Terraform IaC 执行链路",
+      "title": "Terraform 一次 apply 的完整链路",
       "format": "mermaid",
-      "content": "flowchart LR\nA[HCL 配置声明] --> B[State 资源映射]\nB[State 资源映射] --> C[Plan 差异预览]\nC[Plan 差异预览] --> D[Apply 调用云 API]\nD[Apply 调用云 API] --> E[Drift 检测修复]",
-      "fallback": "HCL 配置声明 -> State 资源映射 -> Plan 差异预览 -> Apply 调用云 API -> Drift 检测修复",
-      "caption": "图示展示 Terraform 如何从配置和 state 计算差异并执行基础设施变更。"
+      "content": "flowchart TB\nA[HCL: main.tf / variables.tf / modules] --> B[terraform init: 下载 provider, 配置 backend]\nB --> C[terraform plan: refresh state + diff]\nC --> D{plan 输出: + create / ~ update / - destroy}\nD --> E[CI 审批 / -out=tfplan 落盘]\nE --> F[terraform apply tfplan]\nF --> G[DynamoDB 写锁 LockID]\nG --> H[按依赖图调用 provider Create/Update/Delete]\nH --> I[更新 S3 远程 state + 版本]\nI --> J[释放锁 / 输出 outputs]\nH -.手工改云端.-> K[Drift: 下次 plan 显示反向变更]\nK -.terraform import / state rm.-> A",
+      "fallback": "HCL → init 拉 provider/backend → plan refresh+diff → CI 审批落盘 tfplan → apply 加 DynamoDB 锁 → 按依赖图调云 API → 写回 S3 state → 释放锁；手工改云端 = drift，下次 plan 会反向回改，需要 import 或更新 HCL。",
+      "caption": "图示串起 init/plan/apply 三步、远程 backend 锁机制和漂移修复路径，是面试讲流程时的主干。"
     },
     {
       "type": "compareTable",
-      "title": "IaC 关键机制对比",
+      "title": "Terraform vs Pulumi vs CloudFormation：选型对照",
       "columns": [
         "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
+        "Terraform",
+        "Pulumi",
+        "AWS CloudFormation"
       ],
       "rows": [
         [
-          "声明式配置",
-          "描述期望状态",
-          "基础设施版本化",
-          "不适合临时手工修补"
+          "配置语言",
+          "HCL（专用 DSL，声明式）",
+          "TS/Python/Go/C# 通用语言",
+          "YAML/JSON（声明式）"
         ],
         [
-          "State",
-          "资源 ID 映射",
-          "差异计算",
-          "泄漏和冲突风险"
+          "云覆盖",
+          "多云：AWS/GCP/Azure/K8s/SaaS provider 数千个",
+          "多云：底层复用 Terraform provider",
+          "仅 AWS（含 CDK 是 CFN 的高层封装）"
         ],
         [
-          "Plan",
-          "执行前预览变更",
-          "审批和审计",
-          "复杂变更仍需人工判断"
+          "state 管理",
+          "tfstate + 远程 backend，自己负责锁",
+          "Pulumi 自托管 backend 或自建 S3，机制类似",
+          "AWS 托管，无 state 文件，stack 即状态"
         ],
         [
-          "模块",
-          "复用基础设施模式",
-          "多环境标准化",
-          "抽象过度难排查"
+          "diff 与回滚",
+          "plan 显式预览，apply 失败需手动修",
+          "preview 同 plan，失败可自动回滚",
+          "stack 失败自动 rollback 到上一稳态"
+        ],
+        [
+          "适用场景",
+          "多云/混合云、生态最广、面试默认选项",
+          "重逻辑场景（动态生成大量资源、强类型测试）",
+          "纯 AWS、要原生集成（StackSet、Service Catalog）"
+        ],
+        [
+          "主要痛点",
+          "HCL 表达力有限、state 与漂移要自己治",
+          "依赖运行时语言版本，团队需懂编程",
+          "锁死 AWS、嵌套 stack 复杂、变更慢"
         ]
       ]
     },
     {
-      "type": "interviewAnswer",
-      "title": "面试回答思路",
-      "content": "结论：Terraform 与基础设施即代码 要从目标、关键机制、风险边界和观测验证四层回答。\n\n我会按这几层展开：\n1. 先说明它解决的核心工程问题是 声明式资源、state、plan/apply、模块化和漂移治理。\n2. 再沿着 HCL 配置声明、State 资源映射、Plan 差异预览、Apply 调用云 API、Drift 检测修复 说明执行链路\n3. 然后讲清 声明式配置 和 State 的适用边界\n4. 最后补充用 plan 输出、state lock、drift diff、云审计日志、模块版本 验证效果和定位异常\n\n最后补充边界：云原生能力提升交付和治理效率，但配置错误、权限过大和观测缺失会把故障影响放大。",
-      "followUpQuestions": [
+      "type": "code",
+      "title": "S3 + DynamoDB 远程后端 + module 调用最小骨架",
+      "language": "hcl",
+      "content": "# environments/prod/backend.tf\nterraform {\n  required_version = \">= 1.6.0\"\n  required_providers {\n    aws = { source = \"hashicorp/aws\", version = \"~> 5.40\" }\n  }\n  backend \"s3\" {\n    bucket         = \"acme-tfstate-prod\"\n    key            = \"network/terraform.tfstate\"\n    region         = \"ap-northeast-1\"\n    dynamodb_table = \"acme-tflock\"   # 锁表，主键 LockID(String)\n    encrypt        = true              # SSE-S3，敏感字段加密\n  }\n}\n\n# environments/prod/main.tf\nmodule \"vpc\" {\n  source  = \"git::https://github.com/acme/tf-modules.git//vpc?ref=v1.2.0\"\n  name    = \"prod-vpc\"\n  cidr    = \"10.20.0.0/16\"\n  azs     = [\"ap-northeast-1a\", \"ap-northeast-1c\"]\n}\n\nresource \"aws_db_instance\" \"orders\" {\n  identifier     = \"orders-prod\"\n  engine         = \"mysql\"\n  instance_class = \"db.r6g.large\"\n  # ForceNew 字段，改了会 destroy+create，prod 必须兜底\n  lifecycle {\n    prevent_destroy       = true\n    create_before_destroy = false\n    ignore_changes        = [password]   # 密码走 SSM 不进 state diff\n  }\n}\n\noutput \"vpc_id\" {\n  value = module.vpc.vpc_id\n}",
+      "highlights": [
         {
-          "question": "Terraform 与基础设施即代码 出问题时你先看哪些信号？",
-          "answer": "我会先看 plan 输出、state lock、drift diff、云审计日志、模块版本，把异常定位到 State 资源映射、Plan 差异预览、Apply 调用云 API，再决定是回滚、降级、扩容还是修配置。"
+          "line": 9,
+          "note": "backend \"s3\" 必须写在 terraform 块里，且不能用变量插值——init 时还没解析变量。"
         },
         {
-          "question": "Terraform 与基础设施即代码 最容易忽略的边界是什么？",
-          "answer": "最容易忽略的是自动化本身也会放大错误，所以必须保留审批、审计、回滚、灰度和人工接管路径。"
+          "line": 12,
+          "note": "dynamodb_table 是关键：没有它 S3 backend 不会上锁，多人并发 apply 会写花 state。"
+        },
+        {
+          "line": 21,
+          "note": "module source 用 git tag 而不是相对路径或分支，保证 prod 不会因为 main 分支改动突然出现 diff。"
+        },
+        {
+          "line": 32,
+          "note": "prevent_destroy = true 让误删 RDS 时 plan 直接报错，必须先手动注释掉才能删，是生产兜底。"
+        },
+        {
+          "line": 34,
+          "note": "ignore_changes 把 password 排除出 diff，配合外部 SSM/Secrets Manager 管理，避免敏感值进 state。"
+        }
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "30 秒结论 + 机制 + 边界三段式",
+      "content": "结论：Terraform 是声明式 IaC 工具，核心是「HCL 写期望 + state 记录现状 + plan 算 diff + apply 调云 API」，落地难点是 state 治理、锁机制和漂移控制，多云场景比 CloudFormation 通用，比 Pulumi 学习成本低。\n\n机制：一次正常变更链路是 init 拉 provider 和远程 backend → plan 先 refresh 拉云端真实状态再和 HCL diff，输出 + 创建 / ~ 更新 / - 删除清单 → CI 审批后 apply tfplan，过程中 DynamoDB 上锁，按依赖图（资源引用自动推导）调云 API，结束写回 S3 state 并释放锁。多环境复用靠 module + 按目录隔离的 backend，比 workspace 切 state 更适合 prod。\n\n边界：state 文件含敏感信息必须 S3 加密 + 远程 backend + DynamoDB 锁，本地 tfstate 在团队里基本是事故源；手工改云端会产生 drift，下次 plan 显示反向变更，要么 terraform import 进 state，要么把改动写回 HCL；ForceNew 字段（AZ、引擎大版本）改了会 destroy+create，生产用 lifecycle.prevent_destroy 和 create_before_destroy 兜底；-target 只在救火时用，长期会让 state 偏离 HCL。",
+      "followUpQuestions": [
+        {
+          "question": "如果 apply 中途有人 Ctrl+C，DynamoDB 锁没释放，怎么处理？",
+          "answer": "先看 DynamoDB acme-tflock 表里 LockID 的 Operation、Who、Created 字段，确认对方真的中断了（必要时去问一下），再用 terraform force-unlock <LOCK_ID> 强制解锁。盲目 force-unlock 的风险是：如果对方实际还在 apply，两人同时写 state 会让 S3 上的 tfstate 损坏，需要从 S3 版本历史回滚到中断前的版本，再 terraform refresh 对齐。"
+        },
+        {
+          "question": "线上某个安全组规则被人在控制台手动加了一条，下次 plan 显示要删掉，怎么办？",
+          "answer": "两条路：1) 如果手工改是合理的（比如临时排障开了 22 端口），把这条规则同步进 HCL 的 aws_security_group_rule 资源，再 plan 应该是 No changes；2) 如果手工改是临时的，就 apply 让 Terraform 把它删掉，恢复到 HCL 期望。绝对不要长期忽视 drift，否则 state 和云端会越偏越远，等真要做大变更时 plan 里全是「我没想改的东西也要改」。生产里建议用 driftctl 或定时 terraform plan -detailed-exitcode 做漂移巡检。"
+        },
+        {
+          "question": "团队问该用 workspace 还是按目录拆环境，怎么选？",
+          "answer": "判断标准是 dev 和 prod 的资源结构差异有多大。差异很小（只是规格、副本数不同）用 workspace 简单：同一份代码，terraform workspace new prod 后 state 自动隔离。差异大（prod 多 NAT 网关、跨 AZ、独立 KMS、单独 IAM）就按目录拆：environments/dev、environments/prod 各自 backend、各自 main.tf，共享逻辑全部下沉到 modules/。生产中我倾向后者，因为 workspace 切错（terraform workspace show 没看就 apply）会把 dev 改动打到 prod，按目录拆的物理隔离更安全，且 CI 流水线也更清晰。"
         }
       ]
     },
     {
       "type": "checklist",
-      "title": "学完后应能说清楚",
+      "title": "面试自检：能不能讲透这几点",
       "items": [
-        "能说明 Terraform 与基础设施即代码 的目标和边界",
-        "能沿 HCL 配置声明 -> State 资源映射 -> Plan 差异预览 -> Apply 调用云 API -> Drift 检测修复 讲清链路",
-        "能解释关键配置和失败模式",
-        "能用观测指标验证效果"
+        "能解释声明式 vs 命令式的区别，并说出 Terraform 的幂等是靠 plan diff + provider Update 实现的",
+        "能画出 init → plan(refresh+diff) → apply(锁+依赖图+state 写回) 的完整链路",
+        "能说清 state 的作用、为什么必须远程 backend、S3 + DynamoDB 各负责什么",
+        "能解释 drift 的产生原因和两种修复路径（import vs 同步进 HCL）",
+        "能区分 workspace 和按目录拆环境的适用场景，并能说出 workspace 切错的事故风险",
+        "能说出至少 3 个 module 设计要点（versions.tf、tag pinning、validation、ignore_changes）",
+        "能对比 Terraform、Pulumi、CloudFormation 在 state、语言、回滚上的差异，给出选型理由",
+        "能说出 prevent_destroy、create_before_destroy、ignore_changes 三个 lifecycle 的实战用途"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "devops.platform.terraform-iac.recall.1",
-      "prompt": "请讲一下 Terraform 与基础设施即代码 的核心链路和它解决的工程问题。",
+      "prompt": "请讲一下 terraform plan 和 apply 的完整执行过程，重点说明 state 在其中的作用和远程 backend 怎么防止并发冲突。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "devops.platform.terraform-iac.recall.2",
-      "prompt": "Terraform 与基础设施即代码 在生产环境里最常见的失败模式有哪些？",
+      "prompt": "线上有人在控制台手动改了一条安全组规则导致 state drift，下次 plan 显示要回滚这条规则，你会怎么处理，并怎么避免这种事再发生？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "devops.platform.terraform-iac.recall.3",
-      "prompt": "如果 Terraform 与基础设施即代码 相关变更上线后异常，你会如何回滚和验证？",
+      "prompt": "团队从单环境扩展到 dev/staging/prod，你会用 terraform workspace 还是按目录拆？module 怎么组织？请说出选择理由和潜在坑。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "devops.platform.terraform-iac.recall.4",
+      "prompt": "对比 Terraform、Pulumi、AWS CloudFormation 在配置语言、state 管理、回滚机制和适用场景上的差异，并说明你在多云团队会怎么选。",
+      "mode": "text",
+      "expectedMinutes": 4,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明 Terraform 与基础设施即代码 的核心目标",
-      "能讲清 HCL 配置声明、State 资源映射、Plan 差异预览 的关系",
-      "能指出 声明式配置 和 State 的差异",
-      "能给出可观测验证和回滚思路"
+      "声明式 HCL + plan diff + apply 调 provider 的三段执行模型",
+      "tfstate 的作用：资源 ID 到 HCL 地址的映射表 + 属性快照",
+      "S3 远程 backend + DynamoDB 锁的并发保护机制",
+      "drift 的定义和两种修复路径（import 进 state 或同步进 HCL）",
+      "workspace 切 state 与按目录拆环境的适用场景区别"
     ],
     "goodToHave": [
-      "能结合 plan 输出、state lock、drift diff、云审计日志、模块版本 做定位",
-      "能说明多环境差异和权限边界",
-      "能把自动化、审计和回滚串成闭环"
+      "lifecycle 的 prevent_destroy / create_before_destroy / ignore_changes 实战用法",
+      "module 用 git tag 或 Registry 版本锁，避免相对路径",
+      "plan -out=tfplan 落盘 + CI 审批的 GitOps 流程",
+      "terraform import / state rm / force-unlock 等修复命令",
+      "Terraform vs Pulumi vs CloudFormation 在 state、语言、回滚上的对比",
+      "用 driftctl 或 plan -detailed-exitcode 做漂移巡检"
     ],
     "commonMistakes": [
-      "只背 Terraform 与基础设施即代码 的命令或组件，不说明交付链路和运行时对象",
-      "忽略 Terraform 与基础设施即代码 的回滚、权限、容量或人工接管边界",
-      "没有把指标、日志、告警和用户影响关联到 Terraform 与基础设施即代码"
+      "把 Terraform 当 shell 脚本理解，认为 apply 是顺序执行命令而不是收敛到期望状态",
+      "本地 tfstate 直接进 git，或远程 backend 不配 DynamoDB 锁导致 state 写花",
+      "长期忽视 drift，等大变更时 plan 里全是不想改的反向回滚",
+      "module source 用相对路径或分支名，造成 prod 因别处改动突然出现 diff",
+      "在生产用 -target 救火当成常态，让 state 慢慢偏离 HCL",
+      "误以为 workspace 能做强隔离，实际只是 state 前缀，HCL 还是同一份"
     ],
     "scoreWeights": {
-      "coverage": 30,
-      "accuracy": 25,
+      "coverage": 25,
+      "accuracy": 30,
       "interviewExpression": 20,
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

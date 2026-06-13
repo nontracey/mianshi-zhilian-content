@@ -4,13 +4,14 @@
   "category": "identity-crypto",
   "group": "identity-crypto",
   "title": "OAuth2、OIDC 与 JWT",
-  "summary": "理解授权码流程、Token 类型、OIDC 身份层、JWT 签名和撤销边界。",
+  "summary": "理解授权码 + PKCE 流程、Token 类型、OIDC 身份层、JWT 签名校验和撤销边界。",
   "tags": [
     "网络安全",
     "OAuth2",
     "OIDC",
     "JWT",
-    "授权码"
+    "授权码",
+    "PKCE"
   ],
   "difficulty": 3,
   "estimatedMinutes": 30,
@@ -19,74 +20,112 @@
   "status": "production",
   "prerequisites": [],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能区分授权和认证，讲清授权码流程、ID Token 与 Access Token 的使用边界。",
+  "interviewerFocus": "授权码 + PKCE 全链路、ID/Access/Refresh Token 三类令牌的接收方差异、JWT 验签必查的 iss/aud/exp/kid、自包含 Token 撤销的工程兜底。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "OAuth2、OIDC 与 JWT 的职责边界",
-      "content": "OAuth2 是授权框架，解决第三方客户端如何获得访问资源的授权；OIDC 在 OAuth2 之上增加身份认证层；JWT 是一种自包含令牌格式，不等于 OAuth2 本身。\n\n学习 OAuth2、OIDC 与 JWT 时，可以先沿「用户登录授权 -> Authorization Code 返回 -> 后端换取 Token -> 资源服务器验 Access Token -> OIDC ID Token 身份声明」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- OAuth2：授权框架，适合 第三方访问资源，风险是 不是登录协议本身\n- OIDC：身份认证层，适合 单点登录，风险是 要校验 ID Token 声明\n- JWT：自包含签名令牌，适合 无状态校验，风险是 泄露后撤销困难\n- 授权码+PKCE：保护公共客户端，适合 移动端、SPA，风险是 redirect_uri 和 state 必须校验\n\n把这条路径落回 OAuth2、OIDC 与 JWT 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "OAuth2 是授权、OIDC 是认证、JWT 是格式",
+      "content": "三者经常一起出现但不是同一层概念，混淆后会写出“用 JWT 做登录就安全”的错答。\n\nOAuth2（RFC 6749）是授权框架，定义客户端如何代表资源拥有者拿到 Access Token 去访问资源，规范四种授权模式：authorization_code（带后端的 Web 应用）、client_credentials（机器对机器）、refresh_token（续期）、device_code（电视/IoT 输入受限设备）；implicit 和 password 已被 OAuth 2.1 弃用，移动端和 SPA 必须改用 authorization_code + PKCE。\n\nOIDC 在 OAuth2 token endpoint 的响应里多返回一个 id_token，并新增 nonce、prompt、acr、userinfo endpoint 等字段。id_token 是 JWT，aud 必须等于客户端 client_id；access_token 由资源服务器消费，aud 等于资源服务器标识，二者不能混用。\n\nJWT（RFC 7519）只是一种紧凑的 token 容器：header.payload.signature 三段 base64url，签名算法 HS256（HMAC，对称密钥）或 RS256/ES256（非对称，公钥发布在 /.well-known/jwks.json）。Access Token 既可以是 JWT，也可以是不透明字符串（opaque），后者要通过 RFC 7662 introspection endpoint 反查，二选一各有取舍。"
     },
     {
       "type": "explain",
-      "title": "OAuth2、OIDC 与 JWT 的失败模式与排查",
-      "content": "难点在 Token 边界。Access Token 给资源服务器校验权限，ID Token 给客户端确认用户身份；JWT 签名只能防篡改，不能天然解决泄露后的即时撤销。\n\nOAuth2、OIDC 与 JWT 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 「OAuth2、OIDC 与 JWT 的核心目标」决定这个知识点的主线，必须先说清触发条件\n- 「用户登录授权、Authorization Code 返回、后端换取 Token 的关系」决定方案能否稳定落地，不能只停留在名称层面\n- 「只记防护名词而不解释攻击路径」是常见失效点，需要提前说明防护或修复方式\n- 可以用「能结合 redirect_uri、state、code_verifier、token aud/iss/exp、资源服务器日志 做定位」验证自己是否能说出关键路径\n\n排查时不要先猜结论，应把现象映射到 Authorization Code 返回、后端换取 Token、资源服务器验 Access Token 这些环节，再结合 redirect_uri、state、code_verifier、token aud/iss/exp、资源服务器日志 验证。"
+      "title": "授权码 + PKCE 全流程与失败路径",
+      "content": "PKCE（RFC 7636）解决“公共客户端没有 client_secret，code 一旦被截获就能换 token”的问题，现在是所有客户端的默认推荐。\n\n完整 7 步：\n1. 客户端生成 code_verifier（43-128 字符随机串）和 code_challenge = BASE64URL(SHA256(code_verifier))，同时生成不可预测的 state 和（OIDC 场景下）nonce。\n2. 浏览器跳转到 /authorize?response_type=code&client_id=&redirect_uri=&scope=openid+profile&state=&code_challenge=&code_challenge_method=S256。\n3. 用户在授权服务器登录并同意 scope。\n4. 授权服务器 302 回调 redirect_uri?code=&state=，前端必须比对 state 是否与本地一致，不一致直接丢弃（防 CSRF / 会话混淆）。\n5. 客户端后端 POST /token，带 grant_type=authorization_code、code、redirect_uri、code_verifier；授权服务器对 code_verifier 重算 SHA256 与原 code_challenge 比对一致才发 token。\n6. 响应里拿到 access_token、refresh_token，OIDC 场景多一个 id_token。\n7. 调资源接口时 Authorization: Bearer <access_token>，资源服务器校验签名 + iss + aud + exp + scope。\n\n常见失败点：redirect_uri 用通配匹配（应严格全字符串比较）、state 没校验或服用同一值、公共客户端不接 PKCE、code 被重放（授权服务器必须做一次性失效）、把 id_token 拿去调资源接口（aud 不匹配）、refresh_token 不轮换（被盗后长期有效）。"
+    },
+    {
+      "type": "explain",
+      "title": "JWT 验签必查项与撤销工程边界",
+      "content": "JWT 风险集中在两件事：验签做得不全 + 自包含 token 难以即时撤销。\n\n验签必查清单（缺一不可）：\n1. 算法白名单：服务端固定支持的 alg 列表，拒绝 alg=none，拒绝 alg 与密钥类型不匹配（历史漏洞：HS256 用 RS256 公钥当 HMAC 密钥伪造）。\n2. kid + JWKS：从 header.kid 在 /.well-known/jwks.json 找公钥，本地缓存设 TTL（建议 5-10 分钟）+ kid 未命中时主动刷新一次，避免轮换日全员失败。\n3. 标准声明：iss 必须等于预期签发者；aud 必须包含本服务标识；exp 当前时间未过期；nbf/iat 未到生效时间；时钟偏差容忍 30-60 秒。\n4. OIDC 场景额外校验 nonce 与登录请求一致，azp（authorized party）匹配 client_id。\n\n撤销策略（自包含 JWT 不能天然即时失效，必须工程兜底）：\n- 短 TTL + Refresh Token 轮换：access_token 设 5-15 分钟，refresh_token 一次性消费，每次 /token 返回新的并使旧的失效（RFC 6749 §10.4 推荐），盗用后最多在 TTL 内有效。\n- jti 黑名单：登出 / 封禁时把 token 的 jti 写 Redis，TTL 取剩余 exp，资源服务器请求路径上查；适合中小流量。\n- Token introspection：access_token 改用 opaque，资源服务器每次调 /introspect，授权服务器集中控制吊销状态，代价是每次请求多一跳。\n- 网关层会话映射：JWT 只在边缘验签，业务态绑定到网关 session，登出时清网关 session 即生效。"
     },
     {
       "type": "diagram",
-      "title": "OAuth2/OIDC 授权码链路",
+      "title": "授权码 + PKCE 时序图",
       "format": "mermaid",
-      "content": "flowchart LR\nA[用户登录授权] --> B[Authorization Code 返回]\nB[Authorization Code 返回] --> C[后端换取 Token]\nC[后端换取 Token] --> D[资源服务器验 Access Token]\nD[资源服务器验 Access Token] --> E[OIDC ID Token 身份声明]",
-      "fallback": "用户登录授权 -> Authorization Code 返回 -> 后端换取 Token -> 资源服务器验 Access Token -> OIDC ID Token 身份声明",
-      "caption": "图示展示授权码从浏览器返回客户端，再由后端换取和使用 Token 的过程。"
+      "content": "sequenceDiagram\nparticipant U as 用户浏览器\nparticipant C as 客户端(SPA/App)\nparticipant B as 客户端后端\nparticipant AS as 授权服务器\nparticipant RS as 资源服务器\nC->>C: 生成 code_verifier/code_challenge/state/nonce\nU->>AS: /authorize?code_challenge=&state=&nonce=\nAS->>U: 登录页 + 同意 scope\nU->>AS: 提交凭证\nAS->>U: 302 redirect_uri?code=&state=\nU->>C: 回调携带 code+state\nC->>C: 校验 state 一致\nC->>B: 转发 code+code_verifier\nB->>AS: POST /token (code,code_verifier,client_id)\nAS->>AS: SHA256(code_verifier)==code_challenge?\nAS->>B: access_token + refresh_token + id_token(JWT)\nB->>RS: GET /api Authorization: Bearer access_token\nRS->>RS: 验签+iss+aud+exp+scope\nRS->>B: 资源数据",
+      "fallback": "用户浏览器→客户端生成 code_verifier/state→跳转 /authorize 带 code_challenge→用户登录同意→302 回调带 code+state→客户端校验 state→后端用 code+code_verifier 调 /token→授权服务器重算 SHA256 比对→返回 access_token+refresh_token+id_token→后端用 access_token 调资源服务器→资源服务器验签 iss/aud/exp/scope→返回数据",
+      "caption": "PKCE 的关键点：code_verifier 只在客户端持有，授权服务器在 /token 阶段重算 SHA256 比对 code_challenge，截获 code 也无法换取 token。"
     },
     {
       "type": "compareTable",
-      "title": "OAuth2/OIDC/JWT 对比",
+      "title": "三类 Token 的接收方与误用风险",
       "columns": [
-        "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
+        "Token",
+        "签发方",
+        "正确接收方",
+        "校验关键字段",
+        "误用后果"
       ],
       "rows": [
         [
-          "OAuth2",
-          "授权框架",
-          "第三方访问资源",
-          "不是登录协议本身"
+          "id_token",
+          "授权服务器(OIDC)",
+          "客户端(SPA/后端) 用于建立登录态",
+          "iss、aud=client_id、exp、nonce、azp",
+          "发给资源服务器会因 aud 不匹配被拒，或被错误信任成访问凭证导致越权"
         ],
         [
-          "OIDC",
-          "身份认证层",
-          "单点登录",
-          "要校验 ID Token 声明"
+          "access_token",
+          "授权服务器",
+          "资源服务器(API) 用于授权访问",
+          "签名、iss、aud=资源服务器、scope、exp",
+          "客户端持久化展示用户信息会泄露 scope，发给前端解析会绕过资源服务器校验"
         ],
         [
-          "JWT",
-          "自包含签名令牌",
-          "无状态校验",
-          "泄露后撤销困难"
+          "refresh_token",
+          "授权服务器",
+          "客户端后端(机密存储) 用于续签",
+          "绑定 client_id、一次性消费、轮换、可撤销",
+          "存到浏览器 localStorage 或不轮换，泄露后攻击者可长期续签 access_token"
         ],
         [
-          "授权码+PKCE",
-          "保护公共客户端",
-          "移动端、SPA",
-          "redirect_uri 和 state 必须校验"
+          "opaque token",
+          "授权服务器",
+          "资源服务器调 introspection 反查",
+          "introspect 返回 active=true、scope、exp",
+          "资源服务器自己离线解析会失败，必须接 /introspect endpoint"
         ]
+      ]
+    },
+    {
+      "type": "code",
+      "title": "JWT 验签必查项（Node.js + jose 示例）",
+      "language": "javascript",
+      "content": "import { createRemoteJWKSet, jwtVerify } from 'jose';\n\nconst JWKS = createRemoteJWKSet(new URL('https://issuer.example.com/.well-known/jwks.json'), {\n  cooldownDuration: 30_000,\n  cacheMaxAge: 600_000\n});\n\nasync function verifyAccessToken(token) {\n  const { payload, protectedHeader } = await jwtVerify(token, JWKS, {\n    issuer: 'https://issuer.example.com',\n    audience: 'api://orders',\n    algorithms: ['RS256', 'ES256'],\n    clockTolerance: 30\n  });\n\n  if (!payload.scope || !payload.scope.split(' ').includes('orders.read')) {\n    throw new Error('insufficient_scope');\n  }\n  if (await isJtiRevoked(payload.jti)) {\n    throw new Error('token_revoked');\n  }\n  return payload;\n}",
+      "highlights": [
+        {
+          "line": "createRemoteJWKSet(...cooldownDuration/cacheMaxAge)",
+          "note": "JWKS 缓存 + kid 未命中冷却刷新，避免密钥轮换日打爆 issuer，也避免攻击者用伪造 kid 频繁触发刷新"
+        },
+        {
+          "line": "algorithms: ['RS256','ES256']",
+          "note": "显式算法白名单，关键防御 alg=none 和 RS256→HS256 公钥混淆攻击"
+        },
+        {
+          "line": "issuer / audience / clockTolerance",
+          "note": "iss 必须严格匹配，aud 必须等于本资源服务器标识，clockTolerance 30 秒兜底集群时钟偏差"
+        },
+        {
+          "line": "scope 检查 + isJtiRevoked",
+          "note": "签名通过≠授权通过：还要按业务 scope 拒绝越权调用，jti 黑名单兜底登出 / 封禁场景"
+        }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：OAuth2、OIDC 与 JWT 要从目标、关键机制、风险边界和观测验证四层回答。\n\n我会按这几层展开：\n1. 先说明它解决的核心工程问题是 授权码流程、Token 类型、OIDC 身份层、JWT 签名和撤销边界。\n2. 再沿着 用户登录授权、Authorization Code 返回、后端换取 Token、资源服务器验 Access Token、OIDC ID Token 身份声明 说明执行链路\n3. 然后讲清 OAuth2 和 OIDC 的适用边界\n4. 最后补充用 redirect_uri、state、code_verifier、token aud/iss/exp、资源服务器日志 验证效果和定位异常\n\n最后补充边界：安全防护要按攻击路径逐层设计，单点措施失效时仍应有日志、权限和隔离兜底。",
+      "content": "我会按“概念分层 → 主流程 → 验证细节 → 撤销边界”讲。\n\n第一层概念：OAuth2 是授权框架，回答“客户端能访问什么资源”，定义 authorization_code / client_credentials / refresh_token / device_code 四种主流模式；OIDC 在 OAuth2 上加身份层，多发一个 id_token，回答“登录用户是谁”；JWT 只是 header.payload.signature 的 token 容器，可以用来装 access_token 或 id_token，但本身不等于安全。\n\n第二层主流程是授权码 + PKCE：客户端生成 code_verifier 和 SHA256 后的 code_challenge，跳转 /authorize 带 challenge 和 state；用户登录同意后回调带 code 和 state，客户端先比对 state；后端用 code + code_verifier 调 /token，授权服务器重算 SHA256 比对一致才发 token；资源访问时 Authorization: Bearer access_token，资源服务器验签 + iss + aud + exp + scope。\n\n第三层验签：算法走白名单拒绝 alg=none，按 kid 从 JWKS 取公钥并设 TTL 缓存 + kid 未命中冷却刷新；iss 严格匹配、aud 等于本服务、exp 未过期、时钟偏差容忍 30-60 秒；OIDC 场景再校验 nonce 和 azp。\n\n第四层撤销：JWT 自包含、过期前默认无法即时失效，工程上要短 TTL + refresh_token 一次性轮换、jti 黑名单、token introspection 或网关 session 兜底；登出和封禁场景必须明确选哪一种，否则只是“看起来登出了”。",
       "followUpQuestions": [
         {
-          "question": "OAuth2、OIDC 与 JWT 出问题时你先看哪些信号？",
-          "answer": "我会先看 redirect_uri、state、code_verifier、token aud/iss/exp、资源服务器日志，把异常定位到 Authorization Code 返回、后端换取 Token、资源服务器验 Access Token，再决定是回滚、降级、扩容还是修配置。"
+          "question": "PKCE 是怎么防止授权码被截获后换 token 的？为什么 client_secret 解决不了 SPA 的问题？",
+          "answer": "PKCE 在 /authorize 带 code_challenge=SHA256(code_verifier)，/token 阶段必须出示 code_verifier，授权服务器重算 SHA256 与 challenge 比对。攻击者就算截获 code，没有 code_verifier 也换不到 token。SPA 和原生 App 没法安全保存 client_secret（前端代码或 APK 都会被反编译），所以业界用 PKCE 替代 client_secret 作为公共客户端的身份证明，OAuth 2.1 把 PKCE 设为所有客户端的默认要求。"
         },
         {
-          "question": "OAuth2、OIDC 与 JWT 最容易忽略的边界是什么？",
-          "answer": "最容易忽略的是自动化本身也会放大错误，所以必须保留审批、审计、回滚、灰度和人工接管路径。"
+          "question": "JWT 自包含怎么实现“立即登出”和“封禁用户”？工程上一般怎么落地？",
+          "answer": "纯自包含 JWT 在 exp 之前默认无法主动失效，要靠工程手段兜底。常用 4 种：(1) 短 TTL（5-15 分钟） + refresh_token 一次性轮换，登出时只让授权服务器拒绝后续刷新即可，最差 TTL 内有效；(2) jti 黑名单写 Redis，TTL=剩余 exp，资源服务器每次校验后查一下，适合中小流量；(3) access_token 改用 opaque + introspection endpoint，授权服务器集中控制，代价是每次请求多一跳；(4) JWT 只在网关层验签，业务态挂在网关 session，登出清 session 即时生效。一般组合用：短 TTL + refresh 轮换是底座，关键操作（封禁、改密码）再叠加 jti 黑名单。"
+        },
+        {
+          "question": "id_token 和 access_token 都是 JWT，为什么不能拿 id_token 去调资源接口？",
+          "answer": "二者 aud 不同。id_token 的 aud 是 client_id，规范上是“给客户端用来识别登录用户”的；access_token 的 aud 是资源服务器标识，scope 也是给资源接口用的。资源服务器按规范要校验 aud=自己，id_token 的 aud=client_id 会直接被拒。即便资源服务器没严格校验 aud 而错误放行，id_token 里通常没有 scope，无法做接口级授权，会出现“凭身份直接越权”的风险。OIDC 规范明确要求 id_token 不能作为 access_token 使用。"
         }
       ]
     },
@@ -94,52 +133,57 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 OAuth2、OIDC 与 JWT 的目标和边界",
-        "能沿 用户登录授权 -> Authorization Code 返回 -> 后端换取 Token -> 资源服务器验 Access Token -> OIDC ID Token 身份声明 讲清链路",
-        "能解释关键配置和失败模式",
-        "能用观测指标验证效果"
+        "能画出授权码 + PKCE 的 7 步时序，并说出 code_verifier / code_challenge / state / nonce 各自防御什么",
+        "能区分 id_token / access_token / refresh_token 的签发方、接收方、aud 校验和误用风险",
+        "能列出 JWT 验签必查项：算法白名单、kid+JWKS、iss、aud、exp、nbf、时钟偏差、OIDC 的 nonce/azp",
+        "能说出 4 种自包含 JWT 撤销策略（短 TTL + refresh 轮换 / jti 黑名单 / introspection / 网关 session）的取舍",
+        "能识别 implicit flow 弃用、redirect_uri 通配、alg=none、RS256→HS256 公钥混淆等典型漏洞"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "security.identity-crypto.oauth2-oidc-jwt.recall.1",
-      "prompt": "请讲一下 OAuth2、OIDC 与 JWT 的核心链路和它解决的工程问题。",
+      "prompt": "请用授权码 + PKCE 完整描述 OAuth2/OIDC 登录链路，并说明 code_verifier、state、nonce 各自防御什么攻击。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "security.identity-crypto.oauth2-oidc-jwt.recall.2",
-      "prompt": "OAuth2、OIDC 与 JWT 在生产环境里最常见的失败模式有哪些？",
+      "prompt": "id_token、access_token、refresh_token 分别给谁用？把 id_token 当 access_token 调资源接口会发生什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "security.identity-crypto.oauth2-oidc-jwt.recall.3",
-      "prompt": "如果 OAuth2、OIDC 与 JWT 相关变更上线后异常，你会如何回滚和验证？",
+      "prompt": "线上发现某用户 access_token 被泄露需要立即封禁，但系统用的是自包含 JWT，你会怎么做到“立即生效”并复盘根因？",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "expectedMinutes": 4,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明 OAuth2、OIDC 与 JWT 的核心目标",
-      "能讲清 用户登录授权、Authorization Code 返回、后端换取 Token 的关系",
-      "能指出 OAuth2 和 OIDC 的差异",
-      "能给出可观测验证和回滚思路"
+      "OAuth2 是授权框架 / OIDC 是身份认证层 / JWT 是 token 容器，三者不能互相替代",
+      "授权码 + PKCE 7 步流程：code_verifier→code_challenge→/authorize→回调校验 state→/token 重算 SHA256→拿到三类 token→Bearer 调资源",
+      "id_token aud=client_id 给客户端，access_token aud=资源服务器给 API，refresh_token 必须一次性轮换",
+      "JWT 验签必查：算法白名单（拒 alg=none）、kid+JWKS 缓存、iss、aud、exp、时钟偏差",
+      "自包含 JWT 撤销不能即时，需短 TTL+refresh 轮换 / jti 黑名单 / introspection / 网关 session 兜底"
     ],
     "goodToHave": [
-      "能结合 redirect_uri、state、code_verifier、token aud/iss/exp、资源服务器日志 做定位",
-      "能说明多环境差异和权限边界",
-      "能把自动化、审计和回滚串成闭环"
+      "能讲出 RS256→HS256 公钥混淆、alg=none、redirect_uri 通配匹配等典型历史漏洞",
+      "能说出 OAuth 2.1 弃用 implicit / password flow，所有客户端默认 PKCE 的演进背景",
+      "能比较 JWT 自包含 vs opaque + introspection 的取舍：性能 vs 撤销实时性",
+      "能说明 JWKS 公钥轮换日的 kid 缓存策略（TTL + 未命中冷却刷新）"
     ],
     "commonMistakes": [
-      "只记 OAuth2、OIDC 与 JWT 的防护名词，不解释攻击路径和信任边界",
-      "把单点校验当成完整安全方案，忽略 OAuth2、OIDC 与 JWT 的绕过方式",
-      "没有把日志审计、密钥或权限治理、应急处置纳入 OAuth2、OIDC 与 JWT"
+      "把 OAuth2 当登录协议、把 JWT 当“安全本身”",
+      "JWT 只 jwt.decode 不 verify，或没有算法白名单导致 alg=none 被接受",
+      "把 id_token 发到资源服务器当访问凭证，或资源服务器不校验 aud / iss",
+      "公共客户端（SPA/App）不接 PKCE，或 redirect_uri 用通配匹配",
+      "refresh_token 不轮换、不绑定 client_id，泄露后长期可用"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -148,5 +192,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

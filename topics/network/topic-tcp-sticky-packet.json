@@ -4,65 +4,65 @@
   "category": "tcp-udp",
   "group": "tcp-udp",
   "title": "TCP 粘包与拆包",
-  "summary": "理解TCP粘包和拆包现象的产生原因(Nagle算法/缓冲区)，掌握固定长度、分隔符、长度前缀三种解决方案及其适用场景。",
+  "summary": "理解 TCP 字节流没有消息边界、Nagle/MSS/接收缓冲共同造成粘包拆包，掌握定长、分隔符、长度前缀 LV 三种解码方式以及 Netty 三个内置解码器的取舍。",
   "tags": [
     "TCP",
     "粘包",
     "拆包",
-    "Nagle算法"
+    "Nagle",
+    "Netty",
+    "LengthFieldBasedFrameDecoder"
   ],
   "difficulty": 3,
   "estimatedMinutes": 20,
   "order": 50,
-  "recommendWeight": 75,
+  "recommendWeight": 78,
   "learningCards": [
     {
       "type": "explain",
-      "title": "TCP 粘包与拆包：现象不是 TCP 错误、UDP 和 HTTP 为什么感觉不同",
-      "content": "## 现象不是 TCP 错误\nTCP 保证字节流可靠有序，但不保留应用层消息边界。应用连续写入的两条消息，接收方可能一次读到一起，叫粘包；一条消息也可能分多次读到，叫拆包。Nagle、发送缓冲区、MSS、接收方读取时机都会影响表现。\n\n## UDP 和 HTTP 为什么感觉不同\nUDP 是数据报协议，天然保留报文边界；HTTP 在应用层定义了 Content-Length、Chunked 或协议语法，所以能从字节流中还原消息边界。"
+      "title": "为什么流式协议天然会粘包：Nagle + MSS + 接收缓冲三重作用",
+      "content": "## 一句话定位\nTCP 把应用层 write 视为字节流而不是离散消息，发送侧 Nagle/MSS、接收侧滑动窗口缓冲、应用侧 read 时机三重因素错位，就出现一次 read 拿到多条消息（粘包）或半条消息（拆包）。这不是 TCP bug，而是 RFC 793 的契约：可靠有序字节流，边界由应用层负责。\n\n## 三重机制怎么互相叠加\n- 发送侧 Nagle（RFC 896）：未确认的小包会被合并直到凑够 MSS 或收到 ACK；典型表现是连续 write 100B + 200B 在 TCP_NODELAY 关闭时被合成一段发出。\n- MSS 拆分：超过 MSS（以太网常见 1460B）的 write 一定会被切成多个 TCP segment，对端必然分多次 read。\n- 接收侧：内核把若干 segment 顺序拷进 socket 接收缓冲区，read(buf, n) 只承诺返回 1..n 字节，不承诺对齐到一条消息。\n\n## 与 UDP / HTTP 的关键差异\nUDP 是 SOCK_DGRAM，每次 sendto 一条独立报文，recvfrom 要么完整收到要么丢弃，所以语义上不存在粘包；代价是 64KB 上限和不保证可靠。HTTP 不是「没有粘包」，而是它在应用层强制定义了边界：HTTP/1.1 用 Content-Length 或 Transfer-Encoding: chunked，HTTP/2 用 frame 头里的 length 字段——本质上就是「分隔符」和「长度前缀」这两类方案。"
     },
     {
       "type": "explain",
-      "title": "TCP 粘包与拆包：三类常见方案、工程注意",
-      "content": "## 三类常见方案\n固定长度最简单但浪费空间，只适合定长协议；分隔符适合文本协议，但要处理转义；长度前缀最常用，在消息头写 body 长度，接收方先读够头，再按长度读完整 body。\n\n## 工程注意\n解码器要维护累积缓冲区，不能假设一次 read 就是一条完整消息。长度字段要限制最大值，避免恶意长度导致内存打爆；二进制协议要统一字节序和版本字段。\n\n把 TCP 粘包与拆包 放到真实场景里看，重点是报文/连接状态、传输路径、异常边界和抓包证据。先确认触发条件，再看状态或数据怎样变化，最后用指标、日志、测试结果或复杂度证明判断。\n\n学习 TCP 粘包与拆包 时，要把报文/连接状态、传输路径、异常边界和抓包证据对应到具体例子里。遇到异常或效果不符合预期时，先定位触发条件，再判断哪一层状态、数据或假设发生偏移。"
+      "title": "三种解码方案的真实取舍 + Netty 三选一怎么挑",
+      "content": "## 定长 / 分隔符 / 长度前缀 LV 的边界\n- 定长（FixedLengthFrameDecoder）：每条消息固定 N 字节，不足补零。命令字协议、心跳报文场景适用；变长业务用它会浪费带宽，且「补零」后业务侧还要自己 trim。\n- 分隔符（DelimiterBasedFrameDecoder / LineBasedFrameDecoder）：用 \\r\\n 或自定义分隔符。问题是 body 里若出现分隔符必须转义（HTTP/SMTP 是文本协议所以可以用），二进制数据里几乎不可避免误命中。\n- 长度前缀 LV（LengthFieldBasedFrameDecoder）：消息头写 body 长度，接收方先读够头、再按长度读 body。这是 Dubbo、gRPC、Kafka、Redis RESP3 二进制 frame 的共同选择。\n\n## 实战必踩的坑\n1. 累积缓冲区是必须的：解码器要持有 ByteBuf，每次只取出一条完整消息，剩余字节留到下一次。一次 read 不等于一条消息这个前提如果忘了，就会出现「收到半个 length 字段就开始解析」的经典 bug。\n2. lengthFieldOffset 要算清：Netty 的 LengthFieldBasedFrameDecoder 五个参数（maxFrameLength / lengthFieldOffset / lengthFieldLength / lengthAdjustment / initialBytesToStrip）任何一个错位都会让 frame 越界。lengthAdjustment 用来表达「长度字段值是否包含自身和魔数」，最常忘。\n3. maxFrameLength 必须设：恶意/异常发送方写一个 0x7FFFFFFF 长度，没有上限会直接 OOM；Dubbo 默认 8MB，要按业务调。\n4. 字节序统一为大端（网络字节序），魔数 + 版本号放在 length 之前便于乱包识别和协议演进。"
     },
     {
       "type": "diagram",
-      "title": "长度前缀拆包流程",
+      "title": "长度前缀 LV 解码：累积缓冲区状态机",
       "format": "mermaid",
-      "content": "flowchart TD\nA[读取字节到累积缓冲区] --> B{是否够 4 字节长度头}\nB -->|否| A\nB -->|是| C[解析消息长度 len]\nC --> D{缓冲区是否够 len 字节 body}\nD -->|否| A\nD -->|是| E[取出完整消息交给业务]\nE --> F[移除已消费字节]\nF --> B",
-      "caption": "长度前缀协议用累积缓冲区反复判断“头够不够、body 够不够”。",
-      "fallback": "长度前缀拆包：读缓冲 -> 判断长度头 -> 判断 body -> 交付完整消息。"
+      "content": "flowchart TD\n    READ[read 到 ByteBuf 累积区]\n    CHKHDR{可读字节 >= 4 ?}\n    PEEK[peek 出 length=N 不消费指针]\n    CHKBODY{可读字节 >= 4 + N ?}\n    EMIT[skipBytes 4 + 取出 N 字节交给业务]\n    WAIT[保留累积区 等下次 channelRead]\n    GUARD{N > maxFrameLength ?}\n    FAIL[抛 TooLongFrameException 关连接]\n    READ --> CHKHDR\n    CHKHDR -->|否| WAIT\n    CHKHDR -->|是| PEEK\n    PEEK --> GUARD\n    GUARD -->|是| FAIL\n    GUARD -->|否| CHKBODY\n    CHKBODY -->|否| WAIT\n    CHKBODY -->|是| EMIT\n    EMIT --> CHKHDR\n    WAIT --> READ",
+      "caption": "Netty LengthFieldBasedFrameDecoder 的核心状态：先 peek 长度做 maxFrameLength 守卫，再判 body 是否到齐，到齐才消费指针。",
+      "fallback": "状态机：读入 -> 判 4 字节头是否到 -> peek 长度 N -> 校验 N <= maxFrameLength -> 判 body 是否够 -> 够则交付并继续循环 -> 不够保留缓冲等下一次 read。"
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 方案 | 原理 | 优点 | 缺点 | 适用场景 |\n| --- | --- | --- | --- | --- |\n| 固定长度 | 每个消息固定N字节 | 简单，解析快 | 浪费带宽，不适合变长消息 | 命令固定长度的协议 |\n| 分隔符 | 用特殊字符标记边界 | 灵活，支持变长 | 需要转义，不适合二进制 | 文本协议(HTTP/FTP) |\n| 长度前缀 | 头部包含消息长度 | 高效，支持变长和二进制 | 需要额外字段 | 大多数二进制协议(Dubbo/gRPC) |"
+      "title": "三种解码方案 + Netty 解码器对照",
+      "content": "| 方案 | 头格式 | Netty 解码器 | 优点 | 致命缺点 | 典型协议 |\n| --- | --- | --- | --- | --- | --- |\n| 定长 | 无，每条 N 字节 | FixedLengthFrameDecoder | 解析最快，O(1) | 变长业务浪费带宽，补零需业务 trim | 心跳、命令字、SMS PDU |\n| 分隔符 | 末尾 \\r\\n 或自定义 | DelimiterBasedFrameDecoder / LineBasedFrameDecoder | 文本协议天然可读 | body 含分隔符必须转义，二进制不适用 | HTTP/1.x header、SMTP、Redis RESP2 |\n| 长度前缀 LV | 前 N 字节写 body 长度 | LengthFieldBasedFrameDecoder | 支持二进制和变长，效率高 | 需设 maxFrameLength，参数多易配错 | Dubbo、gRPC（5 字节 frame 头）、Kafka、MQTT |\n| UDP（参考） | 报文边界由内核保留 | 不需要 | 天然有边界 | 64KB 上限、不可靠 | DNS、QUIC 之前的 RTP |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// Java: 长度前缀方案解决粘包拆包\npublic class LengthPrefixDecoder {\n    private static final int HEADER_SIZE = 4;\n\n    // 编码: 在消息前添加4字节长度\n    public static byte[] encode(byte[] data) {\n        byte[] result = new byte[HEADER_SIZE + data.length];\n        // 写入长度(大端序)\n        result[0] = (byte) (data.length >> 24);\n        result[1] = (byte) (data.length >> 16);\n        result[2] = (byte) (data.length >> 8);\n        result[3] = (byte) data.length;\n        System.arraycopy(data, 0, result, HEADER_SIZE, data.length);\n        return result;\n    }\n\n    // 解码: 先读长度，再读对应字节数\n    public static List<byte[]> decode(byte[] buffer) {\n        List<byte[]> messages = new ArrayList<>();\n        int offset = 0;\n        while (offset + HEADER_SIZE <= buffer.length) {\n            // 读取长度\n            int length = ((buffer[offset] & 0xFF) << 24)\n                       | ((buffer[offset + 1] & 0xFF) << 16)\n                       | ((buffer[offset + 2] & 0xFF) << 8)\n                       | (buffer[offset + 3] & 0xFF);\n            // 检查数据是否完整\n            if (offset + HEADER_SIZE + length > buffer.length) {\n                break;  // 数据不完整，等待更多数据\n            }\n            // 提取消息\n            byte[] message = new byte[length];\n            System.arraycopy(buffer, offset + HEADER_SIZE, message, 0, length);\n            messages.add(message);\n            offset += HEADER_SIZE + length;\n        }\n        return messages;\n    }\n}\n\n// Go: 长度前缀方案\ntype LengthPrefixCodec struct{}\n\nfunc (c *LengthPrefixCodec) Encode(data []byte) []byte {\n    length := len(data)\n    result := make([]byte, 4+length)\n    binary.BigEndian.PutUint32(result[:4], uint32(length))\n    copy(result[4:], data)\n    return result\n}\n\nfunc (c *LengthPrefixCodec) Decode(reader io.Reader) ([]byte, error) {\n    // 先读4字节长度\n    header := make([]byte, 4)\n    if _, err := io.ReadFull(reader, header); err != nil {\n        return nil, err\n    }\n    length := binary.BigEndian.Uint32(header)\n    // 再读length字节数据\n    data := make([]byte, length)\n    if _, err := io.ReadFull(reader, data); err != nil {\n        return nil, err\n    }\n    return data, nil\n}",
-      "language": "java",
-      "highlights": [
-        {
-          "line": 28,
-          "note": "这里是边界条件分支，回答 TCP 粘包与拆包 时要说明它为什么会改变执行路径。"
-        }
-      ]
+      "title": "Netty LengthFieldBasedFrameDecoder 配置 + 自写长度前缀编解码",
+      "content": "// 1) Netty 长度前缀解码器：4 字节大端长度 + body，不带魔数版本号\n//    maxFrameLength=8MB，lengthFieldOffset=0，lengthFieldLength=4\n//    lengthAdjustment=0（长度字段值仅表示 body 长度）\n//    initialBytesToStrip=4（向业务交付时已剥掉头）\nch.pipeline()\n  .addLast(new LengthFieldBasedFrameDecoder(8 * 1024 * 1024, 0, 4, 0, 4))\n  .addLast(new LengthFieldPrepender(4))            // 编码端自动写 4 字节长度\n  .addLast(new BizHandler());\n\n// 2) 带魔数 + 版本号的更稳健头格式：MAGIC(2) + VERSION(1) + LENGTH(4) + BODY\n//    lengthFieldOffset=3，lengthFieldLength=4，lengthAdjustment=0\n//    initialBytesToStrip=7（业务只拿到纯 body）\nch.pipeline()\n  .addLast(new LengthFieldBasedFrameDecoder(8 * 1024 * 1024, 3, 4, 0, 7));\n\n// 3) 不依赖框架时的手写解码 —— 突出累积缓冲与 maxFrameLength 守卫\npublic class LengthPrefixDecoder {\n    private static final int HEADER = 4;\n    private static final int MAX_FRAME = 8 * 1024 * 1024; // 必须设上限\n    private final ByteBuf cumulation;                     // 跨 channelRead 累积\n\n    public LengthPrefixDecoder(ByteBufAllocator alloc) {\n        this.cumulation = alloc.buffer();\n    }\n\n    public List<ByteBuf> decode(ByteBuf in) {\n        cumulation.writeBytes(in);                        // 累积，关键\n        List<ByteBuf> out = new ArrayList<>();\n        while (cumulation.readableBytes() >= HEADER) {\n            int readerIdx = cumulation.readerIndex();\n            int length = cumulation.getInt(readerIdx);    // peek，不移动指针\n            if (length < 0 || length > MAX_FRAME) {\n                cumulation.clear();\n                throw new TooLongFrameException(\"frame too large: \" + length);\n            }\n            if (cumulation.readableBytes() < HEADER + length) break; // body 没到齐，等下次\n            cumulation.skipBytes(HEADER);\n            out.add(cumulation.readRetainedSlice(length));\n        }\n        cumulation.discardReadBytes();                    // 释放已消费空间\n        return out;\n    }\n}",
+      "language": "java"
     },
     {
       "type": "interviewAnswer",
-      "title": "面试回答思路",
-      "content": "**高频问题1：什么是TCP粘包和拆包？如何产生的？**\n\nTCP是字节流协议，没有消息边界。粘包是指多个应用层消息被合并成一个TCP段发送，拆包是指一个消息被拆分成多个TCP段。产生原因主要有三个：\n\n1. 发送端Nagle算法会合并小数据包\n2. 应用层多次write的数据在TCP发送缓冲区合并\n3. 接收端读取时机不确定，可能一次读到多个消息或只读到部分消息。\n\n**高频问题2：如何解决TCP粘包问题？**\n\n有三种常用方案：\n\n1. 固定长度：每个消息固定N字节，不足补零，简单但浪费带宽\n2. 分隔符：用特殊字符标记消息边界，如HTTP用\\r\\n，适合文本协议但需要转义\n3. 长度前缀：在消息头部添加长度字段，接收方先读长度再读数据，最高效且支持二进制数据，是Dubbo、gRPC等框架的选择。实际项目中推荐使用长度前缀方案。\n\n**高频问题3：HTTP是如何处理粘包的？**\n\nHTTP主要通过两种方式处理：\n\n1. Content-Length头部：明确告知消息体长度，接收方读取指定字节数\n2. Transfer-Encoding: chunked：分块传输，每个块前有长度字段，最后一个块长度为0。HTTP/1.1默认使用长连接，多个请求复用同一个TCP连接，通过这两个机制区分不同的HTTP消息。",
+      "title": "面试回答思路：30 秒结论 + 机制 + 边界",
+      "content": "**结论先行**：粘包/拆包不是 TCP 的 bug，而是 TCP 字节流契约的必然结果——发送侧 Nagle 合并、MSS 切分、接收侧 read 时机错位，三者叠加让一次 read 既可能拿到多条消息也可能拿到半条。解决方法只有一类：在应用层重建消息边界，工程上的三种实现是定长、分隔符、长度前缀 LV，二进制协议绝大多数选第三种。\n\n**机制层**：发送方 write 100B + 200B，若 TCP_NODELAY 关闭且前一段未 ACK，Nagle 会把它们合成一个 segment 发出；若 write 一次 4KB 在以太网上必然被 MSS 1460 切成至少 3 个 segment。接收侧 socket 缓冲区是连续字节，read 只保证返回 1..n 字节。所以解码器必须维护累积缓冲区，按协议头反复判断「够不够一条」。\n\n**实战与边界**：Netty 三个内置解码器对应三类方案——FixedLengthFrameDecoder、DelimiterBasedFrameDecoder、LengthFieldBasedFrameDecoder。生产里基本只用 LengthFieldBasedFrameDecoder，原因是它支持二进制、长度可变、效率最高。配置上必须设 maxFrameLength（防恶意长度 OOM），lengthFieldOffset / lengthFieldLength / lengthAdjustment 要按协议头精确算，遗漏会出现「业务拿到的 frame 越界一两个字节」这种调起来很痛的 bug。Dubbo、gRPC、Kafka 的 frame 头都属于这一类。UDP 因为是数据报协议天然有边界，但代价是 64KB 上限和不可靠，所以业务长消息基本不会选 UDP。",
       "followUpQuestions": [
         {
-          "question": "面试官追问「TCP 粘包与拆包」时，最应该展开哪条机制链？",
-          "answer": "回答「TCP 粘包与拆包」时先抓住 能解释粘包和拆包现象及其根本原因，再展开 能说明Nagle算法和接收缓冲区如何导致粘包。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对网络协议里真实机制的理解。"
+          "question": "TCP_NODELAY 开了之后还会不会粘包？为什么？",
+          "answer": "还会。TCP_NODELAY 只关掉发送侧的 Nagle 合并，没有关掉 MSS 切分，也改不了接收侧 read 拿到多少字节的不确定性。一次 write 4KB 在以太网上仍会被切成多个 segment，对端 read 仍然可能一次拿到 1-N 个 segment 拼成的字节串。所以 NODELAY 只解决「延迟合并」，不解决「消息边界」，应用层解码器一样要写。"
         },
         {
-          "question": "如果「TCP 粘包与拆包」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "可以先确认现象是否落在「能说明Nagle算法和接收缓冲区如何导致粘包」，再结合日志、指标、输入规模和依赖状态验证。"
+          "question": "用 Netty LengthFieldBasedFrameDecoder 时五个参数怎么算？lengthAdjustment 什么时候非零？",
+          "answer": "五个参数是 maxFrameLength（防 OOM 上限）、lengthFieldOffset（长度字段在头部的起始位置）、lengthFieldLength（长度字段占几字节）、lengthAdjustment（length 字段值与剩余待读字节之差，用来表达「长度值是否包含自身或魔数」）、initialBytesToStrip（交付业务前剥掉前几字节）。lengthAdjustment 非零的典型场景：协议规定 length 字段值是「整个 frame 长度（含头）」而不是「body 长度」，此时 lengthAdjustment = -(lengthFieldOffset + lengthFieldLength)，让 Netty 算出真正还需要再读多少字节。"
+        },
+        {
+          "question": "如果生产上突然出现「客户端发的 JSON 解析报错、偶发 unexpected EOF」，你怎么定位是不是粘包问题？",
+          "answer": "三步：第一步 tcpdump 抓一段对应连接的报文，看 TCP segment 的 payload 拼起来是不是和应用层日志里收到的一致——如果一致说明 TCP 没丢，问题在应用层解码；第二步看解码器是不是基于「一次 read = 一条消息」假设写的（最常见是直接 new String(byte[])，没有累积缓冲区），如果是就必然在高 QPS 下偶发；第三步检查是否有 maxFrameLength 上限和魔数校验，长度字段乱掉时不抛异常会在缓冲区里堆积错位字节，表现为后续所有消息都解析失败。修复方案就是切到 LengthFieldBasedFrameDecoder 或自写带累积缓冲的状态机。"
         }
       ]
     },
@@ -70,67 +70,78 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释TCP粘包和拆包现象及其根本原因(TCP是字节流)",
-        "能说出Nagle算法如何导致粘包",
-        "能描述三种解决方案(固定长度/分隔符/长度前缀)的原理和优缺点",
-        "能用代码实现长度前缀的编解码器",
-        "能说明HTTP/Dubbo等协议如何处理粘包问题",
-        "能解释为什么UDP没有粘包问题"
+        "能解释为什么 TCP 字节流契约必然产生粘包/拆包，以及 Nagle、MSS、接收缓冲区分别在哪一步起作用",
+        "能说出 TCP_NODELAY 只关 Nagle、不消除粘包，仍然需要应用层解码器",
+        "能对比定长 / 分隔符 / 长度前缀 LV 三种方案的优缺点和典型协议",
+        "能写出基于累积缓冲区的长度前缀解码状态机，并知道为什么必须设 maxFrameLength",
+        "能讲清 Netty LengthFieldBasedFrameDecoder 五个参数的含义，特别是 lengthAdjustment 非零的场景",
+        "能解释 UDP 不会粘包是因为 SOCK_DGRAM 报文边界由内核保留，以及 HTTP 用 Content-Length / chunked 实际上就是长度前缀和分隔符两类方案"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "network.tcp-udp.topic-tcp-sticky-packet.recall.1",
-      "prompt": "什么是TCP粘包和拆包？有哪些解决方案？",
+      "prompt": "为什么 TCP 会粘包/拆包？UDP 为什么不会？把 Nagle、MSS、接收缓冲、SOCK_DGRAM 串起来讲。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "network.tcp-udp.topic-tcp-sticky-packet.recall.2",
-      "prompt": "长度前缀方案如何实现？请用代码描述编解码过程。",
+      "prompt": "对比定长、分隔符、长度前缀三种方案的优缺点，并说明为什么 Dubbo / gRPC / Kafka 都选长度前缀。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "network.tcp-udp.topic-tcp-sticky-packet.recall.3",
-      "prompt": "TCP 粘包与拆包 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "Netty LengthFieldBasedFrameDecoder 的五个参数怎么算？带魔数+版本号+长度的协议头怎么填？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "network.tcp-udp.topic-tcp-sticky-packet.recall.4",
+      "prompt": "线上偶发 unexpected EOF / JSON 解析失败，怎么判断是不是粘包问题？修复路径是什么？",
+      "mode": "text",
+      "expectedMinutes": 4,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能解释粘包和拆包现象及其根本原因",
-      "能说明Nagle算法和接收缓冲区如何导致粘包",
-      "能描述三种解决方案的原理和适用场景",
-      "能用代码实现长度前缀的编解码"
+      "TCP 字节流契约：粘包/拆包是 RFC 793 必然结果，不是 bug",
+      "Nagle 合并 + MSS 切分 + 接收缓冲 read 时机三重叠加",
+      "定长 / 分隔符 / 长度前缀 LV 三种应用层方案及典型协议",
+      "解码器必须基于累积缓冲区 + 必须设 maxFrameLength 上限",
+      "UDP 不粘包是 SOCK_DGRAM 边界保留，HTTP 边界靠 Content-Length 或 chunked"
     ],
     "goodToHave": [
-      "能说明HTTP的Content-Length和chunked编码机制",
-      "了解为什么UDP没有粘包问题(数据报有边界)",
-      "能结合实际项目经验说明粘包问题的排查过程"
+      "能讲清 Netty LengthFieldBasedFrameDecoder 五个参数，特别是 lengthAdjustment 的语义",
+      "能区分 TCP_NODELAY 只关 Nagle、不解决粘包",
+      "知道 Dubbo 默认 maxFrameLength 8MB、gRPC 5 字节 frame 头、Kafka 长度前缀的典型实现",
+      "能用 tcpdump 抓包对照应用层日志判断问题层级"
     ],
     "commonMistakes": [
-      "只列出 TCP、粘包、拆包，但说不出触发条件、状态变化和验证证据",
-      "把「TCP 粘包与拆包」的适用场景、失效条件和相邻概念混在一起",
-      "遇到网络协议里的真实问题时，不能说明「TCP 粘包与拆包」应该观察哪些状态、日志或指标"
+      "把粘包当成 TCP 的 bug，或者认为开了 TCP_NODELAY 就不会粘包",
+      "解码器写成「一次 read 就是一条消息」，没有累积缓冲区，高 QPS 下偶发解析错乱",
+      "用 LengthFieldBasedFrameDecoder 不设 maxFrameLength，恶意长度直接打爆内存",
+      "二进制协议里用 \\r\\n 当分隔符，body 命中分隔符后 frame 错位",
+      "lengthAdjustment / initialBytesToStrip 算错，业务拿到的 frame 头多/少几字节"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-13",
   "status": "production",
   "prerequisites": [
     "network.tcp-udp.topic-tcp-flow-congestion"
   ],
-  "interviewFrequency": "low",
-  "interviewerFocus": "考察是否能围绕「TCP 粘包与拆包」说清能解释粘包和拆包现象及其根本原因、能说明Nagle算法和接收缓冲区如何导致粘包，并放到网络协议场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewFrequency": "medium",
+  "interviewerFocus": "面试官通常先问粘包/拆包的成因（必须说出 Nagle + MSS + 接收缓冲三重叠加而不是只说「TCP 是流」），再追问三种解码方案的取舍和 Netty 选型，最后用一个「线上偶发解析失败怎么定位」的实战题验证你是否真写过解码器。"
 }

@@ -102,19 +102,7 @@ function isAlgorithmProblemIntroCard(topic, card) {
   return /^(题目描述|示例|约束条件)$/.test((card.title ?? "").trim());
 }
 
-function extractMermaidLabels(content = "") {
-  const source = String(content).replace(/\\n/g, "\n");
-  const labels = [];
-  for (const match of source.matchAll(/\[([^\]]+)\]/g)) {
-    labels.push(match[1].trim());
-  }
-  for (const match of source.matchAll(/\{([^}]+)\}/g)) {
-    labels.push(match[1].trim());
-  }
-  return labels;
-}
-
-function mermaidStatements(content = "") {
+function mermaidUnfence(content = "") {
   let source = String(content).replace(/\\n/g, "\n").trim();
   if (source.startsWith("```")) {
     const lines = source.split("\n");
@@ -122,13 +110,162 @@ function mermaidStatements(content = "") {
     if (lines[lines.length - 1]?.trim() === "```") lines.pop();
     source = lines.join("\n").trim();
   }
-  return source
-    .split("\n")
+  return source;
+}
+
+// 把跨行的节点标签（[...]、{...}、(...)、"..." 内的换行）合并回单条语句，
+// 否则多行标签会被按 \n 切碎、误判为孤立节点或非连线语句。
+function mermaidStatements(content = "") {
+  const source = mermaidUnfence(content);
+  const merged = [];
+  let buffer = "";
+  let square = 0;
+  let curly = 0;
+  let paren = 0;
+  let inQuote = false;
+  for (const rawLine of source.split("\n")) {
+    const line = rawLine.trim();
+    buffer = buffer ? `${buffer} ${line}` : line;
+    for (const ch of rawLine) {
+      if (ch === '"') inQuote = !inQuote;
+      else if (inQuote) continue;
+      else if (ch === "[") square += 1;
+      else if (ch === "]") square = Math.max(0, square - 1);
+      else if (ch === "{") curly += 1;
+      else if (ch === "}") curly = Math.max(0, curly - 1);
+      else if (ch === "(") paren += 1;
+      else if (ch === ")") paren = Math.max(0, paren - 1);
+    }
+    if (!inQuote && square === 0 && curly === 0 && paren === 0) {
+      merged.push(buffer);
+      buffer = "";
+    }
+  }
+  if (buffer) merged.push(buffer);
+  return merged
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("%%"))
     .flatMap((line) => line.split(";"))
     .map((line) => line.trim())
     .filter(Boolean);
+}
+
+const mermaidTypePattern =
+  /^(flowchart|graph|sequenceDiagram|stateDiagram-v2|stateDiagram|classDiagram|erDiagram|journey|gantt|pie|timeline|mindmap|gitGraph|quadrantChart|requirementDiagram|C4Context)/;
+
+function mermaidDiagramType(content = "") {
+  const header = mermaidStatements(content)[0] ?? "";
+  const match = header.match(mermaidTypePattern);
+  return match ? match[1] : "";
+}
+
+// 结构/声明行：subgraph/end、participant/note/loop 等，既不是连线也不应判为孤立节点。
+const mermaidStructuralLinePattern =
+  /^(subgraph|end|direction|classDef|class|style|linkStyle|click|title|accTitle|accDescr|participant|actor|note|activate|deactivate|loop|alt|opt|par|and|else|rect|autonumber|box|critical|break|state|link|requirement|element)\b/i;
+// flowchart / stateDiagram 连线标记（已剥离括号标签后检测）。
+const flowchartEdgeMarkPattern = /-->|---|<-->|==>|===|-\.->|-\.-|\.->|--[xo]|[xo]--|->|=>/;
+// 时序图消息：Actor 箭头 Actor : 文本。
+const sequenceMessagePattern = /^[\s+-]*[\w"][^:]*?(-->>|->>|-->|->|--x|-x|--\)|-\))\s*[+-]?[\w"]/;
+// 按操作符切分以提取两端节点 id（长操作符在前，避免被 -- 截断）。
+const mermaidArrowSplitPattern =
+  /\s*(?:-->>|-->|->>|->|-\.->|-\.-|<-->|===|==>|---|--x|-x|--o|o--|--\)|-\)|--|==)\s*/;
+
+function stripMermaidLabels(statement) {
+  let previous;
+  let current = statement;
+  do {
+    previous = current;
+    current = current.replace(/\[[^\[\]]*\]|\{[^{}]*\}|\([^()]*\)/g, "");
+  } while (current !== previous);
+  return current.replace(/\|[^|]*\|/g, " ").replace(/:[\s\S]*$/, " ");
+}
+
+function mermaidEdgeNodeIds(statement) {
+  return stripMermaidLabels(statement)
+    .split(mermaidArrowSplitPattern)
+    .map((token) => (token.trim().match(/^([A-Za-z][\w]*)/) || [])[1])
+    .filter(Boolean);
+}
+
+// 单一真源：解析一张 Mermaid 图，按类型给出节点数、连线数、孤立节点、标签和重复连线。
+function analyzeMermaid(content = "") {
+  const statements = mermaidStatements(content);
+  const header = statements[0] ?? "";
+  const type = mermaidDiagramType(content);
+  const isSequence = type === "sequenceDiagram";
+  const isNodeGraph =
+    type === "flowchart" || type === "graph" || type === "stateDiagram" || type === "stateDiagram-v2";
+  const nodes = new Map();
+  const referenced = new Set();
+  const labels = [];
+  const edges = [];
+
+  function isEdge(statement) {
+    if (isSequence) return sequenceMessagePattern.test(statement);
+    return flowchartEdgeMarkPattern.test(stripMermaidLabels(statement));
+  }
+
+  for (const statement of statements.slice(1)) {
+    if (mermaidStructuralLinePattern.test(statement)) {
+      const decl = statement.match(/^(?:participant|actor|state|class|element)\s+([A-Za-z][\w]*)(?:\s+as\s+(.+?))?\s*$/i);
+      if (decl) {
+        const label = (decl[2] ?? decl[1]).replace(/["<>]/g, "").trim();
+        nodes.set(decl[1], label);
+        labels.push(label);
+      }
+      const subgraph = statement.match(/^subgraph\s+\w+\[([^\]]+)\]/i);
+      if (subgraph) labels.push(subgraph[1].trim());
+      continue;
+    }
+    if (isEdge(statement)) {
+      edges.push(stripMermaidLabels(statement).replace(/\s+/g, " ").trim());
+      for (const id of mermaidEdgeNodeIds(statement)) referenced.add(id);
+      for (const match of statement.matchAll(/([A-Za-z][\w]*)\s*[\[{(]+([^\]})]*)[\]})]+/g)) {
+        nodes.set(match[1], match[2].trim());
+        labels.push(match[2].trim());
+      }
+      for (const match of statement.matchAll(/\|([^|]+)\|/g)) labels.push(match[1].trim());
+      if (isSequence) {
+        const message = statement.match(/:\s*(.+)$/);
+        if (message) labels.push(message[1].trim());
+      }
+    } else {
+      const def = statement.match(/^([A-Za-z][\w]*)\s*[\[{(]+([^\]})]*)[\]})]+\s*$/);
+      if (def) {
+        nodes.set(def[1], def[2].trim());
+        labels.push(def[2].trim());
+      }
+    }
+  }
+
+  const isolatedNodes = isNodeGraph ? [...nodes.keys()].filter((id) => !referenced.has(id)) : [];
+  const nodeCount = isSequence ? nodes.size : new Set([...nodes.keys(), ...referenced]).size;
+  const seen = new Set();
+  let duplicateEdge = false;
+  for (const edge of edges) {
+    if (seen.has(edge)) {
+      duplicateEdge = true;
+      break;
+    }
+    seen.add(edge);
+  }
+
+  return {
+    type,
+    validHeader: validMermaidHeaderPattern.test(header),
+    statements,
+    edges,
+    edgeCount: edges.length,
+    nodeCount,
+    labels: labels.filter(Boolean),
+    isolatedNodes,
+    duplicateEdge,
+    isNodeGraph,
+  };
+}
+
+function extractMermaidLabels(content = "") {
+  return analyzeMermaid(content).labels;
 }
 
 function relevanceTokens(topic) {
@@ -237,17 +374,17 @@ function booleanScore(condition, points) {
 }
 
 function mermaidEdgeCount(content = "") {
-  const statements = mermaidStatements(content);
-  return statements.slice(1).filter((statement) => mermaidEdgePattern.test(statement)).length;
+  return analyzeMermaid(content).edgeCount;
 }
 
 function hasMermaidBranch(content = "") {
-  return /--\s*(?:是|否|yes|no|成功|失败|命中|未命中|允许|拒绝|通过|不通过|异常|正常)\s*--?>|\{[^}]+\}/i.test(content);
+  return /--\s*(?:是|否|yes|no|成功|失败|命中|未命中|允许|拒绝|通过|不通过|异常|正常)\s*--?>|\{[^}]+\}|\balt\b|\bopt\b/i.test(content);
 }
 
 function diagramHumanSignals(card, topic) {
-  const labels = extractMermaidLabels(card.content ?? "");
-  const edgeCount = mermaidEdgeCount(card.content ?? "");
+  const analyzed = analyzeMermaid(card.content ?? "");
+  const labels = analyzed.labels;
+  const edgeCount = analyzed.edgeCount;
   const labelText = labels.join(" ");
   const fallbackText = `${card.fallback ?? ""}${card.caption ?? ""}`;
   const tokens = primaryRelevanceTokens(topic);
@@ -342,8 +479,6 @@ const rubricTemplateItemPattern =
   /能准确解释.+的核心概念、作用和适用边界|能说清\s*.+\s*的核心机制和关键流程|核心目标与适用边界|能结合指标或示例验证\s*.+\s*的效果|^.+\s+的条件和边界$/;
 const proseFillerPattern =
   /本质上|可以理解为|核心是|关键在于|需要注意的是|换句话说|简单来说|从这个角度看/g;
-const mermaidEdgePattern = /(.+?)\s*(-->|---|==>|-\.->)\s*(.+)|(.+?)\s*--\s*([^>-]+?)\s*--?>\s*(.+)/;
-const isolatedMermaidNodePattern = /^\s*[A-Za-z][A-Za-z0-9_]*\[[^\]]+\]\s*$/;
 const shortRubricAllowPattern =
   /^(BFS|DFS|DP|LRU|LFU|AQS|CAS|MVCC|JWT|TLS|SSL|TCP|UDP|HTTP|HTTPS|DNS|CDN|GC|JVM|JIT|BFC|GMP|MCP|RAG|ETL|CDC|OLAP|OLTP|DDL|DML|SQL|NoSQL|ACID|CAP|BASE|CI\/CD|IaC|SRE|DDD|CQRS|Pod|K8s|Go|MySQL|Redis|MongoDB|Kafka|Spark|Flink|Hive|路径|状态|队列|栈|堆|锁|事务|索引|缓存|分片|分区|副本|主键|外键|快照|回溯|剪枝|哈希|递归|指针|滑窗|窗口|协议|证书|权限|认证|授权)$/i;
 
@@ -949,32 +1084,28 @@ function scoreTopic(topic, ref, corpus) {
       deduct(4, `图示标题或图注模板化：${card.title}`);
     }
     if (card.type === "diagram") {
-      const labels = extractMermaidLabels(card.content ?? "");
+      const mermaid = (card.format ?? "") === "mermaid" ? analyzeMermaid(card.content ?? "") : null;
+      const labels = mermaid ? mermaid.labels : extractMermaidLabels(card.content ?? "");
       const diagramSignals = diagramHumanSignals(card, topic);
-      if ((card.format ?? "") === "mermaid" && labels.length < 4) {
-        deduct(4, `图示节点过少，难以解释机制：${card.title}`);
-      }
-      if ((card.format ?? "") === "mermaid") {
-        const statements = mermaidStatements(card.content ?? "");
-        if (!validMermaidHeaderPattern.test(statements[0] ?? "")) {
+      if (mermaid) {
+        if (!mermaid.validHeader) {
           deduct(4, `Mermaid 首行不是合法图类型声明：${card.title}`);
         }
-        for (const statement of statements.slice(1)) {
-          if (isolatedMermaidNodePattern.test(statement) || !mermaidEdgePattern.test(statement)) {
-            deduct(5, `Mermaid 图存在孤立节点或非连线语句，需先诊断引用错位、补边、重画或确认已有更好图承接，不能直接删除：${card.title}`);
-            break;
-          }
+        if (mermaid.nodeCount < 4) {
+          deduct(4, `图示节点过少，难以解释机制：${card.title}`);
         }
-        const seenEdges = new Set();
-        for (const statement of statements.slice(1)) {
-          if (!mermaidEdgePattern.test(statement)) continue;
-          if (seenEdges.has(statement)) {
-            deduct(2, `Mermaid 存在完全重复的连线：${card.title}`);
-            break;
-          }
-          seenEdges.add(statement);
+        // 孤立节点只对 flowchart/stateDiagram 这类节点图判定，且语义是“定义了却没有任何连线引用”，
+        // 不再把“先声明节点再连边”“多行标签”“时序图消息/subgraph”误判为孤立。
+        if (mermaid.isNodeGraph && mermaid.isolatedNodes.length) {
+          deduct(
+            5,
+            `Mermaid 图存在孤立节点（${mermaid.isolatedNodes.slice(0, 3).join("、")}），需先诊断引用错位、补边、重画或确认已有更好图承接，不能直接删除：${card.title}`,
+          );
         }
-        if (topic.difficulty >= 3 && diagramSignals.edgeCount < 3) {
+        if (mermaid.duplicateEdge) {
+          deduct(2, `Mermaid 存在完全重复的连线：${card.title}`);
+        }
+        if (topic.difficulty >= 3 && mermaid.edgeCount < 3) {
           deduct(3, `图示连线过少，难以表达真实关系：${card.title}`);
         }
       }
@@ -1637,6 +1768,7 @@ async function main() {
     duplicateTitleIssues,
     duplicateLanguageIssues,
     domains: domainReports,
+    allTopics: topicReports.map((item) => ({ score: item.score, grade: item.grade, domain: item.domain, title: item.title, ref: item.ref })),
     failingTopics: failingTopics
       .sort((a, b) => a.score - b.score || a.domain.localeCompare(b.domain))
       .map((item) => ({
