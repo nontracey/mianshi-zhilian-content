@@ -1015,8 +1015,11 @@ confirm_execution() {
   summary
   local choice
   while true; do
-    printf '开始执行？[Y/n] %s: ' "$(prompt_suffix)" >&2
+    printf '开始执行？[Y/n，回车默认 Y] %s: ' "$(prompt_suffix)" >&2
     IFS= read -r choice || exit 1
+    # 去掉前后空白，避免误按空格当成无效输入
+    choice="${choice#"${choice%%[![:space:]]*}"}"
+    choice="${choice%"${choice##*[![:space:]]}"}"
     check_nav_input "$choice" || return $?
     choice="${choice:-y}"
     case "$choice" in
@@ -1027,7 +1030,7 @@ confirm_execution() {
         return 130
         ;;
       *)
-        printf '%s\n' "${YELLOW}请输入 y 开始、n 取消、b 返回上一层。${RESET}" >&2
+        printf '%s\n' "${YELLOW}请输入 y 开始、n 取消、b 返回上一层（直接回车默认 Y）。${RESET}" >&2
         ;;
     esac
   done

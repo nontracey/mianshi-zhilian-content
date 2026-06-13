@@ -119,8 +119,77 @@ function extractJson(text) {
   }
 }
 
-function looksLikeAvailabilityFailure(text) {
-  return /(rate.?limit|too many requests|\b429\b|quota|throttl|overloaded|service busy|server busy|temporar(?:y|ily) unavailable|unavailable|timeout|timed out|econnreset|etimedout|eai_again|enotfound|限流|频率|请求过多|额度|服务繁忙|暂时不可用|不可用|超时)/i
+// 是否是合法的 topic 契约 JSON（白名单识别）：有 id / domain / learningCards 且与原 topic 同身份
+function looksLikeTopicContract(parsed, original) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  if (typeof parsed.id !== "string" || typeof parsed.domain !== "string") return false;
+  if (!Array.isArray(parsed.learningCards)) return false;
+  if (original) {
+    if (parsed.id !== original.id) return false;
+    if (parsed.domain !== original.domain) return false;
+  }
+  return true;
+}
+
+// 是否是错误响应 JSON（黑名单识别）：含 code/error/message/status 等错误字段，且无 topic 核心字段
+// 覆盖各家 LLM/网关常见错误格式：
+//   { code: 429, message: "Too Many Requests", details: "..." }
+//   { error: { type: "rate_limit_error", message: "..." } }   // Anthropic/OpenAI
+//   { error: "rate_limit_exceeded", error_description: "..." } // OAuth 风格
+//   { status: "error", reason: "...", retry_after: 30 }
+function looksLikeErrorResponseJson(parsed) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  // 有 topic 核心字段就不是错误响应
+  if (typeof parsed.id === "string" && typeof parsed.domain === "string" && Array.isArray(parsed.learningCards)) {
+    return false;
+  }
+  const hasErrorField = parsed.error !== undefined
+    || parsed.errors !== undefined
+    || parsed.error_description !== undefined
+    || parsed.error_message !== undefined
+    || parsed.message !== undefined
+    || parsed.detail !== undefined
+    || parsed.details !== undefined
+    || parsed.reason !== undefined;
+  if (!hasErrorField) return false;
+  // HTTP-style code 字段（数字状态码或带数字的字符串）
+  const codeRaw = parsed.code ?? parsed.status ?? parsed.statusCode ?? parsed.status_code ?? parsed.httpStatus;
+  const codeNum = typeof codeRaw === "number" ? codeRaw : (typeof codeRaw === "string" ? Number(codeRaw) : NaN);
+  if (Number.isFinite(codeNum) && codeNum >= 400 && codeNum < 600) return true;
+  // 常见错误状态字符串
+  const statusStr = typeof parsed.status === "string" ? parsed.status.toLowerCase() : "";
+  if (statusStr === "error" || statusStr === "failed" || statusStr === "fail") return true;
+  // error 字段是对象（OpenAI/Anthropic 风格）或字符串
+  if (typeof parsed.error === "string" && parsed.error.length) return true;
+  if (parsed.error && typeof parsed.error === "object" && !Array.isArray(parsed.error)) return true;
+  // retry_after / retryAfter 是限流响应的强特征
+  if (parsed.retry_after !== undefined || parsed.retryAfter !== undefined || parsed["Retry-After"] !== undefined) return true;
+  return false;
+}
+
+// 从错误响应 JSON 提取一条人类可读的摘要
+function summarizeErrorResponse(parsed) {
+  if (!parsed || typeof parsed !== "object") return "";
+  const code = parsed.code ?? parsed.status ?? parsed.statusCode ?? parsed.status_code ?? parsed.httpStatus;
+  const msg = parsed.message
+    ?? parsed.error_message
+    ?? parsed.error_description
+    ?? parsed.detail
+    ?? parsed.details
+    ?? parsed.reason
+    ?? (typeof parsed.error === "string" ? parsed.error : parsed.error?.message)
+    ?? "";
+  const retryAfter = parsed.retry_after ?? parsed.retryAfter ?? parsed["Retry-After"];
+  const parts = [];
+  if (code !== undefined) parts.push(`code=${code}`);
+  if (msg) parts.push(String(msg).slice(0, 200));
+  if (retryAfter !== undefined) parts.push(`retry_after=${retryAfter}`);
+  return parts.join(" ").trim();
+}
+
+// 文本兜底（仅在 JSON 解析失败、无法用结构化判断时使用）
+function looksLikeAvailabilityFailureText(text) {
+  return /(rate.?limit|too many requests|\b429\b|\b50[023]\b|quota exceeded|throttl|overloaded|service busy|server busy|temporar(?:y|ily) unavailable|service unavailable|gateway timeout|connection reset|econnreset|etimedout|eai_again|enotfound|限流|请求过多|额度不足|服务繁忙|暂时不可用|网关超时)/i
     .test(clean(text));
 }
 
@@ -284,25 +353,38 @@ function buildCliArgs(cfg, prompt, model) {
 }
 
 // ===== 模型降级链：主用模型频繁不可用就自动降到下一个，最后兜底 =====
-function makeModelState(chain, degradeAfter) {
-  return { chain: chain.length ? chain : [undefined], index: 0, consecutive: 0, degradeAfter };
+function makeModelState(chain, degradeAfter, windowMs) {
+  return {
+    chain: chain.length ? chain : [undefined],
+    index: 0,
+    degradeAfter,
+    windowMs,
+    failures: [], // 时间戳数组：仅在窗口内频繁可用性失败才降级
+  };
 }
 function currentModel(modelState) {
   return modelState.chain[modelState.index];
 }
-// 只有“可用性失败”（进程超时/非零退出/端点不可用）才计入降级；
+// 只有“可用性失败”（进程超时/非零退出/端点限流/不可用）才计入降级；
 // “内容失败”（模型出了 JSON 但没过校验）属于该篇正常重试，不触发降级。
+// 用滑动窗口（默认 60s）判断：只有“短时间内连续频繁”可用性失败才降级，避免偶发 429 立刻切模型。
+function pruneWindow(timestamps, windowMs, now) {
+  const cutoff = now - windowMs;
+  while (timestamps.length && timestamps[0] < cutoff) timestamps.shift();
+}
 function noteModelResult(modelState, result) {
-  if (result.ok) {
-    modelState.consecutive = 0;
-    return;
-  }
+  const now = Date.now();
+  pruneWindow(modelState.failures, modelState.windowMs, now);
+  if (result.ok) return; // 成功不重置——窗口里其他失败仍然要计数，自然过期即可
   if (!result.availabilityFailure) return;
-  modelState.consecutive += 1;
-  if (modelState.consecutive >= modelState.degradeAfter && modelState.index < modelState.chain.length - 1) {
+  modelState.failures.push(now);
+  if (modelState.failures.length >= modelState.degradeAfter && modelState.index < modelState.chain.length - 1) {
     modelState.index += 1;
-    modelState.consecutive = 0;
-    console.log(`[DEGRADE] 主用模型频繁不可用，降级到：${currentModel(modelState) ?? "CLI 默认"}（链 ${modelState.index + 1}/${modelState.chain.length}）`);
+    modelState.failures = [];
+    console.log(
+      `[DEGRADE] ${Math.round(modelState.windowMs / 1000)}s 窗口内可用性失败 ≥ ${modelState.degradeAfter} 次，` +
+        `降级到：${currentModel(modelState) ?? "CLI 默认"}（链 ${modelState.index + 1}/${modelState.chain.length}）`,
+    );
   }
 }
 
@@ -473,12 +555,43 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
         throw spawnError;
       }
       availabilityFailure = false; // 进程已正常产出 -> 不是可用性问题
-      if (looksLikeAvailabilityFailure(raw)) {
-        availabilityFailure = true;
-        throw new Error(`CLI 输出疑似服务不可用/限流：${tailLine(raw) || "no detail"}`);
-      }
       if (detailedProgress) console.log(`[TOPIC] CLI 已返回，开始解析 JSON ${ref}`);
-      const parsed = extractJson(raw);
+      let parsed;
+      try {
+        parsed = extractJson(raw);
+      } catch (jsonError) {
+        // JSON 解析失败时才用文本兜底判断是否服务不可用——避免技术内容中的"超时""不可用"等术语误判。
+        if (looksLikeAvailabilityFailureText(raw)) {
+          availabilityFailure = true;
+          throw new Error(`CLI 输出疑似服务不可用/限流：${tailLine(raw) || "no detail"}`);
+        }
+        throw jsonError;
+      }
+      // JSON 解析成功，先用黑名单识别错误响应（429/限流/上游错误等），再用白名单确认是 topic 契约。
+      // 这样 LLM/网关返回 {code:429,message,details} 之类合法 JSON 但非 topic 契约时，
+      // 能给出明确的"限流/上游错误"提示并触发可用性降级，而不是被当成 topic 进 invariant 检查报"id 被改动"。
+      if (looksLikeErrorResponseJson(parsed)) {
+        const summary = summarizeErrorResponse(parsed) || "no detail";
+        const code = parsed.code ?? parsed.status ?? parsed.statusCode ?? parsed.status_code ?? parsed.httpStatus;
+        const codeNum = typeof code === "number" ? code : Number(code);
+        const isRateLimit = codeNum === 429
+          || parsed.retry_after !== undefined
+          || parsed.retryAfter !== undefined
+          || parsed["Retry-After"] !== undefined
+          || /rate.?limit|too many requests|throttl|quota|限流|请求过多|额度/i.test(summary);
+        const isUpstream5xx = Number.isFinite(codeNum) && codeNum >= 500 && codeNum < 600;
+        if (isRateLimit || isUpstream5xx) {
+          availabilityFailure = true; // 限流/上游错误 -> 计入降级，触发并发收敛和模型降级
+          throw new Error(`CLI 输出为${isRateLimit ? "限流" : "上游错误"}响应 JSON：${summary}`);
+        }
+        throw new Error(`CLI 输出为错误响应 JSON 而非 topic 契约：${summary}`);
+      }
+      if (!looksLikeTopicContract(parsed, original)) {
+        // JSON 合法、不是已知错误格式，但也不是本 topic 的契约（如改了 id、丢了 learningCards）。
+        // 不计入可用性失败——这是模型内容失败，应该按本篇正常重试。
+        const previewKeys = Object.keys(parsed).slice(0, 8).join(",");
+        throw new Error(`CLI 输出 JSON 不是当前 topic 契约（id=${parsed.id ?? "?"} domain=${parsed.domain ?? "?"} keys=${previewKeys}）`);
+      }
       const bad = checkInvariants(original, parsed);
       if (bad) throw new Error(`schema 不变量失败：${bad}`);
       if (writeTo) {
@@ -624,20 +737,42 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
 async function refinePoolWithConcurrencyFallback(targets, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters) {
   let pending = [...targets];
   const allResults = [];
+  // 池级滑动窗口：仅当短时间内频繁可用性失败才降并发；偶发 429 由该篇内重试自行消化。
+  const poolFailures = []; // 时间戳数组
+  const windowMs = modelState.windowMs;
+  const threshold = Math.max(2, modelState.degradeAfter); // 至少 2 次才算“频繁”
   while (pending.length) {
     const results = await refinePool(pending, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters);
     allResults.push(...results);
     const availabilityFailures = [...new Set(results
       .filter((result) => !result.ok && result.availabilityFailure)
       .map((result) => result.ref))];
-    if (!availabilityFailures.length || cfg.autoConcurrencyMin <= 0 || cfg.concurrency <= cfg.autoConcurrencyMin) break;
+    if (!availabilityFailures.length) break;
+
+    const now = Date.now();
+    for (let i = 0; i < availabilityFailures.length; i += 1) poolFailures.push(now);
+    pruneWindow(poolFailures, windowMs, now);
+
+    if (cfg.autoConcurrencyMin <= 0 || cfg.concurrency <= cfg.autoConcurrencyMin) {
+      console.log(
+        `[CONCURRENCY] ${availabilityFailures.length} 个可用性失败，但并发已到下限 ${cfg.concurrency}；不再降并发，停止重试。`,
+      );
+      break;
+    }
+    if (poolFailures.length < threshold) {
+      console.log(
+        `[CONCURRENCY] ${availabilityFailures.length} 个可用性失败，窗口内累计 ${poolFailures.length}/${threshold}（${Math.round(windowMs / 1000)}s），未达频繁阈值，仅按本篇重试不降并发。`,
+      );
+      break;
+    }
 
     const nextConcurrency = Math.max(cfg.autoConcurrencyMin, cfg.concurrency - 1);
     console.log(
-      `[CONCURRENCY] 并发 ${cfg.concurrency} 出现 ${availabilityFailures.length} 个可用性失败，` +
-        `降到 ${nextConcurrency} 并重试失败项。`,
+      `[CONCURRENCY] ${Math.round(windowMs / 1000)}s 窗口内累计 ${poolFailures.length} 次可用性失败 ≥ ${threshold}，` +
+        `并发 ${cfg.concurrency} → ${nextConcurrency} 并重试 ${availabilityFailures.length} 个失败项。`,
     );
     cfg.concurrency = nextConcurrency;
+    poolFailures.length = 0; // 降并发后重新观察新一轮窗口
     pending = availabilityFailures;
     counters.total += pending.length;
   }
@@ -674,6 +809,8 @@ async function main() {
   const previewMode = Boolean(args.preview);
   const topicFilters = parseTopicList(args);
   const degradeAfter = Number(args["degrade-after"] ?? 3);
+  // 滑动窗口长度：仅当窗口内可用性失败次数 ≥ degradeAfter 才视为“频繁”，触发并发降级 / 模型降级。
+  const degradeWindowSeconds = Number(args["degrade-window-seconds"] ?? 60);
   const progressStyle = String(
     args["progress-style"] ?? process.env.QUALITY_REFINE_PROGRESS_STYLE ?? (previewMode ? "topic" : "summary"),
   ).trim();
@@ -699,6 +836,9 @@ async function main() {
   ensureInt(maxRounds, "max-rounds", 1, 10);
   ensureInt(retries, "retries", 0, 5);
   ensureInt(degradeAfter, "degrade-after", 1, 50);
+  if (!(degradeWindowSeconds >= 5 && degradeWindowSeconds <= 3600)) {
+    throw new Error(`--degrade-window-seconds 必须在 [5, 3600] 范围内，实际 ${degradeWindowSeconds}`);
+  }
   ensureInt(heartbeatSeconds, "heartbeat-seconds", 0, 600);
   if (!["quiet", "summary", "topic"].includes(progressStyle)) {
     throw new Error("--progress-style 必须是 quiet | summary | topic");
@@ -755,7 +895,7 @@ async function main() {
   const runDir = path.join(root, ".quality-refine", runId);
   await mkdir(runDir, { recursive: true });
   const progressPath = path.join(runDir, "progress.jsonl");
-  const modelState = makeModelState(modelChain, degradeAfter);
+  const modelState = makeModelState(modelChain, degradeAfter, degradeWindowSeconds * 1000);
 
   // 测试/预览模式：精修单篇，结果写到 .quality-refine/preview/（不动仓库），打印路径供 sh 渲染。
   if (previewMode) {
@@ -779,7 +919,7 @@ async function main() {
   }
 
   console.log(
-    `精修启动：cli=${cfg.cli} (${cliPath})，模型链=[${modelChain.map((entry) => entry ?? "CLI默认").join(" → ")}]（频繁不可用降级阈值 ${degradeAfter}），` +
+    `精修启动：cli=${cfg.cli} (${cliPath})，模型链=[${modelChain.map((entry) => entry ?? "CLI默认").join(" → ")}]（${degradeWindowSeconds}s 窗口内可用性失败 ≥ ${degradeAfter} 次才降级），` +
       `scope=${scope}${topicFilters.length ? ` topics=${topicFilters.length}` : " topics=scope全部"}，concurrency=${cfg.concurrency}` +
       `${cfg.autoConcurrencyMin > 0 && cfg.autoConcurrencyMin < cfg.concurrency ? `（可用性失败自动降至 ${cfg.autoConcurrencyMin}）` : ""}，` +
       `maxRounds=${maxRounds}，minScore=${minScore}`,
@@ -866,6 +1006,8 @@ async function main() {
     minScore,
     cli: cfg.cli,
     modelChain: modelChain.map((entry) => entry ?? "CLI default"),
+    degradeAfter,
+    degradeWindowSeconds,
     endedOnModel: currentModel(modelState) ?? "CLI default",
     startedFailing: initialFailing.size,
     processed: processed.length,
