@@ -62,11 +62,13 @@ function applyPreset(cfg) {
   const presets = {
     // 评审任务的全部输入都内嵌在 prompt 中，评审 CLI 不需要任何工具执行权限。
     // plan = 只读/只分析模式，杜绝被评审内容里的注入文本诱导 CLI 执行命令或写文件。
+    // qwen 0.18: -p/--prompt 已 deprecated（"Appended to input on stdin (if any)"，会让 CLI 等 stdin EOF 而不退出），
+    // 官方推荐 positional："Defaults to one-shot; use -i/--prompt-interactive for interactive."
     qwen: {
       baseArgs: [],
       modelArg: "--model",
-      promptArg: "-p",
-      promptMode: "flag",
+      promptArg: null,
+      promptMode: "positional",
       extraArgs: ["--approval-mode", "plan"],
       usePty: true,
     },

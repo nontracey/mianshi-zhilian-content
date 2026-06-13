@@ -100,7 +100,9 @@ function inferPreset(cliName, preset) {
 function applyPreset(cfg) {
   const preset = inferPreset(cfg.cli, cfg.preset);
   const presets = {
-    qwen: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: ["--approval-mode", "auto-edit"], usePty: true },
+    // qwen 0.18: -p/--prompt 已 deprecated（"Appended to input on stdin (if any)"，会让 CLI 等 stdin EOF 而不退出）。
+    // 官方推荐 positional："Defaults to one-shot; use -i/--prompt-interactive for interactive."
+    qwen: { baseArgs: [], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: ["--approval-mode", "auto-edit"], usePty: true },
     gemini: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: ["--approval-mode", "auto_edit"], usePty: true },
     claude: { baseArgs: ["-p"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [], usePty: false },
     opencode: { baseArgs: ["run"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [], usePty: false },
@@ -543,7 +545,8 @@ function noteModelResult(modelState, result) {
 function applyJudgePreset(cli, timeoutMs) {
   const base = cli.split("/").pop().toLowerCase();
   const presets = {
-    qwen: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: ["--approval-mode", "auto-edit"], usePty: true },
+    // qwen 0.18: -p/--prompt 已 deprecated，必须走 positional 才能 one-shot 退出。
+    qwen: { baseArgs: [], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: ["--approval-mode", "auto-edit"], usePty: true },
     gemini: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: ["--approval-mode", "auto_edit"], usePty: true },
     claude: { baseArgs: ["-p"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [], usePty: false },
     opencode: { baseArgs: ["run"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [], usePty: false },
@@ -649,7 +652,11 @@ async function runJudgeProcessJson(prompt, judge, model, ref, index) {
     const filePrompt = buildJudgeFilePrompt(prompt, outputPath, previousError);
     const args = buildCliArgs(judge.cfg, filePrompt, model);
     const label = `JUDGE ${ref} m=${model ?? "默认"} #${index + 1} json=${attempt}/${attempts}`;
-    const progress = { suppressSpawn: true, suppressDone: true, suppressHeartbeat: true, heartbeatMs: 0, label };
+    // outputPath：让 runProcess 心跳里报告 capture 文件大小，JSON 永远从 outputPath 读。
+    const progress = {
+      suppressSpawn: true, suppressDone: true, suppressHeartbeat: true, heartbeatMs: 0, label,
+      outputPath,
+    };
     let stdout = "";
     try {
       if (judge.cfg.usePty && process.platform === "darwin") {
