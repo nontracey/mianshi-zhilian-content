@@ -35,12 +35,14 @@ npm run quality:refine:interactive
 
 - 一个 CLI 调用只处理一个 topic。领域或多 topic 选择只是队列，不会把整个领域塞进同一个 prompt。
 - 并发表示同时启动多个“单 topic CLI 子进程”。如果希望绝对串行，把并发设为 `1`。
+- 并发大于 `3` 时，默认启用自适应并发：遇到限流、服务繁忙、超时、非零退出等可用性失败，会把并发逐步降到 `3`，并重试这些失败 topic；内容校验失败不会触发并发降级。
 - 第一轮会把选中的全部 topic 都送 LLM 精修，即使静态审计已经达到 `90` 分。
 - 静态分数只作为上下文和最终验收兜底，不作为跳过 LLM 的依据。
 - 后续轮次只复修仍低于 `min-score` 的 topic，避免已经静态达标的内容反复重写。
 - 正式精修写回 `topics/`；只有全部目标最终达标时，交互脚本才会按阶段同步到 `staging/`、`draft/`。
 - 测试预览不改仓库内容，产物写入 `.quality-refine/preview/`，并在终端渲染文字版。
 - 执行期间会输出单篇开始、完成/失败和重试信息。正式模式默认每 30 秒输出一条聚合 `[RUNNING]`，不会按每个 CLI 子进程刷屏；测试预览默认显示单篇 `[SPAWN]` / `[WAIT]` / `[DONE]` 细反馈。
+- 正式模式的配置摘要、scope 标题、`[RUNNING]` 心跳和单篇完成行都会显示当前并发；自动降级后会显示新的并发值。
 - 可用 `--progress-style summary|topic|quiet` 控制反馈密度；可用 `--heartbeat-seconds` 或 `QUALITY_REFINE_HEARTBEAT_SECONDS` 调整心跳间隔，`0` 表示关闭心跳。
 - 按 `Ctrl-C` 会中断当前精修，并尝试终止正在运行的外部 CLI 子进程；再次按 `Ctrl-C` 会强制退出。
 
@@ -70,7 +72,7 @@ npm run quality:refine -- \
 npm run quality:refine -- \
   --cli qwen \
   --scope domain:go \
-  --concurrency 2 \
+  --concurrency 3 \
   --max-rounds 3 \
   --retries 1 \
   --timeout-ms 600000 \
@@ -114,12 +116,14 @@ node scripts/sync_environment_content.mjs draft
 
 当当前模型连续达到 `--degrade-after` 次可用性失败后，自动降级到下一个模型。内容质量失败只触发该 topic 重试，不触发模型降级。
 
+并发降级独立于模型降级。直接指定 `--concurrency 4` 时，默认等价于允许降到 `--auto-concurrency-min 3`；如果想关闭并发降级，可以显式传 `--auto-concurrency-min 0`。
+
 ## 进度与产物
 
 正式精修会输出类似：
 
 ```text
-[3/12 ✓2 ✗1 | go | m=minimax-m3] OK topics/go/context.json
+[3/12 ✓2 ✗1 | go | m=minimax-m3] c=3 OK topics/go/context.json
 ```
 
 含义：
@@ -128,6 +132,7 @@ node scripts/sync_environment_content.mjs draft
 - 成功数与失败数。
 - 当前领域。
 - 当前模型。
+- 当前并发。
 - 当前 topic 路径。
 
 正式批量运行等待外部 CLI 时会看到聚合心跳：

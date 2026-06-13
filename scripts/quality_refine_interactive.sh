@@ -27,7 +27,7 @@ STAGE_LABEL=""
 RUN_MODE="refine"
 RUN_MODE_LABEL=""
 MIN_SCORE=90
-CONCURRENCY=2
+CONCURRENCY=3
 MAX_ROUNDS=3
 RETRIES=1
 TIMEOUT_SECONDS=600
@@ -949,7 +949,10 @@ run_refine() {
         topics_csv="$(join_by "," "${SELECTED_TOPIC_REFS[@]}")"
       fi
     fi
-    title "正式精修 scope=${scope}"
+    title "正式精修 scope=${scope}（并发=${CONCURRENCY}）"
+    if (( CONCURRENCY > 3 )); then
+      info "并发可用性失败时会自动降到 3 并重试失败项。"
+    fi
     local cmd=(
       node scripts/quality_refine.mjs
       --scope "$scope"
@@ -1000,7 +1003,11 @@ summary() {
     printf '预览 Topic：%s\n' "$TOPIC_REF"
   fi
   if [[ "$RUN_MODE" == "refine" ]]; then
-    printf '并发：%s，最大轮数：%s，每轮上限：%s\n' "$CONCURRENCY" "$MAX_ROUNDS" "${LIMIT:-不限}"
+    if (( CONCURRENCY > 3 )); then
+      printf '并发：%s（可用性失败自动降到 3），最大轮数：%s，每轮上限：%s\n' "$CONCURRENCY" "$MAX_ROUNDS" "${LIMIT:-不限}"
+    else
+      printf '并发：%s，最大轮数：%s，每轮上限：%s\n' "$CONCURRENCY" "$MAX_ROUNDS" "${LIMIT:-不限}"
+    fi
   fi
 }
 

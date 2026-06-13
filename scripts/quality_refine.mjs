@@ -119,6 +119,11 @@ function extractJson(text) {
   }
 }
 
+function looksLikeAvailabilityFailure(text) {
+  return /(rate.?limit|too many requests|\b429\b|quota|throttl|overloaded|service busy|server busy|temporar(?:y|ily) unavailable|unavailable|timeout|timed out|econnreset|etimedout|eai_again|enotfound|限流|频率|请求过多|额度|服务繁忙|暂时不可用|不可用|超时)/i
+    .test(clean(text));
+}
+
 function formatDuration(ms) {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
   const minutes = Math.floor(totalSeconds / 60);
@@ -468,6 +473,10 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
         throw spawnError;
       }
       availabilityFailure = false; // 进程已正常产出 -> 不是可用性问题
+      if (looksLikeAvailabilityFailure(raw)) {
+        availabilityFailure = true;
+        throw new Error(`CLI 输出疑似服务不可用/限流：${tailLine(raw) || "no detail"}`);
+      }
       if (detailedProgress) console.log(`[TOPIC] CLI 已返回，开始解析 JSON ${ref}`);
       const parsed = extractJson(raw);
       const bad = checkInvariants(original, parsed);
@@ -545,7 +554,7 @@ function resolveTargetRefs(audit, scope, options, topicFilters) {
   return orderByDomain(requested);
 }
 
-function startPoolHeartbeat(counters, active, heartbeatMs) {
+function startPoolHeartbeat(counters, active, heartbeatMs, cfg) {
   if (!heartbeatMs || heartbeatMs <= 0) return () => {};
   const startedAt = Date.now();
   const heartbeat = setInterval(() => {
@@ -556,7 +565,7 @@ function startPoolHeartbeat(counters, active, heartbeatMs) {
     const suffix = activeItems.length ? ` current=${activeItems.join(" | ")}` : "";
     console.log(
       `[RUNNING] ${counters.processed}/${counters.total} ✓${counters.written} ✗${counters.failed} ` +
-        `active=${active.size} elapsed=${formatDuration(now - startedAt)}${suffix}`,
+        `concurrency=${cfg.concurrency} active=${active.size} elapsed=${formatDuration(now - startedAt)}${suffix}`,
     );
   }, heartbeatMs);
   heartbeat.unref();
@@ -568,7 +577,7 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
   let index = 0;
   const active = new Map();
   const stopHeartbeat = cfg.progressStyle === "summary"
-    ? startPoolHeartbeat(counters, active, cfg.heartbeatMs)
+    ? startPoolHeartbeat(counters, active, cfg.heartbeatMs, cfg)
     : () => {};
   async function worker() {
     while (index < targets.length) {
@@ -600,7 +609,7 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
       const domain = ref.split("/")[1];
       console.log(
         `[${snapshot.processed}/${snapshot.total} ✓${snapshot.written} ✗${snapshot.failed} | ${domain} | m=${model ?? "默认"}] ` +
-          `${result.ok ? "OK  " : "FAIL"} ${ref}${result.error ? ` (${result.error})` : ""}`,
+          `c=${cfg.concurrency} ${result.ok ? "OK  " : "FAIL"} ${ref}${result.error ? ` (${result.error})` : ""}`,
       );
     }
   }
@@ -610,6 +619,29 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
     stopHeartbeat();
   }
   return results;
+}
+
+async function refinePoolWithConcurrencyFallback(targets, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters) {
+  let pending = [...targets];
+  const allResults = [];
+  while (pending.length) {
+    const results = await refinePool(pending, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters);
+    allResults.push(...results);
+    const availabilityFailures = [...new Set(results
+      .filter((result) => !result.ok && result.availabilityFailure)
+      .map((result) => result.ref))];
+    if (!availabilityFailures.length || cfg.autoConcurrencyMin <= 0 || cfg.concurrency <= cfg.autoConcurrencyMin) break;
+
+    const nextConcurrency = Math.max(cfg.autoConcurrencyMin, cfg.concurrency - 1);
+    console.log(
+      `[CONCURRENCY] 并发 ${cfg.concurrency} 出现 ${availabilityFailures.length} 个可用性失败，` +
+        `降到 ${nextConcurrency} 并重试失败项。`,
+    );
+    cfg.concurrency = nextConcurrency;
+    pending = availabilityFailures;
+    counters.total += pending.length;
+  }
+  return allResults;
 }
 
 function summarizeFailingByDomain(refs) {
@@ -632,6 +664,7 @@ async function main() {
   const scope = String(args.scope ?? "all").trim();
   const minScore = Number(args["min-score"] ?? 90);
   const concurrency = Number(args.concurrency ?? 2);
+  const autoConcurrencyMin = Number(args["auto-concurrency-min"] ?? (concurrency > 3 ? 3 : concurrency));
   const maxRounds = Number(args["max-rounds"] ?? 3);
   const retries = Number(args.retries ?? 1);
   const timeoutMs = Number(args["timeout-ms"] ?? 600000);
@@ -659,6 +692,10 @@ async function main() {
     : (args.model ?? process.env.QUALITY_LLM_MODEL ? [args.model ?? process.env.QUALITY_LLM_MODEL] : [undefined]);
 
   ensureInt(concurrency, "concurrency", 1, maxConcurrency);
+  ensureInt(autoConcurrencyMin, "auto-concurrency-min", 0, maxConcurrency);
+  if (autoConcurrencyMin > concurrency) {
+    throw new Error(`--auto-concurrency-min 不能大于 --concurrency（${autoConcurrencyMin} > ${concurrency}）`);
+  }
   ensureInt(maxRounds, "max-rounds", 1, 10);
   ensureInt(retries, "retries", 0, 5);
   ensureInt(degradeAfter, "degrade-after", 1, 50);
@@ -709,6 +746,7 @@ async function main() {
     noDefaultExtraArgs: Boolean(args["no-default-extra-args"]),
     heartbeatMs: heartbeatSeconds * 1000,
     progressStyle,
+    autoConcurrencyMin,
   });
   const cliPath = commandPath(cfg.cli);
   if (!cliPath) throw new Error(`找不到 CLI：${cfg.cli}。请先安装或换一个 --cli。`);
@@ -742,7 +780,9 @@ async function main() {
 
   console.log(
     `精修启动：cli=${cfg.cli} (${cliPath})，模型链=[${modelChain.map((entry) => entry ?? "CLI默认").join(" → ")}]（频繁不可用降级阈值 ${degradeAfter}），` +
-      `scope=${scope}${topicFilters.length ? ` topics=${topicFilters.length}` : " topics=scope全部"}，concurrency=${cfg.concurrency}，maxRounds=${maxRounds}，minScore=${minScore}`,
+      `scope=${scope}${topicFilters.length ? ` topics=${topicFilters.length}` : " topics=scope全部"}，concurrency=${cfg.concurrency}` +
+      `${cfg.autoConcurrencyMin > 0 && cfg.autoConcurrencyMin < cfg.concurrency ? `（可用性失败自动降至 ${cfg.autoConcurrencyMin}）` : ""}，` +
+      `maxRounds=${maxRounds}，minScore=${minScore}`,
   );
 
   // 目标集由 scope/topic 选择决定；静态分数只作为上下文，不作为第一轮跳过条件。
@@ -761,6 +801,8 @@ async function main() {
     attempts: 0,
     bestScore: initialAudit.scoreMap.get(ref) ?? 0,
     noImprove: 0,
+    lastOk: null,
+    lastError: null,
   }]));
   const stuck = new Set();
 
@@ -800,15 +842,21 @@ async function main() {
       return;
     }
 
-    for (const ref of ordered) state.get(ref).attempts += 1;
     const counters = { total: ordered.length, processed: 0, written: 0, failed: 0 };
-    await refinePool(ordered, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters);
+    const results = await refinePoolWithConcurrencyFallback(ordered, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters);
+    for (const result of results) {
+      const item = state.get(result.ref);
+      item.attempts += 1;
+      item.lastOk = result.ok;
+      item.lastError = result.error ?? null;
+    }
   }
 
   // 最终审计 + 汇总
   const finalAudit = runAudit(minScore);
   const processed = targetRefs.filter((ref) => state.get(ref).attempts > 0);
   const unprocessed = targetRefs.filter((ref) => state.get(ref).attempts === 0);
+  const failedExecutions = targetRefs.filter((ref) => state.get(ref).attempts > 0 && state.get(ref).lastOk === false);
   const stillFailing = targetRefs.filter((ref) => finalAudit.failingMap.has(ref));
   const fixed = [...initialFailing].filter((ref) => !finalAudit.failingMap.has(ref));
   const summary = {
@@ -822,6 +870,7 @@ async function main() {
     startedFailing: initialFailing.size,
     processed: processed.length,
     unprocessed,
+    failedExecutions: failedExecutions.map((ref) => ({ ref, error: state.get(ref).lastError })),
     fixed: fixed.length,
     stillFailing: stillFailing.length,
     stuck: [...stuck],
@@ -833,7 +882,7 @@ async function main() {
   await writeFile(path.join(runDir, "summary.json"), `${JSON.stringify(summary, null, 2)}\n`);
 
   console.log(`\n==== 精修完成 ====`);
-  console.log(`已送 LLM 精修：${processed.length}/${targetRefs.length}    修好原静态未达标：${fixed.length}/${initialFailing.size}    仍 <${minScore}：${stillFailing.length}    放弃(stuck)：${stuck.size}`);
+  console.log(`已送 LLM 精修：${processed.length}/${targetRefs.length}    执行失败：${failedExecutions.length}    修好原静态未达标：${fixed.length}/${initialFailing.size}    仍 <${minScore}：${stillFailing.length}    放弃(stuck)：${stuck.size}`);
   if (unprocessed.length) console.log(`未处理：${unprocessed.length} 篇（通常是 limit/max-rounds 不足）`);
   console.log(`全量 overall：${initialAudit.overallScore} -> ${finalAudit.overallScore}`);
   console.log(`产物：${path.relative(root, runDir)}（progress.jsonl / summary.json / 每篇 raw 输出）`);
@@ -841,7 +890,11 @@ async function main() {
     console.log(`仍未达标（按分数升序，前 20）：`);
     for (const item of summary.stillFailingDetail.slice(0, 20)) console.log(`- ${item.score}/100  ${item.ref}`);
   }
-  if (stillFailing.length || unprocessed.length) {
+  if (failedExecutions.length) {
+    console.log(`执行失败（前 20）：`);
+    for (const ref of failedExecutions.slice(0, 20)) console.log(`- ${ref}: ${state.get(ref).lastError}`);
+  }
+  if (stillFailing.length || unprocessed.length || failedExecutions.length) {
     process.exitCode = 1;
   }
 }
