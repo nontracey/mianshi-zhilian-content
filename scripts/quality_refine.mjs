@@ -540,11 +540,11 @@ function noteModelResult(modelState, result) {
 function applyJudgePreset(cli, timeoutMs) {
   const base = cli.split("/").pop().toLowerCase();
   const presets = {
-    qwen: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: ["--approval-mode", "plan"], usePty: true },
-    gemini: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: ["--approval-mode", "plan"], usePty: true },
+    qwen: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: ["--approval-mode", "auto-edit"], usePty: true },
+    gemini: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: ["--approval-mode", "auto_edit"], usePty: true },
     claude: { baseArgs: ["-p"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [], usePty: false },
     opencode: { baseArgs: ["run"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [], usePty: false },
-    codex: { baseArgs: ["exec", "--skip-git-repo-check"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: ["--sandbox", "read-only"], usePty: false },
+    codex: { baseArgs: ["exec", "--skip-git-repo-check"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: ["--sandbox", "workspace-write"], usePty: false },
     generic: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: [], usePty: false },
   };
   const key = base === "qwen-code" || base === "qwen" ? "qwen"
@@ -554,22 +554,89 @@ function applyJudgePreset(cli, timeoutMs) {
   return { ...presets[key], timeoutMs };
 }
 
-// 单次判官调用：内嵌 prompt -> stdout 小 review JSON。
-async function spawnJudgeProcess(prompt, judge, model, ref, index) {
-  const args = buildCliArgs(judge.cfg, prompt, model);
-  const progress = { suppressSpawn: true, suppressDone: true, suppressHeartbeat: true, heartbeatMs: 0, label: `JUDGE ${ref} m=${model ?? "默认"} #${index + 1}` };
-  if (judge.cfg.usePty && process.platform === "darwin") {
-    const tmp = mkdtempSync(path.join(tmpdir(), "quality-judge-"));
-    const capture = path.join(tmp, "judge.txt");
+function buildJudgeFilePrompt(prompt, cachePath, previousError = "") {
+  const retryBlock = previousError
+    ? `\n【上一次输出无效，必须修正】${previousError}\n这一次不要复述原因，只写一个合法 JSON 对象到文件。\n`
+    : "";
+  return `${prompt}
+
+【最终输出协议：覆盖上文所有“返回 JSON/输出 JSON”的说法】
+不要在 stdout 输出 JSON，不要解释，不要 Markdown 代码围栏。把唯一的评审 JSON 对象写入下面这个绝对路径的文件：
+${cachePath}
+
+写入规则：
+1. 文件初始为空。一次写不完就按追加(append)模式分片写入，最终拼起来必须是一个合法 JSON 对象。
+2. 全部写完后，必须在文件末尾追加一行结束标记：
+//---END---
+3. 完成后 stdout 只输出一行：
+WROTE:${cachePath}
+${retryBlock}`;
+}
+
+function judgeProtocolError(message) {
+  const error = new Error(message);
+  error.judgeProtocolFailure = true;
+  return error;
+}
+
+function strictParseJudgeJson(text, label) {
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw judgeProtocolError(`${label} 写入的评审 JSON 非法：${error.message}`);
+  }
+}
+
+// 单次判官调用：内嵌 prompt -> 本地文件 JSON（和精修器写缓存协议一致，避免 stdout 大 JSON 被截断/污染）。
+async function runJudgeProcessJson(prompt, judge, model, ref, index) {
+  const attempts = judge.jsonRetries + 1;
+  let previousError = "";
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const outDir = path.join(judge.cacheDir, "outputs");
+    await mkdir(outDir, { recursive: true });
+    const safeRef = String(ref).replace(/[^a-z0-9]+/gi, "-").slice(0, 80);
+    const outputPath = path.join(outDir, `${Date.now()}-${safeRef}-${index + 1}-${attempt}-${sha256(`${ref}|${model ?? "default"}|${Math.random()}`).slice(0, 10)}.json`);
+    await rm(outputPath, { force: true });
+    const filePrompt = buildJudgeFilePrompt(prompt, outputPath, previousError);
+    const args = buildCliArgs(judge.cfg, filePrompt, model);
+    const label = `JUDGE ${ref} m=${model ?? "默认"} #${index + 1} json=${attempt}/${attempts}`;
+    const progress = { suppressSpawn: true, suppressDone: true, suppressHeartbeat: true, heartbeatMs: 0, label };
+    let stdout = "";
     try {
-      await runProcess("script", ["-q", capture, judge.cliPath, ...args], { cwd: root, stdio: ["ignore", "ignore", "pipe"] }, judge.cfg.timeoutMs, progress);
-      return readFileSync(capture, "utf8");
-    } finally {
-      await rm(tmp, { recursive: true, force: true });
+      if (judge.cfg.usePty && process.platform === "darwin") {
+        const tmp = mkdtempSync(path.join(tmpdir(), "quality-judge-"));
+        const capture = path.join(tmp, "judge.txt");
+        try {
+          await runProcess("script", ["-q", capture, judge.cliPath, ...args], { cwd: root, stdio: ["ignore", "ignore", "pipe"] }, judge.cfg.timeoutMs, progress);
+          stdout = readFileSync(capture, "utf8");
+        } finally {
+          await rm(tmp, { recursive: true, force: true });
+        }
+      } else {
+        const result = await runProcess(judge.cliPath, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] }, judge.cfg.timeoutMs, progress);
+        stdout = result.stdout;
+      }
+
+      let cacheContent;
+      try {
+        cacheContent = readFileSync(outputPath, "utf8");
+      } catch (readError) {
+        throw judgeProtocolError(`判官未按文件协议写入 ${path.relative(root, outputPath)}（stdout="${tailLine(stdout)}"，readError=${readError.code ?? readError.message}）`);
+      }
+      const endMarker = "//---END---";
+      const endIdx = cacheContent.lastIndexOf(endMarker);
+      if (endIdx < 0) {
+        throw judgeProtocolError(`判官输出缺少 //---END--- 结束标记（file=${path.relative(root, outputPath)}，尾部="${tailLine(cacheContent)}"）`);
+      }
+      const jsonText = cacheContent.slice(0, endIdx).trim();
+      return strictParseJudgeJson(jsonText, label);
+    } catch (error) {
+      previousError = error.message;
+      if (attempt >= attempts) throw error;
+      console.log(`[JUDGE] JSON 文件协议失败，重试 ${attempt}/${attempts} ${ref}: ${error.message}`);
     }
   }
-  const result = await runProcess(judge.cliPath, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] }, judge.cfg.timeoutMs, progress);
-  return result.stdout;
+  throw new Error(`判官 JSON 文件协议失败：${ref}`);
 }
 
 function judgeCacheFile(topic, judge) {
@@ -605,9 +672,10 @@ async function runJudges(topic, ref, judge) {
     for (let index = 0; index < judge.count; index += 1) {
       if (shutdownRequested) break;
       try {
-        const raw = await spawnJudgeProcess(prompt, judge, model, ref, index);
-        reviews.push(normalizeJudgeReview(extractJson(raw)));
+        const parsed = await runJudgeProcessJson(prompt, judge, model, ref, index);
+        reviews.push(normalizeJudgeReview(parsed));
       } catch (error) {
+        if (error.judgeProtocolFailure) throw error;
         console.log(`[JUDGE] 评审失败 ${ref} m=${model ?? "默认"} #${index + 1}: ${error.message}`);
       }
     }
@@ -625,8 +693,7 @@ async function runJudgeBatch(items, judge) {
   for (const model of judge.models) {
     for (let index = 0; index < judge.count; index += 1) {
       if (shutdownRequested) break;
-      const raw = await spawnJudgeProcess(prompt, judge, model, `batch:${items.length}`, index);
-      const parsed = extractJson(raw);
+      const parsed = await runJudgeProcessJson(prompt, judge, model, `batch:${items.length}`, index);
       const normalized = normalizeJudgeBatchReviews(parsed, items);
       for (const { ref, review } of normalized) byRef.get(ref).push(review);
     }
@@ -659,14 +726,7 @@ async function warmJudgeCacheForTargets(refs, judge) {
     batches.push(missing.slice(i, i + judge.batchSize));
   }
   for (const batch of batches) {
-    try {
-      await runJudgeBatch(batch, judge);
-    } catch (error) {
-      console.log(`[JUDGE] 批量评审失败（${batch.length} 篇）：${error.message}；回退单篇判官`);
-      for (const item of batch) {
-        await runJudges(item.topic, item.ref, judge);
-      }
-    }
+    await runJudgeBatch(batch, judge);
   }
 }
 
@@ -689,10 +749,11 @@ async function runBlockJudges({ ref, title, blocks }, judge) {
     for (let index = 0; index < judge.count; index += 1) {
       if (shutdownRequested) break;
       try {
-        const raw = await spawnJudgeProcess(prompt, judge, model, `block:${ref}`, index);
-        const reviews = normalizeBlockJudgeReview(extractJson(raw), blocks);
+        const parsed = await runJudgeProcessJson(prompt, judge, model, `block:${ref}`, index);
+        const reviews = normalizeBlockJudgeReview(parsed, blocks);
         for (const review of reviews) byKey.get(review.key)?.push(review);
       } catch (error) {
+        if (error.judgeProtocolFailure) throw error;
         console.log(`[JUDGE] 块级评审失败 ${ref} m=${model ?? "默认"} #${index + 1}: ${error.message}`);
       }
     }
@@ -2047,8 +2108,10 @@ async function main() {
   const judgeCount = Number(args["judge-count"] ?? 1);
   const dynamicSkipMin = Number(args["dynamic-skip-min"] ?? args["dynamic-pass-min"] ?? args["dynamic-min"] ?? 85);
   const judgeBatchSize = Number(args["judge-batch-size"] ?? 5);
+  const judgeJsonRetries = Number(args["judge-json-retries"] ?? 2);
   ensureInt(judgeCount, "judge-count", 1, 8);
   ensureInt(judgeBatchSize, "judge-batch-size", 1, 10);
+  ensureInt(judgeJsonRetries, "judge-json-retries", 0, 5);
   if (!Number.isInteger(dynamicSkipMin) || dynamicSkipMin < 1 || dynamicSkipMin > 100) {
     throw new Error("--dynamic-skip-min 必须在 [1,100]（--dynamic-min 仍可作为兼容别名）");
   }
@@ -2068,11 +2131,12 @@ async function main() {
       count: judgeCount,
       dynamicSkipMin,
       batchSize: judgeBatchSize,
+      jsonRetries: judgeJsonRetries,
       cacheDir: path.join(qualityDir, "judge-cache"),
       setHash,
     };
     console.log(
-      `判官：cli=${judgeCli} 模型=[${judgeModels.map((entry) => entry ?? "CLI默认").join(", ")}] × ${judgeCount} 实例，动态免改线 ${dynamicSkipMin}，batch=${judgeBatchSize}（contentHash 缓存复用）`,
+      `判官：cli=${judgeCli} 模型=[${judgeModels.map((entry) => entry ?? "CLI默认").join(", ")}] × ${judgeCount} 实例，动态免改线 ${dynamicSkipMin}，batch=${judgeBatchSize}，json重试=${judgeJsonRetries}（contentHash 缓存复用）`,
     );
   } else {
     console.log("判官：已关闭（--no-judge），仅静态 keep-best。");
@@ -2243,7 +2307,15 @@ async function main() {
     degradeAfter,
     degradeWindowSeconds,
     endedOnModel: currentModel(modelState) ?? "CLI default",
-    judge: judge ? { cli: judge.cli, models: judge.models.map((entry) => entry ?? "CLI default"), count: judge.count, dynamicSkipMin: judge.dynamicSkipMin, batchSize: judge.batchSize } : null,
+    judge: judge ? {
+      cli: judge.cli,
+      models: judge.models.map((entry) => entry ?? "CLI default"),
+      count: judge.count,
+      dynamicSkipMin: judge.dynamicSkipMin,
+      batchSize: judge.batchSize,
+      jsonRetries: judge.jsonRetries,
+      outputProtocol: "file+END",
+    } : null,
     startedFailing: initialFailing.size,
     processed: processed.length,
     unprocessed,

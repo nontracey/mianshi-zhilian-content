@@ -65,7 +65,49 @@ function reviewForText(text) {
 }
 
 function extractJsonAfter(marker) {
-  return JSON.parse(prompt.slice(prompt.lastIndexOf(marker) + marker.length).trim());
+  const tail = prompt.slice(prompt.lastIndexOf(marker) + marker.length).trim();
+  const start = tail.search(/[\[{]/);
+  if (start < 0) throw new Error(`mock_cli: JSON not found after ${marker}`);
+  const open = tail[start];
+  const close = open === "[" ? "]" : "}";
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < tail.length; index += 1) {
+    const ch = tail[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === "\"") inString = false;
+      continue;
+    }
+    if (ch === "\"") {
+      inString = true;
+      continue;
+    }
+    if (ch === open) depth += 1;
+    else if (ch === close) {
+      depth -= 1;
+      if (depth === 0) return JSON.parse(tail.slice(start, index + 1));
+    }
+  }
+  throw new Error(`mock_cli: JSON after ${marker} is incomplete`);
+}
+
+function judgeOutputPath() {
+  const match = prompt.match(/评审 JSON 对象写入下面这个绝对路径的文件：\s*\n\s*(\S+)/);
+  return match?.[1]?.trim() || "";
+}
+
+function emitJudgeJson(payload) {
+  const outputPath = judgeOutputPath();
+  if (outputPath) {
+    writeFileSync(outputPath, `${JSON.stringify(payload, null, 2)}\n//---END---\n`);
+    process.stdout.write(`WROTE:${outputPath}\n`);
+  } else {
+    process.stdout.write(JSON.stringify(payload) + "\n");
+  }
+  process.exit(0);
 }
 
 // ===== 块级判官模式 =====
@@ -84,23 +126,20 @@ if (prompt.includes("待比较 blocks")) {
     }
     return { key: block.key, verdict: "improved", reason: "候选块移除了模板句且没有坏标记", fix: "" };
   });
-  process.stdout.write(JSON.stringify({ blockReviews }) + "\n");
-  process.exit(0);
+  emitJudgeJson({ blockReviews });
 }
 
 // ===== 批量判官模式 =====
 if (prompt.includes("待评审 topics JSON")) {
   const items = extractJsonAfter("待评审 topics JSON：");
-  process.stdout.write(JSON.stringify({
+  emitJudgeJson({
     reviews: items.map((item) => ({ ref: item.ref, ...reviewForText(JSON.stringify(item.topic)) })),
-  }) + "\n");
-  process.exit(0);
+  });
 }
 
 // ===== 判官模式 =====
 if (prompt.includes("待评审 topic JSON")) {
-  process.stdout.write(JSON.stringify(reviewForText(prompt)) + "\n");
-  process.exit(0);
+  emitJudgeJson(reviewForText(prompt));
 }
 
 // ===== 精修模式 =====

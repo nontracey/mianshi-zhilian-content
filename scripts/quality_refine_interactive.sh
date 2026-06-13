@@ -40,6 +40,7 @@ JUDGE_MODELS=""   # 空 = 跟精修主模型一致
 JUDGE_COUNT=1
 DYNAMIC_SKIP_MIN=85
 JUDGE_BATCH_SIZE=5
+JUDGE_JSON_RETRIES=2
 SELECTED_DOMAIN_IDS=()
 SCOPE_ARGS=()
 TOPIC_REF=""
@@ -974,7 +975,7 @@ build_common_refine_args() {
   if [[ "$JUDGE_ENABLED" == "1" ]]; then
     # 判官 CLI 默认 = 精修 CLI；判官模型空时由 .mjs 默认取精修主模型。
     [[ -n "$JUDGE_MODELS" ]] && COMMON_ARGS+=(--judge-models "$JUDGE_MODELS")
-    COMMON_ARGS+=(--judge-count "$JUDGE_COUNT" --dynamic-skip-min "$DYNAMIC_SKIP_MIN" --judge-batch-size "$JUDGE_BATCH_SIZE")
+    COMMON_ARGS+=(--judge-count "$JUDGE_COUNT" --dynamic-skip-min "$DYNAMIC_SKIP_MIN" --judge-batch-size "$JUDGE_BATCH_SIZE" --judge-json-retries "$JUDGE_JSON_RETRIES")
   else
     COMMON_ARGS+=(--no-judge)
   fi
@@ -1097,7 +1098,7 @@ summary() {
   fi
   if [[ "$RUN_MODE" == "refine" ]]; then
     if [[ "$JUDGE_ENABLED" == "1" ]]; then
-      printf '判官：%s × %s 实例，动态免改线 %s，batch %s\n' "${JUDGE_MODELS:-同精修模型}" "$JUDGE_COUNT" "$DYNAMIC_SKIP_MIN" "$JUDGE_BATCH_SIZE"
+      printf '判官：%s × %s 实例，动态免改线 %s，batch %s，JSON重试 %s\n' "${JUDGE_MODELS:-同精修模型}" "$JUDGE_COUNT" "$DYNAMIC_SKIP_MIN" "$JUDGE_BATCH_SIZE" "$JUDGE_JSON_RETRIES"
     else
       printf '判官：未启用（纯静态 keep-best）\n'
     fi

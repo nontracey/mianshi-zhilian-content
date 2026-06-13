@@ -38,7 +38,7 @@ npm run quality:refine:interactive
 - 一个 CLI 调用只处理一个 topic。领域或多 topic 选择只是队列，不会把整个领域塞进同一个 prompt。
 - 并发表示同时启动多个“单 topic CLI 子进程”。如果希望绝对串行，把并发设为 `1`。
 - 并发大于 `3` 时，默认启用自适应并发：遇到限流、服务繁忙、超时、非零退出等可用性失败，会把并发逐步降到 `3`，并重试这些失败 topic；内容校验失败不会触发并发降级。
-- 启用判官时，第一轮会先对 scope 内 topic 做判前评审，并按 `contentHash` 缓存；全域运行会按 `judge-batch-size` 批量预热缓存，失败再回退单篇判官。
+- 启用判官时，第一轮会先对 scope 内 topic 做判前评审，并按 `contentHash` 缓存；全域运行会按 `judge-batch-size` 批量预热缓存。判官输出和精修输出一样走本地文件协议，文件必须带 `//---END---`，主进程严格解析合法 JSON，格式失败只允许同批重试，不能作为正常回退路径吞掉。
 - 静态分数是地板，判官分数是语义天花板。静态分达标且判官达到 `dynamic-skip-min`、8 维均不低于 4、无 blocking 时，topic 会直接跳过改写。
 - 未达标 topic 才进入逐篇改写；候选会先跑 invariant、静态审计和判后评审，再用回归向量决定整篇接受、保留旧版，或只合并变好的块。
 - 块级合并只吸收被静态检查和块级判官确认更好的块；合并前后会检查重复块回归，候选不得新增同类型同标题重复块，也不得增加同类型语义高度相似的卡片对。
@@ -87,6 +87,7 @@ npm run quality:refine -- \
   --judge-count 1 \
   --dynamic-skip-min 85 \
   --judge-batch-size 5 \
+  --judge-json-retries 2 \
   --min-score 90
 ```
 
