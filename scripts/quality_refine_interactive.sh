@@ -41,6 +41,8 @@ JUDGE_COUNT=1
 DYNAMIC_SKIP_MIN=85
 JUDGE_BATCH_SIZE=5
 JUDGE_JSON_RETRIES=2
+PROGRESS_STYLE="summary"
+HEARTBEAT_SECONDS=60
 SELECTED_DOMAIN_IDS=()
 SCOPE_ARGS=()
 TOPIC_REF=""
@@ -729,7 +731,7 @@ choose_judge_count() {
     rc=$?; return "$rc"
   fi
   DYNAMIC_SKIP_MIN="$ASK_VALUE"
-  if ask_number "判官批量大小 judge-batch-size（首轮判前预热，失败会回退单篇）" "$JUDGE_BATCH_SIZE" 1 10 >/dev/null; then
+  if ask_number "判官批量大小 judge-batch-size（首轮判前预热，走文件协议写本地缓存）" "$JUDGE_BATCH_SIZE" 1 10 >/dev/null; then
     :
   else
     rc=$?; return "$rc"
@@ -968,6 +970,8 @@ build_common_refine_args() {
     --retries "$RETRIES"
     --timeout-ms "$((TIMEOUT_SECONDS * 1000))"
     --degrade-after "$DEGRADE_AFTER"
+    --progress-style "$PROGRESS_STYLE"
+    --heartbeat-seconds "$HEARTBEAT_SECONDS"
   )
   if [[ -n "$MODEL_CHAIN" ]]; then
     COMMON_ARGS+=(--model-chain "$MODEL_CHAIN")
@@ -1095,6 +1099,7 @@ summary() {
     printf 'CLI：%s\n' "$SELECTED_CLI"
     printf '模型链：%s\n' "${MODEL_CHAIN:-CLI默认}"
     printf '重试：%s 次，超时：%s 秒，降级阈值：%s\n' "$RETRIES" "$TIMEOUT_SECONDS" "$DEGRADE_AFTER"
+    printf '进度：%s，心跳：%s 秒（每完成一篇立即刷一行）\n' "$PROGRESS_STYLE" "$HEARTBEAT_SECONDS"
   fi
   if [[ "$RUN_MODE" == "refine" ]]; then
     if [[ "$JUDGE_ENABLED" == "1" ]]; then

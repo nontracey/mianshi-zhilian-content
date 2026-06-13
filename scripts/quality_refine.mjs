@@ -342,8 +342,10 @@ function availabilityFailureMatch(text) {
 
 function formatDuration(ms) {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
+  if (hours) return `${hours}h${String(minutes % 60).padStart(2, "0")}m`;
   return minutes ? `${minutes}m${String(seconds).padStart(2, "0")}s` : `${seconds}s`;
 }
 
@@ -472,11 +474,11 @@ function runProcess(command, args, options, timeoutMs, progress = {}) {
         reject(makeInterruptedError(signal || "SIGINT"));
       } else if (timedOut) {
         reject(new Error(`timeout after ${timeoutMs}ms`));
-      } else if (code === 0) {
+      } else if (code === 0 || progress.allowNonZero) {
         if (!progress.suppressDone) {
           console.log(`[DONE] ${label} elapsed=${formatDuration(elapsed)} ${outputKind}=${outputPath ? fileSizeLabel(outputPath) : `${stdout.length}B`}`);
         }
-        resolve({ stdout, stderr });
+        resolve({ stdout, stderr, code });
       } else {
         reject(new Error(`exit code=${code} signal=${signal || ""} stderr=${stderr.trim().slice(0, 400)}`));
       }
@@ -709,7 +711,21 @@ async function runJudgeBatch(items, judge) {
   return out;
 }
 
-async function warmJudgeCacheForTargets(refs, judge) {
+function startJudgeHeartbeat(state, heartbeatMs, cfg) {
+  if (!heartbeatMs || heartbeatMs <= 0 || cfg.progressStyle !== "summary") return () => {};
+  const startedAt = Date.now();
+  const heartbeat = setInterval(() => {
+    console.log(
+      `[判官] 心跳 ${state.doneTopics}/${state.totalTopics} ${pct(state.doneTopics, state.totalTopics)} ` +
+        `批次=${state.doneBatches}/${state.totalBatches} 缓存=${state.cachedTopics} ` +
+        `剩余=${formatDuration(remainingEtaByThroughput(state.doneTopics, state.totalTopics, state.startedAt))} 已用=${formatDuration(Date.now() - state.startedAt)}`,
+    );
+  }, heartbeatMs);
+  heartbeat.unref();
+  return () => clearInterval(heartbeat);
+}
+
+async function warmJudgeCacheForTargets(refs, judge, cfg = {}) {
   if (!judge?.enabled || judge.batchSize <= 1) return;
   const missing = [];
   for (const ref of refs) {
@@ -720,13 +736,34 @@ async function warmJudgeCacheForTargets(refs, judge) {
       // 读不到的 topic 交给后续单篇流程报错。
     }
   }
-  if (!missing.length) return;
+  const cachedTopics = refs.length - missing.length;
+  if (!missing.length) {
+    if (cfg.progressStyle !== "quiet") console.log(`[判官] 判前缓存命中 ${refs.length}/${refs.length}，无需预热`);
+    return;
+  }
   const batches = [];
   for (let i = 0; i < missing.length; i += judge.batchSize) {
     batches.push(missing.slice(i, i + judge.batchSize));
   }
-  for (const batch of batches) {
-    await runJudgeBatch(batch, judge);
+  if (cfg.progressStyle !== "quiet") {
+    console.log(`[判官] 判前预热 missing=${missing.length} cached=${cachedTopics} batchSize=${judge.batchSize}`);
+    if (cfg.progressStyle === "summary") console.log(progressHeader("JUDGE"));
+  }
+  const state = { doneTopics: 0, totalTopics: missing.length, doneBatches: 0, totalBatches: batches.length, cachedTopics, startedAt: Date.now() };
+  const stopHeartbeat = startJudgeHeartbeat(state, cfg.heartbeatMs, cfg);
+  try {
+    for (const batch of batches) {
+      await runJudgeBatch(batch, judge);
+      state.doneBatches += 1;
+      state.doneTopics += batch.length;
+      if (cfg.progressStyle === "summary") {
+        console.log(formatJudgeProgress(state.doneBatches, state.totalBatches, state.doneTopics, state.totalTopics, cachedTopics, batch.map((item) => item.ref), state.startedAt));
+      } else if (cfg.progressStyle === "topic") {
+        console.log(`[判官] batch ${state.doneBatches}/${state.totalBatches} done=${state.doneTopics}/${state.totalTopics} refs=${batch.map((item) => item.ref).join(",")}`);
+      }
+    }
+  } finally {
+    stopHeartbeat();
   }
 }
 
@@ -785,24 +822,32 @@ async function runBlockJudges({ ref, title, blocks }, judge) {
 }
 
 // ===== 确定性审计（唯一事实源 + 验收门禁）=====
-function runAudit(minScore) {
+async function runAudit(minScore, cfg = {}) {
   const startedAt = Date.now();
-  console.log(`[AUDIT] 开始确定性审计 minScore=${minScore}`);
-  const result = spawnSync(
+  if (cfg.progressStyle !== "quiet") console.log(`[AUDIT] 开始 minScore=${minScore}`);
+  const result = await runProcess(
     process.execPath,
     ["scripts/content_quality_audit.mjs", "--json", `--min-score=${minScore}`],
-    { cwd: root, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 },
+    { cwd: root, stdio: ["ignore", "pipe", "pipe"] },
+    Math.max(cfg.timeoutMs ?? 600000, 600000),
+    {
+      label: "AUDIT",
+      heartbeatMs: cfg.heartbeatMs ?? 60000,
+      suppressSpawn: true,
+      suppressDone: true,
+      suppressHeartbeat: cfg.progressStyle === "quiet",
+      allowNonZero: true,
+    },
   );
   if (!result.stdout) {
-    throw new Error(`审计未产出结果：${result.stderr || `exit ${result.status}`}`);
+    throw new Error(`审计未产出结果：${result.stderr || `exit ${result.code}`}`);
   }
   const audit = JSON.parse(result.stdout);
   audit.failingMap = new Map((audit.failingTopics ?? []).map((topic) => [topic.ref, topic]));
   audit.scoreMap = new Map((audit.allTopics ?? []).map((topic) => [topic.ref, topic.score]));
-  console.log(
-    `[AUDIT] 完成 overall=${audit.overallScore}/100 failing=${audit.failingTopicCount}/${audit.topicCount} ` +
-      `elapsed=${formatDuration(Date.now() - startedAt)}`,
-  );
+  if (cfg.progressStyle !== "quiet") {
+    console.log(`[AUDIT] 完成 overall=${audit.overallScore}/100 failing=${audit.failingTopicCount}/${audit.topicCount} elapsed=${formatDuration(Date.now() - startedAt)}`);
+  }
   return audit;
 }
 
@@ -1519,7 +1564,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
     if (beforeReview) {
       findingLines = findingsToPromptLines(beforeReview);
       if (staticBefore >= minScore && judgePasses(beforeReview, judge.dynamicSkipMin)) {
-        if (cfg.progressStyle !== "quiet") {
+        if (detailedProgress) {
           console.log(`[TOPIC] 已达标，跳过改写 ${ref}（static ${staticBefore} + 动态 ${beforeReview.score}，8 维全过、无事实问题）`);
         }
         return {
@@ -1547,7 +1592,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
     let raw = "";
     try {
       const args = buildCliArgs(cfg, prompt, model);
-      if (cfg.progressStyle !== "quiet") {
+      if (detailedProgress) {
         console.log(`[TOPIC] 开始 ${attemptLabel} score=${score}/100 cli=${cfg.cli}`);
       }
       try {
@@ -1731,15 +1776,17 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
       keptOld = true;
       bestRejectedAfter = bestRejectedAfter === null ? after : Math.max(bestRejectedAfter, after);
       lastError = new Error(`候选未优于现版，保留旧版（${decision.reason}）`);
-      console.log(`[TOPIC] 保留旧版 ${attemptLabel}: ${decision.reason}`);
+      if (detailedProgress) console.log(`[TOPIC] 保留旧版 ${attemptLabel}: ${decision.reason}`);
       lastError.decisionReason = decision.reason;
       continue;
     } catch (error) {
       if (error.interrupted || shutdownRequested) throw error;
       keptOld = false; // 本 attempt 是真失败（CLI/解析/契约/不变量），不是“保留旧版”
       lastError = error;
-      console.log(`[TOPIC] 失败 ${attemptLabel}: ${error.message}`);
-      if (attempt < attempts) console.log(`[RETRY] ${ref} ${attempt}/${attempts}: ${error.message}`);
+      if (detailedProgress) {
+        console.log(`[TOPIC] 失败 ${attemptLabel}: ${error.message}`);
+        if (attempt < attempts) console.log(`[RETRY] ${ref} ${attempt}/${attempts}: ${error.message}`);
+      }
     } finally {
       // raw 始终落盘（无论成功失败），用于失败诊断；attempt 编号区分重试。
       if (raw) {
@@ -1814,18 +1861,94 @@ function resolveTargetRefs(audit, scope, options, topicFilters) {
   return orderByDomain(requested);
 }
 
+function pct(done, total) {
+  if (!total) return "0.0%";
+  return `${((done / total) * 100).toFixed(1)}%`;
+}
+
+function avgDuration(counters) {
+  const count = counters.timed ?? 0;
+  return count ? (counters.topicMs ?? 0) / count : 0;
+}
+
+function remainingEtaByAverage(counters, cfg) {
+  const avg = avgDuration(counters);
+  if (!avg || !counters.total || !counters.processed) return 0;
+  const remaining = Math.max(0, counters.total - counters.processed);
+  const concurrency = Math.max(1, Math.min(cfg.concurrency ?? 1, remaining || 1));
+  return (remaining * avg) / concurrency;
+}
+
+function remainingEtaByThroughput(done, total, startedAt) {
+  if (!done || !total || !startedAt) return 0;
+  const elapsed = Date.now() - startedAt;
+  const remaining = Math.max(0, total - done);
+  return remaining ? (elapsed / done) * remaining : 0;
+}
+
+function compactRef(ref, max = 42) {
+  const text = String(ref).replace(/^topics\//, "").replace(/\.json$/, "");
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(8, max - 18))}...${text.slice(-15)}`;
+}
+
+function progressHeader(kind) {
+  if (kind === "JUDGE") {
+    return "[判官] 批次    完成     进度     已用    剩余    缓存  最新";
+  }
+  return "[精修] 完成     进度    免改 写回 合并 保留 失败 运行   均时   剩余   已用  最新";
+}
+
+function maybePrintProgressHeader(kind, index) {
+  if (index === 1 || (index - 1) % 24 === 0) console.log(progressHeader(kind));
+}
+
+function outcomeLabel(outcome) {
+  return {
+    good: "免改",
+    ok: "写回",
+    merg: "合并",
+    keep: "保留",
+    fail: "失败",
+  }[outcome] ?? outcome;
+}
+
+function formatRefineProgress(snapshot, activeSize, outcome, ref, cfg, counters) {
+  const latest = `${outcomeLabel(outcome)} ${compactRef(ref)}`;
+  const elapsed = Date.now() - (counters.startedAt ?? Date.now());
+  const avg = avgDuration(counters);
+  const eta = remainingEtaByAverage(counters, cfg);
+  return `[精修] ${String(snapshot.processed).padStart(3)}/${String(snapshot.total).padEnd(3)} ` +
+    `${pct(snapshot.processed, snapshot.total).padStart(6)} ` +
+    `${String(snapshot.good).padStart(5)} ${String(snapshot.written).padStart(3)} ${String(snapshot.merged).padStart(6)} ` +
+    `${String(snapshot.kept).padStart(4)} ${String(snapshot.failed).padStart(4)} ${String(activeSize).padStart(3)} ` +
+    `${formatDuration(avg).padStart(6)} ${formatDuration(eta).padStart(6)} ${formatDuration(elapsed).padStart(7)} ${latest}`;
+}
+
+function formatJudgeProgress(doneBatches, totalBatches, doneTopics, totalTopics, cachedTopics, latestRefs, startedAt) {
+  const latest = latestRefs.map((ref) => compactRef(ref, 30)).join(", ");
+  const elapsed = Date.now() - startedAt;
+  const eta = remainingEtaByThroughput(doneTopics, totalTopics, startedAt);
+  return `[判官] ${String(doneBatches).padStart(3)}/${String(totalBatches).padEnd(3)} ` +
+    `${String(doneTopics).padStart(3)}/${String(totalTopics).padEnd(3)} ` +
+    `${pct(doneTopics, totalTopics).padStart(6)} ` +
+    `${formatDuration(elapsed).padStart(7)} ${formatDuration(eta).padStart(7)} ` +
+    `${String(cachedTopics).padStart(6)} ${latest}`;
+}
+
 function startPoolHeartbeat(counters, active, heartbeatMs, cfg) {
   if (!heartbeatMs || heartbeatMs <= 0) return () => {};
   const startedAt = Date.now();
   const heartbeat = setInterval(() => {
     const now = Date.now();
     const activeItems = [...active.entries()]
-      .slice(0, 4)
-      .map(([ref, item]) => `${ref} ${formatDuration(now - item.startedAt)} m=${item.model ?? "默认"}`);
-    const suffix = activeItems.length ? ` current=${activeItems.join(" | ")}` : "";
+      .slice(0, 3)
+      .map(([ref, item]) => `${compactRef(ref, 26)} ${formatDuration(now - item.startedAt)}`);
+    const suffix = activeItems.length ? ` activeNow=${activeItems.join(" | ")}` : "";
     console.log(
-      `[RUNNING] ${counters.processed}/${counters.total} ★${counters.good ?? 0} ✓${counters.written} ⇄${counters.merged ?? 0} ◦${counters.kept ?? 0} ✗${counters.failed} ` +
-        `concurrency=${cfg.concurrency} active=${active.size} elapsed=${formatDuration(now - startedAt)}${suffix}`,
+      `[精修] 心跳 ${counters.processed}/${counters.total} ${pct(counters.processed, counters.total)} ` +
+        `免改=${counters.good ?? 0} 写回=${counters.written} 合并=${counters.merged ?? 0} 保留=${counters.kept ?? 0} 失败=${counters.failed} ` +
+        `运行=${active.size}/${cfg.concurrency} 均时=${formatDuration(avgDuration(counters))} 剩余=${formatDuration(remainingEtaByAverage(counters, cfg))} 已用=${formatDuration(now - startedAt)}${suffix}`,
     );
   }, heartbeatMs);
   heartbeat.unref();
@@ -1836,6 +1959,9 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
   const results = [];
   let index = 0;
   const active = new Map();
+  counters.startedAt ??= Date.now();
+  counters.topicMs ??= 0;
+  counters.timed ??= 0;
   const stopHeartbeat = cfg.progressStyle === "summary"
     ? startPoolHeartbeat(counters, active, cfg.heartbeatMs, cfg)
     : () => {};
@@ -1844,13 +1970,16 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
       if (shutdownRequested) throw makeInterruptedError();
       const ref = targets[index++];
       const model = currentModel(modelState);
-      active.set(ref, { model: model ?? "默认", startedAt: Date.now() });
+      const itemStartedAt = Date.now();
+      active.set(ref, { model: model ?? "默认", startedAt: itemStartedAt });
       let result;
       try {
         result = await refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, model, undefined, corpus, judge);
       } finally {
         active.delete(ref);
       }
+      counters.topicMs += Date.now() - itemStartedAt;
+      counters.timed += 1;
       noteModelResult(modelState, result);
       results.push({ ref, ...result });
       counters.processed += 1;
@@ -1893,10 +2022,15 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
       );
       const domain = ref.split("/")[1];
       const label = outcome === "good" ? "GOOD" : outcome === "written" ? "OK  " : outcome === "merged" ? "MERG" : outcome === "kept" ? "KEEP" : "FAIL";
-      console.log(
-        `[${snapshot.processed}/${snapshot.total} ★${snapshot.good} ✓${snapshot.written} ⇄${snapshot.merged} ◦${snapshot.kept} ✗${snapshot.failed} | ${domain} | m=${model ?? "默认"}] ` +
-          `c=${cfg.concurrency} ${label} ${ref}${result.error ? ` (${result.error})` : ""}`,
-      );
+      if (cfg.progressStyle === "summary") {
+        maybePrintProgressHeader("REFINE", snapshot.processed);
+        console.log(formatRefineProgress(snapshot, active.size, label.trim().toLowerCase(), ref, cfg, counters));
+      } else if (cfg.progressStyle === "topic") {
+        console.log(
+          `[${snapshot.processed}/${snapshot.total} ★${snapshot.good} ✓${snapshot.written} ⇄${snapshot.merged} ◦${snapshot.kept} ✗${snapshot.failed} | ${domain} | m=${model ?? "默认"}] ` +
+            `c=${cfg.concurrency} ${label} ${ref}${result.error ? ` (${result.error})` : ""}`,
+        );
+      }
     }
   }
   try {
@@ -2014,7 +2148,7 @@ async function main() {
   const progressStyle = String(
     args["progress-style"] ?? process.env.QUALITY_REFINE_PROGRESS_STYLE ?? (previewMode ? "topic" : "summary"),
   ).trim();
-  const defaultHeartbeatSeconds = progressStyle === "summary" ? 30 : 10;
+  const defaultHeartbeatSeconds = progressStyle === "summary" ? 60 : 10;
   const heartbeatSeconds = Number(args["heartbeat-seconds"] ?? process.env.QUALITY_REFINE_HEARTBEAT_SECONDS ?? defaultHeartbeatSeconds);
   const options = {
     scope,
@@ -2045,10 +2179,11 @@ async function main() {
   }
   if (!Number.isInteger(timeoutMs) || timeoutMs < 30000) throw new Error("--timeout-ms 必须是 >=30000 的整数");
   if (!Number.isInteger(minScore) || minScore < 1 || minScore > 100) throw new Error("--min-score 必须在 [1,100]");
+  const progressCfg = { progressStyle, heartbeatMs: heartbeatSeconds * 1000, timeoutMs };
 
   // 审计预览：不调用任何 LLM，只看当前还差哪些篇、各篇缺口。
   if (auditOnly) {
-    const audit = runAudit(minScore);
+    const audit = await runAudit(minScore, progressCfg);
     const targetRefs = resolveTargetRefs(audit, scope, options, topicFilters);
     const targetSet = new Set(targetRefs);
     const scoped = audit.failingTopics.map((topic) => topic.ref).filter((ref) => targetSet.has(ref));
@@ -2144,7 +2279,7 @@ async function main() {
 
   // 测试/预览模式：精修单篇，结果写到 .quality-refine/preview/（不动仓库），打印路径供 sh 渲染。
   if (previewMode) {
-    const audit = runAudit(minScore);
+    const audit = await runAudit(minScore, cfg);
     const templates = templatesByRef(audit);
     const candidates = resolveTargetRefs(audit, scope, options, topicFilters);
     let ref = candidates[0];
@@ -2171,13 +2306,13 @@ async function main() {
   );
 
   // 目标集由 scope/topic 选择决定；静态分数只作为上下文，不作为第一轮跳过条件。
-  const initialAudit = runAudit(minScore);
+  const initialAudit = await runAudit(minScore, cfg);
   const targetRefs = resolveTargetRefs(initialAudit, scope, options, topicFilters);
   if (!targetRefs.length) throw new Error(`scope=${scope} 内没有可精修 topic。`);
   const targetSet = new Set(targetRefs);
   const initialFailing = new Set(initialAudit.failingTopics.map((topic) => topic.ref).filter((ref) => targetSet.has(ref)));
   console.log(
-    `起始：目标 ${targetRefs.length} 篇（第一轮都会送 LLM 精修），其中静态 <${minScore} ${initialFailing.size} 篇  ` +
+    `起始：目标 ${targetRefs.length} 篇（第一轮都会进入处理队列，判官达标会免改），其中静态 <${minScore} ${initialFailing.size} 篇  ` +
       `[${summarizeFailingByDomain([...initialFailing]) || "无"}]`,
   );
 
@@ -2193,7 +2328,7 @@ async function main() {
 
   for (let round = 1; round <= maxRounds; round += 1) {
     if (shutdownRequested) throw makeInterruptedError();
-    const audit = runAudit(minScore);
+    const audit = await runAudit(minScore, cfg);
     const templates = templatesByRef(audit);
     const corpus = buildRefineCorpus(); // keep-best：候选与现版用同一套 scoreTopic + 语料库对比
     const firstPass = targetRefs.filter((ref) => !stuck.has(ref) && state.get(ref).attempts === 0);
@@ -2228,7 +2363,7 @@ async function main() {
       return;
     }
 
-    await warmJudgeCacheForTargets(ordered, judge);
+    await warmJudgeCacheForTargets(ordered, judge, cfg);
 
     const counters = { total: ordered.length, processed: 0, good: 0, written: 0, merged: 0, kept: 0, failed: 0 };
     const results = await refinePoolWithConcurrencyFallback(ordered, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters, corpus, judge);
@@ -2247,7 +2382,7 @@ async function main() {
   }
 
   // 最终审计 + 汇总
-  const finalAudit = runAudit(minScore);
+  const finalAudit = await runAudit(minScore, cfg);
   const processed = targetRefs.filter((ref) => state.get(ref).attempts > 0);
   const unprocessed = targetRefs.filter((ref) => state.get(ref).attempts === 0);
   // 执行失败 = 真出错（CLI/解析/契约/不变量），不含 keptOld（候选合法但未优于现版、保留旧版）。

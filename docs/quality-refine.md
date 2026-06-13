@@ -47,7 +47,7 @@ npm run quality:refine:interactive
 - 测试预览不改仓库内容，产物写入 `.quality-refine/preview/`，并在终端渲染文字版。
 - 执行期间会输出单篇开始、完成/失败和重试信息。正式模式默认每 30 秒输出一条聚合 `[RUNNING]`，不会按每个 CLI 子进程刷屏；测试预览默认显示单篇 `[SPAWN]` / `[WAIT]` / `[DONE]` 细反馈。
 - 正式模式的配置摘要、scope 标题、`[RUNNING]` 心跳和单篇完成行都会显示当前并发；自动降级后会显示新的并发值。
-- 可用 `--progress-style summary|topic|quiet` 控制反馈密度；可用 `--heartbeat-seconds` 或 `QUALITY_REFINE_HEARTBEAT_SECONDS` 调整心跳间隔，`0` 表示关闭心跳。
+- 可用 `--progress-style summary|topic|quiet` 控制反馈密度；`summary` 会按阶段输出低频心跳，并在每完成一篇时刷一行紧凑进度表。可用 `--heartbeat-seconds` 或 `QUALITY_REFINE_HEARTBEAT_SECONDS` 调整心跳间隔，`0` 表示关闭心跳。
 - 按 `Ctrl-C` 会中断当前精修，并尝试终止正在运行的外部 CLI 子进程；再次按 `Ctrl-C` 会强制退出。
 
 ## 常用命令
@@ -80,7 +80,7 @@ npm run quality:refine -- \
   --max-rounds 3 \
   --retries 1 \
   --timeout-ms 600000 \
-  --heartbeat-seconds 30 \
+  --heartbeat-seconds 60 \
   --progress-style summary \
   --model-chain minimax-m3,deepseek-v4-pro,glm-5.1 \
   --judge-models minimax-m3,deepseek-v4-pro \
