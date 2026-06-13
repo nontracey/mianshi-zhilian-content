@@ -27,7 +27,14 @@ const DOMAIN_ORDER = [
 ];
 
 // ===== 内嵌精修规范（弱模型唯一参照，不读 81KB 大文档；要求只增不减）=====
+// 调用 buildRefinePrompt 时会把字面量 ${todayYmd} 替换为实际的 YYYY-MM-DD 日期串。
 const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任务：把下面这一篇 topic 改写到“真人专家会认可、面试能直接用”的高质量，使其通过确定性质量审计（满分 100，合格线见下，8 个维度各有地板分，强项不能补偿短板）。
+
+【输出格式（违反任意一条会被驱动判失败并重试）】
+- 你必须只输出一个 JSON 对象，第一个非空白字符必须是 \`{\`，最后一个非空白字符必须是 \`}\`。
+- 禁止任何 markdown 代码围栏（不要 \`\`\`json / \`\`\`），禁止解释性前后缀，禁止任何额外文字。
+- 禁止 JSON 注释（不要 //、不要 /* */），禁止 trailing comma（最后一个属性、最后一个数组元素后面禁止逗号）。
+- 所有字符串必须用双引号；字符串内的双引号用 \\\\\" 转义；换行必须用 \\\\n 表示。
 
 【8 个评估维度——每一项都要做到位，不能为了一项牺牲另一项】
 1. 结构完整性：必须含 explain + interviewAnswer + checklist；至少一张 compareTable / diagram / code；rubric 四维权重之和=100。
@@ -47,14 +54,19 @@ const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任�
 
 【准确性与时效】所有事实、版本、API、默认值、数值必须正确且贴合当前主流实践；不确定的断言宁可不写，不要编造。算法题要给正确复杂度与边界条件。
 
-【硬性约束（违反会被驱动判失败并重试）】
-- 保持 id / domain / category 完全不变；status 保持 "production"；difficulty 不得下调。
-- 不得删空内容、不得整体缩水（信息量只增不减）；followUpQuestions ≥2；recallPrompts ≥1；rubric.scoreWeights 之和=100。
-- 必须含 explain + interviewAnswer + checklist，且至少一张 compareTable / diagram / code 卡片。
-- interviewAnswer 正文不得使用行内编号列表（如“1）… 2）…”或“：1) …”），要用 Markdown 列表（每项换行、以 - 或 1. 开头）。
-- 每张 code 卡片必须标注 language；不得在 code 卡片里使用 box-drawing 字符画（┌─┐│└┘ 等），需要画图就用 diagram 卡片。
-- 把 updatedAt 设为今天。
-- 严禁保留任何上面列出的模板句；严禁跨 topic 照抄通用句子。`;
+【字段结构契约（schema 不变量，任何一条违反都会被驱动判失败并重试）】
+- 顶层字段：保持 id / domain / category 完全不变；status 必须保持 "production"；difficulty 不得下调；topic 原本已存在的任何字段都必须原样保留（包括但不限于 leetcodeUrl / sourceRef / prerequisites / interviewFrequency / interviewerFocus / recommendWeight / order / tags / group / summary / estimatedMinutes），不得删除、不得改键名。
+- updatedAt：必须更新为 \${todayYmd}（格式 YYYY-MM-DD，短横线分隔；这是 topic 文件用的格式，与 manifest.json 的 contentVersion 点号格式不同），不要带时分秒、不要带时区。
+- estimatedMinutes：是用户首次阅读该 topic 卡片所需的分钟数（一般 15-40），不是练习时长，原值合理就别动。
+- learningCards：必须是非空数组；类型集合必须同时包含 explain / interviewAnswer / checklist 三类，且至少额外含一张 compareTable / diagram / code。
+- learningCards.code：必须有 language 字段，取值仅限 java / python / javascript / typescript / bash / sql / json / yaml / c / cpp / go / rust 之一；禁止在 code 卡片里使用 box-drawing 字符画（┌─┐│└┘ 等），需要画图就用 diagram 卡片。
+- learningCards.diagram：format 取值 mermaid / svg / image / text 之一；当 format=mermaid 时，content 必须以 \`flowchart\` 或 \`graph\` 开头并紧跟 TB|TD|BT|LR|RL 方向（例如 \`flowchart LR\`），禁止使用 subgraph / classDef / style / sequenceDiagram / classDiagram / stateDiagram / mindmap；必须提供 fallback（一句话纯文本概括），节点文案必须紧扣本 topic 主题。
+- learningCards.compareTable：content 可选两种合法形态——markdown 表格字符串（content 以 \`|\` 开头）或 \`{columns:[...], rows:[[...]]}\` 结构对象；保留原 topic 用的那种形态，不要互换。
+- learningCards.interviewAnswer.followUpQuestions：必须是 \`[{question, answer}]\` 对象数组，长度至少 2，禁止退化为字符串数组。
+- learningCards.interviewAnswer.content：内部不得出现行内编号列表（如“1）… 2）…”或“：1) …”），要用 Markdown 列表（每项换行、以 \`-\` 或 \`1.\` 开头）。
+- recallPrompts：至少 1 条；第一条必须是该 topic 最核心、面试官最常开口问的那个问题（首轮练习兼容旧版 App 用）；每条对象结构必须是 \`{id, prompt, mode}\`，id 形如 \`<topic.id>.recall.<n>\`，mode 取值仅限 text / code / voice；可选附加 expectedMinutes（数字，分钟）、difficulty（1-5）。
+- rubric：必须含 mustHave（≥1 条）/ goodToHave / commonMistakes / scoreWeights 四个字段；scoreWeights 必须包含 coverage / accuracy / interviewExpression / depth 四个键，每个值是 0-100 的整数，**四个值之和必须严格等于 100**。
+- 总长度：精修后用 JSON.stringify 序列化的字符串长度不得少于原 topic 的 60%（信息量只增不减）。`;
 
 // ===== CLI 预设（与评审同款只读/plan：精修器只输出 JSON，不需要任何写/工具权限）=====
 function inferPreset(cliName, preset) {
@@ -108,15 +120,122 @@ function clean(text) {
 }
 
 function extractJson(text) {
-  const source = clean(text).replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
-  try {
-    return JSON.parse(source);
-  } catch {
-    const start = source.indexOf("{");
-    const end = source.lastIndexOf("}");
+  // 1) 标准化：去 ANSI/控制字符、剥 markdown 围栏、去 BOM/零宽字符。
+  const stripped = clean(text)
+    .replace(/^\uFEFF/, "")
+    .replace(/[\u200B-\u200D\u2060]/g, "")
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+  const tryParse = (s) => {
+    try {
+      return { ok: true, value: JSON.parse(s) };
+    } catch (err) {
+      return { ok: false, error: err };
+    }
+  };
+  // 2) 直接 parse。
+  const direct = tryParse(stripped);
+  if (direct.ok) return direct.value;
+  // 3) 平衡花括号扫描：识别字符串/转义，找出第一个完整 {...} 子串。
+  const slice = balancedJsonObjectSlice(stripped);
+  if (!slice) {
+    // 4) 兜底：取最外层 {...} 区间（旧实现）。
+    const start = stripped.indexOf("{");
+    const end = stripped.lastIndexOf("}");
     if (start < 0 || end <= start) throw new Error("CLI 输出里没有 JSON 对象");
-    return JSON.parse(source.slice(start, end + 1));
+    return repairAndParseJson(stripped.slice(start, end + 1));
   }
+  const sliced = tryParse(slice);
+  if (sliced.ok) return sliced.value;
+  // 5) 容错：去注释 + 去 trailing comma 后再 parse。
+  return repairAndParseJson(slice);
+}
+
+// 在 source 中扫描第一个语义完整的 {...} 子串，正确处理双引号字符串、转义、嵌套花括号。
+function balancedJsonObjectSlice(source) {
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === "\"") {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === "}") {
+      if (depth === 0) continue;
+      depth--;
+      if (depth === 0 && start >= 0) {
+        return source.slice(start, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
+// 容错修复：剥行/块注释、去 trailing comma，再尝试 parse。
+function repairAndParseJson(source) {
+  let s = source;
+  // 剥行注释 // ...（仅在字符串外）
+  s = stripJsonComments(s);
+  // 去 trailing comma：}, 或 ], 形如  ,\s*}  /  ,\s*]
+  s = s.replace(/,(\s*[}\]])/g, "$1");
+  return JSON.parse(s);
+}
+
+// 剥 // 行注释和 /* */ 块注释，识别字符串/转义，避免误删字符串内容。
+function stripJsonComments(source) {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  let i = 0;
+  while (i < source.length) {
+    const ch = source[i];
+    const next = source[i + 1];
+    if (inString) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === "\"") inString = false;
+      i++;
+      continue;
+    }
+    if (ch === "\"") {
+      inString = true;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      i += 2;
+      while (i < source.length && source[i] !== "\n") i++;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i++;
+      i += 2;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
 }
 
 // 是否是合法的 topic 契约 JSON（白名单识别）：有 id / domain / learningCards 且与原 topic 同身份
@@ -432,6 +551,8 @@ function templatesByRef(audit) {
 }
 
 function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministicScore) {
+  const todayYmd = new Date().toISOString().slice(0, 10);
+  const spec = REFINE_SPEC.split("${todayYmd}").join(todayYmd);
   const issues = failingInfo?.issues ?? [];
   const tmpl = templates ?? [];
   const issueBlock = issues.length
@@ -442,7 +563,7 @@ function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministi
         .map((entry) => `- （在 ${entry.count} 篇里重复）${entry.sentence}`)
         .join("\n")}\n`
     : "";
-  return `${REFINE_SPEC}
+  return `${spec}
 
 【本篇当前确定性审计分】${deterministicScore ?? failingInfo?.score ?? "?"}/100，静态验收线 ${minScore}。
 静态分数只是验收兜底，不是跳过理由。你必须先在内部按真人专家口径重新评分和找问题，再直接输出精修后的完整 JSON；不要输出评分过程。
@@ -450,7 +571,7 @@ function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministi
 【本篇被扣分的具体缺口（务必逐条消除）】
 ${issueBlock}
 ${templateBlock}
-【输出要求】只输出改写后的完整 topic JSON 对象，从 { 开始到 } 结束。不要解释、不要 markdown 代码围栏、不要任何额外文字。
+【输出要求】只输出改写后的完整 topic JSON 对象，从 { 开始到 } 结束。不要解释、不要 markdown 代码围栏、不要任何额外文字。今天日期是 ${todayYmd}，updatedAt 必须设为该值。
 
 【当前 topic JSON】
 ${JSON.stringify(topic, null, 2)}
@@ -494,6 +615,38 @@ function checkInvariants(original, parsed) {
   const originalLen = JSON.stringify(original).length;
   const newLen = JSON.stringify(parsed).length;
   if (newLen < originalLen * 0.6) return `内容疑似被截断/掏空（${newLen} < 原文 ${originalLen} 的 60%）`;
+
+  // mermaid 子集校验：仅允许 flowchart/graph + 基本边；禁用 subgraph/classDef/style 与其他图种。
+  const mermaidHeadRe = /^\s*(?:flowchart|graph)\s+(?:TB|TD|BT|LR|RL)\b/;
+  const mermaidBlacklist = /\b(?:subgraph|classDef|style|sequenceDiagram|classDiagram|stateDiagram|mindmap|gantt|pie|journey|erDiagram)\b/;
+  for (const card of cards) {
+    if (card.type === "diagram" && card.format === "mermaid") {
+      const content = typeof card.content === "string" ? card.content : "";
+      if (!mermaidHeadRe.test(content)) {
+        return `diagram(mermaid) 必须以 flowchart|graph 开头并跟 TB|TD|BT|LR|RL：${card.title ?? ""}`;
+      }
+      if (mermaidBlacklist.test(content)) {
+        return `diagram(mermaid) 含禁用语法（subgraph/classDef/style/其他图种）：${card.title ?? ""}`;
+      }
+    }
+  }
+
+  // recallPrompts 每条必须含 id 与 mode ∈ {text, code, voice}
+  if (Array.isArray(parsed.recallPrompts)) {
+    const allowedModes = new Set(["text", "code", "voice"]);
+    for (let i = 0; i < parsed.recallPrompts.length; i += 1) {
+      const item = parsed.recallPrompts[i];
+      if (!item || typeof item !== "object") return `recallPrompts[${i}] 不是对象`;
+      if (typeof item.id !== "string" || item.id.length === 0) return `recallPrompts[${i}].id 缺失或非字符串`;
+      if (!allowedModes.has(item.mode)) return `recallPrompts[${i}].mode 必须为 text|code|voice，实际 ${item.mode}`;
+    }
+  }
+
+  // updatedAt 必须严格匹配 YYYY-MM-DD
+  if (typeof parsed.updatedAt !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(parsed.updatedAt)) {
+    return `updatedAt 必须为 YYYY-MM-DD 格式，实际 ${parsed.updatedAt}`;
+  }
+
   return null;
 }
 
