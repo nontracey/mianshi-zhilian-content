@@ -340,30 +340,31 @@ AI 或人工审查内容时，不能只看单个 topic 是否写得完整，还�
 8. 跨领域一致性：是否与其他领域重复、边界不清或混入无关内容。
 9. 正向证据密度：是否能看到具体例子、真实场景、失败路径、验证/排查指标、工程取舍、专属术语覆盖和非模板化 rubric。
 
-### 8.4 LLM 抽样语义评审
+### 8.4 人工 LLM 精修
 
-静态脚本只能拦截结构、模板、重复、覆盖率和正向证据，不能可靠判断事实正确性、讲解顺序是否符合认知规律、专家口吻是否真实。因此发布态 topic 改动必须补充 LLM 抽样评审。
+静态脚本只能拦截结构、模板、重复、覆盖率和正向证据，不能可靠判断事实正确性、讲解顺序是否符合认知规律、专家口吻是否真实。因此发布态 topic 的新增、大改或质量不确定时，应由维护者本地运行精修器。
 
-默认档规则：
+默认规则：
 
-1. 仓库和 CI 不配置 LLM key、模型或 provider。
-2. 维护者先暂存内容改动，再运行 `npm run quality:llm:packet`。
-3. 维护者显式选择一个外部 CLI，用 `npm run quality:llm:run -- --cli <外部CLI>` 非交互执行评审；不得让当前写作/修改内容的 agent 直接开 subagent 自评。
-4. `.quality-review/requests/` 是本地临时产物，不提交；`.quality-review/reports/` 必须提交。
-5. 本地和 CI 运行 `npm run quality:llm:verify`，只验证报告是否覆盖当前改动、哈希是否匹配、rubric 版本是否当前、结论是否通过。
-6. 默认范围是 `--env=production --scope=changed`，即检查当前改动中的全部发布态 topic，不做 10 条抽样。需要全域、单领域、单 topic、staging/draft 或显式抽样时再传参。
-7. 每个本地 clone 必须运行一次 `npm run hooks:install` 才会启用 `.githooks/pre-commit`；未安装本地 hook 时，CI 仍会兜底验证。
+1. CI 不配置 LLM key、模型或 provider，也不再要求提交 `.quality-review/reports/`。
+2. CI 只运行 `npm run validate`、`npm run quality:scan`、`npm run quality:audit`。
+3. 维护者用 `npm run quality:refine:interactive` 启动本地精修器，按需选择领域、topic、CLI agent 和模型链。
+4. 一个 CLI 调用只能处理一个 topic。选择领域或多个 topic 只是建立队列，不得把整个领域合成一次 prompt。
+5. 静态分数只作为验收兜底；即使 topic 已经达到 90 分，第一轮正式精修仍可以送 LLM 重新审读和改写。
+6. 测试预览模式只精修单篇，写入 `.quality-refine/preview/` 并在终端渲染文字版；正式精修写回 `topics/`。
+7. 正式精修成功后再同步 staging/draft；交互脚本会按所选阶段自动同步，直接运行核心脚本时需要手动执行 `node scripts/sync_environment_content.mjs <all|staging|draft>`。
+8. 每个本地 clone 必须运行一次 `npm run hooks:install` 才会启用 `.githooks/pre-commit`；当前 hook 只做暂存 topic 的 JSON 和静态质量分门禁。
 
-LLM 评审必须重点检查（总分 0-100、维度分 1-5）：
+精修器必须重点处理：
 
-1. 事实正确性：关键事实、版本、复杂度、协议行为、框架机制不能错；图的流程方向、对比表结论、代码正确性同样按事实核验；时间敏感内容必须标记可疑或核验来源。
-2. 认知顺序：是否按“动机 -> 定义 -> 机制 -> 例子 -> 边界/失败路径 -> 对比/取舍 -> 面试表达”推进。
-3. 专家口吻真伪：是否有机制、条件、指标、失败模式、工程边界和取舍，而不是模板腔或百科腔。
-4. 自包含闭环：正文是否足以回答自己的 `recallPrompts` 和 `rubric.mustHave`。
-5. 面试可用性：是否能形成可复述的 30 秒结论、机制主线和追问边界。
+1. 事实正确性：关键事实、版本、复杂度、协议行为、框架机制不能错；图的流程方向、对比表结论、代码正确性同样按事实核验。
+2. 认知顺序：按“动机 -> 定义 -> 机制 -> 例子 -> 边界/失败路径 -> 对比/取舍 -> 面试表达”推进。
+3. 专家口吻真伪：有机制、条件、指标、失败模式、工程边界和取舍，而不是模板腔或百科腔。
+4. 自包含闭环：正文足以回答自己的 `recallPrompts` 和 `rubric.mustHave`。
+5. 面试可用性：能形成可复述的 30 秒结论、机制主线和追问边界。
 6. 难度匹配：内容深度与 `difficulty` 标注一致，difficulty 1-2 不注水、difficulty 4-5 必须讲透机制和权衡。
 
-评审必须留下核验痕迹：每篇 topic 至少 3 条结构化事实核验记录（断言/结论/依据），`wrong`、`outdated` 的事实与 `pass` 结论互斥。评审会话必须是干净上下文，不得复用写作会话。出现关键事实错误、任一核心维度低于 4 分、任一 topic 总分低于 85、或学完正文仍无法回答自己的 mustHave/recallPrompts 时，LLM report 必须为 `fail`，不得提交通过报告。
+精修后的内容仍必须通过确定性校验。静态 `90` 分不是内容真的达标的证明，只是提交和同步前的最低门槛。
 
 ## 9. 面试可用性标准
 
@@ -691,7 +692,7 @@ NODE
 15. 高频 topic 的 `interviewAnswer` 能读出“30 秒结论 -> 核心机制 -> 追问边界”的层次。
 16. 运行结构化质量扫描 `npm run quality:scan`，确认没有模板化空话、前端通用追问、占位式追问答案或正文行内编号残留。
 17. 运行内容质量评分 `npm run quality:audit`，确认单 topic、单领域和全库总体均达到 90 分以上。
-18. 若改动发布态 topic，运行 `npm run quality:llm:packet`，提交 `.quality-review/reports/<reviewId>.json`，并确认 `npm run quality:llm:verify` 通过。
+18. 若新增、大改或不确定发布态 topic 的语义质量，运行 `npm run quality:refine:interactive` 做测试预览或正式精修。
 19. 图示必须逐张检查：节点是否专属、关系是否清楚、是否和 topic 相关、fallback/caption 是否能解释图意，不能只检查 Mermaid 语法是否通过。
 
 建议附加检查关键词：

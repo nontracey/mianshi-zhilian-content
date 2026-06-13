@@ -18,7 +18,7 @@
 - `schemas/`：内容 schema。
 - `scripts/`：内容生成与校验脚本。
 - `.githooks/`：本地 Git hooks，需要执行 `npm run hooks:install` 后才会生效。
-- `.quality-review/reports/`：LLM 内容质量评审报告，CI 会验证报告是否匹配当前改动。
+- `.quality-refine/`：本地精修器运行产物和测试预览输出，已被 `.gitignore` 忽略。
 
 ## 本地命令
 
@@ -27,14 +27,27 @@ npm install
 npm run generate  # 需要设置 CONTENT_SOURCE_ROOT 环境变量指向原始 Markdown 目录
 npm run sync:env  # 从正式内容同步生成 staging/draft 隔离副本
 npm run validate
+npm run quality:scan
+npm run quality:audit
+npm run quality:refine:interactive  # 交互式启动内容精修器
 npm run hooks:install  # 每个本地 clone 需要安装一次 Git hooks
-npm run quality:llm:packet
-npm run quality:llm:run -- --cli qwen  # 也可换成 claude/gemini/opencode 等外部 CLI
-npm run quality:llm:prune
-npm run quality:llm:verify
 ```
 
 内容规范来自《面试智练内容格式规范》。用户侧知识结构只保留"领域 -> 分类 -> 知识点"，不使用阶段、天数或排期概念。
+
+## 内容精修器
+
+维护者需要做语义质量、事实正确性、专家口吻和面试可用性检查时，使用本地精修器：
+
+```bash
+npm run quality:refine:interactive
+```
+
+交互器支持选择同步阶段、运行模式、领域、topic、CLI agent 和模型降级链。测试预览模式只精修单篇并在终端渲染结果；正式模式会把选中的 topic 逐篇发给外部 CLI/LLM 精修，成功后按阶段同步到 `staging/`、`draft/`。
+
+注意：一个 CLI 调用只处理一个 topic。选择领域或多个 topic 只是建立队列，不会把整个领域塞进同一个 prompt。静态 `90` 分只是验收兜底，不会阻止已达标 topic 进入第一轮 LLM 精修。
+
+详细说明见 [docs/quality-refine.md](docs/quality-refine.md)。
 
 ## ⚠️ 创建新领域指南（必读）
 
@@ -98,12 +111,12 @@ topics/{domain}/{filename}.json
 
 1. **修改内容**（知识点、分类、领域等），或在 [内容工作台](https://github.com/nontracey/mianshi-zhilian-studio) 编辑
 2. **验证内容**：`npm run validate`
-3. **生成 LLM 评审报告**：先 `git add` 内容改动，再运行 `npm run quality:llm:packet`，然后用 `npm run quality:llm:run -- --cli <外部CLI>` 让维护者选择的非交互 CLI 写入 `.quality-review/reports/<reviewId>.json`
-4. **验证 LLM 报告**：`npm run quality:llm:verify`
+3. **运行确定性质量检查**：`npm run quality:scan && npm run quality:audit`
+4. **按需人工精修**：`npm run quality:refine:interactive`
 5. **提交 Pull Request**（fork PR 仅限 `draft/` 目录）
 6. **合并到 `main`** 后自动部署并更新版本号
 
-LLM 评审采用默认档：本地 agent 评审，仓库和 CI 只验证结构化报告，不配置任何 LLM key 或 provider。详细流程见 [docs/llm-quality-review.md](docs/llm-quality-review.md)。
+CI 不再运行 LLM 评分，也不要求提交 `.quality-review/reports/`。语义质量由维护者本地运行精修器把关；CI 只运行 `validate`、`quality:scan` 和 `quality:audit`。
 
 ### 本地 Git hook
 
@@ -113,7 +126,7 @@ LLM 评审采用默认档：本地 agent 评审，仓库和 CI 只验证结构�
 npm run hooks:install
 ```
 
-安装后，普通 `git commit` 会触发 `.githooks/pre-commit`，默认校验 staged diff 中的发布态 topic 是否已有匹配的 LLM 评审报告。如果没有安装，本地提交不会触发 hook；CI 仍会在 PR / main push 中运行 `quality:llm:verify` 兜底。
+安装后，普通 `git commit` 会触发 `.githooks/pre-commit`。当前 hook 只做快速确定性门禁：校验暂存 topic JSON 可解析，并要求暂存 topic 的静态质量分达到 90。CI 会继续运行全量 `validate`、`quality:scan` 和 `quality:audit`。
 
 ### ⚠️ 内容结构同步规则（必读）
 
@@ -320,8 +333,9 @@ App 每次加载最新 manifest/domain 后会按引用列表裁剪本地缓存�
 > **⚠️ 提交信息规范**：Cloudflare Pages API 不接受中文顿号 `、` 等特殊 Unicode 字符。请使用英文逗号 `,` 或其他 ASCII 标点替代。
 
 1. `npm ci && npm run validate` 校验内容
-2. 准备 `dist/` 目录
-3. `wrangler pages deploy dist --project-name=mianshi-zhilian-content` 部署
+2. `npm run quality:scan && npm run quality:audit` 跑确定性质量检查
+3. 准备 `dist/` 目录
+4. `wrangler pages deploy dist --project-name=mianshi-zhilian-content` 部署
 
 ### 必需配置
 
