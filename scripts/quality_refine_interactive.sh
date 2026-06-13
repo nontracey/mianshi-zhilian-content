@@ -41,6 +41,7 @@ JUDGE_COUNT=1
 DYNAMIC_SKIP_MIN=85
 JUDGE_BATCH_SIZE=5
 JUDGE_JSON_RETRIES=2
+JUDGE_WARM_CONCURRENCY=""   # 空 = 跟随 CONCURRENCY
 PROGRESS_STYLE="summary"
 HEARTBEAT_SECONDS=60
 SELECTED_DOMAIN_IDS=()
@@ -718,77 +719,74 @@ choose_judge_count() {
   # 未启用判官则本步无内容，直接通过（步骤跳转已据 JUDGE_ENABLED 决定是否进入本步）。
   [[ "$JUDGE_ENABLED" == "1" ]] || return 0
   title "判官数量与动态免改线"
-  local rc
-  if ask_number "每个判官模型跑几个判官实例（>1 用投票压方差，需模型温度>0）" "$JUDGE_COUNT" 1 8 >/dev/null; then
-    :
-  else
-    rc=$?; return "$rc"
-  fi
-  JUDGE_COUNT="$ASK_VALUE"
-  if ask_number "动态免改线 dynamic-skip-min（低于此分会进入改写；候选接受仍看回归向量）" "$DYNAMIC_SKIP_MIN" 1 100 >/dev/null; then
-    :
-  else
-    rc=$?; return "$rc"
-  fi
-  DYNAMIC_SKIP_MIN="$ASK_VALUE"
-  if ask_number "判官批量大小 judge-batch-size（首轮判前预热，走文件协议写本地缓存）" "$JUDGE_BATCH_SIZE" 1 10 >/dev/null; then
-    :
-  else
-    rc=$?; return "$rc"
-  fi
-  JUDGE_BATCH_SIZE="$ASK_VALUE"
+  local idx=0 rc warm_default
+  warm_default="${JUDGE_WARM_CONCURRENCY:-$CONCURRENCY}"
+  while (( idx < 4 )); do
+    case "$idx" in
+      0) ask_number "每个判官模型跑几个判官实例（>1 用投票压方差，需模型温度>0）" "$JUDGE_COUNT" 1 8 >/dev/null; rc=$? ;;
+      1) ask_number "动态免改线 dynamic-skip-min（低于此分会进入改写；候选接受仍看回归向量）" "$DYNAMIC_SKIP_MIN" 1 100 >/dev/null; rc=$? ;;
+      2) ask_number "判官批量大小 judge-batch-size（首轮判前预热，走文件协议写本地缓存）" "$JUDGE_BATCH_SIZE" 1 10 >/dev/null; rc=$? ;;
+      3) ask_number "判前预热并发 judge-warm-concurrency（默认与精修并发一致）" "$warm_default" 1 8 >/dev/null; rc=$? ;;
+    esac
+    if (( rc == 0 )); then
+      case "$idx" in
+        0) JUDGE_COUNT="$ASK_VALUE" ;;
+        1) DYNAMIC_SKIP_MIN="$ASK_VALUE" ;;
+        2) JUDGE_BATCH_SIZE="$ASK_VALUE" ;;
+        3) JUDGE_WARM_CONCURRENCY="$ASK_VALUE" ;;
+      esac
+      idx=$((idx + 1))
+    elif (( rc == 2 )); then
+      if (( idx == 0 )); then return 2; fi
+      idx=$((idx - 1))
+    else
+      return "$rc"
+    fi
+  done
   return 0
 }
 
 choose_quality_options() {
   title "执行参数"
-  local rc
-  if ask_number "合格分 min-score" "$MIN_SCORE" 1 100 >/dev/null; then
-    :
-  else
-    rc=$?; return "$rc"
-  fi
-  MIN_SCORE="$ASK_VALUE"
+  # 按 RUN_MODE 动态构造题表（每题一个 id），子题 b 只回退到上一题，第一题 b 才整步退回。
+  local -a fields=("min")
   if [[ "$RUN_MODE" == "refine" ]]; then
-    if ask_number "并发数 concurrency" "$CONCURRENCY" 1 8 >/dev/null; then
-      :
-    else
-      rc=$?; return "$rc"
-    fi
-    CONCURRENCY="$ASK_VALUE"
-    if ask_number "最大轮数 max-rounds" "$MAX_ROUNDS" 1 10 >/dev/null; then
-      :
-    else
-      rc=$?; return "$rc"
-    fi
-    MAX_ROUNDS="$ASK_VALUE"
-    if ask_optional_number "每轮最多处理篇数 limit" 1 9999 >/dev/null; then
-      :
-    else
-      rc=$?; return "$rc"
-    fi
-    LIMIT="$ASK_VALUE"
+    fields+=("conc" "rounds" "limit")
   fi
   if [[ "$RUN_MODE" != "audit" ]]; then
-    if ask_number "单篇失败重试次数 retries" "$RETRIES" 0 5 >/dev/null; then
-      :
-    else
-      rc=$?; return "$rc"
-    fi
-    RETRIES="$ASK_VALUE"
-    if ask_number "单篇超时秒数" "$TIMEOUT_SECONDS" 30 7200 >/dev/null; then
-      :
-    else
-      rc=$?; return "$rc"
-    fi
-    TIMEOUT_SECONDS="$ASK_VALUE"
-    if ask_number "连续多少次 CLI 不可用后降级模型" "$DEGRADE_AFTER" 1 50 >/dev/null; then
-      :
-    else
-      rc=$?; return "$rc"
-    fi
-    DEGRADE_AFTER="$ASK_VALUE"
+    fields+=("retries" "timeout" "degrade")
   fi
+  local total="${#fields[@]}"
+  local idx=0 rc field
+  while (( idx < total )); do
+    field="${fields[$idx]}"
+    case "$field" in
+      min)     ask_number "合格分 min-score" "$MIN_SCORE" 1 100 >/dev/null; rc=$? ;;
+      conc)    ask_number "并发数 concurrency" "$CONCURRENCY" 1 8 >/dev/null; rc=$? ;;
+      rounds)  ask_number "最大轮数 max-rounds" "$MAX_ROUNDS" 1 10 >/dev/null; rc=$? ;;
+      limit)   ask_optional_number "每轮最多处理篇数 limit" 1 9999 >/dev/null; rc=$? ;;
+      retries) ask_number "单篇失败重试次数 retries" "$RETRIES" 0 5 >/dev/null; rc=$? ;;
+      timeout) ask_number "单篇超时秒数" "$TIMEOUT_SECONDS" 30 7200 >/dev/null; rc=$? ;;
+      degrade) ask_number "连续多少次 CLI 不可用后降级模型" "$DEGRADE_AFTER" 1 50 >/dev/null; rc=$? ;;
+    esac
+    if (( rc == 0 )); then
+      case "$field" in
+        min)     MIN_SCORE="$ASK_VALUE" ;;
+        conc)    CONCURRENCY="$ASK_VALUE" ;;
+        rounds)  MAX_ROUNDS="$ASK_VALUE" ;;
+        limit)   LIMIT="$ASK_VALUE" ;;
+        retries) RETRIES="$ASK_VALUE" ;;
+        timeout) TIMEOUT_SECONDS="$ASK_VALUE" ;;
+        degrade) DEGRADE_AFTER="$ASK_VALUE" ;;
+      esac
+      idx=$((idx + 1))
+    elif (( rc == 2 )); then
+      if (( idx == 0 )); then return 2; fi
+      idx=$((idx - 1))
+    else
+      return "$rc"
+    fi
+  done
   return 0
 }
 
@@ -980,6 +978,7 @@ build_common_refine_args() {
     # 判官 CLI 默认 = 精修 CLI；判官模型空时由 .mjs 默认取精修主模型。
     [[ -n "$JUDGE_MODELS" ]] && COMMON_ARGS+=(--judge-models "$JUDGE_MODELS")
     COMMON_ARGS+=(--judge-count "$JUDGE_COUNT" --dynamic-skip-min "$DYNAMIC_SKIP_MIN" --judge-batch-size "$JUDGE_BATCH_SIZE" --judge-json-retries "$JUDGE_JSON_RETRIES")
+    [[ -n "$JUDGE_WARM_CONCURRENCY" ]] && COMMON_ARGS+=(--judge-warm-concurrency "$JUDGE_WARM_CONCURRENCY")
   else
     COMMON_ARGS+=(--no-judge)
   fi
@@ -1103,7 +1102,9 @@ summary() {
   fi
   if [[ "$RUN_MODE" == "refine" ]]; then
     if [[ "$JUDGE_ENABLED" == "1" ]]; then
-      printf '判官：%s × %s 实例，动态免改线 %s，batch %s，JSON重试 %s\n' "${JUDGE_MODELS:-同精修模型}" "$JUDGE_COUNT" "$DYNAMIC_SKIP_MIN" "$JUDGE_BATCH_SIZE" "$JUDGE_JSON_RETRIES"
+      printf '判官：%s × %s 实例，动态免改线 %s，batch %s，判前预热并发 %s，JSON重试 %s\n' \
+        "${JUDGE_MODELS:-同精修模型}" "$JUDGE_COUNT" "$DYNAMIC_SKIP_MIN" "$JUDGE_BATCH_SIZE" \
+        "${JUDGE_WARM_CONCURRENCY:-$CONCURRENCY}" "$JUDGE_JSON_RETRIES"
     else
       printf '判官：未启用（纯静态 keep-best）\n'
     fi

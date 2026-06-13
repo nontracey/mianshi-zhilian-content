@@ -745,23 +745,61 @@ async function warmJudgeCacheForTargets(refs, judge, cfg = {}) {
   for (let i = 0; i < missing.length; i += judge.batchSize) {
     batches.push(missing.slice(i, i + judge.batchSize));
   }
+  // 并发数：默认 = 主流程 cfg.concurrency；可被 judge.warmConcurrency 覆盖；不超过批次数
+  const requestedWarm = Math.max(1, Number(judge.warmConcurrency ?? cfg.concurrency ?? 1));
+  const warmConcurrency = Math.min(requestedWarm, batches.length);
+  // 起步 ETA：按 batch 单耗约 = min(timeoutMs, 180s) / 4 估算（保守占位）
+  const initialBatchMs = Math.min(judge.cfg?.timeoutMs ?? 600000, 180000) / 4;
+  const initialEtaMs = Math.ceil(batches.length / warmConcurrency) * initialBatchMs;
   if (cfg.progressStyle !== "quiet") {
-    console.log(`[判官] 判前预热 missing=${missing.length} cached=${cachedTopics} batchSize=${judge.batchSize}`);
+    console.log(
+      `[判官] 判前预热 missing=${missing.length} cached=${cachedTopics} batches=${batches.length} ` +
+        `batchSize=${judge.batchSize} 并发=${warmConcurrency} 预计=${formatDuration(initialEtaMs)}`,
+    );
     if (cfg.progressStyle === "summary") console.log(progressHeader("JUDGE"));
   }
   const state = { doneTopics: 0, totalTopics: missing.length, doneBatches: 0, totalBatches: batches.length, cachedTopics, startedAt: Date.now() };
   const stopHeartbeat = startJudgeHeartbeat(state, cfg.heartbeatMs, cfg);
-  try {
-    for (const batch of batches) {
-      await runJudgeBatch(batch, judge);
+  let cursor = 0;
+  let aborted = null;
+  async function warmWorker() {
+    while (true) {
+      if (shutdownRequested || aborted) return;
+      const idx = cursor;
+      if (idx >= batches.length) return;
+      cursor += 1;
+      const batch = batches[idx];
+      try {
+        await runJudgeBatch(batch, judge);
+      } catch (error) {
+        aborted = error;
+        return;
+      }
       state.doneBatches += 1;
       state.doneTopics += batch.length;
       if (cfg.progressStyle === "summary") {
-        console.log(formatJudgeProgress(state.doneBatches, state.totalBatches, state.doneTopics, state.totalTopics, cachedTopics, batch.map((item) => item.ref), state.startedAt));
+        console.log(
+          formatJudgeProgress(
+            state.doneBatches,
+            state.totalBatches,
+            state.doneTopics,
+            state.totalTopics,
+            cachedTopics,
+            batch.map((item) => item.ref),
+            state.startedAt,
+          ),
+        );
       } else if (cfg.progressStyle === "topic") {
-        console.log(`[判官] batch ${state.doneBatches}/${state.totalBatches} done=${state.doneTopics}/${state.totalTopics} refs=${batch.map((item) => item.ref).join(",")}`);
+        console.log(
+          `[判官] batch ${state.doneBatches}/${state.totalBatches} done=${state.doneTopics}/${state.totalTopics} ` +
+            `refs=${batch.map((item) => item.ref).join(",")}`,
+        );
       }
     }
+  }
+  try {
+    await Promise.all(Array.from({ length: warmConcurrency }, () => warmWorker()));
+    if (aborted) throw aborted;
   } finally {
     stopHeartbeat();
   }
@@ -2244,9 +2282,11 @@ async function main() {
   const dynamicSkipMin = Number(args["dynamic-skip-min"] ?? args["dynamic-pass-min"] ?? args["dynamic-min"] ?? 85);
   const judgeBatchSize = Number(args["judge-batch-size"] ?? 5);
   const judgeJsonRetries = Number(args["judge-json-retries"] ?? 2);
+  const judgeWarmConcurrency = Number(args["judge-warm-concurrency"] ?? concurrency);
   ensureInt(judgeCount, "judge-count", 1, 8);
   ensureInt(judgeBatchSize, "judge-batch-size", 1, 10);
   ensureInt(judgeJsonRetries, "judge-json-retries", 0, 5);
+  ensureInt(judgeWarmConcurrency, "judge-warm-concurrency", 1, maxConcurrency);
   if (!Number.isInteger(dynamicSkipMin) || dynamicSkipMin < 1 || dynamicSkipMin > 100) {
     throw new Error("--dynamic-skip-min 必须在 [1,100]（--dynamic-min 仍可作为兼容别名）");
   }
@@ -2267,11 +2307,13 @@ async function main() {
       dynamicSkipMin,
       batchSize: judgeBatchSize,
       jsonRetries: judgeJsonRetries,
+      warmConcurrency: judgeWarmConcurrency,
       cacheDir: path.join(qualityDir, "judge-cache"),
       setHash,
     };
     console.log(
-      `判官：cli=${judgeCli} 模型=[${judgeModels.map((entry) => entry ?? "CLI默认").join(", ")}] × ${judgeCount} 实例，动态免改线 ${dynamicSkipMin}，batch=${judgeBatchSize}，json重试=${judgeJsonRetries}（contentHash 缓存复用）`,
+      `判官：cli=${judgeCli} 模型=[${judgeModels.map((entry) => entry ?? "CLI默认").join(", ")}] × ${judgeCount} 实例，` +
+        `动态免改线 ${dynamicSkipMin}，batch=${judgeBatchSize}，判前预热并发=${judgeWarmConcurrency}，json重试=${judgeJsonRetries}（contentHash 缓存复用）`,
     );
   } else {
     console.log("判官：已关闭（--no-judge），仅静态 keep-best。");
