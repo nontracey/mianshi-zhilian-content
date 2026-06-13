@@ -5,6 +5,19 @@
 export const JUDGE_RUBRIC_VERSION = "judge-8dim-v1";
 export const BLOCK_JUDGE_RUBRIC_VERSION = "block-judge-v1";
 
+// 字符串值内禁止未转义 ASCII 双引号——国产模型在 evidence/reason 字段里直接写
+// `"goodToHave"` 之类引号会让 JSON 提前闭合，整批判官输出全废。
+// 这段硬规则直接拼到三个 prompt 末尾，要求模型用中文「」/反引号/\" 转义代替裸 ASCII 双引号。
+export const JSON_STRING_RULES = `
+【JSON 字符串硬规则（违反即视为非法输出）】
+1. JSON 字符串值内一律不要写未转义的 ASCII 双引号 "。需要引用术语/字段名/状态值时，必须改用以下形式之一：
+   - 中文双引号：「goodToHave」「pass」「fail」
+   - 反引号：\`goodToHave\` \`mustHave\` \`pass\`
+   - 转义：\\"goodToHave\\"
+2. 不要在字符串值里写裸换行；多行内容请用 \\n 转义或拆成多个字段。
+3. 如果你不确定某个字符是否需要转义，宁可改写措辞，也不要让 JSON.parse 失败。
+4. 整体输出必须能被 JSON.parse 成功解析，不要包 Markdown 代码围栏，不要在 JSON 外加任何解释。`;
+
 // 8 维（原 6 维对应标准 §8.4 + learnerClarity/coverage 两个正交补洞）。1-5 整数，<4 视为该维不达标。
 export const JUDGE_DIMENSIONS = [
   "accuracy", // 事实/版本/复杂度/协议行为/框架机制正确；图、表、代码也按事实核验
@@ -66,6 +79,7 @@ ${JSON.stringify(schema, null, 2)}
 
 待评审 topic JSON：
 ${JSON.stringify(topic, null, 2)}
+${JSON_STRING_RULES}
 `;
 }
 
@@ -109,6 +123,7 @@ ${JSON.stringify(schema, null, 2)}
 
 待评审 topics JSON：
 ${JSON.stringify(items.map(({ ref, topic }) => ({ ref, topic })), null, 2)}
+${JSON_STRING_RULES}
 `;
 }
 
@@ -144,6 +159,7 @@ Topic：${ref} / ${title}
 
 待比较 blocks：
 ${JSON.stringify(blocks, null, 2)}
+${JSON_STRING_RULES}
 `;
 }
 

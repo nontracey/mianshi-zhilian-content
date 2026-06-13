@@ -29,7 +29,7 @@ RUN_MODE_LABEL=""
 MIN_SCORE=90
 CONCURRENCY=3
 MAX_ROUNDS=3
-RETRIES=1
+RETRIES=2
 TIMEOUT_SECONDS=600
 DEGRADE_AFTER=3
 LIMIT=""
@@ -664,7 +664,8 @@ choose_model_chain() {
 
 choose_judge_models() {
   title "选择判官模型（动态语义/事实评审）"
-  info "判官评“静态分查不出的”事实正确性、认知顺序、零基础可读性、面试覆盖。回车=与精修同模型；0=不启用判官（纯静态、最快）。"
+  info "判官评“静态分查不出的”事实正确性、认知顺序、零基础可读性、面试覆盖。回车=与精修主模型一致（只用链首一个）；0=不启用判官（纯静态、最快）。"
+  info "提示：精修模型链是“降级链”（链首优先、挂了才换下一个）；判官默认只用链首，避免把备用模型也当判官多花一倍开销。要做多判官投票请在下面显式多选。"
   JUDGE_MODEL_VALUES=()
   JUDGE_MODEL_LABELS=()
   local line value label
@@ -678,7 +679,8 @@ choose_judge_models() {
 
   local index choice selections selected idx items
   printf ' 0. 不启用判官（纯静态 keep-best，最快）\n'
-  printf ' d. 与精修同模型（默认）：%s\n' "${MODEL_CHAIN:-CLI默认}"
+  local judge_default_model="${MODEL_CHAIN%%,*}"
+  printf ' d. 与精修主模型一致（默认，只用链首一个）：%s\n' "${judge_default_model:-CLI默认}"
   for (( index = 0; index < ${#JUDGE_MODEL_VALUES[@]}; index += 1 )); do
     printf '%2d. %s\n' "$((index + 1))" "${JUDGE_MODEL_LABELS[$index]}"
   done
@@ -695,7 +697,9 @@ choose_judge_models() {
     fi
     if [[ "$choice" == "d" || "$choice" == "D" ]]; then
       JUDGE_ENABLED=1
-      JUDGE_MODELS="$MODEL_CHAIN"
+      # 只取精修链首一个模型当判官，不把整条“降级链”当 ensemble 全跑（那会用上备用模型、多花开销）。
+      # 留空时由 quality_refine.mjs 默认取 modelChain[0]；这里显式取链首让 summary/日志更透明。
+      JUDGE_MODELS="${MODEL_CHAIN%%,*}"
       return 0
     fi
     selections="$(expand_selection "$choice" "${#JUDGE_MODEL_VALUES[@]}")"
@@ -1103,7 +1107,7 @@ summary() {
   if [[ "$RUN_MODE" == "refine" ]]; then
     if [[ "$JUDGE_ENABLED" == "1" ]]; then
       printf '判官：%s × %s 实例，动态免改线 %s，batch %s，判前预热并发 %s，JSON重试 %s\n' \
-        "${JUDGE_MODELS:-同精修模型}" "$JUDGE_COUNT" "$DYNAMIC_SKIP_MIN" "$JUDGE_BATCH_SIZE" \
+        "${JUDGE_MODELS:-同精修主模型}" "$JUDGE_COUNT" "$DYNAMIC_SKIP_MIN" "$JUDGE_BATCH_SIZE" \
         "${JUDGE_WARM_CONCURRENCY:-$CONCURRENCY}" "$JUDGE_JSON_RETRIES"
     else
       printf '判官：未启用（纯静态 keep-best）\n'

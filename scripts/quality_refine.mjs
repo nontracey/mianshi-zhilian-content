@@ -17,6 +17,7 @@ import { parseArgs, getChangedFiles, sha256 } from "./quality_llm_common.mjs";
 import { scoreTopic, buildCorpus } from "./content_quality_audit.mjs";
 import {
   BLOCK_JUDGE_RUBRIC_VERSION,
+  JSON_STRING_RULES,
   JUDGE_RUBRIC_VERSION,
   buildBlockJudgePrompt,
   buildJudgeBatchPrompt,
@@ -557,9 +558,20 @@ function applyJudgePreset(cli, timeoutMs) {
 }
 
 function buildJudgeFilePrompt(prompt, cachePath, previousError = "") {
-  const retryBlock = previousError
-    ? `\n【上一次输出无效，必须修正】${previousError}\n这一次不要复述原因，只写一个合法 JSON 对象到文件。\n`
-    : "";
+  // previousError 现在可能是结构化对象（含 message + jsonLocation 上下文片段），也可能是字符串。
+  // 把 location 片段单独贴出来，让模型能直接看到“第 40 行 227 列那段引号写错了”，而不是再去猜。
+  let retryBlock = "";
+  if (previousError) {
+    if (typeof previousError === "string") {
+      retryBlock = `\n【上一次输出无效，必须修正】${previousError}\n这一次不要复述原因，只写一个合法 JSON 对象到文件。\n`;
+    } else {
+      const { message, jsonLocation } = previousError;
+      const locLine = jsonLocation
+        ? `\n问题位置：line ${jsonLocation.line} column ${jsonLocation.column}（offset=${jsonLocation.position}）。\n该位置上下文片段（| 标注断点附近）：\n${jsonLocation.context}\n常见原因：你在 evidence/reason/notes 等字段值里写了未转义的 ASCII 双引号，把字符串提前闭合了。\n`
+        : "";
+      retryBlock = `\n【上一次输出无效，必须修正】${message}${locLine}请按 JSON 字符串硬规则改写：用「」/反引号/\\\" 替代裸 ASCII 双引号；不要在字符串值里写裸换行。\n这一次不要复述原因，直接输出一个合法的、能被 JSON.parse 通过的 JSON 对象到文件。\n`;
+    }
+  }
   return `${prompt}
 
 【最终输出协议：覆盖上文所有“返回 JSON/输出 JSON”的说法】
@@ -575,24 +587,59 @@ WROTE:${cachePath}
 ${retryBlock}`;
 }
 
-function judgeProtocolError(message) {
+function judgeProtocolError(message, extras = {}) {
   const error = new Error(message);
   error.judgeProtocolFailure = true;
+  Object.assign(error, extras);
   return error;
+}
+
+// JSON.parse 报错通常带 "at position N" / "line L column C"。把它们抽出来，再切一段上下文片段，
+// 让我们能精准把"第 40 行 227 列那个 \"" 喂给模型重写，而不是只甩一句通用错误。
+function extractJsonErrorLocation(text, error) {
+  const message = error?.message ?? "";
+  const positionMatch = message.match(/position\s+(\d+)/i);
+  const lineColMatch = message.match(/line\s+(\d+)\s+column\s+(\d+)/i);
+  let position = positionMatch ? Number(positionMatch[1]) : null;
+  let line = lineColMatch ? Number(lineColMatch[1]) : null;
+  let column = lineColMatch ? Number(lineColMatch[2]) : null;
+  if (position == null && line != null && column != null) {
+    const lines = text.split("\n");
+    let acc = 0;
+    for (let i = 0; i < line - 1 && i < lines.length; i += 1) acc += lines[i].length + 1;
+    position = acc + Math.max(0, column - 1);
+  }
+  if (position == null) return null;
+  if (line == null || column == null) {
+    let l = 1;
+    let c = 1;
+    for (let i = 0; i < position && i < text.length; i += 1) {
+      if (text[i] === "\n") { l += 1; c = 1; } else { c += 1; }
+    }
+    line = l;
+    column = c;
+  }
+  const ctxStart = Math.max(0, position - 80);
+  const ctxEnd = Math.min(text.length, position + 80);
+  const before = text.slice(ctxStart, position);
+  const after = text.slice(position, ctxEnd);
+  const context = `${before}|${after}`.replace(/\s+/g, " ").slice(0, 240);
+  return { line, column, position, context };
 }
 
 function strictParseJudgeJson(text, label) {
   try {
     return JSON.parse(text);
   } catch (error) {
-    throw judgeProtocolError(`${label} 写入的评审 JSON 非法：${error.message}`);
+    const jsonLocation = extractJsonErrorLocation(text, error);
+    throw judgeProtocolError(`${label} 写入的评审 JSON 非法：${error.message}`, { jsonLocation });
   }
 }
 
 // 单次判官调用：内嵌 prompt -> 本地文件 JSON（和精修器写缓存协议一致，避免 stdout 大 JSON 被截断/污染）。
 async function runJudgeProcessJson(prompt, judge, model, ref, index) {
   const attempts = judge.jsonRetries + 1;
-  let previousError = "";
+  let previousError = null; // 现在传整个 error 对象（含 jsonLocation），prompt 拼装时再展开
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const outDir = path.join(judge.cacheDir, "outputs");
     await mkdir(outDir, { recursive: true });
@@ -633,9 +680,21 @@ async function runJudgeProcessJson(prompt, judge, model, ref, index) {
       const jsonText = cacheContent.slice(0, endIdx).trim();
       return strictParseJudgeJson(jsonText, label);
     } catch (error) {
-      previousError = error.message;
+      // 限流/上游错误兜底：stdout 里夹着 429/quota/throttl 这类信号时，标记成可用性失败，
+      // 让上层（runRefinePool / warm 预热）能感知到“该退避，不是判官 prompt 写坏了”。
+      const stdoutHit = availabilityFailureMatch(stdout);
+      const messageHit = availabilityFailureMatch(error.message ?? "");
+      if (stdoutHit || messageHit) {
+        error.availabilityFailure = true;
+        const ctx = (stdoutHit ?? messageHit).context;
+        console.log(`[JUDGE] 检测到可用性失败信号 ${ref}：${ctx}`);
+      }
+      previousError = error;
       if (attempt >= attempts) throw error;
-      console.log(`[JUDGE] JSON 文件协议失败，重试 ${attempt}/${attempts} ${ref}: ${error.message}`);
+      const locTag = error.jsonLocation
+        ? ` @line ${error.jsonLocation.line} col ${error.jsonLocation.column}`
+        : "";
+      console.log(`[JUDGE] JSON 文件协议失败，重试 ${attempt}/${attempts} ${ref}${locTag}: ${error.message}`);
     }
   }
   throw new Error(`判官 JSON 文件协议失败：${ref}`);
@@ -677,8 +736,10 @@ async function runJudges(topic, ref, judge) {
         const parsed = await runJudgeProcessJson(prompt, judge, model, ref, index);
         reviews.push(normalizeJudgeReview(parsed));
       } catch (error) {
-        if (error.judgeProtocolFailure) throw error;
-        console.log(`[JUDGE] 评审失败 ${ref} m=${model ?? "默认"} #${index + 1}: ${error.message}`);
+        // 判官协议失败（多次重试仍写坏 JSON）也只降级、绝不上抛——否则判前 runJudges 会一路抛穿
+        // worker(无 catch) 把整轮 run 崩掉。这里当“该判官此次不可用”，reviews 为空时返回 null → 退回静态护栏。
+        const tag = error.judgeProtocolFailure ? "JSON协议失败(降级静态)" : "评审失败";
+        console.log(`[JUDGE] ${tag} ${ref} m=${model ?? "默认"} #${index + 1}: ${error.message}`);
       }
     }
   }
@@ -692,20 +753,52 @@ async function runJudgeBatch(items, judge) {
   if (!items.length) return new Map();
   const byRef = new Map(items.map((item) => [item.ref, []]));
   const prompt = buildJudgeBatchPrompt(items);
+  let batchFatal = null; // 批量协议失败时记下，后面降级单篇兜底
   for (const model of judge.models) {
     for (let index = 0; index < judge.count; index += 1) {
       if (shutdownRequested) break;
-      const parsed = await runJudgeProcessJson(prompt, judge, model, `batch:${items.length}`, index);
-      const normalized = normalizeJudgeBatchReviews(parsed, items);
-      for (const { ref, review } of normalized) byRef.get(ref).push(review);
+      try {
+        const parsed = await runJudgeProcessJson(prompt, judge, model, `batch:${items.length}`, index);
+        const normalized = normalizeJudgeBatchReviews(parsed, items);
+        for (const { ref, review } of normalized) byRef.get(ref).push(review);
+      } catch (error) {
+        // 批量 prompt 一旦坏掉（JSON 非法 / 模型遗漏 ref / 进程失败），整批 16 篇都拿不到结果。
+        // 单批失败先记下来，整批所有 model × count 跑完后再决定要不要降级到单篇模式。
+        batchFatal = batchFatal ?? error;
+        const tag = error.judgeProtocolFailure ? "JSON 协议" : "进程";
+        console.log(
+          `[JUDGE] 批量评审${tag}失败 m=${model ?? "默认"} #${index + 1}/${judge.count} ` +
+            `size=${items.length}：${error.message}`,
+        );
+      }
     }
   }
   const out = new Map();
+  const fallbackQueue = [];
   for (const item of items) {
     const agg = aggregateReviews(byRef.get(item.ref) ?? []);
     if (agg) {
       out.set(item.ref, agg);
       await writeJudgeCache(item.topic, judge, agg);
+    } else if (batchFatal) {
+      fallbackQueue.push(item);
+    }
+  }
+  // 整批拿不到任何结果 -> 退到“单篇 runJudges”模式，避免一篇坏 JSON 把同批 N 篇全部拖垮。
+  if (fallbackQueue.length) {
+    console.log(
+      `[JUDGE] 批量整批失败，降级为单篇模式重跑 ${fallbackQueue.length}/${items.length} 篇：` +
+        `${fallbackQueue.map((item) => item.ref).slice(0, 4).join(",")}` +
+        (fallbackQueue.length > 4 ? ` …+${fallbackQueue.length - 4}` : ""),
+    );
+    for (const item of fallbackQueue) {
+      if (shutdownRequested) break;
+      try {
+        const agg = await runJudges(item.topic, item.ref, judge);
+        if (agg) out.set(item.ref, agg); // writeJudgeCache 已在 runJudges 内部完成
+      } catch (error) {
+        console.log(`[JUDGE] 单篇兜底仍失败 ${item.ref}：${error.message}`);
+      }
     }
   }
   return out;
@@ -756,10 +849,13 @@ async function warmJudgeCacheForTargets(refs, judge, cfg = {}) {
       `[判官] 判前预热 missing=${missing.length} cached=${cachedTopics} batches=${batches.length} ` +
         `batchSize=${judge.batchSize} 并发=${warmConcurrency} 预计=${formatDuration(initialEtaMs)}`,
     );
-    if (cfg.progressStyle === "summary") console.log(progressHeader("JUDGE"));
+    if (cfg.progressStyle === "summary" && !dashboard.enabled) console.log(progressHeader("JUDGE"));
   }
   const state = { doneTopics: 0, totalTopics: missing.length, doneBatches: 0, totalBatches: batches.length, cachedTopics, startedAt: Date.now() };
-  const stopHeartbeat = startJudgeHeartbeat(state, cfg.heartbeatMs, cfg);
+  const useDashboard = dashboard.enabled;
+  if (useDashboard) dashboard.updateJudge(state);
+  // dashboard 启用时由它的 1s 重绘 timer 顶替心跳行；未启用时走旧的 console.log 心跳。
+  const stopHeartbeat = useDashboard ? () => {} : startJudgeHeartbeat(state, cfg.heartbeatMs, cfg);
   let cursor = 0;
   let aborted = null;
   async function warmWorker() {
@@ -777,7 +873,9 @@ async function warmJudgeCacheForTargets(refs, judge, cfg = {}) {
       }
       state.doneBatches += 1;
       state.doneTopics += batch.length;
-      if (cfg.progressStyle === "summary") {
+      if (useDashboard) {
+        dashboard.updateJudge(state);
+      } else if (cfg.progressStyle === "summary") {
         console.log(
           formatJudgeProgress(
             state.doneBatches,
@@ -802,6 +900,7 @@ async function warmJudgeCacheForTargets(refs, judge, cfg = {}) {
     if (aborted) throw aborted;
   } finally {
     stopHeartbeat();
+    if (useDashboard) dashboard.clearJudge();
   }
 }
 
@@ -828,8 +927,9 @@ async function runBlockJudges({ ref, title, blocks }, judge) {
         const reviews = normalizeBlockJudgeReview(parsed, blocks);
         for (const review of reviews) byKey.get(review.key)?.push(review);
       } catch (error) {
-        if (error.judgeProtocolFailure) throw error;
-        console.log(`[JUDGE] 块级评审失败 ${ref} m=${model ?? "默认"} #${index + 1}: ${error.message}`);
+        // 同 runJudges：块级判官协议失败也只降级（返回 null → 块级 keep-best 退回静态/整篇判定），不上抛崩溃。
+        const tag = error.judgeProtocolFailure ? "块级JSON协议失败(降级)" : "块级评审失败";
+        console.log(`[JUDGE] ${tag} ${ref} m=${model ?? "默认"} #${index + 1}: ${error.message}`);
       }
     }
   }
@@ -931,11 +1031,22 @@ function templatesByRef(audit) {
   return map;
 }
 
-function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministicScore, cachePath, findingLines = []) {
+function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministicScore, cachePath, findingLines = [], previousError = null) {
   const todayYmd = new Date().toISOString().slice(0, 10);
   const spec = REFINE_SPEC.split("${todayYmd}").join(todayYmd);
   const issues = failingInfo?.issues ?? [];
   const tmpl = templates ?? [];
+  // 上一次输出解析失败 → 把“具体哪坏了 + 位置上下文”喂回去，让模型精准修格式，而不是同 prompt 再撞一次。
+  // 关键诉求：失败要因为内容不够好，而不是少括号/少逗号/裸引号/中英文标点这种格式问题。
+  let retryBlock = "";
+  if (previousError) {
+    const message = typeof previousError === "string" ? previousError : previousError.message;
+    const jsonLocation = typeof previousError === "string" ? null : previousError.jsonLocation;
+    const locLine = jsonLocation
+      ? `\n上次失败位置：line ${jsonLocation.line} column ${jsonLocation.column}（offset=${jsonLocation.position}）。该位置上下文（| 标断点附近）：\n${jsonLocation.context}\n最常见原因：某个字符串值里写了未转义的 ASCII 双引号或裸换行，把字符串/对象提前截断了。\n`
+      : "";
+    retryBlock = `\n【上一次输出无法被程序解析，必须修正——这是 JSON 格式问题，不是内容问题，不要因此删改内容】${message}${locLine}修正要点：① 整份必须是一个能被 JSON.parse 通过的对象；② 字符串值里的双引号一律转义为 \\\\" 或改用中文「」/反引号；③ 换行用 \\\\n，不要写裸换行；④ 不要漏逗号、不要留多余 trailing comma、所有括号要配对闭合。请以下面【当前 topic JSON】为基底重写、只改文字内容，不要解释。\n`;
+  }
   const judgeBlock = findingLines.length
     ? `\n【动态判官（资深评审）指出的具体缺口——这是“每一块更精准”的重点，逐条消除】\n${findingLines
         .map((line, index) => `${index + 1}. ${line}`)
@@ -950,13 +1061,15 @@ function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministi
         .join("\n")}\n`
     : "";
   return `${spec}
-
+${retryBlock}
 【本篇当前确定性审计分】${deterministicScore ?? failingInfo?.score ?? "?"}/100，静态验收线 ${minScore}。
 静态分数只是验收兜底，不是跳过理由。你必须先在内部按真人专家口径重新评分和找问题，再直接输出精修后的完整 JSON；不要输出评分过程。
 
 【本篇被扣分的具体缺口（务必逐条消除）】
 ${issueBlock}
 ${templateBlock}${judgeBlock}
+【降低格式出错的关键做法（务必照做）】下面【当前 topic JSON】本身就是一份格式完全正确的模板。请把它当基底：保持所有字段名、括号层级、引号转义方式与它一致，只改写需要提升的“文字内容”，不要重排结构、不要新造字段名、不要改动你没必要改的部分的标点与转义。这样能把 JSON 格式出错概率降到最低——记住：我们要的失败是“内容不够好”，绝不接受“少括号/少逗号/裸引号/中英文标点”这类格式失败。
+
 【输出要求】不要在 stdout 输出 JSON 内容、不要解释、不要 markdown 代码围栏。把改写后的完整 topic JSON 对象（从 { 开始到 } 结束、单一对象、合法 JSON）写入下面这个绝对路径的文件：
 ${cachePath}
 
@@ -970,6 +1083,7 @@ WROTE:${cachePath}
 不要在 stdout 输出 JSON 内容或任何其它文字。
 
 今天日期是 ${todayYmd}，updatedAt 必须设为该值。
+${JSON_STRING_RULES}
 
 【当前 topic JSON】
 ${JSON.stringify(topic, null, 2)}
@@ -1539,7 +1653,9 @@ async function tryBlockKeepBest({ original, candidate, ref, corpus, beforeStatic
   if (judge?.enabled && beforeReview) {
     mergedReview = await runJudges(merged, ref, judge);
     decision = mergedReview
-      ? acceptByJudge({ before: beforeReview, after: mergedReview, staticBefore: beforeStaticReport.score, staticAfter: mergedStaticReport.score, minStatic: 90 })
+      // 地板用棘轮口径（与纯静态 staticRegressionVectorAccepts 一致）：现版 ≥90 才要求候选 ≥90；
+      // 现版本来 <90 时只要求“候选不低于现版”，让 80->85 这类真实改善也能逐格上挪，而不是被 90 硬地板退回更差旧版。
+      ? acceptByJudge({ before: beforeReview, after: mergedReview, staticBefore: beforeStaticReport.score, staticAfter: mergedStaticReport.score, minStatic: Math.min(90, beforeStaticReport.score) })
       : { accept: false, reason: "块级合并后判官失败，降级整篇接受/拒绝" };
   } else {
     decision = staticRegressionVectorAccepts(beforeStaticReport, mergedStaticReport)
@@ -1570,7 +1686,10 @@ async function tryBlockKeepBest({ original, candidate, ref, corpus, beforeStatic
 
 // writeTo 不为空时写到该路径（预览模式，不动仓库）；否则原子写回仓库 ref。
 // corpus 用于落盘前的静态 keep-best：候选静态分不严格高于现版就保留旧版（“越跑越高、不许改烂”）。
-async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, model, writeTo, corpus, judge) {
+// setPhase(phase): 可选回调，用于把当前阶段标签写回 pool 的 active map，
+// 让 summary 心跳能区分子 agent 当前是 judgeBefore/refineCall/blockJudge/judgeAfter/merging 哪个阶段。
+async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, model, writeTo, corpus, judge, setPhase) {
+  const phase = typeof setPhase === "function" ? setPhase : () => {};
   const original = JSON.parse(readFileSync(path.join(root, ref), "utf8"));
   const attempts = cfg.retries + 1;
   const mode = writeTo ? "PREVIEW" : "REFINE";
@@ -1598,35 +1717,56 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
   let beforeReview = null;
   let findingLines = [];
   if (!writeTo && judge?.enabled) {
+    phase("judgeBefore");
     beforeReview = await runJudges(original, ref, judge);
-    if (beforeReview) {
-      findingLines = findingsToPromptLines(beforeReview);
-      if (staticBefore >= minScore && judgePasses(beforeReview, judge.dynamicSkipMin)) {
-        if (detailedProgress) {
-          console.log(`[TOPIC] 已达标，跳过改写 ${ref}（static ${staticBefore} + 动态 ${beforeReview.score}，8 维全过、无事实问题）`);
-        }
-        return {
-          ok: true,
-          attempts: 0,
-          availabilityFailure: false,
-          alreadyGood: true,
-          action: "alreadyGood",
-          decisionReason: "static + dynamic 已达标",
-          staticBefore,
-          staticAfter: staticBefore,
-          dynamicBefore: beforeReview.score,
-          dynamicAfter: beforeReview.score,
-        };
+    if (!beforeReview) {
+      // 判官启用 = 判官必需。判前（已含 judge 内部 jsonRetries）仍拿不到动态评审 → 绝不退回“双静态”（那不是精修），
+      // 直接判该篇失败、计入最终报告的“判官评审失败”。本轮该篇静态若仍 <minScore，下一轮会重新进队列再试（跨轮重试）。
+      if (detailedProgress) console.log(`[TOPIC] 判官评审失败（判前），判该篇失败 ${ref}`);
+      return {
+        ok: false,
+        attempts: 0,
+        error: "判官评审失败（判前无法获得动态评审，已重试到上限）",
+        judgeFailure: true,
+        availabilityFailure: false,
+        keptOld: false,
+        action: "failed",
+        staticBefore,
+        staticAfter: null,
+        dynamicBefore: undefined,
+      };
+    }
+    findingLines = findingsToPromptLines(beforeReview);
+    if (staticBefore >= minScore && judgePasses(beforeReview, judge.dynamicSkipMin)) {
+      if (detailedProgress) {
+        console.log(`[TOPIC] 已达标，跳过改写 ${ref}（static ${staticBefore} + 动态 ${beforeReview.score}，8 维全过、无事实问题）`);
       }
+      return {
+        ok: true,
+        attempts: 0,
+        availabilityFailure: false,
+        alreadyGood: true,
+        action: "alreadyGood",
+        decisionReason: "static + dynamic 已达标",
+        staticBefore,
+        staticAfter: staticBefore,
+        dynamicBefore: beforeReview.score,
+        dynamicAfter: beforeReview.score,
+      };
     }
   }
+  // 上一次 attempt 若是“格式/解析类失败”（非 keptOld），把结构化错误喂回下一次 prompt 让模型精准修格式。
+  let previousFormatError = null;
+  let attemptsMade = 0; // 实际跑了几次（keptOld 会 break，真实次数 < 配置上限），用于汇总重试统计不虚高
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    attemptsMade = attempt;
+    phase("refineCall");
     const tmp = mkdtempSync(path.join(tmpdir(), "quality-refine-"));
     const attemptLabel = `${mode} ${ref} attempt=${attempt}/${attempts} model=${model ?? "CLI默认"}`;
     const cachePath = path.join(cacheDir, `${safeRef}.attempt${attempt}.json`);
     // 旧产物先删，避免子 agent 没写而我们读到上次 attempt 的内容。
     await rm(cachePath, { force: true });
-    const prompt = buildRefinePrompt(original, audit.failingMap.get(ref), templates.get(ref), minScore, audit.scoreMap.get(ref), cachePath, findingLines);
+    const prompt = buildRefinePrompt(original, audit.failingMap.get(ref), templates.get(ref), minScore, audit.scoreMap.get(ref), cachePath, findingLines, previousFormatError);
     let raw = "";
     try {
       const args = buildCliArgs(cfg, prompt, model);
@@ -1695,7 +1835,11 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
       try {
         parsed = extractJson(jsonText);
       } catch (jsonError) {
-        throw new Error(`${jsonError.message}（cache 长度 ${clean(jsonText).length}，尾部="${tailLine(jsonText) || ""}"）`);
+        // 附上 JSON 报错的精确行列 + 上下文片段，下一次 attempt 的 prompt 会把它喂回模型精准修格式。
+        const formatError = new Error(`${jsonError.message}（cache 长度 ${clean(jsonText).length}，尾部="${tailLine(jsonText) || ""}"）`);
+        const loc = extractJsonErrorLocation(clean(jsonText), jsonError);
+        if (loc) formatError.jsonLocation = loc;
+        throw formatError;
       }
       // JSON 解析成功，先用黑名单识别错误响应（429/限流/上游错误等），再用白名单确认是 topic 契约。
       // 这样 LLM/网关返回 {code:429,message,details} 之类合法 JSON 但非 topic 契约时，
@@ -1742,8 +1886,10 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
       // 再对拼好的整篇复判；复判不过则降级为下面的整篇接受/拒绝。
       let blockResult = null;
       if (corpus) {
+        phase("blockJudge");
         blockResult = await tryBlockKeepBest({ original, candidate: parsed, ref, corpus, beforeStaticReport: staticBeforeReport, beforeReview, judge });
         if (blockResult.accept) {
+          phase("merging");
           await writeTopicAtomic(ref, blockResult.topic);
           if (detailedProgress) {
             console.log(
@@ -1778,15 +1924,21 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
       if (judge?.enabled && beforeReview) {
         // 判后：对候选判一次。回归向量（不退步任一维 + 不新增事实问题 + 静态≥90 + 至少一处改善）才接受。
         // 不拿“总分”当唯一开关，避免误杀“部分更好但总分波动”的候选（这是块级合并前的整篇近似）。
+        phase("judgeAfter");
         afterReview = await runJudges(parsed, ref, judge);
         if (afterReview) {
-          decision = acceptByJudge({ before: beforeReview, after: afterReview, staticBefore, staticAfter: after, minStatic: 90 });
+          // 棘轮地板：现版 ≥90 守 90；现版 <90 时只要不低于现版即可接受真实改善（避免把更好的 <90 候选退回更差旧版）。
+          decision = acceptByJudge({ before: beforeReview, after: afterReview, staticBefore, staticAfter: after, minStatic: Math.min(90, staticBefore) });
         } else {
-          // 判后失败：退回静态严格护栏，宁可保留旧版也不在“无动态信号”下放行。
-          decision = { accept: after > staticBefore, reason: after > staticBefore ? `静态↑(判后失败,退回静态护栏)` : `静态未升且判后失败` };
+          // 判官启用但判后拿不到评审：绝不退回“双静态”放行（那不是精修）。抛出 → 被 attempt catch 捕获 → 重试；
+          // 重试到上限仍失败 → 该篇计入最终报告的“判官评审失败”。磁盘保留旧版（绝不在无动态信号下覆盖）。
+          const judgeErr = new Error("判官评审失败（判后无法获得动态评审，已重试到上限）");
+          judgeErr.judgeFailure = true; // 标记：这是判官坏了，不是精修输出格式坏了 —— 别把它当格式错误喂回 prompt
+          throw judgeErr;
         }
       } else {
-        // --no-judge 或判前失败：Phase 1 静态严格护栏（候选静态分必须严格高于现版）。
+        // --no-judge（用户显式选择纯静态模式）：Phase 1 静态严格护栏（候选静态分必须严格高于现版）。
+        // 注意：judge 启用时不会走到这里——判前拿不到评审已直接判失败，不存在“judge 启用却退静态”的路径。
         decision = { accept: after > staticBefore, reason: after > staticBefore ? `static ${staticBefore} -> ${after}` : `static ${after} <= ${staticBefore}` };
       }
       const duplicate = duplicateBlockRegression(original, parsed);
@@ -1794,6 +1946,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
         decision = { accept: false, reason: `重复块守卫：${duplicate}` };
       }
       if (decision.accept) {
+        phase("merging");
         await writeTopicAtomic(ref, parsed);
         if (detailedProgress) console.log(`[TOPIC] 已写回 ${ref}（${decision.reason}${afterReview ? `，动态 ${beforeReview.score}->${afterReview.score}` : ""}）`);
         if (detailedProgress) console.log(`[TOPIC] 完成 ${attemptLabel}`);
@@ -1810,17 +1963,24 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
           blockMerge: blockResult ? { attempted: blockResult.attempted, reason: blockResult.reason, changedBlocks: blockResult.changedBlocks, mergedBlocks: blockResult.mergedBlocks?.length ?? 0 } : null,
         };
       }
-      // 候选未优于现版：保留旧版、本 attempt 不写。记为 keptOld，继续重试（下个 attempt 可能更好）。
+      // 候选未优于现版：保留旧版、本 attempt 不写。记为 keptOld。
+      // 不在同一次调用里重试——本轮 prompt/findings 不变，同 prompt 再调一次对确定性模型是纯浪费（实测会 double 调用）；
+      // retries 语义是“失败重试”，keptOld 是“合法但没更好”不算失败。真要再 roll，交给跨轮循环（下一轮带新审计/findings 再试）。
       keptOld = true;
       bestRejectedAfter = bestRejectedAfter === null ? after : Math.max(bestRejectedAfter, after);
       lastError = new Error(`候选未优于现版，保留旧版（${decision.reason}）`);
       if (detailedProgress) console.log(`[TOPIC] 保留旧版 ${attemptLabel}: ${decision.reason}`);
       lastError.decisionReason = decision.reason;
-      continue;
+      break;
     } catch (error) {
       if (error.interrupted || shutdownRequested) throw error;
       keptOld = false; // 本 attempt 是真失败（CLI/解析/契约/不变量），不是“保留旧版”
       lastError = error;
+      // 把本次失败喂回下一次 attempt 的 prompt：解析/格式类错误带上 jsonLocation，让模型精准修格式而不是再撞一次。
+      // 可用性失败（限流/超时）、判官失败（判官坏了不是精修输出坏了）都不喂回——否则会误导模型“你的 JSON 坏了”。
+      previousFormatError = error.availabilityFailure || error.judgeFailure
+        ? null
+        : { message: error.message, jsonLocation: error.jsonLocation ?? null };
       if (detailedProgress) {
         console.log(`[TOPIC] 失败 ${attemptLabel}: ${error.message}`);
         if (attempt < attempts) console.log(`[RETRY] ${ref} ${attempt}/${attempts}: ${error.message}`);
@@ -1837,7 +1997,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
   }
   return {
     ok: false,
-    attempts,
+    attempts: attemptsMade, // 实际尝试次数（keptOld break 后 < 配置上限），避免汇总把“一次就保留旧版”误报成触发了重试
     error: lastError?.message ?? "unknown error",
     availabilityFailure,
     keptOld,
@@ -1934,7 +2094,7 @@ function progressHeader(kind) {
   if (kind === "JUDGE") {
     return "[判官] 批次    完成     进度     已用    剩余    缓存  最新";
   }
-  return "[精修] 完成     进度    免改 写回 合并 保留 失败 运行   均时   剩余   已用  最新";
+  return "[精修] 完成     进度    免改 写回 合并 保留 失败 运行(判/生)   均时   剩余   已用  最新";
 }
 
 function maybePrintProgressHeader(kind, index) {
@@ -1951,15 +2111,27 @@ function outcomeLabel(outcome) {
   }[outcome] ?? outcome;
 }
 
-function formatRefineProgress(snapshot, activeSize, outcome, ref, cfg, counters) {
+function formatRefineProgress(snapshot, active, outcome, ref, cfg, counters) {
   const latest = `${outcomeLabel(outcome)} ${compactRef(ref)}`;
   const elapsed = Date.now() - (counters.startedAt ?? Date.now());
   const avg = avgDuration(counters);
   const eta = remainingEtaByAverage(counters, cfg);
+  const buckets = { judge: 0, gen: 0, other: 0 };
+  let activeSize = 0;
+  if (active && typeof active.entries === "function") {
+    for (const [, item] of active.entries()) {
+      activeSize += 1;
+      buckets[phaseBucket(item.phase)] += 1;
+    }
+  } else {
+    activeSize = Number(active) || 0;
+  }
+  // 运行列：总并发(判官/生成)，让 summary 一行也能看出此刻有几个子 agent 在审判、几个在生成。
+  const runCol = `${String(activeSize).padStart(2)}(${buckets.judge}/${buckets.gen})`;
   return `[精修] ${String(snapshot.processed).padStart(3)}/${String(snapshot.total).padEnd(3)} ` +
     `${pct(snapshot.processed, snapshot.total).padStart(6)} ` +
     `${String(snapshot.good).padStart(5)} ${String(snapshot.written).padStart(3)} ${String(snapshot.merged).padStart(6)} ` +
-    `${String(snapshot.kept).padStart(4)} ${String(snapshot.failed).padStart(4)} ${String(activeSize).padStart(3)} ` +
+    `${String(snapshot.kept).padStart(4)} ${String(snapshot.failed).padStart(4)} ${runCol.padStart(8)} ` +
     `${formatDuration(avg).padStart(6)} ${formatDuration(eta).padStart(6)} ${formatDuration(elapsed).padStart(7)} ${latest}`;
 }
 
@@ -1974,19 +2146,273 @@ function formatJudgeProgress(doneBatches, totalBatches, doneTopics, totalTopics,
     `${String(cachedTopics).padStart(6)} ${latest}`;
 }
 
+// ====== LiveDashboard：summary 模式下原地刷新的顶部仪表盘 ======
+// 思路：
+//   - 在 process.stdout.write 上挂一层 hook：外部任何 write 都会先把当前面板擦掉，
+//     让原始内容自然写出去（事件、日志、子进程 inherit stdout 全保留滚动），写完后再
+//     把面板重画到 cursor 当前位置。
+//   - dashboard 自身的重绘也走同一通道；render() 只更新内部 state，setInterval 触发 paint。
+//   - 非 TTY 或 --progress != summary 时不启用；调用 enable() 是 no-op，update/event 一律
+//     回退到普通 console.log，保留旧的滚屏行为兼容 CI / 重定向。
+//   - 退出（stop / process exit / shutdownRequested）时要把 cursor 恢复、面板擦干净，避免
+//     终端留 ANSI 残影。
+class LiveDashboard {
+  constructor() {
+    this.enabled = false;
+    this.state = {
+      title: "精修进度",
+      counters: null,
+      cfg: null,
+      poolActive: null,
+      judge: null,
+      lastEvents: [],
+      runStartedAt: null, // 全程墙钟起点：面板顶栏显示“全程已用”
+      stage: "", // 当前阶段：审计 / 判官预热 / 精修 / 收尾审计
+      round: 0,
+      maxRounds: 0,
+    };
+    this.painted = 0; // 上次面板占了多少行
+    this.repaintTimer = null;
+    this.originalWrite = null;
+    this.originalErrWrite = null;
+    this.painting = false; // 防止 paint 内部 write 触发递归
+    this.dirty = false;
+  }
+
+  enable(stream = process.stdout) {
+    if (this.enabled) return;
+    if (!stream || !stream.isTTY) return; // 非 TTY 不启用
+    this.enabled = true;
+    this.stream = stream;
+    this.originalWrite = stream.write.bind(stream);
+    // hook：任何外部写入 stdout 都先擦面板，让事件文本自然滚动，写完后立刻重画。
+    stream.write = (chunk, encoding, cb) => {
+      if (this.painting) return this.originalWrite(chunk, encoding, cb);
+      this.clearPainted();
+      const ret = this.originalWrite(chunk, encoding, cb);
+      this.paint();
+      return ret;
+    };
+    // stderr 也劫持一下，防止 process.stderr.write 的输出被面板盖住或乱位。
+    if (process.stderr && process.stderr.isTTY) {
+      this.originalErrWrite = process.stderr.write.bind(process.stderr);
+      process.stderr.write = (chunk, encoding, cb) => {
+        if (this.painting) return this.originalErrWrite(chunk, encoding, cb);
+        this.clearPainted();
+        const ret = this.originalErrWrite(chunk, encoding, cb);
+        this.paint();
+        return ret;
+      };
+    }
+    this.repaintTimer = setInterval(() => {
+      if (this.dirty) this.paint();
+    }, 1000);
+    this.repaintTimer.unref?.();
+  }
+
+  disable() {
+    if (!this.enabled) return;
+    this.clearPainted();
+    if (this.originalWrite) this.stream.write = this.originalWrite;
+    if (this.originalErrWrite) process.stderr.write = this.originalErrWrite;
+    if (this.repaintTimer) clearInterval(this.repaintTimer);
+    this.repaintTimer = null;
+    this.originalWrite = null;
+    this.originalErrWrite = null;
+    this.enabled = false;
+  }
+
+  setStatic({ title, cfg, runStartedAt }) {
+    if (title) this.state.title = title;
+    if (cfg) this.state.cfg = cfg;
+    if (runStartedAt) this.state.runStartedAt = runStartedAt;
+    this.dirty = true;
+  }
+
+  // 标记当前所处阶段（审计 / 判官预热 / 精修 / 收尾审计）+ 轮次，顶栏统一展示，让用户随时看清“现在在干嘛、第几轮”。
+  setStage(stage, { round, maxRounds } = {}) {
+    if (stage !== undefined) this.state.stage = stage;
+    if (round !== undefined) this.state.round = round;
+    if (maxRounds !== undefined) this.state.maxRounds = maxRounds;
+    this.dirty = true;
+    if (this.enabled) this.paint();
+  }
+
+  updateRefine({ counters, active }) {
+    this.state.counters = counters ? { ...counters } : null;
+    if (active && typeof active.entries === "function") {
+      this.state.poolActive = [...active.entries()].map(([ref, item]) => ({
+        ref,
+        phase: item.phase,
+        phaseStartedAt: item.phaseStartedAt ?? item.startedAt,
+        startedAt: item.startedAt,
+        model: item.model,
+      }));
+    } else {
+      this.state.poolActive = null;
+    }
+    this.dirty = true;
+    if (this.enabled) this.paint();
+  }
+
+  updateJudge(state) {
+    this.state.judge = state ? { ...state } : null;
+    this.dirty = true;
+    if (this.enabled) this.paint();
+  }
+
+  clearJudge() {
+    this.state.judge = null;
+    this.dirty = true;
+    if (this.enabled) this.paint();
+  }
+
+  clearPainted() {
+    if (!this.enabled || !this.painted) return;
+    this.painting = true;
+    try {
+      // 把 cursor 上移到面板第一行，再清屏到结尾。
+      this.originalWrite(`\x1b[${this.painted}F\x1b[0J`);
+      this.painted = 0;
+    } finally {
+      this.painting = false;
+    }
+  }
+
+  paint() {
+    if (!this.enabled) return;
+    this.dirty = false;
+    const lines = this.renderLines();
+    this.painting = true;
+    try {
+      this.clearPaintedInternal();
+      // 在 cursor 当前位置打印面板，每行末尾清行末，最后留一行空白把 cursor 停在面板底部。
+      const text = lines.map((line) => `${line}\x1b[0K`).join("\n") + "\n";
+      this.originalWrite(text);
+      this.painted = lines.length + 1; // +1 = 末尾的换行让 cursor 落在下一行起点
+    } finally {
+      this.painting = false;
+    }
+  }
+
+  clearPaintedInternal() {
+    if (!this.painted) return;
+    this.originalWrite(`\x1b[${this.painted}F\x1b[0J`);
+    this.painted = 0;
+  }
+
+  renderLines() {
+    const lines = [];
+    const width = Math.max(40, Math.min(this.stream?.columns ?? 100, 160));
+    const sep = "─".repeat(width);
+    const counters = this.state.counters;
+    const cfg = this.state.cfg ?? {};
+    const judge = this.state.judge;
+
+    lines.push(`╭─ ${this.state.title} ${"─".repeat(Math.max(0, width - this.state.title.length - 4))}`);
+    // 顶栏：当前阶段 + 轮次 + 全程已用，让“总进度/已执行多久”一眼可见（不随单轮重置）。
+    const runElapsed = this.state.runStartedAt ? Date.now() - this.state.runStartedAt : 0;
+    const roundLabel = this.state.maxRounds ? ` · 轮次 ${this.state.round}/${this.state.maxRounds}` : "";
+    const stageLabel = this.state.stage ? this.state.stage : "运行中";
+    lines.push(` 阶段  ${stageLabel}${roundLabel} · 全程已用 ${formatDuration(runElapsed)}`);
+    if (counters) {
+      const total = counters.total ?? 0;
+      const done = counters.processed ?? 0;
+      const ratio = total ? done / total : 0;
+      const barWidth = Math.max(10, Math.min(40, width - 30));
+      const filled = Math.round(barWidth * ratio);
+      const bar = "█".repeat(filled) + "░".repeat(Math.max(0, barWidth - filled));
+      lines.push(` 本轮  [${bar}] ${done}/${total}  ${pct(done, total)}`);
+      lines.push(
+        ` 状态  免改 ${counters.good ?? 0}  写回 ${counters.written ?? 0}  合并 ${counters.merged ?? 0}  保留 ${counters.kept ?? 0}  失败 ${counters.failed ?? 0}`,
+      );
+      const buckets = { judge: 0, gen: 0, other: 0 };
+      const active = this.state.poolActive ?? [];
+      for (const item of active) buckets[phaseBucket(item.phase)] += 1;
+      const concurrency = cfg.concurrency ?? "?";
+      lines.push(
+        ` 并发  运行 ${active.length}/${concurrency} · 判官 ${buckets.judge}  生成 ${buckets.gen}  其他 ${buckets.other}`,
+      );
+      const elapsed = counters.startedAt ? Date.now() - counters.startedAt : 0;
+      const avg = avgDuration(counters);
+      const eta = remainingEtaByAverage(counters, cfg);
+      lines.push(
+        ` 速度  本轮均时 ${formatDuration(avg)}  本轮剩余 ${formatDuration(eta)}  本轮已用 ${formatDuration(elapsed)}`,
+      );
+    } else {
+      lines.push(" 本轮  （等待开始）");
+    }
+
+    const active = this.state.poolActive ?? [];
+    if (active.length) {
+      lines.push(`├─ active workers (${active.length}) ${"─".repeat(Math.max(0, width - 24 - String(active.length).length))}`);
+      const now = Date.now();
+      // 全展示，按 phaseStartedAt 升序（最久的排前），让长尾子 agent 一眼看见。
+      const sorted = [...active].sort((a, b) => (a.phaseStartedAt ?? 0) - (b.phaseStartedAt ?? 0));
+      for (const item of sorted) {
+        const dur = formatDuration(now - (item.phaseStartedAt ?? item.startedAt ?? now));
+        const phase = phaseLabel(item.phase);
+        const ref = compactRef(item.ref, Math.max(20, width - 30));
+        lines.push(` · ${ref}  ${phase}  ${dur}`);
+      }
+    }
+
+    if (judge) {
+      lines.push(`├─ 判官预热（判前评审，走缓存）${"─".repeat(Math.max(0, width - 28))}`);
+      const elapsed = judge.startedAt ? Date.now() - judge.startedAt : 0;
+      const eta = remainingEtaByThroughput(judge.doneTopics, judge.totalTopics, judge.startedAt);
+      lines.push(
+        ` 批次 ${judge.doneBatches ?? 0}/${judge.totalBatches ?? 0}  篇 ${judge.doneTopics ?? 0}/${judge.totalTopics ?? 0}  ` +
+          `缓存命中 ${judge.cachedTopics ?? 0}  剩余 ${formatDuration(eta)}  已用 ${formatDuration(elapsed)}`,
+      );
+    }
+
+    lines.push(`╰${sep.slice(1)}`);
+    return lines;
+  }
+}
+
+const dashboard = new LiveDashboard();
+
+function phaseLabel(phase) {
+  return {
+    starting: "启动",
+    judgeBefore: "判前",
+    refineCall: "生成",
+    blockJudge: "块判",
+    judgeAfter: "判后",
+    merging: "写回",
+  }[phase] ?? phase ?? "?";
+}
+
+function phaseBucket(phase) {
+  // 把细粒度 phase 归到 3 个桶：判官（judgeBefore/blockJudge/judgeAfter）、生成（refineCall）、其他（starting/merging）。
+  // 用于心跳行的 "判官=A 生成=B" 概览。
+  if (phase === "judgeBefore" || phase === "blockJudge" || phase === "judgeAfter") return "judge";
+  if (phase === "refineCall") return "gen";
+  return "other";
+}
+
 function startPoolHeartbeat(counters, active, heartbeatMs, cfg) {
   if (!heartbeatMs || heartbeatMs <= 0) return () => {};
   const startedAt = Date.now();
   const heartbeat = setInterval(() => {
     const now = Date.now();
-    const activeItems = [...active.entries()]
+    const entries = [...active.entries()];
+    const buckets = { judge: 0, gen: 0, other: 0 };
+    for (const [, item] of entries) buckets[phaseBucket(item.phase)] += 1;
+    const activeItems = entries
       .slice(0, 3)
-      .map(([ref, item]) => `${compactRef(ref, 26)} ${formatDuration(now - item.startedAt)}`);
+      .map(([ref, item]) => {
+        const phaseAt = item.phaseStartedAt ?? item.startedAt;
+        return `${compactRef(ref, 22)}·${phaseLabel(item.phase)} ${formatDuration(now - phaseAt)}`;
+      });
     const suffix = activeItems.length ? ` activeNow=${activeItems.join(" | ")}` : "";
     console.log(
       `[精修] 心跳 ${counters.processed}/${counters.total} ${pct(counters.processed, counters.total)} ` +
         `免改=${counters.good ?? 0} 写回=${counters.written} 合并=${counters.merged ?? 0} 保留=${counters.kept ?? 0} 失败=${counters.failed} ` +
-        `运行=${active.size}/${cfg.concurrency} 均时=${formatDuration(avgDuration(counters))} 剩余=${formatDuration(remainingEtaByAverage(counters, cfg))} 已用=${formatDuration(now - startedAt)}${suffix}`,
+        `运行=${active.size}/${cfg.concurrency}（判官${buckets.judge} 生成${buckets.gen} 其他${buckets.other}） ` +
+        `均时=${formatDuration(avgDuration(counters))} 剩余=${formatDuration(remainingEtaByAverage(counters, cfg))} 已用=${formatDuration(now - startedAt)}${suffix}`,
     );
   }, heartbeatMs);
   heartbeat.unref();
@@ -2000,7 +2426,11 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
   counters.startedAt ??= Date.now();
   counters.topicMs ??= 0;
   counters.timed ??= 0;
-  const stopHeartbeat = cfg.progressStyle === "summary"
+  // dashboard 启用时由它的 setInterval 自己 1s 重绘一次，无需再单独 console.log 心跳行；
+  // 未启用时（progressStyle != summary 或非 TTY）回退到旧的 console.log 心跳。
+  const useDashboard = dashboard.enabled;
+  if (useDashboard) dashboard.updateRefine({ counters, active });
+  const stopHeartbeat = !useDashboard && cfg.progressStyle === "summary"
     ? startPoolHeartbeat(counters, active, cfg.heartbeatMs, cfg)
     : () => {};
   async function worker() {
@@ -2009,12 +2439,29 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
       const ref = targets[index++];
       const model = currentModel(modelState);
       const itemStartedAt = Date.now();
-      active.set(ref, { model: model ?? "默认", startedAt: itemStartedAt });
+      // phase = 子 agent 当前所在阶段：starting / judgeBefore / refineCall / blockJudge / judgeAfter / merging
+      // setPhase 由 refineOneTopic 在每个阶段切换时回调，让 summary 心跳能区分“审判 vs 生成”。
+      active.set(ref, { model: model ?? "默认", startedAt: itemStartedAt, phase: "starting", phaseStartedAt: itemStartedAt });
+      if (useDashboard) dashboard.updateRefine({ counters, active });
+      const setPhase = (next) => {
+        const entry = active.get(ref);
+        if (!entry) return;
+        entry.phase = next;
+        entry.phaseStartedAt = Date.now();
+        if (useDashboard) dashboard.updateRefine({ counters, active });
+      };
       let result;
       try {
-        result = await refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, model, undefined, corpus, judge);
+        result = await refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, model, undefined, corpus, judge, setPhase);
+      } catch (error) {
+        // 兜底：中断信号照常上抛（让 shutdown 生效）；其余任何意外错误（如 refineOneTopic 顶部读文件/打分抛错）
+        // 都转成“该篇失败”，绝不让单篇的意外把整轮 run 崩掉——这是“跑完不用管”的最后一道防线。
+        if (error?.interrupted || shutdownRequested) throw error;
+        console.log(`[FAIL] ${compactRef(ref, 50)} 意外错误（已隔离为单篇失败）：${error.message}`);
+        result = { ok: false, attempts: 0, error: `未捕获异常：${error.message}`, availabilityFailure: false, keptOld: false, action: "failed" };
       } finally {
         active.delete(ref);
+        if (useDashboard) dashboard.updateRefine({ counters, active });
       }
       counters.topicMs += Date.now() - itemStartedAt;
       counters.timed += 1;
@@ -2060,9 +2507,14 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
       );
       const domain = ref.split("/")[1];
       const label = outcome === "good" ? "GOOD" : outcome === "written" ? "OK  " : outcome === "merged" ? "MERG" : outcome === "kept" ? "KEEP" : "FAIL";
-      if (cfg.progressStyle === "summary") {
+      if (useDashboard) {
+        // 面板自身已涵盖完整快照，这里只把每篇的"判定结果 + ref"作为事件行滚到面板下方，
+        // 让用户能从滚动区追溯历史；面板会被 stdout hook 在写入后自动重绘。
+        console.log(`[${label.trim()}] ${compactRef(ref, 50)}${result.error ? ` (${result.error})` : ""}`);
+        dashboard.updateRefine({ counters, active });
+      } else if (cfg.progressStyle === "summary") {
         maybePrintProgressHeader("REFINE", snapshot.processed);
-        console.log(formatRefineProgress(snapshot, active.size, label.trim().toLowerCase(), ref, cfg, counters));
+        console.log(formatRefineProgress(snapshot, active, label.trim().toLowerCase(), ref, cfg, counters));
       } else if (cfg.progressStyle === "topic") {
         console.log(
           `[${snapshot.processed}/${snapshot.total} ★${snapshot.good} ✓${snapshot.written} ⇄${snapshot.merged} ◦${snapshot.kept} ✗${snapshot.failed} | ${domain} | m=${model ?? "默认"}] ` +
@@ -2124,6 +2576,38 @@ async function refinePoolWithConcurrencyFallback(targets, audit, templates, cfg,
   return allResults;
 }
 
+// 把一条失败 error 文本归类，供汇总按原因统计（让用户一眼看出“坏在程序还是内容/上游”）。
+function classifyFailure(error) {
+  const text = String(error ?? "");
+  if (/判官评审失败|判官.*不可用|动态评审/.test(text)) return "判官评审失败";
+  if (/超时|timeout after|timed out/i.test(text)) return "超时";
+  if (/限流|服务不可用|上游错误|rate.?limit|too many requests|\b429\b|\b50[023]\b|quota|throttl|overloaded|可用性|unavailable/i.test(text)) return "限流/服务不可用";
+  if (/未把 JSON 写入缓存|未按文件协议|缺少 \/\/---END---|写入未完成/.test(text)) return "子agent未写入缓存";
+  if (/不是当前 topic 契约|错误响应 JSON 而非 topic 契约/.test(text)) return "输出非topic契约";
+  if (/没有 JSON 对象|JSON.*(?:非法|解析)|Unexpected (?:token|end)|parse/i.test(text)) return "JSON解析失败";
+  if (/schema 不变量失败|不变量失败/.test(text)) return "schema不变量";
+  if (/exit code|signal/i.test(text)) return "进程非零退出";
+  return "其他";
+}
+
+// 汇总重试/恢复：basesByRef 累计每 ref 跨轮/跨 attempt 的处理情况，配合最终状态判断“重试后是否成功”。
+function summarizeRetries(retryStats, state) {
+  const triggered = [];
+  for (const [ref, info] of retryStats.entries()) {
+    if (info.maxAttempts > 1 || info.rounds > 1) triggered.push(ref);
+  }
+  let recovered = 0;
+  let stillFailed = 0;
+  let retained = 0;
+  for (const ref of triggered) {
+    const s = state.get(ref);
+    if (s?.lastOk) recovered += 1;
+    else if (s?.lastKeptOld) retained += 1;
+    else stillFailed += 1;
+  }
+  return { triggered: triggered.length, recovered, stillFailed, retained, triggeredRefs: triggered };
+}
+
 function summarizeFailingByDomain(refs) {
   const byDomain = new Map();
   for (const ref of refs) {
@@ -2166,14 +2650,37 @@ async function gcOldRuns(qualityDir, keep) {
   }
 }
 
+// judge-cache/outputs/ 只存判官失败的现场样本（诊断用），从不参与命中判断，会无限增长。
+// 启动时按 mtime 仅保留最近 keep 个，其余删掉，避免缓存目录越攒越大。
+async function gcJudgeOutputs(outputsDir, keep) {
+  let entries;
+  try {
+    entries = await readdir(outputsDir, { withFileTypes: true });
+  } catch {
+    return; // 目录不存在直接跳过
+  }
+  const files = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const file = path.join(outputsDir, entry.name);
+    const st = await stat(file).catch(() => null);
+    if (st) files.push({ file, mtimeMs: st.mtimeMs });
+  }
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const { file } of files.slice(keep)) {
+    await rm(file, { force: true }).catch(() => {});
+  }
+}
+
 async function main() {
+  const runStartedAt = Date.now(); // 全程墙钟起点：汇总里报“本次执行多久”
   const args = parseArgs();
   const scope = String(args.scope ?? "all").trim();
   const minScore = Number(args["min-score"] ?? 90);
   const concurrency = Number(args.concurrency ?? 2);
   const autoConcurrencyMin = Number(args["auto-concurrency-min"] ?? (concurrency > 3 ? 3 : concurrency));
   const maxRounds = Number(args["max-rounds"] ?? 3);
-  const retries = Number(args.retries ?? 1);
+  const retries = Number(args.retries ?? 2); // 默认 2：给“格式失败带反馈重写”留足自愈空间（keptOld 已 break、不吃重试预算）
   const timeoutMs = Number(args["timeout-ms"] ?? 600000);
   const limit = args.limit ? Number(args.limit) : Infinity;
   const dryRun = Boolean(args["dry-run"]);
@@ -2267,6 +2774,7 @@ async function main() {
   const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${sha256(scope).slice(0, 6)}`;
   const qualityDir = path.join(root, ".quality-refine");
   await gcOldRuns(qualityDir, 3);
+  await gcJudgeOutputs(path.join(qualityDir, "judge-cache", "outputs"), 50);
   const runDir = path.join(qualityDir, runId);
   await mkdir(runDir, { recursive: true });
   const progressPath = path.join(runDir, "progress.jsonl");
@@ -2358,6 +2866,18 @@ async function main() {
       `[${summarizeFailingByDomain([...initialFailing]) || "无"}]`,
   );
 
+  // dashboard 仅在 summary 模式 + TTY 输出时启用；非 TTY / 重定向到日志文件 / topic|quiet 模式自动降级为原滚屏。
+  if (cfg.progressStyle === "summary") {
+    const modelsLabel = modelChain.map((entry) => entry ?? "CLI默认").join(" → ");
+    const judgeLabel = judge ? `${judge.models.map((entry) => entry ?? "CLI默认").join(",")}×${judgeCount}` : "off";
+    dashboard.setStatic({
+      title: `quality_refine  scope=${scope}  cli=${cfg.cli}  精修=${modelsLabel}  判官=${judgeLabel}`,
+      cfg: { concurrency: cfg.concurrency, judge: judgeLabel, minScore },
+      runStartedAt,
+    });
+    dashboard.enable(process.stdout);
+  }
+
   // 跨轮状态：bestScore 用于检测“连续无提升 -> 放弃，避免死循环”。
   const state = new Map(targetRefs.map((ref) => [ref, {
     attempts: 0,
@@ -2367,9 +2887,12 @@ async function main() {
     lastError: null,
   }]));
   const stuck = new Set();
+  // 跨轮重试累计：每 ref 处理了几轮（rounds）+ 单轮内最多 attempt 次数（maxAttempts），用于汇总“重试后是否成功”。
+  const retryStats = new Map();
 
   for (let round = 1; round <= maxRounds; round += 1) {
     if (shutdownRequested) throw makeInterruptedError();
+    dashboard.setStage("① 全量审计", { round, maxRounds });
     const audit = await runAudit(minScore, cfg);
     const templates = templatesByRef(audit);
     const corpus = buildRefineCorpus(); // keep-best：候选与现版用同一套 scoreTopic + 语料库对比
@@ -2405,8 +2928,10 @@ async function main() {
       return;
     }
 
+    dashboard.setStage("② 判官预热", { round, maxRounds });
     await warmJudgeCacheForTargets(ordered, judge, cfg);
 
+    dashboard.setStage("③ 精修", { round, maxRounds });
     const counters = { total: ordered.length, processed: 0, good: 0, written: 0, merged: 0, kept: 0, failed: 0 };
     const results = await refinePoolWithConcurrencyFallback(ordered, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters, corpus, judge);
     for (const result of results) {
@@ -2417,6 +2942,10 @@ async function main() {
       item.lastAlreadyGood = result.alreadyGood ?? false;
       item.lastError = result.error ?? null;
       item.lastResult = result;
+      const rs = retryStats.get(result.ref) ?? { rounds: 0, maxAttempts: 0 };
+      rs.rounds += 1;
+      rs.maxAttempts = Math.max(rs.maxAttempts, result.attempts ?? 1);
+      retryStats.set(result.ref, rs);
     }
     console.log(
       `[round ${round}] 完成：已达标(免改) ${counters.good}，整篇写回 ${counters.written}，块级合并 ${counters.merged}，保留旧版(未改善) ${counters.kept}，失败 ${counters.failed}`,
@@ -2424,6 +2953,7 @@ async function main() {
   }
 
   // 最终审计 + 汇总
+  dashboard.setStage("④ 收尾审计", { round: maxRounds, maxRounds });
   const finalAudit = await runAudit(minScore, cfg);
   const processed = targetRefs.filter((ref) => state.get(ref).attempts > 0);
   const unprocessed = targetRefs.filter((ref) => state.get(ref).attempts === 0);
@@ -2474,11 +3004,23 @@ async function main() {
       error: result?.error ?? null,
     };
   });
+  // 失败原因分类统计（按 classifyFailure 归桶），让汇总能说清“几条限流、几条坏 JSON、几条未写入缓存”。
+  const failureBreakdown = {};
+  for (const ref of failedExecutions) {
+    const cat = classifyFailure(state.get(ref).lastError);
+    failureBreakdown[cat] = (failureBreakdown[cat] ?? 0) + 1;
+  }
+  const retrySummary = summarizeRetries(retryStats, state);
+  const durationMs = Date.now() - runStartedAt;
   const summary = {
     runId,
     scope,
     selectedTargets: targetRefs.length,
     minScore,
+    durationMs,
+    durationLabel: formatDuration(durationMs),
+    retry: { triggered: retrySummary.triggered, recovered: retrySummary.recovered, stillFailed: retrySummary.stillFailed, retained: retrySummary.retained },
+    failureBreakdown,
     cli: cfg.cli,
     modelChain: modelChain.map((entry) => entry ?? "CLI default"),
     degradeAfter,
@@ -2512,18 +3054,33 @@ async function main() {
   };
   await writeFile(path.join(runDir, "summary.json"), `${JSON.stringify(summary, null, 2)}\n`);
 
+  // 精修结束：关掉 dashboard，让最终汇总用普通滚屏输出。
+  dashboard.disable();
+
   console.log(`\n==== 精修完成 ====`);
+  console.log(`本次耗时：${formatDuration(durationMs)}    最终模型：${currentModel(modelState) ?? "CLI默认"}    全量 overall：${initialAudit.overallScore} -> ${finalAudit.overallScore}`);
   console.log(`处理：${processed.length}/${targetRefs.length}    已达标(免改)：${goodRefs.length}    整篇写回：${writtenRefs.length}    块级合并：${mergedRefs.length}    保留旧版(未改善)：${keptOldRefs.length}    执行失败：${failedExecutions.length}    修好原静态未达标：${fixed.length}/${initialFailing.size}    仍 <${minScore}：${stillFailing.length}    放弃(stuck)：${stuck.size}`);
+  if (retrySummary.triggered) {
+    console.log(`重试：${retrySummary.triggered} 篇触发重试（多次 attempt 或跨轮再处理）→ 重试后达标 ${retrySummary.recovered}，保留旧版 ${retrySummary.retained}，仍失败 ${retrySummary.stillFailed}`);
+  } else {
+    console.log(`重试：本次无 topic 触发重试。`);
+  }
   if (unprocessed.length) console.log(`未处理：${unprocessed.length} 篇（通常是 limit/max-rounds 不足）`);
-  console.log(`全量 overall：${initialAudit.overallScore} -> ${finalAudit.overallScore}`);
   console.log(`产物：${path.relative(root, runDir)}（progress.jsonl / summary.json / 每篇 raw 输出）`);
+  if (failedExecutions.length) {
+    const breakdownLabel = Object.entries(failureBreakdown)
+      .sort((a, b) => b[1] - a[1])
+      .map(([cat, n]) => `${cat}×${n}`)
+      .join("  ");
+    console.log(`执行失败原因分类：${breakdownLabel}`);
+  }
   if (stillFailing.length) {
     console.log(`仍未达标（按分数升序，前 20）：`);
     for (const item of summary.stillFailingDetail.slice(0, 20)) console.log(`- ${item.score}/100  ${item.ref}`);
   }
   if (failedExecutions.length) {
-    console.log(`执行失败（前 20）：`);
-    for (const ref of failedExecutions.slice(0, 20)) console.log(`- ${ref}: ${state.get(ref).lastError}`);
+    console.log(`执行失败明细（前 20）：`);
+    for (const ref of failedExecutions.slice(0, 20)) console.log(`- [${classifyFailure(state.get(ref).lastError)}] ${ref}: ${state.get(ref).lastError}`);
   }
   // 退出码只反映“是否还有目标 <minScore 或没跑完”。keptOld / 已达标篇上的执行失败不阻断同步，
   // 因为磁盘上留的是合格的旧版内容（“越跑越高、不许改烂”：失败时绝不退步）。
@@ -2534,12 +3091,18 @@ async function main() {
 
 installSignalHandlers();
 
-main().catch((error) => {
-  if (error?.interrupted) {
-    console.error("[INTERRUPT] 精修已中断。");
-    process.exitCode = 130;
-    return;
-  }
-  console.error(error);
-  process.exitCode = 1;
-});
+main()
+  .catch((error) => {
+    if (error?.interrupted) {
+      console.error("[INTERRUPT] 精修已中断。");
+      process.exitCode = 130;
+      return;
+    }
+    console.error(error);
+    process.exitCode = 1;
+  })
+  .finally(() => {
+    try {
+      dashboard.disable();
+    } catch {}
+  });
