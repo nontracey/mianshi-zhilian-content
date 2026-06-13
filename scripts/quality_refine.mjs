@@ -4,11 +4,12 @@
 //     从架构上根除“主 agent 长会话上下文溢出”。
 //   - 目标集由 scope/topic 选择决定；确定性审计只提供上下文、验收和重试信号，
 //     不把静态 >=90 当成“无需送 LLM 看”的跳过条件。
-//   - 弱模型只负责“改”：CLI 只把改写后的整篇 JSON 输出到 stdout（只读/plan 模式，零写权限），
-//     由本驱动校验 schema 不变量后才原子落盘；坏输出永不污染仓库。
+//   - 弱模型只负责“改”：CLI 把改写后的整篇 JSON 分块写入 .quality-refine/<runId>/topic-cache/ 缓存文件
+//     （auto-edit / workspace-write 沙盒，写权限限定在工作区，prompt 严格指定缓存绝对路径），
+//     由本驱动校验 schema 不变量后才原子落盘到 topics/；坏输出永不污染仓库。
 //   - 验收门禁 = 现有 content_quality_audit.mjs（≥minScore、8 维有地板、反刷分），不放宽任何口径。
 import { spawn, spawnSync } from "node:child_process";
-import { mkdir, rename, rm, writeFile, appendFile } from "node:fs/promises";
+import { mkdir, readdir, rename, rm, stat, writeFile, appendFile } from "node:fs/promises";
 import { mkdtempSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -68,7 +69,7 @@ const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任�
 - rubric：必须含 mustHave（≥1 条）/ goodToHave / commonMistakes / scoreWeights 四个字段；scoreWeights 必须包含 coverage / accuracy / interviewExpression / depth 四个键，每个值是 0-100 的整数，**四个值之和必须严格等于 100**。
 - 总长度：精修后用 JSON.stringify 序列化的字符串长度不得少于原 topic 的 60%（信息量只增不减）。`;
 
-// ===== CLI 预设（与评审同款只读/plan：精修器只输出 JSON，不需要任何写/工具权限）=====
+// ===== CLI 预设（auto-edit/workspace-write 允许写缓存文件，prompt 严格限定写缓存路径）=====
 function inferPreset(cliName, preset) {
   if (preset && preset !== "auto") return preset;
   const base = cliName.split("/").pop().toLowerCase();
@@ -83,11 +84,11 @@ function inferPreset(cliName, preset) {
 function applyPreset(cfg) {
   const preset = inferPreset(cfg.cli, cfg.preset);
   const presets = {
-    qwen: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: ["--approval-mode", "plan"], usePty: true },
-    gemini: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: ["--approval-mode", "plan"], usePty: true },
+    qwen: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: ["--approval-mode", "auto-edit"], usePty: true },
+    gemini: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: ["--approval-mode", "auto_edit"], usePty: true },
     claude: { baseArgs: ["-p"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [], usePty: false },
     opencode: { baseArgs: ["run"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [], usePty: false },
-    codex: { baseArgs: ["exec", "--skip-git-repo-check"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: ["--sandbox", "read-only"], usePty: false },
+    codex: { baseArgs: ["exec", "--skip-git-repo-check"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: ["--sandbox", "workspace-write"], usePty: false },
     generic: { baseArgs: [], modelArg: cfg.modelArg, promptArg: cfg.promptArg, promptMode: cfg.promptMode, extraArgs: [], usePty: cfg.usePty },
   };
   const selected = presets[preset] ?? presets.generic;
@@ -308,8 +309,20 @@ function summarizeErrorResponse(parsed) {
 
 // 文本兜底（仅在 JSON 解析失败、无法用结构化判断时使用）
 function looksLikeAvailabilityFailureText(text) {
-  return /(rate.?limit|too many requests|\b429\b|\b50[023]\b|quota exceeded|throttl|overloaded|service busy|server busy|temporar(?:y|ily) unavailable|service unavailable|gateway timeout|connection reset|econnreset|etimedout|eai_again|enotfound|限流|请求过多|额度不足|服务繁忙|暂时不可用|网关超时)/i
-    .test(clean(text));
+  return availabilityFailureMatch(text) !== null;
+}
+
+// 返回首个命中的可用性关键词及其上下文片段，便于失败诊断；未命中返回 null。
+function availabilityFailureMatch(text) {
+  const cleaned = clean(text);
+  const re = /(rate.?limit|too many requests|\b429\b|\b50[023]\b|quota exceeded|throttl|overloaded|service busy|server busy|temporar(?:y|ily) unavailable|service unavailable|gateway timeout|connection reset|econnreset|etimedout|eai_again|enotfound|限流|请求过多|额度不足|服务繁忙|暂时不可用|网关超时)/i;
+  const m = cleaned.match(re);
+  if (!m) return null;
+  const idx = m.index ?? 0;
+  const ctxStart = Math.max(0, idx - 40);
+  const ctxEnd = Math.min(cleaned.length, idx + m[0].length + 40);
+  const context = cleaned.slice(ctxStart, ctxEnd).replace(/\s+/g, " ");
+  return { keyword: m[0], context, position: idx, totalLen: cleaned.length };
 }
 
 function formatDuration(ms) {
@@ -550,7 +563,7 @@ function templatesByRef(audit) {
   return map;
 }
 
-function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministicScore) {
+function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministicScore, cachePath) {
   const todayYmd = new Date().toISOString().slice(0, 10);
   const spec = REFINE_SPEC.split("${todayYmd}").join(todayYmd);
   const issues = failingInfo?.issues ?? [];
@@ -571,7 +584,19 @@ function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministi
 【本篇被扣分的具体缺口（务必逐条消除）】
 ${issueBlock}
 ${templateBlock}
-【输出要求】只输出改写后的完整 topic JSON 对象，从 { 开始到 } 结束。不要解释、不要 markdown 代码围栏、不要任何额外文字。今天日期是 ${todayYmd}，updatedAt 必须设为该值。
+【输出要求】不要在 stdout 输出 JSON 内容、不要解释、不要 markdown 代码围栏。把改写后的完整 topic JSON 对象（从 { 开始到 } 结束、单一对象、合法 JSON）写入下面这个绝对路径的文件：
+${cachePath}
+
+写入规则（重要，必须遵守）：
+1. 文件初始为空。如果你的写文件工具一次能写下完整 JSON，就一次写完；如果 JSON 很长担心被工具/响应截断，请分多次调用写文件工具，按"追加(append)"模式把 JSON 切成 2~5 个连续片段顺序写入同一个文件，最终拼起来仍是一个合法 JSON 对象。
+2. 全部写完后，必须再调用一次写文件工具，往该文件末尾追加一行结束标记：
+//---END---
+这行是给主进程识别"写完了"用的，不要省略，也不要写成别的样子（区分大小写）。
+3. 完成上述写入后，在 stdout 只输出一行：
+WROTE:${cachePath}
+不要在 stdout 输出 JSON 内容或任何其它文字。
+
+今天日期是 ${todayYmd}，updatedAt 必须设为该值。
 
 【当前 topic JSON】
 ${JSON.stringify(topic, null, 2)}
@@ -660,7 +685,6 @@ async function writeTopicAtomic(ref, parsed) {
 // writeTo 不为空时写到该路径（预览模式，不动仓库）；否则原子写回仓库 ref。
 async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, model, writeTo) {
   const original = JSON.parse(readFileSync(path.join(root, ref), "utf8"));
-  const prompt = buildRefinePrompt(original, audit.failingMap.get(ref), templates.get(ref), minScore, audit.scoreMap.get(ref));
   const attempts = cfg.retries + 1;
   const mode = writeTo ? "PREVIEW" : "REFINE";
   const score = audit.scoreMap.get(ref) ?? "?";
@@ -671,14 +695,21 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
     suppressDone: !detailedProgress,
     heartbeatMs: cfg.heartbeatMs,
   };
+  const safeRef = ref.replace(/[^a-z0-9]+/gi, "-");
+  const cacheDir = path.join(runDir, "topic-cache");
+  await mkdir(cacheDir, { recursive: true });
   let lastError = null;
   let availabilityFailure = false;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const tmp = mkdtempSync(path.join(tmpdir(), "quality-refine-"));
     const attemptLabel = `${mode} ${ref} attempt=${attempt}/${attempts} model=${model ?? "CLI默认"}`;
+    const cachePath = path.join(cacheDir, `${safeRef}.attempt${attempt}.json`);
+    // 旧产物先删，避免子 agent 没写而我们读到上次 attempt 的内容。
+    await rm(cachePath, { force: true });
+    const prompt = buildRefinePrompt(original, audit.failingMap.get(ref), templates.get(ref), minScore, audit.scoreMap.get(ref), cachePath);
+    let raw = "";
     try {
       const args = buildCliArgs(cfg, prompt, model);
-      let raw = "";
       if (cfg.progressStyle !== "quiet") {
         console.log(`[TOPIC] 开始 ${attemptLabel} score=${score}/100 cli=${cfg.cli}`);
       }
@@ -708,17 +739,43 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
         throw spawnError;
       }
       availabilityFailure = false; // 进程已正常产出 -> 不是可用性问题
-      if (detailedProgress) console.log(`[TOPIC] CLI 已返回，开始解析 JSON ${ref}`);
+      if (detailedProgress) console.log(`[TOPIC] CLI 已返回，开始读缓存 ${ref}`);
+
+      // 子 agent 把 JSON 分多次 append 到 cachePath，最后一行追加 //---END--- 表示写完。
+      // 这样 LLM 输出长度上限只受磁盘限制，不再被 stdout / max_tokens 截断。
+      let cacheContent;
+      try {
+        cacheContent = readFileSync(cachePath, "utf8");
+      } catch (readError) {
+        // 缓存文件不存在：要么子 agent 没遵循指令（写工具不可用 / 直接 stdout 输出 JSON），
+        // 要么进程退出但实际未完成。先用文本兜底判断可用性，再报"未写入缓存"。
+        const hit = availabilityFailureMatch(raw);
+        if (hit) {
+          availabilityFailure = true;
+          throw new Error(
+            `CLI 输出疑似服务不可用/限流：命中关键词「${hit.keyword}」@${hit.position}/${hit.totalLen} 上下文="${hit.context}"`,
+          );
+        }
+        throw new Error(
+          `子 agent 未把 JSON 写入缓存路径 ${path.relative(root, cachePath)}（stdout 长度 ${clean(raw).length}，尾部="${tailLine(raw) || ""}"，readError=${readError.code ?? readError.message}）`,
+        );
+      }
+
+      // 切掉 //---END--- 之后的内容；找不到标记就视为写入未完成（agent 中途退出 / 工具崩溃）。
+      const endMarker = "//---END---";
+      const endIdx = cacheContent.lastIndexOf(endMarker);
+      if (endIdx < 0) {
+        throw new Error(
+          `缓存文件缺少 //---END--- 结束标记，子 agent 写入未完成（cache 长度 ${clean(cacheContent).length}，尾部="${tailLine(cacheContent) || ""}"）`,
+        );
+      }
+      const jsonText = cacheContent.slice(0, endIdx);
+
       let parsed;
       try {
-        parsed = extractJson(raw);
+        parsed = extractJson(jsonText);
       } catch (jsonError) {
-        // JSON 解析失败时才用文本兜底判断是否服务不可用——避免技术内容中的"超时""不可用"等术语误判。
-        if (looksLikeAvailabilityFailureText(raw)) {
-          availabilityFailure = true;
-          throw new Error(`CLI 输出疑似服务不可用/限流：${tailLine(raw) || "no detail"}`);
-        }
-        throw jsonError;
+        throw new Error(`${jsonError.message}（cache 长度 ${clean(jsonText).length}，尾部="${tailLine(jsonText) || ""}"）`);
       }
       // JSON 解析成功，先用黑名单识别错误响应（429/限流/上游错误等），再用白名单确认是 topic 契约。
       // 这样 LLM/网关返回 {code:429,message,details} 之类合法 JSON 但非 topic 契约时，
@@ -755,7 +812,6 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
         await writeTopicAtomic(ref, parsed);
         if (detailedProgress) console.log(`[TOPIC] 已写回 ${ref}`);
       }
-      await writeFile(path.join(runDir, `${ref.replace(/[^a-z0-9]+/gi, "-")}.raw.txt`), `${clean(raw)}\n`).catch(() => {});
       if (detailedProgress) console.log(`[TOPIC] 完成 ${attemptLabel}`);
       return { ok: true, attempts: attempt, availabilityFailure: false };
     } catch (error) {
@@ -764,6 +820,12 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
       console.log(`[TOPIC] 失败 ${attemptLabel}: ${error.message}`);
       if (attempt < attempts) console.log(`[RETRY] ${ref} ${attempt}/${attempts}: ${error.message}`);
     } finally {
+      // raw 始终落盘（无论成功失败），用于失败诊断；attempt 编号区分重试。
+      if (raw) {
+        const safeRef = ref.replace(/[^a-z0-9]+/gi, "-");
+        const rawPath = path.join(runDir, `${safeRef}.attempt${attempt}.raw.txt`);
+        await writeFile(rawPath, `${clean(raw)}\n`).catch(() => {});
+      }
       await rm(tmp, { recursive: true, force: true });
     }
   }
@@ -947,6 +1009,33 @@ function ensureInt(value, name, min, max) {
   }
 }
 
+// 启动时 GC：保留 .quality-refine/ 下最近 keep 轮 runDir，其余 rm -rf。
+// 只清理形如时间戳前缀的目录（preview/ 等特殊目录跳过）。
+async function gcOldRuns(qualityDir, keep) {
+  let entries;
+  try {
+    entries = await readdir(qualityDir, { withFileTypes: true });
+  } catch {
+    return; // 目录不存在等情况静默
+  }
+  const runDirs = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (!/^\d{4}-\d{2}-\d{2}T/.test(entry.name)) continue;
+    const dir = path.join(qualityDir, entry.name);
+    const st = await stat(dir).catch(() => null);
+    if (!st) continue;
+    runDirs.push({ dir, mtimeMs: st.mtimeMs });
+  }
+  runDirs.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const stale = runDirs.slice(keep);
+  for (const { dir } of stale) {
+    await rm(dir, { recursive: true, force: true }).catch((err) => {
+      console.warn(`[gc] 清理旧 runDir 失败 ${path.relative(qualityDir, dir)}: ${err.message}`);
+    });
+  }
+}
+
 async function main() {
   const args = parseArgs();
   const scope = String(args.scope ?? "all").trim();
@@ -1045,7 +1134,9 @@ async function main() {
   if (!cliPath) throw new Error(`找不到 CLI：${cfg.cli}。请先安装或换一个 --cli。`);
 
   const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${sha256(scope).slice(0, 6)}`;
-  const runDir = path.join(root, ".quality-refine", runId);
+  const qualityDir = path.join(root, ".quality-refine");
+  await gcOldRuns(qualityDir, 3);
+  const runDir = path.join(qualityDir, runId);
   await mkdir(runDir, { recursive: true });
   const progressPath = path.join(runDir, "progress.jsonl");
   const modelState = makeModelState(modelChain, degradeAfter, degradeWindowSeconds * 1000);
