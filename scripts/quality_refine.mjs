@@ -9,13 +9,15 @@
 //   - 验收门禁 = 现有 content_quality_audit.mjs（≥minScore、8 维有地板、反刷分），不放宽任何口径。
 import { spawn, spawnSync } from "node:child_process";
 import { mkdir, rename, rm, writeFile, appendFile } from "node:fs/promises";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { parseArgs, getChangedFiles, sha256 } from "./quality_llm_common.mjs";
 
 const root = process.cwd();
 const maxConcurrency = 8;
+const activeChildren = new Map();
+let shutdownRequested = false;
 
 // 处理顺序：先小后大，便于早期发现问题、降低单次回滚成本（与 manual-refine 一致）。
 const DOMAIN_ORDER = [
@@ -117,25 +119,146 @@ function extractJson(text) {
   }
 }
 
-function runProcess(command, args, options, timeoutMs) {
+function formatDuration(ms) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes ? `${minutes}m${String(seconds).padStart(2, "0")}s` : `${seconds}s`;
+}
+
+function tailLine(text) {
+  const lines = clean(text).split(/\n/).map((line) => line.trim()).filter(Boolean);
+  return lines.at(-1)?.slice(0, 180) ?? "";
+}
+
+function fileSizeLabel(file) {
+  if (!file) return "";
+  try {
+    const size = statSync(file).size;
+    if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)}MB`;
+    if (size >= 1024) return `${Math.round(size / 1024)}KB`;
+    return `${size}B`;
+  } catch {
+    return "0B";
+  }
+}
+
+function killChildProcess(child, signal = "SIGTERM") {
+  if (!child?.pid) return;
+  try {
+    if (process.platform !== "win32") process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {}
+  }
+}
+
+function terminateActiveChildren(signal = "SIGTERM") {
+  for (const [pid, child] of activeChildren.entries()) {
+    console.log(`[INTERRUPT] 终止外部 CLI pid=${pid} signal=${signal}`);
+    killChildProcess(child, signal);
+  }
+}
+
+function makeInterruptedError(signal = "SIGINT") {
+  const error = new Error(`interrupted by ${signal}`);
+  error.interrupted = true;
+  return error;
+}
+
+function installSignalHandlers() {
+  let interrupted = false;
+  const handle = (signal) => {
+    shutdownRequested = true;
+    if (interrupted) {
+      console.log(`[INTERRUPT] 再次收到 ${signal}，强制退出。`);
+      terminateActiveChildren("SIGKILL");
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    }
+    interrupted = true;
+    console.log(`\n[INTERRUPT] 收到 ${signal}，正在停止当前精修任务和外部 CLI。`);
+    terminateActiveChildren("SIGTERM");
+    setTimeout(() => {
+      terminateActiveChildren("SIGKILL");
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    }, 3000).unref();
+  };
+  process.once("SIGINT", () => handle("SIGINT"));
+  process.once("SIGTERM", () => handle("SIGTERM"));
+}
+
+function runProcess(command, args, options, timeoutMs, progress = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, options);
+    const child = spawn(command, args, {
+      ...options,
+      detached: process.platform !== "win32",
+    });
+    if (child.pid) activeChildren.set(child.pid, child);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let settled = false;
+    const startedAt = Date.now();
+    const heartbeatMs = progress.heartbeatMs ?? 10000;
+    const label = progress.label ?? command;
+    const outputPath = progress.outputPath;
+    const outputKind = outputPath ? "capture" : "stdout";
+    const stopTimers = () => {
+      clearTimeout(timer);
+      if (heartbeat) clearInterval(heartbeat);
+    };
+    const printHeartbeat = (kind = "WAIT", force = false) => {
+      if (progress.suppressHeartbeat && !force) return;
+      const elapsed = Date.now() - startedAt;
+      const outputSize = outputPath ? fileSizeLabel(outputPath) : `${stdout.length}B`;
+      const stderrTail = tailLine(stderr);
+      console.log(
+        `[${kind}] ${label} elapsed=${formatDuration(elapsed)} / timeout=${formatDuration(timeoutMs)} ` +
+          `${outputKind}=${outputSize} stderr=${stderr.length}B${stderrTail ? ` last="${stderrTail}"` : ""}`,
+      );
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 3000).unref();
+      printHeartbeat("TIMEOUT", true);
+      killChildProcess(child, "SIGTERM");
+      setTimeout(() => killChildProcess(child, "SIGKILL"), 3000).unref();
     }, timeoutMs);
+    const heartbeat = heartbeatMs > 0 && !progress.suppressHeartbeat
+      ? setInterval(() => printHeartbeat(), heartbeatMs)
+      : null;
+    heartbeat?.unref();
+    if (!progress.suppressSpawn) {
+      console.log(`[SPAWN] ${label} pid=${child.pid ?? "?"} timeout=${formatDuration(timeoutMs)}`);
+    }
     child.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
     child.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
-    child.on("error", (error) => { clearTimeout(timer); reject(error); });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      stopTimers();
+      if (child.pid) activeChildren.delete(child.pid);
+      reject(shutdownRequested ? makeInterruptedError() : error);
+    });
     child.on("close", (code, signal) => {
-      clearTimeout(timer);
-      if (timedOut) reject(new Error(`timeout after ${timeoutMs}ms`));
-      else if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`exit code=${code} signal=${signal || ""} stderr=${stderr.trim().slice(0, 400)}`));
+      if (settled) return;
+      settled = true;
+      stopTimers();
+      if (child.pid) activeChildren.delete(child.pid);
+      const elapsed = Date.now() - startedAt;
+      if (shutdownRequested) {
+        reject(makeInterruptedError(signal || "SIGINT"));
+      } else if (timedOut) {
+        reject(new Error(`timeout after ${timeoutMs}ms`));
+      } else if (code === 0) {
+        if (!progress.suppressDone) {
+          console.log(`[DONE] ${label} elapsed=${formatDuration(elapsed)} ${outputKind}=${outputPath ? fileSizeLabel(outputPath) : `${stdout.length}B`}`);
+        }
+        resolve({ stdout, stderr });
+      } else {
+        reject(new Error(`exit code=${code} signal=${signal || ""} stderr=${stderr.trim().slice(0, 400)}`));
+      }
     });
   });
 }
@@ -180,6 +303,8 @@ function noteModelResult(modelState, result) {
 
 // ===== 确定性审计（唯一事实源 + 验收门禁）=====
 function runAudit(minScore) {
+  const startedAt = Date.now();
+  console.log(`[AUDIT] 开始确定性审计 minScore=${minScore}`);
   const result = spawnSync(
     process.execPath,
     ["scripts/content_quality_audit.mjs", "--json", `--min-score=${minScore}`],
@@ -191,6 +316,10 @@ function runAudit(minScore) {
   const audit = JSON.parse(result.stdout);
   audit.failingMap = new Map((audit.failingTopics ?? []).map((topic) => [topic.ref, topic]));
   audit.scoreMap = new Map((audit.allTopics ?? []).map((topic) => [topic.ref, topic.score]));
+  console.log(
+    `[AUDIT] 完成 overall=${audit.overallScore}/100 failing=${audit.failingTopicCount}/${audit.topicCount} ` +
+      `elapsed=${formatDuration(Date.now() - startedAt)}`,
+  );
   return audit;
 }
 
@@ -293,20 +422,45 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
   const original = JSON.parse(readFileSync(path.join(root, ref), "utf8"));
   const prompt = buildRefinePrompt(original, audit.failingMap.get(ref), templates.get(ref), minScore, audit.scoreMap.get(ref));
   const attempts = cfg.retries + 1;
+  const mode = writeTo ? "PREVIEW" : "REFINE";
+  const score = audit.scoreMap.get(ref) ?? "?";
+  const detailedProgress = cfg.progressStyle === "topic";
+  const processProgress = {
+    suppressHeartbeat: !detailedProgress,
+    suppressSpawn: !detailedProgress,
+    suppressDone: !detailedProgress,
+    heartbeatMs: cfg.heartbeatMs,
+  };
   let lastError = null;
   let availabilityFailure = false;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const tmp = mkdtempSync(path.join(tmpdir(), "quality-refine-"));
+    const attemptLabel = `${mode} ${ref} attempt=${attempt}/${attempts} model=${model ?? "CLI默认"}`;
     try {
       const args = buildCliArgs(cfg, prompt, model);
       let raw = "";
+      if (cfg.progressStyle !== "quiet") {
+        console.log(`[TOPIC] 开始 ${attemptLabel} score=${score}/100 cli=${cfg.cli}`);
+      }
       try {
         if (cfg.usePty && process.platform === "darwin") {
           const capture = path.join(tmp, "capture.txt");
-          await runProcess("script", ["-q", capture, cliPath, ...args], { cwd: root, stdio: ["ignore", "ignore", "pipe"] }, cfg.timeoutMs);
+          await runProcess(
+            "script",
+            ["-q", capture, cliPath, ...args],
+            { cwd: root, stdio: ["ignore", "ignore", "pipe"] },
+            cfg.timeoutMs,
+            { ...processProgress, label: attemptLabel, outputPath: capture },
+          );
           raw = readFileSync(capture, "utf8");
         } else {
-          const result = await runProcess(cliPath, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] }, cfg.timeoutMs);
+          const result = await runProcess(
+            cliPath,
+            args,
+            { cwd: root, stdio: ["ignore", "pipe", "pipe"] },
+            cfg.timeoutMs,
+            { ...processProgress, label: attemptLabel },
+          );
           raw = result.stdout;
         }
       } catch (spawnError) {
@@ -314,19 +468,25 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
         throw spawnError;
       }
       availabilityFailure = false; // 进程已正常产出 -> 不是可用性问题
+      if (detailedProgress) console.log(`[TOPIC] CLI 已返回，开始解析 JSON ${ref}`);
       const parsed = extractJson(raw);
       const bad = checkInvariants(original, parsed);
       if (bad) throw new Error(`schema 不变量失败：${bad}`);
       if (writeTo) {
         await mkdir(path.dirname(writeTo), { recursive: true });
         await writeFile(writeTo, `${JSON.stringify(parsed, null, 2)}\n`);
+        if (detailedProgress) console.log(`[TOPIC] 预览产物已写入 ${path.relative(root, writeTo)}`);
       } else {
         await writeTopicAtomic(ref, parsed);
+        if (detailedProgress) console.log(`[TOPIC] 已写回 ${ref}`);
       }
       await writeFile(path.join(runDir, `${ref.replace(/[^a-z0-9]+/gi, "-")}.raw.txt`), `${clean(raw)}\n`).catch(() => {});
+      if (detailedProgress) console.log(`[TOPIC] 完成 ${attemptLabel}`);
       return { ok: true, attempts: attempt, availabilityFailure: false };
     } catch (error) {
+      if (error.interrupted || shutdownRequested) throw error;
       lastError = error;
+      console.log(`[TOPIC] 失败 ${attemptLabel}: ${error.message}`);
       if (attempt < attempts) console.log(`[RETRY] ${ref} ${attempt}/${attempts}: ${error.message}`);
     } finally {
       await rm(tmp, { recursive: true, force: true });
@@ -385,31 +545,70 @@ function resolveTargetRefs(audit, scope, options, topicFilters) {
   return orderByDomain(requested);
 }
 
+function startPoolHeartbeat(counters, active, heartbeatMs) {
+  if (!heartbeatMs || heartbeatMs <= 0) return () => {};
+  const startedAt = Date.now();
+  const heartbeat = setInterval(() => {
+    const now = Date.now();
+    const activeItems = [...active.entries()]
+      .slice(0, 4)
+      .map(([ref, item]) => `${ref} ${formatDuration(now - item.startedAt)} m=${item.model ?? "默认"}`);
+    const suffix = activeItems.length ? ` current=${activeItems.join(" | ")}` : "";
+    console.log(
+      `[RUNNING] ${counters.processed}/${counters.total} ✓${counters.written} ✗${counters.failed} ` +
+        `active=${active.size} elapsed=${formatDuration(now - startedAt)}${suffix}`,
+    );
+  }, heartbeatMs);
+  heartbeat.unref();
+  return () => clearInterval(heartbeat);
+}
+
 async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters) {
   const results = [];
   let index = 0;
+  const active = new Map();
+  const stopHeartbeat = cfg.progressStyle === "summary"
+    ? startPoolHeartbeat(counters, active, cfg.heartbeatMs)
+    : () => {};
   async function worker() {
     while (index < targets.length) {
+      if (shutdownRequested) throw makeInterruptedError();
       const ref = targets[index++];
       const model = currentModel(modelState);
-      const result = await refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, model);
+      active.set(ref, { model: model ?? "默认", startedAt: Date.now() });
+      let result;
+      try {
+        result = await refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, model);
+      } finally {
+        active.delete(ref);
+      }
       noteModelResult(modelState, result);
       results.push({ ref, ...result });
       counters.processed += 1;
       if (result.ok) counters.written += 1;
       else counters.failed += 1;
+      const snapshot = {
+        processed: counters.processed,
+        total: counters.total,
+        written: counters.written,
+        failed: counters.failed,
+      };
       await appendFile(
         progressPath,
         `${JSON.stringify({ ref, status: result.ok ? "written" : "failed", attempts: result.attempts, model: model ?? "default", error: result.error, ts: new Date().toISOString() })}\n`,
       );
       const domain = ref.split("/")[1];
       console.log(
-        `[${counters.processed}/${counters.total} ✓${counters.written} ✗${counters.failed} | ${domain} | m=${model ?? "默认"}] ` +
+        `[${snapshot.processed}/${snapshot.total} ✓${snapshot.written} ✗${snapshot.failed} | ${domain} | m=${model ?? "默认"}] ` +
           `${result.ok ? "OK  " : "FAIL"} ${ref}${result.error ? ` (${result.error})` : ""}`,
       );
     }
   }
-  await Promise.all(Array.from({ length: cfg.concurrency }, worker));
+  try {
+    await Promise.all(Array.from({ length: cfg.concurrency }, worker));
+  } finally {
+    stopHeartbeat();
+  }
   return results;
 }
 
@@ -442,6 +641,11 @@ async function main() {
   const previewMode = Boolean(args.preview);
   const topicFilters = parseTopicList(args);
   const degradeAfter = Number(args["degrade-after"] ?? 3);
+  const progressStyle = String(
+    args["progress-style"] ?? process.env.QUALITY_REFINE_PROGRESS_STYLE ?? (previewMode ? "topic" : "summary"),
+  ).trim();
+  const defaultHeartbeatSeconds = progressStyle === "summary" ? 30 : 10;
+  const heartbeatSeconds = Number(args["heartbeat-seconds"] ?? process.env.QUALITY_REFINE_HEARTBEAT_SECONDS ?? defaultHeartbeatSeconds);
   const options = {
     scope,
     diffRef: args["diff-ref"],
@@ -458,6 +662,10 @@ async function main() {
   ensureInt(maxRounds, "max-rounds", 1, 10);
   ensureInt(retries, "retries", 0, 5);
   ensureInt(degradeAfter, "degrade-after", 1, 50);
+  ensureInt(heartbeatSeconds, "heartbeat-seconds", 0, 600);
+  if (!["quiet", "summary", "topic"].includes(progressStyle)) {
+    throw new Error("--progress-style 必须是 quiet | summary | topic");
+  }
   if (!Number.isInteger(timeoutMs) || timeoutMs < 30000) throw new Error("--timeout-ms 必须是 >=30000 的整数");
   if (!Number.isInteger(minScore) || minScore < 1 || minScore > 100) throw new Error("--min-score 必须在 [1,100]");
 
@@ -499,6 +707,8 @@ async function main() {
     promptMode: args["prompt-mode"] ?? "flag",
     usePty: Boolean(args["use-pty"]),
     noDefaultExtraArgs: Boolean(args["no-default-extra-args"]),
+    heartbeatMs: heartbeatSeconds * 1000,
+    progressStyle,
   });
   const cliPath = commandPath(cfg.cli);
   if (!cliPath) throw new Error(`找不到 CLI：${cfg.cli}。请先安装或换一个 --cli。`);
@@ -555,6 +765,7 @@ async function main() {
   const stuck = new Set();
 
   for (let round = 1; round <= maxRounds; round += 1) {
+    if (shutdownRequested) throw makeInterruptedError();
     const audit = runAudit(minScore);
     const templates = templatesByRef(audit);
     const firstPass = targetRefs.filter((ref) => !stuck.has(ref) && state.get(ref).attempts === 0);
@@ -635,7 +846,14 @@ async function main() {
   }
 }
 
+installSignalHandlers();
+
 main().catch((error) => {
+  if (error?.interrupted) {
+    console.error("[INTERRUPT] 精修已中断。");
+    process.exitCode = 130;
+    return;
+  }
   console.error(error);
   process.exitCode = 1;
 });

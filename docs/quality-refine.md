@@ -40,6 +40,9 @@ npm run quality:refine:interactive
 - 后续轮次只复修仍低于 `min-score` 的 topic，避免已经静态达标的内容反复重写。
 - 正式精修写回 `topics/`；只有全部目标最终达标时，交互脚本才会按阶段同步到 `staging/`、`draft/`。
 - 测试预览不改仓库内容，产物写入 `.quality-refine/preview/`，并在终端渲染文字版。
+- 执行期间会输出单篇开始、完成/失败和重试信息。正式模式默认每 30 秒输出一条聚合 `[RUNNING]`，不会按每个 CLI 子进程刷屏；测试预览默认显示单篇 `[SPAWN]` / `[WAIT]` / `[DONE]` 细反馈。
+- 可用 `--progress-style summary|topic|quiet` 控制反馈密度；可用 `--heartbeat-seconds` 或 `QUALITY_REFINE_HEARTBEAT_SECONDS` 调整心跳间隔，`0` 表示关闭心跳。
+- 按 `Ctrl-C` 会中断当前精修，并尝试终止正在运行的外部 CLI 子进程；再次按 `Ctrl-C` 会强制退出。
 
 ## 常用命令
 
@@ -71,6 +74,8 @@ npm run quality:refine -- \
   --max-rounds 3 \
   --retries 1 \
   --timeout-ms 600000 \
+  --heartbeat-seconds 30 \
+  --progress-style summary \
   --model-chain minimax-m3,deepseek-v4-pro,glm-5.1 \
   --min-score 90
 ```
@@ -124,6 +129,20 @@ node scripts/sync_environment_content.mjs draft
 - 当前领域。
 - 当前模型。
 - 当前 topic 路径。
+
+正式批量运行等待外部 CLI 时会看到聚合心跳：
+
+```text
+[RUNNING] 3/12 ✓3 ✗0 active=2 elapsed=1m30s current=topics/go/context.json 44s m=minimax-m3 | topics/go/interface.json 41s m=minimax-m3
+```
+
+测试预览或 `--progress-style topic` 时还会看到单篇细反馈：
+
+```text
+[SPAWN] REFINE topics/go/context.json attempt=1/2 model=minimax-m3 pid=12345 timeout=10m00s
+[WAIT] REFINE topics/go/context.json attempt=1/2 model=minimax-m3 elapsed=30s / timeout=10m00s capture=42KB stderr=0B
+[DONE] REFINE topics/go/context.json attempt=1/2 model=minimax-m3 elapsed=1m42s capture=118KB
+```
 
 每次运行的中间产物在 `.quality-refine/<runId>/`：
 
