@@ -26,6 +26,10 @@ STAGE_TARGET="all"
 STAGE_LABEL=""
 RUN_MODE="refine"
 RUN_MODE_LABEL=""
+# 测试跑：走和正式精修完全一样的真实流程（审计→判官预热→keep-best→写回→validate→同步），
+# 只是把目标钉成选定领域里的一篇（随机/指定），用来快速验证整条流程。RUN_MODE 仍是 refine，
+# 仅靠 TEST_RUN=1 把 topic 选择强制成单篇、并打上"测试跑"标签；其余选择项与正式一致。
+TEST_RUN=0
 MIN_SCORE=90
 CONCURRENCY=3
 MAX_ROUNDS=3
@@ -54,7 +58,7 @@ ASK_VALUE=""
 # --last 短路：命令行加 --last 后跳过中间所有题，仅保留 SCOPE/LIMIT/MAX_ROUNDS 让用户回车确认。
 REPLAY_FLAG=0
 LAST_CONFIG_FILE=".quality-refine/last-config.env"
-LAST_CONFIG_VERSION=1
+LAST_CONFIG_VERSION=2
 
 # 模型路由相关数组（在 choose_model_chain / choose_judge_models 里填充；这里预声明便于复用模式安全引用）
 MODEL_CHAIN_ITEMS=()
@@ -258,7 +262,7 @@ choose_stage() {
 choose_run_mode() {
   title "选择运行模式"
   printf '1. 正式精修：批量调用 agent，写回 topics/，完成后按阶段同步\n'
-  printf '2. 测试预览：只精修单篇，写到 .quality-refine/preview/，并在终端渲染文字版\n'
+  printf '2. 测试跑：和正式精修完全相同的真实流程，但只跑选定领域里的一篇（随机/指定），用来验证流程\n'
   printf '3. 仅审计：不调用 agent，只列出当前待修内容\n'
   local choice
   while true; do
@@ -267,9 +271,11 @@ choose_run_mode() {
     check_nav_input "$choice" || return $?
     choice="${choice:-1}"
     case "$choice" in
-      1) RUN_MODE="refine"; RUN_MODE_LABEL="正式精修"; return 0 ;;
-      2) RUN_MODE="preview"; RUN_MODE_LABEL="测试预览"; return 0 ;;
-      3) RUN_MODE="audit"; RUN_MODE_LABEL="仅审计"; return 0 ;;
+      1) RUN_MODE="refine"; TEST_RUN=0; RUN_MODE_LABEL="正式精修"; return 0 ;;
+      # 测试跑 = 正式精修的真实流程，只是 TEST_RUN=1 把目标钉成单篇；RUN_MODE 仍是 refine，
+      # 这样选 CLI/模型/判官/参数全部自动走 refine 那套，执行也走 run_refine（含 validate+同步）。
+      2) RUN_MODE="refine"; TEST_RUN=1; RUN_MODE_LABEL="测试跑（单篇·真实流程）"; return 0 ;;
+      3) RUN_MODE="audit"; TEST_RUN=0; RUN_MODE_LABEL="仅审计"; return 0 ;;
       *) printf '%s\n' "${YELLOW}未知运行模式：$choice${RESET}" >&2 ;;
     esac
   done
@@ -930,8 +936,8 @@ choose_topics() {
       "$DIM" "${TOPIC_TITLES[$index]}" "$RESET"
   done
 
-  if [[ "$RUN_MODE" == "preview" ]]; then
-    printf '\n测试预览只精修单篇：输入编号选择；直接回车或 r 随机一篇；m 手动输入路径。\n'
+  if [[ "$TEST_RUN" == "1" ]]; then
+    printf '\n测试跑只跑单篇（真实流程）：输入编号选择；直接回车或 r 随机一篇；m 手动输入路径。\n'
     printf 'b. 上一步\n'
     printf 'q. 退出\n'
     while true; do
@@ -958,7 +964,7 @@ choose_topics() {
           continue
         fi
         if (( $(printf '%s\n' "$selections" | sed '/^$/d' | wc -l | tr -d ' ') != 1 )); then
-          printf '%s\n' "${YELLOW}测试预览一次只能选 1 篇。${RESET}" >&2
+          printf '%s\n' "${YELLOW}测试跑一次只能选 1 篇。${RESET}" >&2
           continue
         fi
         selected="$selections"
@@ -1120,31 +1126,6 @@ run_audit() {
   return "$failed"
 }
 
-run_preview() {
-  build_common_refine_args
-  [[ -n "$TOPIC_REF" ]] || die "没有选择测试预览 topic。"
-  title "测试预览"
-  local log_file preview_rel preview_abs
-  log_file="$(mktemp "${TMPDIR:-/tmp}/quality-refine-preview.XXXXXX.log")"
-  set +e
-  node scripts/quality_refine.mjs \
-    --preview \
-    --scope all \
-    --topic "$TOPIC_REF" \
-    "${COMMON_ARGS[@]}" 2>&1 | tee "$log_file"
-  local rc="${PIPESTATUS[0]}"
-  set -e
-  if (( rc != 0 )); then
-    printf '%s\n' "${RED}预览失败，日志：${log_file}${RESET}" >&2
-    return "$rc"
-  fi
-  preview_rel="$(sed -n 's/^PREVIEW_OUTPUT=//p' "$log_file" | tail -n 1)"
-  [[ -n "$preview_rel" ]] || die "没有从预览输出中找到 PREVIEW_OUTPUT。日志：$log_file"
-  preview_abs="$ROOT/$preview_rel"
-  title "终端文字预览：$preview_rel"
-  node scripts/render_topic.mjs "$preview_abs"
-}
-
 run_refine() {
   build_common_refine_args
   local scope
@@ -1234,8 +1215,8 @@ summary() {
       printf '判官：未启用（纯静态 keep-best）\n'
     fi
   fi
-  if [[ "$RUN_MODE" == "preview" ]]; then
-    printf '预览 Topic：%s\n' "$TOPIC_REF"
+  if [[ "$TEST_RUN" == "1" ]]; then
+    printf '%s\n' "（测试跑：真实流程只跑这一篇，含 validate + 同步）"
   fi
   if [[ "$RUN_MODE" == "refine" ]]; then
     if (( CONCURRENCY > 3 )); then
@@ -1290,6 +1271,7 @@ save_last_config() {
     printf 'STAGE_TARGET=%q\n' "$STAGE_TARGET"
     printf 'STAGE_LABEL=%q\n' "$STAGE_LABEL"
     printf 'RUN_MODE=%q\n' "$RUN_MODE"
+    printf 'TEST_RUN=%q\n' "$TEST_RUN"
     printf 'RUN_MODE_LABEL=%q\n' "$RUN_MODE_LABEL"
     printf 'MIN_SCORE=%q\n' "$MIN_SCORE"
     printf 'CONCURRENCY=%q\n' "$CONCURRENCY"
@@ -1451,7 +1433,7 @@ confirm_execution() {
 }
 
 # 步骤：0 阶段 1 模式 2 领域 3 (audit?参数:topic) 4 参数 5 CLI 6 模型链 7 判官模型 8 判官参数 9 确认
-# audit 跳到 9；preview 走到 6 后直接 9（不判官）；refine 走 7、(启用判官?8)、9。
+# audit 跳到 9；refine（含测试跑）走 7、(启用判官?8)、9——测试跑只是 topic 步钉成单篇，其余完全一致。
 next_step() {
   case "$1" in
     0) printf '1\n' ;;
@@ -1486,8 +1468,6 @@ previous_step() {
     9)
       if [[ "$RUN_MODE" == "audit" ]]; then
         printf '3\n'
-      elif [[ "$RUN_MODE" == "preview" ]]; then
-        printf '6\n'
       elif [[ "$JUDGE_ENABLED" == "1" ]]; then
         printf '8\n'
       else
@@ -1531,8 +1511,7 @@ run_wizard_step() {
 execute_selected_mode() {
   case "$RUN_MODE" in
     audit) run_audit ;;
-    preview) run_preview ;;
-    refine) run_refine ;;
+    refine) run_refine ;;  # 测试跑也是 refine（TEST_RUN=1 已在 choose_topics 钉成单篇）
     *) die "未知运行模式：$RUN_MODE" ;;
   esac
 }

@@ -32,6 +32,12 @@ import {
 } from "./quality_llm_judge.mjs";
 
 const root = process.cwd();
+// .quality-refine 产物根目录（runDir / judge-cache / preview 全在这下面）。
+// 默认在仓库根，但可用 QUALITY_REFINE_DIR 覆盖到隔离目录——回归测试指向临时目录，
+// 这样 run.sh 的 `rm -rf .../judge-cache` 只会清隔离缓存，绝不误删用户辛苦攒的真预热缓存。
+const qualityRoot = process.env.QUALITY_REFINE_DIR
+  ? path.resolve(process.env.QUALITY_REFINE_DIR)
+  : path.join(root, ".quality-refine");
 const maxConcurrency = 8;
 const activeChildren = new Map();
 let shutdownRequested = false;
@@ -45,29 +51,33 @@ const DOMAIN_ORDER = [
 
 // ===== 内嵌精修规范（弱模型唯一参照，不读 81KB 大文档；要求只增不减）=====
 // 调用 buildRefinePrompt 时会把字面量 ${todayYmd} 替换为实际的 YYYY-MM-DD 日期串。
-const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任务：把下面这一篇 topic 改写到“真人专家会认可、面试能直接用”的高质量，使其通过确定性质量审计（满分 100，合格线见下，8 个维度各有地板分，强项不能补偿短板）。
+const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任务：把下面这一篇 topic 改写到"真人专家会认可、面试能直接用"的高质量，使其通过确定性质量审计（满分 100，合格线见下，8 个维度各有地板分，强项不能补偿短板）。
+
+【核心原则——只调内容，不动格式】
+你的唯一任务是优化内容质量（深度、准确性、面试可用性）。不得改变 JSON 结构和字段格式——每个字段的键名、类型、取值范围必须与原 topic 完全一致。如果原 topic 某个字段用的是 A 格式，精修后必须还是 A 格式。格式错误等于精修失败。
 
 【输出格式（违反任意一条会被驱动判失败并重试）】
 - 你必须只输出一个 JSON 对象，第一个非空白字符必须是 \`{\`，最后一个非空白字符必须是 \`}\`。
 - 禁止任何 markdown 代码围栏（不要 \`\`\`json / \`\`\`），禁止解释性前后缀，禁止任何额外文字。
 - 禁止 JSON 注释（不要 //、不要 /* */），禁止 trailing comma（最后一个属性、最后一个数组元素后面禁止逗号）。
-- 所有字符串必须用双引号；字符串内的双引号用 \\\\\" 转义；换行必须用 \\\\n 表示。
+（字符串的转义/换行规则随输出协议不同，见文末"字符串排版规则"那一节，按那里的要求执行。）
 
 【8 个评估维度——每一项都要做到位，不能为了一项牺牲另一项】
 1. 结构完整性：必须含 explain + interviewAnswer + checklist；至少一张 compareTable / diagram / code；rubric 四维权重之和=100。
 2. 内容深度：每张 explain 要讲清机制/触发条件/关键指标/失败路径/工程取舍，不是清单堆砌、不是大白话复述定义。
-3. 专家证据：给出具体抓手——真实函数名/类名/参数、版本边界、命令与配置项、数值量级、生产现象与定位线索。禁止“通常、一般、很重要”这类空话。
+3. 专家证据：给出具体抓手——真实函数名/类名/参数、版本边界、命令与配置项、数值量级、生产现象与定位线索。禁止"通常、一般、很重要"这类空话。
 4. 讲解清晰度：遵循认知顺序——先动机/痛点 → 机制 → 具体例子 → 边界/反例 → 面试如何表达；逻辑连贯不跳跃。
-5. 图示/对比：diagram 节点必须是本题专属概念（不是“输入→处理→输出”这种万能图）；compareTable 行列对齐，且每一行都含真正的结论而非同义复述。
+5. 图示/对比：diagram 节点必须是本题专属概念（不是"输入→处理→输出"这种万能图）；compareTable 行列对齐，且每一行都含真正的结论而非同义复述。
 6. 面试可用性：interviewAnswer 用三层结构——30 秒结论 → 机制要点列表 → 边界/追问应对；followUpQuestions ≥2 条，且答案是本题专属、不复述题面。
-7. rubric 评估质量：mustHave 是具体知识点名词（如“本地队列+全局队列+work stealing 三层调度”），不是“能说明「X」在「Y」里的作用和判断标准”这类套娃句；commonMistakes 是真实的坑，不是泛化。
+7. rubric 评估质量：mustHave 是具体知识点名词（如"本地队列+全局队列+work stealing 三层调度"），不是"能说明「X」在「Y」里的作用和判断标准"这类套娃句；commonMistakes 是真实的坑，不是泛化。
 8. 模板与语言卫生：逐字消除下列 P0 模板句式（命中必改写成本题专属的具体表达）：
-   - explain 结尾三段式：“把 X 放到真实场景里看…”/“判断 X 是否答到位时…”/“学透 X 的关键是…追问/复述校验”。
-   - code 高亮注释套话：“这里定义示例的核心入口或结构…”/“这里给出最终结果或提前退出条件…”等。
-   - rubric.mustHave：“能说明「{点}」在「{标题}」里的作用和判断标准”。
-   - interviewerFocus：“考察是否能解释 X 的 a、b、c、d”这种四词排比模板。
-   - followUpQuestions：“X 一般怎么定位/怎么排查”这种通用骨架但答案没有本题专属抓手。
-   - 任何“今日笔记/今日练习/第 X 天/Day X”。
+   - explain 结尾三段式："把 X 放到真实场景里看…"/"判断 X 是否答到位时…"/"学透 X 的关键是…追问/复述校验"。
+   - code 高亮注释套话："这里定义示例的核心入口或结构…"/"这里给出最终结果或提前退出条件…"/"并发控制点：说明它保护的…"/"这里体现状态推进或遍历过程…"/"需要说明终止条件、复杂度和异常输入"等一切非本题专属的通用说明。
+   - interviewAnswer 四段式骨架："结论：X 要先说清它解决什么问题，再展开…/我会这样回答：1.先定位核心问题…2.再串起关键机制…3.接着补充边界…4.最后验证…"——必须改写为本题独有的自然表达。
+   - rubric.mustHave：所有以"能说明/能解释/能准确解释 X 的 Y"开头的泛化句式，都应替换为具体知识点名词（如"弱引用 key 回收后 value 仍被 Thread 强持有"而非"能说明 value 泄漏原因"）。
+   - interviewerFocus：四词排比模板（"考察是否能解释 X 的 a、b、c、d"）和两段式泛化（"考察对 X 的理解深度，能否区分 Y 和 Z"）都应改写为本题考察的具体能力点。
+   - followUpQuestions："X 一般怎么定位/怎么排查"这种通用骨架但答案没有本题专属抓手。
+   - 任何"今日笔记/今日练习/第 X 天/Day X"。
 
 【准确性与时效】所有事实、版本、API、默认值、数值必须正确且贴合当前主流实践；不确定的断言宁可不写，不要编造。算法题要给正确复杂度与边界条件。
 
@@ -75,12 +85,17 @@ const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任�
 - 顶层字段：保持 id / domain / category 完全不变；status 必须保持 "production"；difficulty 不得下调；topic 原本已存在的任何字段都必须原样保留（包括但不限于 leetcodeUrl / sourceRef / prerequisites / interviewFrequency / interviewerFocus / recommendWeight / order / tags / group / summary / estimatedMinutes），不得删除、不得改键名。
 - updatedAt：必须更新为 \${todayYmd}（格式 YYYY-MM-DD，短横线分隔；这是 topic 文件用的格式，与 manifest.json 的 contentVersion 点号格式不同），不要带时分秒、不要带时区。
 - estimatedMinutes：是用户首次阅读该 topic 卡片所需的分钟数（一般 15-40），不是练习时长，原值合理就别动。
-- learningCards：必须是非空数组；类型集合必须同时包含 explain / interviewAnswer / checklist 三类，且至少额外含一张 compareTable / diagram / code。
-- learningCards.code：必须有 language 字段，取值仅限 java / python / javascript / typescript / bash / sql / json / yaml / c / cpp / go / rust 之一；禁止在 code 卡片里使用 box-drawing 字符画（┌─┐│└┘ 等），需要画图就用 diagram 卡片。
-- learningCards.diagram：format 取值 mermaid / svg / image / text 之一；当 format=mermaid 时，content 必须以 \`flowchart\` 或 \`graph\` 开头并紧跟 TB|TD|BT|LR|RL 方向（例如 \`flowchart LR\`），禁止使用 subgraph / classDef / style / sequenceDiagram / classDiagram / stateDiagram / mindmap；必须提供 fallback（一句话纯文本概括），节点文案必须紧扣本 topic 主题。
-- learningCards.compareTable：content 可选两种合法形态——markdown 表格字符串（content 以 \`|\` 开头）或 \`{columns:[...], rows:[[...]]}\` 结构对象；保留原 topic 用的那种形态，不要互换。
-- learningCards.interviewAnswer.followUpQuestions：必须是 \`[{question, answer}]\` 对象数组，长度至少 2，禁止退化为字符串数组。
-- learningCards.interviewAnswer.content：内部不得出现行内编号列表（如“1）… 2）…”或“：1) …”），要用 Markdown 列表（每项换行、以 \`-\` 或 \`1.\` 开头）。
+- learningCards：必须是非空数组；类型集合必须同时包含 explain / interviewAnswer / checklist 三类，且至少额外含一张 compareTable / diagram / code。每张卡片的 type / title 必填。
+
+【learningCards 各类型的合法字段与格式（必须严格遵守，不得增删字段、不得改换格式）】
+- explain：合法字段有 type / title / content。content 为 Markdown 字符串。禁止在 explain 的 content 里使用 box-drawing 字符画（┌─┐│└┘├─等），需要画图就用 diagram 卡片。
+- interviewAnswer：合法字段有 type / title / content / followUpQuestions。content 为 Markdown 字符串，涉及多个要点必须使用 Markdown 列表（\`-\` 或 \`1.\` 开头），禁止行内编号（"1）…2）…"）。followUpQuestions 必须是 \`[{question, answer}]\` 对象数组，长度至少 2，禁止退化为字符串数组。
+- checklist：合法字段有 type / title / items。items 必须是字符串数组，每项是一条可核验的能力点。
+- code：合法字段有 type / title / content / language / highlights。language 必填，取值仅限 java / python / javascript / typescript / bash / sql / json / yaml / c / cpp / go / rust 之一。highlights 为 \`[{line, note}]\` 数组，line 是从 1 开始的行号，note 是该行的具体语义说明（禁止"关键行"/"核心入口"等泛化占位，必须是本题专属的具体解释）；禁止在 code 卡片里使用 box-drawing 字符画（┌─┐│└┘ 等），需要画图就用 diagram 卡片。
+- compareTable：合法字段有 type / title / content / columns / rows。两种合法形态——（A）Markdown 表格字符串放在 content（以 \`|\` 开头）；（B）结构化表格，columns 为表头字符串数组、rows 为二维字符串数组。**保留原 topic 用的那种形态，不要互换。** 若原 topic 用 columns+rows 形态，则每行 rows 的列数必须与 columns 对齐；若原 topic 用 content 形态，则精修后仍用 content 形态。
+- diagram：合法字段有 type / title / content / format / items / fallback / caption / svgPath / asset / svg。format 取值 mermaid / svg / image / text 之一；当 format=mermaid 时，content 必须以 \`flowchart\` 或 \`graph\` 开头并紧跟 TB|TD|BT|LR|RL 方向（例如 \`flowchart LR\`），禁止使用 subgraph / classDef / style / sequenceDiagram / classDiagram / stateDiagram / mindmap。items 为字符串数组，是图示要点列表，**原 topic 有 items 字段就必须保留**。必须提供 fallback（一句话纯文本概括）。caption 为图注。节点文案必须紧扣本 topic 主题，禁止使用"输入→处理→输出"这类万能节点。
+- animation：合法字段有 type / title / asset / fallback / caption。asset 为资源路径，fallback 必填。
+
 - recallPrompts：至少 1 条；第一条必须是该 topic 最核心、面试官最常开口问的那个问题（首轮练习兼容旧版 App 用）；每条对象结构必须是 \`{id, prompt, mode}\`，id 形如 \`<topic.id>.recall.<n>\`，mode 取值仅限 text / code / voice；可选附加 expectedMinutes（数字，分钟）、difficulty（1-5）。
 - rubric：必须含 mustHave（≥1 条）/ goodToHave / commonMistakes / scoreWeights 四个字段；scoreWeights 必须包含 coverage / accuracy / interviewExpression / depth 四个键，每个值是 0-100 的整数，**四个值之和必须严格等于 100**。
 - 总长度：精修后用 JSON.stringify 序列化的字符串长度不得少于原 topic 的 60%（信息量只增不减）。`;
@@ -333,6 +348,19 @@ const STRUCTURED_OUTPUT_OVERRIDE = `
 
 【最终输出协议（覆盖上文一切“返回/输出 JSON、第一个字符是 {、不要解释”之类的说法）】
 不要把 JSON 当作普通文本写到 stdout。你必须改为【调用 structured_output 工具】，把上文要求的那个 JSON 对象原样作为该工具的唯一参数传入。只调用一次 structured_output，调用后即结束，不要再输出任何文字。`;
+
+// 结构化路径专用的字符串排版规则（替代 JSON_STRING_RULES）。
+// 关键修复（2026-06-15）：JSON_STRING_RULES / REFINE_SPEC 那套“换行必须用 \\n 转义、双引号要转义”是给
+// **文件/文本协议**写的（模型把生 JSON 文本写进文件，需要自己保证 JSON 合法）。但 structured_output 路径下
+// 模型是把一个 JSON 对象交给工具、由工具负责序列化与转义——此时若模型还按“换行写成 \\n”执行，就会双重转义，
+// 正文里留下字面量 \\n / \\t（实测 minimax 把一篇 94 分 topic 的全部真实换行写成字面 \\n，触发“未渲染字面量 +
+// 无分段长文 + 超长句”连环扣分，94→37）。所以结构化路径必须反过来要求：写真实换行、不要手动转义。
+const STRUCTURED_STRING_RULES = `
+【字符串排版规则（structured_output 路径，必须照做）】
+1. 你是通过 structured_output 工具返回一个 JSON 对象，工具会自动完成 JSON 序列化与转义——你只管在各字符串字段里写"正常的人类可读文本"。
+2. 需要换行/分段就直接敲真实换行，需要缩进就用真实空格。严禁把换行写成字面量 \\n、严禁把制表符写成字面量 \\t，也不要给双引号手动加反斜杠——那样会让正文出现未渲染的 \\n / \\t / \\" 乱码，被审计判低分。
+3. 需要引用术语/字段名时用中文「」或反引号 \`\` 包起来，避免裸双引号。
+4. 字段名、层级、数组结构与下面【当前 topic JSON】完全一致，只改文字内容。`;
 
 // 用 --bare + 显式凭据 + --json-schema 跑一次 qwen，返回 structured_result（一个 JS 对象）。
 // 判官、精修共用。任何 API 报错（402/限流/鉴权）标记成 availabilityFailure，让上层走模型降级/退避。
@@ -1490,7 +1518,7 @@ WROTE:${cachePath}
 不要在 stdout 输出 JSON 内容或任何其它文字。` : `【输出要求】通过 structured_output 工具一次性返回改写后的【完整 topic JSON 对象】：以下面【当前 topic JSON】为基底，保持所有字段名、层级、数组结构不变，只改写需要提升的文字内容；原有字段一个都不能少、不得缩水或删除。只调用一次 structured_output，不要解释、不要走普通文本输出。`}
 
 今天日期是 ${todayYmd}，updatedAt 必须设为该值。
-${JSON_STRING_RULES}
+${cachePath ? JSON_STRING_RULES : STRUCTURED_STRING_RULES}
 
 【当前 topic JSON】
 ${JSON.stringify(topic, null, 2)}
@@ -3219,7 +3247,7 @@ async function main() {
   if (!cliPath) throw new Error(`找不到 CLI：${cfg.cli}。请先安装或换一个 --cli。`);
 
   const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${sha256(scope).slice(0, 6)}`;
-  const qualityDir = path.join(root, ".quality-refine");
+  const qualityDir = qualityRoot;
   await gcOldRuns(qualityDir, 3);
   await gcJudgeOutputs(path.join(qualityDir, "judge-cache", "outputs"), 50);
   const runDir = path.join(qualityDir, runId);
@@ -3283,7 +3311,7 @@ async function main() {
     if (!ref) {
       throw new Error(`scope=${scope} 内没有可预览 topic。`);
     }
-    const outPath = path.join(root, ".quality-refine", "preview", `${ref.replace(/[^a-z0-9]+/gi, "-")}.json`);
+    const outPath = path.join(qualityRoot, "preview", `${ref.replace(/[^a-z0-9]+/gi, "-")}.json`);
     console.log(`预览精修单篇：${ref}（当前分 ${audit.scoreMap.get(ref)}/100），model=${currentModel(modelState) ?? "CLI 默认"}`);
     const result = await refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, currentModel(modelState), outPath, null, null);
     if (!result.ok) {

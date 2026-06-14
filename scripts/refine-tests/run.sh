@@ -12,6 +12,10 @@ cd "$ROOT"
 
 MOCK="$ROOT/scripts/refine-tests/mock_cli.mjs"
 chmod +x "$MOCK"
+
+# 把判官缓存 / runDir / preview 等全部产物隔离到临时目录，绝不碰仓库里真实的 .quality-refine。
+# 否则本测试里的 `rm -rf .../judge-cache` 会清掉用户辛苦攒的真预热缓存（曾踩过此坑）。
+export QUALITY_REFINE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/refine-tests.XXXXXX")"
 export MOCK_TEMPLATE_SENTENCE="建议结合实际项目理解这个知识点的价值并多加练习。"
 export MOCK_FACTBUG_SENTENCE="在所有情况下该机制都会以完全相反的方式工作并保证零开销且无任何代价。"
 export MOCK_SUBTLE_BAD_SENTENCE="这个问题要看具体情况，结合项目经验灵活回答即可。"
@@ -20,7 +24,7 @@ T="topics/go/goroutine-gmp.json"
 PASS=0
 FAIL=0
 
-cleanup() { git checkout -- "$T" 2>/dev/null || true; }
+cleanup() { git checkout -- "$T" 2>/dev/null || true; rm -rf "$QUALITY_REFINE_DIR" 2>/dev/null || true; }
 trap cleanup EXIT
 ensure_clean() { git checkout -- "$T" 2>/dev/null || true; }
 
@@ -70,7 +74,7 @@ echo "[1.6] dropsummary（删非元数据字段）→ 走“字段被删除”�
 ensure_clean; out="$(run_static dropsummary)"; assert_contains_out "$out" "原有字段被删除"; assert_no_diff "dropsummary→invariant"
 
 echo "########## 2) Phase 2：判官进回路 ##########"
-rm -rf .quality-refine/judge-cache 2>/dev/null || true
+rm -rf "$QUALITY_REFINE_DIR/judge-cache" 2>/dev/null || true
 echo "[2.1] 判官接受真改善（预降级→strip，judge-after 动态升）→ 写回"
 ensure_clean; predegrade; out="$(run_judge strip)"; assert_contains_out "$out" "已写回"; assert_no_diff "judge:strip→written"
 echo "[2.2] 已达标免改（现版干净，judge-before 通过）→ 跳过改写、不动盘"
@@ -79,7 +83,7 @@ echo "[2.3] 拦截静态查不出的事实退化（dynamic-skip-min 99 强制改
 ensure_clean; out="$(run_judge factbug --dynamic-skip-min 99)"; assert_contains_out "$out" "保留旧版"; assert_absent "judge:factbug-blocked(absent)" "$MOCK_FACTBUG_SENTENCE"; assert_no_diff "judge:factbug→keep"
 
 echo "########## 3) Phase 3：块级 keep-best + 整篇复判 ##########"
-rm -rf .quality-refine/judge-cache 2>/dev/null || true
+rm -rf "$QUALITY_REFINE_DIR/judge-cache" 2>/dev/null || true
 echo "[3.1] 候选部分好部分差（strip explain + factbug interview）→ 只吸收好块，事实错回退"
 ensure_clean; predegrade; out="$(run_judge partial)"; assert_contains_out "$out" "块级合并已写回"; assert_absent "phase3:factbug-blocked(absent)" "$MOCK_FACTBUG_SENTENCE"; assert_absent "phase3:template-stripped(absent)" "$MOCK_TEMPLATE_SENTENCE"; assert_no_diff "phase3:partial→merged"
 echo "[3.2] 候选改 explain 标题但内容相似 → 仍匹配旧块，不当新增重复块"
