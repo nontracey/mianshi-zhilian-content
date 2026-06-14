@@ -51,6 +51,18 @@ SELECTED_TOPIC_REFS=()
 TOPIC_SELECTION_LABEL="全部 topic"
 ASK_VALUE=""
 
+# --last 短路：命令行加 --last 后跳过中间所有题，仅保留 SCOPE/LIMIT/MAX_ROUNDS 让用户回车确认。
+REPLAY_FLAG=0
+LAST_CONFIG_FILE=".quality-refine/last-config.env"
+LAST_CONFIG_VERSION=1
+
+# 模型路由相关数组（在 choose_model_chain / choose_judge_models 里填充；这里预声明便于复用模式安全引用）
+MODEL_CHAIN_ITEMS=()
+CHAIN_BASE_URLS=()
+CHAIN_ENV_KEYS=()
+JUDGE_CHAIN_BASE_URLS=()
+JUDGE_CHAIN_ENV_KEYS=()
+
 hr() {
   printf '%s\n' "${DIM}────────────────────────────────────────────────────────${RESET}"
 }
@@ -1264,6 +1276,154 @@ print_qwen_route_summary() {
   (( any == 0 )) && printf 'qwen 路由：选中模型未携带 baseUrl（不会传 --qwen-routes）\n'
 }
 
+# 把当前内存里的「技术参数」（CLI/模型/判官/并发/qwen 路由）落盘成 KV 文件，下次跑可一键复用。
+# 不存 SCOPE/LIMIT/MAX_ROUNDS——这些是「本次任务范围」，每次重新问；只把当前值当 default。
+# 不存任何 API key 本身，仅存 envKey 变量名。
+save_last_config() {
+  local dir
+  dir="$(dirname "$LAST_CONFIG_FILE")"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  {
+    printf '# quality_refine_interactive last-config v%s\n' "$LAST_CONFIG_VERSION"
+    printf '# saved at %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    printf 'LAST_CONFIG_VERSION=%s\n' "$LAST_CONFIG_VERSION"
+    printf 'STAGE_TARGET=%q\n' "$STAGE_TARGET"
+    printf 'STAGE_LABEL=%q\n' "$STAGE_LABEL"
+    printf 'RUN_MODE=%q\n' "$RUN_MODE"
+    printf 'RUN_MODE_LABEL=%q\n' "$RUN_MODE_LABEL"
+    printf 'MIN_SCORE=%q\n' "$MIN_SCORE"
+    printf 'CONCURRENCY=%q\n' "$CONCURRENCY"
+    printf 'MAX_ROUNDS=%q\n' "$MAX_ROUNDS"
+    printf 'RETRIES=%q\n' "$RETRIES"
+    printf 'TIMEOUT_SECONDS=%q\n' "$TIMEOUT_SECONDS"
+    printf 'DEGRADE_AFTER=%q\n' "$DEGRADE_AFTER"
+    printf 'PROGRESS_STYLE=%q\n' "$PROGRESS_STYLE"
+    printf 'HEARTBEAT_SECONDS=%q\n' "$HEARTBEAT_SECONDS"
+    printf 'SELECTED_CLI=%q\n' "$SELECTED_CLI"
+    printf 'MODEL_CHAIN=%q\n' "$MODEL_CHAIN"
+    printf 'JUDGE_ENABLED=%q\n' "$JUDGE_ENABLED"
+    printf 'JUDGE_MODELS=%q\n' "$JUDGE_MODELS"
+    printf 'JUDGE_COUNT=%q\n' "$JUDGE_COUNT"
+    printf 'DYNAMIC_SKIP_MIN=%q\n' "$DYNAMIC_SKIP_MIN"
+    printf 'JUDGE_BATCH_SIZE=%q\n' "$JUDGE_BATCH_SIZE"
+    printf 'JUDGE_JSON_RETRIES=%q\n' "$JUDGE_JSON_RETRIES"
+    printf 'JUDGE_WARM_CONCURRENCY=%q\n' "$JUDGE_WARM_CONCURRENCY"
+    # qwen 主路由：MODEL_CHAIN_ITEMS / CHAIN_BASE_URLS / CHAIN_ENV_KEYS 三平行数组按 index 平铺
+    local n i
+    n=${#MODEL_CHAIN_ITEMS[@]:-0}
+    printf 'MODEL_CHAIN_LEN=%s\n' "$n"
+    for (( i = 0; i < n; i += 1 )); do
+      printf 'MODEL_CHAIN_ITEM_%s=%q\n' "$i" "${MODEL_CHAIN_ITEMS[$i]:-}"
+      printf 'CHAIN_BASE_URL_%s=%q\n' "$i" "${CHAIN_BASE_URLS[$i]:-}"
+      printf 'CHAIN_ENV_KEY_%s=%q\n' "$i" "${CHAIN_ENV_KEYS[$i]:-}"
+    done
+    # qwen 判官路由：JUDGE_CHAIN_BASE_URLS / JUDGE_CHAIN_ENV_KEYS 两平行数组（model id 已在 JUDGE_MODELS）
+    n=${#JUDGE_CHAIN_BASE_URLS[@]:-0}
+    printf 'JUDGE_CHAIN_LEN=%s\n' "$n"
+    for (( i = 0; i < n; i += 1 )); do
+      printf 'JUDGE_CHAIN_BASE_URL_%s=%q\n' "$i" "${JUDGE_CHAIN_BASE_URLS[$i]:-}"
+      printf 'JUDGE_CHAIN_ENV_KEY_%s=%q\n' "$i" "${JUDGE_CHAIN_ENV_KEYS[$i]:-}"
+    done
+  } > "$LAST_CONFIG_FILE.tmp" 2>/dev/null && mv "$LAST_CONFIG_FILE.tmp" "$LAST_CONFIG_FILE" 2>/dev/null || true
+}
+
+# 读取上次配置文件并灌回全局变量；返回 0 表示成功，1 表示文件不存在/格式异常/版本不兼容。
+load_last_config() {
+  [[ -f "$LAST_CONFIG_FILE" ]] || return 1
+  local expected_version="$LAST_CONFIG_VERSION"
+  # shellcheck disable=SC1090
+  if ! source "$LAST_CONFIG_FILE" 2>/dev/null; then
+    return 1
+  fi
+  # source 之后 LAST_CONFIG_VERSION 已被文件里的值覆盖；用先前缓存的 expected_version 比对
+  if [[ -n "${LAST_CONFIG_VERSION:-}" && "$LAST_CONFIG_VERSION" != "$expected_version" ]]; then
+    LAST_CONFIG_VERSION="$expected_version"
+    return 1
+  fi
+  LAST_CONFIG_VERSION="$expected_version"
+  # 把平铺的 chain 数组还原回来
+  local n i var
+  MODEL_CHAIN_ITEMS=()
+  CHAIN_BASE_URLS=()
+  CHAIN_ENV_KEYS=()
+  n="${MODEL_CHAIN_LEN:-0}"
+  for (( i = 0; i < n; i += 1 )); do
+    var="MODEL_CHAIN_ITEM_$i"; MODEL_CHAIN_ITEMS+=("${!var:-}")
+    var="CHAIN_BASE_URL_$i";   CHAIN_BASE_URLS+=("${!var:-}")
+    var="CHAIN_ENV_KEY_$i";    CHAIN_ENV_KEYS+=("${!var:-}")
+  done
+  JUDGE_CHAIN_BASE_URLS=()
+  JUDGE_CHAIN_ENV_KEYS=()
+  n="${JUDGE_CHAIN_LEN:-0}"
+  for (( i = 0; i < n; i += 1 )); do
+    var="JUDGE_CHAIN_BASE_URL_$i"; JUDGE_CHAIN_BASE_URLS+=("${!var:-}")
+    var="JUDGE_CHAIN_ENV_KEY_$i";  JUDGE_CHAIN_ENV_KEYS+=("${!var:-}")
+  done
+  return 0
+}
+
+# 用 discover_models 跑一次当前 CLI 的 model 列表，校验上次记下的 model id 是否还在。
+# 缺一个就返回 1 + 在 stderr 上点名缺失的 id。让上层退回到手选 step。
+verify_replayed_models() {
+  local cli="$SELECTED_CLI"
+  [[ -z "$cli" ]] && return 1
+  local available=()
+  local value label base_url env_key
+  while IFS=$'\t' read -r value label base_url env_key; do
+    [[ -z "$value" ]] && continue
+    available+=("$value")
+  done < <(discover_models "$cli")
+  # discover_models 对非 qwen CLI 可能返回空——空列表视为「未知列表，跳过校验」。
+  (( ${#available[@]} == 0 )) && return 0
+  local id missing=()
+  for id in "${MODEL_CHAIN_ITEMS[@]}"; do
+    [[ -z "$id" ]] && continue
+    local hit=0 v
+    for v in "${available[@]}"; do
+      [[ "$v" == "$id" ]] && { hit=1; break; }
+    done
+    (( hit == 0 )) && missing+=("精修:$id")
+  done
+  if [[ "$JUDGE_ENABLED" == "1" && -n "$JUDGE_MODELS" ]]; then
+    IFS=',' read -r -a __jms <<< "$JUDGE_MODELS"
+    for id in "${__jms[@]}"; do
+      [[ -z "$id" ]] && continue
+      local hit=0 v
+      for v in "${available[@]}"; do
+        [[ "$v" == "$id" ]] && { hit=1; break; }
+      done
+      (( hit == 0 )) && missing+=("判官:$id")
+    done
+  fi
+  if (( ${#missing[@]} > 0 )); then
+    printf '%s\n' "${YELLOW}上次配置里的模型在 $cli 当前列表里找不到：$(join_by "," "${missing[@]}")${RESET}" >&2
+    printf '%s\n' "${DIM}（settings.json 改过/provider 删过/CLI 升级换 id 都可能导致；将退回手选）${RESET}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# 给 summary 用的「上次配置摘要」，单行简版，给一键复用题做提示
+last_config_summary_line() {
+  [[ -f "$LAST_CONFIG_FILE" ]] || { printf ''; return 0; }
+  # 用子 shell 隔离，不污染当前作用域
+  (
+    set +e
+    # shellcheck disable=SC1090
+    source "$LAST_CONFIG_FILE" 2>/dev/null || exit 1
+    local saved_at=""
+    saved_at=$(grep -m1 '^# saved at ' "$LAST_CONFIG_FILE" 2>/dev/null | sed 's/^# saved at //')
+    printf '%s · cli=%s · model=%s · judge=%s · batch=%s · warm=%s · concurrency=%s' \
+      "${saved_at:-未知时间}" \
+      "${SELECTED_CLI:-?}" \
+      "${MODEL_CHAIN:-CLI默认}" \
+      "${JUDGE_MODELS:-同精修}" \
+      "${JUDGE_BATCH_SIZE:-?}" \
+      "${JUDGE_WARM_CONCURRENCY:-跟随并发}" \
+      "${CONCURRENCY:-?}"
+  )
+}
+
 confirm_execution() {
   summary
   local choice
@@ -1277,6 +1437,7 @@ confirm_execution() {
     choice="${choice:-y}"
     case "$choice" in
       y|Y|yes|YES|Yes|是|好|开始)
+        save_last_config
         return 0
         ;;
       n|N|no|NO|No|否|不|取消)
@@ -1338,6 +1499,14 @@ previous_step() {
 }
 
 run_wizard_step() {
+  if (( REPLAY_FLAG == 1 )); then
+    case "$1" in
+      5|6|7|8)
+        printf '%s\n' "${DIM}（复用上次配置：跳过 $(case "$1" in 5) echo CLI ;; 6) echo 模型链 ;; 7) echo 判官模型 ;; 8) echo 判官参数 ;; esac)）${RESET}" >&2
+        return 0
+        ;;
+    esac
+  fi
   case "$1" in
     0) choose_stage ;;
     1) choose_run_mode ;;
@@ -1369,9 +1538,79 @@ execute_selected_mode() {
 }
 
 main() {
+  local force_last=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --last|-l)
+        force_last=1
+        shift
+        ;;
+      --help|-h)
+        cat <<'USAGE'
+用法: quality_refine_interactive.sh [选项]
+  --last, -l   直接复用上次配置（跳过 CLI/模型链/判官 询问，仍会问 stage/mode/domains/topics/参数）
+  --help, -h   显示帮助
+USAGE
+        return 0
+        ;;
+      *)
+        printf '未知参数：%s\n' "$1" >&2
+        return 64
+        ;;
+    esac
+  done
+
   title "知识精修交互式启动器"
   info "正式精修始终改 production topics/；选择阶段只决定成功后同步到哪些环境。"
   load_domains
+
+  if [[ -f "$LAST_CONFIG_FILE" ]]; then
+    local summary
+    summary="$(last_config_summary_line || true)"
+    if (( force_last == 1 )); then
+      info "检测到上次配置（--last），尝试复用：${summary}"
+      if load_last_config; then
+        if verify_replayed_models; then
+          REPLAY_FLAG=1
+          info "✓ 上次配置已复用，将跳过 CLI/模型链/判官 步骤。"
+        else
+          printf '%s\n' "${YELLOW}警告：上次配置中的模型已不可用（详见上方提示），退回手选模式。${RESET}" >&2
+          REPLAY_FLAG=0
+        fi
+      else
+        printf '%s\n' "${YELLOW}警告：上次配置文件读取失败或版本不兼容，退回手选模式。${RESET}" >&2
+        REPLAY_FLAG=0
+      fi
+    else
+      printf '\n%s\n' "${BOLD}检测到上次配置：${RESET}${summary}" >&2
+      printf '是否复用？[Y/n] %s: ' "$(prompt_suffix)" >&2
+      local ans
+      IFS= read -r ans || true
+      ans="${ans:-y}"
+      case "$ans" in
+        y|Y|yes|YES|Yes|是|好)
+          if load_last_config; then
+            if verify_replayed_models; then
+              REPLAY_FLAG=1
+              info "✓ 已复用上次配置，将跳过 CLI/模型链/判官 步骤（仍会问阶段/模式/领域/topic/参数）。"
+            else
+              printf '%s\n' "${YELLOW}警告：上次配置中的模型已不可用（详见上方提示），退回手选模式。${RESET}" >&2
+              REPLAY_FLAG=0
+            fi
+          else
+            printf '%s\n' "${YELLOW}警告：上次配置文件读取失败或版本不兼容，退回手选模式。${RESET}" >&2
+            REPLAY_FLAG=0
+          fi
+          ;;
+        *)
+          REPLAY_FLAG=0
+          ;;
+      esac
+    fi
+  elif (( force_last == 1 )); then
+    printf '%s\n' "${YELLOW}警告：未找到上次配置文件 ${LAST_CONFIG_FILE}，将走完整流程。${RESET}" >&2
+  fi
+
   local step=0
   local rc
   while true; do
