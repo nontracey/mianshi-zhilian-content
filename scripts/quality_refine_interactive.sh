@@ -761,15 +761,16 @@ choose_judge_models() {
 choose_judge_count() {
   # 未启用判官则本步无内容，直接通过（步骤跳转已据 JUDGE_ENABLED 决定是否进入本步）。
   [[ "$JUDGE_ENABLED" == "1" ]] || return 0
-  title "判官数量与动态免改线"
+  title "判官参数（投票/免改线/批量/并发）"
+  info "批量大小决定每个 qwen 子进程一次判几个 topic：批=1 最稳但 425 个 topic 要冷启 425 次；批=3-5 可省冷启时间，代价是同批挂掉会连坐。"
   local idx=0 rc warm_default
   warm_default="${JUDGE_WARM_CONCURRENCY:-$CONCURRENCY}"
   while (( idx < 4 )); do
     case "$idx" in
-      0) ask_number "每个判官模型跑几个判官实例（>1 用投票压方差，需模型温度>0）" "$JUDGE_COUNT" 1 8 >/dev/null; rc=$? ;;
-      1) ask_number "动态免改线 dynamic-skip-min（低于此分会进入改写；候选接受仍看回归向量）" "$DYNAMIC_SKIP_MIN" 1 100 >/dev/null; rc=$? ;;
-      2) ask_number "判官批量大小 judge-batch-size（首轮判前预热；默认单篇，避免大批量长时间无进度）" "$JUDGE_BATCH_SIZE" 1 10 >/dev/null; rc=$? ;;
-      3) ask_number "判前预热并发 judge-warm-concurrency（默认与精修并发一致）" "$warm_default" 1 8 >/dev/null; rc=$? ;;
+      0) ask_number "每个判官模型跑几个判官实例 judge-count（>1 用投票压方差，需模型温度>0）" "$JUDGE_COUNT" 1 8 >/dev/null; rc=$? ;;
+      1) ask_number "动态免改线 dynamic-skip-min（低于此分进入改写；候选接受仍看回归向量）" "$DYNAMIC_SKIP_MIN" 1 100 >/dev/null; rc=$? ;;
+      2) ask_number "判官批量大小 judge-batch-size（一次几个 topic 喂给一个 qwen 子进程；1=最稳，5=省冷启）" "$JUDGE_BATCH_SIZE" 1 10 >/dev/null; rc=$? ;;
+      3) ask_number "判前预热并发 judge-warm-concurrency（同时跑几路 qwen 子进程；默认与精修并发一致）" "$warm_default" 1 8 >/dev/null; rc=$? ;;
     esac
     if (( rc == 0 )); then
       case "$idx" in
@@ -1288,7 +1289,7 @@ confirm_execution() {
   done
 }
 
-# 步骤：0 阶段 1 模式 2 领域 3 (audit?参数:topic) 4 参数 5 CLI 6 模型链 7 判官模型 8 判官数量 9 确认
+# 步骤：0 阶段 1 模式 2 领域 3 (audit?参数:topic) 4 参数 5 CLI 6 模型链 7 判官模型 8 判官参数 9 确认
 # audit 跳到 9；preview 走到 6 后直接 9（不判官）；refine 走 7、(启用判官?8)、9。
 next_step() {
   case "$1" in
