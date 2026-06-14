@@ -719,7 +719,15 @@ function runProcess(command, args, options, timeoutMs, progress = {}) {
         }
         resolve({ stdout, stderr, code });
       } else {
-        reject(new Error(`exit code=${code} signal=${signal || ""} stderr=${stderr.trim().slice(0, 400)}`));
+        // 截尾不截头：qwen 0.18 yolo warning 是 stderr 首行（~270 字），会把 400 字额度吃光让真因被盖。
+        // 同时把 stdout 末尾带上：qwen 出 [API Error: 402…] / 鉴权失败常常写到 stdout 而不是 stderr。
+        const stderrTail = stderr.trim().slice(-600);
+        const stdoutTail = stdout.trim().slice(-600);
+        reject(new Error(
+          `exit code=${code} signal=${signal || ""} ` +
+          `stderr.tail=${stderrTail || "(empty)"} ` +
+          `stdout.tail=${stdoutTail || "(empty)"}`,
+        ));
       }
     });
   });
