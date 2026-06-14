@@ -230,12 +230,57 @@ const QWEN_BLOCK_JUDGE_SCHEMA = {
   required: ["blockReviews"],
   additionalProperties: true,
 };
-// 精修结构化 schema 按当前 topic 的顶层字段生成：列出全部键当 properties 提示（引导模型扁平输出、不缩水），
-// 仅 required 关键身份字段（其余靠 checkInvariants 兜底防缩水），additionalProperties:true 容错。
+// 精修结构化 schema：递归镜像当前 topic 的结构，给每一层 array/object/标量都显式标 type。
+// 关键修复（2026-06-14）：原实现只把每个顶层 key 列成空 schema {}（无 type）。火山 minimax-m3 在
+// structured_output 下遇到"无 type 的属性 + 数组值"会把数组包成 {"item":[...]} 对象——learningCards /
+// recallPrompts / tags / rubric.mustHave / interviewAnswer.followUpQuestions / checklist.items 全中招，
+// 于是 looksLikeTopicContract 的 Array.isArray(learningCards) 必失败 → 凡是真调了模型的篇统统报
+// "CLI 输出 JSON 不是当前 topic 契约"（实测一次 run 里 model-invoked 篇 100% 挂、只有 alreadyGood 的篇幸免）。
+// 这正是 QWEN_JUDGE_SCHEMA 注释里早就踩过的"无 type → 模型套一层包装"坑；判官 schema 当初显式 typed 才好用。
+// 修法：显式 type 把输出钉成数组/对象；递归且合并异构数组元素的键，让 followUpQuestions/items/columns/rows
+// 这些"只在某类卡片里出现"的嵌套数组也拿到 type。required 钉顶层全部键（同 checkInvariants 防丢字段口径），
+// 嵌套层不设 required（卡片类型异构，避免误拒），additionalProperties:true 全程容错让模型自由改写文字。
+function schemaForArrayItems(arr) {
+  if (!arr.length) return null;
+  if (arr.every((el) => el && typeof el === "object" && !Array.isArray(el))) {
+    const merged = {};
+    for (const el of arr) {
+      for (const [k, v] of Object.entries(el)) {
+        if (!(k in merged)) merged[k] = schemaForValue(v);
+      }
+    }
+    const node = { type: "object", additionalProperties: true };
+    if (Object.keys(merged).length) node.properties = merged;
+    return node;
+  }
+  if (arr.every((el) => Array.isArray(el))) return schemaForValue(arr[0]);
+  if (arr.every((el) => typeof el === "number")) return { type: "number" };
+  if (arr.every((el) => typeof el === "boolean")) return { type: "boolean" };
+  return { type: "string" };
+}
+function schemaForValue(value) {
+  if (value === null || value === undefined) return {};
+  if (Array.isArray(value)) {
+    const items = schemaForArrayItems(value);
+    return items ? { type: "array", items } : { type: "array" };
+  }
+  if (typeof value === "object") {
+    const node = { type: "object", additionalProperties: true };
+    const entries = Object.entries(value);
+    if (entries.length) {
+      node.properties = {};
+      for (const [k, v] of entries) node.properties[k] = schemaForValue(v);
+    }
+    return node;
+  }
+  if (typeof value === "number") return { type: "number" };
+  if (typeof value === "boolean") return { type: "boolean" };
+  return { type: "string" };
+}
 function buildTopicSchema(original) {
   const properties = {};
-  for (const key of Object.keys(original || {})) properties[key] = {};
-  return { type: "object", properties, required: ["id", "domain"], additionalProperties: true };
+  for (const [key, value] of Object.entries(original || {})) properties[key] = schemaForValue(value);
+  return { type: "object", properties, required: Object.keys(original || {}), additionalProperties: true };
 }
 // --bare 默认仍带 read_file/edit/notebook_edit/run_shell_command；判官/精修只需要合成的 structured_output，
 // 把这些副作用工具全排除——既杜绝 deepseek 之类模型乱调工具触发 --max-tool-calls 0 的 budget abort(exit 55)，
@@ -503,6 +548,23 @@ function looksLikeTopicContract(parsed, original) {
     if (parsed.domain !== original.domain) return false;
   }
   return true;
+}
+
+// 点名 looksLikeTopicContract 具体挂在哪一条，给报错带上可定位的因果（而不是只列前几个键）。
+function describeContractMiss(parsed, original) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return `不是 JSON 对象（${Array.isArray(parsed) ? "数组" : typeof parsed}）`;
+  if (typeof parsed.id !== "string") return `id 缺失或非字符串（${typeof parsed.id}）`;
+  if (typeof parsed.domain !== "string") return `domain 缺失或非字符串（${typeof parsed.domain}）`;
+  if (!Array.isArray(parsed.learningCards)) {
+    const lc = parsed.learningCards;
+    const shape = lc && typeof lc === "object" ? `对象{${Object.keys(lc).slice(0, 4).join(",")}}` : typeof lc;
+    // 结构化输出把数组包成 {item:[...]} 是最常见成因，单独点出来便于一眼认出 schema 问题。
+    const hint = lc && typeof lc === "object" && Array.isArray(lc.item) ? "（疑似结构化输出把数组包成 {item:[...]}，检查 buildTopicSchema 的 type 标注）" : "";
+    return `learningCards 不是数组而是 ${shape}${hint}`;
+  }
+  if (original && parsed.id !== original.id) return `id 被改动：${parsed.id} ≠ ${original.id}`;
+  if (original && parsed.domain !== original.domain) return `domain 被改动：${parsed.domain} ≠ ${original.domain}`;
+  return `id=${parsed.id} domain=${parsed.domain} keys=${Object.keys(parsed).slice(0, 8).join(",")}`;
 }
 
 // 是否是错误响应 JSON（黑名单识别）：含 code/error/message/status 等错误字段，且无 topic 核心字段
@@ -2229,8 +2291,9 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
       if (!looksLikeTopicContract(parsed, original)) {
         // JSON 合法、不是已知错误格式，但也不是本 topic 的契约（如改了 id、丢了 learningCards）。
         // 不计入可用性失败——这是模型内容失败，应该按本篇正常重试。
-        const previewKeys = Object.keys(parsed).slice(0, 8).join(",");
-        throw new Error(`CLI 输出 JSON 不是当前 topic 契约（id=${parsed.id ?? "?"} domain=${parsed.domain ?? "?"} keys=${previewKeys}）`);
+        // 点名具体哪条契约挂了：之前只打 slice(0,8) 顶层键，曾把"learningCards 被结构化输出包成
+        // {item:[...]} 对象"这种 schema 坑误导成"只剩 8 个键/丢内容"，排查走了弯路。
+        throw new Error(`CLI 输出 JSON 不是当前 topic 契约（${describeContractMiss(parsed, original)}）`);
       }
       const bad = checkInvariants(original, parsed);
       if (bad) throw new Error(`schema 不变量失败：${bad}`);
