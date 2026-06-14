@@ -499,13 +499,16 @@ function addProviderEntry(protocol, entry, index, objectKey = "") {
   const host = hostOf(baseUrl);
   // ~/.qwen/settings.json 字段是 envKey；mjs 端 --qwen-routes 期望 apiKeyEnv——映射在 bash 拼 inline JSON 时再做。
   const envKey = entry.envKey || entry.apiKeyEnv || entry.apiKeyEnvName || "";
+  const label = `${name}${name !== id ? ` [${id}]` : ""} · ${protocol}${host ? ` · ${host}` : ""}`;
   if (kind === "qwen") {
-    // qwen：用裸 name 当 value+label，让“火山 minimax-m3 / 通义 minimax-m3”作为两条独立条目共存；
-    // 把 baseUrl/envKey 透传到 TSV，后续按选中条目拼 --qwen-routes 精确路由。
-    add(name, name, `${protocol}:${objectKey || index}:${name}`, { baseUrl, envKey });
+    // qwen：value 必须是 provider 端真正认的 model id（不是 settings.json 的 name 友好昵称）。
+    // 之前用 name 当 value 是为了让“火山 minimax-m3 / 通义 minimax-m3”同 id 不同 provider 共存，
+    // 但碰上 LongCat 这种 id="LongCat-2.0-Preview" / name="LongCat 2.0 Preview"，端点会 400 拒掉
+    // （LongCat 不接受带空格的 model 字段）。现在 value 改回 id，重复 id 靠 dedupeKey 里的 host 区分共存；
+    // label 仍展示 name 让用户认得出，baseUrl/envKey 透传到 TSV 供后续拼 --qwen-routes 精确路由。
+    add(id, label, `${protocol}:${objectKey || index}:${id}:${host}`, { baseUrl, envKey });
     return;
   }
-  const label = `${name}${name !== id ? ` [${id}]` : ""} · ${protocol}${host ? ` · ${host}` : ""}`;
   add(id, label, `${protocol}:${objectKey || index}:${id}:${host}:${name}`);
 }
 
