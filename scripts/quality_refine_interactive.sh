@@ -39,7 +39,7 @@ JUDGE_ENABLED=1
 JUDGE_MODELS=""   # 空 = 跟精修主模型一致
 JUDGE_COUNT=1
 DYNAMIC_SKIP_MIN=85
-JUDGE_BATCH_SIZE=5
+JUDGE_BATCH_SIZE=1
 JUDGE_JSON_RETRIES=2
 JUDGE_WARM_CONCURRENCY=""   # 空 = 跟随 CONCURRENCY
 PROGRESS_STYLE="summary"
@@ -454,7 +454,7 @@ function hostOf(url) {
   }
 }
 
-function add(value, label = value, dedupeKey = value) {
+function add(value, label = value, dedupeKey = value, meta = {}) {
   if (!value || typeof value !== "string") return;
   const item = value.trim();
   const display = String(label || item).trim();
@@ -463,7 +463,9 @@ function add(value, label = value, dedupeKey = value) {
   const key = String(dedupeKey || item).trim();
   if (!seen.has(key)) {
     seen.add(key);
-    models.push({ value: item, label: display });
+    // baseUrl/envKey：仅 qwen 显式路由用——交互层据此为选中的模型生成 --qwen-routes，让“火山 minimax-m3”等
+    // 重复 id 模型经 --bare + 显式凭据精确路由到对的 provider（裸值不含 tab，安全拼进 TSV）。
+    models.push({ value: item, label: display, baseUrl: meta.baseUrl || "", envKey: meta.envKey || "" });
   }
 }
 
@@ -495,8 +497,12 @@ function addProviderEntry(protocol, entry, index, objectKey = "") {
   const name = entry.name && entry.name !== id ? entry.name : id;
   const baseUrl = entry.baseUrl || entry.baseURL || entry.url || entry.endpoint || "";
   const host = hostOf(baseUrl);
+  // ~/.qwen/settings.json 字段是 envKey；mjs 端 --qwen-routes 期望 apiKeyEnv——映射在 bash 拼 inline JSON 时再做。
+  const envKey = entry.envKey || entry.apiKeyEnv || entry.apiKeyEnvName || "";
   if (kind === "qwen") {
-    add(name, name, `${protocol}:${objectKey || index}:${name}`);
+    // qwen：用裸 name 当 value+label，让“火山 minimax-m3 / 通义 minimax-m3”作为两条独立条目共存；
+    // 把 baseUrl/envKey 透传到 TSV，后续按选中条目拼 --qwen-routes 精确路由。
+    add(name, name, `${protocol}:${objectKey || index}:${name}`, { baseUrl, envKey });
     return;
   }
   const label = `${name}${name !== id ? ` [${id}]` : ""} · ${protocol}${host ? ` · ${host}` : ""}`;
@@ -595,7 +601,10 @@ if (!models.length) {
   for (const model of fallbackModelsByKind[kind] ?? []) add(model);
 }
 
-for (const model of models) console.log(`${model.value}\t${model.label}`);
+// 输出 4 列 TSV：value \t label \t baseUrl \t envKey
+// baseUrl/envKey 仅 qwen 显式路由要用；其它 CLI 这两列为空。bash 端按 IFS=$'\t' 读 4 列即可，
+// 列数变化不会破坏旧行为：未带路由的模型行第三/第四列直接是空字符串。
+for (const model of models) console.log(`${model.value}\t${model.label}\t${model.baseUrl}\t${model.envKey}`);
 NODE
 }
 
@@ -603,18 +612,18 @@ choose_model_chain() {
   title "选择模型与降级链"
   MODEL_VALUES=()
   MODEL_LABELS=()
-  local line
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    local value label
-    value="${line%%$'\t'*}"
-    if [[ "$line" == *$'\t'* ]]; then
-      label="${line#*$'\t'}"
-    else
-      label="$value"
-    fi
+  MODEL_BASE_URLS=()
+  MODEL_ENV_KEYS=()
+  CHAIN_BASE_URLS=()
+  CHAIN_ENV_KEYS=()
+  local line value label base_url env_key
+  while IFS=$'\t' read -r value label base_url env_key; do
+    [[ -z "$value" ]] && continue
+    [[ -z "$label" ]] && label="$value"
     MODEL_VALUES+=("$value")
     MODEL_LABELS+=("$label")
+    MODEL_BASE_URLS+=("$base_url")
+    MODEL_ENV_KEYS+=("$env_key")
   done < <(discover_models "$SELECTED_CLI")
 
   local index choice custom selections selected idx rc
@@ -640,6 +649,9 @@ choose_model_chain() {
           rc=$?; return "$rc"
         fi
         MODEL_CHAIN="$ASK_VALUE"
+        # 手动输入的模型不在 TSV 表内，无法自动配路由；如需精确路由请回到列表选择。
+        CHAIN_BASE_URLS=()
+        CHAIN_ENV_KEYS=()
         return 0
       else
         selections="$(expand_selection "$choice" "${#MODEL_VALUES[@]}")"
@@ -648,10 +660,14 @@ choose_model_chain() {
           continue
         fi
         MODEL_CHAIN_ITEMS=()
+        CHAIN_BASE_URLS=()
+        CHAIN_ENV_KEYS=()
         while IFS= read -r selected; do
           [[ -z "$selected" ]] && continue
           idx=$((selected - 1))
           MODEL_CHAIN_ITEMS+=("${MODEL_VALUES[$idx]}")
+          CHAIN_BASE_URLS+=("${MODEL_BASE_URLS[$idx]}")
+          CHAIN_ENV_KEYS+=("${MODEL_ENV_KEYS[$idx]}")
         done <<< "$selections"
         MODEL_CHAIN="$(join_by "," "${MODEL_CHAIN_ITEMS[@]}")"
         return 0
@@ -663,6 +679,8 @@ choose_model_chain() {
     IFS= read -r custom || exit 1
     check_nav_input "$custom" || return $?
     MODEL_CHAIN="$custom"
+    CHAIN_BASE_URLS=()
+    CHAIN_ENV_KEYS=()
   fi
 }
 
@@ -672,13 +690,18 @@ choose_judge_models() {
   info "提示：精修模型链是“降级链”（链首优先、挂了才换下一个）；判官默认只用链首，避免把备用模型也当判官多花一倍开销。要做多判官投票请在下面显式多选。"
   JUDGE_MODEL_VALUES=()
   JUDGE_MODEL_LABELS=()
-  local line value label
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    value="${line%%$'\t'*}"
-    if [[ "$line" == *$'\t'* ]]; then label="${line#*$'\t'}"; else label="$value"; fi
+  JUDGE_MODEL_BASE_URLS=()
+  JUDGE_MODEL_ENV_KEYS=()
+  JUDGE_CHAIN_BASE_URLS=()
+  JUDGE_CHAIN_ENV_KEYS=()
+  local line value label base_url env_key
+  while IFS=$'\t' read -r value label base_url env_key; do
+    [[ -z "$value" ]] && continue
+    [[ -z "$label" ]] && label="$value"
     JUDGE_MODEL_VALUES+=("$value")
     JUDGE_MODEL_LABELS+=("$label")
+    JUDGE_MODEL_BASE_URLS+=("$base_url")
+    JUDGE_MODEL_ENV_KEYS+=("$env_key")
   done < <(discover_models "$SELECTED_CLI")
 
   local index choice selections selected idx items
@@ -704,6 +727,11 @@ choose_judge_models() {
       # 只取精修链首一个模型当判官，不把整条“降级链”当 ensemble 全跑（那会用上备用模型、多花开销）。
       # 留空时由 quality_refine.mjs 默认取 modelChain[0]；这里显式取链首让 summary/日志更透明。
       JUDGE_MODELS="${MODEL_CHAIN%%,*}"
+      # 路由也直接借精修链首：保证“同模型”意味着“同 provider”，否则火山/通义同名 id 又会被 qwen 静默回落。
+      if (( ${#CHAIN_BASE_URLS[@]} )); then
+        JUDGE_CHAIN_BASE_URLS=("${CHAIN_BASE_URLS[0]}")
+        JUDGE_CHAIN_ENV_KEYS=("${CHAIN_ENV_KEYS[0]}")
+      fi
       return 0
     fi
     selections="$(expand_selection "$choice" "${#JUDGE_MODEL_VALUES[@]}")"
@@ -712,10 +740,14 @@ choose_judge_models() {
       continue
     fi
     items=()
+    JUDGE_CHAIN_BASE_URLS=()
+    JUDGE_CHAIN_ENV_KEYS=()
     while IFS= read -r selected; do
       [[ -z "$selected" ]] && continue
       idx=$((selected - 1))
       items+=("${JUDGE_MODEL_VALUES[$idx]}")
+      JUDGE_CHAIN_BASE_URLS+=("${JUDGE_MODEL_BASE_URLS[$idx]}")
+      JUDGE_CHAIN_ENV_KEYS+=("${JUDGE_MODEL_ENV_KEYS[$idx]}")
     done <<< "$selections"
     JUDGE_ENABLED=1
     JUDGE_MODELS="$(join_by "," "${items[@]}")"
@@ -733,7 +765,7 @@ choose_judge_count() {
     case "$idx" in
       0) ask_number "每个判官模型跑几个判官实例（>1 用投票压方差，需模型温度>0）" "$JUDGE_COUNT" 1 8 >/dev/null; rc=$? ;;
       1) ask_number "动态免改线 dynamic-skip-min（低于此分会进入改写；候选接受仍看回归向量）" "$DYNAMIC_SKIP_MIN" 1 100 >/dev/null; rc=$? ;;
-      2) ask_number "判官批量大小 judge-batch-size（首轮判前预热，走文件协议写本地缓存）" "$JUDGE_BATCH_SIZE" 1 10 >/dev/null; rc=$? ;;
+      2) ask_number "判官批量大小 judge-batch-size（首轮判前预热；默认单篇，避免大批量长时间无进度）" "$JUDGE_BATCH_SIZE" 1 10 >/dev/null; rc=$? ;;
       3) ask_number "判前预热并发 judge-warm-concurrency（默认与精修并发一致）" "$warm_default" 1 8 >/dev/null; rc=$? ;;
     esac
     if (( rc == 0 )); then
@@ -969,6 +1001,42 @@ choose_topics() {
   done
 }
 
+build_qwen_routes_json() {
+  # 把 (model, baseUrl, envKey) 三元组合并成一份 inline JSON，给 mjs --qwen-routes 用。
+  # 仅当 SELECTED_CLI 是 qwen/qwen-code 且至少一项带 baseUrl 时才返回非空字符串。
+  # 实现走 node：bash 拼 JSON 容易踩 \"、$、`、引号嵌套；node 端调 JSON.stringify 一劳永逸，
+  # 同时把 ~/.qwen/settings.json 字段名 envKey 重命名成 mjs 期望的 apiKeyEnv。
+  local cli_base
+  cli_base="${SELECTED_CLI##*/}"
+  case "$cli_base" in
+    qwen|qwen-code) ;;
+    *) printf ''; return 0 ;;
+  esac
+  local -a models=("$@")
+  local count=$(( ${#models[@]} / 3 ))
+  (( count > 0 )) || { printf ''; return 0; }
+  local has_route=0 i base_url
+  for (( i = 0; i < count; i += 1 )); do
+    base_url="${models[$((i * 3 + 1))]}"
+    [[ -n "$base_url" ]] && { has_route=1; break; }
+  done
+  (( has_route == 1 )) || { printf ''; return 0; }
+  /usr/local/bin/node - "$@" <<'NODE'
+const out = {};
+const argv = process.argv.slice(2);
+for (let i = 0; i < argv.length; i += 3) {
+  const model = argv[i];
+  const baseUrl = argv[i + 1] || "";
+  const envKey = argv[i + 2] || "";
+  if (!model || !baseUrl) continue;
+  // 同一 model 多次出现（精修主链 + 判官选了同一条）按后写入覆盖即可，三元组本身一致。
+  out[model] = { baseUrl, apiKeyEnv: envKey || undefined };
+  if (!envKey) delete out[model].apiKeyEnv;
+}
+process.stdout.write(JSON.stringify(out));
+NODE
+}
+
 build_common_refine_args() {
   COMMON_ARGS=(
     --cli "$SELECTED_CLI"
@@ -989,6 +1057,38 @@ build_common_refine_args() {
     [[ -n "$JUDGE_WARM_CONCURRENCY" ]] && COMMON_ARGS+=(--judge-warm-concurrency "$JUDGE_WARM_CONCURRENCY")
   else
     COMMON_ARGS+=(--no-judge)
+  fi
+
+  # qwen/qwen-code 显式路由：把精修链 + 判官多选模型的 (model, baseUrl, envKey) 全收齐写成 inline JSON
+  # 交给 mjs。这是解决 “同 modelId 不同 provider 被 qwen 静默回落到第一条 openai entry → 402” 的关键。
+  # apiKey 不进命令行（防 ps 泄露），mjs 端读 envKey 指向的环境变量或 ~/.qwen/settings.json 的 env 段。
+  local -a route_triples=()
+  local i n
+  n=${#MODEL_CHAIN_ITEMS[@]:-0}
+  if (( n > 0 )); then
+    for (( i = 0; i < n; i += 1 )); do
+      route_triples+=("${MODEL_CHAIN_ITEMS[$i]}" "${CHAIN_BASE_URLS[$i]:-}" "${CHAIN_ENV_KEYS[$i]:-}")
+    done
+  fi
+  if [[ "$JUDGE_ENABLED" == "1" && -n "$JUDGE_MODELS" ]]; then
+    local judge_count=${#JUDGE_CHAIN_BASE_URLS[@]:-0}
+    if (( judge_count > 0 )); then
+      local -a judge_items=()
+      IFS=',' read -r -a judge_items <<< "$JUDGE_MODELS"
+      local jn=${#judge_items[@]}
+      (( jn < judge_count )) && judge_count=$jn
+      for (( i = 0; i < judge_count; i += 1 )); do
+        route_triples+=("${judge_items[$i]}" "${JUDGE_CHAIN_BASE_URLS[$i]:-}" "${JUDGE_CHAIN_ENV_KEYS[$i]:-}")
+      done
+    fi
+  fi
+  if (( ${#route_triples[@]} > 0 )); then
+    local routes_json
+    routes_json="$(build_qwen_routes_json "${route_triples[@]}")"
+    # 当返回空串（CLI 不是 qwen 系，或全部模型都没有 baseUrl）时跳过追加。
+    if [[ -n "$routes_json" && "$routes_json" != "{}" ]]; then
+      COMMON_ARGS+=(--qwen-routes "$routes_json")
+    fi
   fi
 }
 
@@ -1105,6 +1205,7 @@ summary() {
     printf 'Topic：%s\n' "$TOPIC_SELECTION_LABEL"
     printf 'CLI：%s\n' "$SELECTED_CLI"
     printf '模型链：%s\n' "${MODEL_CHAIN:-CLI默认}"
+    print_qwen_route_summary
     printf '重试：%s 次，超时：%s 秒，降级阈值：%s\n' "$RETRIES" "$TIMEOUT_SECONDS" "$DEGRADE_AFTER"
     printf '进度：%s，心跳：%s 秒（每完成一篇立即刷一行）\n' "$PROGRESS_STYLE" "$HEARTBEAT_SECONDS"
   fi
@@ -1127,6 +1228,36 @@ summary() {
       printf '并发：%s，最大轮数：%s，每轮上限：%s\n' "$CONCURRENCY" "$MAX_ROUNDS" "${LIMIT:-不限}"
     fi
   fi
+}
+
+print_qwen_route_summary() {
+  # 把已绑定的 (model → host · envKey) 一行行打出来；列表空就一行 “未绑定”。
+  # 让用户当场识破“忘选/选错 provider”——尤其是火山/通义同名 id 的场景。
+  local cli_base
+  cli_base="${SELECTED_CLI##*/}"
+  case "$cli_base" in
+    qwen|qwen-code) ;;
+    *) return 0 ;;
+  esac
+  local n=${#MODEL_CHAIN_ITEMS[@]:-0}
+  if (( n == 0 )); then
+    printf 'qwen 路由：未绑定（用 CLI 默认/手动模型链）\n'
+    return 0
+  fi
+  local i model base_url env_key host any=0
+  for (( i = 0; i < n; i += 1 )); do
+    model="${MODEL_CHAIN_ITEMS[$i]}"
+    base_url="${CHAIN_BASE_URLS[$i]:-}"
+    env_key="${CHAIN_ENV_KEYS[$i]:-}"
+    [[ -z "$base_url" ]] && continue
+    any=1
+    host="${base_url#*://}"; host="${host%%/*}"
+    if (( i == 0 )); then
+      printf 'qwen 路由：\n'
+    fi
+    printf '  - %s → %s · %s\n' "$model" "$host" "${env_key:-（无 envKey）}"
+  done
+  (( any == 0 )) && printf 'qwen 路由：选中模型未携带 baseUrl（不会传 --qwen-routes）\n'
 }
 
 confirm_execution() {
