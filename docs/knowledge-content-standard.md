@@ -237,13 +237,15 @@ AI 或人工审查内容时，不能只看单个 topic 是否写得完整，还�
 7. 常见误区和坑是什么。
 8. 如何用一段完整面试回答讲出来。
 
-推荐正文结构：
+`learningCards` 排列顺序必须遵循以下规则，校验脚本会检查并扣分：
 
 1. `explain`：概念和核心原理。
 2. `diagram` 或 `compareTable`：流程、结构、对比。
-3. `interviewAnswer`：标准面试回答。
-4. `code`：需要代码表达的知识点才使用。
+3. `code`：需要代码表达的知识点才使用。
+4. `interviewAnswer`：标准面试回答。
 5. `checklist`：复述要点、排查步骤或答题结构。
+
+`code` 卡位置允许微调（例如紧跟在引用它的 explain 后面），但 `interviewAnswer` 必须在所有 explain/diagram/compareTable/code 之后、`checklist` 之前。
 
 正文禁止：
 

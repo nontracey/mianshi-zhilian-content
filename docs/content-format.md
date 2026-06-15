@@ -314,7 +314,7 @@ content-repo/
 
 ## 6. learningCards 类型
 
-`learningCards` 是知识学习页的核心。App 按 `type` 选择渲染方式。
+`learningCards` 是知识学习页的核心。App 按 `type` 选择渲染方式。卡片必须按以下顺序排列：`explain` → `diagram`/`compareTable`/`code` → `interviewAnswer` → `checklist`。同一类型的卡片之间保持逻辑递进即可，但类型之间的先后顺序不可调换。
 
 所有卡片都应至少包含：
 
@@ -472,8 +472,8 @@ content-repo/
 Mermaid 约束：
 
 1. `format=mermaid` 的 `content` 必须以 `flowchart` 或 `graph` 开头，并带方向声明，例如 `flowchart LR`、`flowchart TD`、`graph LR`。
-2. 只使用 App 已验证的基础流程图子集：节点、连线、分支、简单标签；不要使用 sequence、classDiagram、stateDiagram、mindmap、复杂样式或外部资源引用。
-3. Mermaid 图应该能用纯文本解释兜底，复杂知识建议同时写 `fallback` 或 `caption`。
+2. 只使用 App 已验证的基础流程图子集：节点、连线、分支、简单标签；不要使用 `sequenceDiagram`、`classDiagram`、`stateDiagram`、`mindmap`、`subgraph`、`classDef`、`style` 或外部资源引用。
+3. 禁止使用带标签虚线边 `A -.label.-> B`；App 不渲染虚线边上的标签，会导致信息丢失。需要标注的连线必须改用实线标签 `A -->|标签| B`。
 4. 图示节点必须使用当前 topic 的专属概念、对象、状态或链路名，不得大量使用 `输入`、`处理`、`输出`、`关键流程`、`边界处理` 这类万能节点。
 5. 图示必须表达真实关系，例如调用顺序、数据流、状态转移、依赖关系、隔离边界或失败路径；不能只是把正文关键词横向摆放。
 6. `caption` 或 `fallback` 应说明图在解释哪个机制，不能写成“展示本知识点关键环节”这类模板句。
@@ -625,7 +625,7 @@ Mermaid 约束：
 - [ ] `id` 全局唯一。
 - [ ] `domain` 在 manifest 中存在。
 - [ ] `category` 在领域文件中存在。
-- [ ] `learningCards` 至少包含一个 `explain`。
+- [ ] `learningCards` 至少包含一个 `explain`，且卡片顺序为 explain → 图/表/code → interviewAnswer → checklist。
 - [ ] `interviewAnswer` 卡片的 `followUpQuestions` 至少 2 个，回答必须针对当前知识点。
 - [ ] `recallPrompts` 至少包含一个问题。
 - [ ] `rubric.mustHave` 不为空。
