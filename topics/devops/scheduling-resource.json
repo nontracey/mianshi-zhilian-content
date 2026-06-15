@@ -25,17 +25,25 @@
     {
       "type": "explain",
       "title": "kube-scheduler 的两阶段：Filter（predicates）与 Score（priorities）",
-      "content": "调度器从 apiserver watch 到 spec.nodeName 为空的 Pod 后，对每个候选节点跑两轮：\n\n1. Filter 阶段（旧名 predicates）：剔除不满足硬条件的节点。常见过滤器有 NodeResourcesFit（requests 是否够，注意比的是 Allocatable 而不是 Capacity）、NodeAffinity（required 段）、PodTopologySpread、TaintToleration、NodeUnschedulable、VolumeBinding（PV 拓扑）、NodePorts。任何一项不通过节点直接淘汰。\n2. Score 阶段（旧名 priorities）：对幸存节点按多个插件打 0-100 分加权求和。常见打分器：LeastAllocated 偏好空闲多的节点、BalancedAllocation 偏好 CPU/内存使用率均衡的、ImageLocality 偏好已拉好镜像的、InterPodAffinity、TaintToleration（preferredDuringScheduling 走这里）。最高分胜出，并发同分时随机。\n\n胜出后调度器调用 Bind 把 Pod 的 spec.nodeName 写回 apiserver，kubelet 才看见并真正拉起容器。所以 `kubectl describe pod` 里 Events 里 `FailedScheduling 0/12 nodes are available: 6 Insufficient cpu, 4 node(s) had taint ...` 就是 Filter 阶段输出的真实原因，按这一行就能定位到底是资源不足、亲和性、污点还是 PVC 拓扑问题，不用瞎猜。"
+      "content": "调度器从 apiserver watch 到 spec.nodeName 为空的 Pod 后，对每个候选节点跑两轮。\n\n1. Filter 阶段（旧名 predicates）：剔除不满足硬条件的节点。常见过滤器有 NodeResourcesFit（requests 是否够，注意比的是 Allocatable 而不是 Capacity）、NodeAffinity（required 段）、PodTopologySpread、TaintToleration、NodeUnschedulable、VolumeBinding（PV 拓扑）、NodePorts。任何一项不通过节点直接淘汰。\n2. Score 阶段（旧名 priorities）：对幸存节点按多个插件打 0-100 分加权求和。常见打分器：LeastAllocated 偏好空闲多的节点、BalancedAllocation 偏好 CPU/内存使用率均衡的、ImageLocality 偏好已拉好镜像的、InterPodAffinity、TaintToleration（preferredDuringScheduling 走这里）。最高分胜出，并发同分时随机。\n\n胜出后调度器调用 Bind 把 Pod 的 spec.nodeName 写回 apiserver，kubelet 才看见并真正拉起容器。所以 `kubectl describe pod` 里 Events 中 `FailedScheduling 0/12 nodes are available: 6 Insufficient cpu, 4 node(s) had taint ...` 就是 Filter 阶段输出的真实原因。按这一行就能定位到底是资源不足、亲和性、污点还是 PVC 拓扑问题，不用瞎猜。"
     },
     {
       "type": "explain",
       "title": "requests/limits 与 QoS：三档分类决定谁先被驱逐",
-      "content": "requests 是调度依据，limits 是 cgroup 上限，二者搭配决定 Pod 的 QoSClass，而 QoSClass 直接决定节点资源紧张时谁第一个被 kubelet 干掉。\n\n- Guaranteed：每个容器的每种资源 requests == limits（且都显式写了）。OOM score 最低，节点驱逐时最后被赶。\n- Burstable：至少有一个 request 或 limit 设置，但不满足 Guaranteed 的等式条件。最常见档位。\n- BestEffort：requests 和 limits 都没设。OOM score 最高，节点压力一来第一个被驱逐。\n\nCPU 与内存的执行差异要分清：CPU limit 触发的是 cgroup CFS 限流（throttling），表现是 P99 抖动、`container_cpu_cfs_throttled_periods_total` 升高，进程不会死；内存 limit 触发的是 OOMKilled，进程被 SIGKILL，`kubectl describe` 里 Last State Reason 写得很清楚。\n\n超卖来自 requests << limits 的差值：节点 Allocatable 按 requests 之和算，所以你可以把 requests 调小、limits 留大，让更多 Pod 落到同一节点。代价是节点真的吃紧时 kubelet 走 eviction：先按 PriorityClass，再按 QoSClass（BestEffort → Burstable → Guaranteed），同档内按内存使用超 request 的程度排序。这就是为什么生产关键服务必须显式写 requests，否则掉成 BestEffort 一压就被赶。"
+      "content": "requests 是调度依据，limits 是 cgroup 上限，二者搭配决定 Pod 的 QoSClass。而 QoSClass 直接决定节点资源紧张时谁第一个被 kubelet 干掉。\n\n- Guaranteed：每个容器的每种资源 requests == limits（且都显式写了）。OOM score 最低，节点驱逐时最后被赶。\n- Burstable：至少有一个 request 或 limit 设置，但不满足 Guaranteed 的等式条件。最常见档位。\n- BestEffort：requests 和 limits 都没设。OOM score 最高，节点压力一来第一个被驱逐。\n\nCPU 与内存的执行差异要分清：CPU limit 触发的是 cgroup CFS 限流（throttling），表现是 P99 抖动、`container_cpu_cfs_throttled_periods_total` 升高，进程不会死。内存 limit 触发的是 OOMKilled，进程被 SIGKILL，`kubectl describe` 里 Last State Reason 写得很清楚。\n\n超卖来自 requests << limits 的差值：节点 Allocatable 按 requests 之和算，所以你可以把 requests 调小、limits 留大，让更多 Pod 落到同一节点。代价是节点真的吃紧时 kubelet 走 eviction：先按 PriorityClass，再按 QoSClass（BestEffort → Burstable → Guaranteed），同档内按内存使用超 request 的程度排序。这就是为什么生产关键服务必须显式写 requests，否则掉成 BestEffort 一压就被赶。"
     },
     {
       "type": "explain",
       "title": "亲和性、反亲和性与污点容忍：让 Pod 落到该落的节点",
-      "content": "三套机制按强度从弱到强叠加，调度器在 Filter/Score 两阶段分别消化：\n\n- nodeSelector：最朴素的 label 精确匹配，required 语义，不满足直接 Filter 掉。\n- nodeAffinity：requiredDuringSchedulingIgnoredDuringExecution 走 Filter（必须满足），preferredDuringScheduling 走 Score（加权偏好）。`IgnoredDuringExecution` 表示已调度的 Pod 不会因为节点 label 后改变而被赶走。\n- podAffinity / podAntiAffinity：基于 topologyKey（一般是 `kubernetes.io/hostname` 或 `topology.kubernetes.io/zone`）让 Pod 靠近或远离其他 Pod。最经典是 web 服务用 `podAntiAffinity + topologyKey: hostname` 强制不同副本落在不同节点，避免单机故障一次性带走全部副本。注意 podAffinity 是 O(N²) 计算，大集群上 required 段会显著拖慢调度，能用 PodTopologySpread 替代就替代。\n- taints/tolerations：方向反过来——taint 打在节点上排斥 Pod，Pod 必须显式 toleration 才能落进去。effect 三档：NoSchedule（新 Pod 不进来）、PreferNoSchedule（尽量不进）、NoExecute（连已经在跑的没 toleration 的也踢走，常见于节点 NotReady 后的 `node.kubernetes.io/unreachable:NoExecute` 自动 taint）。GPU 节点、专属租户节点、master 节点都是用 taint 实现隔离的。\n\n排查口诀：`describe pod` 看 Events 报的具体原因；亲和性问题对照 `kubectl get nodes --show-labels`；污点问题对照 `kubectl describe node | grep Taints`。"
+      "content": "三套机制按强度从弱到强叠加，调度器在 Filter/Score 两阶段分别消化。\n\n- nodeSelector：最朴素的 label 精确匹配，required 语义，不满足直接 Filter 掉。\n- nodeAffinity：requiredDuringSchedulingIgnoredDuringExecution 走 Filter（必须满足），preferredDuringScheduling 走 Score（加权偏好）。`IgnoredDuringExecution` 表示已调度的 Pod 不会因为节点 label 后改变而被赶走。\n- podAffinity / podAntiAffinity：基于 topologyKey（一般是 `kubernetes.io/hostname` 或 `topology.kubernetes.io/zone`）让 Pod 靠近或远离其他 Pod。最经典是 web 服务用 `podAntiAffinity + topologyKey: hostname` 强制不同副本落在不同节点，避免单机故障一次性带走全部副本。注意 podAffinity 是 O(N²) 计算，大集群上 required 段会显著拖慢调度，能用 PodTopologySpread 替代就替代。\n- taints/tolerations：方向反过来——taint 打在节点上排斥 Pod，Pod 必须显式 toleration 才能落进去。effect 三档：NoSchedule（新 Pod 不进来）、PreferNoSchedule（尽量不进）、NoExecute（连已经在跑的没 toleration 的也踢走，常见于节点 NotReady 后的 `node.kubernetes.io/unreachable:NoExecute` 自动 taint）。GPU 节点、专属租户节点、master 节点都是用 taint 实现隔离的。\n\n排查口诀：`describe pod` 看 Events 报的具体原因；亲和性问题对照 `kubectl get nodes --show-labels`；污点问题对照 `kubectl describe node | grep Taints`。"
+    },
+    {
+      "type": "diagram",
+      "title": "kube-scheduler 调度与节点驱逐全链路",
+      "format": "mermaid",
+      "content": "flowchart TD\nA[Pod 创建 spec.nodeName 为空] --> B[调度队列]\nB --> C[Filter 阶段]\nC --> D{NodeResourcesFit}\nD -- 否 --> E[淘汰: Insufficient cpu/memory]\nD -- 是 --> F{TaintToleration}\nF -- 否 --> G[淘汰: taint 不匹配]\nF -- 是 --> H{PodTopologySpread}\nH -- 否 --> I[淘汰: 拓扑分布不满足]\nH -- 是 --> J[Score 阶段]\nJ --> K[LeastAllocated 打分]\nK --> L[BalancedAllocation 打分]\nL --> M[ImageLocality 打分]\nM --> N[最高分节点胜出]\nN --> O[Bind: 写入 spec.nodeName]\nO --> P[kubelet 拉起容器]\nP --> Q[cgroup 执行 requests/limits]\nQ --> R{节点压力?}\nR -- 是 --> S[按 PriorityClass 排序]\nS --> T[按 QoSClass 驱逐]\nT --> U[BestEffort最先 Burstable次之 Guaranteed最后]\nR -- 否 --> V[正常运行]",
+      "fallback": "调度链路：Pod 无 nodeName → Filter 阶段按 NodeResourcesFit/TaintToleration/PodTopologySpread 淘汰节点 → Score 阶段按 LeastAllocated/BalancedAllocation/ImageLocality 打分 → Bind 写入 nodeName → kubelet 拉起 → cgroup 执行 limits。节点压力时按 PriorityClass → QoSClass（BestEffort → Burstable → Guaranteed）顺序驱逐。",
+      "caption": "Filter 阶段输出在 kubectl describe pod 的 Events 里可直接看到，是 Pending 排查的第一线索。节点驱逐按 QoSClass 分层，Guaranteed 最后才被赶。"
     },
     {
       "type": "compareTable",
@@ -83,7 +91,7 @@
         },
         {
           "line": 14,
-          "note": "nodeAffinity 用 required 段强制只能落到 workload=payment 的节点；和 toleration 是双向门——节点既要让你进，你也要选它。"
+          "note": "nodeAffinity 用 required 段强制只能落到 workload=payment 的节点。和 toleration 是双向门——节点既要让你进，你也要选它。"
         },
         {
           "line": 22,
@@ -91,18 +99,18 @@
         },
         {
           "line": 32,
-          "note": "memory requests 和 limits 都是 512Mi 但 CPU requests 500m 而 limits 1，所以这是 Burstable 不是 Guaranteed；想做 Guaranteed 必须 CPU 也写成相等。"
+          "note": "memory requests 和 limits 都是 512Mi 但 CPU requests 500m 而 limits 1，所以这是 Burstable 不是 Guaranteed。想做 Guaranteed 必须 CPU 也写成相等。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论先给：K8s 调度本质是 kube-scheduler 的两阶段决策（Filter 排除硬约束、Score 给候选节点打分），落到节点后由 kubelet 按 cgroup 执行 requests/limits、按 QoSClass 决定驱逐顺序。\n\n机制层我会沿调度生命周期讲：第一，Pod 进队列后，Filter 阶段跑 NodeResourcesFit、NodeAffinity、TaintToleration 等过滤插件，任何一项不过节点就被淘汰，这也是 `FailedScheduling Insufficient cpu / had taint` 报错的来源；第二，Score 阶段跑 LeastAllocated、BalancedAllocation、ImageLocality 等打分器加权求和，最高分胜出；第三，调度器 Bind 完后 kubelet 拉起容器，CPU limit 触发 CFS 限流（throttle，进程不死）、memory limit 触发 OOMKilled（进程被 SIGKILL）。\n\n边界点必须说清楚：requests 决定调度和 QoSClass，limits 决定运行上限；Guaranteed/Burstable/BestEffort 三档驱逐顺序刚好是 BestEffort → Burstable → Guaranteed；超卖就是把 sum(requests) 调到接近 Allocatable、但 sum(limits) 远大于 Allocatable 来榨容量，代价是节点压力时驱逐风暴；亲和性里 podAntiAffinity + hostname topologyKey 是高可用副本打散的标配，taints/tolerations 用来做 GPU、专属租户、master 节点隔离。\n\n生产视角补充一句：Pending 看 `describe pod` 的 Events，CrashLoop 看容器退出码和探针配置，OOMKilled 看 `Last State.Reason` 和 `container_memory_working_set_bytes` 是否长期顶到 limit，CPU 抖动看 `container_cpu_cfs_throttled_periods_total`，定位路径稳定到链路就不会乱。",
+      "content": "**30 秒结论**\n\nK8s 调度本质是 kube-scheduler 的两阶段决策（Filter 排除硬约束、Score 给候选节点打分），落到节点后由 kubelet 按 cgroup 执行 requests/limits、按 QoSClass 决定驱逐顺序。\n\n**核心机制**\n\n1. **Filter 阶段**：跑 NodeResourcesFit、NodeAffinity、TaintToleration 等过滤插件，任何一项不过节点就被淘汰。这也是 `FailedScheduling Insufficient cpu / had taint` 报错的来源。\n2. **Score 阶段**：跑 LeastAllocated、BalancedAllocation、ImageLocality 等打分器加权求和，最高分胜出。\n3. **kubelet 执行**：Bind 完后 kubelet 拉起容器。CPU limit 触发 CFS 限流（throttle，进程不死），memory limit 触发 OOMKilled（进程被 SIGKILL）。\n\n**边界点**\n\n- requests 决定调度和 QoSClass，limits 决定运行上限。\n- Guaranteed/Burstable/BestEffort 三档驱逐顺序是 BestEffort → Burstable → Guaranteed。\n- 超卖就是把 sum(requests) 调到接近 Allocatable、但 sum(limits) 远大于 Allocatable 来榨容量，代价是节点压力时驱逐风暴。\n- 亲和性里 podAntiAffinity + hostname topologyKey 是高可用副本打散的标配，taints/tolerations 用来做 GPU、专属租户、master 节点隔离。\n\n**生产排查**\n\nPending 看 `describe pod` 的 Events，CrashLoop 看容器退出码和探针配置，OOMKilled 看 `Last State.Reason` 和 `container_memory_working_set_bytes` 是否长期顶到 limit，CPU 抖动看 `container_cpu_cfs_throttled_periods_total`。",
       "followUpQuestions": [
         {
           "question": "线上一个 Pod 一直 Pending，你怎么按调度链路排查？",
-          "answer": "先 `kubectl describe pod` 看 Events，里面会写 `FailedScheduling 0/N nodes are available: X Insufficient cpu, Y node(s) had taint, Z node(s) didn't match Pod's node affinity`——直接告诉你 Filter 阶段是哪个插件刷的。如果是 Insufficient，对照节点 Allocatable（不是 Capacity）和现有 sum(requests)，看看是不是 requests 写太大或者节点真的满了；如果是 taint，对照 `kubectl describe node | grep Taints` 加 toleration；如果是 affinity，`kubectl get nodes --show-labels` 看 label 和 nodeAffinity 里的 matchExpressions 对不对得上；如果是 PVC 拓扑（`had volume node affinity conflict`），就是 PV 绑定的 zone 和节点 zone 不一致，常见于跨可用区调度。"
+          "answer": "先 `kubectl describe pod` 看 Events，里面会写 `FailedScheduling 0/N nodes are available: X Insufficient cpu, Y node(s) had taint, Z node(s) didn't match Pod's node affinity`——直接告诉你 Filter 阶段是哪个插件刷的。如果是 Insufficient，对照节点 Allocatable（不是 Capacity）和现有 sum(requests)，看看是不是 requests 写太大或者节点真的满了。如果是 taint，对照 `kubectl describe node | grep Taints` 加 toleration。如果是 affinity，`kubectl get nodes --show-labels` 看 label 和 nodeAffinity 里的 matchExpressions 对不对得上。如果是 PVC 拓扑（`had volume node affinity conflict`），就是 PV 绑定的 zone 和节点 zone 不一致，常见于跨可用区调度。"
         },
         {
           "question": "QoS 三档的驱逐顺序是怎么定的，为什么核心服务要做成 Guaranteed？",
