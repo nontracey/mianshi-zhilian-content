@@ -24,7 +24,7 @@
     {
       "type": "explain",
       "title": "为什么这是综合题：五段链路决定 LCP",
-      "content": "用户按下回车到首屏画出，浏览器要按顺序走完五件事：URL/缓存判定、DNS 解析、TCP+TLS 建连、HTTP 请求/响应、HTML 解析与渲染。任何一段卡住，都会直接体现在 LCP（最大内容绘制）和 INP（交互响应）上。\n\n理解这条链路的关键是把它当成一条 RTT 流水线：\n\n- 冷启动一次 HTTPS 请求，至少要 1 次 DNS 往返 + 1 次 TCP 三次握手（1 RTT）+ TLS 1.3 1-RTT，然后才能发第一个字节，请求处理完再花 1 个 RTT 把首字节传回来——这就是 TTFB 至少 3-4 个 RTT 的由来。\n- HTTP/3 走 QUIC over UDP，把 TCP 握手和 TLS 握手合并成 1-RTT，回头客可以 0-RTT 复用，弱网下 LCP 普遍能压缩 100-300ms。\n- 渲染阶段并不是请求结束才开始：HTML 流式解析时 preload scanner 已经在并行去发 CSS/JS/图片请求，所以\"请求-渲染\"实际上是叠在一起的。\n\n判断一个候选人是否真讲清楚，看他能不能把每段对应到工具和指标：DNS 看 `dig +trace` 和 `chrome://net-internals/#dns`；建连看 Chrome DevTools Network 面板里的 Connection Start/SSL；HTTP 看 TTFB；渲染看 Performance 面板里 Recalculate Style/Layout/Paint/Composite Layers。"
+      "content": "用户按下回车到首屏画出，浏览器要按顺序走完五件事：URL/缓存判定、DNS 解析、TCP+TLS 建连、HTTP 请求/响应、HTML 解析与渲染。任何一段卡住，都会直接体现在 LCP（最大内容绘制）和 INP（交互响应）上。\n\n理解这条链路的关键是把它当成一条 RTT 流水线：\n\n- 冷启动一次 HTTPS 请求，DNS 往返占 1 个 RTT。TCP 三次握手再占 1 个 RTT。TLS 1.3 握手占 1 个 RTT。此时才能发出第一个字节。服务端处理完后，还要 1 个 RTT 把首字节传回客户端。TTFB 至少 3-4 个 RTT 就是这么来的。\n- HTTP/3 走 QUIC over UDP，把 TCP 握手和 TLS 握手合并成 1-RTT，回头客可以 0-RTT 复用，弱网下 LCP 普遍能压缩 100-300ms。\n- 渲染阶段并不是请求结束才开始。HTML 流式解析时，preload scanner 已经在并行去发 CSS/JS/图片请求。\"请求-渲染\"实际上是叠在一起的。\n\n判断一个候选人是否真讲清楚，看他能不能把每段对应到工具和指标：\n\n- DNS 看 `dig +trace` 和 `chrome://net-internals/#dns`。\n- 建连看 Chrome DevTools Network 面板里的 Connection Start/SSL。\n- HTTP 看 TTFB。\n- 渲染看 Performance 面板里 Recalculate Style/Layout/Paint/Composite Layers。"
     },
     {
       "type": "explain",
@@ -34,7 +34,7 @@
     {
       "type": "diagram",
       "title": "URL 到首屏的 RTT 时序",
-      "content": "sequenceDiagram\n  participant U as 用户/浏览器\n  participant DNS as DNS\n  participant CDN as CDN 边缘节点\n  participant ORI as 源站\n  U->>U: URL 解析 + HSTS + 强缓存\n  U->>DNS: 查询 A/AAAA (可被 dns-prefetch 提前)\n  DNS-->>U: 返回 CDN 就近 IP\n  U->>CDN: TCP 三次握手 (1 RTT)\n  U->>CDN: TLS 1.3 ClientHello (1 RTT, 0-RTT 可复用)\n  CDN-->>U: ServerHello + 证书 + Finished\n  U->>CDN: HTTP 请求 (含 Cookie / If-None-Match)\n  CDN->>ORI: 未命中边缘缓存时回源\n  ORI-->>CDN: 200 / 304\n  CDN-->>U: 响应 (TTFB)\n  U->>U: HTML 流式解析 + preload scanner 并行发 CSS/JS/图片\n  U->>U: 构建 DOM/CSSOM → Layout → Paint → Composite (LCP)",
+      "content": "flowchart LR\nU-->|URL 解析 + HSTS + 强缓存|U\nU-->|查询 A/AAAA (可被 dns-prefetch 提前)|DNS\nDNS-->|返回 CDN 就近 IP|U\nU-->|TCP 三次握手 (1 RTT)|CDN\nU-->|TLS 1.3 ClientHello (1 RTT, 0-RTT 可复用)|CDN\nCDN-->|ServerHello + 证书 + Finished|U\nU-->|HTTP 请求 (含 Cookie / If-None-Match)|CDN\nCDN-->|未命中边缘缓存时回源|ORI\nORI-->|200 / 304|CDN\nCDN-->|响应 (TTFB)|U\nU-->|HTML 流式解析 + preload scanner 并行发 CSS/JS/图片|U\nU-->|构建 DOM/CSSOM → Layout → Paint → Composite (LCP)|U",
       "format": "mermaid",
       "fallback": "URL 解析→DNS→TCP→TLS→HTTP→渲染，HTTPS 冷启动至少 3 个 RTT 才能拿到首字节；CDN 命中可省掉回源那段；preload scanner 让渲染和子资源请求重叠。",
       "caption": "把每段映射到 RTT，方便面试时讲清\"为什么 HTTP/3 0-RTT 能省 100-300ms\"以及\"CDN 把哪段去掉了\"。"
@@ -84,7 +84,17 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "30 秒结论：从输入 URL 到页面展示，本质是一条由 RTT 串起来的流水线，分五段——URL/缓存判定、DNS、TCP+TLS 建连、HTTP 请求响应、浏览器解析渲染。HTTPS 冷启动至少 3 个 RTT 才拿到首字节，所以每段优化都是在抠 RTT 或者把某段直接跳过。\n\n机制主线（按面试官期待的顺序）：\n\n1. **URL 与缓存**：浏览器先解析 URL，命中强缓存或 Service Worker 直接返回，否则查 HSTS 决定是否升级 HTTPS。\n2. **DNS**：浏览器/系统/递归 DNS 多级缓存，未命中走根→TLD→权威，CDN 在这里返回就近边缘 IP。\n3. **建连**：TCP 三次握手 1 RTT，HTTPS 再叠 TLS 1.3 1-RTT；HTTP/3 用 QUIC 把这两步合并，回头客 0-RTT。\n4. **HTTP**：带上 Cookie 和 If-None-Match 等条件请求头，CDN 命中直接回，未命中回源；服务端可能流式返回 HTML。\n5. **渲染**：HTML 边下边解析，preload scanner 并行发子资源；构建 DOM/CSSOM→Render Tree→Layout→Paint→Composite，遇到同步 JS 阻塞解析、CSS 阻塞渲染。\n\n边界与验证：把每段对应到 DevTools 的 Network/Performance 面板和 LCP/INP/CLS 指标，能讲出\"哪一段慢了用什么工具看、用什么手段降\"，就能跟普通背书拉开差距。"
+      "content": "30 秒结论：从输入 URL 到页面展示，本质是一条由 RTT 串起来的流水线，分五段——URL/缓存判定、DNS、TCP+TLS 建连、HTTP 请求响应、浏览器解析渲染。HTTPS 冷启动至少 3 个 RTT 才拿到首字节，所以每段优化都是在抠 RTT 或者把某段直接跳过。\n\n核心机制（按面试官期待的顺序）：\n\n1. **URL 与缓存**\n   - 浏览器先解析 URL，命中强缓存或 Service Worker 直接返回。\n   - 未命中则查 HSTS 决定是否升级 HTTPS。\n2. **DNS**\n   - 浏览器/系统/递归 DNS 多级缓存。\n   - 未命中走根 → TLD → 权威。\n   - CDN 在这里返回就近边缘 IP。\n3. **建连**\n   - TCP 三次握手占 1 个 RTT。\n   - HTTPS 再叠 TLS 1.3 的 1-RTT。\n   - HTTP/3 用 QUIC 把这两步合并，回头客 0-RTT。\n4. **HTTP**\n   - 带上 Cookie 和 If-None-Match 等条件请求头。\n   - CDN 命中直接回，未命中回源。\n   - 服务端可能流式返回 HTML。\n5. **渲染**\n   - HTML 边下边解析，preload scanner 并行发子资源。\n   - 构建 DOM/CSSOM → Render Tree → Layout → Paint → Composite。\n   - 遇到同步 JS 阻塞解析，CSS 阻塞渲染。\n\n边界与验证：\n\n- 把每段对应到 DevTools 的 Network/Performance 面板。\n- 把 LCP/INP/CLS 指标落到具体阶段。\n- 能讲出\"哪一段慢了用什么工具看、用什么手段降\"，就能跟普通背书拉开差距。",
+      "followUpQuestions": [
+        {
+          "question": "HTTP/2 和 HTTP/3 在这条链路上分别消除了什么瓶颈？",
+          "answer": "HTTP/2 用多路复用消除了应用层队头阻塞——同一连接上并行多个请求/响应，但 TCP 层丢包仍会阻塞所有流。HTTP/3 用 QUIC 换掉 TCP，彻底消除了传输层队头阻塞，单个流丢包不影响其他流；同时把 TLS 1.3 拥进握手，冷启动从 TCP+TLS 2 RTT 降到 1 RTT，回头客 0-RTT。"
+        },
+        {
+          "question": "如果 DevTools Network 面板显示首个请求的 Waiting (TTFB) 超过 2 秒，你会怎么定位是哪一段慢？",
+          "answer": "按链路倒推：先看 DNS Lookup 耗时是否异常——如果是，切换 DNS 或检查本地缓存；再看 SSL/TLS 握手耗时——证书链太长或 OCSP 没有本地缓存会拉长；然后看服务端处理时间——是否命中 CDN 缓存、回源是否慢、是否有慢查询。最常见的原因是回源慢或 CDN 穿透率高，X-Cache 头能直接判断是否命中边缘。"
+        }
+      ]
     },
     {
       "type": "checklist",

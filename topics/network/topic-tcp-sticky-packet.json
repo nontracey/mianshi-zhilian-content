@@ -26,13 +26,13 @@
     {
       "type": "explain",
       "title": "三种解码方案的真实取舍 + Netty 三选一怎么挑",
-      "content": "## 定长 / 分隔符 / 长度前缀 LV 的边界\n- 定长（FixedLengthFrameDecoder）：每条消息固定 N 字节，不足补零。命令字协议、心跳报文场景适用；变长业务用它会浪费带宽，且「补零」后业务侧还要自己 trim。\n- 分隔符（DelimiterBasedFrameDecoder / LineBasedFrameDecoder）：用 \\r\\n 或自定义分隔符。问题是 body 里若出现分隔符必须转义（HTTP/SMTP 是文本协议所以可以用），二进制数据里几乎不可避免误命中。\n- 长度前缀 LV（LengthFieldBasedFrameDecoder）：消息头写 body 长度，接收方先读够头、再按长度读 body。这是 Dubbo、gRPC、Kafka、Redis RESP3 二进制 frame 的共同选择。\n\n## 实战必踩的坑\n1. 累积缓冲区是必须的：解码器要持有 ByteBuf，每次只取出一条完整消息，剩余字节留到下一次。一次 read 不等于一条消息这个前提如果忘了，就会出现「收到半个 length 字段就开始解析」的经典 bug。\n2. lengthFieldOffset 要算清：Netty 的 LengthFieldBasedFrameDecoder 五个参数（maxFrameLength / lengthFieldOffset / lengthFieldLength / lengthAdjustment / initialBytesToStrip）任何一个错位都会让 frame 越界。lengthAdjustment 用来表达「长度字段值是否包含自身和魔数」，最常忘。\n3. maxFrameLength 必须设：恶意/异常发送方写一个 0x7FFFFFFF 长度，没有上限会直接 OOM；Dubbo 默认 8MB，要按业务调。\n4. 字节序统一为大端（网络字节序），魔数 + 版本号放在 length 之前便于乱包识别和协议演进。"
+      "content": "## 定长 / 分隔符 / 长度前缀 LV 的边界\n- 定长（FixedLengthFrameDecoder）：每条消息固定 N 字节，不足补零。命令字协议、心跳报文场景适用；变长业务用它会浪费带宽，且「补零」后业务侧还要自己 trim。\n- 分隔符（DelimiterBasedFrameDecoder / LineBasedFrameDecoder）：用 \\r\\n 或自定义分隔符。问题是 body 里若出现分隔符必须转义（HTTP/SMTP 是文本协议所以可以用），二进制数据里几乎不可避免误命中。\n- 长度前缀 LV（LengthFieldBasedFrameDecoder）：消息头写 body 长度，接收方先读够头、再按长度读 body。这是 Dubbo、gRPC、Kafka、Redis RESP3 二进制 frame 的共同选择。\n\n## 实战必踩的坑\n1. 累积缓冲区是必须的：解码器要持有 ByteBuf，每次只取出一条完整消息，剩余字节留到下一次。一次 read 不等于一条消息这个前提如果忘了，就会出现「收到半个 length 字段就开始解析」的经典 bug。\n2. lengthFieldOffset 要算清。Netty 的 LengthFieldBasedFrameDecoder 有五个参数：\n- maxFrameLength\n- lengthFieldOffset\n- lengthFieldLength\n- lengthAdjustment\n- initialBytesToStrip\n\n任何一个错位都会让 frame 越界。lengthAdjustment 用来表达「长度字段值是否包含自身和魔数」，最常忘。\n3. maxFrameLength 必须设：恶意/异常发送方写一个 0x7FFFFFFF 长度，没有上限会直接 OOM；Dubbo 默认 8MB，要按业务调。\n4. 字节序统一为大端（网络字节序），魔数 + 版本号放在 length 之前便于乱包识别和协议演进。"
     },
     {
       "type": "diagram",
       "title": "长度前缀 LV 解码：累积缓冲区状态机",
       "format": "mermaid",
-      "content": "flowchart TD\n    READ[read 到 ByteBuf 累积区]\n    CHKHDR{可读字节 >= 4 ?}\n    PEEK[peek 出 length=N 不消费指针]\n    CHKBODY{可读字节 >= 4 + N ?}\n    EMIT[skipBytes 4 + 取出 N 字节交给业务]\n    WAIT[保留累积区 等下次 channelRead]\n    GUARD{N > maxFrameLength ?}\n    FAIL[抛 TooLongFrameException 关连接]\n    READ --> CHKHDR\n    CHKHDR -->|否| WAIT\n    CHKHDR -->|是| PEEK\n    PEEK --> GUARD\n    GUARD -->|是| FAIL\n    GUARD -->|否| CHKBODY\n    CHKBODY -->|否| WAIT\n    CHKBODY -->|是| EMIT\n    EMIT --> CHKHDR\n    WAIT --> READ",
+      "content": "flowchart TD\n    READ[read 到 ByteBuf 累积区] --> CHKHDR{可读字节 >= 4 ?}\n    CHKHDR -->|否| WAIT[保留累积区 等下次 channelRead]\n    CHKHDR -->|是| PEEK[peek 出 length=N 不消费指针]\n    PEEK --> GUARD{N > maxFrameLength ?}\n    GUARD -->|是| FAIL[抛 TooLongFrameException 关连接]\n    GUARD -->|否| CHKBODY{可读字节 >= 4 + N ?}\n    CHKBODY -->|否| WAIT\n    CHKBODY -->|是| EMIT[skipBytes 4 + 取出 N 字节交给业务]\n    EMIT --> CHKHDR\n    WAIT --> READ",
       "caption": "Netty LengthFieldBasedFrameDecoder 的核心状态：先 peek 长度做 maxFrameLength 守卫，再判 body 是否到齐，到齐才消费指针。",
       "fallback": "状态机：读入 -> 判 4 字节头是否到 -> peek 长度 N -> 校验 N <= maxFrameLength -> 判 body 是否够 -> 够则交付并继续循环 -> 不够保留缓冲等下一次 read。"
     },
@@ -45,12 +45,30 @@
       "type": "code",
       "title": "Netty LengthFieldBasedFrameDecoder 配置 + 自写长度前缀编解码",
       "content": "// 1) Netty 长度前缀解码器：4 字节大端长度 + body，不带魔数版本号\n//    maxFrameLength=8MB，lengthFieldOffset=0，lengthFieldLength=4\n//    lengthAdjustment=0（长度字段值仅表示 body 长度）\n//    initialBytesToStrip=4（向业务交付时已剥掉头）\nch.pipeline()\n  .addLast(new LengthFieldBasedFrameDecoder(8 * 1024 * 1024, 0, 4, 0, 4))\n  .addLast(new LengthFieldPrepender(4))            // 编码端自动写 4 字节长度\n  .addLast(new BizHandler());\n\n// 2) 带魔数 + 版本号的更稳健头格式：MAGIC(2) + VERSION(1) + LENGTH(4) + BODY\n//    lengthFieldOffset=3，lengthFieldLength=4，lengthAdjustment=0\n//    initialBytesToStrip=7（业务只拿到纯 body）\nch.pipeline()\n  .addLast(new LengthFieldBasedFrameDecoder(8 * 1024 * 1024, 3, 4, 0, 7));\n\n// 3) 不依赖框架时的手写解码 —— 突出累积缓冲与 maxFrameLength 守卫\npublic class LengthPrefixDecoder {\n    private static final int HEADER = 4;\n    private static final int MAX_FRAME = 8 * 1024 * 1024; // 必须设上限\n    private final ByteBuf cumulation;                     // 跨 channelRead 累积\n\n    public LengthPrefixDecoder(ByteBufAllocator alloc) {\n        this.cumulation = alloc.buffer();\n    }\n\n    public List<ByteBuf> decode(ByteBuf in) {\n        cumulation.writeBytes(in);                        // 累积，关键\n        List<ByteBuf> out = new ArrayList<>();\n        while (cumulation.readableBytes() >= HEADER) {\n            int readerIdx = cumulation.readerIndex();\n            int length = cumulation.getInt(readerIdx);    // peek，不移动指针\n            if (length < 0 || length > MAX_FRAME) {\n                cumulation.clear();\n                throw new TooLongFrameException(\"frame too large: \" + length);\n            }\n            if (cumulation.readableBytes() < HEADER + length) break; // body 没到齐，等下次\n            cumulation.skipBytes(HEADER);\n            out.add(cumulation.readRetainedSlice(length));\n        }\n        cumulation.discardReadBytes();                    // 释放已消费空间\n        return out;\n    }\n}",
-      "language": "java"
+      "language": "java",
+      "highlights": [
+        {
+          "line": 4,
+          "note": "maxFrameLength=8MB 防恶意长度导致 OOM。lengthFieldOffset=0 表示长度字段在头部起始位置。"
+        },
+        {
+          "line": 8,
+          "note": "带魔数+版本号的头格式更稳健。lengthFieldOffset=3 表示长度字段从第 3 字节开始。"
+        },
+        {
+          "line": 18,
+          "note": "cumulation.writeBytes(in) 是跨 channelRead 累积缓冲区的关键。没有它高 QPS 下必偶发解析失败。"
+        },
+        {
+          "line": 22,
+          "note": "getInt(readerIdx) 是 peek 操作，不移动读指针。等 body 到齐后才 skipBytes + readSlice。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路：30 秒结论 + 机制 + 边界",
-      "content": "**结论先行**：粘包/拆包不是 TCP 的 bug，而是 TCP 字节流契约的必然结果——发送侧 Nagle 合并、MSS 切分、接收侧 read 时机错位，三者叠加让一次 read 既可能拿到多条消息也可能拿到半条。解决方法只有一类：在应用层重建消息边界，工程上的三种实现是定长、分隔符、长度前缀 LV，二进制协议绝大多数选第三种。\n\n**机制层**：发送方 write 100B + 200B，若 TCP_NODELAY 关闭且前一段未 ACK，Nagle 会把它们合成一个 segment 发出；若 write 一次 4KB 在以太网上必然被 MSS 1460 切成至少 3 个 segment。接收侧 socket 缓冲区是连续字节，read 只保证返回 1..n 字节。所以解码器必须维护累积缓冲区，按协议头反复判断「够不够一条」。\n\n**实战与边界**：Netty 三个内置解码器对应三类方案——FixedLengthFrameDecoder、DelimiterBasedFrameDecoder、LengthFieldBasedFrameDecoder。生产里基本只用 LengthFieldBasedFrameDecoder，原因是它支持二进制、长度可变、效率最高。配置上必须设 maxFrameLength（防恶意长度 OOM），lengthFieldOffset / lengthFieldLength / lengthAdjustment 要按协议头精确算，遗漏会出现「业务拿到的 frame 越界一两个字节」这种调起来很痛的 bug。Dubbo、gRPC、Kafka 的 frame 头都属于这一类。UDP 因为是数据报协议天然有边界，但代价是 64KB 上限和不可靠，所以业务长消息基本不会选 UDP。",
+      "content": "**结论先行**：粘包/拆包不是 TCP 的 bug，而是 TCP 字节流契约的必然结果——发送侧 Nagle 合并、MSS 切分、接收侧 read 时机错位，三者叠加让一次 read 既可能拿到多条消息也可能拿到半条。解决方法只有一类：在应用层重建消息边界，工程上的三种实现是定长、分隔符、长度前缀 LV，二进制协议绝大多数选第三种。\n\n**机制层**：发送方 write 100B + 200B，若 TCP_NODELAY 关闭且前一段未 ACK，Nagle 会把它们合成一个 segment 发出；若 write 一次 4KB 在以太网上必然被 MSS 1460 切成至少 3 个 segment。接收侧 socket 缓冲区是连续字节，read 只保证返回 1..n 字节。所以解码器必须维护累积缓冲区，按协议头反复判断「够不够一条」。\n\n**实战与边界**：\n\n- Netty 三个内置解码器对应三类方案：FixedLengthFrameDecoder、DelimiterBasedFrameDecoder、LengthFieldBasedFrameDecoder。\n- 生产里基本只用 LengthFieldBasedFrameDecoder。它支持二进制、长度可变、效率最高。\n- 配置上必须设 maxFrameLength，防恶意长度导致 OOM。\n- lengthFieldOffset、lengthFieldLength、lengthAdjustment 要按协议头精确算。遗漏会出现「业务拿到的 frame 越界一两个字节」这种调起来很痛的 bug。\n- Dubbo、gRPC、Kafka 的 frame 头都属于长度前缀这一类。\n- UDP 因为是数据报协议天然有边界。但代价是 64KB 上限和不可靠。业务长消息基本不会选 UDP。",
       "followUpQuestions": [
         {
           "question": "TCP_NODELAY 开了之后还会不会粘包？为什么？",
