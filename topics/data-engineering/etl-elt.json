@@ -83,7 +83,7 @@
       "type": "diagram",
       "title": "MySQL 业务库到数仓的 CDC 入仓链路",
       "format": "mermaid",
-      "content": "flowchart LR\nA[MySQL 业务库\\nbinlog row 模式] --> B[Flink CDC Source\\n首次全量+增量]\nB --> C[Kafka ODS Topic\\n按主键分区]\nC --> D[Flink SQL 转换\\n维表 join + 清洗]\nC --> E[ODS 原始层\\nIceberg/Hudi upsert]\nD --> F[DWD 明细层\\n分区表]\nE -.重算.-> D\nF --> G[质量校验\\n行数/主键唯一/枚举值]\nG --> H[发布 ADS/对外服务]",
+      "content": "flowchart LR\nA[MySQL 业务库<br/>binlog row 模式] --> B[Flink CDC Source<br/>首次全量+增量]\nB --> C[Kafka ODS Topic<br/>按主键分区]\nC --> D[Flink SQL 转换<br/>维表 join + 清洗]\nC --> E[ODS 原始层<br/>Iceberg/Hudi upsert]\nD --> F[DWD 明细层<br/>分区表]\nE -->|重算| D\nF --> G[质量校验<br/>行数/主键唯一/枚举值]\nG --> H[发布 ADS/对外服务]",
       "fallback": "MySQL binlog → Flink CDC（首次全量+增量切换）→ Kafka ODS Topic → 双写 Iceberg ODS 原始层与 Flink SQL 清洗 → DWD → 质量校验 → 发布。原始层保留以便下游异常时回溯重算。",
       "caption": "核心是：Flink CDC 把 binlog 转成可重放的事件流，ODS 层无脑落原始数据，DWD 转换出错可从 ODS 回放重算，不再回头打扰业务库。"
     },
@@ -94,24 +94,16 @@
       "content": "-- Flink SQL：MySQL CDC Source（全量+增量一体）\nCREATE TABLE orders_src (\n  id        BIGINT,\n  user_id   BIGINT,\n  amount    DECIMAL(10,2),\n  status    STRING,\n  update_time TIMESTAMP(3),\n  PRIMARY KEY (id) NOT ENFORCED   -- 必须声明主键，否则 update/delete 无法 upsert\n) WITH (\n  'connector' = 'mysql-cdc',\n  'hostname' = 'mysql-prod',\n  'database-name' = 'shop',\n  'table-name' = 'orders',\n  'scan.startup.mode' = 'initial',     -- initial=首次全量+增量；latest-offset=只增量\n  'scan.incremental.snapshot.enabled' = 'true',  -- 2.x 增量快照，避免锁表\n  'server-id' = '5400-5410'             -- 必须唯一，避免与其他 slave 冲突\n);\n\n-- 写入 Iceberg ODS 层，按 dt 分区，主键 upsert\nCREATE TABLE ods_orders (\n  id BIGINT, user_id BIGINT, amount DECIMAL(10,2),\n  status STRING, update_time TIMESTAMP(3), dt STRING,\n  PRIMARY KEY (id) NOT ENFORCED\n) PARTITIONED BY (dt) WITH (\n  'connector' = 'iceberg',\n  'write.upsert.enabled' = 'true'       -- 关键：开启 upsert 才能正确处理 update/delete\n);\n\nINSERT INTO ods_orders\nSELECT id, user_id, amount, status, update_time,\n       DATE_FORMAT(update_time, 'yyyy-MM-dd') AS dt\nFROM orders_src;",
       "highlights": [
         {
-          "line": "PRIMARY KEY (id) NOT ENFORCED",
-          "note": "CDC 链路必须声明主键，否则 UPDATE 会被当成新增行，DELETE 事件无法生效"
+          "line": 1,
+          "note": "Flink CDC source 定义 MySQL binlog 消费"
         },
         {
-          "line": "'scan.startup.mode' = 'initial'",
-          "note": "initial 模式 = 先 select 全量 + 自动切 binlog 增量，全量阶段也无锁；如果只想从当前位点开始用 latest-offset"
+          "line": 19,
+          "note": "Iceberg sink 写入 ODS 分区表"
         },
         {
-          "line": "'scan.incremental.snapshot.enabled' = 'true'",
-          "note": "Flink CDC 2.x 的核心改进：把全量切 chunk 并发读，避免老版本全局锁导致业务库 DML 卡住"
-        },
-        {
-          "line": "'server-id' = '5400-5410'",
-          "note": "MySQL 限制每个 slave 必须有唯一 server-id；并发任务要给区间，否则连接会互相踢线"
-        },
-        {
-          "line": "'write.upsert.enabled' = 'true'",
-          "note": "下游存储必须支持 upsert（Iceberg/Hudi/Doris），否则只能 append 处理不了 update"
+          "line": 26,
+          "note": "upsert 开关处理 update/delete 事件"
         }
       ]
     },
