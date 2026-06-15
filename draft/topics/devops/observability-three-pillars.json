@@ -4,10 +4,11 @@
   "category": "observability-sre",
   "group": "observability-sre",
   "title": "指标、日志与链路追踪",
-  "summary": "理解 Metrics、Logs、Traces 的职责、关联方式和故障定位闭环。",
+  "summary": "讲清 Metrics/Logs/Traces 三类信号的定位差异、OpenTelemetry 统一采集模型、trace context 跨进程传播以及 RED/USE 排查方法。",
   "tags": [
     "DevOps",
     "可观测性",
+    "OpenTelemetry",
     "Metrics",
     "Logs",
     "Traces"
@@ -19,74 +20,117 @@
   "status": "draft",
   "prerequisites": [],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「指标、日志与链路追踪」讲清定义、核心机制、适用边界、常见误区，并把它用于真实问题定位。",
+  "interviewerFocus": "能否区分三类信号在数据模型、查询代价和适用问题上的差别，并说清 OpenTelemetry 如何把它们用 trace_id/resource label 关联起来。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "指标、日志与链路追踪 的职责边界",
-      "content": "指标、日志和链路追踪分别回答不同问题：指标看趋势和告警，日志看局部事件细节，链路追踪看一次请求跨服务的路径和耗时分布。\n\n学习 指标、日志与链路追踪 时，可以先沿「用户请求异常 -> 指标告警触发 -> Trace 定位慢段 -> 日志查看错误上下文 -> 修复后指标回落」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- Metrics：聚合数值和趋势，适合 告警和容量，风险是 高基数会爆炸\n- Logs：事件上下文，适合 错误原因和参数，风险是 采样和脱敏要治理\n- Traces：请求调用链路，适合 跨服务耗时定位，风险是 采样可能漏低频问题\n- Profiling：进程级资源热点，适合 CPU/内存性能问题，风险是 开销和权限要控制\n\n把这条路径落回 指标、日志与链路追踪 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "三类信号的数据模型差异：为什么不能互相替代",
+      "content": "Metrics、Logs、Traces 的本质是三种不同的数据结构，决定了它们各自能回答的问题。\n\n- Metrics 是按时间分桶的数值序列：counter/gauge/histogram，写入是 append-only 的小数值，存储在 TSDB（Prometheus 的 head + WAL + chunks）。查询走 PromQL，复杂度 O(series × points)。它能回答 \"QPS 现在多少\"、\"P99 是不是涨了\"，但只要把高基数字段（user_id、order_id、url path）写进 label，series 数量就会爆炸：Prometheus 单实例 series 一般控制在 1000 万以内，超过会触发 OOM。\n- Logs 是结构化事件流：每条带 timestamp + 任意 key/value，写入量大，需要全文/索引检索。Loki 的设计是 \"label index + 内容 grep\"，索引只建在少量低基数 label 上（service、env、level），其它字段靠 LogQL 在原始内容里扫描，这样存储成本压到 Elasticsearch 的 1/10 量级。\n- Traces 是带因果关系的 span 树：每个 span 有 trace_id/span_id/parent_span_id + 起止时间 + attributes，跨进程靠在 HTTP header 里传 traceparent（W3C Trace Context）连起来。它能回答 \"这次慢请求慢在哪一跳\"，但通常只采样 1%-10%，不适合统计聚合。\n\n关键边界：Metrics 不能查单个请求，Logs 不能算分位数，Traces 不能做长期趋势告警。三者必须靠 trace_id（log 里嵌 trace_id、metric 用 exemplar 关联 trace_id）+ resource label（service.name、k8s.pod.name、deployment.environment）拼成一次完整定位。"
     },
     {
       "type": "explain",
-      "title": "指标、日志与链路追踪 的失败模式与排查",
-      "content": "可观测性的价值在关联。没有 traceId、实例标签、版本标签和业务维度，三类数据会变成孤岛；基数控制不好，指标和日志成本也会失控。\n\n指标、日志与链路追踪 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 「指标、日志与链路追踪 的核心目标」决定这个知识点的主线，必须先说清触发条件\n- 「用户请求异常、指标告警触发、Trace 定位慢段 的关系」决定方案能否稳定落地，不能只停留在名称层面\n- 「只背工具命令而不讲执行链路」是常见失效点，需要提前说明防护或修复方式\n- 可以用「能结合 RED/USE 指标、traceId、错误日志、版本标签、SLO 看板 做定位」验证自己是否能说出关键路径\n\n排查时不要先猜结论，应把现象映射到 指标告警触发、Trace 定位慢段、日志查看错误上下文 这些环节，再结合 RED/USE 指标、traceId、错误日志、版本标签、SLO 看板 验证。"
+      "title": "OpenTelemetry 统一采集与 trace context 跨进程传播",
+      "content": "OpenTelemetry（OTel）的价值是把三类信号收敛到同一个 SDK + 同一种线协议（OTLP gRPC/HTTP），后端可以随时换 Prometheus / Loki / Tempo / Jaeger / Datadog，不用改业务代码。\n\nSDK 内部分三层：API（业务代码调用 tracer.start_span / meter.create_counter / logger.emit）→ SDK（采样、批处理、resource 注入）→ Exporter（OTLP/Prometheus/stdout）。中间通过 BatchSpanProcessor 攒批后异步发送，避免阻塞业务线程。\n\n跨进程靠 Propagator 把 trace context 序列化成 HTTP header：\n- W3C 标准是 traceparent: 00-{trace_id 32hex}-{span_id 16hex}-{flags 2hex}，例如 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01。flags 最低位是 sampled 位，控制下游是否要采样。\n- tracestate 用来携带各厂商私有字段（vendor=value 列表），不影响标准链路。\n\n常见坑：\n1. Header 大小写不敏感但 key 必须是 traceparent，自研中间件如果只透传白名单 header 会断链。\n2. 异步任务（线程池、消息队列）必须把 context 显式 inject 到任务参数 / MQ header，否则子 span 找不到 parent，trace 树断成森林。\n3. 采样决策只在 root span 做一次（head sampling），下游必须遵守 sampled 位；Tempo / Jaeger 还支持 tail sampling，按错误码或耗时反向决定保留。\n4. SDK 默认 resource 来自环境变量 OTEL_RESOURCE_ATTRIBUTES 和 OTEL_SERVICE_NAME，K8s 里要靠 Downward API 注入 pod/node 标签，否则 span 在后端无法按 pod 聚合。"
+    },
+    {
+      "type": "explain",
+      "title": "RED/USE 方法与三支柱的真实排查闭环",
+      "content": "RED 和 USE 是把指标体系结构化的两套方法，决定告警面板该看什么。\n\n- RED 面向请求服务：Rate（QPS）、Errors（错误率）、Duration（耗时分布，至少看 P50/P95/P99）。Histogram 必须用 le bucket 计算分位数：histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))，bucket 边界要覆盖业务 SLO（如 100ms/300ms/1s/3s），否则 P99 会被压在最大 bucket 上失真。\n- USE 面向资源：Utilization（使用率）、Saturation（排队长度/等待）、Errors（硬件/驱动错误）。CPU 看 node_cpu_seconds_total{mode!='idle'}，磁盘看 node_disk_io_time_weighted_seconds_total（饱和度），网卡看 errors/drops。\n\n真实排查链路（以 \"用户反馈下单慢\" 为例）：\n1. 看 RED：order-service 的 P99 从 200ms 涨到 2s，Rate 没变 → 不是流量打爆，是某条路径变慢。\n2. 在 Grafana 上点 P99 panel 的 exemplar（Prometheus 2.43+ 支持），跳到 Tempo 拿到一条 trace_id。\n3. Tempo 的 flame graph 显示 90% 时间花在 \"mysql.query inventory\" 这一跳。\n4. 用同一个 trace_id 去 Loki 查 {service=\"order-service\"} | json | trace_id=\"4bf92f...\"，看到这条请求的 SQL 和 \"Lock wait timeout\"。\n5. 切到 USE：MySQL 实例的 Innodb_row_lock_waits 在同一时间窗陡增，定位到行锁竞争。\n6. 修完后回看 RED：P99 回落到 200ms，错误率归零，告警自动恢复。\n\n这个闭环成立的前提：log 里强制带 trace_id（用 OTel logging instrumentation 或 MDC）、metric 开 exemplar、trace 采样不能太低（错误请求强制 100% 采样）、所有信号共用 service.name + deployment.environment 标签。任何一环缺失，三支柱就退化成三个独立看板。"
     },
     {
       "type": "diagram",
-      "title": "三类可观测信号定位链路",
+      "title": "OpenTelemetry 采集与 Loki/Prometheus/Tempo 关联",
       "format": "mermaid",
-      "content": "flowchart LR\nA[用户请求异常] --> B[指标告警触发]\nB[指标告警触发] --> C[Trace 定位慢段]\nC[Trace 定位慢段] --> D[日志查看错误上下文]\nD[日志查看错误上下文] --> E[修复后指标回落]",
-      "fallback": "用户请求异常 -> 指标告警触发 -> Trace 定位慢段 -> 日志查看错误上下文 -> 修复后指标回落",
-      "caption": "图示展示从告警到 trace、日志再回到指标验证的闭环。"
+      "content": "flowchart LR\nApp[业务进程<br/>OTel SDK] -->|OTLP gRPC| Collector[OTel Collector<br/>batch + tail sampling]\nCollector -->|remote_write| Prom[Prometheus<br/>TSDB]\nCollector -->|push| Loki[Loki<br/>label index + chunks]\nCollector -->|OTLP| Tempo[Tempo<br/>trace_id 主键]\nProm -->|exemplar trace_id| Grafana\nLoki -->|LogQL trace_id=| Grafana\nTempo -->|TraceQL| Grafana\nGrafana -->|跳转 by trace_id / service.name| User[SRE 排查]",
+      "fallback": "App 通过 OTel SDK 把 metrics/logs/traces 用 OTLP 发到 Collector，Collector 分流到 Prometheus（TSDB）、Loki（日志）、Tempo（trace）；Grafana 通过 trace_id 在三者之间跳转。",
+      "caption": "OTel Collector 是统一入口，trace_id 是三支柱关联的主键。"
     },
     {
       "type": "compareTable",
-      "title": "可观测信号对比",
+      "title": "Metrics / Logs / Traces 数据模型与成本对比",
       "columns": [
         "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
+        "数据结构",
+        "查询语言",
+        "单位成本",
+        "回答的典型问题",
+        "高成本陷阱"
       ],
       "rows": [
         [
           "Metrics",
-          "聚合数值和趋势",
-          "告警和容量",
-          "高基数会爆炸"
+          "时序数值 (label set + 时间桶)",
+          "PromQL",
+          "极低 (按 series 数计)",
+          "P99 涨没涨 / QPS 多少 / 容量够不够",
+          "label 高基数 (user_id) 导致 series 爆炸"
         ],
         [
           "Logs",
-          "事件上下文",
-          "错误原因和参数",
-          "采样和脱敏要治理"
+          "结构化事件流",
+          "LogQL / Lucene",
+          "中 (按写入量计)",
+          "这条请求报了什么错 / 参数是什么",
+          "DEBUG 全开 + 无采样 + 无脱敏"
         ],
         [
           "Traces",
-          "请求调用链路",
-          "跨服务耗时定位",
-          "采样可能漏低频问题"
+          "span 树 (trace_id + parent)",
+          "TraceQL / Jaeger UI",
+          "中高 (按采样后 span 数)",
+          "慢请求慢在哪一跳 / 跨服务依赖",
+          "采样过低漏掉低频错误，过高存储爆"
         ],
         [
           "Profiling",
-          "进程级资源热点",
-          "CPU/内存性能问题",
-          "开销和权限要控制"
+          "stack trace 火焰图",
+          "pprof / Pyroscope",
+          "高 (按 stack 频率)",
+          "CPU/内存热点在哪行代码",
+          "持续开启对业务有 1%-5% 性能损耗"
         ]
+      ]
+    },
+    {
+      "type": "code",
+      "title": "OTel SDK + traceparent 跨进程传播示例",
+      "language": "python",
+      "content": "from opentelemetry import trace\nfrom opentelemetry.sdk.trace import TracerProvider\nfrom opentelemetry.sdk.trace.export import BatchSpanProcessor\nfrom opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter\nfrom opentelemetry.sdk.resources import Resource\nfrom opentelemetry.propagate import inject, extract\nimport requests\n\n# 1) Resource: service.name 是后端切分维度，K8s 里再注入 pod/node\nresource = Resource.create({\n    \"service.name\": \"order-service\",\n    \"deployment.environment\": \"prod\",\n})\nprovider = TracerProvider(resource=resource)\n# 2) BatchSpanProcessor 异步攒批，避免阻塞业务线程\nprovider.add_span_processor(\n    BatchSpanProcessor(OTLPSpanExporter(endpoint=\"otel-collector:4317\", insecure=True))\n)\ntrace.set_tracer_provider(provider)\ntracer = trace.get_tracer(__name__)\n\ndef create_order(user_id: str):\n    with tracer.start_as_current_span(\"create_order\") as span:\n        span.set_attribute(\"user.id\", user_id)  # 业务属性\n        headers = {}\n        # 3) inject 把当前 context 写入 HTTP header (traceparent + tracestate)\n        inject(headers)\n        # 现在 headers 里会有 traceparent: 00-<trace_id>-<span_id>-01\n        resp = requests.post(\"http://inventory-service/deduct\", headers=headers)\n        if resp.status_code >= 500:\n            span.set_status(trace.Status(trace.StatusCode.ERROR))\n            span.record_exception(RuntimeError(f\"inventory failed: {resp.status_code}\"))\n        return resp.json()\n\n# 下游服务 (Flask 中间件) 用 extract 还原 parent context\n# from flask import request\n# ctx = extract(request.headers)\n# with tracer.start_as_current_span(\"deduct\", context=ctx) as span: ...",
+      "highlights": [
+        {
+          "line": 8,
+          "note": "service.name 和 deployment.environment 是 OTel resource 的语义约定，Tempo/Loki/Prometheus 都按这两个维度切分租户和租金。"
+        },
+        {
+          "line": 14,
+          "note": "BatchSpanProcessor 在内存攒满 512 个 span 或 5 秒后批量发送，崩溃可能丢这一批；要求强一致就改 SimpleSpanProcessor，但会拖慢业务接口。"
+        },
+        {
+          "line": 23,
+          "note": "inject 写出的 traceparent 形如 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01，最后两位是 sampled flag，下游必须遵守。"
+        },
+        {
+          "line": 27,
+          "note": "set_status(ERROR) 会让 tail sampling 优先保留这条 trace，并触发 Grafana 错误率指标里把它纳入分子。"
+        }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：指标、日志与链路追踪 要从目标、关键机制、风险边界和观测验证四层回答。\n\n我会按这几层展开：\n1. 先说明它解决的核心工程问题是  Metrics、Logs、Traces 的职责、关联方式和故障定位闭环。\n2. 再沿着 用户请求异常、指标告警触发、Trace 定位慢段、日志查看错误上下文、修复后指标回落 说明执行链路\n3. 然后讲清 Metrics 和 Logs 的适用边界\n4. 最后补充用 RED/USE 指标、traceId、错误日志、版本标签、SLO 看板 验证效果和定位异常\n\n最后补充边界：云原生能力提升交付和治理效率，但配置错误、权限过大和观测缺失会把故障影响放大。",
+      "content": "30 秒结论：Metrics 看趋势、Logs 看细节、Traces 看链路，三类信号的数据模型决定了它们解决的问题不同，必须靠 OpenTelemetry 统一 SDK 和 trace_id 关联起来才能形成定位闭环。\n\n机制主线我会按四点展开。第一，三类信号本质是三种数据结构：Metrics 是 TSDB 里的时序数值，靠 PromQL 算 RED 指标；Logs 是结构化事件流，Loki 靠少量 label 索引压低成本；Traces 是 span 树，跨进程靠 W3C 的 traceparent header 串起来。第二，OpenTelemetry 是行业事实标准，SDK 把三类信号用 OTLP 发到 Collector，Collector 再分流到 Prometheus、Loki、Tempo，业务代码不感知后端。第三，关联点是两个：log 行里强制带 trace_id（用 OTel logging instrumentation 或 MDC），Prometheus histogram 开 exemplar 把 trace_id 嵌到指标点上，Grafana 就能从 P99 panel 直接跳到对应 trace。第四，方法论用 RED 看请求服务（Rate/Errors/Duration），用 USE 看资源（Utilization/Saturation/Errors），分别对应应用层和基础设施层告警。\n\n边界追问我会主动给：高基数 label 会让 Prometheus series 爆炸，user_id 这种字段只能进 log 不能进 metric；trace 采样过低会漏掉低频错误，所以错误请求要强制 100% 采样或用 Tempo 的 tail sampling；异步任务必须显式传 context，否则 trace 断成森林；日志的 PII 字段要在 Collector 的 processor 阶段脱敏，不能依赖业务自觉。",
       "followUpQuestions": [
         {
-          "question": "指标、日志与链路追踪 出问题时你先看哪些信号？",
-          "answer": "我会先看 RED/USE 指标、traceId、错误日志、版本标签、SLO 看板，把异常定位到 指标告警触发、Trace 定位慢段、日志查看错误上下文，再决定是回滚、降级、扩容还是修配置。"
+          "question": "Prometheus 的 label 高基数为什么会爆炸？怎么治理？",
+          "answer": "Prometheus 把每一种 label 组合存成一条独立 series，head block 里每条 series 占约 3KB 内存。把 user_id、order_id、url 这种高基数字段写进 label，series 数量就是 N×M×K 笛卡尔积，单实例超过 1000 万就 OOM。治理上：高基数维度只进 log 或 trace，metric 只保留 method/status_code/route 这种枚举字段；用 relabel_config 在抓取阶段 drop 危险 label；上 Mimir/Thanos 做横向分片；对必须保留的高基数指标用 recording rule 预聚合掉维度。"
         },
         {
-          "question": "指标、日志与链路追踪 最容易忽略的边界是什么？",
-          "answer": "最容易忽略的是自动化本身也会放大错误，所以必须保留审批、审计、回滚、灰度和人工接管路径。"
+          "question": "OpenTelemetry 和 Prometheus、Jaeger 是替代关系还是互补？",
+          "answer": "互补。OTel 只定义 API、SDK 和 OTLP 线协议，不存数据。它取代的是 Jaeger client、Zipkin client、Prometheus client_library 这些 SDK 层，让业务代码只写一次。后端仍然是 Prometheus（metrics）、Tempo/Jaeger（traces）、Loki/Elasticsearch（logs）。新项目应该直接用 OTel SDK + OTel Collector，老项目用 Prometheus exporter / Jaeger agent 的可以让 Collector 同时收旧协议再转 OTLP，逐步迁移。"
+        },
+        {
+          "question": "Tempo 不建索引为什么还能查 trace？和 Jaeger 比有什么取舍？",
+          "answer": "Tempo 把 trace 按 trace_id 当 key 直接存对象存储（S3/GCS），查询入口必须知道 trace_id，所以它的存储成本几乎只取决于对象存储单价，比 Jaeger 用 Cassandra/Elasticsearch 建全文索引便宜一个数量级。代价是不能像 Jaeger 那样按 service+operation+tag 自由搜 trace，必须先从 metric exemplar 或 log 的 trace_id 跳进来。Tempo 后来加了 TraceQL 和 search tag 索引，但仍只对 service.name、span.name 这种低基数字段建索引，定位思路是 \"先用 metric/log 找到 trace_id，再用 Tempo 看链路\"。"
         }
       ]
     },
@@ -94,59 +138,65 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 指标、日志与链路追踪 的目标和边界",
-        "能沿 用户请求异常 -> 指标告警触发 -> Trace 定位慢段 -> 日志查看错误上下文 -> 修复后指标回落 讲清链路",
-        "能解释关键配置和失败模式",
-        "能用观测指标验证效果"
+        "能讲清 Metrics（TSDB 时序）、Logs（事件流）、Traces（span 树）三种数据结构和各自能回答的问题",
+        "能说出 W3C traceparent header 的格式，以及 sampled flag 在跨进程传播时的作用",
+        "能解释 OpenTelemetry SDK + Collector + OTLP 的分层，以及它和 Prometheus/Jaeger 的互补关系",
+        "能用 RED 和 USE 方法分别对请求服务和资源出告警面板",
+        "能说出 trace_id 关联三支柱的两个落地点：log 强制带 trace_id、metric 开 exemplar",
+        "能识别高基数 label 爆炸、trace 采样过低、异步任务断链这三类常见坑"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "devops.observability-sre.observability-three-pillars.recall.1",
-      "prompt": "请讲一下 指标、日志与链路追踪 的核心链路和它解决的工程问题。",
+      "prompt": "为什么 Metrics、Logs、Traces 不能互相替代？请从数据模型和典型查询举例说明。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "devops.observability-sre.observability-three-pillars.recall.2",
-      "prompt": "指标、日志与链路追踪 在生产环境里最常见的失败模式有哪些？",
+      "prompt": "OpenTelemetry 是怎么做到跨进程传播 trace context 的？traceparent header 各字段含义是什么？异步任务里要注意什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "devops.observability-sre.observability-three-pillars.recall.3",
-      "prompt": "如果 指标、日志与链路追踪 相关变更上线后异常，你会如何回滚和验证？",
+      "prompt": "线上 P99 突然涨了 10 倍，结合 RED/USE 方法和三支柱讲一下你的定位流程。",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "expectedMinutes": 4,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明 指标、日志与链路追踪 的核心目标",
-      "能讲清 用户请求异常、指标告警触发、Trace 定位慢段 的关系",
-      "能指出 Metrics 和 Logs 的差异",
-      "能给出可观测验证和回滚思路"
+      "区分 Metrics（TSDB 时序数值）、Logs（结构化事件流）、Traces（span 树）三种数据结构",
+      "说出 W3C Trace Context 的 traceparent header 格式与 sampled flag 作用",
+      "解释 OpenTelemetry SDK + OTLP + Collector 的分层与后端无关性",
+      "用 RED（Rate/Errors/Duration）和 USE（Utilization/Saturation/Errors）描述指标体系",
+      "说明 trace_id 是三支柱关联的主键（log 嵌 trace_id + metric exemplar）"
     ],
     "goodToHave": [
-      "能结合 RED/USE 指标、traceId、错误日志、版本标签、SLO 看板 做定位",
-      "能说明多环境差异和权限边界",
-      "能把自动化、审计和回滚串成闭环"
+      "能讲清 Prometheus histogram 的 bucket 设计与 P99 计算公式",
+      "能对比 Tempo（按 trace_id 主键 + 对象存储）和 Jaeger（全文索引）的存储取舍",
+      "能说出 head sampling 和 tail sampling 的区别及错误请求强制保留策略",
+      "了解 Loki 的 label index + 内容 grep 模型与 Elasticsearch 的成本差距"
     ],
     "commonMistakes": [
-      "只背 指标、日志与链路追踪 的命令或组件，不说明交付链路和运行时对象",
-      "忽略 指标、日志与链路追踪 的回滚、权限、容量或人工接管边界",
-      "没有把指标、日志、告警和用户影响关联到 指标、日志与链路追踪"
+      "把 user_id、order_id 写进 Prometheus label，导致 series 高基数爆炸",
+      "异步任务/线程池/消息队列里没有显式传 context，trace 树断成多个 root span",
+      "trace 采样率统一拍 1%，结果错误请求采不到，定位时 trace 缺失",
+      "log 里没埋 trace_id，无法从 P99 panel 跳到对应日志，三支柱退化成三个孤岛",
+      "把 Metrics 当万能信号，用高基数 label 算 per-user 指标而不是放进 trace 或 log"
     ],
     "scoreWeights": {
       "coverage": 30,
-      "accuracy": 25,
+      "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 25
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

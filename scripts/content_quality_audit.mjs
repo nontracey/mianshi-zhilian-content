@@ -465,6 +465,10 @@ const unnaturalLanguagePattern =
   /的难点在于把「[^」]+」「[^」]+」「[^」]+」连成因果链|「[^」]+ 的核心目标」决定这个知识点的主线|验证理解是否落到真实链路|不能只给工具名|把这几层连起来看，才能|从零理解可以抓住这条主线|深入理解时重点看三个问题|实际使用时，应回到输入规模、执行顺序、依赖状态和可观测证据上验证|到了 .+ 的高阶追问|回答时要给出触发条件、状态变化和验证证据|继续往下看，.+不能只记结论/;
 const algorithmTemplateLeakPattern =
   /要先说明题目约束，再给出核心解法和复杂度|先复述输入、输出和限制条件|空输入、重复值、指针越界或状态初始化|给出时间、空间复杂度/;
+// 标题参数化模板：生成器套用"结论：{标题} 要先说清它解决什么问题 …… 我会这样回答：1. 先定位核心问题 …… 2. 再串起关键机制 …… 3. 接着补充边界和风险 …… 4. 验证 {标题} 时 …… 如果(面试官)继续追问 {标题}"。
+// 每篇 slot 进不同标题，逐字指纹永不命中 4 篇，绕过跨 topic 模板句检测；但这套脚手架本身是机器腔，面试中念出来很尴尬。专门按结构短语识别，与标题无关。
+const parameterizedAnswerTemplatePattern =
+  /要先说清它解决什么问题，再展开机制、边界和验证方式|我会这样回答：[\s\S]{0,60}先定位核心问题|再串起关键机制[\s\S]{0,80}接着补充边界和风险|时，(?:我会|要回到)[\s\S]{0,80}(?:才算判断闭环|放在一起交叉确认)/;
 const machineRelationPhrasePattern = /能否说清|的定义和核心目标|如何影响[^，。；\n]{2,60}/;
 const concreteExamplePattern =
   /例如|比如|举例|以[^，。；\n]{1,24}为例|假设|案例|场景|当[^，。；\n]{1,40}时|如果[^，。；\n]{1,40}(?:，|则|就)/;
@@ -885,6 +889,11 @@ function scoreTopic(topic, ref, corpus) {
   if (unnaturalLanguagePattern.test(allText)) deduct(8, "语言自然度不足，存在拼接感或占位句");
   if (topic.domain !== "algorithm" && algorithmTemplateLeakPattern.test(allText)) {
     deduct(10, "非算法 topic 混入算法题回答模板");
+  }
+  const interviewAnswerText = interviewCards.map((card) => card.content ?? "").join("\n");
+  if (parameterizedAnswerTemplatePattern.test(interviewAnswerText)) {
+    deduct(16, "interviewAnswer 是标题参数化模板（“要先说清它解决什么问题…我会这样回答：先定位核心问题…”），面试中无法直接说出口");
+    capScore(80, "interviewAnswer 套用生成器脚手架模板，必须改写成本知识点真实的口语化回答");
   }
   if (primaryTokens.length >= 3 && primaryTokenMatches.length < Math.min(3, primaryTokens.length)) {
     deduct(5, `卡片正文与标题/标签的专属词呼应不足 ${primaryTokenMatches.length}/${Math.min(3, primaryTokens.length)}`);

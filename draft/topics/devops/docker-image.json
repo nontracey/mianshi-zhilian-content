@@ -3,13 +3,14 @@
   "domain": "devops",
   "category": "container-k8s",
   "group": "container-k8s",
-  "title": "Docker 镜像层与容器运行时",
-  "summary": "理解镜像分层、写时复制、构建缓存、多阶段构建和容器主进程。",
+  "title": "Docker 镜像分层与体积优化",
+  "summary": "讲清 OverlayFS 分层与写时复制、Dockerfile 缓存命中规则、多阶段构建与 distroless/scratch 的减肥手段，以及镜像安全扫描的关键约束。",
   "tags": [
     "DevOps",
     "Docker",
-    "镜像层",
-    "容器运行时"
+    "OverlayFS",
+    "多阶段构建",
+    "镜像安全"
   ],
   "difficulty": 3,
   "estimatedMinutes": 30,
@@ -18,134 +19,179 @@
   "status": "draft",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能解释镜像层、容器可写层、Dockerfile 缓存和进程模型对交付质量的影响。",
+  "interviewerFocus": "镜像分层与 OverlayFS 写时复制原理、Dockerfile 缓存失效规则、多阶段构建与最小基础镜像选择、镜像扫描与瘦身的工程权衡。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Docker 镜像层与容器运行时 的职责边界",
-      "content": "Docker 镜像由多层只读文件系统组成，容器运行时在上面增加可写层并启动一个前台主进程。镜像层可复用，容器层短暂存在。\n\n学习 Docker 镜像层与容器运行时 时，可以先沿「Dockerfile 指令 -> 镜像只读层 -> 容器可写层 -> 主进程启动 -> 日志信号退出」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- 镜像层：只读且可复用，适合 构建缓存，风险是 密钥写入层后难清除\n- 容器层：运行时可写，适合 临时文件，风险是 状态丢失\n- 多阶段构建：隔离编译和运行环境，适合 减小镜像，风险是 复制产物遗漏\n- 主进程模型：前台进程决定生命周期，适合 服务容器，风险是 信号处理不当影响退出\n\n把这条路径落回 Docker 镜像层与容器运行时 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "镜像分层与 OverlayFS 写时复制怎么跑",
+      "content": "Docker 镜像本质是一组只读层 (lowerdir) + 一个容器可写层 (upperdir)，由 OverlayFS 联合挂载成一个统一视图 (merged)。Dockerfile 里的 RUN/COPY/ADD 每条指令都会生成一层 tar，按 SHA256 摘要寻址，多个镜像可以共享相同的层 (例如同一个 ubuntu:22.04 base)。\n\n关键机制：\n1. 容器启动时，runtime 把 N 个只读层叠在下面、新建一个空 upperdir 当可写层，再 mount -t overlay 出 merged 目录作为容器根。\n2. 写时复制 (CoW)：容器修改 /etc/hosts 这种已存在文件时，OverlayFS 会先把整个文件从 lowerdir 复制到 upperdir 再改，因此首次写大文件 (如 1GB 数据库文件) 会触发整文件复制，IO 抖动明显。\n3. 删除文件不会真正缩小镜像：upperdir 只是写一个 whiteout 标记 (字符设备 0/0)，下层文件仍占空间。所以 RUN apt-get install ... && apt-get clean 必须写在同一条 RUN 里，否则 clean 只在新一层加 whiteout，旧层 deb 缓存依然存在。\n4. 层数有上限：OverlayFS 的 lowerdir 在 5.x 内核上一般支持到 128 层，超过会 mount 失败。这就是为什么不能把 RUN 拆得过细。"
     },
     {
       "type": "explain",
-      "title": "Docker 镜像层与容器运行时 的失败模式与排查",
-      "content": "难点在构建和运行边界。Dockerfile 指令顺序会影响缓存命中，多阶段构建能减少运行镜像体积，容器中主进程退出就意味着容器生命周期结束。\n\nDocker 镜像层与容器运行时 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 「Docker 镜像层与容器运行时 的核心目标」决定这个知识点的主线，必须先说清触发条件\n- 「Dockerfile 指令、镜像只读层、容器可写层 的关系」决定方案能否稳定落地，不能只停留在名称层面\n- 「只背工具命令而不讲执行链路」是常见失效点，需要提前说明防护或修复方式\n- 可以用「能结合 镜像 history、构建缓存、容器日志、退出码、镜像扫描结果 做定位」验证自己是否能说出关键路径\n\n排查时不要先猜结论，应把现象映射到 镜像只读层、容器可写层、主进程启动 这些环节，再结合 镜像 history、构建缓存、容器日志、退出码、镜像扫描结果 验证。"
+      "title": "构建缓存命中规则与多阶段瘦身的取舍",
+      "content": "Dockerfile 缓存按指令顺序逐层匹配：当前指令的字符串 + 上一层的镜像 ID + (对 COPY/ADD) 文件内容哈希一致才算命中。一旦某一层 miss，后面所有层都要重建。这条规则决定了三个生产实践：\n\n1. 把变化频率低的指令前置：先 COPY package.json 跑 npm ci，再 COPY . . 跑 build。颠倒顺序会让每次改业务代码都重装依赖，构建从 30s 涨到 5min。\n2. 多阶段构建 (FROM ... AS builder + 第二个 FROM) 是当前的标准减肥手段：第一阶段用 golang:1.22 (约 800MB) 编译，第二阶段用 gcr.io/distroless/static (约 2MB) 只 COPY --from=builder /app/bin。最终镜像只有二进制 + 必要的 CA 证书，不含 shell、apt、busybox。\n3. 基础镜像选择有梯度：alpine (5MB，musl libc，可能与 glibc 程序不兼容) → distroless (无 shell，无法 docker exec 调试，但攻击面最小) → scratch (空镜像，仅适合纯静态二进制如 Go)。Java/Python 这类需要运行时的语言通常用 eclipse-temurin:21-jre-alpine 或 python:3.12-slim，不能直接 scratch。\n4. 安全扫描 (Trivy / Grype / Snyk) 扫的是层里的包元数据 (dpkg/apk/pip 数据库)。distroless 没有包管理器数据库，扫描器只能识别 COPY 进来的应用依赖，OS 层 CVE 自然为 0，但也意味着应用层依赖必须自己管。"
     },
     {
       "type": "diagram",
-      "title": "Docker 镜像到容器运行链路",
+      "title": "OverlayFS 联合挂载与写时复制",
       "format": "mermaid",
-      "content": "flowchart LR\nA[Dockerfile 指令] --> B[镜像只读层]\nB[镜像只读层] --> C[容器可写层]\nC[容器可写层] --> D[主进程启动]\nD[主进程启动] --> E[日志信号退出]",
-      "fallback": "Dockerfile 指令 -> 镜像只读层 -> 容器可写层 -> 主进程启动 -> 日志信号退出",
-      "caption": "图示把 Dockerfile、镜像层、容器层和主进程生命周期串起来。"
+      "content": "flowchart TB\nA[lowerdir L1: ubuntu base] --> M[merged 容器根视图]\nB[lowerdir L2: apt install jdk] --> M\nC[lowerdir L3: COPY app.jar] --> M\nD[upperdir 容器可写层] --> M\nM --> W{容器写 /etc/hosts}\nW -->|首次写| CP[CoW: 从 L1 复制整文件到 upperdir]\nW -->|删除文件| WO[在 upperdir 写 whiteout 字符设备]\nWO -.->|不释放下层空间| A",
+      "fallback": "lowerdir 多层只读 + upperdir 可写层经 OverlayFS 挂为 merged 视图。写已存在文件触发 CoW 整文件复制；删除只在 upperdir 写 whiteout，下层空间不会回收。",
+      "caption": "镜像层叠加成容器视图，写和删都只动 upperdir，决定了 RUN 必须把安装与清理写在同一条指令里。"
     },
     {
       "type": "compareTable",
-      "title": "镜像与容器运行要点",
+      "title": "最小基础镜像选型对照",
       "columns": [
-        "维度",
-        "核心含义",
+        "基础镜像",
+        "典型体积",
+        "含 shell/包管理",
         "适用场景",
-        "常见风险"
+        "主要坑"
       ],
       "rows": [
         [
-          "镜像层",
-          "只读且可复用",
-          "构建缓存",
-          "密钥写入层后难清除"
+          "ubuntu:22.04",
+          "约 77MB",
+          "bash + apt",
+          "需要复杂依赖或调试期",
+          "CVE 多, 镜像大, 启动慢"
         ],
         [
-          "容器层",
-          "运行时可写",
-          "临时文件",
-          "状态丢失"
+          "alpine:3.19",
+          "约 7MB",
+          "ash + apk",
+          "Go/Node/Python 通用瘦身",
+          "musl libc 与 glibc 二进制不兼容, DNS 行为差异"
         ],
         [
-          "多阶段构建",
-          "隔离编译和运行环境",
-          "减小镜像",
-          "复制产物遗漏"
+          "debian:12-slim",
+          "约 30MB",
+          "bash + apt",
+          "需要 glibc 又想瘦身",
+          "比 alpine 大, CVE 仍需扫描"
         ],
         [
-          "主进程模型",
-          "前台进程决定生命周期",
-          "服务容器",
-          "信号处理不当影响退出"
+          "distroless/java21",
+          "约 180MB",
+          "无 shell, 无包管理",
+          "生产 Java/Go/Python 服务",
+          "无法 docker exec 进容器调试, 需要 sidecar 或 ephemeral container"
+        ],
+        [
+          "scratch",
+          "0",
+          "无任何东西",
+          "纯静态 Go 二进制",
+          "需自带 CA 证书 + tzdata, 无 nsswitch"
         ]
       ]
     },
     {
-      "type": "interviewAnswer",
-      "title": "面试回答思路",
-      "content": "结论：Docker 镜像层与容器运行时 要从目标、关键机制、风险边界和观测验证四层回答。\n\n我会按这几层展开：\n1. 先说明它解决的核心工程问题是 镜像分层、写时复制、构建缓存、多阶段构建和容器主进程。\n2. 再沿着 Dockerfile 指令、镜像只读层、容器可写层、主进程启动、日志信号退出 说明执行链路\n3. 然后讲清 镜像层 和 容器层 的适用边界\n4. 最后补充用 镜像 history、构建缓存、容器日志、退出码、镜像扫描结果 验证效果和定位异常\n\n最后补充边界：云原生能力提升交付和治理效率，但配置错误、权限过大和观测缺失会把故障影响放大。",
-      "followUpQuestions": [
+      "type": "code",
+      "title": "多阶段构建 + 缓存友好的 Go 服务 Dockerfile",
+      "language": "dockerfile",
+      "content": "# syntax=docker/dockerfile:1.7\nFROM golang:1.22-alpine AS builder\nWORKDIR /src\n\n# 1. 先拷依赖描述, 单独成层, 改业务代码不会失效这一层\nCOPY go.mod go.sum ./\nRUN --mount=type=cache,target=/root/.cache/go-build \\\n    --mount=type=cache,target=/go/pkg/mod \\\n    go mod download\n\n# 2. 再拷源码, 业务代码变动只重建这一层之后\nCOPY . .\nRUN --mount=type=cache,target=/root/.cache/go-build \\\n    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/app ./cmd/server\n\n# 3. 运行阶段: distroless static, 仅含 CA 证书与 tzdata\nFROM gcr.io/distroless/static-debian12:nonroot\nCOPY --from=builder /out/app /app\nUSER nonroot:nonroot\nEXPOSE 8080\nENTRYPOINT [\"/app\"]",
+      "highlights": [
         {
-          "question": "Docker 镜像层与容器运行时 出问题时你先看哪些信号？",
-          "answer": "我会先看 镜像 history、构建缓存、容器日志、退出码、镜像扫描结果，把异常定位到 镜像只读层、容器可写层、主进程启动，再决定是回滚、降级、扩容还是修配置。"
+          "line": 1,
+          "note": "启用 BuildKit 语法 1.7, 才能用 --mount=type=cache 跨构建复用 Go module 与 build 缓存"
         },
         {
-          "question": "Docker 镜像层与容器运行时 最容易忽略的边界是什么？",
-          "answer": "最容易忽略的是自动化本身也会放大错误，所以必须保留审批、审计、回滚、灰度和人工接管路径。"
+          "line": 6,
+          "note": "go.mod/go.sum 单独 COPY 是缓存命中关键: 业务代码改动不会让 go mod download 这一层失效"
+        },
+        {
+          "line": 13,
+          "note": "-trimpath -ldflags='-s -w' 去掉调试符号, 二进制可缩小约 30%, CGO_ENABLED=0 是为了能跑在 distroless static 上"
+        },
+        {
+          "line": 17,
+          "note": "distroless/static-debian12:nonroot 自带非 root UID 65532, 配合 USER 满足 K8s PodSecurity restricted"
+        }
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答：Docker 镜像分层与瘦身怎么讲",
+      "content": "30 秒结论：Docker 镜像是一组按内容寻址的只读层，容器运行时再叠一层可写层，OverlayFS 联合挂载成一个根视图；写时复制和 whiteout 决定了清理必须和安装写在同一条 RUN，多阶段构建配合 distroless 是当前主流瘦身方案。\n\n机制主线：\n1. 分层与寻址：每条 Dockerfile 指令产生一层 tar，SHA256 内容寻址，跨镜像可复用。\n2. OverlayFS 运行时：N 个 lowerdir + 1 个 upperdir 挂成 merged，写时把整文件从下层复制到 upperdir，删除写 whiteout 不真正释放空间。\n3. 构建缓存：按指令字符串 + 上层 ID + 文件哈希命中，依赖描述前置、源码后置是关键技巧。\n4. 体积控制：多阶段构建把 builder 阶段的工具链丢掉，运行阶段选 alpine / distroless / scratch；安全扫描用 Trivy 检 OS 包 + 应用依赖 CVE。\n\n边界与坑：alpine 的 musl 与 glibc 不兼容会导致 Java native 库挂掉；distroless 无 shell，调试要靠 K8s ephemeral container 或 debug sidecar；scratch 必须自己 COPY ca-certificates 和 tzdata 否则 HTTPS 和时区都会出问题。",
+      "followUpQuestions": [
+        {
+          "question": "Dockerfile 里 RUN apt-get install 之后单独写一条 RUN apt-get clean，镜像为什么不会变小？",
+          "answer": "因为镜像层是只读且按指令分层的：apt-get install 那一层已经把 deb 缓存写入了，clean 只在新一层用 whiteout 标记把 /var/cache/apt 删掉，但下面那一层的 deb 文件仍在占空间，最终镜像还是把两层都打包。正确做法是 RUN apt-get update && apt-get install -y --no-install-recommends pkg && rm -rf /var/lib/apt/lists/* 写在同一条 RUN 里，让缓存从未进入任何只读层。"
+        },
+        {
+          "question": "为什么生产推荐 distroless 而不是 alpine？distroless 怎么调试？",
+          "answer": "distroless 不含 shell 和包管理器，攻击面更小，CVE 扫描通常只剩应用依赖；alpine 用 musl libc，跟 glibc 编译的 JNI/native 库 (例如某些 JDK 加密库、grpc-java 的 netty-tcnative) 不兼容，还有 DNS 解析行为差异。代价是 distroless 没有 sh，无法 docker exec -it sh 调试。生产上靠两种方式：一是用 :debug 变种镜像 (gcr.io/distroless/...:debug 自带 busybox)，二是 K8s 1.25+ 的 kubectl debug 启动 ephemeral container，把 busybox 镜像挂到目标 Pod 的 PID namespace。"
+        },
+        {
+          "question": "镜像里不小心 COPY 进了私钥然后再 RUN rm 删除，安全吗？",
+          "answer": "不安全。COPY 那一层已经把私钥写入了不可变的只读层，docker history 和 docker save 都能拿到原文件，rm 只是在新一层加 whiteout。补救方式：(1) 用多阶段构建，把私钥只 COPY 到 builder 阶段，最终阶段不 COPY 过去；(2) BuildKit 的 RUN --mount=type=secret 把密钥挂载成临时文件，构建完不进任何层；(3) 已经发布到 registry 的镜像必须吊销该密钥，并重建镜像，docker history --no-trunc 能验证私钥是否还残留。"
         }
       ]
     },
     {
       "type": "checklist",
-      "title": "学完后应能说清楚",
+      "title": "复述检查：能讲清这 6 条就算掌握",
       "items": [
-        "能说明 Docker 镜像层与容器运行时 的目标和边界",
-        "能沿 Dockerfile 指令 -> 镜像只读层 -> 容器可写层 -> 主进程启动 -> 日志信号退出 讲清链路",
-        "能解释关键配置和失败模式",
-        "能用观测指标验证效果"
+        "能画出 lowerdir + upperdir + merged 的 OverlayFS 结构, 并解释 CoW 触发条件",
+        "能说清 whiteout 机制以及为什么 install/clean 必须在同一条 RUN",
+        "能讲 Dockerfile 缓存命中规则 (指令字符串 + 上层 ID + 文件哈希) 和依赖前置技巧",
+        "能对比 ubuntu / alpine / debian-slim / distroless / scratch 的体积、调试性和坑",
+        "能写出多阶段 + BuildKit cache mount 的 Dockerfile, 说明 -ldflags='-s -w' 与 CGO_ENABLED=0 的作用",
+        "能说明 Trivy/Grype 扫描对 distroless 的影响, 以及私钥泄漏到镜像层的补救方式"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "devops.container-k8s.docker-image.recall.1",
-      "prompt": "请讲一下 Docker 镜像层与容器运行时 的核心链路和它解决的工程问题。",
+      "prompt": "请讲一下 OverlayFS 是怎么把多层镜像挂成容器视图的？写时复制和 whiteout 分别在什么时候触发？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "devops.container-k8s.docker-image.recall.2",
-      "prompt": "Docker 镜像层与容器运行时 在生产环境里最常见的失败模式有哪些？",
+      "prompt": "线上 Java 服务镜像 1.2GB，要求压到 300MB 以下，你会怎么改 Dockerfile？需要权衡哪些点？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "devops.container-k8s.docker-image.recall.3",
-      "prompt": "如果 Docker 镜像层与容器运行时 相关变更上线后异常，你会如何回滚和验证？",
+      "prompt": "Trivy 扫描一个 distroless 镜像报 0 CVE，但它运行的 Spring Boot 应用其实有 log4j 漏洞，为什么扫不出来？怎么补全扫描链路？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 3
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明 Docker 镜像层与容器运行时 的核心目标",
-      "能讲清 Dockerfile 指令、镜像只读层、容器可写层 的关系",
-      "能指出 镜像层 和 容器层 的差异",
-      "能给出可观测验证和回滚思路"
+      "OverlayFS 的 lowerdir/upperdir/merged 三层结构与写时复制流程",
+      "whiteout 机制以及 install + clean 必须同一条 RUN 的原因",
+      "Dockerfile 缓存命中三要素与依赖前置、源码后置的写法",
+      "多阶段构建配合 distroless/scratch/alpine 的选型差异"
     ],
     "goodToHave": [
-      "能结合 镜像 history、构建缓存、容器日志、退出码、镜像扫描结果 做定位",
-      "能说明多环境差异和权限边界",
-      "能把自动化、审计和回滚串成闭环"
+      "BuildKit 的 --mount=type=cache 与 --mount=type=secret 用法",
+      "alpine musl 与 glibc 不兼容、scratch 缺 CA 证书 / tzdata 的具体表现",
+      "Trivy/Grype 对 OS 层和应用依赖层的扫描差异",
+      "docker history --no-trunc 验证敏感数据是否泄漏到镜像层"
     ],
     "commonMistakes": [
-      "只背 Docker 镜像层与容器运行时 的命令或组件，不说明交付链路和运行时对象",
-      "忽略 Docker 镜像层与容器运行时 的回滚、权限、容量或人工接管边界",
-      "没有把指标、日志、告警和用户影响关联到 Docker 镜像层与容器运行时"
+      "认为 RUN rm 或 docker rmi 中间层就能让镜像变小, 忽略 whiteout 不释放下层空间",
+      "把 RUN apt-get install 和 RUN apt-get clean 写成两条, 导致 deb 缓存永远留在镜像里",
+      "把 COPY . . 写在 COPY package.json 之前, 每次改代码都重装依赖, 构建时间暴涨",
+      "对纯 Java 服务直接套 scratch, 忽略 JRE 依赖；或用 alpine 跑 glibc 编译的二进制导致 not found 错误",
+      "把私钥 COPY 进镜像再 RUN rm, 误以为这样就安全, 实际上 docker history 仍能取到原文件"
     ],
     "scoreWeights": {
-      "coverage": 30,
-      "accuracy": 25,
+      "coverage": 25,
+      "accuracy": 30,
       "interviewExpression": 20,
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

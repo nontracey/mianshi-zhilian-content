@@ -4,13 +4,16 @@
   "category": "platform",
   "group": "platform",
   "title": "元数据、血缘与数据目录",
-  "summary": "理解技术元数据、业务元数据、血缘采集、影响分析、指标目录和治理闭环。",
+  "summary": "理解 Atlas/DataHub/OpenMetadata 的元数据模型、表级与字段级血缘采集方式，以及血缘在影响分析、合规审计中的应用。",
   "tags": [
     "数据工程",
     "元数据",
     "血缘",
     "数据目录",
-    "数据治理"
+    "数据治理",
+    "Atlas",
+    "DataHub",
+    "OpenMetadata"
   ],
   "difficulty": 3,
   "estimatedMinutes": 30,
@@ -19,74 +22,96 @@
   "status": "draft",
   "prerequisites": [],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能说明元数据和血缘如何支撑数据发现、影响分析和质量治理。",
+  "interviewerFocus": "字段级血缘的采集难点、Atlas/DataHub/OpenMetadata 模型差异、影响分析与合规审计场景。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "元数据、血缘与数据目录 的职责边界",
-      "content": "元数据描述数据的数据，包括表结构、字段含义、负责人、产出 SLA、质量规则、使用热度和权限。血缘描述数据从源头到下游表、指标和报表的依赖关系。\n\n学习 元数据、血缘与数据目录 时，可以先沿「任务 SQL 解析 -> 表字段元数据采集 -> 血缘图谱构建 -> 指标目录发布 -> 影响分析和治理」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- 技术元数据：表结构和任务信息，适合 自动采集，风险是 字段含义可能缺失\n- 业务元数据：指标口径和负责人，适合 数据目录，风险是 需要人工治理\n- 血缘：上下游依赖关系，适合 影响分析和追责，风险是 字段级血缘采集难\n- 数据目录：可搜索的数据资产入口，适合 自助取数，风险是 无质量和权限会失控\n\n把这条路径落回 元数据、血缘与数据目录 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "元数据模型：Entity + Relationship + Classification",
+      "content": "三个主流系统的核心抽象都是「实体 + 关系 + 分类标签」三件套，但落地差异很大。\n\nApache Atlas 用 JanusGraph 做底层图存储，通过 Hook（Hive Hook、Spark Atlas Connector、Sqoop Hook）在任务执行时把 hive_table、hive_column、hive_process 这类预置 Type 推送到 Kafka 的 ATLAS_HOOK topic，再由 Atlas Server 落图。它的优势是和 Hadoop 生态深度集成、支持血缘图遍历查询；短板是 Type 系统重，自定义实体要先注册 TypeDef。\n\nLinkedIn DataHub 用 GMS（Generalized Metadata Service）+ MAE/MCE Kafka topic + Elasticsearch + Neo4j 多存储分层。它的核心是 PDL/Avro 定义的 Aspect 模型：一个 Dataset 实体由 schemaMetadata、ownership、upstreamLineage、glossaryTerms 等多个 Aspect 拼装而成，每次变更只发对应 Aspect 的 MCE 消息。Aspect 化让 schema 演进非常友好，新增治理维度不用改实体定义。\n\nOpenMetadata 走 OpenAPI 优先路线，所有实体都有 REST API 和 JSON Schema，元数据存在关系数据库（MySQL/Postgres）+ Elasticsearch，血缘走 Lineage API。它的 Ingestion Framework 用 Python connector（约 50+ 数据源），靠 Airflow/原生调度周期性拉取，没有强制 Hook，对存量集群侵入小。\n\n选型时记一个判断：以 Hadoop/Hive 实时血缘为主选 Atlas；要做完整数据资产门户、看重 schema 演进和现代 UI 选 DataHub；想快速接入异构源、走 API 集成选 OpenMetadata。"
     },
     {
       "type": "explain",
-      "title": "元数据、血缘与数据目录 的失败模式与排查",
-      "content": "难点在自动采集和人工维护结合。SQL 解析能采集部分字段血缘，但 UDF、脚本、手工口径和跨系统同步仍需要规范和补充。目录没有责任人和口径说明，就只是搜索框。\n\n元数据、血缘与数据目录 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 「元数据、血缘与数据目录 的核心目标」决定这个知识点的主线，必须先说清触发条件\n- 「任务 SQL 解析、表字段元数据采集、血缘图谱构建 的关系」决定方案能否稳定落地，不能只停留在名称层面\n- 「只讲工具名不讲数据语义和链路」是常见失效点，需要提前说明防护或修复方式\n- 可以用「能结合 表负责人、字段注释、血缘图、访问热度、质量规则、权限记录 做定位」验证自己是否能说出关键路径\n\n排查时不要先猜结论，应把现象映射到 表字段元数据采集、血缘图谱构建、指标目录发布 这些环节，再结合 表负责人、字段注释、血缘图、访问热度、质量规则、权限记录 验证。"
+      "title": "表级 vs 字段级血缘：采集成本与适用场景",
+      "content": "表级血缘只记录「source_table -> target_table」一条边，靠任务调度元信息（Airflow DAG、DolphinScheduler workflow）或 Hive Hook 的 input/output 列表就能生成，覆盖率高但粒度粗——下游问「我把 user_profile.email 改成加密字段，会影响哪些报表」时表级血缘答不出来。\n\n字段级血缘要拆 SQL 表达式：解析 SELECT 列表、JOIN ON、WHERE、子查询、UNION、CTE，把每一个目标列追溯到一组源列。常见实现：\n- Atlas 通过 Hive QueryPlan 拿到 ColumnLineageInfo，再写入 hive_column_lineage 实体；\n- DataHub 用 sqllineage / sqlglot 库静态解析 SQL，输出 fineGrainedLineages aspect；\n- 自研方案多基于 Calcite 或 ANTLR 生成的 AST 做列级追踪。\n\n字段级血缘的真坑：\n1. SELECT * 展开依赖采集时的 schema 快照，一旦上游表加列，旧血缘就失真；\n2. UDF（如 mask_phone(mobile)）和 Python UDTF 解析不出内部逻辑，只能记成「mobile -> output_field via UDF」黑盒；\n3. 动态 SQL（Jinja 模板、Spark DataFrame.selectExpr 拼接字符串）在静态解析阶段拿不到完整文本，要么运行时 Hook 拿到展开后 SQL，要么人工补；\n4. 跨引擎（Hive 写、Spark 读、Flink 同步到 Kafka 再写 ClickHouse）需要把多个 Process 实体串起来，否则血缘断链；\n5. 报表层 BI 工具（Tableau、Superset、QuickBI）的字段引用要用专门 connector 拉，否则血缘止步于仓库出口表。\n\n生产经验：先把表级血缘做到 95% 以上覆盖率（用调度依赖兜底），再针对高价值核心表（指标层、对客字段、合规字段）开字段级，不要一上来就追求全库字段级。"
     },
     {
       "type": "diagram",
-      "title": "元数据血缘治理链路",
+      "title": "血缘采集与影响分析链路",
       "format": "mermaid",
-      "content": "flowchart LR\nA[任务 SQL 解析] --> B[表字段元数据采集]\nB[表字段元数据采集] --> C[血缘图谱构建]\nC[血缘图谱构建] --> D[指标目录发布]\nD[指标目录发布] --> E[影响分析和治理]",
-      "fallback": "任务 SQL 解析 -> 表字段元数据采集 -> 血缘图谱构建 -> 指标目录发布 -> 影响分析和治理",
-      "caption": "图示展示元数据从采集、血缘构建到目录和影响分析的治理过程。"
+      "content": "flowchart LR\nA[Hive/Spark 任务执行] --> B[Hive Hook / Spark Atlas Connector]\nC[调度系统 DAG 依赖] --> D[Airflow OpenLineage Plugin]\nE[BI 工具元数据] --> F[Tableau/Superset Connector]\nB --> G[Kafka ATLAS_HOOK / MCE Topic]\nD --> G\nF --> G\nG --> H[Atlas Server / DataHub GMS]\nH --> I[图存储 JanusGraph/Neo4j]\nI --> J[字段级血缘 API]\nJ --> K[影响分析: 字段改名波及哪些报表]\nJ --> L[合规审计: PII 字段流向追溯]\nJ --> M[根因定位: 指标异常反查上游表]",
+      "fallback": "任务执行时通过 Hook 推送血缘事件 -> Kafka -> Atlas/DataHub Server -> 图存储 -> 通过 API 支撑影响分析、合规审计、根因定位三类场景。",
+      "caption": "血缘从 Hook、调度、BI 三路采集，落到图存储后供影响分析、合规审计、根因定位使用。"
     },
     {
       "type": "compareTable",
-      "title": "元数据类型对比",
+      "title": "Atlas vs DataHub vs OpenMetadata 选型对比",
       "columns": [
         "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
+        "Apache Atlas",
+        "LinkedIn DataHub",
+        "OpenMetadata"
       ],
       "rows": [
         [
-          "技术元数据",
-          "表结构和任务信息",
-          "自动采集",
-          "字段含义可能缺失"
+          "存储架构",
+          "JanusGraph + HBase/Solr",
+          "MySQL + Elasticsearch + Neo4j + Kafka",
+          "MySQL/Postgres + Elasticsearch"
         ],
         [
-          "业务元数据",
-          "指标口径和负责人",
-          "数据目录",
-          "需要人工治理"
+          "元数据采集",
+          "Hive/Spark/Sqoop Hook 实时推送",
+          "Push（MCE Kafka）+ Pull（ingestion framework）",
+          "Pull 为主，Python Connector 周期拉取"
         ],
         [
-          "血缘",
-          "上下游依赖关系",
-          "影响分析和追责",
-          "字段级血缘采集难"
+          "字段级血缘",
+          "Hive QueryPlan 原生支持，Spark 通过 SAC",
+          "sqllineage/sqlglot 静态解析 + fineGrainedLineages",
+          "Lineage API + 各 Connector 自实现"
         ],
         [
-          "数据目录",
-          "可搜索的数据资产入口",
-          "自助取数",
-          "无质量和权限会失控"
+          "Schema 演进",
+          "TypeDef 重，新增字段需注册类型",
+          "Aspect 化，新增维度只加 Aspect 不改实体",
+          "JSON Schema + OpenAPI，改 schema 自动同步"
+        ],
+        [
+          "适用场景",
+          "Hadoop/Hive 重度生态、Ranger 联动鉴权",
+          "现代数据资产门户、复杂治理标签",
+          "异构源快速接入、API 集成、轻量化部署"
+        ],
+        [
+          "短板",
+          "UI 老旧、非 Hadoop 源接入成本高",
+          "组件多、运维复杂、学习曲线陡",
+          "实时血缘弱、生态相对年轻"
         ]
       ]
     },
     {
+      "type": "code",
+      "title": "DataHub 字段级血缘上报示例",
+      "language": "python",
+      "content": "from datahub.emitter.mce_builder import make_dataset_urn\nfrom datahub.emitter.rest_emitter import DatahubRestEmitter\nfrom datahub.metadata.schema_classes import (\n    UpstreamLineageClass, UpstreamClass, DatasetLineageTypeClass,\n    FineGrainedLineageClass, FineGrainedLineageDownstreamTypeClass,\n    FineGrainedLineageUpstreamTypeClass,\n)\n\n# 目标：dwd.user_profile.email_md5 由 ods.user_raw.email 经 md5() 加密得到\nupstream_urn = make_dataset_urn('hive', 'ods.user_raw', 'PROD')\ndownstream_urn = make_dataset_urn('hive', 'dwd.user_profile', 'PROD')\n\nfine_grained = FineGrainedLineageClass(\n    upstreamType=FineGrainedLineageUpstreamTypeClass.FIELD_SET,\n    upstreams=[f'urn:li:schemaField:({upstream_urn},email)'],\n    downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD,\n    downstreams=[f'urn:li:schemaField:({downstream_urn},email_md5)'],\n    transformOperation='MD5_HASH',  # 标记加密变换，合规审计可识别\n    confidenceScore=1.0,\n)\n\nlineage = UpstreamLineageClass(\n    upstreams=[UpstreamClass(dataset=upstream_urn, type=DatasetLineageTypeClass.TRANSFORMED)],\n    fineGrainedLineages=[fine_grained],\n)\n\nemitter = DatahubRestEmitter(gms_server='http://datahub-gms:8080')\nemitter.emit_mcp(downstream_urn, aspect=lineage)"
+    },
+    {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：元数据、血缘与数据目录 要从目标、关键机制、风险边界和观测验证四层回答。\n\n我会按这几层展开：\n1. 先说明它解决的核心工程问题是 技术元数据、业务元数据、血缘采集、影响分析、指标目录和治理闭环。\n2. 再沿着 任务 SQL 解析、表字段元数据采集、血缘图谱构建、指标目录发布、影响分析和治理 说明执行链路\n3. 然后讲清 技术元数据 和 业务元数据 的适用边界\n4. 最后补充用 表负责人、字段注释、血缘图、访问热度、质量规则、权限记录 验证效果和定位异常\n\n最后补充边界：数据工程方案必须同时关注口径、时效、成本和可追溯性，不能只追求跑通任务。",
+      "content": "30 秒结论：元数据系统的核心是 Entity + Relationship + Classification 三件套，血缘是其中最有工程价值的关系，用来回答「这张表谁在用、改了会炸什么、PII 流向了哪里」三类问题。\n\n机制层面我会展开三块：\n采集方式上，运行时 Hook（Atlas 的 Hive Hook、Spark Atlas Connector）能拿到真实执行计划，字段级血缘最准但侵入性强；静态 SQL 解析（DataHub 用 sqlglot、自研用 Calcite）覆盖广但解不出 UDF 和动态 SQL；调度依赖（Airflow OpenLineage）兜底表级血缘。生产上三路并存。\n\n模型差异上，Atlas 是 Type-first，元数据 schema 改动重；DataHub 是 Aspect-first，新增治理维度只加 Aspect；OpenMetadata 是 API-first，靠 Python connector 拉异构源。选型看是 Hadoop 重生态、现代数据门户还是轻量 API 集成。\n\n应用场景上，影响分析靠字段级血缘做「改字段前预演下游报表炸点」；合规审计靠 transformOperation 标记追溯 PII 加密链路，回答个保法 DSAR；根因定位靠血缘反向遍历，从指标异常追到上游脏数据。\n\n边界提醒：字段级血缘对 SELECT *、UDF、动态 SQL、跨引擎链路是天然短板，要靠运行时 Hook + schema 快照 + 人工标注三层兜底，不能指望纯静态解析做到 100%。",
       "followUpQuestions": [
         {
-          "question": "元数据、血缘与数据目录 出问题时你先看哪些信号？",
-          "answer": "我会先看 表负责人、字段注释、血缘图、访问热度、质量规则、权限记录，把异常定位到 表字段元数据采集、血缘图谱构建、指标目录发布，再决定是回滚、降级、扩容还是修配置。"
+          "question": "Atlas 和 DataHub 在字段级血缘上的实现差异是什么？",
+          "answer": "Atlas 走运行时路线：Hive 执行时 HiveHook 从 QueryPlan 里拿 ColumnLineageInfo，直接写 hive_column_lineage 实体，因此 UDF、CTE、子查询都是引擎已展开的真实计划，准确度高但只覆盖 Hive 系。DataHub 走静态解析路线：用 sqllineage 或 sqlglot 把 SQL 解析成 AST，推导列映射写入 fineGrainedLineages aspect，能覆盖任何文本 SQL（Snowflake、ClickHouse、Trino），但碰到 UDF 和 Jinja 动态拼接就只能给 confidenceScore 低分或退化到表级。生产上常见组合：Hive 走 Atlas Hook，外部仓库走 DataHub 静态解析，再统一汇聚到 DataHub UI。"
         },
         {
-          "question": "元数据、血缘与数据目录 最容易忽略的边界是什么？",
-          "answer": "最容易忽略的是自动化本身也会放大错误，所以必须保留审批、审计、回滚、灰度和人工接管路径。"
+          "question": "线上要把 user.phone 改成加密存储，怎么用血缘评估影响范围？",
+          "answer": "三步走：第一步在 DataHub/Atlas 查 user.phone 的 downstream fine-grained lineage，列出所有引用它的下游字段（含中间层 dwd/dws 派生字段、ADS 报表字段、BI dashboard 引用）；第二步按 transformOperation 分类，IDENTITY/COPY 的下游必须同步加密、AGGREGATION 的下游通常无影响、UDF 黑盒的下游标记人工 review；第三步交叉访问热度（DataHub 的 usage stats）筛出 30 天内有查询的活跃下游，优先通知这些 owner，并在变更前用沙箱跑一次 schema diff 验证下游任务能否解析新字段。没有字段级血缘只能通报「所有引用 user 表的下游」，会扩大 10 倍以上的通知面，owner 收到后又无法判断和自己有没有关系，最后变成人人忽视的告警。"
+        },
+        {
+          "question": "数据目录建好后没人用，问题出在哪、怎么破？",
+          "answer": "技术元数据自动同步只是地基，三个常见死因：一是没有业务元数据，搜 user_order 出来 50 张同名表分不清正式表和临时表，要补 owner、ODS/DWD/ADS 分层标签、指标口径、样例 SQL；二是没和工作流闭环，找数据还要切去 IM 问人，要把目录嵌到取数平台、SQL 编辑器（DataHub 的 Lineage Browser、OpenMetadata 的 SDK）做到点字段直接看血缘和质量；三是没有信任信号，要把质量分（最近一次 DQ 结果）、新鲜度（最后一次产出时间）、热度（近 7 天查询次数）、负责人在线状态显示在卡片上，让用户判断「这数据现在能不能用」而不只是「这数据存不存在」。运营上 owner 覆盖率、字段注释率要纳入数据团队 OKR，否则永远没人维护。"
         }
       ]
     },
@@ -94,31 +119,33 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 元数据、血缘与数据目录 的目标和边界",
-        "能沿 任务 SQL 解析 -> 表字段元数据采集 -> 血缘图谱构建 -> 指标目录发布 -> 影响分析和治理 讲清链路",
-        "能解释关键配置和失败模式",
-        "能用观测指标验证效果"
+        "能区分技术元数据（schema/分区/任务）、业务元数据（owner/口径/标签）、操作元数据（运行时/质量/访问）、血缘四类",
+        "能讲清 Atlas（Hook 推送 + JanusGraph）、DataHub（Aspect + GMS + 多存储）、OpenMetadata（API + Pull connector）三种架构差异和选型依据",
+        "能解释字段级血缘的采集路径：运行时 QueryPlan vs 静态 SQL 解析 vs 调度依赖兜底，以及 SELECT */UDF/动态 SQL 三大断点",
+        "能用 fineGrainedLineages 的 transformOperation 和 confidenceScore 描述 PII 加密追溯和置信度",
+        "能用血缘做影响分析（改字段预演下游炸点）、合规审计（PII 流向）、根因定位（指标异常反查）三类工程动作",
+        "能识别数据目录失效的三种典型死因（业务元数据缺、不闭环、无信任信号）并给出运营指标"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "data-engineering.platform.metadata-lineage.recall.1",
-      "prompt": "请讲一下 元数据、血缘与数据目录 的核心链路和它解决的工程问题。",
+      "prompt": "Atlas、DataHub、OpenMetadata 在元数据模型和采集方式上有什么本质区别？什么场景选哪个？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "data-engineering.platform.metadata-lineage.recall.2",
-      "prompt": "元数据、血缘与数据目录 在生产环境里最常见的失败模式有哪些？",
+      "prompt": "为什么字段级血缘比表级血缘难？SELECT *、UDF、动态 SQL 这三种情况分别怎么处理？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "data-engineering.platform.metadata-lineage.recall.3",
-      "prompt": "如果 元数据、血缘与数据目录 相关变更上线后异常，你会如何回滚和验证？",
+      "prompt": "线上要对一个 PII 字段做加密改造，你会怎么用血缘评估和通知影响范围？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -126,20 +153,22 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说明 元数据、血缘与数据目录 的核心目标",
-      "能讲清 任务 SQL 解析、表字段元数据采集、血缘图谱构建 的关系",
-      "能指出 技术元数据 和 业务元数据 的差异",
-      "能给出可观测验证和回滚思路"
+      "Entity + Relationship + Classification 元数据三件套，以及四类元数据（技术/业务/操作/血缘）的区分",
+      "Atlas 运行时 Hook、DataHub Aspect 模型 + MCE Kafka、OpenMetadata Pull connector 三种架构的差异",
+      "字段级血缘的三种采集路径（QueryPlan、静态 SQL 解析、调度依赖）以及 SELECT */UDF/动态 SQL 三大断点",
+      "血缘在影响分析、合规审计（PII 追溯）、根因定位三类工程场景的具体应用方式"
     ],
     "goodToHave": [
-      "能结合 表负责人、字段注释、血缘图、访问热度、质量规则、权限记录 做定位",
-      "能说明多环境差异和权限边界",
-      "能把自动化、审计和回滚串成闭环"
+      "fineGrainedLineages 的 transformOperation 和 confidenceScore 在合规审计和置信标注中的用法",
+      "BI 工具（Tableau/Superset/QuickBI）通过专用 connector 接入血缘的必要性",
+      "数据目录的运营指标：owner 覆盖率、字段注释率、血缘完整率、热度、质量分",
+      "Atlas 与 Ranger 联动做基于血缘的字段级权限治理"
     ],
     "commonMistakes": [
-      "只讲 元数据、血缘与数据目录 的工具名，不说明数据语义、状态变化和上下游影响",
-      "忽略 元数据、血缘与数据目录 在重跑、补数、迟到数据或口径变更下的边界",
-      "没有用质量指标、血缘、SLA 或成本数据验证 元数据、血缘与数据目录 的结果"
+      "把 Atlas、DataHub、OpenMetadata 当同类替代品，忽视存储架构和采集模型的本质差异",
+      "追求一上来就全库字段级血缘，忽略表级覆盖率优先、核心字段重点突破的工程节奏",
+      "认为静态 SQL 解析能覆盖 100% 字段血缘，忽视 UDF/动态 SQL/跨引擎导致的断链",
+      "数据目录只接技术元数据不补业务元数据（owner/口径/样例），最后沦为搜不到信任不了的表名列表"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -148,5 +177,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

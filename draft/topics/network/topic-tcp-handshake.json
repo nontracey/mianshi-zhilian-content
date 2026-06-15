@@ -4,132 +4,169 @@
   "category": "tcp-udp",
   "group": "tcp-udp",
   "title": "TCP 三次握手与四次挥手",
-  "summary": "深入理解TCP连接建立的三次握手和连接释放的四次挥手过程，掌握每个阶段的状态变迁及常见面试追问点。",
+  "summary": "讲清三次握手为什么不是两次或四次、四次挥手 FIN/ACK 拆分原因、TIME_WAIT 与 CLOSE_WAIT 在生产里怎么排查、以及半连接队列与 syncookies 的取舍。",
   "tags": [
     "网络",
     "TCP",
     "三次握手",
     "四次挥手",
-    "TIME_WAIT"
+    "TIME_WAIT",
+    "CLOSE_WAIT",
+    "syncookies"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 22,
   "order": 20,
   "recommendWeight": 95,
   "learningCards": [
     {
       "type": "explain",
-      "title": "TCP 三次握手与四次挥手：三步分别确认什么、为什么不是两次",
-      "content": "## 三步分别确认什么\n客户端发 `SYN`，表示我要建立连接并给出初始序列号；服务端回 `SYN+ACK`，确认客户端序列号并给出自己的初始序列号；客户端再回 `ACK`，确认服务端序列号。到这里双方都确认了自己和对方的发送、接收路径可用。\n\n## 为什么不是两次\n两次握手会让服务端无法确认客户端是否收到了自己的初始序列号，也更容易受历史重复 SYN 影响。第三次 ACK 能确认双向能力，并让双方序列号状态达成一致。\n\n## 关闭为什么常是四次\nTCP 是全双工，主动关闭方发 `FIN` 表示自己不再发送；对端先 `ACK`，等自己的数据也发送完再发 `FIN`；主动方最后 `ACK`。如果对端也正好无数据，ACK 和 FIN 可能合并，看起来像三次。\n\n## TIME_WAIT 的意义\n主动关闭方进入 TIME_WAIT，等待 2MSL，确保最后 ACK 有机会重传，也让旧连接里的迟到报文自然过期。`SO_REUSEADDR` 主要解决服务重启时端口绑定问题，不是 TIME_WAIT 堆积的根治方案。"
+      "title": "三次握手到底在确认什么：ISN、收发能力、历史 SYN",
+      "content": "## 三次报文里序列号的真实意义\n第一步客户端发 `SYN, seq=x`，x 是客户端选的初始序列号 ISN（Linux 上由内核基于时间和四元组哈希产生，参考 RFC 6528），用来防止旧连接的报文混进新连接。第二步服务端回 `SYN, seq=y; ACK, ack=x+1`，告诉客户端「我收到你的 x，我自己用 y 开始」。第三步客户端回 `ACK, ack=y+1`，表示「我也收到你的 y」。`ack=x+1` 而不是 `ack=x`，是因为 SYN 占 1 个序号；后续数据序号从 x+1、y+1 开始累计。\n\n## 为什么不是两次也不是四次\n两次握手时，服务端发完 SYN+ACK 就认为连接建立，但它无法确认对方真的收到自己的 ISN：如果客户端那条 ACK 在路上丢了，服务端却已经分配了 socket，旧的滞留 SYN 还可能让它建出错误连接（RFC 793 经典案例）。三次握手后双方都拿到「对方对我 ISN 的确认」，建立条件就闭合了。四次没必要，是因为服务端可以把对客户端 SYN 的 ACK 和自己的 SYN 合并成一个报文（SYN+ACK），少一次往返。\n\n## 失败路径与重传\nSYN 没回 SYN+ACK，客户端按 `tcp_syn_retries`（默认 6）退避重传，总耗时约 1+2+4+...≈63 秒；SYN+ACK 没回 ACK，服务端按 `tcp_synack_retries`（默认 5）重传。这两个参数直接决定连接超时手感，调小可以让前端更快失败回退。"
     },
     {
       "type": "explain",
-      "title": "TCP 三次握手与四次挥手的边界、坑点与答题抓手",
-      "content": "三次握手用于确认双方收发能力并协商初始序列号，四次挥手体现 TCP 半关闭语义。回答时要把 SYN 队列、accept 队列、TIME_WAIT、CLOSE_WAIT 和重传联系到真实故障，比如连接建不起来、端口耗尽或应用没有及时关闭 socket。生产调优不能只改内核参数，还要看连接复用、超时设置、负载均衡和应用释放资源的路径。"
+      "title": "四次挥手的 FIN/ACK 为什么要拆开：半关闭与 CLOSE_WAIT 的根因",
+      "content": "## TCP 是全双工，两个方向必须分别关\n挥手能拆成四步，是因为 TCP 把发送和接收当成两条独立的字节流。主动方调用 `close()` 后发 `FIN`，仅表示「我这边没数据要发了」，但仍可以继续接收对方数据，这就是「半关闭」。被动方先回 `ACK` 确认收到 FIN，但此时它的应用层可能还有数据没发完——比如服务端正在写最后一段响应——所以它会继续 send 直到 EOF，再发自己的 `FIN`，主动方再 `ACK`。\n\n## 什么时候看起来是三次\n如果被动方收到 FIN 时刚好也没有要发的数据（比如简单的 echo 服务在收到 EOF 后立刻 close），内核会把 ACK 和 FIN 合并到同一个报文，抓包看到的就是三段，本质还是四次挥手，只是第二、第三次合并了。\n\n## CLOSE_WAIT 堆积的根因\n被动方收到 FIN 进入 CLOSE_WAIT 后，要等应用层主动调 `close()` 才会发出自己的 FIN 并进入 LAST_ACK。生产上 `ss -ant | grep CLOSE-WAIT` 能看到大量该状态时，几乎都是应用 BUG：连接异常分支没走到 close、连接池没回收、线程池打满导致 close 不到。换句话说，CLOSE_WAIT 是应用问题，TIME_WAIT 才是协议问题，两者根因截然不同。"
+    },
+    {
+      "type": "explain",
+      "title": "TIME_WAIT 2MSL 与 SYN flood：参数到底怎么调",
+      "content": "## TIME_WAIT 为什么要等 2MSL\n主动关闭方发出最后那个 ACK 后进入 TIME_WAIT，等待 2MSL（Linux 写死 60 秒，对应 MSL=30s，不可调）。两个作用：① 最后 ACK 如果丢了，对端会重传 FIN，主动方还能再回一次 ACK；② 让上一个连接里的迟到报文在 2MSL 内自然过期，防止串到新连接（同四元组）。\n\n## 高 TIME_WAIT 不一定是问题\nTIME_WAIT 多的一方一定是主动 close 那一侧。短连接客户端（比如 nginx 反代回源）压力大时本来就会有几万个 TIME_WAIT，只要本地端口不耗尽就没事。优化优先顺序：长连接复用（HTTP keep-alive、连接池）→ 客户端 `net.ipv4.ip_local_port_range` 放宽到 `1024 65535` → `tcp_tw_reuse=1` 允许 outbound 复用 TIME_WAIT 端口（前提开 `tcp_timestamps`）。`tcp_tw_recycle` 在 4.12 内核已被移除，绝对不要再用，它在 NAT 后面会随机丢连接。`SO_REUSEADDR` 解决的是服务端重启绑端口的问题，跟 TIME_WAIT 堆积没关系。\n\n## 半连接队列与 syncookies\n服务端收到 SYN 后会把它放入半连接队列（SYN queue），完成三次握手后挪到 accept 队列等 `accept()`。SYN flood 攻击就是只发 SYN 不回 ACK，把半连接队列打满，让正常请求建不上。Linux 的对策是 `tcp_syncookies=1`：当队列满时不分配 TCB，把连接信息编码进 SYN+ACK 的序列号里，等收到 ACK 时再校验解码、重建连接。代价是 syncookies 路径不支持完整的 TCP 选项协商（窗口缩放、SACK 在解码时部分丢失），所以默认只在队列将满时启用。配套要看的还有 `tcp_max_syn_backlog`、`somaxconn` 和应用 `listen()` 的 backlog 参数，三者取最小值决定 accept 队列上限。"
     },
     {
       "type": "diagram",
-      "title": "TCP 建连与断连状态流程",
+      "title": "握手 / 挥手状态机（含 TIME_WAIT 与 CLOSE_WAIT）",
       "format": "mermaid",
-      "content": "flowchart TD\nA[客户端 CLOSED] --> B[SYN_SENT 发送 SYN]\nB --> C[服务端 SYN_RCVD 返回 SYN+ACK]\nC --> D[客户端 ESTABLISHED 返回 ACK]\nD --> E[双方 ESTABLISHED]\nE --> F[主动方 FIN_WAIT_1 发送 FIN]\nF --> G[被动方 CLOSE_WAIT 返回 ACK]\nG --> H[被动方 LAST_ACK 发送 FIN]\nH --> I[主动方 TIME_WAIT 返回 ACK]\nI --> J[2MSL 后 CLOSED]",
-      "caption": "握手同步序列号，挥手分别关闭两个方向的数据流。",
-      "fallback": "TCP 流程：SYN -> SYN+ACK -> ACK 建连；FIN -> ACK -> FIN -> ACK 断连。"
+      "content": "flowchart LR\nA[Client CLOSED] -->|send SYN seq=x| B[SYN_SENT]\nB -->|recv SYN+ACK ack=x+1, send ACK ack=y+1| E[ESTABLISHED]\nL[Server LISTEN] -->|recv SYN, send SYN+ACK 入半连接队列| S[SYN_RCVD]\nS -->|recv ACK 入 accept 队列| E\nE -->|主动方 close, send FIN| F1[FIN_WAIT_1]\nF1 -->|recv ACK| F2[FIN_WAIT_2]\nE -->|被动方 recv FIN, send ACK| CW[CLOSE_WAIT 等 app close]\nCW -->|app close, send FIN| LA[LAST_ACK]\nF2 -->|recv FIN, send ACK| TW[TIME_WAIT 等 2MSL=60s]\nLA -->|recv ACK| C2[CLOSED]\nTW -->|2MSL 超时| C2",
+      "caption": "左半建连：SYN 进半连接队列、ACK 进 accept 队列；右半断连：主动方走 TIME_WAIT，被动方走 CLOSE_WAIT。",
+      "fallback": "建连：CLOSED→SYN_SENT→ESTABLISHED；服务端：LISTEN→SYN_RCVD→ESTABLISHED。断连：主动方 FIN_WAIT_1→FIN_WAIT_2→TIME_WAIT(2MSL)→CLOSED；被动方 CLOSE_WAIT→LAST_ACK→CLOSED。"
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | 三次握手 | 四次挥手 |\n| --- | --- | --- |\n| 目的 | 建立连接，同步序列号 | 释放连接，双方关闭发送通道 |\n| 报文交互 | SYN → SYN+ACK → ACK | FIN → ACK → FIN → ACK |\n| 次数原因 | 三次即可确认双方收发能力 | TCP全双工，双方需分别关闭 |\n| 状态变迁 | SYN_SENT/SYN_RCVD/ESTABLISHED | FIN_WAIT/CLOSE_WAIT/TIME_WAIT |\n| 异常处理 | SYN超时重传，SYN Flood攻击 | FIN丢失重传，TIME_WAIT堆积 |\n| 耗时 | 1.5个RTT | 2个RTT + 2MSL |"
+      "title": "TIME_WAIT vs CLOSE_WAIT：现象、根因、排查与修法",
+      "content": "| 维度 | TIME_WAIT | CLOSE_WAIT |\n| --- | --- | --- |\n| 出现在哪一方 | 主动 close 的一方 | 被动收到 FIN 的一方 |\n| 持续时间 | 固定 2MSL（Linux=60s） | 直到应用调 close()，可无限长 |\n| 触发条件 | 正常关闭流程的最后一步 | 应用没及时关 socket |\n| 观察命令 | `ss -ant state time-wait` 计数 | `ss -ant state close-wait` 看进程 |\n| 核心危害 | 占用本地端口，可能耗尽 outbound | 占用 fd 与内存，连接池会被打爆 |\n| 是否协议问题 | 是，由 RFC 793 设计 | 否，是应用 BUG |\n| 正确修法 | 开 keep-alive 复用、tcp_tw_reuse、放宽端口范围 | 修代码：异常分支 close、连接池超时回收、try-finally |\n| 错误修法 | tcp_tw_recycle（已废弃，会丢包） | 调内核参数（治标不治本，掩盖 BUG） |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "import socket\nimport threading\n\n# === TCP 服务器端 (被动打开) ===\ndef tcp_server():\n    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n    server.bind(('127.0.0.1', 8888))\n    server.listen(1)  # 进入LISTEN状态，等待三次握手\n    print('服务器等待连接...')\n    conn, addr = server.accept()  # 三次握手在此完成\n    print(f'连接已建立: {addr}')\n    data = conn.recv(1024)\n    print(f'收到数据: {data.decode()}')\n    conn.close()  # 发起四次挥手\n    server.close()\n\n# === TCP 客户端 (主动打开) ===\ndef tcp_client():\n    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    # connect触发三次握手: SYN → SYN-ACK → ACK\n    client.connect(('127.0.0.1', 8888))  # 进入ESTABLISHED状态\n    client.send(b'Hello TCP!')\n    client.close()  # 发起四次挥手\n\n# 运行: 先启动server，再启动client\nif __name__ == '__main__':\n    t = threading.Thread(target=tcp_server)\n    t.daemon = True\n    t.start()\n    import time; time.sleep(0.5)\n    tcp_client()",
-      "language": "python",
+      "title": "抓包视角：握手 / 挥手 + 排查命令",
+      "language": "bash",
+      "content": "# === 1. 用 tcpdump 抓三次握手和四次挥手 ===\n# Flags [S]=SYN, [S.]=SYN+ACK, [.]=ACK, [F.]=FIN+ACK\nsudo tcpdump -i lo -nn 'port 8888' -c 10\n# 典型输出（建连）:\n#   client.54321 > server.8888: Flags [S],  seq 1000\n#   server.8888  > client.54321: Flags [S.], seq 2000, ack 1001\n#   client.54321 > server.8888: Flags [.],            ack 2001\n# 典型输出（断连，主动方=client）:\n#   client > server: Flags [F.], seq 1500, ack 2300\n#   server > client: Flags [.],            ack 1501\n#   server > client: Flags [F.], seq 2300, ack 1501   # 服务端发完剩余数据再 FIN\n#   client > server: Flags [.],            ack 2301   # 进入 TIME_WAIT 60s\n\n# === 2. 排查 TIME_WAIT / CLOSE_WAIT 堆积 ===\nss -s                                    # 总览各状态计数\nss -ant state time-wait  | wc -l         # TIME_WAIT 数量（看主动 close 方）\nss -ant state close-wait                 # CLOSE_WAIT 列表（哪个端口/进程）\nlsof -i :8888 | grep CLOSE_WAIT          # 定位到具体进程，几乎都是应用 BUG\n\n# === 3. 半连接队列与 SYN flood 防护 ===\nss -lnt                                  # Recv-Q=当前 accept 队列长度，Send-Q=上限\nnetstat -s | grep -i 'listen\\|syn'        # 看 SYNs to LISTEN sockets dropped 等关键计数\nsysctl net.ipv4.tcp_syncookies            # 1=队列满时启用 syncookies\nsysctl net.ipv4.tcp_max_syn_backlog       # 半连接队列上限（默认 128~2048）\nsysctl net.core.somaxconn                 # accept 队列上限（应用 listen backlog 不能超过）\n\n# === 4. TIME_WAIT 调优（按风险从低到高） ===\n# (a) 优先：应用层 keep-alive / 连接池，根治短连接\n# (b) 客户端放宽端口范围\nsysctl -w net.ipv4.ip_local_port_range='1024 65535'\n# (c) 谨慎：允许 outbound 复用 TIME_WAIT，需要 tcp_timestamps=1 双方都开\nsysctl -w net.ipv4.tcp_tw_reuse=1\n# (d) 严禁：tcp_tw_recycle 在 4.12 内核已删除，NAT 环境下会随机丢连接，绝对不要开",
       "highlights": [
         {
-          "line": 27,
-          "note": "这里是边界条件分支，回答 TCP 三次握手与四次挥手 时要说明它为什么会改变执行路径。"
+          "line": 3,
+          "note": "tcpdump Flags 标记：[S]/[S.]/[.]/[F.] 分别对应 SYN/SYN+ACK/ACK/FIN+ACK，是看握手挥手最直观的方式"
+        },
+        {
+          "line": 17,
+          "note": "排查 TIME_WAIT 计数；如果是反代/回源机器，几万 TIME_WAIT 通常正常，关键看本地端口是否耗尽"
+        },
+        {
+          "line": 18,
+          "note": "CLOSE_WAIT 列表必须配 lsof 定位到具体进程去查代码，调内核参数无效"
+        },
+        {
+          "line": 31,
+          "note": "tcp_tw_reuse 只对 outbound 端口生效且需要 tcp_timestamps=1；tcp_tw_recycle 已被 4.12 内核移除，严禁使用"
         }
       ]
     },
     {
       "type": "interviewAnswer",
-      "title": "标准面试回答",
-      "content": "结论：TCP 握手的目标是确认双方收发能力和初始序列号，挥手的目标是让双方都能可靠关闭各自方向的数据流。三次握手建立全双工连接，四次挥手是因为 TCP 双向通道需要分别关闭。\n\n机制上，握手和挥手分别看状态流转：\n1. 握手：客户端发 SYN，服务端回 SYN+ACK，客户端再回 ACK，双方确认序列号和收发能力。\n2. 挥手：主动关闭方发 FIN，对方 ACK；被动方数据发完后再发 FIN，主动方 ACK。\n3. TIME_WAIT：主动关闭方等待 2MSL，确保最后 ACK 可重传，并让旧连接报文自然过期。\n4. 异常处理：SYN backlog、半连接队列和重传会影响连接建立成功率。\n\n追问边界：追问常见于 SYN flood、CLOSE_WAIT、TIME_WAIT 过多。CLOSE_WAIT 多通常是应用没有关闭 socket；TIME_WAIT 多不一定是坏事，要结合连接复用、端口耗尽和服务角色判断。",
+      "title": "面试回答：建连断连 + TIME_WAIT/CLOSE_WAIT 排查",
+      "content": "30 秒结论：三次握手的目的是同步双方的初始序列号 ISN 并互相确认收发能力，三次是闭合这一确认的最少次数；四次挥手是因为 TCP 全双工，两个方向必须分别关闭，被动方收到 FIN 后还可能有数据要发，所以 ACK 和 FIN 不能合并。\n\n机制主线：\n- 握手第一步 SYN 带 seq=x，第二步 SYN+ACK 带 seq=y、ack=x+1，第三步 ACK 带 ack=y+1，SYN 各占一个序号，后续数据从 x+1、y+1 算起。\n- 服务端收到 SYN 先入半连接队列，三次完成后挪到 accept 队列等应用 accept；半连接队列被打满就是 SYN flood，靠 tcp_syncookies 在队列满时把连接信息编进序列号兜底。\n- 挥手主动方走 FIN_WAIT_1 → FIN_WAIT_2 → TIME_WAIT，被动方走 CLOSE_WAIT → LAST_ACK；TIME_WAIT 等 2MSL（Linux=60s）是为了让最后 ACK 可重传、让旧报文过期。\n\n追问边界：线上 TIME_WAIT 多通常是主动 close 的一方比如反代回源，用 keep-alive、tcp_tw_reuse、放宽 ip_local_port_range 处理，绝对不要开 tcp_tw_recycle；CLOSE_WAIT 多则是应用没调 close，要去翻代码异常分支和连接池回收，调内核参数没用。",
       "followUpQuestions": [
         {
-          "question": "为什么不是两次握手？",
-          "answer": "两次无法让服务端确认客户端收到自己的 SYN+ACK，也难以避免历史连接请求造成错误连接。"
+          "question": "为什么不是两次握手，也不是四次？",
+          "answer": "两次时服务端发完 SYN+ACK 就建连，但它没法确认客户端真的收到自己的 ISN，旧的滞留 SYN 还可能让服务端建出错误连接；三次握手让双方都拿到「对方对我 ISN 的确认」。四次没必要，是因为服务端的 ACK 和 SYN 可以合并成 SYN+ACK，少一次往返就够。"
         },
         {
-          "question": "TIME_WAIT 可以直接去掉吗？",
-          "answer": "不能简单去掉，它保护最后 ACK 和旧报文清理；优化要通过连接复用、合理超时和内核参数谨慎处理。"
+          "question": "线上服务器 CLOSE_WAIT 几千个怎么排查？跟 TIME_WAIT 多的处理思路一样吗？",
+          "answer": "完全不一样。CLOSE_WAIT 是被动方收到 FIN 后应用没调 close，根因在代码：先 `ss -ant state close-wait` 看是哪个端口、`lsof` 定位进程，再去看异常分支是不是漏了 close、连接池超时是不是没设、线程池是不是被打满导致 close 不到。调 tcp 内核参数没用。TIME_WAIT 是主动 close 方的协议正常状态，处理思路是开 keep-alive 复用 + tcp_tw_reuse + 放宽端口范围，绝对不要碰已删除的 tcp_tw_recycle。"
+        },
+        {
+          "question": "syncookies 是怎么在半连接队列满时不丢连接的？有副作用吗？",
+          "answer": "队列将满时内核不再分配 TCB（连接控制块），而是把客户端 IP/Port、MSS 等信息哈希编码进 SYN+ACK 的初始序列号里发出去；客户端回 ACK 时 ack-1 还原出这些信息，再正式建连。代价是 SYN 阶段的 TCP 选项无法完整保留，比如窗口缩放、SACK 会受影响，所以默认只在 `tcp_max_syn_backlog` 将满时启用，不是无脑开。"
         }
       ]
     },
     {
       "type": "checklist",
-      "title": "学完后应能说清楚",
+      "title": "学完后能答清楚的关键问题",
       "items": [
-        "能画出三次握手和四次挥手的完整流程图",
-        "能说出每个阶段客户端和服务器的状态变化",
-        "能解释为什么握手是三次而不是两次",
-        "能解释为什么挥手是四次而不是三次",
-        "能说明TIME_WAIT存在的原因和2MSL的含义",
-        "能描述SYN Flood攻击的原理及防御方法",
-        "能用代码演示TCP连接的建立和释放过程"
+        "能画出握手三步对应的 seq/ack 数值变化，并解释 SYN 为什么占一个序号",
+        "能说清两次握手为什么不够，四次握手为什么没必要",
+        "能解释 FIN/ACK 拆开的原因（半关闭语义），以及什么场景下挥手看起来是三次",
+        "能区分 TIME_WAIT 和 CLOSE_WAIT 出现在哪一方、根因是协议还是应用",
+        "能说出 TIME_WAIT 等 2MSL 的两个作用，并给出 keep-alive、tcp_tw_reuse、ip_local_port_range 的优化顺序",
+        "能解释半连接队列、accept 队列、somaxconn、listen backlog 之间的关系",
+        "能讲清 syncookies 在 SYN flood 下的工作原理和它牺牲了什么 TCP 选项",
+        "知道 tcp_tw_recycle 已被移除、为什么在 NAT 下不能开"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "network.tcp-udp.topic-tcp-handshake.recall.1",
-      "prompt": "请讲清楚 TCP 三次握手和四次挥手的每一步，以及为什么需要 TIME_WAIT。",
+      "prompt": "讲一下三次握手三步分别在确认什么、为什么不是两次也不是四次，结合 ISN 和 ack=x+1 来说。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "network.tcp-udp.topic-tcp-handshake.recall.2",
-      "prompt": "为什么建立连接是三次握手，关闭连接通常是四次挥手？",
+      "prompt": "线上发现某服务 CLOSE_WAIT 持续涨到几千个，但 TIME_WAIT 正常，你会怎么定位？为什么调内核参数没用？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "network.tcp-udp.topic-tcp-handshake.recall.3",
-      "prompt": "挥手为什么要四次而握手只要三次？TIME_WAIT 为什么等 2MSL、服务器大量 TIME_WAIT 怎么办？",
+      "prompt": "Nginx 回源出现端口耗尽（cannot assign requested address），TIME_WAIT 数万，怎么按风险从低到高优化？为什么不要碰 tcp_tw_recycle？",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "network.tcp-udp.topic-tcp-handshake.recall.4",
+      "prompt": "解释半连接队列、accept 队列与 somaxconn、tcp_max_syn_backlog、listen() backlog 的关系，以及 syncookies 在 SYN flood 下怎么工作、代价是什么。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "SYN/SYN+ACK/ACK",
-      "FIN/ACK",
-      "能说明「半关闭」在「TCP 三次握手与四次挥手」里的作用和判断标准",
-      "TIME_WAIT"
+      "握手三步的 seq/ack 含义：SYN 占 1 序号，ack=对端 seq+1",
+      "三次握手是闭合「双方都确认对方 ISN」的最少次数，两次会被旧 SYN 误建连",
+      "四次挥手源于 TCP 全双工 + 半关闭语义，FIN 与 ACK 不能合并",
+      "TIME_WAIT 出现在主动 close 方，等 2MSL（Linux=60s）保护最后 ACK 与旧报文过期",
+      "CLOSE_WAIT 出现在被动方，根因是应用没调 close，不是协议问题"
     ],
     "goodToHave": [
-      "SYN flood",
-      "CLOSE_WAIT",
-      "能说明「半连接队列」在「TCP 三次握手与四次挥手」里的触发条件、收益和失效边界"
+      "tcp_syn_retries / tcp_synack_retries 与建连超时手感",
+      "半连接队列、accept 队列、somaxconn、listen backlog 取最小值的关系",
+      "tcp_syncookies 在队列满时编码 ISN 的工作原理和对 TCP 选项的影响",
+      "tcp_tw_reuse vs 已废弃的 tcp_tw_recycle、NAT 下为何不能开",
+      "短连接场景优先 keep-alive / 连接池，再放宽端口范围的优化顺序"
     ],
     "commonMistakes": [
-      "把握手说成只确认在线",
-      "不知道 TIME_WAIT 在主动关闭方",
-      "把 CLOSE_WAIT 归因于网络问题"
+      "把三次握手简单说成「确认对方在线」，不提 ISN 和序号同步",
+      "把 TIME_WAIT 和 CLOSE_WAIT 混为一谈、用同一套内核参数应对",
+      "把 CLOSE_WAIT 堆积归因于网络抖动或对端，而不是本应用没 close",
+      "建议开 tcp_tw_recycle 解决 TIME_WAIT（实际已被 4.12 内核移除且会丢连接）",
+      "把 SO_REUSEADDR 当成解决 TIME_WAIT 堆积的手段（它解决的是端口绑定）",
+      "不知道 listen() backlog 受 somaxconn 限制，盲调单一参数"
     ],
     "scoreWeights": {
-      "coverage": 35,
-      "accuracy": 30,
+      "coverage": 30,
+      "accuracy": 35,
       "interviewExpression": 20,
       "depth": 15
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-13",
   "status": "draft",
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能围绕「TCP 三次握手与四次挥手」说清SYN/SYN+ACK/ACK、FIN/ACK，并放到网络协议场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "重点考察是否能用 ISN 和 seq/ack 数值讲清三次握手的闭合性、四次挥手的半关闭语义；线上能区分 TIME_WAIT（主动方协议正常）与 CLOSE_WAIT（被动方应用 BUG）的排查路径与正确修法；以及半连接队列被打满时 syncookies 的工作机制与对 TCP 选项的代价。"
 }

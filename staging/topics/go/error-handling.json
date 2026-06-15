@@ -4,12 +4,14 @@
   "category": "runtime",
   "group": "runtime",
   "title": "Error 处理与错误链",
-  "summary": "掌握 Go 显式错误返回、wrap、errors.Is/As 和业务错误分类。",
+  "summary": "掌握 Go 显式错误返回、%w 包装、errors.Is/As/Unwrap 与 typed nil、context 超时等错误链工程实践。",
   "tags": [
     "Go",
     "error",
     "错误处理",
-    "errors.Is"
+    "errors.Is",
+    "errors.As",
+    "typed-nil"
   ],
   "difficulty": 3,
   "estimatedMinutes": 28,
@@ -20,86 +22,112 @@
     "go.runtime.defer-panic-recover"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能解释 Go 显式 error、错误包装、errors.Is/As、sentinel error 和业务错误边界。",
+  "interviewerFocus": "重点看候选人是否真正区分 sentinel error 与自定义类型、是否清楚 %w 与 %v 断链差异、是否踩过 typed nil 陷阱并能在 HTTP/gRPC 边界正确解包 context.DeadlineExceeded 等错误。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Go 错误处理强调显式返回和可判断错误链",
-      "content": "Go 把可预期失败作为返回值处理，而不是默认用异常控制流程。调用方必须检查 error；从 Go 1.13 起，`fmt.Errorf(\"...: %w\", err)` 可以保留错误链，让上层既补充上下文又能判断根因。\n\n从零理解时先抓住这几个点：\n- 普通失败返回 error，panic 只处理不可恢复异常或编程错误\n- 错误包装用 %w 保留 cause，方便逐层加上下文\n- errors.Is 判断错误链中是否包含某个 sentinel error\n- errors.As 把错误链中的某类错误提取出来做结构化处理\n\n容易答浅的地方通常在边界：\n- 只返回原始错误会丢失业务上下文\n- 用字符串匹配错误信息很脆弱\n- 包装时用了 %v 而不是 %w 会断开错误链"
+      "title": "Go 错误处理：显式返回 + 错误链 + 边界解包",
+      "content": "Go 的 error 是个只有一个方法的接口：`type error interface { Error() string }`。约定把可预期失败做返回值，让调用方在每一层显式选择「重试/包装/上抛/降级」。这套方案的代价是写法啰嗦，但好处是失败路径在源码里一眼可见，不像 Java 那样靠 try/catch 隐式跳转。\n\nGo 1.13（2019）以前，跨层加上下文要么用 `fmt.Errorf` 拼字符串（断链）、要么靠 `github.com/pkg/errors`。1.13 起标准库引入三件套：\n- `fmt.Errorf(\"load user %d: %w\", id, err)` 用 `%w` 把原 error 挂到链上，等价于让新 error 实现 `Unwrap() error`\n- `errors.Is(err, target)` 沿着 Unwrap 链逐节比较，命中 sentinel（如 `io.EOF`、`sql.ErrNoRows`、`context.DeadlineExceeded`）就返回 true\n- `errors.As(err, &target)` 沿链找第一个能赋值给 target 类型的节点，用来把 `*os.PathError`、`*net.OpError`、自定义 `*BizError` 这类带字段的错误提取出来做结构化决策\n\n常见误区集中在三处：\n1. 误用 `%v` 或 `%s` 包装：拿到的是字符串拷贝，errors.Is/As 全部失效\n2. typed nil：`var e *MyErr; return e` 时返回值是「类型非空、值为 nil」的接口，调用方 `if err != nil` 永远成立\n3. 把 panic 当 error 用：业务失败应该返回，panic 只留给「程序员错误」（数组越界、map 并发写、空指针解引用）和无法继续的初始化失败"
     },
     {
       "type": "explain",
-      "title": "错误链让“给上下文”和“可判断”同时成立",
-      "content": "实际工程里，底层错误只知道“数据库超时”或“文件不存在”，上层还需要知道用户、订单、操作阶段等上下文。直接拼字符串虽然可读，但机器无法可靠判断；直接定义大量全局 sentinel error 又容易暴露实现细节。比较稳妥的做法是：底层返回可识别错误，上层用 `%w` 包装，边界层统一映射成 HTTP 状态码、日志字段或用户提示。\n\n面试中还可以补充自定义错误类型。比如带 `Code`、`Retryable`、`Temporary` 字段的错误可以通过 `errors.As` 提取，做重试或降级决策。关键是不要在每层都吞掉原始错误，也不要把敏感内部信息直接暴露给用户。"
+      "title": "sentinel vs 自定义类型：选哪种取决于调用方要不要解构",
+      "content": "工程里两种错误并存。Sentinel error 是预先 `errors.New` 出来的全局变量，调用方用 `errors.Is` 比对；典型例子是 `io.EOF`、`sql.ErrNoRows`、`context.Canceled`、`context.DeadlineExceeded`、`os.ErrNotExist`。优点是零成本、API 稳定，缺点是只能携带「身份」，无法附加 RequestID、HTTP 状态码、是否可重试这些字段，且暴露成全局变量后会被外部包依赖，删除即破坏向后兼容。\n\n自定义错误类型适合需要携带结构化字段的场景。最小骨架：\n```go\ntype BizError struct {\n    Code     string  // 比如 \"USER_LOCKED\"\n    HTTP     int     // 4xx/5xx 映射\n    Retry    bool    // 调用方是否可重试\n    Cause    error   // 原始错误，参与 Unwrap\n}\nfunc (e *BizError) Error() string { return fmt.Sprintf(\"%s: %v\", e.Code, e.Cause) }\nfunc (e *BizError) Unwrap() error { return e.Cause }\n```\n返回时务必用 `error` 接口类型而不是具体指针类型，避免 typed nil；解包用 `var be *BizError; if errors.As(err, &be) { ... }`，让中间任何一层用 `%w` 包装都不影响识别。\n\n错误链的栈信息是 Go 的弱项。`pkg/errors` 提供过 `WithStack`，但官方 1.13 起已不再推荐——标准库 errors 不带 stack，只能在产生错误的最底层手动 `runtime.Callers` 抓栈或在日志中间件里输出。生产实践里通常在「产生错误的那一层」记录 caller 信息，跨层只补业务字段，避免每层都抓栈造成 GC 压力。"
     },
     {
       "type": "diagram",
-      "title": "错误链传递与判断",
+      "title": "错误链 Unwrap + Is/As 判定流程",
       "format": "mermaid",
-      "content": "flowchart LR\nA[底层产生错误] --> B[上层补充上下文并包装]\nB[上层补充上下文并包装] --> C[继续返回调用方]\nC[继续返回调用方] --> D[边界层 errors.Is/As 判断]\nD[边界层 errors.Is/As 判断] --> E[记录日志并映射响应]",
-      "fallback": "底层产生错误 -> 上层补充上下文并包装 -> 继续返回调用方 -> 边界层 errors.Is/As 判断 -> 记录日志并映射响应",
-      "caption": "错误链的价值是同时保留根因、调用上下文和机器可判断能力。"
+      "content": "flowchart LR\nA[底层 io.EOF / sql.ErrNoRows / *PathError] --> B[Repo 层 fmt.Errorf %w 包装]\nB --> C[Service 层 *BizError 包装<br/>填 Code/HTTP/Retry]\nC --> D[Handler errors.As &be]\nD -->|matched| E[按 be.HTTP 返 4xx/5xx<br/>be.Retry 决定重试]\nD -->|errors.Is DeadlineExceeded| F[返 504 + 触发熔断]\nD -->|未识别| G[兜底 500 + 记录 stack]",
+      "fallback": "底层错误 -> Repo 用 %w 包装 -> Service 包成 *BizError 带 Code/HTTP/Retry -> Handler 用 errors.As 解包 -> 命中 BizError 按字段映射响应；命中 context.DeadlineExceeded 返 504 + 熔断；未识别走兜底 500。",
+      "caption": "错误链的目标是让 Handler 拿到任意一层包装后的 err 都能恢复出原始决策依据。"
     },
     {
       "type": "compareTable",
-      "title": "错误处理方式对比",
+      "title": "错误处理选型与陷阱",
       "columns": [
-        "考点",
-        "应该怎么理解",
-        "面试追问",
-        "常见坑"
+        "方式",
+        "适用场景",
+        "解包手段",
+        "典型坑"
       ],
       "rows": [
         [
-          "直接返回 error",
-          "保留原始失败",
-          "简单调用链",
-          "缺少业务上下文"
+          "sentinel error（io.EOF 等）",
+          "只需识别身份，无附加字段；跨包公开契约",
+          "errors.Is(err, io.EOF)",
+          "暴露成 API 后无法删除；信息量小，无法承载 RequestID/重试位"
         ],
         [
-          "%w 包装",
-          "保留 cause 并加上下文",
-          "跨层返回",
-          "误用 %v 断链"
+          "自定义错误类型（*BizError）",
+          "需携带 Code、HTTP 状态、Retryable、TraceID 等字段",
+          "errors.As(err, &be)",
+          "返回时声明成具体指针类型 → typed nil；字段过度膨胀变上帝错误"
         ],
         [
-          "errors.Is",
-          "判断 sentinel error",
-          "权限、未找到、超时",
-          "只比字符串"
+          "fmt.Errorf %w 包装",
+          "跨层补充业务上下文，又要保留根因可判断",
+          "Unwrap 链 + Is/As",
+          "误写 %v 或 %s → 链断；同一层包装多个 %w（Go 1.20+ 才支持多个）"
         ],
         [
-          "errors.As",
-          "提取自定义错误类型",
-          "重试和状态映射",
-          "类型设计过度"
+          "context.DeadlineExceeded / Canceled",
+          "RPC、DB、HTTP client 超时或主动取消",
+          "errors.Is(err, context.DeadlineExceeded)",
+          "把超时当普通失败重试 → 雪崩；忽略 ctx.Err() 让 goroutine 泄漏"
+        ],
+        [
+          "panic + recover 转 error",
+          "防止第三方库 panic 击穿，或在 HTTP/gRPC 拦截器统一兜底",
+          "defer 中 recover 后赋值给命名返回值 err",
+          "用 panic 替代业务返回；recover 后吞掉 stack 不打日志"
         ]
       ]
     },
     {
       "type": "code",
-      "title": "包装错误并保留可判断根因",
+      "title": "包装、解包、typed nil 与 recover 转 error",
       "language": "go",
-      "content": "package main\n\nimport (\n\t\"errors\"\n\t\"fmt\"\n)\n\nvar ErrNotFound = errors.New(\"not found\")\n\nfunc loadUser(id int) error {\n\treturn fmt.Errorf(\"load user %d: %w\", id, ErrNotFound)\n}\n\nfunc main() {\n\terr := loadUser(7)\n\tif errors.Is(err, ErrNotFound) {\n\t\tfmt.Println(\"return 404\")\n\t}\n}",
+      "content": "package main\n\nimport (\n\t\"context\"\n\t\"errors\"\n\t\"fmt\"\n\t\"net/http\"\n)\n\n// 1. 自定义错误类型，实现 Unwrap 参与 errors.Is/As 链\ntype BizError struct {\n\tCode  string\n\tHTTP  int\n\tRetry bool\n\tCause error\n}\n\nfunc (e *BizError) Error() string { return fmt.Sprintf(\"%s: %v\", e.Code, e.Cause) }\nfunc (e *BizError) Unwrap() error { return e.Cause }\n\nvar ErrUserNotFound = errors.New(\"user not found\") // sentinel\n\nfunc loadUser(ctx context.Context, id int) error {\n\t// 模拟底层超时\n\tif err := ctx.Err(); err != nil {\n\t\treturn fmt.Errorf(\"loadUser id=%d: %w\", id, err) // %w 保留 context.DeadlineExceeded\n\t}\n\treturn fmt.Errorf(\"loadUser id=%d: %w\", id, ErrUserNotFound)\n}\n\nfunc getUser(ctx context.Context, id int) error {\n\tif err := loadUser(ctx, id); err != nil {\n\t\t// Service 层包成 BizError，注意返回类型是 error（接口），避免 typed nil\n\t\treturn &BizError{Code: \"USER_NOT_FOUND\", HTTP: 404, Retry: false, Cause: err}\n\t}\n\treturn nil\n}\n\n// 2. typed nil 反例：返回具体指针类型时，nil 指针被装入接口，err != nil 永远成立\nfunc badReturn() error {\n\tvar e *BizError // nil\n\treturn e // 调用方 if err != nil 为 true！\n}\n\n// 3. defer + recover 转 error，常用于 HTTP 中间件兜底\nfunc safeCall(fn func()) (err error) {\n\tdefer func() {\n\t\tif r := recover(); r != nil {\n\t\t\terr = fmt.Errorf(\"panic recovered: %v\", r) // 生产里还应记录 debug.Stack()\n\t\t}\n\t}()\n\tfn()\n\treturn nil\n}\n\n// 4. Handler 边界：errors.As 解结构化错误，errors.Is 解 sentinel\nfunc handle(w http.ResponseWriter, r *http.Request) {\n\terr := getUser(r.Context(), 7)\n\tvar be *BizError\n\tswitch {\n\tcase err == nil:\n\t\tw.WriteHeader(http.StatusOK)\n\tcase errors.Is(err, context.DeadlineExceeded):\n\t\thttp.Error(w, \"upstream timeout\", http.StatusGatewayTimeout) // 504\n\tcase errors.As(err, &be):\n\t\thttp.Error(w, be.Code, be.HTTP) // 用结构化字段映射\n\tdefault:\n\t\thttp.Error(w, \"internal\", http.StatusInternalServerError) // 兜底，记录 stack\n\t}\n}",
       "highlights": [
         {
-          "line": 16,
-          "note": "这里是边界条件分支，回答 Error 处理与错误链 时要说明它为什么会改变执行路径。"
+          "line": 14,
+          "note": "BizError 实现 Unwrap 后，外层用 %w 包装也不影响 errors.As 找到它，是「自定义类型 + 错误链」并存的关键"
+        },
+        {
+          "line": 27,
+          "note": "用 %w 把 ctx.Err()（context.DeadlineExceeded）挂上链，Handler 才能用 errors.Is 识别超时并返 504"
+        },
+        {
+          "line": 41,
+          "note": "typed nil 陷阱：返回类型必须写成 error 接口而不是 *BizError，否则 nil 指针被装箱后 err != nil 恒为 true"
+        },
+        {
+          "line": 47,
+          "note": "recover 必须配合命名返回值 err 才能改写返回值；生产里还要补 debug.Stack() 与监控指标，不能静默吞 panic"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "Go error 我会先说显式返回，再讲错误链如何保留上下文和根因判断。\n\n我会按这条线展开：\n1. 可预期失败用 error 返回，调用方显式处理\n2. 上层用 %w 包装错误，既补充上下文又保留根因\n3. errors.Is 适合判断 sentinel error，errors.As 适合提取自定义错误类型\n4. 系统边界统一把内部错误映射成日志、指标和用户可见响应\n\n最后补一句边界：不要用 panic 替代业务错误，也不要用字符串匹配错误内容做控制流。",
+      "content": "Go error 我会先说显式返回的设计动机，再讲错误链怎么同时承载根因和业务上下文。\n\n展开顺序：\n1. error 是 `interface{ Error() string }`，约定可预期失败用返回值，panic 只留给程序员错误和不可恢复初始化\n2. 跨层加上下文用 `fmt.Errorf(\"...: %w\", err)`，这会让新 error 实现 Unwrap，链上 errors.Is 能识别 io.EOF、sql.ErrNoRows、context.DeadlineExceeded 等 sentinel；errors.As 能把 *BizError、*os.PathError 这类带字段的错误提取出来\n3. sentinel 适合「只判断身份」的稳定契约，自定义类型适合需要 Code/HTTP/Retry 等字段的业务错误，两者通过 Unwrap 串成同一条链\n4. HTTP/gRPC 边界用 errors.As 拿 BizError 映射 4xx/5xx，errors.Is(ctx 超时) 单独返 504 并触发熔断，未识别走 500 兜底并记录 stack\n\n边界要主动提：%v/%s 包装会断链；返回具体指针类型会触发 typed nil，调用方 err != nil 恒成立；标准库 errors 不带 stack，要在产生错误那一层抓 caller 而不是每层都抓；panic 不能替代业务错误，只在拦截器里 recover 转 error 兜底。",
       "followUpQuestions": [
         {
-          "question": "%w 和 %v 包装错误有什么区别？",
-          "answer": "%w 会把原始错误放入错误链，errors.Is/As 还能识别；%v 只是格式化文本，会断开机器可判断的错误关系。"
+          "question": "%w 和 %v 包装错误有什么本质区别？Go 1.20 之后 %w 又有哪些变化？",
+          "answer": "%w 让 fmt.Errorf 返回的新 error 实现 Unwrap()，原 error 挂到链上，errors.Is/As 能沿链识别；%v 只是把 Error() 的字符串嵌入，链断掉。Go 1.20 起 fmt.Errorf 支持多个 %w，对应错误实现 Unwrap() []error，配合 errors.Join 用于聚合多路并发错误（如 errgroup 收集多个子任务失败）。"
         },
         {
-          "question": "什么时候用 sentinel error，什么时候用自定义错误类型？",
-          "answer": "只需要判断固定原因时可以用 sentinel error；需要携带状态码、是否可重试、业务字段时更适合自定义错误类型并用 errors.As 提取。"
+          "question": "返回错误时为什么不能写 `var e *MyErr; return e`？怎么避开？",
+          "answer": "因为函数返回类型是 error 接口，nil 指针被装入接口后接口值变成「类型=*MyErr，值=nil」，整体不为 nil，调用方 if err != nil 恒成立，看似有错实则没错。修复方法是显式判 nil 后返回 error(nil)，或返回时直接写 `return nil`，更稳的是函数内部统一用 `var err error` 累积，只在确实出错时赋值具体指针。"
+        },
+        {
+          "question": "服务上游调用超时，如何在错误链里把 context.DeadlineExceeded 一路传到 HTTP Handler？",
+          "answer": "底层 HTTP/DB client 超时返回的 err 本身就 wrap 了 context.DeadlineExceeded（标准库已经 %w）。中间各层只要继续用 fmt.Errorf %w 包装就不会断链。Handler 里用 `errors.Is(err, context.DeadlineExceeded)` 判定，命中就返 504 并触发熔断/重试预算扣减；不要把超时当普通错误重试，否则上游恢复前重试洪峰会击穿。"
+        },
+        {
+          "question": "标准库 errors 没有 stack trace，生产怎么定位错误来源？",
+          "answer": "三种思路：一是只在「产生错误的最底层」用 runtime.Callers 抓 PC 存到自定义错误类型字段里，跨层只用 %w 补业务上下文，避免每层都抓栈；二是日志中间件统一记录 trace_id + 入口 caller；三是接入 OpenTelemetry，把 error 作为 span event 上报，由 trace 系统串联。pkg/errors 的 WithStack 在 1.13 后已不被官方推荐，新项目建议自定义最小骨架。"
         }
       ]
     },
@@ -107,32 +135,41 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释显式 error",
-        "能使用 %w 包装",
-        "能区分 Is 和 As",
-        "能设计自定义错误类型",
-        "能说明 panic 边界"
+        "能背出 error 接口签名 `Error() string` 并解释为何 Go 选显式返回而非异常",
+        "能解释 Go 1.13 引入 %w / errors.Is / errors.As / Unwrap 的动机与各自适用边界",
+        "能写出带 Unwrap 的自定义 BizError，并说明为什么必须返回 error 接口避免 typed nil",
+        "能给出 sentinel error 与自定义类型的选型判据，并举出 io.EOF、sql.ErrNoRows、context.DeadlineExceeded 等典型 sentinel",
+        "能在 HTTP/gRPC 边界用 errors.As + errors.Is 区分 4xx 业务失败、504 超时、500 兜底",
+        "能说明为什么 panic 不能替代业务错误，以及 defer+recover 转 error 的标准写法（命名返回值 + debug.Stack）",
+        "能解释 Go 1.20 多 %w / errors.Join 的使用场景，例如 errgroup 聚合并发任务错误"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "go.runtime.error-handling.recall.1",
-      "prompt": "请解释 Go 错误链、%w、errors.Is 和 errors.As 的关系。",
+      "prompt": "请把 %w 包装、errors.Is、errors.As、Unwrap 四者的关系串起来，并各举一个适用场景。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "go.runtime.error-handling.recall.2",
-      "prompt": "为什么不推荐用字符串匹配 error？",
+      "prompt": "解释一下 typed nil 陷阱：为什么 `var e *BizError; return e` 会让调用方 err != nil 恒成立？怎么修？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "go.runtime.error-handling.recall.3",
-      "prompt": "业务错误、系统错误和 panic 的边界怎么区分？",
+      "prompt": "上游 RPC 触发 context.DeadlineExceeded，从底层到 HTTP Handler 应该怎么传播和响应？为什么不能直接当普通错误重试？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "go.runtime.error-handling.recall.4",
+      "prompt": "对比 sentinel error 与自定义错误类型：各自能解决什么、不能解决什么？什么时候必须组合使用？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -140,20 +177,26 @@
   ],
   "rubric": {
     "mustHave": [
-      "error 显式返回",
-      "%w 错误包装",
-      "errors.Is",
-      "errors.As"
+      "error 接口只有 Error() string，可预期失败用返回值",
+      "Go 1.13 起 %w 让 fmt.Errorf 实现 Unwrap，配合 errors.Is/As 沿链判定",
+      "sentinel error（io.EOF/sql.ErrNoRows/context.DeadlineExceeded）与自定义错误类型（带 Code/HTTP/Retry 的 BizError）选型边界",
+      "%w 与 %v 区别：后者断链导致 errors.Is/As 失效",
+      "typed nil 陷阱：返回具体指针类型会让 err != nil 恒成立，必须返回 error 接口"
     ],
     "goodToHave": [
-      "边界层错误映射",
-      "可重试错误字段",
-      "避免泄露内部信息"
+      "HTTP/gRPC 边界用 errors.As 解 BizError、errors.Is 解超时分别映射 4xx/504/500",
+      "Go 1.20 多 %w + errors.Join，配合 errgroup 聚合并发错误",
+      "defer+recover 转 error 的标准写法（命名返回值 + debug.Stack）",
+      "标准库 errors 不带 stack，最佳实践是底层抓 caller 而非每层都抓",
+      "context.DeadlineExceeded 不应当作普通失败重试，避免上游恢复前的重试雪崩"
     ],
     "commonMistakes": [
-      "用字符串匹配错误",
-      "包装时用 %v 断链",
-      "把业务失败写成 panic"
+      "用 %v / %s 包装 error 导致 errors.Is/As 失效",
+      "返回 *BizError 具体指针类型而非 error 接口，触发 typed nil",
+      "把可预期业务失败写成 panic，污染调用栈也让上层无法选择性处理",
+      "全靠字符串匹配 err.Error() 做控制流，错误文案一改就崩",
+      "在每一层都用 pkg/errors WithStack 抓栈，造成重复栈和 GC 压力",
+      "context 超时被中间层吞掉或重新 errors.New 包装，断链后 Handler 无法识别 504"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -162,5 +205,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

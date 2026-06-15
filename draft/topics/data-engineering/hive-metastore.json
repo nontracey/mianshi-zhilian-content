@@ -3,14 +3,14 @@
   "domain": "data-engineering",
   "category": "batch",
   "group": "batch",
-  "title": "Hive 与 Metastore",
-  "summary": "理解 Hive 表元数据、分区、文件格式、统计信息和 Metastore 职责。",
+  "title": "Hive Metastore",
+  "summary": "Hive Metastore 作为 schema/分区/统计信息的统一元数据中心，被 Hive、Spark、Presto/Trino 共享，是数据湖查询性能与高可用的关键。",
   "tags": [
     "数据工程",
-    "Hive",
-    "Metastore",
-    "分区",
-    "ORC"
+    "Hive Metastore",
+    "HMS",
+    "分区元数据",
+    "Trino"
   ],
   "difficulty": 4,
   "estimatedMinutes": 35,
@@ -19,106 +19,148 @@
   "status": "draft",
   "prerequisites": [],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能说明 Hive 如何把 SQL 映射到 HDFS/对象存储文件，并通过元数据管理表。",
+  "interviewerFocus": "面试官想确认你能区分 Hive 计算层和 Metastore 元数据层，能讲清 HMS 的表/分区/统计信息存储模型，并能识别多引擎共享 HMS 的高可用与性能瓶颈。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Hive 与 Metastore 的职责边界",
-      "content": "Hive 提供类 SQL 的数据仓库能力，真正的数据在 HDFS 或对象存储中，Metastore 保存库表、字段、分区、位置、文件格式和统计信息。\n\n学习 Hive 与 Metastore 时，可以先沿「SQL 查询提交 -> Metastore 读取元数据 -> 分区裁剪 -> 文件格式扫描 -> 执行引擎计算」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- Metastore：保存表和分区元数据，适合 多引擎共享表，风险是 元数据不一致会读错\n- 分区：按日期或业务键裁剪扫描，适合 大表查询，风险是 分区过细导致元数据压力\n- ORC/Parquet：列式存储和压缩，适合 分析查询，风险是 小文件影响性能\n- 统计信息：帮助优化器估算，适合 Join 和过滤，风险是 缺失会选错计划\n\n把这条路径落回 Hive 与 Metastore 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "Metastore 是元数据库，不是数据本体",
+      "content": "Hive Metastore（HMS）是一个独立的 Thrift 服务，把表、分区、列、Serde、StorageDescriptor、统计信息、ACL 等元数据持久化到关系数据库（默认 Derby，生产用 MySQL/PostgreSQL）。底层数据文件本身仍然在 HDFS、S3、OSS 这些存储里，HMS 只记录“表 t 的分区 dt=20260101 对应 s3://bucket/warehouse/t/dt=20260101/”这种映射。\n\n关键 schema 包括 DBS、TBLS、PARTITIONS、SDS（StorageDescriptor）、SERDES、COLUMNS_V2、TAB_COL_STATS、PART_COL_STATS。一次普通 SELECT 的元数据访问大概是：客户端 Thrift 调用 get_table → get_partitions_by_filter → get_table_column_statistics，HMS 在 RDBMS 上跑多条 join 查询返回结果。一个有 1.7 万个分区的小时表，仅 get_partitions_by_filter 就可能扫描几十万行，所以 HMS 慢往往是 RDBMS 慢，不是 Thrift 协议本身慢。\n\n这也是 HMS 与 HDFS NameNode 的核心区别：NameNode 管的是文件块，HMS 管的是“表→分区→文件路径”这一层语义。删除 HMS 里一行分区记录不会删 S3 上的对象，反过来直接 rm 数据文件也不会让 HMS 知道，这就是 MSCK REPAIR TABLE 与 schema/data drift 的来源。"
     },
     {
       "type": "explain",
-      "title": "Hive 与 Metastore 的失败模式与排查",
-      "content": "难点在元数据和文件布局。分区能减少扫描范围，但小文件过多、分区过细、统计信息缺失都会让查询和调度变慢。\n\nHive 与 Metastore 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 「Hive 与 Metastore 的核心目标」决定这个知识点的主线，必须先说清触发条件\n- 「SQL 查询提交、Metastore 读取元数据、分区裁剪 的关系」决定方案能否稳定落地，不能只停留在名称层面\n- 「只讲工具名不讲数据语义和链路」是常见失效点，需要提前说明防护或修复方式\n- 可以用「能结合 Metastore 表、分区数量、小文件数、统计信息、执行计划 做定位」验证自己是否能说出关键路径\n\n排查时不要先猜结论，应把现象映射到 Metastore 读取元数据、分区裁剪、文件格式扫描 这些环节，再结合 Metastore 表、分区数量、小文件数、统计信息、执行计划 验证。"
+      "title": "为什么 Spark/Presto/Trino 都接 HMS",
+      "content": "HMS 之所以成为湖仓事实标准，是因为它解决了多引擎共享元数据的问题。Spark（spark.sql.catalogImplementation=hive）通过 HiveExternalCatalog 直连 HMS，Presto/Trino 通过 hive connector 配置 hive.metastore.uri=thrift://hms:9083，Flink 通过 HiveCatalog 也走同一个 HMS。结果是同一张 ods.user_event 表，Spark 写入、Trino 即席查询、Hive 跑离线 ETL，看到的 schema 和分区列表完全一致。\n\n但“共享”也意味着耦合。Spark 写 partition 后会调用 alter_partition 注册到 HMS，Trino 才能查到；如果绕过 HMS 直接 hadoop fs -put 文件，Trino 看不到新分区。Iceberg/Hudi/Delta 在 HMS 之上又加了一层 snapshot 元数据，把 HMS 当作 catalog pointer，这样多引擎读到的是同一个 commit。\n\n面试常问“为什么不直接用 HDFS 目录扫描代替 HMS”。原因有三：一是分区过滤要在元数据层下推（partition pruning），扫目录拿不到列统计；二是 schema evolution（加列、改 Serde）需要版本化记录；三是多租户权限（SBA/Ranger）要挂在 HMS 上做统一授权。少了 HMS 这些都得每个引擎自己重新实现。"
+    },
+    {
+      "type": "explain",
+      "title": "HMS 高可用与性能瓶颈在哪里",
+      "content": "生产 HMS 的瓶颈几乎都集中在三处：后端 RDBMS、HMS 进程本身、以及 ObjectStore 缓存。\n\nRDBMS 是单点。HMS 的 Thrift 服务可以无状态横向扩，多副本前面挂 LB（hive.metastore.uris 配多个地址，client 自己 round-robin），但底下的 MySQL 仍然是一主多从。生产做法：MySQL 5.7+/8.0 主从 + ProxySQL 或 RDS 高可用，连接池用 HikariCP（datanucleus.connectionPool.maxPoolSize=80–200），并对 PARTITIONS、PARTITION_KEY_VALS、TAB_COL_STATS 建联合索引。一个常见故障是 PARTITIONS 表超过 5 千万行后 get_partitions_by_filter 走全表扫描，p99 飙到 30s+。\n\nHMS 进程本身的瓶颈是 DataNucleus 的 ORM 缓存和 Thrift 线程模型。hive.metastore.server.max.threads 默认 1000 但通常 CPU 受限，建议 200–500，并打开 hive.metastore.try.direct.sql=true 走原生 SQL 旁路 ORM。direct SQL 对 get_partitions_by_expr 的加速可达 5-10 倍。\n\n第三类是 listing 风暴。Trino 的 hive.metastore-cache-ttl、Spark 的 spark.sql.hive.metastorePartitionPruning 没开时，每次查询都全量拉分区，HMS QPS 会被一个 BI 工具打爆。治理手段：开启 metastore client 端缓存、限制单查询返回分区数（hive.limit.query.max.table.partition）、把超大分区表迁到 Iceberg 由 snapshot 元数据接管。"
     },
     {
       "type": "diagram",
-      "title": "Hive 查询与元数据链路",
+      "title": "多引擎共享 HMS 的查询链路",
       "format": "mermaid",
-      "content": "flowchart LR\nA[SQL 查询提交] --> B[Metastore 读取元数据]\nB[Metastore 读取元数据] --> C[分区裁剪]\nC[分区裁剪] --> D[文件格式扫描]\nD[文件格式扫描] --> E[执行引擎计算]",
-      "fallback": "SQL 查询提交 -> Metastore 读取元数据 -> 分区裁剪 -> 文件格式扫描 -> 执行引擎计算",
-      "caption": "图示展示 Hive 查询如何借助 Metastore 找到分区和文件，再交给执行引擎处理。"
+      "content": "flowchart LR\nC1[Spark SQL] --> HMS[(Hive Metastore<br/>Thrift :9083)]\nC2[Trino] --> HMS\nC3[Hive CLI] --> HMS\nC4[Flink SQL] --> HMS\nHMS --> RDB[(MySQL/PostgreSQL<br/>DBS/TBLS/PARTITIONS/COL_STATS)]\nHMS -->|snapshot| ICE[Iceberg/Hudi metadata]\nC1 --> S3[(HDFS / S3 数据文件)]\nC2 --> S3\nC3 --> S3\nC4 --> S3",
+      "fallback": "Spark/Trino/Hive/Flink 都走 Thrift:9083 访问 HMS；HMS 把元数据持久化到 MySQL，再返回分区路径让引擎直接读 HDFS/S3。Iceberg/Hudi 在 HMS 之上挂 snapshot 指针。",
+      "caption": "HMS 在多引擎之间充当 catalog；数据流和元数据流分离，引擎只在元数据层共享，数据访问绕过 HMS 直连存储。"
     },
     {
       "type": "compareTable",
-      "title": "Hive 关键能力对比",
+      "title": "HMS 性能问题对照诊断表",
       "columns": [
-        "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
+        "症状",
+        "可能原因",
+        "定位手段",
+        "治理动作"
       ],
       "rows": [
         [
-          "Metastore",
-          "保存表和分区元数据",
-          "多引擎共享表",
-          "元数据不一致会读错"
+          "查询提交卡住，Spark/Trino UI 没 task",
+          "get_partitions_by_filter 在 RDBMS 走全表扫描",
+          "看 HMS 日志慢 SQL；MySQL 看 PARTITIONS 索引命中",
+          "对 TBL_ID+PART_NAME 建联合索引；开 try.direct.sql"
         ],
         [
-          "分区",
-          "按日期或业务键裁剪扫描",
-          "大表查询",
-          "分区过细导致元数据压力"
+          "HMS QPS 飙高被打挂",
+          "BI 工具或 Trino 缓存关闭，每查询全量拉分区",
+          "metastore audit log 看 caller；Trino metastore-cache 配置",
+          "开 client 端缓存；限制 max.table.partition；迁 Iceberg"
         ],
         [
-          "ORC/Parquet",
-          "列式存储和压缩",
-          "分析查询",
-          "小文件影响性能"
+          "Spark 写完分区 Trino 查不到",
+          "写入路径绕过 HMS，没有 alter_partition",
+          "对比 HDFS 目录与 PARTITIONS 表",
+          "MSCK REPAIR TABLE 或改用 saveAsTable 走 HMS"
         ],
         [
-          "统计信息",
-          "帮助优化器估算",
-          "Join 和过滤",
-          "缺失会选错计划"
+          "join 计划选错，小表当大表广播失败",
+          "TAB_COL_STATS / PART_COL_STATS 缺失或陈旧",
+          "EXPLAIN 看 estimated rows；DESCRIBE FORMATTED 看 numRows",
+          "ANALYZE TABLE COMPUTE STATISTICS FOR COLUMNS"
+        ],
+        [
+          "HMS 主备切换后部分客户端报错",
+          "client 只配单 URI 或长连接没断开",
+          "看 Thrift 重连日志；netstat 看连接落点",
+          "hive.metastore.uris 配多地址；缩短 client.socket.timeout"
         ]
       ]
     },
     {
-      "type": "interviewAnswer",
-      "title": "面试回答思路",
-      "content": "结论：Hive 与 Metastore 要从目标、关键机制、风险边界和观测验证四层回答。\n\n我会按这几层展开：\n1. 先说明它解决的核心工程问题是  Hive 表元数据、分区、文件格式、统计信息和 Metastore 职责。\n2. 再沿着 SQL 查询提交、Metastore 读取元数据、分区裁剪、文件格式扫描、执行引擎计算 说明执行链路\n3. 然后讲清 Metastore 和 分区 的适用边界\n4. 最后补充用 Metastore 表、分区数量、小文件数、统计信息、执行计划 验证效果和定位异常\n\n最后补充边界：数据工程方案必须同时关注口径、时效、成本和可追溯性，不能只追求跑通任务。",
-      "followUpQuestions": [
+      "type": "code",
+      "title": "排查 HMS 慢分区裁剪的实操命令",
+      "language": "sql",
+      "content": "-- 1. 在 HMS 后端 MySQL 上看真实慢 SQL（最常见 bottleneck）\nSELECT COUNT(*) FROM PARTITIONS;        -- 分区行数过亿就要警惕\nSHOW INDEX FROM PARTITIONS;              -- 必须有 (TBL_ID, PART_NAME) 联合索引\nSHOW INDEX FROM PARTITION_KEY_VALS;\n\n-- 2. 在 Hive/Spark 端打开 direct SQL，绕开 DataNucleus ORM\nSET hive.metastore.try.direct.sql=true;\nSET hive.metastore.try.direct.sql.ddl=true;\n\n-- 3. 用 EXPLAIN 验证分区裁剪是否真的下推到 HMS\nEXPLAIN EXTENDED\nSELECT user_id FROM ods.user_event\nWHERE dt='2026-06-13' AND hour='10';\n-- 关注 'Partition Filter Operator' 是否出现，以及读到的 partition 数量\n\n-- 4. 更新统计信息，修复优化器选错 join 计划\nANALYZE TABLE ods.user_event PARTITION(dt='2026-06-13')\n  COMPUTE STATISTICS FOR COLUMNS user_id, event_type;\nDESCRIBE FORMATTED ods.user_event PARTITION(dt='2026-06-13');  -- 看 numRows / numFiles\n\n-- 5. 数据被 Spark 直接写到 S3 但 HMS 没注册时\nMSCK REPAIR TABLE ods.user_event SYNC PARTITIONS;",
+      "highlights": [
         {
-          "question": "Hive 与 Metastore 出问题时你先看哪些信号？",
-          "answer": "我会先看 Metastore 表、分区数量、小文件数、统计信息、执行计划，把异常定位到 Metastore 读取元数据、分区裁剪、文件格式扫描，再决定是回滚、降级、扩容还是修配置。"
+          "line": 3,
+          "note": "PARTITIONS 表行数是判断 HMS 是否到瓶颈的第一个指标，超过 5 千万就要考虑 Iceberg 或归档冷分区。"
         },
         {
-          "question": "Hive 与 Metastore 最容易忽略的边界是什么？",
-          "answer": "最容易忽略的是自动化本身也会放大错误，所以必须保留审批、审计、回滚、灰度和人工接管路径。"
+          "line": 9,
+          "note": "try.direct.sql=true 让 HMS 跳过 DataNucleus 直接发 SQL，对 get_partitions_by_expr 这种重接口能快 5-10 倍。"
+        },
+        {
+          "line": 14,
+          "note": "EXPLAIN EXTENDED 才会打印 Partition Filter Operator；如果分区过滤没下推，就是 SQL 写法或 Serde 的问题，不是 HMS 慢。"
+        },
+        {
+          "line": 19,
+          "note": "FOR COLUMNS 必须显式列出，否则只更新表级 numRows，列基数仍然是空，CBO 还是会瞎猜。"
+        }
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答模板",
+      "content": "我会先把概念分清：Hive Metastore 是一个独立的 Thrift 服务，把库、表、分区、Serde、StorageDescriptor、列统计信息持久化到 MySQL 这种关系库里，数据本身仍在 HDFS 或 S3。Spark、Trino、Flink 都通过 hive.metastore.uri 接同一个 HMS，所以它实际上是湖仓的 catalog 层。\n\n接着我会讲查询路径：客户端发 SQL，引擎先调 get_table、get_partitions_by_filter、get_table_column_statistics，HMS 在底层 MySQL 上跑 join 拿到分区路径和统计信息，然后引擎直接去 S3 读 ORC/Parquet 文件。所以“查询提交慢”和“执行慢”要分开排查：提交慢看 HMS+MySQL，执行慢看引擎和文件布局。\n\n生产瓶颈我会按三层讲：MySQL 这一层最容易爆，PARTITIONS 表上亿行而没有 (TBL_ID, PART_NAME) 索引时 get_partitions_by_filter 直接走全表；HMS 进程这一层关键是 hive.metastore.try.direct.sql=true 旁路 DataNucleus ORM；客户端这一层要看 Trino 的 metastore-cache-ttl、Spark 的 metastorePartitionPruning 有没有开，否则一个 BI 工具就能把 QPS 打爆。高可用方面，HMS Thrift 无状态，可以挂多实例，但底层 MySQL 必须做主备 + ProxySQL，否则切换时 client 长连接会失败，要靠 hive.metastore.uris 配多地址 + 缩短 socket.timeout 兜底。\n\n如果是超大表，我会建议从 HMS 迁到 Iceberg：分区元数据进 manifest 文件，HMS 只保留 catalog pointer，分区数量再大也不会压到 RDBMS。",
+      "followUpQuestions": [
+        {
+          "question": "HMS 单实例挂了对线上有什么影响？应该怎么做高可用？",
+          "answer": "HMS 挂了后所有查询的元数据访问都会失败，但已经在跑的 task 因为只读文件不受影响。高可用做法：HMS Thrift 服务部署 2+ 实例，client 端 hive.metastore.uris 配多地址走 client-side failover；后端 MySQL 上主备 + ProxySQL 或云 RDS 高可用；client 把 hive.metastore.client.socket.timeout 调到 60s 内，避免一个慢节点拖死整个查询。注意 HMS 自身没 leader 选举，多实例并发写同一张表的 alter 操作要靠 MySQL 行锁兜底。"
+        },
+        {
+          "question": "为什么 Iceberg/Hudi 还要接 HMS，不能彻底替代它吗？",
+          "answer": "Iceberg 把分区列表、文件清单放到自己的 manifest 里，确实绕过了 HMS 管分区的瓶颈。但它仍需要一个 catalog 解决“表名→当前 snapshot”的映射，并复用统一权限模型。HMSCatalog 模式下，HMS 表里只存一个 metadata_location 指向 Iceberg 的 snapshot 文件，分区数量再多 HMS 也只看到一行，所以 HMS 反而成了轻量 catalog。也有 Glue Catalog、Nessie 这类替代品，但企业里现有 Ranger/Atlas/血缘工具都挂在 HMS 上，迁移成本是真正的阻力。"
+        },
+        {
+          "question": "线上 SELECT * FROM 大表 WHERE dt='20260613' 提交几十秒才开始跑，怎么定位？",
+          "answer": "先看是元数据慢还是计划生成慢。打开 HMS 审计日志看 get_partitions_by_filter 的耗时，如果几十秒就锁定在 HMS。再到后端 MySQL 上 SHOW PROCESSLIST，看 PARTITIONS 上的查询是否走索引；常见就是 (TBL_ID, PART_NAME) 没建索引导致全表扫。短期处理：开 hive.metastore.try.direct.sql=true、把分区过滤条件写得更精确（dt='20260613' 直接命中分区键而不是 substr）；长期处理：拆分区表 / 归档历史分区 / 迁 Iceberg。"
         }
       ]
     },
     {
       "type": "checklist",
-      "title": "学完后应能说清楚",
+      "title": "学完应当能复述的关键点",
       "items": [
-        "能说明 Hive 与 Metastore 的目标和边界",
-        "能沿 SQL 查询提交 -> Metastore 读取元数据 -> 分区裁剪 -> 文件格式扫描 -> 执行引擎计算 讲清链路",
-        "能解释关键配置和失败模式",
-        "能用观测指标验证效果"
+        "HMS 存什么、不存什么：存 schema/分区/Serde/统计信息，不存数据文件本身",
+        "Thrift :9083 是入口，DBS/TBLS/PARTITIONS/TAB_COL_STATS 是后端表",
+        "Spark/Trino/Flink 都通过 hive.metastore.uri 共享同一个 HMS catalog",
+        "提交慢 vs 执行慢的分界线：HMS+MySQL 在前，引擎+文件在后",
+        "PARTITIONS 索引、try.direct.sql、client 端 metastore-cache 是三大性能开关",
+        "HMS HA 靠多 Thrift 实例 + 后端 RDBMS 主备，client 配多 URI",
+        "ANALYZE TABLE FOR COLUMNS 才会真正生成列统计，CBO 才能用"
       ]
     }
   ],
   "recallPrompts": [
     {
-      "id": "data-engineering.batch.hive-metastore.recall.1",
-      "prompt": "请讲一下 Hive 与 Metastore 的核心链路和它解决的工程问题。",
+      "id": "data-engineering.hive-metastore.recall.1",
+      "prompt": "请讲清 Hive Metastore 在 SQL 查询中的角色：从客户端发 SQL 到读到 S3 上的文件，HMS 在哪些环节被调用，每一步对应后端 MySQL 的哪些表？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
+      "id": "data-engineering.hive-metastore.recall.2",
+      "prompt": "线上一张 1.7 万分区的小时表，Trino 查询提交后卡 40 秒才进入 task 阶段，executor 完全空闲。你会按什么顺序定位 HMS、MySQL、client 缓存这几层，并给出可落地的修复动作？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
-      "id": "data-engineering.batch.hive-metastore.recall.2",
-      "prompt": "Hive 与 Metastore 在生产环境里最常见的失败模式有哪些？",
-      "mode": "text",
-      "expectedMinutes": 4,
-      "difficulty": 4
-    },
-    {
-      "id": "data-engineering.batch.hive-metastore.recall.3",
-      "prompt": "如果 Hive 与 Metastore 相关变更上线后异常，你会如何回滚和验证？",
+      "id": "data-engineering.hive-metastore.recall.3",
+      "prompt": "Spark、Trino、Flink 共享同一个 HMS 时会产生哪些一致性和性能问题？Iceberg 把哪部分元数据从 HMS 拿走，又为什么仍然要接 HMS？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
@@ -126,20 +168,24 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说明 Hive 与 Metastore 的核心目标",
-      "能讲清 SQL 查询提交、Metastore 读取元数据、分区裁剪 的关系",
-      "能指出 Metastore 和 分区 的差异",
-      "能给出可观测验证和回滚思路"
+      "Hive Metastore 是独立 Thrift 服务，元数据落在 MySQL/PostgreSQL，数据文件留在 HDFS/S3",
+      "DBS/TBLS/PARTITIONS/SDS/TAB_COL_STATS 五张核心表与 schema/分区/统计信息的对应关系",
+      "Spark、Trino、Flink 通过 hive.metastore.uri 共享同一 HMS catalog，元数据流与数据流分离",
+      "提交慢 vs 执行慢的分界：HMS + 后端 RDBMS 在前，引擎 + 文件 IO 在后",
+      "HA 设计：HMS Thrift 多实例无状态 + 后端 RDBMS 主备 + client 配多 URI"
     ],
     "goodToHave": [
-      "能结合 Metastore 表、分区数量、小文件数、统计信息、执行计划 做定位",
-      "能说明多环境差异和权限边界",
-      "能把自动化、审计和回滚串成闭环"
+      "PARTITIONS 表 (TBL_ID, PART_NAME) 联合索引、hive.metastore.try.direct.sql 这类一线优化开关",
+      "Trino metastore-cache-ttl、Spark metastorePartitionPruning 等 client 端缓存参数",
+      "Iceberg/Hudi 把分区元数据下沉到 manifest、HMS 仅作为 catalog pointer 的演进路线",
+      "ANALYZE TABLE ... FOR COLUMNS 与 CBO join reorder 之间的关系"
     ],
     "commonMistakes": [
-      "只讲 Hive 与 Metastore 的工具名，不说明数据语义、状态变化和上下游影响",
-      "忽略 Hive 与 Metastore 在重跑、补数、迟到数据或口径变更下的边界",
-      "没有用质量指标、血缘、SLA 或成本数据验证 Hive 与 Metastore 的结果"
+      "把 HMS 当成存数据本身的服务，分不清它和 NameNode 的边界",
+      "PARTITIONS 表上亿行而后端 MySQL 没建联合索引，导致 get_partitions_by_filter 走全表扫",
+      "Spark 直接 hadoop fs -put 写文件后没调 alter_partition，导致 Trino 查不到新分区",
+      "只跑 ANALYZE TABLE COMPUTE STATISTICS 而不带 FOR COLUMNS，列基数仍为空，CBO 估算失真",
+      "HMS 多实例部署但 client 端 hive.metastore.uris 只配单 URI，主备切换时全部超时"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -148,5 +194,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

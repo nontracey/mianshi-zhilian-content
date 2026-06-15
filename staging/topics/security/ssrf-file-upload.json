@@ -18,74 +18,107 @@
   "status": "staging",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能说明外部输入如何驱动服务端访问内网或写入危险文件，并设计多层防护。",
+  "interviewerFocus": "重点看候选人能否区分 SSRF 的网络层信任边界（URL→DNS→TCP）和文件上传的内容信任边界（扩展名→MIME→魔数→二次渲染→落盘域名），并给出 DNS rebinding 与 0x00/双扩展名等真实绕过的应对。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "SSRF 与文件上传安全 的职责边界",
-      "content": "SSRF 是攻击者控制服务端发起请求，借服务端网络位置访问内网、云元数据或本地服务。文件上传风险来自文件类型、内容解析、存储路径和后续访问执行链路。\n\n学习 SSRF 与文件上传安全 时，可以先沿「外部 URL 或文件 -> 服务端请求解析 -> 内网资源或存储路径 -> 内容处理与访问 -> 白名单隔离重编码」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- SSRF：服务端访问攻击者指定地址，适合 URL 抓取、Webhook，风险是 DNS rebinding 和内网 IP\n- 上传类型校验：限制后缀和 MIME，适合 图片、文档上传，风险是 只看后缀容易绕过\n- 内容重编码：重新生成安全文件，适合 图片处理，风险是 解析库漏洞要关注\n- 隔离存储：文件不在应用目录执行，适合 对象存储 CDN，风险是 访问权限和鉴权要控制\n\n把这条路径落回 SSRF 与文件上传安全 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "SSRF：服务端拿着内网信任去访问攻击者指定的地址",
+      "content": "SSRF 之所以危险，是因为服务端往往位于 VPC 内部，自带访问内网数据库、Redis、管理面、云 metadata 的网络权限。一旦业务里出现“按用户给的 URL 抓取/预览/Webhook 回调/SSO 头像/导入远程文件”这类入口，攻击者就能把这层信任借走。\n\n经典攻击面有三条：① 内网横向，访问 10.0.0.0/8、172.16.0.0/12、192.168.0.0/16、127.0.0.0/8、169.254.0.0/16 这些内网/链路本地段，去打未鉴权的 Redis（gopher://6379 一行命令写 crontab）、Elasticsearch、Consul、Spring Boot Actuator、Kubelet 10250；② 云元数据，AWS 的 169.254.169.254/latest/meta-data/iam/security-credentials/ 直接拿临时 AK/SK，阿里云对应 100.100.100.200，IMDSv2 强制 PUT token 才能缓解；③ 协议跨越，file://、gopher://、dict://、ldap:// 让 HTTP 客户端变成任意协议探针，Java 的 URLConnection 历来对 file/gopher 处理松散。\n\n校验必须分两层：连接前对 URL 做规范化（小写 host、解 punycode、剥 userinfo），按业务白名单放行协议（只 http/https）和域名；连接时把 DNS 解析的 IP 列表全部过一遍 IP 段黑名单，并禁止 30x 跳到非白名单 host。"
     },
     {
       "type": "explain",
-      "title": "SSRF 与文件上传安全 的失败模式与排查",
-      "content": "深入点在“服务端代替攻击者做事”。URL 白名单、DNS/IP 校验、禁止内网地址、请求代理隔离、上传内容重编码和对象存储隔离都要组合使用。\n\nSSRF 与文件上传安全 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 「SSRF 与文件上传安全 的核心目标」决定这个知识点的主线，必须先说清触发条件\n- 「外部 URL 或文件、服务端请求解析、内网资源或存储路径 的关系」决定方案能否稳定落地，不能只停留在名称层面\n- 「只记防护名词而不解释攻击路径」是常见失效点，需要提前说明防护或修复方式\n- 可以用「能结合 出站请求日志、DNS 解析记录、对象存储访问日志、文件魔数、杀毒扫描结果 做定位」验证自己是否能说出关键路径\n\n排查时不要先猜结论，应把现象映射到 服务端请求解析、内网资源或存储路径、内容处理与访问 这些环节，再结合 出站请求日志、DNS 解析记录、对象存储访问日志、文件魔数、杀毒扫描结果 验证。"
+      "title": "为什么字符串黑名单一定挡不住：DNS rebinding 与 IP 混淆",
+      "content": "只过滤 “127.0.0.1” 几乎一定被绕过，原因是 URL 字符串和 TCP 连接目标可以解耦。常见绕法：① 进制混淆，2130706433、0x7f000001、0177.0.0.1、127.1 都解析成 127.0.0.1；② IPv6 形式，[::1]、[::ffff:127.0.0.1]、[0:0:0:0:0:ffff:7f00:1]；③ 解析库差异，Python urllib 与 requests 对 http://evil.com#@127.0.0.1/ 的 host 提取结果不一样，PHP parse_url 也踩过坑；④ 短链/重定向，先返 200，再 302 跳到内网；⑤ DNS rebinding——这是最致命的：攻击者把 a.evil.com 配成 60s TTL，第一次解析返回外网 IP（通过校验），代码执行 socket.connect 时再次解析返回 169.254.169.254，于是“校验时是外网，连接时是内网”。\n\n所以正确姿势是 TOCTOU 双重校验：在 SSRFFilter 里先 InetAddress.getAllByName 拿到 IP 列表全部校验，然后用“校验过的 IP”去建连（绕开二次解析）；或者把出站流量统一走专用代理（Squid/自研），代理上再做一次目标 IP 限制并落审计日志。Pod 层面还可以用 NetworkPolicy 直接禁掉到 169.254.169.254 和数据库段的出站，这是兜底防线。"
+    },
+    {
+      "type": "explain",
+      "title": "文件上传：扩展名→MIME→魔数→二次渲染→落盘域名 五道闸",
+      "content": "上传漏洞的本质是“校验”和“消费”脱节。任何一道闸单独存在都会被绕过：① 只看扩展名 .jpg 会被 shell.php.jpg、shell.jpg.php（Apache mod_mime 多扩展名）、shell.php%00.jpg（C 字符串截断，PHP < 5.3.4 经典）打穿；② 只看 Content-Type 不可靠，curl -F 完全可控；③ 校验文件魔数（PNG=89 50 4E 47、JPEG=FF D8 FF、PDF=%PDF、ZIP=50 4B 03 04）能挡掉伪造，但 GIF89a + <?php phpinfo();?> 这种“图片马”魔数合法、文件尾藏 PHP，配合 .htaccess 或 Nginx 错误的 location ~ \\.php 会被解析；④ 真正干净的做法是“二次渲染”——服务端用 ImageMagick/Pillow 解码后重新编码，PHP payload 就被剥掉，但要小心 ImageTragick（CVE-2016-3714）和 zip slip、解压炸弹这类解析器漏洞；⑤ 最关键的一道是落盘——用户上传文件必须放对象存储（S3/OSS）或独立子域，回源用 Content-Disposition: attachment 强制下载，nginx 配 location /uploads { types {} default_type application/octet-stream; } 关掉脚本解析。\n\n验收时看：上传日志里魔数与扩展名是否一致、对象存储 bucket 是否禁了执行 ACL、CDN 域名是否独立于主站、二次渲染失败的样本是否进了告警队列、是否有 .htaccess/.user.ini/web.config 这类配置文件被传上来。"
     },
     {
       "type": "diagram",
-      "title": "SSRF 与上传风险链路",
+      "title": "SSRF 双重校验与上传五道闸",
       "format": "mermaid",
-      "content": "flowchart LR\nA[外部 URL 或文件] --> B[服务端请求解析]\nB[服务端请求解析] --> C[内网资源或存储路径]\nC[内网资源或存储路径] --> D[内容处理与访问]\nD[内容处理与访问] --> E[白名单隔离重编码]",
-      "fallback": "外部 URL 或文件 -> 服务端请求解析 -> 内网资源或存储路径 -> 内容处理与访问 -> 白名单隔离重编码",
-      "caption": "图示展示攻击输入如何进入服务端请求或文件处理链路，并在关键位置做隔离。"
+      "content": "flowchart TB\nU[用户输入 URL 或文件] --> S{入口类型}\nS -->|URL 抓取| P1[URL 规范化 + 协议白名单 http/https]\nP1 --> P2[DNS 解析全量 IP]\nP2 --> P3{IP 是否命中 10/8 172.16/12 192.168/16 127/8 169.254/16}\nP3 -->|命中| BLK[阻断 + 审计]\nP3 -->|放行| P4[用已解析 IP 建连 防 rebinding]\nP4 --> P5[出站代理 限重定向 ≤2 跳]\nS -->|文件上传| F1[大小 + 扩展名白名单]\nF1 --> F2[Content-Type 与魔数比对]\nF2 --> F3[图片二次渲染 / ZIP 防 slip]\nF3 --> F4[落对象存储独立域名]\nF4 --> F5[Content-Disposition attachment 关脚本解析]",
+      "fallback": "URL 路径：规范化 -> 协议白名单 -> DNS 全量 IP 校验 -> 用已校验 IP 建连 -> 出站代理限跳转；文件路径：大小+扩展名 -> MIME 与魔数比对 -> 二次渲染 -> 对象存储独立域 -> 强制下载并关脚本解析。",
+      "caption": "两条信任边界：SSRF 在 URL→DNS→TCP 三层都要校验防 rebinding；上传在校验后还要看落盘位置和访问方式。"
     },
     {
       "type": "compareTable",
-      "title": "SSRF 与上传防护对比",
+      "title": "上传校验四种手段：能挡什么、被什么绕过",
       "columns": [
-        "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
+        "校验手段",
+        "能挡住",
+        "典型绕过",
+        "建议组合"
       ],
       "rows": [
         [
-          "SSRF",
-          "服务端访问攻击者指定地址",
-          "URL 抓取、Webhook",
-          "DNS rebinding 和内网 IP"
+          "扩展名白名单",
+          "shell.php、shell.jsp 直传",
+          "shell.php.jpg、shell.jpg.php、%00 截断、双扩展名解析",
+          "必须配合落盘目录关脚本解析"
         ],
         [
-          "上传类型校验",
-          "限制后缀和 MIME",
-          "图片、文档上传",
-          "只看后缀容易绕过"
+          "Content-Type/MIME",
+          "粗糙的浏览器表单",
+          "curl 任意伪造、Burp 改包",
+          "只能做辅助，不能作为唯一校验"
         ],
         [
-          "内容重编码",
-          "重新生成安全文件",
-          "图片处理",
-          "解析库漏洞要关注"
+          "文件魔数 (Magic)",
+          "纯改后缀的伪造文件",
+          "GIF89a 图片马、PDF 头加 PHP 尾、polyglot 文件",
+          "配合二次渲染或内容扫描"
         ],
         [
-          "隔离存储",
-          "文件不在应用目录执行",
-          "对象存储 CDN",
-          "访问权限和鉴权要控制"
+          "二次渲染/重编码",
+          "图片马、嵌入 payload、EXIF 注入",
+          "ImageMagick/解析器自身漏洞 (CVE-2016-3714)、解压炸弹",
+          "解析器隔离 + 资源限额 + 失败告警"
         ]
+      ]
+    },
+    {
+      "type": "code",
+      "title": "Java 防 SSRF：DNS 解析后 IP 段校验 + 用已解析 IP 建连",
+      "language": "java",
+      "content": "// 防 DNS rebinding 的关键：校验时和建连时用同一个 IP\npublic HttpURLConnection openSafe(String url) throws IOException {\n    URI uri = URI.create(url).normalize();\n    if (!Set.of(\"http\", \"https\").contains(uri.getScheme())) {\n        throw new SecurityException(\"protocol not allowed: \" + uri.getScheme());\n    }\n    String host = uri.getHost();\n    InetAddress[] addrs = InetAddress.getAllByName(host); // 一次解析\n    for (InetAddress a : addrs) {\n        if (isBlocked(a)) {\n            throw new SecurityException(\"internal ip blocked: \" + a.getHostAddress());\n        }\n    }\n    // 用已校验的 IP 直连，绕开 JDK 内部的二次 DNS 解析（防 rebinding）\n    InetAddress chosen = addrs[0];\n    URL realUrl = new URL(uri.getScheme(), chosen.getHostAddress(), uri.getPort(), uri.getRawPath());\n    HttpURLConnection conn = (HttpURLConnection) realUrl.openConnection();\n    conn.setRequestProperty(\"Host\", host); // 保留 SNI/Host 头\n    conn.setInstanceFollowRedirects(false); // 重定向手动控制，再次走校验\n    conn.setConnectTimeout(3000);\n    return conn;\n}\n\nprivate boolean isBlocked(InetAddress a) {\n    return a.isLoopbackAddress()        // 127/8 ::1\n        || a.isLinkLocalAddress()       // 169.254/16 169.254.169.254 元数据\n        || a.isSiteLocalAddress()       // 10/8 172.16/12 192.168/16\n        || a.isAnyLocalAddress()        // 0.0.0.0\n        || a.isMulticastAddress()\n        || a.getHostAddress().startsWith(\"100.100.\"); // 阿里云元数据\n}",
+      "highlights": [
+        {
+          "line": 9,
+          "note": "InetAddress.getAllByName 一次性拿到全部解析结果，避免 toctou 时间窗"
+        },
+        {
+          "line": 17,
+          "note": "用已校验过的 IP 字符串构造 URL 建连，是阻断 DNS rebinding 的关键一步"
+        },
+        {
+          "line": 19,
+          "note": "保留原 Host 头是为了 HTTPS SNI 和虚拟主机能正确路由"
+        },
+        {
+          "line": 20,
+          "note": "禁用自动跳转，跳转后必须再次过 isBlocked 校验，否则攻击者可以 302 到内网"
+        }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：SSRF 与文件上传安全 要从目标、关键机制、风险边界和观测验证四层回答。\n\n我会按这几层展开：\n1. 先说明它解决的核心工程问题是 服务端请求伪造、内网探测、元数据泄露、上传校验和内容处理风险。\n2. 再沿着 外部 URL 或文件、服务端请求解析、内网资源或存储路径、内容处理与访问、白名单隔离重编码 说明执行链路\n3. 然后讲清 SSRF 和 上传类型校验 的适用边界\n4. 最后补充用 出站请求日志、DNS 解析记录、对象存储访问日志、文件魔数、杀毒扫描结果 验证效果和定位异常\n\n最后补充边界：安全防护要按攻击路径逐层设计，单点措施失效时仍应有日志、权限和隔离兜底。",
+      "content": "30 秒结论：SSRF 和文件上传的共性是“服务端替用户处理外部对象”，所以信任边界都不在 HTTP 入口，而在后续的 DNS 解析、TCP 连接、文件落盘和二次消费这些链路。\n\n核心机制分两条线讲。SSRF 这条线我会强调四件事：URL 规范化和协议白名单挡掉 file/gopher/dict；DNS 解析后必须把所有返回的 IP 都过一遍 10/172.16/192.168/127/169.254 这几个段；用解析过的 IP 建连而不是再让底层重新解析，这是防 DNS rebinding 的关键；最后限制重定向跳数并把出站走专用代理记审计日志。重点提两个真实目标——169.254.169.254 拿云 IAM 临时凭证、未鉴权 Redis 用 gopher 写 crontab，这是面试官想听的具体攻击。\n\n文件上传这条线是“五道闸”：大小→扩展名白名单→MIME 比对→文件魔数→二次渲染。每一道单独都能被绕，组合起来才稳。重点说 GIF89a 图片马 + Apache 多扩展名解析这种经典组合，以及 ImageTragick 这类解析器自身的漏洞，所以二次渲染要做资源隔离。最后必须强调落盘——用户文件一定要放对象存储或独立子域，CDN 上配 Content-Disposition: attachment 强制下载，nginx 关掉脚本解析。验收手段是看出站代理日志、DNS 解析记录、对象存储访问 ACL、二次渲染失败队列。",
       "followUpQuestions": [
         {
-          "question": "SSRF 与文件上传安全 出问题时你先看哪些信号？",
-          "answer": "我会先看 出站请求日志、DNS 解析记录、对象存储访问日志、文件魔数、杀毒扫描结果，把异常定位到 服务端请求解析、内网资源或存储路径、内容处理与访问，再决定是回滚、降级、扩容还是修配置。"
+          "question": "云上服务被 SSRF 命中了 169.254.169.254，已经拿到了 IAM 临时凭证，怎么处理？",
+          "answer": "立刻在 IAM 里 revoke 当前 InstanceProfile 的临时凭证（AWS 是更新角色 TrustPolicy 或加 deny session 标签），把实例切到 IMDSv2 强制 token 模式，再用 CloudTrail 倒查这个 AccessKey 期间的 API 调用范围；代码侧把出站代理的 169.254.0.0/16 拉黑做兜底；最后审计所有用户传 URL 的入口（Webhook、SSO 头像、富文本图片代理、文档预览），按本次绕过手法补 DNS rebinding 防御。"
         },
         {
-          "question": "SSRF 与文件上传安全 最容易忽略的边界是什么？",
-          "answer": "最容易忽略的是自动化本身也会放大错误，所以必须保留审批、审计、回滚、灰度和人工接管路径。"
+          "question": "白名单只允许图片，攻击者上传了一个 GIF 头部正常但尾部带 PHP 代码的文件，并通过文件包含执行了，前面哪几道闸失效了？",
+          "answer": "扩展名挡不住因为后缀确实是 .gif；MIME 挡不住因为浏览器/curl 可控；魔数挡不住因为 GIF89a 头是合法的；真正应该兜底的是二次渲染——把图片用 Pillow/ImageMagick 解码再重编码，尾部 PHP 就被剥掉。如果没做二次渲染，至少落盘位置不能有脚本解析能力（独立 OSS 域名 + Content-Disposition），这次明显是落到了应用目录或没关 PHP 解析，属于落盘和二次渲染两道都缺失。"
+        },
+        {
+          "question": "白名单只能填业务域名，但业务方说要支持用户填任意 URL（比如富文本里的图片），怎么折中？",
+          "answer": "这种入口必须默认走“图片代理”：服务端按白名单或评分模型决定是否抓取，DNS 解析后过 IP 段，强制 Range 限大小（防压缩炸弹），抓回来后用 Pillow 重编码并去掉 EXIF，存到独立 CDN 域名重写成内部 URL，再让前端引用这个内部 URL。整个抓取过程跑在隔离的出站代理 Pod 里（NetworkPolicy 禁掉到 RFC1918 和 169.254/16 的所有 egress），即使代码出 bug 也打不到内网。"
         }
       ]
     },
@@ -93,52 +126,58 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 SSRF 与文件上传安全 的目标和边界",
-        "能沿 外部 URL 或文件 -> 服务端请求解析 -> 内网资源或存储路径 -> 内容处理与访问 -> 白名单隔离重编码 讲清链路",
-        "能解释关键配置和失败模式",
-        "能用观测指标验证效果"
+        "能列出 SSRF 三大攻击面：内网未鉴权服务（Redis gopher）、云元数据（169.254.169.254）、协议跨越（file/gopher）",
+        "能解释 DNS rebinding 的 TOCTOU 时间窗，以及“用已解析 IP 建连 + 出站代理”的双层防御",
+        "能区分扩展名/MIME/魔数/二次渲染四道闸各自能挡和被绕的场景，并说出 GIF89a 图片马原理",
+        "能说明上传文件落对象存储独立域 + Content-Disposition + 关闭脚本解析为什么是最后一道兜底",
+        "能用出站代理日志、DNS 解析记录、对象存储 ACL、二次渲染失败队列做修复验证"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "security.web-security.ssrf-file-upload.recall.1",
-      "prompt": "请讲一下 SSRF 与文件上传安全 的核心链路和它解决的工程问题。",
+      "prompt": "为什么 SSRF 黑名单只过滤 127.0.0.1 一定会被绕过？请结合 IP 进制混淆、IPv6、解析库差异和 DNS rebinding 解释，并说出正确的双重校验做法。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "security.web-security.ssrf-file-upload.recall.2",
-      "prompt": "SSRF 与文件上传安全 在生产环境里最常见的失败模式有哪些？",
+      "prompt": "AWS 上的服务被 SSRF 打到了 169.254.169.254，攻击者可能拿到什么？IMDSv2、出站代理、NetworkPolicy 在防御链里各自的作用是什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "security.web-security.ssrf-file-upload.recall.3",
-      "prompt": "如果 SSRF 与文件上传安全 相关变更上线后异常，你会如何回滚和验证？",
+      "prompt": "上传校验做了扩展名白名单 + MIME + 魔数三层，攻击者用 GIF89a 头部 + PHP 尾部 + Apache 多扩展名解析仍然 RCE 了，请定位每一道闸为什么没拦住，以及二次渲染和落盘域名应该如何兜底。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明 SSRF 与文件上传安全 的核心目标",
-      "能讲清 外部 URL 或文件、服务端请求解析、内网资源或存储路径 的关系",
-      "能指出 SSRF 和 上传类型校验 的差异",
-      "能给出可观测验证和回滚思路"
+      "SSRF 三大攻击面：内网未鉴权服务、云元数据 169.254.169.254、file/gopher/dict 协议跨越",
+      "URL 规范化 + 协议白名单 + DNS 解析后 IP 段校验 + 用已解析 IP 建连防 DNS rebinding",
+      "上传五道闸：大小、扩展名、MIME、文件魔数、二次渲染，知道每一道单独都会被绕",
+      "落盘必须放对象存储或独立子域，配 Content-Disposition: attachment 并关掉 nginx/Apache 脚本解析",
+      "用出站代理日志、DNS 记录、对象存储访问 ACL、二次渲染失败队列做修复验证"
     ],
     "goodToHave": [
-      "能结合 出站请求日志、DNS 解析记录、对象存储访问日志、文件魔数、杀毒扫描结果 做定位",
-      "能说明多环境差异和权限边界",
-      "能把自动化、审计和回滚串成闭环"
+      "知道 IMDSv2 强制 PUT token 是云元数据 SSRF 的官方缓解，以及阿里云元数据地址 100.100.100.200",
+      "能讲 gopher://6379 写 Redis crontab、Spring Boot Actuator、Kubelet 10250 这类经典内网目标",
+      "知道 GIF89a 图片马、Apache mod_mime 多扩展名、%00 截断、ImageTragick CVE-2016-3714、zip slip、解压炸弹",
+      "能用 NetworkPolicy/安全组在 Pod 层禁掉 169.254.0.0/16 和数据库段的出站作为兜底",
+      "能讲“图片代理 + 重编码 + 独立 CDN 域名”这种支持任意 URL 的折中方案"
     ],
     "commonMistakes": [
-      "只记 SSRF 与文件上传安全 的防护名词，不解释攻击路径和信任边界",
-      "把单点校验当成完整安全方案，忽略 SSRF 与文件上传安全 的绕过方式",
-      "没有把日志审计、密钥或权限治理、应急处置纳入 SSRF 与文件上传安全"
+      "用字符串黑名单或正则匹配 host，忽略 2130706433、0x7f000001、IPv6 形式和解析库差异",
+      "校验时解析一次 DNS、建连时再解析一次 DNS，给 DNS rebinding 留时间窗",
+      "只信 Content-Type 或扩展名，没做文件魔数比对和二次渲染",
+      "上传文件直接落在应用服务器目录或主站同域，nginx 没关 PHP/JSP 解析",
+      "Webhook、SSO 头像、富文本图片代理这类隐蔽 SSRF 入口被遗漏"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -147,5 +186,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

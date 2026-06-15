@@ -51,18 +51,12 @@
       "type": "code",
       "title": "代码示例",
       "content": "// 1. TCC示例 - 订单扣库存\n// Try: 冻结库存\n@Service\npublic class InventoryTccService {\n    @Transactional\n    public boolean tryDeduct(String skuId, int quantity) {\n        // 检查可用库存\n        Inventory inv = inventoryRepo.selectForUpdate(skuId);\n        if (inv.getAvailable() < quantity) return false;\n        // 冻结库存\n        inv.setAvailable(inv.getAvailable() - quantity);\n        inv.setFrozen(inv.getFrozen() + quantity);\n        inventoryRepo.update(inv);\n        return true;\n    }\n\n    // Confirm: 扣减冻结库存\n    @Transactional\n    public void confirmDeduct(String skuId, int quantity) {\n        Inventory inv = inventoryRepo.findBySkuId(skuId);\n        inv.setFrozen(inv.getFrozen() - quantity);\n        inventoryRepo.update(inv);\n    }\n\n    // Cancel: 解冻库存\n    @Transactional\n    public void cancelDeduct(String skuId, int quantity) {\n        Inventory inv = inventoryRepo.findBySkuId(skuId);\n        inv.setFrozen(inv.getFrozen() - quantity);\n        inv.setAvailable(inv.getAvailable() + quantity);\n        inventoryRepo.update(inv);\n    }\n}\n\n// 2. 本地消息表\n@Service\npublic class OrderService {\n    @Transactional\n    public OrderId createOrder(CreateOrderCmd cmd) {\n        // 1. 创建订单\n        Order order = Order.create(cmd);\n        orderRepo.save(order);\n\n        // 2. 写本地消息表（同一个事务）\n        LocalMessage msg = new LocalMessage();\n        msg.setTopic(\"order-created\");\n        msg.setPayload(JSON.toJSONString(order));\n        msg.setStatus(MessageStatus.PENDING);\n        localMessageRepo.save(msg);\n\n        return order.getId();\n    }\n}\n\n// 后台任务轮询发送\n@Scheduled(fixedDelay = 1000)\npublic void pollAndSend() {\n    List<LocalMessage> messages = localMessageRepo\n        .findByStatus(MessageStatus.PENDING, 100);\n    for (LocalMessage msg : messages) {\n        try {\n            kafkaTemplate.send(msg.getTopic(), msg.getPayload());\n            msg.setStatus(MessageStatus.SENT);\n            localMessageRepo.update(msg);\n        } catch (Exception e) {\n            msg.setRetryCount(msg.getRetryCount() + 1);\n            localMessageRepo.update(msg);\n        }\n    }\n}\n\n// 3. Seata AT模式\n@GlobalTransactional(timeoutMills = 60000, name = \"create-order\")\npublic OrderId createOrder(CreateOrderCmd cmd) {\n    // 本地操作\n    Order order = Order.create(cmd);\n    orderRepo.save(order);\n    // 远程调用（Seata自动管理分布式事务）\n    inventoryClient.deduct(cmd.getItems());\n    return order.getId();\n}",
-      "language": "java",
-      "highlights": [
-        {
-          "line": 9,
-          "note": "这里是边界条件分支，回答 分布式事务方案选型 时要说明它为什么会改变执行路径。"
-        }
-      ]
+      "language": "java"
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：分布式事务方案选型 要先说清它解决什么问题，再展开机制、边界和验证方式。掌握2PC、TCC、Saga、本地消息表等分布式事务方案的原理、优缺点和适用场景\n\n我会这样回答：\n1. 先定位核心问题：2PC的两阶段流程和缺点。\n2. 再串起关键机制：TCC的Try-Confirm-Cancel设计，并说明它和 Saga的补偿机制 的关系。\n3. 接着补充边界和风险：混淆2PC/TCC/Saga/本地消息表的适用场景。\n4. 最后落到验证方式：结合容量、延迟、一致性、故障演练和业务约束验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
+      "content": "结论：分布式事务方案选型 要先说清它解决什么问题，再展开机制、边界和验证方式。掌握2PC、TCC、Saga、本地消息表等分布式事务方案的原理、优缺点和适用场景\n\n我会这样回答：\n1. 先定位核心问题：2PC的两阶段流程和缺点。\n2. 再串起关键机制：TCC的Try-Confirm-Cancel设计，并说明它和 Saga的补偿机制 的关系。\n3. 接着补充边界和风险：混淆2PC/TCC/Saga/本地消息表的适用场景。\n4. 验证 分布式事务方案选型 时，我会把 架构设计、微服务 的关键现象、日志指标、测试结果和失败样本放在一起交叉确认。\n\n如果面试官继续追问 分布式事务方案选型，我会把 架构设计、微服务、分布式事务 放进一个可复现案例，讲清请求进入、状态改变、异常暴露和恢复动作。",
       "followUpQuestions": [
         {
           "question": "在你的项目中，分布式事务方案选型是怎么落地的？遇到了什么权衡取舍？",
@@ -70,11 +64,11 @@
         },
         {
           "question": "分布式事务方案选型 在高并发（万级 QPS）和数据一致性要求高的场景下，有哪些关键设计决策？",
-          "answer": "分布式事务方案选型 在高并发场景下要先识别核心约束，再拆成容量、延迟、一致性、故障隔离和可观测性几个维度设计。回答时应说明关键瓶颈在哪里、哪些链路可以异步或降级、哪些数据必须保持一致，以及出现积压、超时或部分失败时如何恢复。"
+          "answer": "分布式事务方案选型 在高并发场景下要先识别核心约束，再拆成容量、延迟、一致性、故障隔离和可观测性几个维度设计。回答 分布式事务方案选型 时，要说明 架构设计、微服务 的关键瓶颈、可异步或降级的链路、必须一致的数据以及积压或超时时的恢复方式。"
         },
         {
           "question": "如果现有系统需要引入 分布式事务方案选型，你会怎么评估改造风险和制定迁移计划？",
-          "answer": "引入 分布式事务方案选型 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。建议分阶段推进：先在非核心模块试点，验证后逐步推广。迁移过程中要做好灰度、回滚、监控，确保业务不受影响。"
+          "answer": "引入 分布式事务方案选型 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。引入 分布式事务方案选型 时建议分阶段推进：先选择 架构设计、微服务、分布式事务 中风险较低的链路试点，验证 降级策略 后再推广。分布式事务方案选型 迁移时要先灰度小流量，再绑定回滚条件、监控指标和业务验收口径。"
         }
       ]
     },

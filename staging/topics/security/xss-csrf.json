@@ -18,74 +18,113 @@
   "status": "staging",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能区分脚本执行风险和借用登录态请求风险，并给出浏览器侧和服务端组合防护。",
+  "interviewerFocus": "能否区分脚本在目标站点执行（XSS）与浏览器自动带凭证发请求（CSRF）这两类完全不同的风险，并给出输出编码 + CSP + SameSite + CSRF Token 的纵深组合。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "XSS 与 CSRF 防护 的职责边界",
-      "content": "XSS 的本质是未可信内容进入浏览器执行上下文，CSRF 的本质是攻击者诱导浏览器携带用户凭证发起非预期请求。两者都发生在 Web 场景，但攻击目标和防护手段不同。\n\n学习 XSS 与 CSRF 防护 时，可以先沿「用户输入进入页面 -> 浏览器执行上下文 -> 恶意脚本或伪造请求 -> 凭证和敏感操作 -> 编码 Token CSP 防护」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- XSS：恶意脚本在页面执行，适合 输出编码、CSP、HttpOnly，风险是 只过滤输入容易被绕过\n- CSRF：借用户登录态发请求，适合 SameSite、CSRF Token，风险是 Token 若被 XSS 读到会失效\n- 存储型 XSS：恶意内容进入数据库，适合 富文本和评论，风险是 影响范围更大\n- 反射型 XSS：参数被页面反射执行，适合 搜索、跳转链接，风险是 需要上下文编码\n\n把这条路径落回 XSS 与 CSRF 防护 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "三类 XSS 的注入位置不同，决定了编码策略",
+      "content": "XSS 按内容如何变成可执行脚本分三种。反射型 XSS：参数从 URL 经服务端拼回页面立即执行，如搜索结果页把 `?q=<script>` 直接渲染到 HTML 文本里，攻击者把恶意链接发给受害者点击；典型受害是搜索、错误提示、跳转页。存储型 XSS：恶意内容写进数据库后被多个用户的页面读出执行，如评论、富文本、用户昵称、头像 alt；危害最大，一次注入可影响所有访问者，常被用来盗 Session、植入挖矿脚本或挂马。DOM 型 XSS：服务端正常返回，但前端 JS 把 `location.hash`、`document.referrer`、`postMessage` 等不可信源直接 `innerHTML`、`document.write`、`eval` 或赋给 `href=javascript:` 协议，浏览器在客户端把它解析成脚本；服务端日志看不到这类攻击。\n\n关键在“输出上下文”而不是“输入过滤”。同一字符串 `\"><img src=x onerror=alert(1)>` 放进 HTML 文本要做 HTML 实体编码（`<` → `&lt;`），放进 HTML 属性还要把 `\"` 编码成 `&quot;`，放进 `<script>` 里的 JS 字符串要做 JS 转义（`\\u003c`），放进 URL 参数要做 `encodeURIComponent`，放进 CSS 要按 CSS 转义。React/Vue 默认的 `{}` 插值只覆盖 HTML 文本上下文，遇到 `dangerouslySetInnerHTML`、`v-html`、`href={userInput}`（可以是 `javascript:` 协议）、`<script>` 拼接仍会出事，富文本必须走 DOMPurify 这类白名单净化器而不是黑名单正则。"
     },
     {
       "type": "explain",
-      "title": "XSS 与 CSRF 防护 的失败模式与排查",
-      "content": "深入理解要抓住浏览器安全边界。输出编码、CSP、HttpOnly 降低脚本执行和凭证窃取风险；SameSite、CSRF Token、重要操作二次确认降低跨站伪造请求风险。\n\nXSS 与 CSRF 防护 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 「XSS 与 CSRF 防护 的核心目标」决定这个知识点的主线，必须先说清触发条件\n- 「用户输入进入页面、浏览器执行上下文、恶意脚本或伪造请求 的关系」决定方案能否稳定落地，不能只停留在名称层面\n- 「只记防护名词而不解释攻击路径」是常见失效点，需要提前说明防护或修复方式\n- 可以用「能结合 请求来源、Referer/Origin、CSP 报告、服务端日志、Token 校验失败记录 做定位」验证自己是否能说出关键路径\n\n排查时不要先猜结论，应把现象映射到 浏览器执行上下文、恶意脚本或伪造请求、凭证和敏感操作 这些环节，再结合 请求来源、Referer/Origin、CSP 报告、服务端日志、Token 校验失败记录 验证。"
+      "title": "CSRF 利用浏览器自动带凭证，与 CORS 是两回事",
+      "content": "CSRF 的前提是浏览器对同一 Origin 的请求会自动带 Cookie、Basic Auth、客户端证书等凭证。攻击者在自己站点放一段 `<img src=\"https://bank.com/transfer?to=evil&amount=1000\">` 或自动提交的表单，受害者打开恶意页面时浏览器会用受害者在 bank.com 的登录态发出这个请求；只要服务端只看 Cookie 不校验来源意图，转账就成功。常见误区是“我用 POST + JSON 就安全”：表单可以用 `enctype=text/plain` 伪造类 JSON 体，复杂请求确实会触发 CORS 预检，但预检失败只意味着前端读不到响应，副作用请求其实已经发出去了，对写接口照样致命。\n\n防护是一组组合拳。SameSite=Lax 是浏览器侧默认开关，跨站发起的 POST/PUT/DELETE 不会带 Cookie，但跨站 GET 顶层导航仍带，所以 GET 不能有副作用；SameSite=Strict 更严但会让外链跳回登录态丢失；SameSite=None 必须配 Secure，常用于第三方嵌入场景。CSRF Token 必须不可预测、与会话或请求绑定（如 HMAC(sessionId, action)），放在自定义请求头或表单隐藏字段里，跨站页面读不到也设置不了；放在 URL 或可被第三方 iframe 读到的位置就失效。Origin / Referer 校验作辅助，注意 Origin 在某些 same-origin POST 下可能为 null，Referer 可能被代理或浏览器策略剥离，不能作为唯一依据。转账、改密、删除这类高危操作再叠加二次确认（输验证码、重输密码、短信）。"
+    },
+    {
+      "type": "explain",
+      "title": "XSS 与 CSRF 可以组合：XSS 一旦得手，CSRF 防线全部失效",
+      "content": "两类攻击的关系常被忽视。XSS 一旦在目标站点拿到执行权，攻击脚本就跑在合法 Origin 内：它能读取页面里的 CSRF Token、用 `fetch(..., {credentials:'include'})` 携带 Cookie 调用任何接口、绕过 SameSite（因为请求确实是 same-site 发起的），还能从 `localStorage` 偷 JWT。所以 CSRF 防护是建立在“脚本不能在我站点执行”这一前提上的；如果有 XSS，所有 CSRF 措施都形同虚设。\n\n这决定了优先级：先用 CSP `default-src 'self'; script-src 'self' 'nonce-xxx'; object-src 'none'; base-uri 'self'` 限制脚本源、禁用内联和 `eval`，再叠加 `report-uri` 把违规上报；HttpOnly 让 Cookie 脱离 JS 可见面但只挡偷 Cookie 不挡借身份发请求；Trusted Types 在 Chromium 上能从根上禁掉危险的 sink 写入。线上排查时区分两类信号：CSP violation report 暴增、前端 DOM 出现陌生节点、XHR 调用陌生域 → XSS 嫌疑大；某个写接口大量来自陌生 Referer/Origin、Token 校验失败率突然升高、用户自己投诉“我没点过这个操作”→ CSRF 嫌疑大。"
     },
     {
       "type": "diagram",
-      "title": "XSS 与 CSRF 攻击防护链路",
+      "title": "XSS 脚本执行路径 vs CSRF 借凭证路径",
       "format": "mermaid",
-      "content": "flowchart LR\nA[用户输入进入页面] --> B[浏览器执行上下文]\nB[浏览器执行上下文] --> C[恶意脚本或伪造请求]\nC[恶意脚本或伪造请求] --> D[凭证和敏感操作]\nD[凭证和敏感操作] --> E[编码 Token CSP 防护]",
-      "fallback": "用户输入进入页面 -> 浏览器执行上下文 -> 恶意脚本或伪造请求 -> 凭证和敏感操作 -> 编码 Token CSP 防护",
-      "caption": "图示同时展示内容进入执行上下文和浏览器携带凭证两个关键风险点。"
+      "content": "flowchart TB\n  X1[攻击者注入 payload] --> X2[反射/存储/DOM sink]\n  X2 --> X3[浏览器解析为 script]\n  X3 --> X4[在受害站 Origin 内执行]\n  X4 --> X5[读 Cookie/Token 调接口]\n  C1[受害者已登录目标站] --> C2[访问攻击者站点]\n  C2 --> C3[img/form/fetch 跨站发请求]\n  C3 --> C4[浏览器自动带 Cookie]\n  C4 --> C5[服务端只看凭证执行操作]\nX5 -->|绕过| C5",
+      "fallback": "XSS 路径：攻击者注入 payload → 反射/存储/DOM sink → 浏览器解析为 script → 在受害站 Origin 内执行 → 读 Cookie 或 Token 并调接口；CSRF 路径：受害者已登录目标站 → 访问攻击者站点 → img/form/fetch 跨站发请求 → 浏览器自动带 Cookie → 服务端只看凭证执行操作；XSS 一旦得手可绕过 CSRF 防线。",
+      "caption": "两条路径分别对应『脚本在目标站执行』和『借浏览器凭证发请求』两个不同攻击面，XSS 得手后会击穿 CSRF 防御。"
     },
     {
       "type": "compareTable",
-      "title": "XSS 与 CSRF 防护对比",
+      "title": "XSS 与 CSRF 在攻击面与防线上的对比",
       "columns": [
         "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
+        "XSS",
+        "CSRF"
       ],
       "rows": [
         [
-          "XSS",
-          "恶意脚本在页面执行",
-          "输出编码、CSP、HttpOnly",
-          "只过滤输入容易被绕过"
+          "本质",
+          "攻击者脚本在目标站 Origin 内执行",
+          "浏览器自动携带受害者凭证发跨站请求"
         ],
         [
-          "CSRF",
-          "借用户登录态发请求",
-          "SameSite、CSRF Token",
-          "Token 若被 XSS 读到会失效"
+          "需要在目标站执行脚本",
+          "需要",
+          "不需要，只需用户已登录"
         ],
         [
-          "存储型 XSS",
-          "恶意内容进入数据库",
-          "富文本和评论",
-          "影响范围更大"
+          "服务端能否在请求体看到攻击者代码",
+          "存储型可以、反射型可以、DOM 型看不到",
+          "看不到，请求与正常请求无差别"
         ],
         [
-          "反射型 XSS",
-          "参数被页面反射执行",
-          "搜索、跳转链接",
-          "需要上下文编码"
+          "首选防线",
+          "上下文输出编码 + 富文本净化 + CSP",
+          "SameSite Cookie + 不可预测的 CSRF Token"
+        ],
+        [
+          "辅助防线",
+          "HttpOnly、Trusted Types、避免 innerHTML/eval",
+          "Origin/Referer 校验、关键操作二次确认"
+        ],
+        [
+          "失效场景",
+          "只过滤输入不按上下文编码、CSP 大量 unsafe-inline",
+          "Token 放在第三方可读位置、GET 接口有副作用、忽视 same-site 子域风险"
+        ],
+        [
+          "组合关系",
+          "XSS 得手可读取 Token 并以 same-site 发请求",
+          "依赖『没有 XSS』作为前提"
         ]
+      ]
+    },
+    {
+      "type": "code",
+      "title": "CSP 与 SameSite + Token 的最小可用配置",
+      "language": "http",
+      "content": "# 1. 输出编码：HTML 文本上下文（服务端模板）\n# 错误：<div>{{userInput}}</div>  -- 模板若不转义直接拼接\n# 正确：用框架默认转义；React 用 {userInput}（自动 HTML 转义），\n#       富文本走 DOMPurify.sanitize(html, { USE_PROFILES: { html: true } })\n\n# 2. CSP 响应头：禁内联脚本、限制脚本源、违规上报\nContent-Security-Policy:\n  default-src 'self';\n  script-src 'self' 'nonce-r4nd0m';\n  style-src 'self' 'nonce-r4nd0m';\n  img-src 'self' data: https:;\n  object-src 'none';\n  base-uri 'self';\n  frame-ancestors 'none';\n  report-uri /csp-report\n\n# 3. Cookie：SameSite + HttpOnly + Secure\nSet-Cookie: SESSIONID=abc; HttpOnly; Secure; SameSite=Lax; Path=/\n# 注意：跨站嵌入场景才用 SameSite=None; Secure，且要承担更大 CSRF 风险\n\n# 4. CSRF Token：服务端签发 HMAC，前端放自定义请求头\n# 服务端：token = HMAC_SHA256(serverSecret, sessionId + ':' + action)\n# 前端发请求：\nPOST /api/transfer HTTP/1.1\nX-CSRF-Token: 8f3a...e21c\nContent-Type: application/json\nCookie: SESSIONID=abc\n\n{\"to\":\"u123\",\"amount\":1000}\n\n# 5. 服务端校验：自定义头存在 + Token HMAC 匹配当前会话 + Origin 在白名单",
+      "highlights": [
+        {
+          "line": 6,
+          "note": "CSP header 只允许同源脚本"
+        },
+        {
+          "line": 17,
+          "note": "SameSite=Lax 阻止跨站 Cookie"
+        },
+        {
+          "line": 22,
+          "note": "csrfToken 中间件校验"
+        }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：XSS 与 CSRF 防护 要从目标、关键机制、风险边界和观测验证四层回答。\n\n我会按这几层展开：\n1. 先说明它解决的核心工程问题是 脚本注入和跨站请求伪造的成因、攻击路径和防御手段。\n2. 再沿着 用户输入进入页面、浏览器执行上下文、恶意脚本或伪造请求、凭证和敏感操作、编码 Token CSP 防护 说明执行链路\n3. 然后讲清 XSS 和 CSRF 的适用边界\n4. 最后补充用 请求来源、Referer/Origin、CSP 报告、服务端日志、Token 校验失败记录 验证效果和定位异常\n\n最后补充边界：安全防护要按攻击路径逐层设计，单点措施失效时仍应有日志、权限和隔离兜底。",
+      "content": "30 秒结论：XSS 是攻击者脚本在我站点 Origin 内执行，CSRF 是借受害者已登录浏览器自动带凭证发请求；两者攻击面不同，防线也不同，但 XSS 一旦得手会击穿 CSRF 防线，所以要分别治理。\n\n机制主线：XSS 按反射型、存储型、DOM 型三种 sink 区分，核心防御是按输出上下文做 HTML/属性/JS/URL/CSS 编码，富文本用 DOMPurify 白名单净化，再叠加 CSP（nonce + 禁 unsafe-inline + report-uri）和 HttpOnly。CSRF 核心是让跨站请求缺少服务端可识别的意图证明：SameSite=Lax 默认挡住跨站 POST，CSRF Token 用 HMAC 绑定会话且放自定义头，关键操作辅以 Origin/Referer 校验和二次确认。\n\n边界与追问：HttpOnly 不能根治 XSS，只挡偷 Cookie，不挡脚本以用户身份发请求；POST + JSON 不天然抗 CSRF，副作用请求即使 CORS 预检失败也已经发出；GET 接口不能改状态，否则 SameSite=Lax 也救不了；Token 不能放 URL 或第三方可读位置；线上排查时 CSP report 激增、陌生 DOM、外联 XHR 偏向 XSS，写接口 Referer/Origin 异常、Token 失败率激增、用户投诉无感操作偏向 CSRF。",
       "followUpQuestions": [
         {
-          "question": "XSS 与 CSRF 防护 出问题时你先看哪些信号？",
-          "answer": "我会先看 请求来源、Referer/Origin、CSP 报告、服务端日志、Token 校验失败记录，把异常定位到 浏览器执行上下文、恶意脚本或伪造请求、凭证和敏感操作，再决定是回滚、降级、扩容还是修配置。"
+          "question": "DOM 型 XSS 和反射型 XSS 有什么区别？为什么 WAF 经常拦不住 DOM 型？",
+          "answer": "反射型走服务端：参数从 URL 经服务端拼回 HTML 后浏览器解析；WAF 在网关能看到 payload。DOM 型完全在浏览器：服务端返回是干净的，前端 JS 把 `location.hash`、`postMessage` 等数据 `innerHTML` 或 `eval` 进 DOM，payload 可能放在 `#` 后根本不会发到服务端，所以 WAF 和服务端日志都看不到，必须靠前端代码审计、Trusted Types 和避免危险 sink 防御。"
         },
         {
-          "question": "XSS 与 CSRF 防护 最容易忽略的边界是什么？",
-          "answer": "最容易忽略的是自动化本身也会放大错误，所以必须保留审批、审计、回滚、灰度和人工接管路径。"
+          "question": "为什么 SameSite=Lax 已经挡住大多数 CSRF，还要再上 CSRF Token？",
+          "answer": "SameSite 是浏览器侧的兜底，存在三类缺口：老浏览器或非主流浏览器对 SameSite 支持不一致；同站子域 XSS 或子域被攻陷时仍是 same-site 请求，Cookie 照带；某些业务必须设 SameSite=None。Token 是服务端层的强校验，绑定会话、放自定义头让跨站根本读不到也设置不了，两者纵深组合才安全。"
+        },
+        {
+          "question": "如果接口返回 JSON 还需要防 CSRF 吗？为什么 CORS 不算防线？",
+          "answer": "需要。CORS 控制的是跨站脚本能否读响应，不是能否发请求。攻击者用表单 `enctype=text/plain` 可以伪造类似 JSON 的请求体，simple request 不触发预检直接送达服务端；即使触发预检失败，副作用接口的写动作其实在服务端已执行，只是攻击者读不到结果。所以只要请求有副作用就要校验 CSRF Token 或 Origin。"
         }
       ]
     },
@@ -93,31 +132,39 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 XSS 与 CSRF 防护 的目标和边界",
-        "能沿 用户输入进入页面 -> 浏览器执行上下文 -> 恶意脚本或伪造请求 -> 凭证和敏感操作 -> 编码 Token CSP 防护 讲清链路",
-        "能解释关键配置和失败模式",
-        "能用观测指标验证效果"
+        "能区分反射型、存储型、DOM 型 XSS 的注入位置和典型 sink（innerHTML、document.write、eval、href=javascript:）",
+        "能按 HTML 文本/属性/JS 字符串/URL/CSS 五种输出上下文给出对应编码方式，并知道 React 默认转义不覆盖 dangerouslySetInnerHTML",
+        "能写出最小可用的 CSP（script-src 'self' 'nonce-xxx'、object-src 'none'、report-uri）并说明 nonce 优于 unsafe-inline",
+        "能解释 SameSite Lax/Strict/None 的差异、为什么 CSRF Token 要 HMAC 绑定会话并放自定义头",
+        "能用 CSP report、Token 校验失败率、陌生 Referer/Origin、用户无感操作投诉判断真实是 XSS 还是 CSRF"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "security.web-security.xss-csrf.recall.1",
-      "prompt": "请讲一下 XSS 与 CSRF 防护 的核心链路和它解决的工程问题。",
+      "prompt": "请分别讲反射型、存储型、DOM 型 XSS 的注入位置和典型 sink，并说明为什么 WAF 看不到 DOM 型 XSS。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "security.web-security.xss-csrf.recall.2",
-      "prompt": "XSS 与 CSRF 防护 在生产环境里最常见的失败模式有哪些？",
+      "prompt": "输出编码、DOMPurify、CSP、HttpOnly、SameSite、CSRF Token、Origin 校验各防住什么、各自的失效边界是什么？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "security.web-security.xss-csrf.recall.3",
-      "prompt": "如果 XSS 与 CSRF 防护 相关变更上线后异常，你会如何回滚和验证？",
+      "prompt": "线上发现某写接口被异常触发，你会从 CSP report、Token 失败日志、Referer/Origin 分布等哪些信号入手判断是 XSS、CSRF 还是普通越权？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "security.web-security.xss-csrf.recall.4",
+      "prompt": "为什么 XSS 一旦得手 CSRF 防线就形同虚设？请用 SameSite 和 Token 两个机制各自的前提解释。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -125,20 +172,23 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说明 XSS 与 CSRF 防护 的核心目标",
-      "能讲清 用户输入进入页面、浏览器执行上下文、恶意脚本或伪造请求 的关系",
-      "能指出 XSS 和 CSRF 的差异",
-      "能给出可观测验证和回滚思路"
+      "区分反射型/存储型/DOM 型 XSS 与 CSRF 跨站请求伪造两条不同攻击路径",
+      "讲清按输出上下文（HTML/属性/JS/URL/CSS）做编码，富文本用 DOMPurify 白名单净化",
+      "讲清 SameSite Lax/Strict/None 差异 + CSRF Token 用 HMAC 绑定会话并放自定义请求头",
+      "指出 XSS 得手会击穿 CSRF 防线（脚本在 same-site 内可读 Token、自动带 Cookie）"
     ],
     "goodToHave": [
-      "能结合 请求来源、Referer/Origin、CSP 报告、服务端日志、Token 校验失败记录 做定位",
-      "能说明多环境差异和权限边界",
-      "能把自动化、审计和回滚串成闭环"
+      "给出最小可用 CSP：script-src 'self' 'nonce-xxx'、object-src 'none'、base-uri 'self'、report-uri",
+      "解释 HttpOnly 只挡偷 Cookie 不挡借身份发请求，Trusted Types 在 Chromium 可禁危险 sink",
+      "说明 POST/JSON/CORS 不是 CSRF 防线，副作用请求即使预检失败也已送达服务端",
+      "区分 XSS（CSP report、陌生 DOM、外联 XHR）与 CSRF（陌生 Referer、Token 失败激增、用户无感操作）的线上排查信号"
     ],
     "commonMistakes": [
-      "只记 XSS 与 CSRF 防护 的防护名词，不解释攻击路径和信任边界",
-      "把单点校验当成完整安全方案，忽略 XSS 与 CSRF 防护 的绕过方式",
-      "没有把日志审计、密钥或权限治理、应急处置纳入 XSS 与 CSRF 防护"
+      "把 HttpOnly 当成 XSS 唯一防线，忽略脚本仍可在页面内以用户身份调接口",
+      "认为只过滤输入就能防 XSS，不按输出上下文区分 HTML/属性/JS/URL 编码",
+      "认为 POST 或 JSON 接口天然不怕 CSRF，没意识到 simple request 和表单可绕过 CORS",
+      "把 CSRF Token 放在 URL 或可被第三方 iframe 读到的位置，或不绑定会话以致可重放",
+      "GET 接口带副作用，导致 SameSite=Lax 也无法挡住跨站 GET 顶层导航触发的 CSRF"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -147,5 +197,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

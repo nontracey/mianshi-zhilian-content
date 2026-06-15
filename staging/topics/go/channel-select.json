@@ -4,7 +4,7 @@
   "category": "concurrency",
   "group": "concurrency",
   "title": "Channel、select 与并发通信",
-  "summary": "掌握 channel 的阻塞语义、关闭规则、缓冲区边界和 select 多路等待。",
+  "summary": "理解 hchan 结构、sendq/recvq 阻塞队列、close 状态机以及 select 随机选择规则下的真实并发语义。",
   "tags": [
     "Go",
     "Channel",
@@ -20,86 +20,104 @@
     "go.concurrency.goroutine-gmp"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能解释 channel 的同步/缓冲语义、关闭规则、select 随机选择和用通信组织并发的边界。",
+  "interviewerFocus": "重点看候选人能否落到 hchan 内部结构（buf 环形队列 + sendq/recvq + lock）、close 后 recv 返回零值与 ok=false 的语义、nil channel 在 select 中的禁用技巧，以及向已关闭 channel 发送/重复 close 的 panic 路径。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Channel 是带同步语义的通信管道",
-      "content": "channel 不只是队列，它同时承载数据传递和 goroutine 协调。无缓冲 channel 要发送方和接收方同时就绪，带缓冲 channel 在缓冲未满或非空时可以让一方先继续执行。\n\n从零理解时先抓住这几个点：\n- 无缓冲 channel 强同步，常用于交接数据和建立 happens-before\n- 缓冲 channel 能吸收短期峰值，但容量不是越大越好\n- close 表示不会再发送，接收方可以用 ok 判断是否关闭\n- select 会在多个就绪分支中伪随机选择一个执行\n\n容易答浅的地方通常在边界：\n- 向已关闭 channel 发送会 panic，重复 close 也会 panic\n- nil channel 会永久阻塞，可用于动态关闭 select 分支\n- 只靠加大缓冲不能解决消费者慢的问题"
+      "title": "Channel 的底层是 hchan：环形缓冲 + 两个等待队列",
+      "content": "runtime 里 channel 对应 `runtime.hchan` 结构，关键字段有 buf（环形缓冲区指针，仅 buffered chan 有）、qcount（当前元素数）、dataqsiz（容量 cap）、sendx/recvx（环形队列读写下标）、sendq/recvq（双向链表，挂等待的 sudog）、closed 标志位、lock（互斥锁）。所有 send/recv/close 都先抢 lock，再按状态走分支。\n\n无缓冲 channel（cap=0）没有 buf，发送和接收必须配对：\n- 发送方进来时如果 recvq 非空，直接把数据从发送方栈拷到接收方栈（runtime 的 sendDirect），不走 buf，然后唤醒接收方 goroutine\n- 如果 recvq 为空，发送方被打包成 sudog 挂到 sendq，gopark 让出 P\n\n有缓冲 channel（cap>0）多了一段 buf 路径：\n- buf 未满 → 数据拷进 buf[sendx]，sendx = (sendx+1) % cap，qcount++，发送方继续跑\n- buf 已满 → 同样进 sendq 阻塞\n- 接收方对称：buf 非空就从 buf[recvx] 拷出；如果 buf 空但 sendq 有等待者（buf 满唤醒场景），会先把 sendq 队头的数据拷进 buf[recvx]、再让出位置给那个发送方\n\n这套结构决定了几个常被问的事实：channel 收发本质上有锁、不是 lock-free；Go 不保证 FIFO 公平度，但 sendq/recvq 在大多数版本是 FIFO 唤醒；channel 同时承担数据传递和 happens-before 同步——一次成功的 send 与对应的 recv 之间建立 happens-before 边，这是 sync 包之外最常用的同步原语。"
     },
     {
       "type": "explain",
-      "title": "关闭归属和 select 公平性是追问重点",
-      "content": "channel 的关闭应该由发送方负责，而且通常由唯一发送方关闭。多个发送者同时 close 很容易 panic，应该用额外的协调机制，例如 Context、WaitGroup 或单独的 done channel。接收方不应该为了“通知结束”随意关闭业务 channel。\n\nselect 的深入问题常见于超时、取消和非阻塞通信。`default` 分支可以避免阻塞，但过度使用会造成忙轮询；多个 case 同时就绪时，Go 不保证固定顺序。写并发代码时要先说清生命周期：谁生产、谁消费、谁关闭、异常时谁取消。\n\n排查 channel 问题要看 goroutine dump、阻塞 profile、`go test -race` 和超时日志：发送端阻塞通常说明没有接收者或缓冲被填满，接收端阻塞说明没有发送者或 channel 未关闭，`default` 空转会在 CPU profile 里表现为忙循环。关闭规则也要用 ownership 验证：只有最后一个发送方知道不会再发送，才应该 close。"
+      "title": "close 是状态变更，不是销毁；nil chan 是 select 的开关",
+      "content": "close(ch) 做三件事：把 hchan.closed 置 1、唤醒 recvq 上所有接收者（让它们读到零值 + ok=false）、唤醒 sendq 上所有发送者（让它们 panic）。channel 本身仍然存在，buf 里还没读完的数据可以继续被 range/recv 读出，读完才返回 ok=false。\n\nclose 的硬规则（每条都对应一类线上事故）：\n- 向已关闭 channel 发送 → 立即 panic: send on closed channel；这条不可恢复，必须靠归属（ownership）规避\n- 重复 close → panic: close of closed channel；多个发送者各自 close 是最常见的炸法\n- close(nil) → panic: close of nil channel\n- 从已关闭 channel 接收：buf 里有剩余先按顺序拿出来，剩余拿完后立刻返回元素零值与 ok=false，永不阻塞，这是 for v := range ch 能正常退出循环的根因\n\n惯用法：\n- 1 个发送者 N 个接收者：发送者关闭，接收者只 range/recv\n- N 个发送者 1 个接收者：用 done channel + sync.Once；发送者 select case <-done 提前退出，由接收者关 done，业务 channel 不主动 close（让 GC 回收）\n- N 个发送者 N 个接收者：再加一层协调者 goroutine 或 context.WithCancel\n\nnil channel 在 select 里有特殊地位：对 nil 的 send 与 recv 都永久阻塞（gopark 无人唤醒）。因此把某个 case 的 channel 置 nil，等价于在运行期把这个 case 关掉而不破坏 select 结构。典型场景是生产者-消费者中：消费者已经 range 完一路输入后把那个 channel 设为 nil，select 就只在剩余分支上等待，避免 busy-loop。default 分支则相反——任何一个 case 都不就绪时执行 default，可用于做非阻塞 send/recv，但写在循环里就变成忙轮询，pprof 的 CPU profile 会直接占顶。\n\n排查路径：goroutine 泄漏看 `runtime/pprof` 的 goroutine profile，找停在 chansend / chanrecv / selectgo 的栈；data race 用 `go test -race`；死锁用 `GODEBUG=schedtrace=1000` 观察是否所有 G 都阻塞在 chan 上。"
     },
     {
       "type": "diagram",
-      "title": "Channel 收发与关闭路径",
+      "title": "hchan 内部结构与 send/recv 决策路径",
       "format": "mermaid",
-      "content": "flowchart LR\nA[创建 channel] --> B[发送方写入]\nB[发送方写入] --> C[接收方读取]\nC[接收方读取] --> D[select 监听多个事件]\nD[select 监听多个事件] --> E[发送方关闭]\nE[发送方关闭] --> F[接收方读到 ok=false]",
-      "fallback": "创建 channel -> 发送方写入 -> 接收方读取 -> select 监听多个事件 -> 发送方关闭 -> 接收方读到 ok=false",
-      "caption": "channel 设计要同时说明数据流和生命周期，尤其是谁负责关闭。"
+      "content": "flowchart TB\nH[hchan: buf+qcount+dataqsiz+sendx+recvx+sendq+recvq+closed+lock] --> S{send 进入}\nS -->|closed=1| SP[panic: send on closed]\nS -->|recvq 非空| SD[sendDirect 直接拷到接收方栈]\nS -->|buf 未满| SB[写入 buf-sendx, qcount++]\nS -->|buf 已满| SQ[包成 sudog 挂入 sendq, gopark]\nH --> R{recv 进入}\nR -->|closed=1 且 buf 空| RZ[返回零值, ok=false]\nR -->|sendq 非空且 buf 满| RM[从 buf-recvx 取, 再把 sendq 头数据搬入 buf]\nR -->|buf 非空| RB[从 buf-recvx 读, qcount--]\nR -->|buf 空且 sendq 空| RQ[挂入 recvq, gopark]\nH --> C[close: closed=1, 全部唤醒 recvq, sendq 唤醒后 panic]",
+      "fallback": "hchan 结构: buf+qcount+dataqsiz+sendx+recvx+sendq+recvq+closed+lock。send 路径: closed→panic / recvq非空→sendDirect / buf未满→入buf / buf满→挂sendq。recv 路径: closed且buf空→零值ok=false / 有发送方且buf满→取buf并搬sendq头数据 / buf非空→读buf / 全空→挂recvq。close: 置位+唤醒recvq+唤醒sendq(后者会panic)。",
+      "caption": "channel 所有行为都可以从 hchan 的字段状态推出：closed、buf 是否空/满、sendq/recvq 是否有等待者。"
     },
     {
       "type": "compareTable",
-      "title": "Channel 场景对比",
+      "title": "无缓冲 / 缓冲 / nil / 已关闭 channel 行为对照",
       "columns": [
-        "考点",
-        "应该怎么理解",
-        "面试追问",
-        "常见坑"
+        "状态",
+        "send 行为",
+        "recv 行为",
+        "close 行为"
       ],
       "rows": [
         [
-          "无缓冲",
-          "发送接收同时就绪",
-          "强同步交接",
-          "容易因无人接收阻塞"
+          "无缓冲 (cap=0)",
+          "recvq 有等待者→sendDirect 直传；否则入 sendq 阻塞",
+          "sendq 有等待者→直接拿走；否则入 recvq 阻塞",
+          "唤醒 recvq 拿零值+ok=false；唤醒 sendq 全部 panic"
         ],
         [
-          "有缓冲",
-          "缓冲未满可发送",
-          "削峰和限流",
-          "掩盖消费者过慢"
+          "缓冲未满",
+          "拷入 buf[sendx]，qcount++，立即返回",
+          "buf 非空→从 buf[recvx] 取；否则同无缓冲规则",
+          "正常关闭，剩余 buf 数据仍可被读出"
         ],
         [
-          "close",
-          "广播无后续数据",
-          "range channel 退出",
-          "多发送者 close panic"
+          "缓冲已满",
+          "入 sendq 阻塞",
+          "从 buf 取，再把 sendq 头部 sudog 的数据搬进腾出的槽位",
+          "唤醒 sendq 上所有等待者并让它们 panic"
         ],
         [
-          "select",
-          "等待多个事件",
-          "取消、超时、多路复用",
-          "default 忙轮询"
+          "nil channel",
+          "永久阻塞（select 中等价禁用此 case）",
+          "永久阻塞（同上，常用于动态关分支）",
+          "panic: close of nil channel"
+        ],
+        [
+          "已关闭 channel",
+          "panic: send on closed channel",
+          "buf 剩余按 FIFO 取完后返回零值, ok=false，永不阻塞",
+          "panic: close of closed channel"
         ]
       ]
     },
     {
       "type": "code",
-      "title": "select 处理数据、取消和超时",
+      "title": "select 三路等待 + nil chan 动态禁用分支",
       "language": "go",
-      "content": "package main\n\nimport (\n\t\"context\"\n\t\"time\"\n)\n\nfunc receive(ctx context.Context, ch <-chan int) (int, bool) {\n\tselect {\n\tcase v, ok := <-ch:\n\t\treturn v, ok\n\tcase <-ctx.Done():\n\t\treturn 0, false\n\tcase <-time.After(200 * time.Millisecond):\n\t\treturn 0, false\n\t}\n}",
+      "content": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"time\"\n)\n\n// fanIn 从 a、b 两路输入合并到 out。任一路 close 后把对应 case 置 nil 以禁用分支，\n// 直到两路都结束才退出；同时支持 ctx 取消和 300ms 软超时心跳。\nfunc fanIn(ctx context.Context, a, b <-chan int, out chan<- int) {\n\tdefer close(out) // 唯一发送方，自己关 out\n\tfor a != nil || b != nil {\n\t\tselect {\n\t\tcase v, ok := <-a:\n\t\t\tif !ok { // a 关闭后读到零值+ok=false，把 a 设 nil\n\t\t\t\ta = nil // select 该 case 永久阻塞 = 等价禁用\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tout <- v\n\t\tcase v, ok := <-b:\n\t\t\tif !ok {\n\t\t\t\tb = nil\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tout <- v\n\t\tcase <-ctx.Done(): // 上游取消：直接退出，out 在 defer 中关闭\n\t\t\treturn\n\t\tcase <-time.After(300 * time.Millisecond):\n\t\t\tfmt.Println(\"idle 300ms\") // 心跳；注意 time.After 会泄露 timer，热路径用 time.NewTimer + Stop\n\t\t}\n\t}\n}",
       "highlights": [
         {
-          "line": 12,
-          "note": "这里体现取消信号的传播，说明 Channel、select 与并发通信 时要强调任务必须有退出条件。"
+          "line": 14,
+          "note": "v, ok := <-a 这一行是 close 状态的唯一感知点：buf 里还有数据时 ok 仍为 true，等到取完零值才会出现 ok=false，所以可以放心 range 或循环到读尽。"
+        },
+        {
+          "line": 16,
+          "note": "把 a 置 nil 是 select 的关键技巧——nil chan 的 recv 永久阻塞，因此 selectgo 在评估就绪 case 时会直接跳过这一支，等价于运行期关分支，不需要重写 select。"
+        },
+        {
+          "line": 31,
+          "note": "time.After 每次都新建 timer 且无法回收，循环里热调用会留下大量未触发的 timer 占内存；正确做法是 timer := time.NewTimer(d); defer timer.Stop(); 在 case <-timer.C 后调用 timer.Reset(d)。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "Channel 我会按“通信 + 同步 + 生命周期”回答，而不是只说收发语法。\n\n我会按这条线展开：\n1. 无缓冲 channel 要发送和接收同时就绪，适合强同步交接\n2. 缓冲 channel 能临时解耦生产和消费，但容量不能替代消费能力\n3. close 表示发送结束，接收方用 ok 或 range 感知结束\n4. select 用来组合数据、取消和超时，但要注意 nil channel、default 和关闭规则\n\n最后补一句边界：channel 适合表达所有权转移和事件通知；共享状态频繁读写时，锁可能更直接。\n\n生产里我会要求所有 select 至少能解释取消路径和超时路径：没有 context 或 timeout 的收发很容易造成 goroutine 泄露；多个发送者关闭同一个 channel 要用协调者或 WaitGroup 汇总后关闭，不能让任意发送者直接 close。",
+      "content": "我会把 channel 拆成三层来讲：底层数据结构、收发与关闭语义、select 在并发组合中的角色。\n\n底层：channel 在 runtime 里就是 hchan，里面有环形 buf、sendx/recvx 下标、sendq/recvq 两个 sudog 等待队列、closed 标志和一把 mutex。所以 channel 收发是有锁操作，配对成功时 runtime 会做 sendDirect 把数据从发送者栈直接拷到接收者栈。\n\n收发与关闭：无缓冲必须发收同时就绪，缓冲在 buf 未满/非空时可以单边继续。close 不销毁 channel——它把 closed 置位、唤醒 recvq 让它们拿零值+ok=false、唤醒 sendq 让它们 panic。三条死规则：向已关闭 chan 发送 panic、重复 close panic、close(nil) panic；这些 panic 不能 recover 业务正确性，所以靠所有权规避：永远由发送方关闭，多发送方场景用协调者或 sync.Once。\n\nselect：核心是伪随机选择就绪 case，多个就绪时不保证顺序；nil channel 的 case 永久阻塞，所以可以把已耗尽的输入置 nil 来禁用该分支；default 写非阻塞收发可以，但放进 for 循环就是忙轮询，pprof 一查 CPU 就在 selectgo 上转。\n\n生产边界：goroutine 泄漏看 pprof 里的 chansend/chanrecv 栈；time.After 在热路径会泄漏 timer，要换 NewTimer+Stop+Reset；缓冲不能替代消费能力，业务上更愿意把容量设小一点早暴露问题，而不是设大几千遮掩消费瓶颈。",
       "followUpQuestions": [
         {
-          "question": "谁应该关闭 channel？",
-          "answer": "通常由发送方关闭，而且最好是唯一发送方关闭。接收方关闭或多个发送者竞争关闭都容易导致 panic。"
+          "question": "向已关闭 channel send 为什么必然 panic，而 recv 反而能拿到零值？",
+          "answer": "send 路径在 chansend 里第一件事就是检查 c.closed，置位则直接 panic('send on closed channel')，因为发送方已经无法保证数据被消费，让它继续写会破坏内存可见性约定。recv 路径在 chanrecv 里相反：closed=1 且 buf 已空时返回元素类型零值并把 ok 设为 false，buf 非空则继续按 recvx 顺序消费完再返回零值，所以 for v, ok := range ch 能干净退出。"
         },
         {
-          "question": "nil channel 在 select 中有什么用？",
-          "answer": "nil channel 的收发会永久阻塞，可以把某个 case 对应的 channel 置 nil，从而动态禁用这个分支。"
+          "question": "为什么大家都说 channel 容量不要随便加大？背后的真实代价是什么？",
+          "answer": "三个层次：1) 缓冲只是把生产-消费的速率差延迟体现，消费跟不上时 buf 会被填满，最终回到 sendq 阻塞，问题没消失只是更晚暴露；2) 大 buf 会让 backpressure 失效，下游异常时上游还在加压，监控难发现；3) 内存占用直接 = cap × elemSize，对大对象 chan（如 *Request）是隐性内存压力，且每次取数据都要触发 typedmemmove 拷贝。一般规则：cap=0 用于强同步交接，cap=1~少量用于解耦，cap 上百要先证明上游确实是突发流量而非稳态过载。"
+        },
+        {
+          "question": "select 多个 case 同时就绪时怎么选？为什么不能依赖顺序？",
+          "answer": "Go runtime 的 selectgo 会先把所有 case 收集到 scase 数组，第一阶段对就绪 case 做 fastrandn 伪随机洗牌选一个执行；这是有意为之，避免大家依赖书写顺序写出在某些 Go 版本失效的代码。如果需要优先级，要写两层 select：外层只 select 高优先级 case + default，default 里再 select 低优先级 case。default 在所有 case 都不就绪时立刻命中，常用于非阻塞 send/recv。"
         }
       ]
     },
@@ -107,53 +125,59 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能区分无缓冲和有缓冲",
-        "能说明 close 归属",
-        "能解释 select 选择规则",
-        "能用 Context 取消等待",
-        "能识别死锁和忙轮询"
+        "能画出 hchan 主要字段（buf/qcount/dataqsiz/sendx/recvx/sendq/recvq/closed/lock）并解释 send 与 recv 的分支决策",
+        "能说清 close 后 send/recv/再次 close/close(nil) 四种行为及对应 panic 信息",
+        "能解释 nil channel 在 select 中的禁用作用，并写出 fanIn 把已关闭分支置 nil 的范式",
+        "能说明 select 多 case 就绪时的伪随机选择，以及如何用嵌套 select 实现优先级",
+        "能识别 default 忙轮询、time.After 在循环中泄漏 timer、单纯加大 buf 掩盖消费瓶颈三类反模式",
+        "能描述 channel 提供的 happens-before 边以及 send 与对应 recv 的同步保证"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "go.concurrency.channel-select.recall.1",
-      "prompt": "请解释无缓冲 channel 和有缓冲 channel 的区别。",
+      "prompt": "画出 hchan 的关键字段，并描述 send 在 closed/recvq 非空/buf 未满/buf 已满四种状态下的执行路径。",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "expectedMinutes": 4,
+      "difficulty": 4
     },
     {
       "id": "go.concurrency.channel-select.recall.2",
-      "prompt": "channel 关闭规则有哪些？为什么向关闭的 channel 发送会 panic？",
+      "prompt": "解释 close 之后 send、recv、再次 close、close(nil) 各自会发生什么，并说明为什么 for v, ok := range ch 能正常退出。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "go.concurrency.channel-select.recall.3",
-      "prompt": "select 如何同时处理数据、超时和取消？",
+      "prompt": "select 中 nil channel 有什么作用？写一个 fanIn 函数，在某一路输入关闭后只通过 nil 化 case 把它从 select 中下线。",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "expectedMinutes": 4,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明「无缓冲同步」在「Channel、select 与并发通信」里的作用和判断标准",
-      "缓冲容量语义",
-      "close/ok",
-      "select 多路等待"
+      "hchan 内部结构（buf 环形缓冲 + sendq/recvq 等待队列 + closed + lock）",
+      "无缓冲 send/recv 通过 sendDirect 直传、有缓冲走 buf[sendx]/buf[recvx]",
+      "close 的三类 panic：send on closed、close of closed、close of nil",
+      "已关闭 channel recv 返回元素零值 + ok=false 且永不阻塞",
+      "select 多 case 就绪时伪随机选择，且 nil channel case 永久阻塞可用于禁用分支"
     ],
     "goodToHave": [
-      "happens-before",
-      "能说明「关闭归属」在「Channel、select 与并发通信」里的触发条件、收益和失效边界",
-      "default 忙轮询风险"
+      "channel send 与对应 recv 之间的 happens-before 同步语义",
+      "channel 关闭归属：1 发 N 收 / N 发 1 收 / N 发 N 收 三种典型 ownership 模式",
+      "time.After 在热循环里泄漏 timer，应改为 NewTimer + Stop + Reset",
+      "嵌套 select + default 实现优先级 case 的写法",
+      "用 pprof goroutine profile 观察 chansend/chanrecv/selectgo 栈定位泄漏"
     ],
     "commonMistakes": [
-      "多个发送者直接 close",
-      "把缓冲当成无限队列",
-      "用 default 写出空转循环"
+      "多个发送者各自 close 同一个 channel 导致 close of closed panic",
+      "把缓冲容量当成无限队列，掩盖消费者瓶颈直到 buf 填满才暴露",
+      "在 for { select { ... default: ... } } 里写 default 形成忙轮询，CPU profile 全在 selectgo",
+      "在循环里反复 time.After(d) 制造未触发的 timer 直至 GC 压力上升",
+      "误以为 close 之后 channel 就不能再读，从而提前 break range 丢失 buf 中剩余数据"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -162,5 +186,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }
