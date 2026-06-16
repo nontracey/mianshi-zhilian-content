@@ -51,7 +51,12 @@ const DOMAIN_ORDER = [
 
 // ===== 内嵌精修规范（弱模型唯一参照，不读 81KB 大文档；要求只增不减）=====
 // 调用 buildRefinePrompt 时会把字面量 ${todayYmd} 替换为实际的 YYYY-MM-DD 日期串。
-const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任务：把下面这一篇 topic 改写到"真人专家会认可、面试能直接用"的高质量，使其通过确定性质量审计（满分 100，合格线见下，8 个维度各有地板分，强项不能补偿短板）。
+const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任务：把下面这一篇 topic 改写到“真人专家会认可、面试能直接用”的高质量，使其通过确定性质量审计（满分 100，合格线见下，9 个维度各有地板分，强项不能补偿短板）。
+
+【目标层次——技术类对标 P7/P7+，非技术类对标对应专家纵深】
+- 技术域：内容深度按资深/专家（P7、可到 P7+）的知识储备来写。difficulty 4-5 必须达到源码级机制、架构链路、极端规模与工程权衡的深度，能真正区分资深与专家；difficulty 3 至少要能区分资深；difficulty 1-2 的基础题保持诚实标注、紧凑不注水，不强行拔高（拔高基础题等于难度虚标）。
+- 非技术域（如自媒体）：按该职业资深从业者的纵深写——要有可量化方法、真实数据口径与来源、失败复盘和取舍，不停留在常识科普。
+- 区分度天花板：一篇题“能筛到哪个职级”由它的 recallPrompts + followUpQuestions 决定。若全部问题只考“是什么/列举”，区分度封顶“仅中级”；要具备资深（P7）区分度，difficulty≥3 必须至少有一条“为什么这样设计而非另一种 / 线上如何排查 / 取舍权衡 / 极端场景如何应对”的深问，且正文要能支撑该深问的答案。
 
 【核心原则——只调内容，不动格式】
 你的唯一任务是优化内容质量（深度、准确性、面试可用性）。不得改变 JSON 结构和字段格式——每个字段的键名、类型、取值范围必须与原 topic 完全一致。如果原 topic 某个字段用的是 A 格式，精修后必须还是 A 格式。格式错误等于精修失败。
@@ -67,9 +72,9 @@ const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任�
 2. 内容深度：每张 explain 要讲清机制/触发条件/关键指标/失败路径/工程取舍，不是清单堆砌、不是大白话复述定义。
 3. 专家证据：给出具体抓手——真实函数名/类名/参数、版本边界、命令与配置项、数值量级、生产现象与定位线索。禁止"通常、一般、很重要"这类空话。
 4. 讲解清晰度：遵循认知顺序——先动机/痛点 → 机制 → 具体例子 → 边界/反例 → 面试如何表达；逻辑连贯不跳跃。
-5. 图示/对比：diagram 节点必须是本题专属概念（不是"输入→处理→输出"这种万能图）；compareTable 行列对齐，且每一行都含真正的结论而非同义复述。
+5. 图示/对比：diagram 节点必须是本题专属概念（不是“输入→处理→输出”这种万能图），且边必须表达真实机制（调用顺序/数据流/状态转移/分支/失败路径）——纯线性关键词链（A→B→C→D→…，无分支/汇合/状态转移）、或终点是“面试结论/答题要点/总结”这类汇聚节点的，即使节点专属也算假图，必须重画；compareTable 行列对齐，且每一行都含真正的结论而非同义复述。
 6. 面试可用性：interviewAnswer 用三层结构——30 秒结论 → 机制要点列表 → 边界/追问应对；followUpQuestions ≥2 条，且答案是本题专属、不复述题面。
-7. rubric 评估质量：mustHave 是具体知识点名词（如"本地队列+全局队列+work stealing 三层调度"），不是"能说明「X」在「Y」里的作用和判断标准"这类套娃句；commonMistakes 是真实的坑，不是泛化。
+7. rubric 评估质量：mustHave 是具体知识点名词（如“本地队列+全局队列+work stealing 三层调度”），不是“能说明「X」在「Y」里的作用和判断标准”这类套娃句；commonMistakes 是真实的坑，不是泛化。mustHave / goodToHave / commonMistakes 只能是知识点名词短语或自然语句，禁止内嵌代码片段（如 throw new ...()、function、=>、带分号的语句、缩进代码块）——代码只放 code 卡。
 8. 模板与语言卫生：逐字消除下列 P0 模板句式（命中必改写成本题专属的具体表达）：
    - explain 结尾三段式："把 X 放到真实场景里看…"/"判断 X 是否答到位时…"/"学透 X 的关键是…追问/复述校验"。
    - code 高亮注释套话："这里定义示例的核心入口或结构…"/"这里给出最终结果或提前退出条件…"/"并发控制点：说明它保护的…"/"这里体现状态推进或遍历过程…"/"需要说明终止条件、复杂度和异常输入"等一切非本题专属的通用说明。
@@ -77,7 +82,8 @@ const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任�
    - rubric.mustHave：所有以"能说明/能解释/能准确解释 X 的 Y"开头的泛化句式，都应替换为具体知识点名词（如"弱引用 key 回收后 value 仍被 Thread 强持有"而非"能说明 value 泄漏原因"）。
    - interviewerFocus：四词排比模板（"考察是否能解释 X 的 a、b、c、d"）和两段式泛化（"考察对 X 的理解深度，能否区分 Y 和 Z"）都应改写为本题考察的具体能力点。
    - followUpQuestions："X 一般怎么定位/怎么排查"这种通用骨架但答案没有本题专属抓手。
-   - 任何"今日笔记/今日练习/第 X 天/Day X"。
+   - 任何“今日笔记/今日练习/第 X 天/Day X”。
+9. 区分度天花板（对标 P7/P7+）：技术类 difficulty≥3 的内容必须深到能区分资深（P7），difficulty 4-5 要到 P7+（源码级机制 / 架构权衡 / 极端规模 / 疑难定位）；非技术类按对应职业的专家纵深。判据见上【目标层次】——只考“是什么/列举”、recallPrompts/followUpQuestions 缺“为什么这样设计 / 如何排查 / 取舍 / 极端场景”深问的，本维不合格。difficulty 1-2 的基础题豁免“区分资深”，但不得为凑深度注水或虚标难度。
 
 【准确性与时效】所有事实、版本、API、默认值、数值必须正确且贴合当前主流实践；不确定的断言宁可不写，不要编造。算法题要给正确复杂度与边界条件。
 
@@ -97,7 +103,7 @@ const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任�
 - animation：合法字段有 type / title / asset / fallback / caption。asset 为资源路径，fallback 必填。
 
 - recallPrompts：至少 1 条；第一条必须是该 topic 最核心、面试官最常开口问的那个问题（首轮练习兼容旧版 App 用）；每条对象结构必须是 \`{id, prompt, mode}\`，id 形如 \`<topic.id>.recall.<n>\`，mode 取值仅限 text / code / voice；可选附加 expectedMinutes（数字，分钟）、difficulty（1-5）。
-- rubric：必须含 mustHave（≥1 条）/ goodToHave / commonMistakes / scoreWeights 四个字段；scoreWeights 必须包含 coverage / accuracy / interviewExpression / depth 四个键，每个值是 0-100 的整数，**四个值之和必须严格等于 100**。
+- rubric：必须含 mustHave（≥1 条）/ goodToHave / commonMistakes / scoreWeights 四个字段；scoreWeights 必须包含 coverage / accuracy / interviewExpression / depth 四个键，每个值是 0-100 的整数，**四个值之和必须严格等于 100**。mustHave / goodToHave / commonMistakes 的每一项只能是知识点描述短语，禁止内嵌代码片段。
 - 总长度：精修后用 JSON.stringify 序列化的字符串长度不得少于原 topic 的 60%（信息量只增不减）。`;
 
 // ===== CLI 预设（auto-edit/workspace-write 允许写缓存文件，prompt 严格限定写缓存路径）=====
@@ -516,14 +522,10 @@ function balancedJsonObjectSlice(source) {
   return null;
 }
 
-// 容错修复：剥行/块注释、去 trailing comma，再尝试 parse。
+// 容错修复：剥行/块注释 + 去 trailing comma（均在 stripJsonComments 里做成字符串感知），再尝试 parse。
 function repairAndParseJson(source) {
-  let s = source;
-  // 剥行注释 // ...（仅在字符串外）
-  s = stripJsonComments(s);
-  // 去 trailing comma：}, 或 ], 形如  ,\s*}  /  ,\s*]
-  s = s.replace(/,(\s*[}\]])/g, "$1");
-  return JSON.parse(s);
+  // 注释剥离与 trailing comma 去除都只作用于字符串外，字符串值里的 // 、, ] 等原样保留。
+  return JSON.parse(stripJsonComments(source));
 }
 
 // 剥 // 行注释和 /* */ 块注释，识别字符串/转义，避免误删字符串内容。
@@ -559,6 +561,16 @@ function stripJsonComments(source) {
       while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i++;
       i += 2;
       continue;
+    }
+    // 字符串外的 trailing comma（逗号后跳过空白紧跟 } 或 ]）才丢弃；字符串内的逗号原样保留，
+    // 避免把 code 卡里 `{1, 2, }` / `arr[i, ]` 这类字符串值里的逗号误删、静默改坏内容。
+    if (ch === ",") {
+      let j = i + 1;
+      while (j < source.length && /\s/.test(source[j])) j++;
+      if (source[j] === "}" || source[j] === "]") {
+        i++;
+        continue;
+      }
     }
     out += ch;
     i++;
@@ -753,22 +765,45 @@ function runProcess(command, args, options, timeoutMs, progress = {}) {
     let timedOut = false;
     let settled = false;
     const startedAt = Date.now();
-    const heartbeatMs = progress.heartbeatMs ?? 10000;
+    const heartbeatMs = progress.heartbeatMs ?? 20000;
     const label = progress.label ?? command;
     const outputPath = progress.outputPath;
     const outputKind = outputPath ? "capture" : "stdout";
+    // 输出大小：文件协议读 capture 文件字节，否则取已累积的 stdout 长度。两条路径都能反映“还在不在吐”。
+    const currentOutputSize = () => {
+      if (outputPath) {
+        try { return statSync(outputPath).size; } catch { return 0; }
+      }
+      return stdout.length;
+    };
+    const stallMs = Number(progress.stallTimeoutMs ?? 0); // 0=关闭；>0=输出连续这么久无增长即判定卡死、提前结束并按可用性失败重试
+    let stalled = false;
+    let lastGrowthSize = 0;
+    let stallArmed = false; // 首次出字节后才武装——全程不吐字节的 buffered 调用不会被误杀（仍靠硬超时兜底）
+    let lastGrowthAt = startedAt;
+    let lastBeatSize = 0;
+    let lastBeatAt = startedAt;
     const stopTimers = () => {
       clearTimeout(timer);
       if (heartbeat) clearInterval(heartbeat);
+      if (stallTimer) clearInterval(stallTimer);
     };
     const printHeartbeat = (kind = "WAIT", force = false) => {
       if (progress.suppressHeartbeat && !force) return;
-      const elapsed = Date.now() - startedAt;
-      const outputSize = outputPath ? fileSizeLabel(outputPath) : `${stdout.length}B`;
+      const now = Date.now();
+      const size = currentOutputSize();
+      const dt = Math.max(1, Math.round((now - lastBeatAt) / 1000));
+      const delta = size - lastBeatSize;
+      lastBeatSize = size;
+      lastBeatAt = now;
+      const sizeLabel = outputPath ? fileSizeLabel(outputPath) : `${size}B`;
+      const idleS = Math.round((now - lastGrowthAt) / 1000);
       const stderrTail = tailLine(stderr);
+      // Δ 是“距上次心跳新增的字节/秒数”，肉眼即可判断还在不在吐；idle 是“多久没增长”，接近 stall 阈值就快被判死。
       console.log(
-        `[${kind}] ${label} elapsed=${formatDuration(elapsed)} / timeout=${formatDuration(timeoutMs)} ` +
-          `${outputKind}=${outputSize} stderr=${stderr.length}B${stderrTail ? ` last="${stderrTail}"` : ""}`,
+        `[${kind}] ${label} elapsed=${formatDuration(now - startedAt)} / timeout=${formatDuration(timeoutMs)} ` +
+          `${outputKind}=${sizeLabel} Δ${delta >= 0 ? "+" : ""}${delta}B/${dt}s${idleS >= 30 ? ` idle=${idleS}s` : ""} ` +
+          `stderr=${stderr.length}B${stderrTail ? ` last="${stderrTail}"` : ""}`,
       );
     };
     const timer = setTimeout(() => {
@@ -781,11 +816,45 @@ function runProcess(command, args, options, timeoutMs, progress = {}) {
       ? setInterval(() => printHeartbeat(), heartbeatMs)
       : null;
     heartbeat?.unref();
+    // 空转看门狗：以远小于硬超时的节奏轮询输出大小；连续 stallMs 无增长即判定子进程卡死（route 挂起/限流空等/
+    // 连接 hang），提前 SIGTERM→SIGKILL，并在 close 里按"可用性失败"reject（触发重试 + 模型降级），不再干等硬超时。
+    // 首次出字节后才武装（stallArmed）——全程不吐字节的 buffered 调用不会被误杀（仍靠硬超时兜底），
+    // 而"流式吐到一半卡住"的能被早抓。
+    const stallTimer = stallMs > 0 && !progress.suppressHeartbeat
+      ? setInterval(() => {
+          if (settled || timedOut || stalled) return;
+          const size = currentOutputSize();
+          if (size > lastGrowthSize) {
+            if (!stallArmed) {
+              stallArmed = true;
+              lastGrowthAt = Date.now();
+            } else {
+              lastGrowthAt = Date.now();
+            }
+            lastGrowthSize = size;
+            return;
+          }
+          if (!stallArmed) return; // 还没出过字节，不判 stall
+          const idle = Date.now() - lastGrowthAt;
+          if (idle >= stallMs) {
+            stalled = true;
+            const sizeLabel = outputPath ? fileSizeLabel(outputPath) : `${size}B`;
+            console.log(`[STALL] ${label} 输出 ${Math.round(idle / 1000)}s 无增长（${outputKind}=${sizeLabel}），判定卡死，提前结束并重试`);
+            killChildProcess(child, "SIGTERM");
+            setTimeout(() => killChildProcess(child, "SIGKILL"), 3000).unref();
+          }
+        }, Math.max(5000, Math.min(stallMs, 15000)))
+      : null;
+    stallTimer?.unref();
     if (!progress.suppressSpawn) {
       console.log(`[SPAWN] ${label} pid=${child.pid ?? "?"} timeout=${formatDuration(timeoutMs)}`);
     }
-    child.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
+    // setEncoding 让 Node 内部 StringDecoder 跨 chunk 正确拼接多字节 UTF-8——否则一个中文字符被切在
+    // chunk 边界时，对单个 Buffer 调 toString() 会解出替换符 �，污染 qwen structured 路径的 topic 正文。
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk) => { stdout += chunk; });
+    child.stderr?.on("data", (chunk) => { stderr += chunk; });
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
@@ -801,6 +870,10 @@ function runProcess(command, args, options, timeoutMs, progress = {}) {
       const elapsed = Date.now() - startedAt;
       if (shutdownRequested) {
         reject(makeInterruptedError(signal || "SIGINT"));
+      } else if (stalled) {
+        const err = new Error(`stalled: 输出连续 ${Math.round(stallMs / 1000)}s 无增长，提前结束（疑似 route 挂起/限流/连接卡死）`);
+        err.availabilityFailure = true; // 计入模型降级 + 触发重试，换链上下一个模型/route
+        reject(err);
       } else if (timedOut) {
         reject(new Error(`timeout after ${timeoutMs}ms`));
       } else if (code === 0 || progress.allowNonZero) {
@@ -2135,6 +2208,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
     suppressSpawn: !detailedProgress,
     suppressDone: !detailedProgress,
     heartbeatMs: cfg.heartbeatMs,
+    stallTimeoutMs: cfg.stallTimeoutMs,
   };
   const safeRef = ref.replace(/[^a-z0-9]+/gi, "-");
   const cacheDir = path.join(runDir, "topic-cache");
@@ -3168,8 +3242,9 @@ async function main() {
   const progressStyle = String(
     args["progress-style"] ?? process.env.QUALITY_REFINE_PROGRESS_STYLE ?? (previewMode ? "topic" : "summary"),
   ).trim();
-  const defaultHeartbeatSeconds = progressStyle === "summary" ? 60 : 10;
+  const defaultHeartbeatSeconds = progressStyle === "summary" ? 60 : 20;
   const heartbeatSeconds = Number(args["heartbeat-seconds"] ?? process.env.QUALITY_REFINE_HEARTBEAT_SECONDS ?? defaultHeartbeatSeconds);
+  const stallTimeoutMs = Number(args["stall-timeout-ms"] ?? process.env.QUALITY_REFINE_STALL_TIMEOUT_MS ?? 150000);
   const options = {
     scope,
     diffRef: args["diff-ref"],
@@ -3194,12 +3269,13 @@ async function main() {
     throw new Error(`--degrade-window-seconds 必须在 [5, 3600] 范围内，实际 ${degradeWindowSeconds}`);
   }
   ensureInt(heartbeatSeconds, "heartbeat-seconds", 0, 600);
+  if (!Number.isInteger(stallTimeoutMs) || stallTimeoutMs < 0) throw new Error("--stall-timeout-ms 必须是 >=0 的整数（0=关闭）");
   if (!["quiet", "summary", "topic"].includes(progressStyle)) {
     throw new Error("--progress-style 必须是 quiet | summary | topic");
   }
   if (!Number.isInteger(timeoutMs) || timeoutMs < 30000) throw new Error("--timeout-ms 必须是 >=30000 的整数");
   if (!Number.isInteger(minScore) || minScore < 1 || minScore > 100) throw new Error("--min-score 必须在 [1,100]");
-  const progressCfg = { progressStyle, heartbeatMs: heartbeatSeconds * 1000, timeoutMs };
+  const progressCfg = { progressStyle, heartbeatMs: heartbeatSeconds * 1000, timeoutMs, stallTimeoutMs };
 
   // 审计预览：不调用任何 LLM，只看当前还差哪些篇、各篇缺口。
   if (auditOnly) {
@@ -3240,6 +3316,7 @@ async function main() {
     usePty: Boolean(args["use-pty"]),
     noDefaultExtraArgs: Boolean(args["no-default-extra-args"]),
     heartbeatMs: heartbeatSeconds * 1000,
+    stallTimeoutMs,
     progressStyle,
     autoConcurrencyMin,
   });

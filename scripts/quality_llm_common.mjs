@@ -467,6 +467,7 @@ export function renderReviewPrompt(review) {
       difficultyFit: 0,
       learnerClarity: 0,
       coverage: 0,
+      seniorityDiscrimination: 0,
     },
     blockingFindings: [],
     reviewedTopics: review.request.targets.map((target) => ({
@@ -521,6 +522,7 @@ export function renderReviewPrompt(review) {
 6. \`difficultyFit\` 难度匹配：内容深度与 \`difficulty\` 标注是否一致——difficulty 1-2 不应有入门铺垫注水或论文式展开，difficulty 4-5 必须讲透机制、失败路径和权衡，不能浅尝辄止。
 7. \`learnerClarity\` 可教会零基础：句子是否清晰，术语是否先解释，是否避免把多个概念挤成一个认知跳跃。
 8. \`coverage\` 面试覆盖完整性：按“这个 title / difficulty 的知识点，资深面试官真正会考什么”判断关键面是否讲全；不要只拿本篇自己的 rubric/recallPrompts 当标尺。
+9. \`seniorityDiscrimination\` 区分度天花板：判断这篇“能筛到哪个职级”。技术类 difficulty≥3 必须能区分资深（对标 P7）、4-5 须到专家深度（P7+：源码级机制、架构权衡、极端规模、疑难定位）；非技术类按对应职业专家纵深。只考“是什么/列举”、缺“为什么这样设计/如何排查/取舍/极端场景”深问的给 ≤3；difficulty 1-2 基础题诚实标注、不注水即给 4。
 
 ## 证据要求（防止走过场）
 
@@ -541,6 +543,8 @@ export function renderReviewPrompt(review) {
 - 任一核心维度低于 4 分。
 - topic 学完无法回答自己的 mustHave 或 recallPrompts。
 - 语言明显模板化，像通用生成骨架，不像为当前知识点写的内容。
+- rubric.mustHave/goodToHave/commonMistakes 内嵌代码片段（throw new ...()、function、=>、带分号语句、缩进代码块）——代码只该在 code 卡。
+- diagram 是纯线性关键词链（无分支/汇合/状态转移）或终点为“面试结论/答题要点/总结”类汇聚节点的假图。
 
 不要为了让提交通过而调高分数：fail 报告的正确处理方式是修复内容后重新评审，而不是修改报告。
 

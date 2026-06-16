@@ -28,6 +28,7 @@ export const JUDGE_DIMENSIONS = [
   "difficultyFit", // 内容深度与 difficulty 标注一致
   "learnerClarity", // 零基础读者能否真看懂：句子清晰、术语先解释、认知负荷不过载
   "coverage", // 面试关键面是否讲全（按知识点该考什么评，不许拿本篇 rubric 当标尺）
+  "seniorityDiscrimination", // 区分度天花板：技术类对标 P7/P7+——difficulty≥3 须能区分资深、4-5 须到专家深度；非技术类对应专家纵深；difficulty 1-2 基础题诚实标注即可
 ];
 
 export const DIMENSION_FLOOR = 4; // 任一维 <4 视为不达标
@@ -66,12 +67,15 @@ export function buildJudgePrompt(topic, ref) {
 6. difficultyFit 难度匹配：内容深度与 difficulty 标注是否一致（低难不注水、高难讲透机制与权衡）。
 7. learnerClarity 可教会零基础：一个不懂的人能否真看懂——句子是否清晰、术语是否先解释、认知负荷是否过载。
 8. coverage 面试覆盖完整性：按“这个 title / difficulty 的知识点，资深面试官真正会考什么”来判断关键面是否讲全。**严禁拿本篇自己的 rubric/recallPrompts 当标尺**（那是循环论证）；要按你对该知识点的专家认知判断有没有漏掉该讲的点。
+9. seniorityDiscrimination 区分度天花板：判断这篇“能筛到哪个职级”。技术类 difficulty≥3 必须深到能区分资深（对标 P7），difficulty 4-5 必须到专家深度（P7+：源码级机制、架构权衡、极端规模、疑难定位）；非技术类按对应职业的资深纵深。只考“是什么/列举”、recallPrompts/followUpQuestions 缺“为什么这样设计而非另一种 / 线上如何排查 / 取舍 / 极端场景”深问的，本维给 ≤3。difficulty 1-2 的基础题只要诚实标注、紧凑不注水即给 4，不要求其区分资深。
 
 硬性要求：
 - score 用 0-100；任一维 <4，或存在 wrong/outdated 事实，verdict 必须为 fail。
 - factFindings 至少 3 条，覆盖定义、机制、边界/失败路径等关键事实；wrong/outdated 的事实必须同时进 blockingFindings。
 - followUpFindings 必须逐条评每个 interviewAnswer 的 followUpQuestion：isSpecific（是否本题专属、不泛化）、answerAdequate（答案是否到位），不达标给出 fix。
 - clarityFindings / coverageFindings 指出零基础读者会卡住的地方、以及面试该讲却没讲的关键面。
+- rubric.mustHave/goodToHave/commonMistakes 内嵌代码片段（throw new ...()、function、=>、带分号语句、缩进代码块）→ 判 fail 并进 blockingFindings；代码只该在 code 卡。
+- diagram 是纯线性关键词链（无分支/汇合/状态转移）或终点为“面试结论/答题要点/总结”类汇聚节点 → 判为假图，压低 expertVoice 并在 voiceFindings 标记要求重画。
 - 不要臆造；无法核验的事实标 suspicious 并在 evidence 说明原因。
 
 输出 JSON schema（仅示意字段，值要按真实评审填）：
@@ -117,6 +121,8 @@ ${JUDGE_DIMENSIONS.map((d, index) => `${index + 1}. ${d}`).join("\n")}
 - score 用 0-100；任一维 <4，或存在 wrong/outdated 事实，verdict 必须为 fail。
 - factFindings 每篇至少 3 条，覆盖定义、机制、边界/失败路径等关键事实；wrong/outdated 的事实必须同时进 blockingFindings。
 - coverage 必须按“这个 title / difficulty 的知识点，资深面试官真正会考什么”判断，严禁拿本篇自己的 rubric/recallPrompts 当唯一标尺。
+- seniorityDiscrimination 区分度天花板：技术类 difficulty≥3 必须能区分资深（对标 P7）、4-5 须到专家深度（P7+），非技术类按对应专家纵深；只考“是什么/列举”、缺“为什么这样设计/如何排查/取舍/极端场景”深问的给 ≤3；difficulty 1-2 基础题诚实标注即给 4。
+- rubric.mustHave/goodToHave/commonMistakes 内嵌代码片段 → fail；diagram 是纯线性关键词链或终点为“面试结论/答题要点”类汇聚节点 → 判假图、压低 expertVoice。
 
 输出 JSON schema（仅示意字段，值要按真实评审填）：
 ${JSON.stringify(schema, null, 2)}

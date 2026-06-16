@@ -489,6 +489,12 @@ const proseFillerPattern =
   /本质上|可以理解为|核心是|关键在于|需要注意的是|换句话说|简单来说|从这个角度看/g;
 const shortRubricAllowPattern =
   /^(BFS|DFS|DP|LRU|LFU|AQS|CAS|MVCC|JWT|TLS|SSL|TCP|UDP|HTTP|HTTPS|DNS|CDN|GC|JVM|JIT|BFC|GMP|MCP|RAG|ETL|CDC|OLAP|OLTP|DDL|DML|SQL|NoSQL|ACID|CAP|BASE|CI\/CD|IaC|SRE|DDD|CQRS|Pod|K8s|Go|MySQL|Redis|MongoDB|Kafka|Spark|Flink|Hive|路径|状态|队列|栈|堆|锁|事务|索引|缓存|分片|分区|副本|主键|外键|快照|回溯|剪枝|哈希|递归|指针|滑窗|窗口|协议|证书|权限|认证|授权)$/i;
+// rubric 内嵌代码：评分标准只能是知识点短语，代码只该进 code 卡（AI 生成器高发 bug，如 throw new ...();）。高精度匹配真实代码结构，避免误判 ThreadLocal.get() 这类 API 名。
+const rubricCodePattern =
+  /throw\s+new\s+[A-Za-z_]\w*\s*\(|\bfunction\s+\w*\s*\([^)]*\)\s*\{|=>\s*[\{(]|`{3}|[A-Za-z_]\w*\s*\([^)]*\)\s*;\s*$|\)\s*\{\s*$|\bconsole\.\w+\s*\(|\bnew\s+[A-Z]\w*\s*\([^)]*\)\s*;/;
+// 假图（关键词直链）的可靠确定性信号：图以“面试结论/答题要点/总结”这类元节点收尾——真正的机制图不会有一个节点叫“面试结论”。纯线性链本身可能是合法顺序流程，不在确定性门禁里硬判，交给 LLM 判官。
+const diagramConclusionNodePattern =
+  /^(面试结论|答题结论|答题要点|面试表达|面试回答|结论与表达|要点总结|考点总结|复述要点|总结提炼|学习主线|答题脚手架)$/;
 
 function isAcceptableShortRubricItem(item, topic) {
   const clean = item.trim();
@@ -1148,6 +1154,23 @@ function scoreTopic(topic, ref, corpus) {
       if (machineRelationPhrasePattern.test(`${card.title ?? ""}${card.content ?? ""}${fallbackText}`)) {
         deduct(6, `图示存在机器拼接关系短语：${card.title}`);
       }
+      if (labels.some((label) => diagramConclusionNodePattern.test(label.trim()))) {
+        deduct(6, `图示以“面试结论/答题要点”类元节点收尾，是关键词直链假图，必须重画为机制图：${card.title}`);
+        capScore(89, "diagram 收束到「面试结论」类元节点，是关键词直链假图");
+      }
+      if (/学习主线|知识全景|核心概念图|深入理解图|学习路线图/.test(card.title ?? "")) {
+        deduct(5, `图示标题是 AI 脚手架式空泛标题（应写本图的具体考点，如“握手三步与状态迁移”）：${card.title}`);
+      }
+      if (
+        mermaid &&
+        (mermaid.type === "flowchart" || mermaid.type === "graph") &&
+        topic.difficulty >= 4 &&
+        mermaid.nodeCount >= 5 &&
+        !hasMermaidBranch(card.content ?? "") &&
+        !/\|[^|]+\|/.test(card.content ?? "")
+      ) {
+        deduct(3, `高阶题图是无分支、无边标签的线性链，疑似关键词直链，建议补失败路径/分支或在连线上标注机制：${card.title}`);
+      }
       if (
         generatedDiagramTitlePattern.test(card.title ?? "") &&
         generatedDiagramCaptionPattern.test(card.caption ?? "") &&
@@ -1268,6 +1291,10 @@ function scoreTopic(topic, ref, corpus) {
       }
       if (machineRelationPhrasePattern.test(item)) {
         deduct(5, `rubric.${sectionName} 存在机器拼接关系短语：${item}`);
+      }
+      if (rubricCodePattern.test(item)) {
+        deduct(6, `rubric.${sectionName} 内嵌代码片段，代码只该放 code 卡：${item.slice(0, 40)}`);
+        capScore(89, "rubric 含代码片段（AI 生成器 bug），不能作为发布态评分标准");
       }
       if (genericRubricItemPattern.test(item.trim())) {
         deduct(sectionName === "mustHave" ? 5 : 4, `rubric.${sectionName} 条目过泛：${item}`);
@@ -1781,6 +1808,17 @@ async function main() {
     duplicateTitleIssues,
     duplicateLanguageIssues,
     domains: domainReports,
+    // 跨域优先级地图（最差在前）：替代人工审计的“哪个域最烂、先动哪”。tier 仅按确定性分；门禁过(≥90)≠内容真达标，区分度/假图/模板腔需本地精修器判官把关。
+    domainPriority: [...domainReports]
+      .sort((a, b) => a.score - b.score || b.failingTopics - a.failingTopics)
+      .map((d) => ({
+        tier: d.score < 80 ? "P0" : d.score < minScore || d.failingTopics ? "P1" : "P2",
+        id: d.id,
+        score: d.score,
+        grade: d.grade,
+        failingTopics: d.failingTopics,
+        minTopicScore: d.minTopicScore,
+      })),
     allTopics: topicReports.map((item) => ({ score: item.score, grade: item.grade, domain: item.domain, title: item.title, ref: item.ref })),
     failingTopics: failingTopics
       .sort((a, b) => a.score - b.score || a.domain.localeCompare(b.domain))
@@ -1823,10 +1861,13 @@ async function main() {
         console.log(`- ${name}: ${(entry.sum / topicReports.length).toFixed(1)} / ${entry.min.toFixed(1)}`);
       }
     }
-    console.log("\nDomains:");
-    for (const domain of domainReports) {
-      console.log(`- ${domain.id}: ${domain.score}/100 (${domain.grade}), minTopic=${domain.minTopicScore}, failingTopics=${domain.failingTopics}`);
+    console.log("\nDomain priority (worst first — 先修这些):");
+    for (const domain of result.domainPriority) {
+      console.log(
+        `- [${domain.tier}] ${domain.id}: ${domain.score}/100 (${domain.grade}), 跌破 ${minScore} ${domain.failingTopics} 篇, 最低 ${domain.minTopicScore}`,
+      );
     }
+    console.log("注：门禁过(≥90)≠内容真达标——区分度不足、关键词直链假图、模板腔需本地精修器(quality:refine)判官把关。");
     if (orderIssues.length) {
       console.log("\nOrder issues:");
       for (const issue of orderIssues) console.log(`- ${issue}`);

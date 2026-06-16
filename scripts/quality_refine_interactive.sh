@@ -48,6 +48,7 @@ JUDGE_JSON_RETRIES=2
 JUDGE_WARM_CONCURRENCY=""   # 空 = 跟随 CONCURRENCY
 PROGRESS_STYLE="summary"
 HEARTBEAT_SECONDS=60
+STALL_TIMEOUT_SECONDS=150
 SELECTED_DOMAIN_IDS=()
 SCOPE_ARGS=()
 TOPIC_REF=""
@@ -58,7 +59,7 @@ ASK_VALUE=""
 # --last 短路：命令行加 --last 后跳过中间所有题，仅保留 SCOPE/LIMIT/MAX_ROUNDS 让用户回车确认。
 REPLAY_FLAG=0
 LAST_CONFIG_FILE=".quality-refine/last-config.env"
-LAST_CONFIG_VERSION=2
+LAST_CONFIG_VERSION=3
 
 # 模型路由相关数组（在 choose_model_chain / choose_judge_models 里填充；这里预声明便于复用模式安全引用）
 MODEL_CHAIN_ITEMS=()
@@ -816,7 +817,7 @@ choose_quality_options() {
     fields+=("conc" "rounds" "limit")
   fi
   if [[ "$RUN_MODE" != "audit" ]]; then
-    fields+=("retries" "timeout" "degrade")
+    fields+=("retries" "timeout" "stall" "degrade")
   fi
   local total="${#fields[@]}"
   local idx=0 rc field
@@ -829,6 +830,7 @@ choose_quality_options() {
       limit)   ask_optional_number "每轮最多处理篇数 limit" 1 9999 >/dev/null; rc=$? ;;
       retries) ask_number "单篇失败重试次数 retries" "$RETRIES" 0 5 >/dev/null; rc=$? ;;
       timeout) ask_number "单篇超时秒数" "$TIMEOUT_SECONDS" 30 7200 >/dev/null; rc=$? ;;
+      stall)   ask_number "空转看门狗秒数（0=关闭）" "$STALL_TIMEOUT_SECONDS" 0 7200 >/dev/null; rc=$? ;;
       degrade) ask_number "连续多少次 CLI 不可用后降级模型" "$DEGRADE_AFTER" 1 50 >/dev/null; rc=$? ;;
     esac
     if (( rc == 0 )); then
@@ -839,6 +841,7 @@ choose_quality_options() {
         limit)   LIMIT="$ASK_VALUE" ;;
         retries) RETRIES="$ASK_VALUE" ;;
         timeout) TIMEOUT_SECONDS="$ASK_VALUE" ;;
+        stall)   STALL_TIMEOUT_SECONDS="$ASK_VALUE" ;;
         degrade) DEGRADE_AFTER="$ASK_VALUE" ;;
       esac
       idx=$((idx + 1))
@@ -1043,7 +1046,7 @@ build_qwen_routes_json() {
     [[ -n "$base_url" ]] && { has_route=1; break; }
   done
   (( has_route == 1 )) || { printf ''; return 0; }
-  /usr/local/bin/node - "$@" <<'NODE'
+  node - "$@" <<'NODE'
 const out = {};
 const argv = process.argv.slice(2);
 for (let i = 0; i < argv.length; i += 3) {
@@ -1065,6 +1068,7 @@ build_common_refine_args() {
     --min-score "$MIN_SCORE"
     --retries "$RETRIES"
     --timeout-ms "$((TIMEOUT_SECONDS * 1000))"
+    --stall-timeout-ms "$((STALL_TIMEOUT_SECONDS * 1000))"
     --degrade-after "$DEGRADE_AFTER"
     --progress-style "$PROGRESS_STYLE"
     --heartbeat-seconds "$HEARTBEAT_SECONDS"
@@ -1184,7 +1188,12 @@ run_refine() {
       return 1
     fi
     title "同步环境内容"
-    node scripts/sync_environment_content.mjs "$STAGE_TARGET"
+    # run_refine 内部重开了 set -e（捕获 node 退出码后），这里若不守护，sync 失败会硬中断、
+    # 盖掉 main 的 set +e 优雅捕获；topics/ 此时已写好，提示可单独重跑 sync 即可。
+    if ! node scripts/sync_environment_content.mjs "$STAGE_TARGET"; then
+      printf '%s\n' "${YELLOW}环境同步失败：topics/ 已更新但未同步到 ${STAGE_LABEL}。可单独重跑：node scripts/sync_environment_content.mjs ${STAGE_TARGET}${RESET}"
+      return 1
+    fi
     printf '%s\n' "${GREEN}已同步：${STAGE_LABEL}${RESET}"
   else
     printf '%s\n' "${YELLOW}精修未完全达标，已跳过 staging/draft 同步。可以修完后重新运行。${RESET}"
@@ -1203,7 +1212,7 @@ summary() {
     printf 'CLI：%s\n' "$SELECTED_CLI"
     printf '模型链：%s\n' "${MODEL_CHAIN:-CLI默认}"
     print_qwen_route_summary
-    printf '重试：%s 次，超时：%s 秒，降级阈值：%s\n' "$RETRIES" "$TIMEOUT_SECONDS" "$DEGRADE_AFTER"
+    printf '重试：%s 次，超时：%s 秒，空转看门狗：%s 秒，降级阈值：%s\n' "$RETRIES" "$TIMEOUT_SECONDS" "$STALL_TIMEOUT_SECONDS" "$DEGRADE_AFTER"
     printf '进度：%s，心跳：%s 秒（每完成一篇立即刷一行）\n' "$PROGRESS_STYLE" "$HEARTBEAT_SECONDS"
   fi
   if [[ "$RUN_MODE" == "refine" ]]; then
@@ -1278,6 +1287,7 @@ save_last_config() {
     printf 'MAX_ROUNDS=%q\n' "$MAX_ROUNDS"
     printf 'RETRIES=%q\n' "$RETRIES"
     printf 'TIMEOUT_SECONDS=%q\n' "$TIMEOUT_SECONDS"
+    printf 'STALL_TIMEOUT_SECONDS=%q\n' "$STALL_TIMEOUT_SECONDS"
     printf 'DEGRADE_AFTER=%q\n' "$DEGRADE_AFTER"
     printf 'PROGRESS_STYLE=%q\n' "$PROGRESS_STYLE"
     printf 'HEARTBEAT_SECONDS=%q\n' "$HEARTBEAT_SECONDS"
