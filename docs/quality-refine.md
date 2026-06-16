@@ -1,6 +1,8 @@
-# 内容精修器
+# 内容精修器（v3，API 模式）
 
 精修器用于替代过去的 CI LLM 评分报告流程。CI 现在只跑确定性校验：`npm run validate`、`npm run quality:scan`、`npm run quality:audit`。LLM 质量检查和内容重写由维护者在本机按需运行精修器完成。
+
+> **v3 重大变更**（2026-06-17）：CLI 调度路径全部删除，统一走 OpenAI 兼容 API；流式 SSE + token 实时显示；额度耗尽全局暂停闸（手动 / 自动探活 / 跳过三种策略）；模型清单 `scripts/llm/env-config.mjs` 硬编码 13 个 spec；所有默认值都在 `.env`，交互向导一路回车即可开跑。9 维度评分、反刷分、keep-best、块合并、空转看门狗、确定性门禁全部保留。
 
 ## 推荐入口
 
@@ -16,42 +18,91 @@ npm run quality:refine:interactive
 ./scripts/quality_refine_interactive.sh
 ```
 
+首次运行需要先把 secret 灌进 `.env`：
+
+```bash
+cp .env.example .env
+node scripts/llm/seed-env.mjs           # 从 ~/.qwen/settings.json 的 env 段把 API key 写入,不覆盖已填值
+node scripts/llm/seed-env.mjs --upgrade-defaults  # 把 .env 里的旧默认值升级到 v3
+```
+
 交互器会依次选择：
 
 1. 同步阶段：全部、仅测试、仅草稿。
 2. 运行模式：正式精修、测试预览、仅审计。
 3. 领域：全部、单领域、多领域。
 4. Topic：列出所选领域内全部 topic；正式模式可选全部、多个编号、范围、随机或手动路径；测试预览只选单篇，直接回车会随机一篇。
-5. 执行参数：合格分、并发、轮数、limit、重试、超时、降级阈值。
-6. CLI agent：自动扫描本机安装的 `qwen`、`codex`、`claude`、`gemini`、`opencode` 等，优先显示 qwen。
-7. 模型链：只展示所选 CLI 的配置模型；可选择多个模型组成降级链。
-8. 判官模型：默认跟精修模型链一致，也可多选组成 ensemble，或选择不启用判官。
-9. 判官数量与动态免改线：配置每个判官模型的实例数、`dynamic-skip-min`、`judge-batch-size`、`judge-warm-concurrency`（判前预热并发，默认与精修并发一致）。
+5. 执行参数：合格分、并发、轮数、limit、重试、超时、降级阈值、**额度耗尽行为**（manual / auto-probe / skip）。
+6. 精修模型链：默认走 `.env REFINE_MODEL_CHAIN`（默认 `volcengine:glm-5.1,volcengine:deepseek-v4-flash`），回车跳过；老手可手选或自定义。
+7. 判官模型：默认走 `.env JUDGE_MODEL_CHAIN`（默认 `volcengine:deepseek-v4-pro,volcengine:deepseek-v4-flash`），回车跳过；可多选组成 ensemble，或选 0 关闭判官。
+8. 判官参数：投票数、动态免改线、批量大小、预热并发。
+9. 确认。
 
 每一步都支持：
 
-- `b`、`back`、`上一步`、`返回`：回到上一层；多输入步骤（执行参数、判官参数）按 `b` 只回退到上一道子题，第一题再按 `b` 才整步退出。
+- `b`、`back`、`上一步`、`返回`：回到上一层。
 - `q`、`quit`、`退出`、`取消`：退出。
+- 任何参数填好后，下次启动器会问要不要复用上次配置；想直接开跑就回车 Yes。
 
 ## 核心原则
 
-- 一个 CLI 调用只处理一个 topic。领域或多 topic 选择只是队列，不会把整个领域塞进同一个 prompt。
-- 并发表示同时启动多个“单 topic CLI 子进程”。如果希望绝对串行，把并发设为 `1`。
-- 并发大于 `3` 时，默认启用自适应并发：遇到限流、服务繁忙、超时、非零退出等可用性失败，会把并发逐步降到 `3`，并重试这些失败 topic；内容校验失败不会触发并发降级。
-- 启用判官时，第一轮会先对 scope 内 topic 做判前评审，并按 `contentHash` 缓存；全域运行会按 `judge-batch-size` 批量预热缓存，预热阶段以 `judge-warm-concurrency` 个 worker 并发跑批，启动行会打印 `missing/cached/batches/并发/预计` 估时，每完成一批刷一行进度（`summary` 模式还会按表头打印 已用/剩余/缓存/最新 引用列）。判官输出和精修输出一样走本地文件协议，文件必须带 `//---END---`，主进程严格解析合法 JSON，格式失败只允许同批重试，不能作为正常回退路径吞掉。
-- 静态分数是地板，判官分数是语义天花板。静态分达标且判官达到 `dynamic-skip-min`、所有评估维度均不低于 4、无 blocking 时，topic 会直接跳过改写。
-- 内容深度对标真实职级：技术域写到 **P7/P7+（资深/专家）** 的纵深，非技术域写到对应职业的资深纵深。判官的 `seniorityDiscrimination`（区分度天花板）维度专门把关这一点——difficulty≥3 缺“为什么这样设计 / 如何排查 / 取舍 / 极端场景”深问的会被压分；difficulty 1-2 的基础题诚实标注即可，不必拔高。rubric 内嵌代码、纯线性关键词链假图都会被判 fail，触发重写。
-- 未达标 topic 才进入逐篇改写；候选会先跑 invariant、静态审计和判后评审，再用回归向量决定整篇接受、保留旧版，或只合并变好的块。
-- 块级合并只吸收被静态检查和块级判官确认更好的块；合并前后会检查重复块回归，候选不得新增同类型同标题重复块，也不得增加同类型语义高度相似的卡片对。
-- 后续轮次只复修仍低于 `min-score` 或判官未达标的 topic，避免已经达标的内容反复重写。
-- 正式精修写回 `topics/`；只有全部目标最终达标时，交互脚本才会按阶段同步到 `staging/`、`draft/`。
-- 测试预览不改仓库内容，产物写入 `.quality-refine/preview/`，并在终端渲染文字版。
-- 执行期间会输出单篇开始、完成/失败和重试信息。正式模式默认每 30 秒输出一条聚合 `[RUNNING]`，不会按每个 CLI 子进程刷屏；测试预览默认显示单篇 `[SPAWN]` / `[WAIT]` / `[DONE]` 细反馈。
-- 正式模式的配置摘要、scope 标题、`[RUNNING]` 心跳和单篇完成行都会显示当前并发；自动降级后会显示新的并发值。
-- 可用 `--progress-style summary|topic|quiet` 控制反馈密度；`summary` 会按阶段输出低频心跳，并在每完成一篇时刷一行紧凑进度表。可用 `--heartbeat-seconds` 或 `QUALITY_REFINE_HEARTBEAT_SECONDS` 调整心跳间隔，`0` 表示关闭心跳。
-- 按 `Ctrl-C` 会中断当前精修，并尝试终止正在运行的外部 CLI 子进程；再次按 `Ctrl-C` 会强制退出。
+- **API 模式独占**。所有 LLM 调用统一走 `scripts/llm/runner.mjs` → `openai-runner.mjs`，无任何 CLI 子进程；模型清单硬编码在 `scripts/llm/env-config.mjs`（13 个 OpenAI 兼容 spec），spec 格式 `<provider>:<modelId>`。
+- 一次精修一个 topic（API 调用，无子进程隔离需求）。领域或多 topic 选择只是队列。
+- 并发表示同时跑多个精修请求；遇到限流/超时/5xx 自动收敛到 `--auto-concurrency-min`。
+- **流式 SSE**：每个调用默认 `stream:true`，token 实时刷在固定栏的子 agent 行（含 `tok N · 最新一行`）；不支持流式的 provider 自动回退非流式。
+- **schema 自适应**：先尝试 `response_format=json_schema`（strict），不支持的端点（如火山方舟）自动降级到 `json_object` 再到 `prompt 注入 schema`，整个 spec 会缓存它能用的 mode 避免重复探测。
+- **额度耗尽行为可选**：
+  - `manual`（默认）：429/402/quota 关键词命中时全局 `pauseBus.pause()`，所有 worker 阻塞；用户在终端按 Enter 继续 / `a` 切自动探活 / `s` 跳过当前篇 / `p` 切回手动。
+  - `auto-probe`：按 `QUOTA_PROBE_BACKOFF_MS=60s,2m,5m,10m` 退避周期对暂停的 spec 发 1-token 探针，恢复即自动 resume。
+  - `skip`：本篇标记 `quota-skip`，跳下一篇继续。
+- **模型降级链**：连续 N 次（`LLM_DEGRADE_AFTER`，10min 滑窗）可用性失败才降到下一 spec；配额错误不计入降级（避免把暂停吞掉）。
+- 启用判官时，第一轮先对 scope 内 topic 做判前评审，按 `contentHash` 缓存。
+- 静态分数是地板，判官分数是语义天花板。两者都达标且所有维度均不低于 4 才直接跳过改写。
+- 内容深度对标真实职级：技术域写到 **P7/P7+（资深/专家）** 的纵深。判官的 `seniorityDiscrimination`（区分度天花板）维度专门把关：difficulty≥3 缺"为什么这样设计 / 如何排查 / 取舍 / 极端场景"会被压分；rubric 内嵌代码、纯线性关键词链假图直接判 fail。
+- 候选会先跑 invariant、静态审计和判后评审，再用回归向量决定整篇接受、保留旧版，或只合并变好的块。
+- **CI 静态门禁不变**：`scripts/content_quality_audit.mjs` / `quality_scan.mjs` / `quality_gate_staged.mjs` 全部不动。精修器以确定性审计为唯一验收线。
+- 按 `Ctrl-C` 中断当前精修；再次按强制退出。
 
-## 常用命令
+## 子 agent 行（固定栏，summary + TTY 模式）
+
+```
+├─ active workers (3) ────────────────────────
+ · java/concurrent/synchronized       生成   12s · glm-5.1@vol · tok 1820 · 改 interviewAnswer.followUpQuestions[0]…
+ · go/context-cancel                  判前    3s · ds-v4-pro@vol · tok 540 · 评估 explainCards[2]
+ · python/decorator-factory           判后   45s · ⏸ 暂停(额度耗尽 volcengine:glm-5.1)
+```
+
+每行实时刷新 `tok` 数和最新一行；`⏸` 表示该 worker 因配额暂停闸阻塞中。
+
+## .env 关键配置
+
+```bash
+# 模型链(默认值,精修便宜稳定、判官评分稳)
+REFINE_MODEL_CHAIN=volcengine:glm-5.1,volcengine:deepseek-v4-flash
+JUDGE_MODEL_CHAIN=volcengine:deepseek-v4-pro,volcengine:deepseek-v4-flash
+BLOCK_JUDGE_MODEL_CHAIN=volcengine:glm-5.1,volcengine:deepseek-v4-flash
+
+# 额度行为
+QUOTA_PAUSE_DEFAULT=manual                     # manual | auto-probe | skip
+QUOTA_PROBE_BACKOFF_MS=60000,120000,300000,600000
+
+# 流式日志
+LLM_STREAM=true
+LLM_LIVE_EVENTS=                                # 留空只渲染 TUI；填路径同时写 JSONL(未来 web shell)
+SUBAGENT_LAST_LINE_MAX=80
+
+# 交互向导默认值(填满后回车直达确认)
+DEFAULT_SCOPE=failing
+DEFAULT_LIMIT=20
+DEFAULT_MAX_ROUNDS=3
+DEFAULT_CONCURRENCY=4
+DEFAULT_MIN_SCORE=90
+DEFAULT_USE_JUDGE=true
+DEFAULT_JUDGE_COUNT=1
+DEFAULT_TEST_RUN=false
+```
+
+## 常用命令（直接 CLI）
 
 仅审计：
 
@@ -59,37 +110,19 @@ npm run quality:refine:interactive
 npm run quality:refine -- --audit-only --scope domain:go --min-score 90
 ```
 
-测试预览单篇：
+正式精修一个领域，模型链全 .env 默认：
 
 ```bash
 npm run quality:refine -- \
-  --preview \
-  --cli qwen \
-  --scope domain:go \
-  --topic topics/go/context.json \
-  --model-chain minimax-m3,deepseek-v4-pro \
-  --min-score 90
-```
-
-正式精修一个领域内全部 topic：
-
-```bash
-npm run quality:refine -- \
-  --cli qwen \
   --scope domain:go \
   --concurrency 3 \
   --max-rounds 3 \
   --retries 1 \
   --timeout-ms 600000 \
-  --heartbeat-seconds 60 \
-  --progress-style summary \
-  --model-chain minimax-m3,deepseek-v4-pro,glm-5.1 \
-  --judge-models minimax-m3,deepseek-v4-pro \
   --judge-count 1 \
   --dynamic-skip-min 85 \
   --judge-batch-size 5 \
   --judge-warm-concurrency 3 \
-  --judge-json-retries 2 \
   --min-score 90
 ```
 
@@ -97,7 +130,6 @@ npm run quality:refine -- \
 
 ```bash
 npm run quality:refine -- \
-  --cli qwen \
   --scope domain:go \
   --topics topics/go/context.json,topics/go/interface.json \
   --concurrency 1 \
@@ -115,59 +147,31 @@ node scripts/sync_environment_content.mjs draft
 
 交互式启动器会在正式精修成功后自动执行对应同步。
 
-## CLI 与模型降级
+## 模型 spec 与降级链
 
-交互器会扫描本机 PATH 中的常见 agent CLI，并优先显示 qwen。模型列表按选中的 CLI 分开读取，例如选择 qwen 时读取 qwen 配置中的模型；选择 codex 时只显示 codex 相关模型。
+支持的 13 个 spec（`scripts/llm/env-config.mjs`）：
 
-模型链用于处理“主模型频繁不可用”的情况：
-
-```bash
---model-chain model-a,model-b,model-c
+```
+volcengine:deepseek-v4-flash    volcengine:deepseek-v4-pro
+volcengine:glm-5.1              volcengine:minimax-m3
+longcat:LongCat-2.0-Preview
+deepseek:deepseek-v4-flash      deepseek:deepseek-v4-pro
+baidu:deepseek-v4-flash         baidu:glm-5            baidu:glm-5.1
+mimo:mimo-v2.5-pro
+opencode:glm-5.1                opencode:deepseek-v4-pro
 ```
 
-当当前模型连续达到 `--degrade-after` 次可用性失败后，自动降级到下一个模型。内容质量失败只触发该 topic 重试，不触发模型降级。
-
-并发降级独立于模型降级。直接指定 `--concurrency 4` 时，默认等价于允许降到 `--auto-concurrency-min 3`；如果想关闭并发降级，可以显式传 `--auto-concurrency-min 0`。
+每个 spec 在 `.env` 通过对应 `<HUOSHAN|DEEPSEEK|BAIDU|LONGCHAT|MIMO|OPENCODE>_API_KEY` 提供凭据。运行时 `discover_models` 只列出 .env 里有 key 的 spec。
 
 ## 进度与产物
 
-正式精修会输出类似：
-
-```text
-[3/12 ✓2 ✗1 | go | m=minimax-m3] c=3 OK topics/go/context.json
-[4/12 ✓2 ✗1 ★1 ⇄1 ◦1 | go | m=minimax-m3] c=3 MERGED topics/go/interface.json
-```
-
-含义：
-
-- 当前进度 / 总数。
-- 成功数与失败数。
-- `★` 整篇接受数，`⇄` 块级合并数，`◦` 判前已达标跳过数。
-- 当前领域。
-- 当前模型。
-- 当前并发。
-- 当前 topic 路径。
-
-正式批量运行等待外部 CLI 时会看到聚合心跳：
-
-```text
-[RUNNING] 3/12 ✓3 ✗0 active=2 elapsed=1m30s current=topics/go/context.json 44s m=minimax-m3 | topics/go/interface.json 41s m=minimax-m3
-```
-
-测试预览或 `--progress-style topic` 时还会看到单篇细反馈：
-
-```text
-[SPAWN] REFINE topics/go/context.json attempt=1/2 model=minimax-m3 pid=12345 timeout=10m00s
-[WAIT] REFINE topics/go/context.json attempt=1/2 model=minimax-m3 elapsed=30s / timeout=10m00s capture=42KB stderr=0B
-[DONE] REFINE topics/go/context.json attempt=1/2 model=minimax-m3 elapsed=1m42s capture=118KB
-```
+正式精修在 summary + TTY 下显示固定栏（含 `active workers` 子 agent 行带 token / lastLine），其它模式回退滚屏。
 
 每次运行的中间产物在 `.quality-refine/<runId>/`：
 
 - `progress.jsonl`：逐 topic 进度。
 - `summary.json`：最终汇总。
 - `judge-cache/`：按 `contentHash + rubricVersion + judgeSetHash` 缓存判官结果。
-- `*.raw.txt`：每篇 CLI 原始输出，便于排查。
 
 `.quality-refine/` 是本地运行产物，已在 `.gitignore` 中忽略。
 
@@ -181,4 +185,5 @@ npm run quality:scan
 npm run quality:audit
 ```
 
-本地 pre-commit hook 也是快速确定性门禁，只检查暂存 topic 的 JSON 和静态质量分。真正的语义质量、事实正确性、专家口吻和面试可用性，改由维护者人工触发精修器来把关。
+本地 pre-commit hook 也是快速确定性门禁。真正的语义质量、事实正确性、专家口吻和面试可用性，改由维护者人工触发精修器来把关。
+

@@ -49,6 +49,7 @@ JUDGE_WARM_CONCURRENCY=""   # 空 = 跟随 CONCURRENCY
 PROGRESS_STYLE="summary"
 HEARTBEAT_SECONDS=60
 STALL_TIMEOUT_SECONDS=150
+QUOTA_PAUSE_POLICY=""  # 空 = 用 .env QUOTA_PAUSE_DEFAULT
 SELECTED_DOMAIN_IDS=()
 SCOPE_ARGS=()
 TOPIC_REF=""
@@ -59,14 +60,13 @@ ASK_VALUE=""
 # --last 短路：命令行加 --last 后跳过中间所有题，仅保留 SCOPE/LIMIT/MAX_ROUNDS 让用户回车确认。
 REPLAY_FLAG=0
 LAST_CONFIG_FILE=".quality-refine/last-config.env"
-LAST_CONFIG_VERSION=3
+# v4：API 模式重构。SELECTED_CLI 退化为 "api" 标签；模型 spec 改成 "provider:modelId"，
+# baseUrl/envKey 由 mjs 端 env-config.mjs 在运行时按 spec 反查，不再持久化到 last-config。
+# 旧 v3 last-config 不兼容（带 CHAIN_BASE_URLS/CHAIN_ENV_KEYS 等已废弃字段），自动丢弃退手选。
+LAST_CONFIG_VERSION=4
 
-# 模型路由相关数组（在 choose_model_chain / choose_judge_models 里填充；这里预声明便于复用模式安全引用）
+# 模型 chain 单平行数组：仅存 spec（"provider:modelId"），不再保留路由元数据。
 MODEL_CHAIN_ITEMS=()
-CHAIN_BASE_URLS=()
-CHAIN_ENV_KEYS=()
-JUDGE_CHAIN_BASE_URLS=()
-JUDGE_CHAIN_ENV_KEYS=()
 
 hr() {
   printf '%s\n' "${DIM}────────────────────────────────────────────────────────${RESET}"
@@ -330,308 +330,35 @@ choose_domains() {
 }
 
 discover_clis() {
-  CLI_NAMES=()
-  CLI_PATHS=()
-  add_cli_candidate() {
-    local candidate="$1"
-    local resolved
-    if [[ -z "$candidate" ]]; then
-      return
-    fi
-    resolved="$(command -v "$candidate" 2>/dev/null || true)"
-    if [[ -z "$resolved" ]]; then
-      return 0
-    fi
-    if ! contains_value "$resolved" "${CLI_PATHS[@]}"; then
-      CLI_NAMES+=("$candidate")
-      CLI_PATHS+=("$resolved")
-    fi
-  }
-  local candidates=(
-    qwen
-    qwen-code
-    codex
-    claude
-    claude-code
-    claudecode
-    gemini
-    opencode
-  )
-  if [[ -n "${QUALITY_REFINE_CLI_CANDIDATES:-}" ]]; then
-    local extra
-    for extra in ${QUALITY_REFINE_CLI_CANDIDATES}; do
-      candidates+=("$extra")
-    done
-  fi
-  local cli
-  for cli in "${candidates[@]}"; do
-    add_cli_candidate "$cli"
-  done
-  local path_dir entry name
-  IFS=':' read -r -a path_dirs <<< "$PATH"
-  for path_dir in "${path_dirs[@]}"; do
-    [[ -d "$path_dir" ]] || continue
-    for entry in "$path_dir"/*; do
-      [[ -f "$entry" && -x "$entry" ]] || continue
-      name="${entry##*/}"
-      case "$name" in
-        qwen|qwen-code|codex|claude|claude-code|claudecode|gemini|opencode)
-          add_cli_candidate "$entry"
-          ;;
-      esac
-    done
-  done
+  # API 模式占位：精修器已不 spawn CLI，统一以 "api" 作为日志标签。
+  CLI_NAMES=(api)
+  CLI_PATHS=(api)
 }
 
 choose_cli() {
-  title "选择 CLI Agent"
-  discover_clis
-  local index choice custom rc
-  if (( ${#CLI_NAMES[@]} )); then
-    for (( index = 0; index < ${#CLI_NAMES[@]}; index += 1 )); do
-      printf '%2d. %-16s %s%s%s\n' \
-        "$((index + 1))" \
-        "${CLI_NAMES[$index]}" \
-        "$DIM" "$(command -v "${CLI_NAMES[$index]}")" "$RESET"
-    done
-    printf ' c. 手动输入其它 CLI 命令\n'
-    while true; do
-      printf '请选择 [1] %s: ' "$(prompt_suffix)" >&2
-      IFS= read -r choice || exit 1
-      check_nav_input "$choice" || return $?
-      choice="${choice:-1}"
-      if [[ "$choice" == "c" || "$choice" == "C" ]]; then
-        if read_required "CLI 命令 $(prompt_suffix): "; then
-          :
-        else
-          rc=$?; return "$rc"
-        fi
-        custom="$ASK_VALUE"
-        if command -v "$custom" >/dev/null 2>&1; then
-          SELECTED_CLI="$custom"
-          MODEL_CHAIN=""
-          return 0
-        fi
-        printf '%s\n' "${YELLOW}找不到 CLI：$custom${RESET}" >&2
-      elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#CLI_NAMES[@]} )); then
-        SELECTED_CLI="${CLI_NAMES[$((choice - 1))]}"
-        MODEL_CHAIN=""
-        return 0
-      else
-        printf '%s\n' "${YELLOW}未知 CLI 选项：$choice${RESET}" >&2
-      fi
-    done
-  else
-    info "没有在 PATH 中发现已知 agent CLI。"
-    while true; do
-      if read_required "请手动输入 CLI 命令 $(prompt_suffix): "; then
-        :
-      else
-        rc=$?; return "$rc"
-      fi
-      custom="$ASK_VALUE"
-      if command -v "$custom" >/dev/null 2>&1; then
-        SELECTED_CLI="$custom"
-        MODEL_CHAIN=""
-        return 0
-      fi
-      printf '%s\n' "${YELLOW}找不到 CLI：$custom${RESET}" >&2
-    done
-  fi
+  # API 模式：直接钉成 "api" 标签，跳过任何 CLI 选择。保留函数是因为向导步骤号
+  # 还在 5（main 的 next_step/previous_step 与复用提示都引用 step 5），返回 0 让流程继续。
+  SELECTED_CLI="api"
+  return 0
 }
 
 discover_models() {
-  local cli="$1"
-  node - "$cli" <<'NODE'
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
-
-const cli = process.argv[2] || "";
-const base = path.basename(cli).toLowerCase();
-const home = os.homedir();
-const seen = new Set();
-const models = [];
-
-function cliKind(name) {
-  if (name.includes("qwen")) return "qwen";
-  if (name.includes("codex")) return "codex";
-  if (name.includes("claude")) return "claude";
-  if (name.includes("gemini")) return "gemini";
-  if (name.includes("opencode")) return "opencode";
-  return "generic";
-}
-
-const kind = cliKind(base);
-
-function hostOf(url) {
-  if (!url || typeof url !== "string") return "";
-  try {
-    return new URL(url).host;
-  } catch {
-    return url.replace(/^https?:\/\//, "").split("/")[0];
-  }
-}
-
-function add(value, label = value, dedupeKey = value, meta = {}) {
-  if (!value || typeof value !== "string") return;
-  const item = value.trim();
-  const display = String(label || item).trim();
-  if (!item || item.length < 3 || item.length > 120) return;
-  if (/[\x00-\x1f\t\n\r"'`\\]/.test(item)) return;
-  const key = String(dedupeKey || item).trim();
-  if (!seen.has(key)) {
-    seen.add(key);
-    // baseUrl/envKey：仅 qwen 显式路由用——交互层据此为选中的模型生成 --qwen-routes，让“火山 minimax-m3”等
-    // 重复 id 模型经 --bare + 显式凭据精确路由到对的 provider（裸值不含 tab，安全拼进 TSV）。
-    models.push({ value: item, label: display, baseUrl: meta.baseUrl || "", envKey: meta.envKey || "" });
-  }
-}
-
-function visitJson(value, key = "") {
-  if (typeof value === "string") {
-    if (/model/i.test(key)) add(value);
-    return;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      if (typeof item === "string" && /models?/i.test(key)) add(item);
-      else visitJson(item, key);
-    }
-    return;
-  }
-  if (value && typeof value === "object") {
-    for (const [childKey, childValue] of Object.entries(value)) visitJson(childValue, childKey);
-  }
-}
-
-function addProviderEntry(protocol, entry, index, objectKey = "") {
-  if (typeof entry === "string") {
-    add(entry, `${entry} · ${protocol}`, `${protocol}:${objectKey || index}:${entry}`);
-    return;
-  }
-  if (!entry || typeof entry !== "object") return;
-  const id = entry.id || entry.model || entry.modelId || entry.name || objectKey;
-  if (!id || typeof id !== "string") return;
-  const name = entry.name && entry.name !== id ? entry.name : id;
-  const baseUrl = entry.baseUrl || entry.baseURL || entry.url || entry.endpoint || "";
-  const host = hostOf(baseUrl);
-  // ~/.qwen/settings.json 字段是 envKey；mjs 端 --qwen-routes 期望 apiKeyEnv——映射在 bash 拼 inline JSON 时再做。
-  const envKey = entry.envKey || entry.apiKeyEnv || entry.apiKeyEnvName || "";
-  const label = `${name}${name !== id ? ` [${id}]` : ""} · ${protocol}${host ? ` · ${host}` : ""}`;
-  if (kind === "qwen") {
-    // qwen：value 必须是 provider 端真正认的 model id（不是 settings.json 的 name 友好昵称）。
-    // 之前用 name 当 value 是为了让“火山 minimax-m3 / 通义 minimax-m3”同 id 不同 provider 共存，
-    // 但碰上 LongCat 这种 id="LongCat-2.0-Preview" / name="LongCat 2.0 Preview"，端点会 400 拒掉
-    // （LongCat 不接受带空格的 model 字段）。现在 value 改回 id，重复 id 靠 dedupeKey 里的 host 区分共存；
-    // label 仍展示 name 让用户认得出，baseUrl/envKey 透传到 TSV 供后续拼 --qwen-routes 精确路由。
-    add(id, label, `${protocol}:${objectKey || index}:${id}:${host}`, { baseUrl, envKey });
-    return;
-  }
-  add(id, label, `${protocol}:${objectKey || index}:${id}:${host}:${name}`);
-}
-
-function readQwenConfig(file) {
-  const abs = file.replace(/^~/, home);
-  if (!fs.existsSync(abs) || !abs.endsWith(".json")) return;
-  let json;
-  try {
-    json = JSON.parse(fs.readFileSync(abs, "utf8"));
-  } catch {
-    return;
-  }
-  if (json.model?.name) add(json.model.name, `${json.model.name} · 当前默认 model.name`, `current:${json.model.name}`);
-  for (const [protocol, entries] of Object.entries(json.modelProviders || {})) {
-    if (Array.isArray(entries)) {
-      entries.forEach((entry, index) => addProviderEntry(protocol, entry, index));
-    } else if (entries && typeof entries === "object") {
-      for (const [key, entry] of Object.entries(entries)) addProviderEntry(protocol, entry, key, key);
-    }
-  }
-}
-
-function readConfig(file) {
-  const abs = file.replace(/^~/, home);
-  if (!fs.existsSync(abs)) return;
-  let text = "";
-  try {
-    text = fs.readFileSync(abs, "utf8");
-  } catch {
-    return;
-  }
-  if (abs.endsWith(".json")) {
-    try {
-      visitJson(JSON.parse(text));
-    } catch {}
-  }
-  const re = /(?:^|\b)(?:model|defaultModel|default_model|model_id|modelId)\s*[:=]\s*["']?([A-Za-z0-9][A-Za-z0-9._:/@+\-]{2,})/g;
-  let match;
-  while ((match = re.exec(text))) add(match[1]);
-}
-
-const configFilesByKind = {
-  qwen: [
-    "~/.qwen/settings.json",
-    "~/.qwen/settings.local.json",
-    "~/.qwen/config.json",
-    "~/.qwen/qwenswitch-meta.json",
-    "~/.qwen/source.json",
-    "~/.qwen-code/settings.json",
-    "~/.qwen-code/config.json",
-    "~/.config/qwen-code/settings.json",
-    "~/.config/qwen-code/config.json",
-    "~/.config/qwen/settings.json",
-    "~/.config/qwen/config.json",
-  ],
-  codex: [
-    "~/.codex/config.toml",
-    "~/.codex/config.json",
-  ],
-  claude: [
-    "~/.claude/settings.json",
-    "~/.claude/settings.local.json",
-    "~/.claude.json",
-  ],
-  gemini: [
-    "~/.gemini/settings.json",
-    "~/.gemini/config.json",
-  ],
-  opencode: [
-    "~/.config/opencode/opencode.json",
-    "~/.config/opencode/config.json",
-    "~/.config/opencode/oh-my-openagent.json",
-    "./opencode.json",
-    "./.opencode.json",
-  ],
-};
-
-const fallbackModelsByKind = {
-  qwen: ["qwen3-coder-plus", "qwen3-coder", "qwen-max", "qwen-plus"],
-  codex: ["gpt-5-codex", "gpt-5", "gpt-5-mini"],
-  claude: ["sonnet", "opus", "haiku", "claude-sonnet-4-5", "claude-opus-4-1", "claude-3-5-haiku-latest"],
-  gemini: ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
-  opencode: ["anthropic/claude-sonnet-4-5", "openai/gpt-5-codex", "google/gemini-2.5-pro"],
-};
-
-const selectedFiles = configFilesByKind[kind] ?? Object.values(configFilesByKind).flat();
-if (kind === "qwen") {
-  for (const file of selectedFiles) readQwenConfig(file);
-} else {
-  for (const file of selectedFiles) readConfig(file);
-}
-if (!models.length) {
-  for (const model of fallbackModelsByKind[kind] ?? []) add(model);
-}
-
-// 输出 4 列 TSV：value \t label \t baseUrl \t envKey
-// baseUrl/envKey 仅 qwen 显式路由要用；其它 CLI 这两列为空。bash 端按 IFS=$'\t' 读 4 列即可，
-// 列数变化不会破坏旧行为：未带路由的模型行第三/第四列直接是空字符串。
-for (const model of models) console.log(`${model.value}\t${model.label}\t${model.baseUrl}\t${model.envKey}`);
-NODE
+  # API 模式:直接从 scripts/llm/env-config.mjs 读硬编码的 13 个 OpenAI 兼容 spec。
+  # 输出 4 列 TSV: spec \t label \t baseUrl \t envKey  (spec = "<provider>:<modelId>")
+  # 只列 .env 里有 apiKey 的 spec(没 key 的 provider 跑不了,藏起来免误选)。
+  node -e '
+    import("./scripts/llm/env-config.mjs").then(({ envConfig }) => {
+      const models = envConfig.listModels({ hasKey: true });
+      for (const m of models) {
+        const spec = `${m.provider}:${m.id}`;
+        console.log(`${spec}\t${m.name}\t${m.baseUrl}\t${m.apiKeyEnv}`);
+      }
+    }).catch((e) => { console.error("[discover_models]", e.message); process.exit(1); });
+  '
 }
 
 choose_model_chain() {
-  title "选择模型与降级链"
+  title "选择精修模型链（默认走 .env REFINE_MODEL_CHAIN）"
   MODEL_VALUES=()
   MODEL_LABELS=()
   MODEL_BASE_URLS=()
@@ -646,32 +373,36 @@ choose_model_chain() {
     MODEL_LABELS+=("$label")
     MODEL_BASE_URLS+=("$base_url")
     MODEL_ENV_KEYS+=("$env_key")
-  done < <(discover_models "$SELECTED_CLI")
+  done < <(discover_models)
+
+  # 读 .env 的默认精修链作为"回车=接受"
+  local env_default
+  env_default="$(grep -E '^REFINE_MODEL_CHAIN=' .env 2>/dev/null | tail -1 | cut -d= -f2-)"
+  env_default="${env_default:-volcengine:glm-5.1,volcengine:deepseek-v4-flash}"
 
   local index choice custom selections selected idx rc
   if (( ${#MODEL_VALUES[@]} )); then
-    printf '0. CLI 默认模型\n'
+    printf '0. 使用 .env REFINE_MODEL_CHAIN：%s（推荐，回车跳过）\n' "$env_default"
     for (( index = 0; index < ${#MODEL_VALUES[@]}; index += 1 )); do
       printf '%2d. %s\n' "$((index + 1))" "${MODEL_LABELS[$index]}"
     done
-    printf ' c. 手动输入模型链（逗号分隔）\n'
+    printf ' c. 手动输入模型链（逗号分隔的 provider:modelId）\n'
     printf '\n可直接输入降级顺序，例如 1,2,3；第一个不可用连续达到阈值后会降到下一个。\n'
     while true; do
-      printf '请选择 [1] %s: ' "$(prompt_suffix)" >&2
+      printf '请选择 [0] %s: ' "$(prompt_suffix)" >&2
       IFS= read -r choice || exit 1
       check_nav_input "$choice" || return $?
-      choice="${choice:-1}"
+      choice="${choice:-0}"
       if [[ "$choice" == "0" ]]; then
-        MODEL_CHAIN=""
+        MODEL_CHAIN=""  # 空 = 让 mjs 端读 .env 默认
         return 0
       elif [[ "$choice" == "c" || "$choice" == "C" ]]; then
-        if read_required "模型链（如 model-a,model-b）$(prompt_suffix): "; then
+        if read_required "模型链（如 volcengine:glm-5.1,volcengine:deepseek-v4-flash）$(prompt_suffix): "; then
           :
         else
           rc=$?; return "$rc"
         fi
         MODEL_CHAIN="$ASK_VALUE"
-        # 手动输入的模型不在 TSV 表内，无法自动配路由；如需精确路由请回到列表选择。
         CHAIN_BASE_URLS=()
         CHAIN_ENV_KEYS=()
         return 0
@@ -696,20 +427,15 @@ choose_model_chain() {
       fi
     done
   else
-    info "未能从配置中发现模型。可以留空使用 CLI 默认模型。"
-    printf '模型链 [空=CLI默认] %s: ' "$(prompt_suffix)" >&2
-    IFS= read -r custom || exit 1
-    check_nav_input "$custom" || return $?
-    MODEL_CHAIN="$custom"
-    CHAIN_BASE_URLS=()
-    CHAIN_ENV_KEYS=()
+    info "未能从配置中发现模型,使用 .env REFINE_MODEL_CHAIN($env_default)。"
+    MODEL_CHAIN=""
+    return 0
   fi
 }
 
 choose_judge_models() {
-  title "选择判官模型（动态语义/事实评审）"
-  info "判官评“静态分查不出的”事实正确性、认知顺序、零基础可读性、面试覆盖。回车=与精修主模型一致（只用链首一个）；0=不启用判官（纯静态、最快）。"
-  info "提示：精修模型链是“降级链”（链首优先、挂了才换下一个）；判官默认只用链首，避免把备用模型也当判官多花一倍开销。要做多判官投票请在下面显式多选。"
+  title "选择判官模型（默认走 .env JUDGE_MODEL_CHAIN）"
+  info "判官评\"静态分查不出的\"事实正确性、认知顺序、零基础可读性、面试覆盖。回车=用 .env JUDGE_MODEL_CHAIN（默认 火山 deepseek-v4-pro）；0=不启用判官（纯静态、最快）。"
   JUDGE_MODEL_VALUES=()
   JUDGE_MODEL_LABELS=()
   JUDGE_MODEL_BASE_URLS=()
@@ -724,18 +450,22 @@ choose_judge_models() {
     JUDGE_MODEL_LABELS+=("$label")
     JUDGE_MODEL_BASE_URLS+=("$base_url")
     JUDGE_MODEL_ENV_KEYS+=("$env_key")
-  done < <(discover_models "$SELECTED_CLI")
+  done < <(discover_models)
+
+  # 读 .env 默认判官链
+  local env_default
+  env_default="$(grep -E '^JUDGE_MODEL_CHAIN=' .env 2>/dev/null | tail -1 | cut -d= -f2-)"
+  env_default="${env_default:-volcengine:deepseek-v4-pro,volcengine:deepseek-v4-flash}"
 
   local index choice selections selected idx items
   printf ' 0. 不启用判官（纯静态 keep-best，最快）\n'
-  local judge_default_model="${MODEL_CHAIN%%,*}"
-  printf ' d. 与精修主模型一致（默认，只用链首一个）：%s\n' "${judge_default_model:-CLI默认}"
+  printf ' d. 使用 .env JUDGE_MODEL_CHAIN：%s（推荐，回车跳过）\n' "$env_default"
   for (( index = 0; index < ${#JUDGE_MODEL_VALUES[@]}; index += 1 )); do
     printf '%2d. %s\n' "$((index + 1))" "${JUDGE_MODEL_LABELS[$index]}"
   done
-  printf '\n可多选组成 ensemble（如 1,3）；回车=与精修同模型；0=不启用。\n'
+  printf '\n可多选组成 ensemble（如 1,3）；回车=.env 默认；0=不启用。\n'
   while true; do
-    printf '请选择 [d=同精修] %s: ' "$(prompt_suffix)" >&2
+    printf '请选择 [d=.env 默认] %s: ' "$(prompt_suffix)" >&2
     IFS= read -r choice || exit 1
     check_nav_input "$choice" || return $?
     choice="${choice:-d}"
@@ -746,14 +476,9 @@ choose_judge_models() {
     fi
     if [[ "$choice" == "d" || "$choice" == "D" ]]; then
       JUDGE_ENABLED=1
-      # 只取精修链首一个模型当判官，不把整条“降级链”当 ensemble 全跑（那会用上备用模型、多花开销）。
-      # 留空时由 quality_refine.mjs 默认取 modelChain[0]；这里显式取链首让 summary/日志更透明。
-      JUDGE_MODELS="${MODEL_CHAIN%%,*}"
-      # 路由也直接借精修链首：保证“同模型”意味着“同 provider”，否则火山/通义同名 id 又会被 qwen 静默回落。
-      if (( ${#CHAIN_BASE_URLS[@]} )); then
-        JUDGE_CHAIN_BASE_URLS=("${CHAIN_BASE_URLS[0]}")
-        JUDGE_CHAIN_ENV_KEYS=("${CHAIN_ENV_KEYS[0]}")
-      fi
+      JUDGE_MODELS=""  # 空 = 让 mjs 端读 .env 默认
+      JUDGE_CHAIN_BASE_URLS=()
+      JUDGE_CHAIN_ENV_KEYS=()
       return 0
     fi
     selections="$(expand_selection "$choice" "${#JUDGE_MODEL_VALUES[@]}")"
@@ -817,10 +542,13 @@ choose_quality_options() {
     fields+=("conc" "rounds" "limit")
   fi
   if [[ "$RUN_MODE" != "audit" ]]; then
-    fields+=("retries" "timeout" "stall" "degrade")
+    fields+=("retries" "timeout" "stall" "degrade" "quota")
   fi
   local total="${#fields[@]}"
   local idx=0 rc field
+  local quota_default
+  quota_default="$(grep -E '^QUOTA_PAUSE_DEFAULT=' .env 2>/dev/null | tail -1 | cut -d= -f2-)"
+  quota_default="${quota_default:-manual}"
   while (( idx < total )); do
     field="${fields[$idx]}"
     case "$field" in
@@ -831,7 +559,8 @@ choose_quality_options() {
       retries) ask_number "单篇失败重试次数 retries" "$RETRIES" 0 5 >/dev/null; rc=$? ;;
       timeout) ask_number "单篇超时秒数" "$TIMEOUT_SECONDS" 30 7200 >/dev/null; rc=$? ;;
       stall)   ask_number "空转看门狗秒数（0=关闭）" "$STALL_TIMEOUT_SECONDS" 0 7200 >/dev/null; rc=$? ;;
-      degrade) ask_number "连续多少次 CLI 不可用后降级模型" "$DEGRADE_AFTER" 1 50 >/dev/null; rc=$? ;;
+      degrade) ask_number "连续多少次 API 不可用后降级模型" "$DEGRADE_AFTER" 1 50 >/dev/null; rc=$? ;;
+      quota)   ask_quota_policy "$quota_default"; rc=$? ;;
     esac
     if (( rc == 0 )); then
       case "$field" in
@@ -843,6 +572,7 @@ choose_quality_options() {
         timeout) TIMEOUT_SECONDS="$ASK_VALUE" ;;
         stall)   STALL_TIMEOUT_SECONDS="$ASK_VALUE" ;;
         degrade) DEGRADE_AFTER="$ASK_VALUE" ;;
+        quota)   QUOTA_PAUSE_POLICY="$ASK_VALUE" ;;
       esac
       idx=$((idx + 1))
     elif (( rc == 2 )); then
@@ -853,6 +583,28 @@ choose_quality_options() {
     fi
   done
   return 0
+}
+
+# 选择额度耗尽时的行为：manual / auto-probe / skip
+ask_quota_policy() {
+  local default="$1"
+  local choice
+  printf '\n%s额度耗尽行为%s\n' "${BOLD}" "${RESET}" >&2
+  printf '  1. manual    全局暂停,等手动按 Enter 继续(默认)\n' >&2
+  printf '  2. auto-probe 自动按退避周期探活,额度恢复即继续\n' >&2
+  printf '  3. skip      当前篇标记 quota-skip 跳下一篇\n' >&2
+  while true; do
+    printf '请选择 [%s] %s: ' "$default" "$(prompt_suffix)" >&2
+    IFS= read -r choice || exit 1
+    check_nav_input "$choice" || return $?
+    choice="${choice:-$default}"
+    case "$choice" in
+      1|manual)     ASK_VALUE="manual"; return 0 ;;
+      2|auto-probe) ASK_VALUE="auto-probe"; return 0 ;;
+      3|skip)       ASK_VALUE="skip"; return 0 ;;
+      *) printf '%s\n' "${YELLOW}请输入 1/2/3 或 manual/auto-probe/skip。${RESET}" >&2 ;;
+    esac
+  done
 }
 
 list_scope_topics() {
@@ -1169,6 +921,10 @@ run_refine() {
     fi
     if [[ -n "$topics_csv" ]]; then
       cmd+=(--topics "$topics_csv")
+    fi
+    # 把交互选的额度策略覆盖到 .env 默认(env var > .env 值)
+    if [[ -n "$QUOTA_PAUSE_POLICY" ]]; then
+      export QUOTA_PAUSE_DEFAULT="$QUOTA_PAUSE_POLICY"
     fi
     printf '%s\n' "${DIM}${cmd[*]}${RESET}"
     set +e

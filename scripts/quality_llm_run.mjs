@@ -131,6 +131,19 @@ function commandPath(name) {
   return result.status === 0 ? result.stdout.trim().split(/\n/)[0] : "";
 }
 
+// 把 model 名称里的 `:` `/` `\` 替换成 `_`，避免 OpenAI 兼容 API 的 chain spec (如 `volcengine:deepseek-v4-pro`)
+// 把输出路径误判为子目录。`default` 兜底是 `cli-preset` 组合，确保无 model 也能落到 `outputs/` 下的稳定目录。
+function safeModelSegment(model, cli, preset) {
+  return String(model || `${cli}-${preset || "auto"}`).replace(/[:\/\\]/g, "_");
+}
+
+// 把 topic ref (`topics/java/xxx.json`) 拍平成可作为文件名的字符串：把 `/` 换成 `__`，剥掉 `.json` 后缀，
+// 避免 `outputs/<model>/<batch>/topics/java/xxx.json` 误建子目录链。ref 本身就是 topic 文件相对路径，
+// 不需要再二次消毒字符；非法字符在 buildReviewRequest 阶段就已经被路径约束挡住。
+function safeRefBaseName(ref) {
+  return String(ref).replace(/\//g, "__").replace(/\.json$/i, "");
+}
+
 function clean(text) {
   return String(text)
     .replace(/\u0004/g, "")
@@ -361,7 +374,10 @@ function extractBatchReviews(parsed) {
   throw new Error("CLI output did not contain a reviews array");
 }
 
-async function runOneBatch(items, review, cfg, cliPath, outDir) {
+async function runOneBatch(items, review, cfg, cliPath, outDir, batchIdx) {
+  // taskId 仍保留：失败重试日志和后续的 stdout 链接都靠它串起来。
+  // 输出文件不再以 taskId 命名：改为 `outputs/<model>/<batchIdx>/<refSafe>.json` 形态，
+  // 这样 (model, batchIdx, ref) 三元组能从路径直接读到，CI 落盘核对也只看 `outputs/` 即可。
   const taskId =
     items.length === 1
       ? `${items[0].ref.replace(/[^a-z0-9]+/gi, "-")}-${sha256(items[0].ref).slice(0, 8)}`
@@ -386,17 +402,39 @@ async function runOneBatch(items, review, cfg, cliPath, outDir) {
       }
       const extracted = extractJson(raw);
       const parsedReviews = items.length === 1 ? [extracted] : extractBatchReviews(extracted);
-      const byRef = new Map(parsedReviews.map((parsed) => [parsed.ref, parsed]));
-      const normalized = items.map((item) => {
-        const parsed = byRef.get(item.ref);
-        if (!parsed) throw new Error(`CLI output missing review for ${item.ref}`);
-        return normalizeTopicReview(parsed, item);
+      // 输出 ref 错位是历史事故的根因：LLM 在 batch 模式下常把 ref/title 填成别的 topic，
+      // 这里按 LLM 输出端最先出现的 ref 顺序回退匹配（顺序对得上就不抛），对得不上才要求 ref 字符串严格相等。
+      // normalizeTopicReview 在写盘前会再覆盖一次 ref/title，所以即便这里匹配错了，磁盘文件仍然正确。
+      const byRef = new Map();
+      parsedReviews.forEach((parsed, parsedIndex) => {
+        if (parsed?.ref && !byRef.has(parsed.ref)) byRef.set(parsed.ref, parsed);
       });
-      const rawPath = path.join(outDir, `${taskId}.raw.txt`);
-      const jsonPath = path.join(outDir, `${taskId}.json`);
+      const byOrder = parsedReviews;
+      const normalized = items.map((item, itemIndex) => {
+        let parsed = byRef.get(item.ref);
+        let usedOrderFallback = false;
+        if (!parsed) {
+          parsed = byOrder[itemIndex];
+          if (!parsed) throw new Error(`CLI output missing review for ${item.ref}`);
+          usedOrderFallback = true;
+        }
+        const review = normalizeTopicReview(parsed, item);
+        if (usedOrderFallback) {
+          review.notes = `${review.notes ? review.notes + " | " : ""}[fallback] LLM 输出缺 ref 字段，按输入顺序回退到第 ${itemIndex + 1} 篇`.trim();
+        }
+        return review;
+      });
+      const rawPath = path.join(outDir, `${batchIdx}.raw.txt`);
       await writeFile(rawPath, clean(raw) + "\n");
-      await writeFile(jsonPath, JSON.stringify(normalized, null, 2) + "\n");
-      return { ok: true, items, reviews: normalized, attempts: attempt, output: jsonPath };
+      // 按 ref 一篇一文件：CI 与开发者 grep 都更直观。
+      // 内层 `ref`/`title` 字段由 normalizeTopicReview 从 item 强制写回，避免 LLM 端把别人 topic 的标题错填到本篇。
+      const refOutputs = [];
+      for (const review of normalized) {
+        const refPath = path.join(outDir, `${safeRefBaseName(review.ref)}.json`);
+        await writeFile(refPath, JSON.stringify(review, null, 2) + "\n");
+        refOutputs.push(refPath);
+      }
+      return { ok: true, items, reviews: normalized, attempts: attempt, output: outDir, refOutputs, taskId };
     } catch (error) {
       lastError = error;
       if (attempt < attempts) {
@@ -407,11 +445,11 @@ async function runOneBatch(items, review, cfg, cliPath, outDir) {
     }
   }
 
-  return { ok: false, items, attempts, error: lastError?.message ?? "unknown error" };
+  return { ok: false, items, attempts, error: lastError?.message ?? "unknown error", taskId };
 }
 
-async function runOneTopic(item, review, cfg, cliPath, outDir) {
-  const result = await runOneBatch([item], review, cfg, cliPath, outDir);
+async function runOneTopic(item, review, cfg, cliPath, outDir, batchIdx) {
+  const result = await runOneBatch([item], review, cfg, cliPath, outDir, batchIdx);
   if (result.ok) {
     return {
       ok: true,
@@ -419,6 +457,7 @@ async function runOneTopic(item, review, cfg, cliPath, outDir) {
       review: result.reviews[0],
       attempts: result.attempts,
       output: result.output,
+      refOutputs: result.refOutputs,
     };
   }
   return {
@@ -435,15 +474,19 @@ function chunk(items, size) {
   return chunks;
 }
 
-async function runPool(items, review, cfg, cliPath, outDir) {
-  if (cfg.batchSize <= 1) return runTopicPool(items, review, cfg, cliPath, outDir);
+async function runPool(items, review, cfg, cliPath, runOutDir) {
+  if (cfg.batchSize <= 1) return runTopicPool(items, review, cfg, cliPath, runOutDir);
   const batches = chunk(items, cfg.batchSize);
   const results = [];
   let index = 0;
   async function worker() {
     while (index < batches.length) {
+      const batchIdx = index;
       const batch = batches[index++];
-      const result = await runOneBatch(batch, review, cfg, cliPath, outDir);
+      // batch 子目录用 4 位 zero-pad：批次数 < 10000 时 lex 序 = 数序，CI 翻 log 友好。
+      const batchOutDir = path.join(runOutDir, String(batchIdx).padStart(4, "0"));
+      await mkdir(batchOutDir, { recursive: true });
+      const result = await runOneBatch(batch, review, cfg, cliPath, batchOutDir, batchIdx);
       for (const item of batch) {
         if (result.ok) {
           const topicReview = result.reviews.find((entry) => entry.ref === item.ref);
@@ -453,6 +496,7 @@ async function runPool(items, review, cfg, cliPath, outDir) {
             review: topicReview,
             attempts: result.attempts,
             output: result.output,
+            refOutputs: result.refOutputs,
             error: topicReview ? undefined : `batch output missing review for ${item.ref}`,
           });
         } else {
@@ -464,20 +508,23 @@ async function runPool(items, review, cfg, cliPath, outDir) {
           });
         }
       }
-      console.log(`[${result.ok ? "OK" : "FAIL"}] batch ${batch[0].ref} ... ${batch[batch.length - 1].ref} (${batch.length})`);
+      console.log(`[${result.ok ? "OK" : "FAIL"}] batch ${batchIdx} ${batch[0].ref} ... ${batch[batch.length - 1].ref} (${batch.length})`);
     }
   }
   await Promise.all(Array.from({ length: cfg.concurrency }, worker));
   return results.sort((left, right) => left.item.ref.localeCompare(right.item.ref));
 }
 
-async function runTopicPool(items, review, cfg, cliPath, outDir) {
+async function runTopicPool(items, review, cfg, cliPath, runOutDir) {
   const results = [];
   let index = 0;
   async function worker() {
     while (index < items.length) {
       const item = items[index++];
-      const result = await runOneTopic(item, review, cfg, cliPath, outDir);
+      const batchIdx = index - 1;
+      const batchOutDir = path.join(runOutDir, String(batchIdx).padStart(4, "0"));
+      await mkdir(batchOutDir, { recursive: true });
+      const result = await runOneTopic(item, review, cfg, cliPath, batchOutDir, batchIdx);
       results.push(result);
       console.log(`[${result.ok ? "OK" : "FAIL"}] ${item.ref}`);
     }
@@ -582,14 +629,18 @@ async function main() {
 
   await writeReviewPacket(review);
 
-  const outDir = path.join(root, ".quality-review/tmp", review.request.reviewId);
-  await mkdir(outDir, { recursive: true });
+  // 输出根目录改成 `outputs/<model-safe>/`：reviewer 用的 model 直接体现在路径里，
+  // 不同 model / 不同 chain 切换时不会互相覆盖；旧的 `.quality-review/tmp/<reviewId>/` 链路是按 reviewId 隔离，
+  // reviewId 又是内容哈希派生的，同一份内容无论用什么 model 都会进同一个目录，反而压制了多 model 对比。
+  const modelSafe = safeModelSegment(cfg.model, cfg.cli, cfg.preset);
+  const runOutDir = path.join(root, "outputs", modelSafe);
+  await mkdir(runOutDir, { recursive: true });
   console.log(
     `Running external LLM review: cli=${cfg.cli} (${cliPath}), model=${cfg.model || "CLI default configured model"}, ` +
       `concurrency=${cfg.concurrency}, retries=${cfg.retries}, batchSize=${cfg.batchSize}, targets=${review.request.reviewedTargetCount}`,
   );
 
-  const results = await runPool(review.topics, review, cfg, cliPath, outDir);
+  const results = await runPool(review.topics, review, cfg, cliPath, runOutDir);
   const finalReport = aggregateReport(review, cfg, cliPath, results);
   const reportPath = path.join(root, review.request.reportPath);
   await mkdir(path.dirname(reportPath), { recursive: true });
@@ -605,13 +656,14 @@ async function main() {
   }
   await writeFile(reportPath, JSON.stringify(finalReport, null, 2) + "\n");
   await writeFile(
-    path.join(outDir, "run-report.json"),
+    path.join(runOutDir, "run-report.json"),
     JSON.stringify(
       {
         cli: cfg.cli,
         preset: cfg.preset,
         cliPath,
         model: cfg.model || "CLI default configured model",
+        modelSegment: modelSafe,
         concurrency: cfg.concurrency,
         retries: cfg.retries,
         batchSize: cfg.batchSize,
@@ -622,6 +674,7 @@ async function main() {
           ok: result.ok,
           attempts: result.attempts,
           output: result.output,
+          refOutputs: result.refOutputs,
           error: result.error,
         })),
       },
@@ -631,7 +684,7 @@ async function main() {
   );
 
   console.log(`Wrote report: ${review.request.reportPath}`);
-  console.log(`Run artifacts: ${path.relative(root, outDir)}`);
+  console.log(`Run artifacts: ${path.relative(root, runOutDir)}/`);
   if (!verifyGeneratedReport(options, review.request.reportPath)) {
     process.exitCode = 1;
   }

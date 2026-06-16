@@ -1,8 +1,8 @@
-// 内容精修“动态判官”的共享纯函数：8 维评审 prompt、输出解析、多判官聚合、通过/接受判据。
+// 内容精修"动态判官"的共享纯函数：9 维评审 prompt、输出解析、多判官聚合、通过/接受判据。
 // 与确定性静态审计互补——静态当地板 + 抓跨 topic 套话，判官当语义/事实/可教会的真天花板。
 // 这里只放纯逻辑（无 IO、无 CLI spawn），便于单测与复用；CLI 调度复用 quality_refine.mjs 的 runProcess。
 
-export const JUDGE_RUBRIC_VERSION = "judge-8dim-v1";
+export const JUDGE_RUBRIC_VERSION = "judge-9dim-v1";
 export const BLOCK_JUDGE_RUBRIC_VERSION = "block-judge-v1";
 
 // 字符串值内禁止未转义 ASCII 双引号——国产模型在 evidence/reason 字段里直接写
@@ -18,7 +18,7 @@ export const JSON_STRING_RULES = `
 3. 如果你不确定某个字符是否需要转义，宁可改写措辞，也不要让 JSON.parse 失败。
 4. 整体输出必须能被 JSON.parse 成功解析，不要包 Markdown 代码围栏，不要在 JSON 外加任何解释。`;
 
-// 8 维（原 6 维对应标准 §8.4 + learnerClarity/coverage 两个正交补洞）。1-5 整数，<4 视为该维不达标。
+// 9 维（原 6 维对应标准 §8.4 + learnerClarity/coverage 两个正交补洞 + seniorityDiscrimination 区分度天花板）。1-5 整数，<4 视为该维不达标。
 export const JUDGE_DIMENSIONS = [
   "accuracy", // 事实/版本/复杂度/协议行为/框架机制正确；图、表、代码也按事实核验
   "cognitiveOrder", // 动机->定义->机制->例子->边界/失败->对比/取舍->面试表达
@@ -324,3 +324,175 @@ export function findingsToPromptLines(review) {
   for (const f of review.coverageFindings ?? []) lines.push(`【覆盖缺口】${f.missingPoint ?? ""}${f.why ? `（${f.why}）` : ""}`);
   return lines;
 }
+
+// ===== 3 个 API 模式 strict JSON schema（response_format=json_schema 用）=====
+// 顶层 additionalProperties:false + required 钉全键；嵌套容错 additionalProperties:true。
+// 数组元素是 object 时按 schemaForArrayItems 合并异构 key。
+// 这些 schema 由 quality_refine.mjs 通过 runRefine/runJudge/runBlockJudge 传给 LLM。
+
+function _jProp(type, description) {
+  return { type, description };
+}
+
+function _jNum(min, max) {
+  const s = { type: "integer" };
+  if (min !== undefined) s.minimum = min;
+  if (max !== undefined) s.maximum = max;
+  return s;
+}
+
+function _jArr(itemSchema) {
+  return { type: "array", items: itemSchema };
+}
+
+// 数组元素是 object 时合并所有元素的 key（异构 key 合并）。
+function _jHeterogeneousArr(examples) {
+  const keys = new Map();
+  for (const ex of examples) {
+    for (const k of Object.keys(ex)) {
+      if (!keys.has(k)) {
+        keys.set(k, { type: ["string", "null", "number", "boolean", "array", "object"] });
+      } else {
+        // 简化：保留第一条遇到的 schema（API 模式够用；normalize 层做严校验）
+      }
+    }
+  }
+  const props = Object.fromEntries(keys);
+  return { type: "array", items: { type: "object", properties: props, additionalProperties: true } };
+}
+
+// 9 维 dimensions schema。
+function _jDimensionsSchema() {
+  return {
+    type: "object",
+    properties: Object.fromEntries(JUDGE_DIMENSIONS.map((d) => [d, _jNum(1, 5)])),
+    required: [...JUDGE_DIMENSIONS],
+    additionalProperties: true,
+  };
+}
+
+// 单篇评审 schema。顶层钉全键 + additionalProperties:false。
+// 这是新版本（API 模式）替换旧的 QWEN_JUDGE_SCHEMA。
+export const JUDGE_REVIEW_SCHEMA = (() => {
+  const factEx = { claim: "被核验的事实断言", verdict: "wrong", evidence: "核验依据" };
+  const orderEx = { where: "卡片标题", issue: "问题", fix: "如何修" };
+  const voiceEx = { where: "卡片标题", issue: "模板腔", fix: "本题专属表达" };
+  const selfEx = { where: "recallPrompt 或 rubric.mustHave", issue: "正文未覆盖", fix: "应补什么" };
+  const clarityEx = { where: "卡片标题或段落", issue: "零基础卡点", fix: "如何讲清" };
+  const coverageEx = { missingPoint: "面试该讲却没讲到的关键面", why: "为什么面试需要它" };
+  const followUpEx = { question: "原追问文案", isSpecific: true, answerAdequate: true, fix: "若不够如何修" };
+  const blockingEx = { reason: "导致 fail 的硬问题" };
+
+  return {
+    type: "object",
+    properties: {
+      ref: _jProp("string", "topic 文件相对路径（保留原样）"),
+      title: _jProp("string", "topic 标题"),
+      verdict: { type: "string", enum: ["pass", "fail"] },
+      score: _jNum(0, 100),
+      dimensions: _jDimensionsSchema(),
+      factFindings: _jHeterogeneousArr([factEx]),
+      orderFindings: _jHeterogeneousArr([orderEx]),
+      voiceFindings: _jHeterogeneousArr([voiceEx]),
+      selfContainedFindings: _jHeterogeneousArr([selfEx]),
+      clarityFindings: _jHeterogeneousArr([clarityEx]),
+      coverageFindings: _jHeterogeneousArr([coverageEx]),
+      followUpFindings: _jHeterogeneousArr([followUpEx]),
+      blockingFindings: _jHeterogeneousArr([blockingEx]),
+      notes: _jProp("string", "评审附加说明"),
+    },
+    required: [
+      "ref",
+      "title",
+      "verdict",
+      "score",
+      "dimensions",
+      "factFindings",
+      "orderFindings",
+      "voiceFindings",
+      "selfContainedFindings",
+      "clarityFindings",
+      "coverageFindings",
+      "followUpFindings",
+      "blockingFindings",
+      "notes",
+    ],
+    additionalProperties: false,
+  };
+})();
+
+// 批量评审 schema。reviews 数组元素同 JUDGE_REVIEW_SCHEMA 形状。
+export const QWEN_JUDGE_BATCH_SCHEMA = (() => {
+  return {
+    type: "object",
+    properties: {
+      reviews: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            ref: _jProp("string", "topic 文件相对路径"),
+            title: _jProp("string", "topic 标题"),
+            verdict: { type: "string", enum: ["pass", "fail"] },
+            score: _jNum(0, 100),
+            dimensions: _jDimensionsSchema(),
+            factFindings: _jHeterogeneousArr([{ claim: "事实", verdict: "correct", evidence: "依据" }]),
+            orderFindings: _jHeterogeneousArr([{ where: "位置", issue: "问题", fix: "如何修" }]),
+            voiceFindings: _jHeterogeneousArr([{ where: "位置", issue: "问题", fix: "如何修" }]),
+            selfContainedFindings: _jHeterogeneousArr([{ where: "位置", issue: "问题", fix: "如何修" }]),
+            clarityFindings: _jHeterogeneousArr([{ where: "位置", issue: "问题", fix: "如何修" }]),
+            coverageFindings: _jHeterogeneousArr([{ missingPoint: "缺失面", why: "原因" }]),
+            followUpFindings: _jHeterogeneousArr([{ question: "追问", isSpecific: true, answerAdequate: true, fix: "修法" }]),
+            blockingFindings: _jHeterogeneousArr([{ reason: "阻断原因" }]),
+            notes: _jProp("string", "评审说明"),
+          },
+          required: [
+            "ref",
+            "title",
+            "verdict",
+            "score",
+            "dimensions",
+            "factFindings",
+            "orderFindings",
+            "voiceFindings",
+            "selfContainedFindings",
+            "clarityFindings",
+            "coverageFindings",
+            "followUpFindings",
+            "blockingFindings",
+            "notes",
+          ],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["reviews"],
+    additionalProperties: false,
+  };
+})();
+
+// 块级评审 schema。blockReviews 数组元素：key / verdict / reason / fix。
+export const QWEN_BLOCK_JUDGE_SCHEMA = (() => {
+  return {
+    type: "object",
+    properties: {
+      ref: _jProp("string", "topic 文件相对路径"),
+      blockReviews: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            key: _jProp("string", "块的稳定 key（与输入对齐）"),
+            verdict: { type: "string", enum: ["improved", "same", "regressed", "blocking"] },
+            reason: _jProp("string", "判定理由"),
+            fix: _jProp("string", "如何修（regressed/blocking 时必填）"),
+          },
+          required: ["key", "verdict", "reason", "fix"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["ref", "blockReviews"],
+    additionalProperties: false,
+  };
+})();

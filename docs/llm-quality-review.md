@@ -48,8 +48,12 @@ npm run quality:llm:verify
 
 旧流程会生成：
 
-- `.quality-review/requests/`：本地请求包，已忽略，不提交。
-- `.quality-review/reports/`：旧式评审报告；当前 CI 不再依赖它。
+- `.quality-review/requests/<reviewId>.{json,md}`：本地请求包，已忽略，不提交。
+- `.quality-review/reports/<reviewId>.json`：旧式评审报告；当前 CI 不再依赖它。
+- `outputs/<model-safe>/<batchIdx>/<ref>.json`：单篇评审落盘（强制 `ref`/`title` 从请求端的 `item` 写回，避免 LLM 端把别人 topic 的标题错填到本篇；ref 字段用 `topic.ref` 文件相对路径，如 `topics/java/xxx.json`）。同一批次原始 LLM 响应落在 `outputs/<model-safe>/<batchIdx>/<batchIdx>.raw.txt`，整个 run 元信息落在 `outputs/<model-safe>/run-report.json`。
+  - `<model-safe>` = `--model` 去掉 `:`/`/`/`\\` 替换为 `_`；未传 `--model` 时退回 `<cli>-<preset>`。
+  - `<batchIdx>` = 4 位 zero-pad 批次序号，单篇模式（`--batch-size=1`）时一篇一目录。
+  - 评审端 LLM 输出缺 `ref` 字段时，按输入顺序回退匹配，并在 `notes` 字段加 `[fallback]` 标记，磁盘文件不受影响。
 
 新内容质量把关应优先使用：
 

@@ -1,16 +1,13 @@
 #!/usr/bin/env node
-// 内容精修驱动器（spawn-per-topic）：
-//   - 编排循环只活在本 Node 进程里，每篇精修 spawn 一个一次性 CLI 子进程、用完即弃，
-//     从架构上根除“主 agent 长会话上下文溢出”。
-//   - 目标集由 scope/topic 选择决定；确定性审计只提供上下文、验收和重试信号，
-//     不把静态 >=90 当成“无需送 LLM 看”的跳过条件。
-//   - 弱模型只负责“改”：CLI 把改写后的整篇 JSON 分块写入 .quality-refine/<runId>/topic-cache/ 缓存文件
-//     （auto-edit / workspace-write 沙盒，写权限限定在工作区，prompt 严格指定缓存绝对路径），
-//     由本驱动校验 schema 不变量后才原子落盘到 topics/；坏输出永不污染仓库。
-//   - 验收门禁 = 现有 content_quality_audit.mjs（≥minScore、8 维有地板、反刷分），不放宽任何口径。
-import { spawn, spawnSync } from "node:child_process";
+// 内容精修驱动器（API 模式）：
+//   - 每个精修/评审/块级评审调用都走 scripts/llm/runner.mjs（统一 OpenAI 兼容 API + 模型链 + 自动降级）。
+//   - 目标集由 scope/topic 选择决定；确定性审计只提供上下文、验收和重试信号。
+//   - 弱模型只负责"改"：调用返回整篇 topic JSON（response_format=json_schema 强约束）。
+//   - 验收门禁 = 现有 content_quality_audit.mjs（≥minScore、9 维有地板、反刷分），不放宽任何口径。
+//   - .env 加载、模型清单、采样参数都由 scripts/llm/env-config.mjs 统一管理；本文件不再探测 CLI / 不再 spawn 子进程。
 import { mkdir, readdir, rename, rm, stat, writeFile, appendFile } from "node:fs/promises";
 import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import { spawn } from "node:child_process";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { parseArgs, getChangedFiles, sha256 } from "./quality_llm_common.mjs";
@@ -29,7 +26,16 @@ import {
   judgePasses,
   acceptByJudge,
   findingsToPromptLines,
+  JUDGE_REVIEW_SCHEMA,
+  QWEN_JUDGE_BATCH_SCHEMA,
+  QWEN_BLOCK_JUDGE_SCHEMA,
 } from "./quality_llm_judge.mjs";
+import { llmRunner } from "./llm/runner.mjs";
+import { liveEvents, newReqId } from "./llm/live-events.mjs";
+import { pauseBus } from "./llm/pause-bus.mjs";
+import { QuotaSkipped } from "./llm/router.mjs";
+import { envConfig } from "./llm/env-config.mjs";
+import { createRouter } from "./llm/router.mjs";
 
 const root = process.cwd();
 // .quality-refine 产物根目录（runDir / judge-cache / preview 全在这下面）。
@@ -39,8 +45,9 @@ const qualityRoot = process.env.QUALITY_REFINE_DIR
   ? path.resolve(process.env.QUALITY_REFINE_DIR)
   : path.join(root, ".quality-refine");
 const maxConcurrency = 8;
-const activeChildren = new Map();
-let shutdownRequested = false;
+// activeChildren 已弃用 —— CLI 子进程路径已删除,API 模式无 spawn。但 installSignalHandlers / runProcess 仍引用 → 改写为 noop
+const activeChildren = new Map(); // noop 占位,后续 edit 会从 runProcess 里移走
+let shutdownRequested = false; // 保留:Ctrl-C 时设 true,所有循环检查后退出
 
 // 处理顺序：先小后大，便于早期发现问题、降低单次回滚成本（与 manual-refine 一致）。
 const DOMAIN_ORDER = [
@@ -106,151 +113,16 @@ const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任�
 - rubric：必须含 mustHave（≥1 条）/ goodToHave / commonMistakes / scoreWeights 四个字段；scoreWeights 必须包含 coverage / accuracy / interviewExpression / depth 四个键，每个值是 0-100 的整数，**四个值之和必须严格等于 100**。mustHave / goodToHave / commonMistakes 的每一项只能是知识点描述短语，禁止内嵌代码片段。
 - 总长度：精修后用 JSON.stringify 序列化的字符串长度不得少于原 topic 的 60%（信息量只增不减）。`;
 
-// ===== CLI 预设（auto-edit/workspace-write 允许写缓存文件，prompt 严格限定写缓存路径）=====
-function inferPreset(cliName, preset) {
-  if (preset && preset !== "auto") return preset;
-  const base = cliName.split("/").pop().toLowerCase();
-  if (base === "qwen" || base === "qwen-code") return "qwen";
-  if (base === "gemini") return "gemini";
-  if (base === "claude" || base === "claudecode" || base === "claude-code") return "claude";
-  if (base === "opencode") return "opencode";
-  if (base === "codex") return "codex";
-  return "generic";
-}
+// CLI 预设探测已删除 —— 改用 scripts/llm/env-config.mjs 的 OpenAI 兼容端点配置。
 
-// ===== qwen 0.18 headless 不变量（精修 + 判官两条 spawn 路径共用）=====
-// 排查（2026-06-14）定位的三个“运行体验”根因，全部由这组参数根治：
-//  ① 卡死/超时：旧实现用 `script -q` 把 qwen 拉进 PTY 交互 TUI，模型写完文件（write_file 工具调用）后
-//     进程不退出，整批预热/精修一路挂到 timeout（默认 600s=10 分钟）。改用 `--output-format json` 进入
-//     headless 模式后，qwen 一次性跑完（含工具调用）即干净退出（实测 9~14s），usePty 一并置 false。
-//  ② computer-use 弹框：用户全局 qwen 装了 @qwen-code/open-computer-use，模型一看到 computer_use__* 工具
-//     就可能调用→拉起 app→弹 macOS 权限框。`--exclude-tools` 把这些（含 skill/agent）全部摘掉。
-//  ③ 启动慢：全局配了 drawio MCP（npx 拉起），每次 spawn 都白等。`--allowed-mcp-server-names __none__` 不加载任何 MCP。
-// 末尾必须是标量参数（--approval-mode yolo），用来给前面的数组型参数（--exclude-tools / --allowed-mcp-server-names）
-// 收尾，避免 buildCliArgs 追加的 positional prompt 在缺省 --model 时被 yargs 并进数组里。
-const QWEN_EXCLUDE_TOOLS = [
-  "computer_use__click",
-  "computer_use__drag",
-  "computer_use__get_app_state",
-  "computer_use__list_apps",
-  "computer_use__perform_secondary_action",
-  "computer_use__press_key",
-  "computer_use__scroll",
-  "computer_use__set_value",
-  "computer_use__type_text",
-  "skill",
-  "agent",
-];
-const QWEN_HEADLESS_EXTRA_ARGS = [
-  "--output-format", "json",
-  "--allowed-mcp-server-names", "__none__",
-  "--exclude-tools", ...QWEN_EXCLUDE_TOOLS,
-  "--approval-mode", "yolo",
-];
+// ===== API 模式（v3）=====
+// 不再 spawn CLI：所有 LLM 调用走 scripts/llm/runner.mjs。
+// response_format=json_schema + 截断自动重试 + 模型链降级，全在 runner.mjs 里处理。
+// 旧版 qwen headless / computer-use / MCP 不变量已不适用，全部弃用。
 
-// qwen 的 --output-format json 把整轮事件以 JSON 数组打到 stdout（init / assistant / tool_result / result）。
-// 文件协议下我们读 cachePath 拿正文，stdout 只用来 ① 报告 qwen 实际落到哪个模型（init.model，识破“名字没匹配上
-// 静默回退到活跃 provider”）② 捞 result 里的 [API Error: ...] 文本好分类成可用性失败。解析失败就当普通文本兜底。
-function parseQwenEnvelope(stdout) {
-  if (!stdout || typeof stdout !== "string") return null;
-  const trimmed = stdout.trim();
-  if (!trimmed.startsWith("[") && !trimmed.startsWith("{")) return null;
-  let events;
-  try {
-    events = JSON.parse(trimmed);
-  } catch {
-    return null;
-  }
-  if (!Array.isArray(events)) events = [events];
-  const init = events.find((e) => e && e.type === "system");
-  const result = events.find((e) => e && e.type === "result");
-  return {
-    model: init?.model ?? null,
-    resultText: typeof result?.result === "string" ? result.result : "",
-    isError: Boolean(result?.is_error),
-    subtype: result?.subtype ?? null,
-    structuredResult: result?.structured_result ?? null,
-  };
-}
-
-// qwen 按 (authType, modelId) 解析模型，modelId 重复时取“第一个匹配”；传 provider 名字（如「火山 deepseek-v4-pro」）
-// 匹配不上会静默回退到活跃 provider。这里抓 init.model 打一行“请求 vs 实际”，第一次出现才打，避免刷屏；不一致时高亮，
-// 让用户立刻看清自己到底跑的是不是想要的模型（修“内容准确”里最隐蔽的一类问题）。
-const reportedActualModels = new Set();
-function noteActualModel(where, requested, stdout) {
-  const env = parseQwenEnvelope(stdout);
-  const actual = env?.model;
-  if (!actual) return;
-  const want = requested ?? "CLI默认";
-  const key = `${where}|${want}|${actual}`;
-  if (reportedActualModels.has(key)) return;
-  reportedActualModels.add(key);
-  const mismatch = requested && actual !== requested && !String(requested).includes(actual);
-  console.log(`[模型] ${where} 请求=${want} 实际=${actual}${mismatch ? "  ⚠ 与请求不一致（qwen 按 modelId 解析，provider 名/重复 id 可能被静默回退）" : ""}`);
-}
-
-// ===== qwen 显式路由 + 结构化输出（修“选不到指定火山模型”+“写大内容不稳”）=====
-// 背景（2026-06-14 排查）：qwen 按 (authType, modelId) 解析模型，modelId 重复时取“第一个匹配”，CLI 的
-// --openai-base-url / OPENAI_BASE_URL 在 modelId 命中 registry 时都会被 registry 覆盖（实测 deepseek-v4-pro
-// 永远被送到 deepseek.com→402，到不了火山）。唯一能精确指向某个 provider 的办法是 `--bare` 跳过 registry，
-// 再用显式 OPENAI_API_KEY + OPENAI_BASE_URL 直连。配合 `--json-schema` 让模型走合成 structured_output 工具、
-// 首个有效调用即退出，直接拿 structured_result 对象（比“写文件 + //---END---”更稳：免 shell 转义、不会截断）。
-// --bare 同时跳过 MCP/扩展，根除 computer-use 弹框、省 npx 启动开销。
-// schema 必须显式给 properties：纯 {additionalProperties:true} 会让模型偶尔把结果套一层 "additionalProperties"
-// 包装（实测），properties+required 能把输出钉成期望的扁平形状。verdict 用 enum 强约束，避免模型写 "approved"
-// 之类被 normalizeJudgeReview 当 fail。additionalProperties:true 让 dimensions/findings/notes 等附加字段照样透传。
-const QWEN_JUDGE_SCHEMA = {
-  type: "object",
-  properties: {
-    verdict: { type: "string", enum: ["pass", "fail"] },
-    score: { type: "number" },
-    dimensions: { type: "object" },
-  },
-  required: ["verdict", "score"],
-  additionalProperties: true,
-};
-const QWEN_JUDGE_BATCH_SCHEMA = {
-  type: "object",
-  properties: {
-    reviews: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          ref: { type: "string" },
-          verdict: { type: "string", enum: ["pass", "fail"] },
-          score: { type: "number" },
-          dimensions: { type: "object" },
-        },
-        required: ["ref", "verdict", "score"],
-        additionalProperties: true,
-      },
-    },
-  },
-  required: ["reviews"],
-  additionalProperties: true,
-};
-const QWEN_BLOCK_JUDGE_SCHEMA = {
-  type: "object",
-  properties: {
-    blockReviews: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          key: { type: "string" },
-          verdict: { type: "string", enum: ["improved", "same", "regressed", "blocking"] },
-          reason: { type: "string" },
-          fix: { type: "string" },
-        },
-        required: ["key", "verdict"],
-        additionalProperties: true,
-      },
-    },
-  },
-  required: ["blockReviews"],
-  additionalProperties: true,
-};
+// qwen 显式路由 + 结构化输出 schema 旧实现已删除 ——
+// ① 路由（--bare + OPENAI_BASE_URL 直连）由 env-config.mjs 的 baseUrl 字段直接管，runner.mjs 透传；
+// ② 结构化 schema 由 quality_llm_judge.mjs 的 JUDGE_REVIEW_SCHEMA / QWEN_JUDGE_BATCH_SCHEMA / QWEN_BLOCK_JUDGE_SCHEMA 提供（顶层 additionalProperties:false + required 钉键），在 quality_refine.mjs 顶部已 import。
 // 精修结构化 schema：递归镜像当前 topic 的结构，给每一层 array/object/标量都显式标 type。
 // 关键修复（2026-06-14）：原实现只把每个顶层 key 列成空 schema {}（无 type）。火山 minimax-m3 在
 // structured_output 下遇到"无 type 的属性 + 数组值"会把数组包成 {"item":[...]} 对象——learningCards /
@@ -303,143 +175,22 @@ function buildTopicSchema(original) {
   for (const [key, value] of Object.entries(original || {})) properties[key] = schemaForValue(value);
   return { type: "object", properties, required: Object.keys(original || {}), additionalProperties: true };
 }
-// --bare 默认仍带 read_file/edit/notebook_edit/run_shell_command；判官/精修只需要合成的 structured_output，
-// 把这些副作用工具全排除——既杜绝 deepseek 之类模型乱调工具触发 --max-tool-calls 0 的 budget abort(exit 55)，
-// 也避免 yolo 下模型用 shell 改动仓库文件。最终 init.tools 只剩 structured_output。
-const QWEN_BARE_EXCLUDE_TOOLS = ["read_file", "edit", "notebook_edit", "run_shell_command"];
-
-let qwenRoutesMap = null; // modelId -> { baseUrl, apiKey, apiKeyEnv }
-let qwenSettingsEnvCache = null;
-function loadQwenSettingsEnv() {
-  if (qwenSettingsEnvCache) return qwenSettingsEnvCache;
-  qwenSettingsEnvCache = {};
-  try {
-    const home = process.env.HOME || process.env.USERPROFILE || "";
-    const s = JSON.parse(readFileSync(path.join(home, ".qwen", "settings.json"), "utf8"));
-    if (s.env && typeof s.env === "object") qwenSettingsEnvCache = s.env;
-  } catch {
-    /* 读不到就空表，apiKey 解析时再报缺失 */
-  }
-  return qwenSettingsEnvCache;
-}
-// --qwen-routes：inline JSON 或文件路径，形如 { "<modelId>": { "baseUrl": "...", "apiKeyEnv": "HUOSHAN_API_KEY" } }。
-// apiKey 取值优先级：process.env[apiKeyEnv] → ~/.qwen/settings.json 的 env[apiKeyEnv] → route.apiKey（不推荐，会落配置文件）。
-// 注意：key 只通过子进程 env 传给 qwen，绝不进命令行参数，避免 ps 泄露。
-function setQwenRoutes(spec) {
-  if (!spec) return;
-  let raw;
-  try {
-    raw = typeof spec === "string" && spec.trim().startsWith("{") ? JSON.parse(spec) : JSON.parse(readFileSync(spec, "utf8"));
-  } catch (error) {
-    throw new Error(`--qwen-routes 解析失败（应为 inline JSON 或可读 JSON 文件路径）：${error.message}`);
-  }
-  qwenRoutesMap = new Map();
-  for (const [modelId, route] of Object.entries(raw || {})) {
-    if (!route || typeof route !== "object" || !route.baseUrl) continue;
-    const envName = route.apiKeyEnv;
-    const apiKey = (envName && (process.env[envName] || loadQwenSettingsEnv()[envName])) || route.apiKey || "";
-    qwenRoutesMap.set(String(modelId), { baseUrl: route.baseUrl, apiKey, apiKeyEnv: envName });
-  }
-}
-function resolveQwenRoute(model) {
-  if (!qwenRoutesMap || !model) return null;
-  return qwenRoutesMap.get(String(model)) ?? null;
-}
-
-// 覆盖协议：判官/精修的原始 prompt 多半写着“只返回一个 JSON 对象、不要解释”（让模型输出纯文本），
-// 这与 --json-schema“必须调用 structured_output 工具”冲突 → 模型照旧吐文本 → qwen 报
-// "Model produced plain text instead of calling the structured_output tool" 并 exit 1。
-// 这段追加在末尾，明确覆盖上文，把“输出文本”改成“调用 structured_output 工具”。
-const STRUCTURED_OUTPUT_OVERRIDE = `
-
-【最终输出协议（覆盖上文一切“返回/输出 JSON、第一个字符是 {、不要解释”之类的说法）】
-不要把 JSON 当作普通文本写到 stdout。你必须改为【调用 structured_output 工具】，把上文要求的那个 JSON 对象原样作为该工具的唯一参数传入。只调用一次 structured_output，调用后即结束，不要再输出任何文字。`;
-
-// 结构化路径专用的字符串排版规则（替代 JSON_STRING_RULES）。
-// 关键修复（2026-06-15）：JSON_STRING_RULES / REFINE_SPEC 那套“换行必须用 \\n 转义、双引号要转义”是给
-// **文件/文本协议**写的（模型把生 JSON 文本写进文件，需要自己保证 JSON 合法）。但 structured_output 路径下
-// 模型是把一个 JSON 对象交给工具、由工具负责序列化与转义——此时若模型还按“换行写成 \\n”执行，就会双重转义，
-// 正文里留下字面量 \\n / \\t（实测 minimax 把一篇 94 分 topic 的全部真实换行写成字面 \\n，触发“未渲染字面量 +
-// 无分段长文 + 超长句”连环扣分，94→37）。所以结构化路径必须反过来要求：写真实换行、不要手动转义。
-const STRUCTURED_STRING_RULES = `
-【字符串排版规则（structured_output 路径，必须照做）】
-1. 你是通过 structured_output 工具返回一个 JSON 对象，工具会自动完成 JSON 序列化与转义——你只管在各字符串字段里写"正常的人类可读文本"。
-2. 需要换行/分段就直接敲真实换行，需要缩进就用真实空格。严禁把换行写成字面量 \\n、严禁把制表符写成字面量 \\t，也不要给双引号手动加反斜杠——那样会让正文出现未渲染的 \\n / \\t / \\" 乱码，被审计判低分。
-3. 需要引用术语/字段名时用中文「」或反引号 \`\` 包起来，避免裸双引号。
-4. 字段名、层级、数组结构与下面【当前 topic JSON】完全一致，只改文字内容。`;
-
-// 用 --bare + 显式凭据 + --json-schema 跑一次 qwen，返回 structured_result（一个 JS 对象）。
-// 判官、精修共用。任何 API 报错（402/限流/鉴权）标记成 availabilityFailure，让上层走模型降级/退避。
-async function runQwenStructured({ cliPath, prompt, schema, model, route, timeoutMs, progress, where }) {
-  const args = [
-    "--bare",
-    "--auth-type", "openai",
-    "--exclude-tools", ...QWEN_BARE_EXCLUDE_TOOLS, // 只留 structured_output，详见常量注释
-    "--json-schema", JSON.stringify(schema),
-    "--output-format", "json",
-    "--max-tool-calls", "0", // 只允许合成的 structured_output（豁免），其余一律禁止
-    "--approval-mode", "yolo",
-  ];
-  if (model) args.push("--model", model); // 标量 flag 收尾，positional prompt 紧随其后不会被吞
-  args.push(`${prompt}${STRUCTURED_OUTPUT_OVERRIDE}`);
-  const childEnv = { ...process.env, OPENAI_BASE_URL: route.baseUrl };
-  if (route.apiKey) childEnv.OPENAI_API_KEY = route.apiKey;
-  const result = await runProcess(
-    cliPath,
-    args,
-    { cwd: root, stdio: ["ignore", "pipe", "pipe"], env: childEnv },
+// 旧 CLI 路径(qwenRoutes / setQwenRoutes / resolveQwenRoute / STRUCTURED_OUTPUT_OVERRIDE / STRUCTURED_STRING_RULES /
+// applyPreset / commandPath / runQwenStructured 等)已彻底删除 —— v3 全 API 模式。
+// 上层调用统一走 callRefineApi(prompt, schema, { model, sampling, signal, onProgress })。
+async function callRefineApi(prompt, schema, { model, sampling, timeoutMs, signal, onProgress } = {}) {
+  const t0 = Date.now();
+  const result = await llmRunner.runRefine({
+    systemPrompt: "你是内容精修助手,通过 structured_output 工具返回 JSON。",
+    userPrompt: prompt,
+    schema,
+    sampling,
+    modelChain: model ? [model] : undefined,
     timeoutMs,
-    progress,
-  );
-  noteActualModel(where ?? "qwen", model, result.stdout);
-  const env = parseQwenEnvelope(result.stdout);
-  if (!env) {
-    const error = new Error(`qwen 结构化输出无法解析为事件 JSON（stdout 尾="${tailLine(result.stdout)}"）`);
-    if (availabilityFailureMatch(result.stdout)) error.availabilityFailure = true;
-    throw error;
-  }
-  // 成功判据 = 拿到了 structured_result 且 result 事件未标 is_error。务必先判这个：成功时绝不去扫 resultText，
-  // 因为 resultText 此刻就是评审/topic 的 JSON 正文，里面的数字（500/402…）/词会误触可用性正则，把好结果当失败重试。
-  if (env.structuredResult != null && typeof env.structuredResult === "object" && !env.isError) {
-    return env.structuredResult;
-  }
-  // 走到这里 = 没拿到结构化结果（含 [API Error: 402…] 这类 subtype=success 但 result 是错误文本的情况）。此时才扫错误分类。
-  const hit = availabilityFailureMatch(env.resultText) || availabilityFailureMatch(result.stdout);
-  const error = new Error(`qwen 未产出 structured_result（subtype=${env.subtype}，text="${(env.resultText || "").slice(0, 200)}"）`);
-  if (hit) error.availabilityFailure = true; // 限流/402/鉴权 → 计入模型降级；其它（如内容协议问题）走普通重试
-  throw error;
-}
-
-function applyPreset(cfg) {
-  const preset = inferPreset(cfg.cli, cfg.preset);
-  const presets = {
-    // qwen 0.18: -p/--prompt 已 deprecated（"Appended to input on stdin (if any)"，会让 CLI 等 stdin EOF 而不退出）。
-    // 官方推荐 positional："Defaults to one-shot; use -i/--prompt-interactive for interactive."
-    // headless 不变量见 QWEN_HEADLESS_EXTRA_ARGS：用 --output-format json 让 qwen 跑完（含 write_file 工具调用）后干净退出，
-    // 不再走 PTY 交互模式（那会让 qwen 写完文件赖着不退、整批卡到超时）。usePty 因此必须为 false。
-    qwen: { baseArgs: [], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [...QWEN_HEADLESS_EXTRA_ARGS], usePty: false },
-    gemini: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: ["--approval-mode", "auto_edit"], usePty: true },
-    claude: { baseArgs: ["-p"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [], usePty: false },
-    opencode: { baseArgs: ["run"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [], usePty: false },
-    codex: { baseArgs: ["exec", "--skip-git-repo-check"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: ["--sandbox", "workspace-write"], usePty: false },
-    generic: { baseArgs: [], modelArg: cfg.modelArg, promptArg: cfg.promptArg, promptMode: cfg.promptMode, extraArgs: [], usePty: cfg.usePty },
-  };
-  const selected = presets[preset] ?? presets.generic;
-  return {
-    ...cfg,
-    preset,
-    baseArgs: cfg.baseArgs.length ? cfg.baseArgs : selected.baseArgs,
-    modelArg: cfg.modelArg === "--model" ? selected.modelArg : cfg.modelArg,
-    promptArg: cfg.promptArg === "-p" ? selected.promptArg : cfg.promptArg,
-    promptMode: cfg.promptMode === "flag" ? selected.promptMode : cfg.promptMode,
-    extraArgs: cfg.noDefaultExtraArgs ? cfg.extraArgs : [...selected.extraArgs, ...cfg.extraArgs],
-    usePty: cfg.usePty || selected.usePty,
-  };
-}
-
-function commandPath(name) {
-  const result = spawnSync("command", ["-v", name], { shell: true, encoding: "utf8" });
-  return result.status === 0 ? result.stdout.trim().split(/\n/)[0] : "";
+    signal,
+    onProgress,
+  });
+  return { parsed: result.parsed, model: result.model, durationMs: Date.now() - t0, usage: result.usage };
 }
 
 function clean(text) {
@@ -707,24 +458,10 @@ function fileSizeLabel(file) {
   }
 }
 
-function killChildProcess(child, signal = "SIGTERM") {
-  if (!child?.pid) return;
-  try {
-    if (process.platform !== "win32") process.kill(-child.pid, signal);
-    else child.kill(signal);
-  } catch {
-    try {
-      child.kill(signal);
-    } catch {}
-  }
-}
-
-function terminateActiveChildren(signal = "SIGTERM") {
-  for (const [pid, child] of activeChildren.entries()) {
-    console.log(`[INTERRUPT] 终止外部 CLI pid=${pid} signal=${signal}`);
-    killChildProcess(child, signal);
-  }
-}
+// killChildProcess / terminateActiveChildren 已弃用 —— CLI 子进程路径已删除(API 模式无 spawn)。
+// 保留为 noop stub,防 runProcess / installSignalHandlers 旧引用炸。
+function killChildProcess(_child, _signal = "SIGTERM") { /* noop,API 模式无 spawn */ }
+function terminateActiveChildren(_signal = "SIGTERM") { /* noop,API 模式无 spawn */ }
 
 function makeInterruptedError(signal = "SIGINT") {
   const error = new Error(`interrupted by ${signal}`);
@@ -732,20 +469,19 @@ function makeInterruptedError(signal = "SIGINT") {
   return error;
 }
 
+// installSignalHandlers 简化版 —— 只设 shutdownRequested,所有循环自动检查后退出。
+// API 模式没有外部 CLI 子进程,所以不再需要 terminateActiveChildren。
 function installSignalHandlers() {
   let interrupted = false;
   const handle = (signal) => {
     shutdownRequested = true;
     if (interrupted) {
       console.log(`[INTERRUPT] 再次收到 ${signal}，强制退出。`);
-      terminateActiveChildren("SIGKILL");
       process.exit(signal === "SIGINT" ? 130 : 143);
     }
     interrupted = true;
-    console.log(`\n[INTERRUPT] 收到 ${signal}，正在停止当前精修任务和外部 CLI。`);
-    terminateActiveChildren("SIGTERM");
+    console.log(`\n[INTERRUPT] 收到 ${signal}，正在停止当前精修任务。`);
     setTimeout(() => {
-      terminateActiveChildren("SIGKILL");
       process.exit(signal === "SIGINT" ? 130 : 143);
     }, 3000).unref();
   };
@@ -753,7 +489,57 @@ function installSignalHandlers() {
   process.once("SIGTERM", () => handle("SIGTERM"));
 }
 
-function runProcess(command, args, options, timeoutMs, progress = {}) {
+// 暂停时键盘交互:Enter 继续 / a 自动探活 / s 跳过当前 / p 切回手动
+function installPauseKeyboard() {
+  if (!process.stdin.isTTY) return;
+  process.stdin.setEncoding("utf8");
+  // 进 raw 模式才能逐字符接 Enter / 单键
+  let rawOn = false;
+  const tryRaw = () => {
+    if (rawOn) return;
+    try { process.stdin.setRawMode(true); rawOn = true; } catch {}
+  };
+  const tryUnraw = () => {
+    if (!rawOn) return;
+    try { process.stdin.setRawMode(false); rawOn = false; } catch {}
+  };
+  pauseBus.on("pause", () => {
+    tryRaw();
+    process.stdin.resume();
+    process.stdout.write(`\n[PAUSED] 额度耗尽 · ${pauseBus.reason}\n[Enter] 继续 / [a] 自动探活 / [s] 跳过当前 / [p] 手动模式\n`);
+  });
+  pauseBus.on("resume", () => {
+    tryUnraw();
+    process.stdout.write(`\n[RESUMED] 已恢复 (${pauseBus.describe().state})\n`);
+  });
+  process.stdin.on("data", (buf) => {
+    if (!pauseBus.isPaused()) return;
+    const ch = buf.toString();
+    if (ch === "\r" || ch === "\n") {
+      pauseBus.resume({ source: "manual-key" });
+    } else if (ch.toLowerCase() === "a") {
+      pauseBus.setPolicy("auto-probe");
+      process.stdout.write("[POLICY] auto-probe(自动探活,额度恢复即续)\n");
+      // resume 一次让 router 自己排上探活循环;但实测应该让 worker 先 retry,触发到 quota error 时再排程
+      pauseBus.resume({ source: "manual-key" });
+    } else if (ch.toLowerCase() === "s") {
+      pauseBus.setPolicy("skip");
+      process.stdout.write("[POLICY] skip(本篇丢弃,继续下一篇)\n");
+      pauseBus.resume({ source: "manual-key-skip" });
+    } else if (ch.toLowerCase() === "p") {
+      pauseBus.setPolicy("manual");
+      process.stdout.write("[POLICY] manual(手动继续)\n");
+    } else if (ch === "") {
+      // Ctrl-C:让正常 SIGINT 流程接管
+      tryUnraw();
+      process.kill(process.pid, "SIGINT");
+    }
+  });
+}
+
+// runProcess: 仅用于跑确定性审计 / validate / sync 这类 Node 子脚本(不是 LLM 调用)。
+// LLM 调用一律走 llmRunner.runRefine/runJudge/runBlockJudge(API 模式)。
+async function runProcess(command, args, options, timeoutMs, progress = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       ...options,
@@ -765,96 +551,39 @@ function runProcess(command, args, options, timeoutMs, progress = {}) {
     let timedOut = false;
     let settled = false;
     const startedAt = Date.now();
-    const heartbeatMs = progress.heartbeatMs ?? 20000;
+    const heartbeatMs = progress.heartbeatMs ?? 10000;
     const label = progress.label ?? command;
     const outputPath = progress.outputPath;
     const outputKind = outputPath ? "capture" : "stdout";
-    // 输出大小：文件协议读 capture 文件字节，否则取已累积的 stdout 长度。两条路径都能反映“还在不在吐”。
-    const currentOutputSize = () => {
-      if (outputPath) {
-        try { return statSync(outputPath).size; } catch { return 0; }
-      }
-      return stdout.length;
-    };
-    const stallMs = Number(progress.stallTimeoutMs ?? 0); // 0=关闭；>0=输出连续这么久无增长即判定卡死、提前结束并按可用性失败重试
-    let stalled = false;
-    let lastGrowthSize = 0;
-    let stallArmed = false; // 首次出字节后才武装——全程不吐字节的 buffered 调用不会被误杀（仍靠硬超时兜底）
-    let lastGrowthAt = startedAt;
-    let lastBeatSize = 0;
-    let lastBeatAt = startedAt;
     const stopTimers = () => {
       clearTimeout(timer);
       if (heartbeat) clearInterval(heartbeat);
-      if (stallTimer) clearInterval(stallTimer);
     };
     const printHeartbeat = (kind = "WAIT", force = false) => {
       if (progress.suppressHeartbeat && !force) return;
-      const now = Date.now();
-      const size = currentOutputSize();
-      const dt = Math.max(1, Math.round((now - lastBeatAt) / 1000));
-      const delta = size - lastBeatSize;
-      lastBeatSize = size;
-      lastBeatAt = now;
-      const sizeLabel = outputPath ? fileSizeLabel(outputPath) : `${size}B`;
-      const idleS = Math.round((now - lastGrowthAt) / 1000);
+      const elapsed = Date.now() - startedAt;
+      const outputSize = outputPath ? fileSizeLabel(outputPath) : `${stdout.length}B`;
       const stderrTail = tailLine(stderr);
-      // Δ 是“距上次心跳新增的字节/秒数”，肉眼即可判断还在不在吐；idle 是“多久没增长”，接近 stall 阈值就快被判死。
       console.log(
-        `[${kind}] ${label} elapsed=${formatDuration(now - startedAt)} / timeout=${formatDuration(timeoutMs)} ` +
-          `${outputKind}=${sizeLabel} Δ${delta >= 0 ? "+" : ""}${delta}B/${dt}s${idleS >= 30 ? ` idle=${idleS}s` : ""} ` +
-          `stderr=${stderr.length}B${stderrTail ? ` last="${stderrTail}"` : ""}`,
+        `[${kind}] ${label} elapsed=${formatDuration(elapsed)} / timeout=${formatDuration(timeoutMs)} ` +
+          `${outputKind}=${outputSize} stderr=${stderr.length}B${stderrTail ? ` last="${stderrTail}"` : ""}`,
       );
     };
     const timer = setTimeout(() => {
       timedOut = true;
       printHeartbeat("TIMEOUT", true);
-      killChildProcess(child, "SIGTERM");
-      setTimeout(() => killChildProcess(child, "SIGKILL"), 3000).unref();
+      try { child.kill("SIGTERM"); } catch {}
+      setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 3000).unref();
     }, timeoutMs);
     const heartbeat = heartbeatMs > 0 && !progress.suppressHeartbeat
       ? setInterval(() => printHeartbeat(), heartbeatMs)
       : null;
     heartbeat?.unref();
-    // 空转看门狗：以远小于硬超时的节奏轮询输出大小；连续 stallMs 无增长即判定子进程卡死（route 挂起/限流空等/
-    // 连接 hang），提前 SIGTERM→SIGKILL，并在 close 里按"可用性失败"reject（触发重试 + 模型降级），不再干等硬超时。
-    // 首次出字节后才武装（stallArmed）——全程不吐字节的 buffered 调用不会被误杀（仍靠硬超时兜底），
-    // 而"流式吐到一半卡住"的能被早抓。
-    const stallTimer = stallMs > 0 && !progress.suppressHeartbeat
-      ? setInterval(() => {
-          if (settled || timedOut || stalled) return;
-          const size = currentOutputSize();
-          if (size > lastGrowthSize) {
-            if (!stallArmed) {
-              stallArmed = true;
-              lastGrowthAt = Date.now();
-            } else {
-              lastGrowthAt = Date.now();
-            }
-            lastGrowthSize = size;
-            return;
-          }
-          if (!stallArmed) return; // 还没出过字节，不判 stall
-          const idle = Date.now() - lastGrowthAt;
-          if (idle >= stallMs) {
-            stalled = true;
-            const sizeLabel = outputPath ? fileSizeLabel(outputPath) : `${size}B`;
-            console.log(`[STALL] ${label} 输出 ${Math.round(idle / 1000)}s 无增长（${outputKind}=${sizeLabel}），判定卡死，提前结束并重试`);
-            killChildProcess(child, "SIGTERM");
-            setTimeout(() => killChildProcess(child, "SIGKILL"), 3000).unref();
-          }
-        }, Math.max(5000, Math.min(stallMs, 15000)))
-      : null;
-    stallTimer?.unref();
     if (!progress.suppressSpawn) {
       console.log(`[SPAWN] ${label} pid=${child.pid ?? "?"} timeout=${formatDuration(timeoutMs)}`);
     }
-    // setEncoding 让 Node 内部 StringDecoder 跨 chunk 正确拼接多字节 UTF-8——否则一个中文字符被切在
-    // chunk 边界时，对单个 Buffer 调 toString() 会解出替换符 �，污染 qwen structured 路径的 topic 正文。
-    child.stdout?.setEncoding("utf8");
-    child.stderr?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk) => { stdout += chunk; });
-    child.stderr?.on("data", (chunk) => { stderr += chunk; });
+    child.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
@@ -870,10 +599,6 @@ function runProcess(command, args, options, timeoutMs, progress = {}) {
       const elapsed = Date.now() - startedAt;
       if (shutdownRequested) {
         reject(makeInterruptedError(signal || "SIGINT"));
-      } else if (stalled) {
-        const err = new Error(`stalled: 输出连续 ${Math.round(stallMs / 1000)}s 无增长，提前结束（疑似 route 挂起/限流/连接卡死）`);
-        err.availabilityFailure = true; // 计入模型降级 + 触发重试，换链上下一个模型/route
-        reject(err);
       } else if (timedOut) {
         reject(new Error(`timeout after ${timeoutMs}ms`));
       } else if (code === 0 || progress.allowNonZero) {
@@ -882,8 +607,6 @@ function runProcess(command, args, options, timeoutMs, progress = {}) {
         }
         resolve({ stdout, stderr, code });
       } else {
-        // 截尾不截头：qwen 0.18 yolo warning 是 stderr 首行（~270 字），会把 400 字额度吃光让真因被盖。
-        // 同时把 stdout 末尾带上：qwen 出 [API Error: 402…] / 鉴权失败常常写到 stdout 而不是 stderr。
         const stderrTail = stderr.trim().slice(-600);
         const stdoutTail = stdout.trim().slice(-600);
         reject(new Error(
@@ -896,148 +619,25 @@ function runProcess(command, args, options, timeoutMs, progress = {}) {
   });
 }
 
-function buildCliArgs(cfg, prompt, model) {
-  const args = [...cfg.baseArgs, ...cfg.extraArgs];
-  const useModel = model ?? cfg.model;
-  if (useModel) args.push(cfg.modelArg, useModel);
-  if (cfg.promptMode === "flag") {
-    if (!cfg.promptArg) throw new Error("promptMode=flag 时必须有 promptArg");
-    args.push(cfg.promptArg, prompt);
-  } else if (cfg.promptMode === "positional") {
-    args.push(prompt);
-  } else {
-    throw new Error(`unsupported promptMode: ${cfg.promptMode}`);
-  }
-  return args;
-}
+// buildCliArgs 已弃用 —— CLI 模式已删,API 模式不构造命令行参数。
+function buildCliArgs(_cfg, _prompt, _model) { throw new Error("buildCliArgs 已弃用 —— API 模式不构造 CLI 参数"); }
 
-// ===== 模型降级链：主用模型频繁不可用就自动降到下一个，最后兜底 =====
-function makeModelState(chain, degradeAfter, windowMs) {
-  return {
-    chain: chain.length ? chain : [undefined],
-    index: 0,
-    degradeAfter,
-    windowMs,
-    failures: [], // 时间戳数组：仅在窗口内频繁可用性失败才降级
-  };
-}
-function currentModel(modelState) {
-  return modelState.chain[modelState.index];
-}
-// 只有“可用性失败”（进程超时/非零退出/端点限流/不可用）才计入降级；
-// “内容失败”（模型出了 JSON 但没过校验）属于该篇正常重试，不触发降级。
-// 用滑动窗口（默认 60s）判断：只有“短时间内连续频繁”可用性失败才降级，避免偶发 429 立刻切模型。
-function pruneWindow(timestamps, windowMs, now) {
-  const cutoff = now - windowMs;
-  while (timestamps.length && timestamps[0] < cutoff) timestamps.shift();
-}
-function noteModelResult(modelState, result) {
-  const now = Date.now();
-  pruneWindow(modelState.failures, modelState.windowMs, now);
-  if (result.ok) return; // 成功不重置——窗口里其他失败仍然要计数，自然过期即可
-  if (!result.availabilityFailure) return;
-  modelState.failures.push(now);
-  if (modelState.failures.length >= modelState.degradeAfter && modelState.index < modelState.chain.length - 1) {
-    modelState.index += 1;
-    modelState.failures = [];
-    console.log(
-      `[DEGRADE] ${Math.round(modelState.windowMs / 1000)}s 窗口内可用性失败 ≥ ${modelState.degradeAfter} 次，` +
-        `降级到：${currentModel(modelState) ?? "CLI 默认"}（链 ${modelState.index + 1}/${modelState.chain.length}）`,
-    );
-  }
-}
+// ===== 模型降级链已弃用 —— 由 scripts/llm/router.mjs 的 createRouter 接管（10min 滑动窗口 + 自动降级） =====
+// 保留为空 stub 防旧调用点(refinePool / main)炸。
+function makeModelState(_chain, _degradeAfter, _windowMs) { return { chain: [undefined], index: 0, degradeAfter: 0, windowMs: 0, failures: [] }; }
+function currentModel(_modelState) { return undefined; }
+function pruneWindow(_timestamps, _windowMs, _now) { /* noop */ }
+function noteModelResult(_modelState, _result) { /* noop,降级由 router.mjs 内部管 */ }
 
-// ===== 动态判官（LLM 8 维评审；只读/plan 预设，零写/工具权限）=====
+// ===== 动态判官（LLM 9 维评审；只读/plan 预设，零写/工具权限）=====
 // 判官输入全内嵌 prompt、输出一个小 review JSON 到 stdout，不需要任何写或工具执行权限。
-function applyJudgePreset(cli, timeoutMs) {
-  const base = cli.split("/").pop().toLowerCase();
-  const presets = {
-    // qwen 0.18: -p/--prompt 已 deprecated，必须走 positional 才能 one-shot 退出。
-    // headless 不变量同精修主流程（见 QWEN_HEADLESS_EXTRA_ARGS）：--output-format json 让判官写完缓存文件即干净退出，
-    // 不再 PTY 卡到超时；--exclude-tools 去掉 computer-use 弹框源；--allowed-mcp-server-names __none__ 不加载 MCP。
-    qwen: { baseArgs: [], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [...QWEN_HEADLESS_EXTRA_ARGS], usePty: false },
-    gemini: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: ["--approval-mode", "auto_edit"], usePty: true },
-    claude: { baseArgs: ["-p"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [], usePty: false },
-    opencode: { baseArgs: ["run"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [], usePty: false },
-    codex: { baseArgs: ["exec", "--skip-git-repo-check"], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: ["--sandbox", "workspace-write"], usePty: false },
-    generic: { baseArgs: [], modelArg: "--model", promptArg: "-p", promptMode: "flag", extraArgs: [], usePty: false },
-  };
-  const key = base === "qwen-code" || base === "qwen" ? "qwen"
-    : base === "claude-code" || base === "claudecode" ? "claude"
-    : presets[base] ? base
-    : "generic";
-  return { ...presets[key], timeoutMs };
-}
-
-function buildJudgeFilePrompt(prompt, cachePath, previousError = "") {
-  // previousError 现在可能是结构化对象（含 message + jsonLocation 上下文片段），也可能是字符串。
-  // 把 location 片段单独贴出来，让模型能直接看到“第 40 行 227 列那段引号写错了”，而不是再去猜。
-  let retryBlock = "";
-  if (previousError) {
-    if (typeof previousError === "string") {
-      retryBlock = `\n【上一次输出无效，必须修正】${previousError}\n这一次不要复述原因，只写一个合法 JSON 对象到文件。\n`;
-    } else {
-      const { message, jsonLocation } = previousError;
-      const locLine = jsonLocation
-        ? `\n问题位置：line ${jsonLocation.line} column ${jsonLocation.column}（offset=${jsonLocation.position}）。\n该位置上下文片段（| 标注断点附近）：\n${jsonLocation.context}\n常见原因：你在 evidence/reason/notes 等字段值里写了未转义的 ASCII 双引号，把字符串提前闭合了。\n`
-        : "";
-      retryBlock = `\n【上一次输出无效，必须修正】${message}${locLine}请按 JSON 字符串硬规则改写：用「」/反引号/\\\" 替代裸 ASCII 双引号；不要在字符串值里写裸换行。\n这一次不要复述原因，直接输出一个合法的、能被 JSON.parse 通过的 JSON 对象到文件。\n`;
-    }
-  }
-  return `${prompt}
-
-【最终输出协议：覆盖上文所有“返回 JSON/输出 JSON”的说法】
-不要在 stdout 输出 JSON，不要解释，不要 Markdown 代码围栏。把唯一的评审 JSON 对象写入下面这个绝对路径的文件：
-${cachePath}
-
-写入规则：
-1. 文件初始为空。一次写不完就按追加(append)模式分片写入，最终拼起来必须是一个合法 JSON 对象。
-2. 全部写完后，必须在文件末尾追加一行结束标记：
-//---END---
-3. 完成后 stdout 只输出一行：
-WROTE:${cachePath}
-${retryBlock}`;
-}
-
-function judgeProtocolError(message, extras = {}) {
-  const error = new Error(message);
-  error.judgeProtocolFailure = true;
-  Object.assign(error, extras);
-  return error;
-}
-
-// JSON.parse 报错通常带 "at position N" / "line L column C"。把它们抽出来，再切一段上下文片段，
-// 让我们能精准把"第 40 行 227 列那个 \"" 喂给模型重写，而不是只甩一句通用错误。
-function extractJsonErrorLocation(text, error) {
-  const message = error?.message ?? "";
-  const positionMatch = message.match(/position\s+(\d+)/i);
-  const lineColMatch = message.match(/line\s+(\d+)\s+column\s+(\d+)/i);
-  let position = positionMatch ? Number(positionMatch[1]) : null;
-  let line = lineColMatch ? Number(lineColMatch[1]) : null;
-  let column = lineColMatch ? Number(lineColMatch[2]) : null;
-  if (position == null && line != null && column != null) {
-    const lines = text.split("\n");
-    let acc = 0;
-    for (let i = 0; i < line - 1 && i < lines.length; i += 1) acc += lines[i].length + 1;
-    position = acc + Math.max(0, column - 1);
-  }
-  if (position == null) return null;
-  if (line == null || column == null) {
-    let l = 1;
-    let c = 1;
-    for (let i = 0; i < position && i < text.length; i += 1) {
-      if (text[i] === "\n") { l += 1; c = 1; } else { c += 1; }
-    }
-    line = l;
-    column = c;
-  }
-  const ctxStart = Math.max(0, position - 80);
-  const ctxEnd = Math.min(text.length, position + 80);
-  const before = text.slice(ctxStart, position);
-  const after = text.slice(position, ctxEnd);
-  const context = `${before}|${after}`.replace(/\s+/g, " ").slice(0, 240);
-  return { line, column, position, context };
-}
+// applyJudgePreset / buildJudgeFilePrompt / judgeProtocolError / extractJsonErrorLocation 已弃用
+// —— CLI 文件协议路径已删除(API 模式用 response_format=json_schema strict,工具自动序列化,无需"文件协议+重试")。
+// 保留为 stub 防旧引用炸。
+function applyJudgePreset(_cli, timeoutMs) { return { baseArgs: [], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [], usePty: false, timeoutMs }; }
+function buildJudgeFilePrompt(prompt, _cachePath, _previousError = "") { return prompt; }
+function judgeProtocolError(message, extras = {}) { const err = new Error(message); err.judgeProtocolFailure = true; Object.assign(err, extras); return err; }
+function extractJsonErrorLocation(_text, _error) { return null; /* API 模式 schema strict 校验,不需 line/col 定位 */ }
 
 function strictParseJudgeJson(text, label) {
   try {
@@ -1048,98 +648,43 @@ function strictParseJudgeJson(text, label) {
   }
 }
 
-// 单次判官调用：内嵌 prompt -> 本地文件 JSON（和精修器写缓存协议一致，避免 stdout 大 JSON 被截断/污染）。
-async function runJudgeProcessJson(prompt, judge, model, ref, index, schema = QWEN_JUDGE_SCHEMA) {
-  const attempts = judge.jsonRetries + 1;
-  let previousError = null; // 现在传整个 error 对象（含 jsonLocation），prompt 拼装时再展开
+// 单次判官调用：API 模式 —— 调 llmRunner.runJudge（自动应用 JUDGE_MODEL_CHAIN + 默认采样 + 降级 + 截断重试）。
+async function runJudgeProcessJson(prompt, judge, model, ref, index, schema) {
+  void judge; // API 模式不需要 judge.cliPath / judge.cfg
+  const finalSchema = schema ?? JUDGE_REVIEW_SCHEMA;
+  const attempts = judge?.jsonRetries ? judge.jsonRetries + 1 : 1;
+  let lastError = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     if (shutdownRequested) throw makeInterruptedError();
-    // qwen 显式路由：走 --bare + --json-schema 结构化输出（精确路由到指定火山模型 + 直接拿对象，免文件协议）。
-    const route = resolveQwenRoute(model);
-    if (route) {
-      const label = `JUDGE ${ref} m=${model ?? "默认"} #${index + 1} json=${attempt}/${attempts}`;
-      const progress = { suppressSpawn: true, suppressDone: true, suppressHeartbeat: true, heartbeatMs: 0, label };
-      try {
-        return await runQwenStructured({
-          cliPath: judge.cliPath, prompt, schema, model, route,
-          timeoutMs: judge.cfg.timeoutMs, progress, where: "判官",
-        });
-      } catch (error) {
-        previousError = error;
-        if (shutdownRequested || error.interrupted) throw error;
-        const hit = availabilityFailureMatch(error.message ?? "");
-        if (hit) {
-          error.availabilityFailure = true;
-          console.log(`[JUDGE] 检测到可用性失败信号 ${ref}：${hit.context}`);
-        }
-        if (attempt >= attempts) throw error;
-        console.log(`[JUDGE] 结构化输出失败，重试 ${attempt}/${attempts} ${ref}: ${error.message}`);
-        continue;
-      }
-    }
-    const outDir = path.join(judge.cacheDir, "outputs");
-    await mkdir(outDir, { recursive: true });
-    const safeRef = String(ref).replace(/[^a-z0-9]+/gi, "-").slice(0, 80);
-    const outputPath = path.join(outDir, `${Date.now()}-${safeRef}-${index + 1}-${attempt}-${sha256(`${ref}|${model ?? "default"}|${Math.random()}`).slice(0, 10)}.json`);
-    await rm(outputPath, { force: true });
-    const filePrompt = buildJudgeFilePrompt(prompt, outputPath, previousError);
-    const args = buildCliArgs(judge.cfg, filePrompt, model);
-    const label = `JUDGE ${ref} m=${model ?? "默认"} #${index + 1} json=${attempt}/${attempts}`;
-    // outputPath：让 runProcess 心跳里报告 capture 文件大小，JSON 永远从 outputPath 读。
-    const progress = {
-      suppressSpawn: true, suppressDone: true, suppressHeartbeat: true, heartbeatMs: 0, label,
-      outputPath,
-    };
-    let stdout = "";
+    const reqId = newReqId();
+    liveEvents.emitEvent("llm.request", { reqId, topicRef: ref, kind: "judge", spec: model ?? null, attempt, attempts });
     try {
-      if (judge.cfg.usePty && process.platform === "darwin") {
-        const tmp = mkdtempSync(path.join(tmpdir(), "quality-judge-"));
-        const capture = path.join(tmp, "judge.txt");
-        try {
-          await runProcess("script", ["-q", capture, judge.cliPath, ...args], { cwd: root, stdio: ["ignore", "ignore", "pipe"] }, judge.cfg.timeoutMs, progress);
-          stdout = readFileSync(capture, "utf8");
-        } finally {
-          await rm(tmp, { recursive: true, force: true });
-        }
-      } else {
-        const result = await runProcess(judge.cliPath, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] }, judge.cfg.timeoutMs, progress);
-        stdout = result.stdout;
-      }
-      noteActualModel("判官", model, stdout); // 非 qwen（无 JSON 信封）时内部 no-op
-
-      let cacheContent;
-      try {
-        cacheContent = readFileSync(outputPath, "utf8");
-      } catch (readError) {
-        throw judgeProtocolError(`判官未按文件协议写入 ${path.relative(root, outputPath)}（stdout="${tailLine(stdout)}"，readError=${readError.code ?? readError.message}）`);
-      }
-      const endMarker = "//---END---";
-      const endIdx = cacheContent.lastIndexOf(endMarker);
-      if (endIdx < 0) {
-        throw judgeProtocolError(`判官输出缺少 //---END--- 结束标记（file=${path.relative(root, outputPath)}，尾部="${tailLine(cacheContent)}"）`);
-      }
-      const jsonText = cacheContent.slice(0, endIdx).trim();
-      return strictParseJudgeJson(jsonText, label);
+      const result = await llmRunner.runJudge({
+        systemPrompt: "你是独立的内容质量评审 agent,只返回符合 schema 的 JSON 对象。",
+        userPrompt: prompt,
+        schema: finalSchema,
+        modelChain: model ? [model] : undefined,
+        onProgress: (e) => {
+          if (e.type === "token") {
+            liveEvents.emitEvent("llm.token", {
+              reqId, topicRef: ref, tokens: e.tokens, lastLine: e.lastLine, spec: e.spec, kind: "judge",
+            });
+          }
+        },
+      });
+      liveEvents.emitEvent("llm.done", { reqId, topicRef: ref, ok: true, kind: "judge", model: result.model, usage: result.usage });
+      return result.parsed;
     } catch (error) {
-      // 限流/上游错误兜底：stdout 里夹着 429/quota/throttl 这类信号时，标记成可用性失败，
-      // 让上层（runRefinePool / warm 预热）能感知到“该退避，不是判官 prompt 写坏了”。
-      const stdoutHit = availabilityFailureMatch(stdout);
-      const messageHit = availabilityFailureMatch(error.message ?? "");
-      if (stdoutHit || messageHit) {
-        error.availabilityFailure = true;
-        const ctx = (stdoutHit ?? messageHit).context;
-        console.log(`[JUDGE] 检测到可用性失败信号 ${ref}：${ctx}`);
-      }
-      previousError = error;
+      liveEvents.emitEvent("llm.done", { reqId, topicRef: ref, ok: false, kind: "judge", error: error.message });
+      lastError = error;
       if (shutdownRequested || error.interrupted) throw error;
+      const hit = availabilityFailureMatch(error.message ?? "");
+      if (hit) error.availabilityFailure = true;
       if (attempt >= attempts) throw error;
-      const locTag = error.jsonLocation
-        ? ` @line ${error.jsonLocation.line} col ${error.jsonLocation.column}`
-        : "";
-      console.log(`[JUDGE] JSON 文件协议失败，重试 ${attempt}/${attempts} ${ref}${locTag}: ${error.message}`);
+      console.log(`[JUDGE] 评审失败,重试 ${attempt}/${attempts} ${ref}: ${error.message.slice(0, 200)}`);
     }
   }
-  throw new Error(`判官 JSON 文件协议失败：${ref}`);
+  throw lastError ?? new Error(`判官失败：${ref}`);
 }
 
 function judgeCacheFile(topic, judge) {
@@ -1562,7 +1107,7 @@ function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministi
     : "";
   const issueBlock = issues.length
     ? issues.map((issue, index) => `${index + 1}. ${issue}`).join("\n")
-    : "（确定性审计未列出扣分明细，可能已经达到静态阈值；这不是内容达标证明。请按上面 8 维重新做专家级审读，找出静态规则遗漏的事实薄弱、表达空泛、结构不顺、面试不可用、图表泛化、追问浅等问题。）";
+    : "（确定性审计未列出扣分明细，可能已经达到静态阈值；这不是内容达标证明。请按上面 9 维重新做专家级审读，找出静态规则遗漏的事实薄弱、表达空泛、结构不顺、面试不可用、图表泛化、追问浅等问题。）";
   const templateBlock = tmpl.length
     ? `\n【跨 topic 模板句——下列句子在多篇里逐字重复，必须改写成本题专属的具体表达，禁止照抄】\n${tmpl
         .map((entry) => `- （在 ${entry.count} 篇里重复）${entry.sentence}`)
@@ -1591,7 +1136,8 @@ WROTE:${cachePath}
 不要在 stdout 输出 JSON 内容或任何其它文字。` : `【输出要求】通过 structured_output 工具一次性返回改写后的【完整 topic JSON 对象】：以下面【当前 topic JSON】为基底，保持所有字段名、层级、数组结构不变，只改写需要提升的文字内容；原有字段一个都不能少、不得缩水或删除。只调用一次 structured_output，不要解释、不要走普通文本输出。`}
 
 今天日期是 ${todayYmd}，updatedAt 必须设为该值。
-${cachePath ? JSON_STRING_RULES : STRUCTURED_STRING_RULES}
+// API 模式: response_format=json_schema strict 工具自动序列化 JSON 字符串值,模型只需写真实换行 / 真实空格 / 中文「」/反引号,不再需要 STRUCTURED_STRING_RULES / JSON_STRING_RULES 那套手写转义规则。
+// 旧 cachePath 路径已删,故此三元表达式直接固定返回空字符串(原本走 STRUCTURED_STRING_RULES 的分支已被 API 路径统一收编)。
 
 【当前 topic JSON】
 ${JSON.stringify(topic, null, 2)}
@@ -2248,7 +1794,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
     findingLines = findingsToPromptLines(beforeReview);
     if (staticBefore >= minScore && judgePasses(beforeReview, judge.dynamicSkipMin)) {
       if (detailedProgress) {
-        console.log(`[TOPIC] 已达标，跳过改写 ${ref}（static ${staticBefore} + 动态 ${beforeReview.score}，8 维全过、无事实问题）`);
+        console.log(`[TOPIC] 已达标，跳过改写 ${ref}（static ${staticBefore} + 动态 ${beforeReview.score}，9 维全过、无事实问题）`);
       }
       return {
         ok: true,
@@ -2271,106 +1817,48 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
     attemptsMade = attempt;
     phase("refineCall");
     const tmp = mkdtempSync(path.join(tmpdir(), "quality-refine-"));
-    const attemptLabel = `${mode} ${ref} attempt=${attempt}/${attempts} model=${model ?? "CLI默认"}`;
-    const route = resolveQwenRoute(model);
+    const attemptLabel = `${mode} ${ref} attempt=${attempt}/${attempts} model=${model ?? "默认链"}`;
     let parsed;
-    let raw = ""; // 结构化路径不产文本；文件协议路径会写入。finally 的 raw 落盘诊断两路共用，故提到 attempt 作用域。
+    let raw = ""; // 结构化路径不产文本；finally 的 raw 落盘诊断保留。
     try {
-      if (route) {
-        // qwen 显式路由：结构化输出路径——prompt 不含文件协议，用 --bare + --json-schema 直接拿整篇 topic 对象。
-        // 比写文件更稳：免 shell 转义大内容、structured_output 首个有效调用即退出、不会被 max_tokens 截断。
-        const prompt = buildRefinePrompt(original, audit.failingMap.get(ref), templates.get(ref), minScore, audit.scoreMap.get(ref), null, findingLines, previousFormatError);
-        if (detailedProgress) console.log(`[TOPIC] 开始 ${attemptLabel} score=${score}/100 cli=${cfg.cli}（结构化路由）`);
-        try {
-          parsed = await runQwenStructured({
-            cliPath, prompt, schema: buildTopicSchema(original), model, route,
-            timeoutMs: cfg.timeoutMs, progress: { ...processProgress, label: attemptLabel }, where: "精修",
+      // ====== API 模式统一走 callRefineApi（其内部已调 llmRunner.runRefine,自动应用 REFINE_MODEL_CHAIN + 截断重试 + 降级 + 流式 onProgress）======
+      const prompt = buildRefinePrompt(original, audit.failingMap.get(ref), templates.get(ref), minScore, audit.scoreMap.get(ref), null, findingLines, previousFormatError);
+      if (detailedProgress) console.log(`[TOPIC] 开始 ${attemptLabel} score=${score}/100（API 模式）`);
+      const reqId = newReqId();
+      liveEvents.emitEvent("llm.request", { reqId, topicRef: ref, kind: "refine", spec: model ?? null, attempt, attempts });
+      const onTokenProgress = (e) => {
+        if (e.type === "token") {
+          liveEvents.emitEvent("llm.token", {
+            reqId, topicRef: ref, tokens: e.tokens, lastLine: e.lastLine, spec: e.spec,
           });
-        } catch (spawnError) {
-          if (spawnError.availabilityFailure) availabilityFailure = true; // API 报错/限流 -> 计入降级
-          throw spawnError;
+          // 把 token 进度写到 active map,固定栏即时可见
+          phase(undefined, { tokens: e.tokens, lastLine: e.lastLine, spec: e.spec, kind: "refine" });
+        } else if (e.type === "retry") {
+          liveEvents.emitEvent("llm.retry", { reqId, topicRef: ref, attempt: e.attempt, reason: e.reason, spec: e.spec });
+          phase(undefined, { lastLine: `重试: ${e.reason}` });
+        } else if (e.type === "fallback-non-stream") {
+          liveEvents.emitEvent("llm.fallback", { reqId, topicRef: ref, spec: e.spec, kind: "non-stream" });
+          phase(undefined, { lastLine: "退化非流式" });
+        } else if (e.type === "schema-fallback") {
+          phase(undefined, { lastLine: `schema-fallback→${e.mode}` });
         }
-        availabilityFailure = false;
-        if (detailedProgress) console.log(`[TOPIC] CLI 已返回（结构化）${ref}`);
-      } else {
-        // 文件协议路径（非 qwen / 未配置 --qwen-routes）：子 agent 写 cachePath + //---END---，主进程读取。
-        const cachePath = path.join(cacheDir, `${safeRef}.attempt${attempt}.json`);
-        // 旧产物先删，避免子 agent 没写而我们读到上次 attempt 的内容。
-        await rm(cachePath, { force: true });
-        const prompt = buildRefinePrompt(original, audit.failingMap.get(ref), templates.get(ref), minScore, audit.scoreMap.get(ref), cachePath, findingLines, previousFormatError);
-        const args = buildCliArgs(cfg, prompt, model);
-        if (detailedProgress) {
-          console.log(`[TOPIC] 开始 ${attemptLabel} score=${score}/100 cli=${cfg.cli}`);
-        }
-        try {
-          if (cfg.usePty && process.platform === "darwin") {
-            const capture = path.join(tmp, "capture.txt");
-            await runProcess(
-              "script",
-              ["-q", capture, cliPath, ...args],
-              { cwd: root, stdio: ["ignore", "ignore", "pipe"] },
-              cfg.timeoutMs,
-              { ...processProgress, label: attemptLabel, outputPath: capture },
-            );
-            raw = readFileSync(capture, "utf8");
-          } else {
-            const result = await runProcess(
-              cliPath,
-              args,
-              { cwd: root, stdio: ["ignore", "pipe", "pipe"] },
-              cfg.timeoutMs,
-              { ...processProgress, label: attemptLabel },
-            );
-            raw = result.stdout;
-          }
-        } catch (spawnError) {
-          availabilityFailure = true; // 进程级失败：超时 / 非零退出 / 端点不可用 -> 计入降级信号
-          throw spawnError;
-        }
-        noteActualModel("精修", model, raw); // 非 qwen（无 JSON 信封）时内部 no-op
-        availabilityFailure = false; // 进程已正常产出 -> 不是可用性问题
-        if (detailedProgress) console.log(`[TOPIC] CLI 已返回，开始读缓存 ${ref}`);
-
-        // 子 agent 把 JSON 分多次 append 到 cachePath，最后一行追加 //---END--- 表示写完。
-        // 这样 LLM 输出长度上限只受磁盘限制，不再被 stdout / max_tokens 截断。
-        let cacheContent;
-        try {
-          cacheContent = readFileSync(cachePath, "utf8");
-        } catch (readError) {
-          // 缓存文件不存在：要么子 agent 没遵循指令（写工具不可用 / 直接 stdout 输出 JSON），
-          // 要么进程退出但实际未完成。先用文本兜底判断可用性，再报"未写入缓存"。
-          const hit = availabilityFailureMatch(raw);
-          if (hit) {
-            availabilityFailure = true;
-            throw new Error(
-              `CLI 输出疑似服务不可用/限流：命中关键词「${hit.keyword}」@${hit.position}/${hit.totalLen} 上下文="${hit.context}"`,
-            );
-          }
-          throw new Error(
-            `子 agent 未把 JSON 写入缓存路径 ${path.relative(root, cachePath)}（stdout 长度 ${clean(raw).length}，尾部="${tailLine(raw) || ""}"，readError=${readError.code ?? readError.message}）`,
-          );
-        }
-
-        // 切掉 //---END--- 之后的内容；找不到标记就视为写入未完成（agent 中途退出 / 工具崩溃）。
-        const endMarker = "//---END---";
-        const endIdx = cacheContent.lastIndexOf(endMarker);
-        if (endIdx < 0) {
-          throw new Error(
-            `缓存文件缺少 //---END--- 结束标记，子 agent 写入未完成（cache 长度 ${clean(cacheContent).length}，尾部="${tailLine(cacheContent) || ""}"）`,
-          );
-        }
-        const jsonText = cacheContent.slice(0, endIdx);
-
-        try {
-          parsed = extractJson(jsonText);
-        } catch (jsonError) {
-          // 附上 JSON 报错的精确行列 + 上下文片段，下一次 attempt 的 prompt 会把它喂回模型精准修格式。
-          const formatError = new Error(`${jsonError.message}（cache 长度 ${clean(jsonText).length}，尾部="${tailLine(jsonText) || ""}"）`);
-          const loc = extractJsonErrorLocation(clean(jsonText), jsonError);
-          if (loc) formatError.jsonLocation = loc;
-          throw formatError;
-        }
+      };
+      try {
+        const apiResult = await callRefineApi(prompt, buildTopicSchema(original), {
+          model, sampling: undefined, timeoutMs: cfg.timeoutMs, onProgress: onTokenProgress,
+        });
+        parsed = apiResult.parsed;
+        liveEvents.emitEvent("llm.done", {
+          reqId, topicRef: ref, ok: true, durationMs: apiResult.durationMs,
+          model: apiResult.model, usage: apiResult.usage,
+        });
+      } catch (apiError) {
+        liveEvents.emitEvent("llm.done", { reqId, topicRef: ref, ok: false, error: apiError.message });
+        if (apiError.availabilityFailure) availabilityFailure = true;
+        throw apiError;
       }
+      availabilityFailure = false;
+      if (detailedProgress) console.log(`[TOPIC] LLM 已返回（API）${ref}`);
       // JSON 解析成功，先用黑名单识别错误响应（429/限流/上游错误等），再用白名单确认是 topic 契约。
       // 这样 LLM/网关返回 {code:429,message,details} 之类合法 JSON 但非 topic 契约时，
       // 能给出明确的"限流/上游错误"提示并触发可用性降级，而不是被当成 topic 进 invariant 检查报"id 被改动"。
@@ -2780,6 +2268,11 @@ class LiveDashboard {
         phaseStartedAt: item.phaseStartedAt ?? item.startedAt,
         startedAt: item.startedAt,
         model: item.model,
+        tokens: item.tokens,
+        lastLine: item.lastLine,
+        spec: item.spec,
+        kind: item.kind,
+        paused: item.paused,
       }));
     } else {
       this.state.poolActive = null;
@@ -2885,8 +2378,17 @@ class LiveDashboard {
       for (const item of sorted) {
         const dur = formatDuration(now - (item.phaseStartedAt ?? item.startedAt ?? now));
         const phase = phaseLabel(item.phase);
-        const ref = compactRef(item.ref, Math.max(20, width - 30));
-        lines.push(` · ${ref}  ${phase}  ${dur}`);
+        const ref = compactRef(item.ref, Math.max(20, Math.floor(width * 0.35)));
+        const spec = item.spec ? ` · ${shortSpec(item.spec)}` : "";
+        const tok = item.tokens != null ? ` · tok ${formatTok(item.tokens)}` : "";
+        let tail = "";
+        if (item.paused) {
+          tail = ` · ⏸ 暂停(${item.paused})`;
+        } else if (item.lastLine) {
+          const remain = Math.max(10, width - ref.length - phase.length - dur.length - spec.length - tok.length - 12);
+          tail = ` · ${truncate(item.lastLine, remain)}`;
+        }
+        lines.push(` · ${ref}  ${phase}  ${dur}${spec}${tok}${tail}`);
       }
     }
 
@@ -2929,6 +2431,29 @@ function phaseLabel(phase) {
     judgeAfter: "判后",
     merging: "写回",
   }[phase] ?? phase ?? "?";
+}
+
+// 子 agent 行展示用的 spec 缩写: "volcengine:glm-5.1" → "glm-5.1@vol"
+function shortSpec(spec) {
+  if (!spec) return "";
+  const idx = spec.indexOf(":");
+  if (idx < 0) return spec;
+  const provider = spec.slice(0, idx);
+  const model = spec.slice(idx + 1);
+  const provShort = provider === "volcengine" ? "vol" : provider === "deepseek" ? "ds" : provider === "opencode" ? "oc" : provider === "longcat" ? "lc" : provider === "baidu" ? "bd" : provider === "mimo" ? "mi" : provider.slice(0, 3);
+  return `${model}@${provShort}`;
+}
+
+function formatTok(n) {
+  if (n == null) return "?";
+  if (n < 1000) return String(n);
+  return `${(n / 1000).toFixed(1)}k`;
+}
+
+function truncate(s, max) {
+  if (!s) return "";
+  if (s.length <= max) return s;
+  return s.slice(0, Math.max(0, max - 1)) + "…";
 }
 
 function phaseBucket(phase) {
@@ -2989,13 +2514,49 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
       // setPhase 由 refineOneTopic 在每个阶段切换时回调，让 summary 心跳能区分“审判 vs 生成”。
       active.set(ref, { model: model ?? "默认", startedAt: itemStartedAt, phase: "starting", phaseStartedAt: itemStartedAt });
       if (useDashboard) dashboard.updateRefine({ counters, active });
-      const setPhase = (next) => {
+      const setPhase = (next, detail) => {
         const entry = active.get(ref);
         if (!entry) return;
-        entry.phase = next;
-        entry.phaseStartedAt = Date.now();
+        if (typeof next === "string") {
+          entry.phase = next;
+          entry.phaseStartedAt = Date.now();
+        }
+        if (detail && typeof detail === "object") {
+          if (detail.tokens != null) entry.tokens = detail.tokens;
+          if (detail.lastLine != null) entry.lastLine = detail.lastLine;
+          if (detail.spec != null) entry.spec = detail.spec;
+          if (detail.kind != null) entry.kind = detail.kind;
+          if (detail.paused != null) entry.paused = detail.paused;
+        }
         if (useDashboard) dashboard.updateRefine({ counters, active });
       };
+      // 订阅本 topic 的 LLM token 事件,把进度反映到 active 行(覆盖判官/块级也能实时显示)
+      const onTokenEvt = (evt) => {
+        if (evt.topicRef !== ref) return;
+        const entry = active.get(ref);
+        if (!entry) return;
+        entry.tokens = evt.tokens;
+        if (evt.lastLine) entry.lastLine = evt.lastLine;
+        if (evt.spec) entry.spec = evt.spec;
+        if (evt.kind) entry.kind = evt.kind;
+        if (useDashboard) dashboard.updateRefine({ counters, active });
+      };
+      liveEvents.on("llm.token", onTokenEvt);
+      // pause 时给本 worker 标记,resume 时清掉
+      const onPause = (evt) => {
+        const entry = active.get(ref);
+        if (!entry) return;
+        entry.paused = `额度耗尽 ${evt.spec || ""}`;
+        if (useDashboard) dashboard.updateRefine({ counters, active });
+      };
+      const onResume = () => {
+        const entry = active.get(ref);
+        if (!entry) return;
+        entry.paused = null;
+        if (useDashboard) dashboard.updateRefine({ counters, active });
+      };
+      liveEvents.on("llm.pause", onPause);
+      liveEvents.on("llm.resume", onResume);
       let result;
       try {
         result = await refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, model, undefined, corpus, judge, setPhase);
@@ -3006,6 +2567,9 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
         console.log(`[FAIL] ${compactRef(ref, 50)} 意外错误（已隔离为单篇失败）：${error.message}`);
         result = { ok: false, attempts: 0, error: `未捕获异常：${error.message}`, availabilityFailure: false, keptOld: false, action: "failed" };
       } finally {
+        liveEvents.off("llm.token", onTokenEvt);
+        liveEvents.off("llm.pause", onPause);
+        liveEvents.off("llm.resume", onResume);
         active.delete(ref);
         if (useDashboard) dashboard.updateRefine({ counters, active });
       }
@@ -3221,9 +2785,10 @@ async function gcJudgeOutputs(outputsDir, keep) {
 async function main() {
   const runStartedAt = Date.now(); // 全程墙钟起点：汇总里报“本次执行多久”
   const args = parseArgs();
-  // qwen 显式模型路由（解决“重复 modelId 选不到指定火山 provider”）：见 setQwenRoutes 注释。
-  // 形如 --qwen-routes '{"minimax-m3":{"baseUrl":"https://ark...volces.com/api/coding/v3","apiKeyEnv":"HUOSHAN_API_KEY"}}'
-  setQwenRoutes(args["qwen-routes"]);
+  // qwen 显式模型路由已弃用：API 模式由 env-config 的 baseUrl/apiKey 直管,无需 --qwen-routes。
+  if (args["qwen-routes"]) {
+    console.warn("[deprecated] --qwen-routes 在 API 模式下已无意义,忽略。");
+  }
   const scope = String(args.scope ?? "all").trim();
   const minScore = Number(args["min-score"] ?? 90);
   const concurrency = Number(args.concurrency ?? 2);
@@ -3294,14 +2859,16 @@ async function main() {
     return;
   }
 
-  const cli = args.cli ?? process.env.QUALITY_LLM_CLI;
-  if (!cli) {
-    throw new Error(
-      "必须用 --cli <claude|codex|qwen|gemini|opencode|generic> 指定精修 CLI（或设 QUALITY_LLM_CLI）。\n" +
-        "示例：npm run quality:refine -- --cli claude --model minimax-m3 --scope domain:go --concurrency 3",
-    );
+  // API 模式不依赖本地 CLI；--cli 仅作为日志标签保留（缺省 "api"），兼容旧脚本/last-config。
+  // QUALITY_LLM_CLI 仍可通过环境变量传入,但不再有路由意义,只影响日志显示。
+  const cli = args.cli ?? process.env.QUALITY_LLM_CLI ?? "api";
+  // 一组在 CLI 模式下生效、API 模式下已无意义的旗标:接受但打一次 deprecation 提示,避免静默吞参误导用户。
+  for (const deprecated of ["qwen-routes", "use-pty", "no-default-extra-args", "model-arg", "prompt-arg", "prompt-mode", "judge-cli"]) {
+    if (args[deprecated] !== undefined) {
+      console.warn(`[deprecated] --${deprecated} 在 API 模式下已无意义,忽略(精修器现直接调 OpenAI 兼容 API,不再 spawn CLI)。`);
+    }
   }
-  const cfg = applyPreset({
+  const cfg = {
     cli,
     model: args.model ?? process.env.QUALITY_LLM_MODEL,
     preset: args.preset ?? "auto",
@@ -3319,9 +2886,9 @@ async function main() {
     stallTimeoutMs,
     progressStyle,
     autoConcurrencyMin,
-  });
-  const cliPath = commandPath(cfg.cli);
-  if (!cliPath) throw new Error(`找不到 CLI：${cfg.cli}。请先安装或换一个 --cli。`);
+  };
+  // API 模式无 CLI 路径,cliPath 仅作展示标签。
+  const cliPath = `__api_mode__/${cfg.cli}`;
 
   const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${sha256(scope).slice(0, 6)}`;
   const qualityDir = qualityRoot;
@@ -3352,8 +2919,8 @@ async function main() {
   }
   let judge = null;
   if (!judgeDisabled) {
-    const judgeCliPath = commandPath(judgeCli);
-    if (!judgeCliPath) throw new Error(`找不到判官 CLI：${judgeCli}（用 --judge-cli 指定，或 --no-judge 关闭判官）。`);
+    // API 模式无判官 CLI 路径,judgeCliPath 仅作展示标签。
+    const judgeCliPath = `__api_mode__/${judgeCli}`;
     const judgeCfg = applyJudgePreset(judgeCli, timeoutMs);
     judgeCfg.cli = judgeCli;
     const setHash = sha256(`${judgeCli}|${judgeModels.map((entry) => entry ?? "default").join(",")}|x${judgeCount}`).slice(0, 8);
@@ -3642,19 +3209,33 @@ async function main() {
 }
 
 installSignalHandlers();
+installPauseKeyboard();
 
-main()
-  .catch((error) => {
-    if (error?.interrupted) {
-      console.error("[INTERRUPT] 精修已中断。");
-      process.exitCode = 130;
-      return;
-    }
-    console.error(error);
-    process.exitCode = 1;
-  })
-  .finally(() => {
-    try {
-      dashboard.disable();
-    } catch {}
-  });
+// 把 .env 里 QUOTA_PAUSE_DEFAULT 套到 pauseBus(交互向导也可以临时改)
+{
+  const policy = envConfig.getEnv("QUOTA_PAUSE_DEFAULT", "manual");
+  try { pauseBus.setPolicy(policy); } catch (e) { console.warn(`[pause-bus] 忽略未知策略: ${policy}`); }
+}
+
+import { fileURLToPath } from "node:url";
+const __isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+
+if (__isMain) {
+  main()
+    .catch((error) => {
+      if (error?.interrupted) {
+        console.error("[INTERRUPT] 精修已中断。");
+        process.exitCode = 130;
+        return;
+      }
+      console.error(error);
+      process.exitCode = 1;
+    })
+    .finally(() => {
+      try {
+        dashboard.disable();
+      } catch {}
+    });
+}
+
+export { refineOneTopic, runAudit, callRefineApi };
