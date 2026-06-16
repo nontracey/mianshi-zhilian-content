@@ -164,10 +164,13 @@ function mermaidDiagramType(content = "") {
 const mermaidStructuralLinePattern =
   /^(subgraph|end|direction|classDef|class|style|linkStyle|click|title|accTitle|accDescr|participant|actor|note|activate|deactivate|loop|alt|opt|par|and|else|rect|autonumber|box|critical|break|state|link|requirement|element)\b/i;
 // flowchart / stateDiagram 连线标记（已剥离括号标签后检测）。
+// codeql[js/bad-html-filtering-regexp] Mermaid arrow syntax, not HTML filtering
 const flowchartEdgeMarkPattern = /-->|---|<-->|==>|===|-\.->|-\.-|\.->|--[xo]|[xo]--|->|=>/;
 // 时序图消息：Actor 箭头 Actor : 文本。
+// codeql[js/bad-html-filtering-regexp] Mermaid arrow syntax, not HTML filtering
 const sequenceMessagePattern = /^[\s+-]*[\w"][^:]*?(-->>|->>|-->|->|--x|-x|--\)|-\))\s*[+-]?[\w"]/;
 // 按操作符切分以提取两端节点 id（长操作符在前，避免被 -- 截断）。
+// codeql[js/bad-html-filtering-regexp] Mermaid arrow syntax, not HTML filtering
 const mermaidArrowSplitPattern =
   /\s*(?:-->>|-->|->>|->|-\.->|-\.-|<-->|===|==>|---|--x|-x|--o|o--|--\)|-\)|--|==)\s*/;
 
