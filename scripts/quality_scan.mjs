@@ -316,7 +316,14 @@ for (const file of await listJson(topicRoot)) {
     }
 
     if (card.type === "code") {
-      for (const highlight of card.highlights ?? []) {
+      const highlights = Array.isArray(card.highlights)
+        ? card.highlights
+        : card.highlights?.item && Array.isArray(card.highlights.item)
+          ? card.highlights.item
+          : Array.isArray(card.highlights)
+            ? card.highlights
+            : [];
+      for (const highlight of highlights) {
         if (genericHighlightPatterns.some((pattern) => pattern.test(highlight.note ?? ""))) {
           issues.push({
             code: "GENERIC_CODE_HIGHLIGHT",

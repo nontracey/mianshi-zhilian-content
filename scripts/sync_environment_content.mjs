@@ -60,6 +60,16 @@ async function syncEnvironment(env) {
   console.log(`Synced ${envManifest.topicCount} ${env} topics.`);
 }
 
-for (const env of environments) {
+// 可选位置参数：staging | draft | all（默认 all=两者都同步，兼容 npm run sync:env / generate）。
+const requested = process.argv.slice(2).filter((arg) => !arg.startsWith("--"));
+const targets =
+  requested.length && !requested.includes("all")
+    ? requested.filter((env) => environments.includes(env))
+    : environments;
+if (!targets.length) {
+  console.error(`No valid environment in ${JSON.stringify(requested)}. Expected: ${environments.join(", ")} or all.`);
+  process.exit(1);
+}
+for (const env of targets) {
   await syncEnvironment(env);
 }

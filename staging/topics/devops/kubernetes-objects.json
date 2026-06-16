@@ -3,90 +3,156 @@
   "domain": "devops",
   "category": "container-k8s",
   "group": "container-k8s",
-  "title": "Kubernetes Pod、Deployment 与 Service",
-  "summary": "理解 Pod 抽象、Deployment 滚动更新、ReplicaSet 和 Service 服务发现。",
+  "title": "Kubernetes 核心对象与 Pod 生命周期",
+  "summary": "Pod/Deployment/StatefulSet/DaemonSet/Job/CronJob、Service/Ingress、ConfigMap/Secret 的职责差异与 Pod 生命周期。",
   "tags": [
     "DevOps",
     "Kubernetes",
     "Pod",
     "Deployment",
-    "Service"
+    "StatefulSet",
+    "Service",
+    "Ingress",
+    "ConfigMap"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 35,
   "order": 50,
-  "recommendWeight": 85,
+  "recommendWeight": 90,
   "status": "staging",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能说明 Kubernetes 工作负载和服务发现的关系，并定位常见发布与访问问题。",
+  "interviewerFocus": "看是否能按工作负载类型（无状态/有状态/守护/批处理）选对控制器，并讲清 Pod 从创建到终止的完整生命周期，包括 readiness/liveness 与 preStop。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Kubernetes Pod、Deployment 与 Service 的职责边界",
-      "content": "Pod 是 Kubernetes 调度和运行的最小单元，Deployment 通过 ReplicaSet 管理副本数量和滚动更新，Service 为一组 Pod 提供稳定访问入口。\n\n学习 Kubernetes Pod、Deployment 与 Service 时，可以先沿「Deployment 期望状态 -> ReplicaSet 管理副本 -> Pod 调度运行 -> Service 选择标签 -> Endpoint 负载访问」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- Pod：一个或多个容器组合，适合 共享网络和卷，风险是 不应直接长期管理\n- Deployment：声明副本和版本，适合 无状态服务发布，风险是 配置错误会滚动失败\n- ReplicaSet：维持副本数量，适合 Deployment 内部对象，风险是 通常不直接操作\n- Service：稳定虚拟访问入口，适合 服务发现和负载均衡，风险是 selector 错误会无端点\n\n把这条路径落回 Kubernetes Pod、Deployment 与 Service 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "六类工作负载控制器选哪个",
+      "content": "Pod 是 K8s 调度的最小单元。一个 Pod 内多容器共享 network namespace 和 volumes。但生产里几乎不直接创建 Pod，而是用控制器声明期望状态，由 controller-manager 不断对齐。\n\n按工作负载特征选控制器：\n\n- Deployment：无状态服务，通过 ReplicaSet 维持副本数。滚动更新时新 RS 逐步扩、旧 RS 逐步缩，maxSurge/maxUnavailable 控制并行度。Pod 名字随机（如 web-7d8c-xk2lp），随时可替换。\n- StatefulSet：有状态服务（MySQL、Kafka、Redis Cluster）。Pod 名字稳定有序（mysql-0、mysql-1），按序启动按逆序终止。每个 Pod 绑定独立 PVC，支持 headless Service 给每个 Pod 一个 DNS（mysql-0.mysql.default.svc）。\n- DaemonSet：每个节点跑一份（日志采集 fluent-bit、监控 node-exporter、CNI）。节点加入自动调度，节点下线自动清理。可用 nodeSelector/taints 限定节点子集。\n- Job：跑到成功为止，失败按 backoffLimit 重试。completions/parallelism 控制总数与并发，常用于一次性数据迁移、批量计算。\n- CronJob：基于时间触发 Job，concurrencyPolicy（Allow/Forbid/Replace）控制重叠。startingDeadlineSeconds 限制错过窗口后是否补跑。\n- ReplicaSet：Deployment 的实现细节，几乎不直接用。\n\n选错的代价：用 Deployment 跑 MySQL 主从会因为 Pod 无序重建丢主。用 StatefulSet 跑无状态 API 会因为有序滚动拖慢发布。DaemonSet 用 Deployment 替代会漏节点。"
     },
     {
       "type": "explain",
-      "title": "Kubernetes Pod、Deployment 与 Service 的失败模式与排查",
-      "content": "深入理解要抓住控制器模型：用户声明期望副本和镜像版本，控制器不断让实际状态接近期望状态。Service 通过 selector 关联 Pod，标签错误会直接导致无端点。\n\nKubernetes Pod、Deployment 与 Service 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 「Kubernetes Pod、Deployment 与 Service 的核心目标」决定这个知识点的主线，必须先说清触发条件\n- 「Deployment 期望状态、ReplicaSet 管理副本、Pod 调度运行 的关系」决定方案能否稳定落地，不能只停留在名称层面\n- 「只背工具命令而不讲执行链路」是常见失效点，需要提前说明防护或修复方式\n- 可以用「能结合 kubectl describe、events、pod status、endpoints、rollout history 做定位」验证自己是否能说出关键路径\n\n排查时不要先猜结论，应把现象映射到 ReplicaSet 管理副本、Pod 调度运行、Service 选择标签 这些环节，再结合 kubectl describe、events、pod status、endpoints、rollout history 验证。"
+      "title": "Pod 生命周期：从 Pending 到 Terminated 的关键钩子",
+      "content": "Pod 状态机：Pending → Running → Succeeded/Failed，外加 Unknown。每一段都有可干预的钩子，面试常问的就是这些钩子在做什么。\n\n创建阶段：\n1. apiserver 写入 etcd，scheduler 根据 resources.requests、nodeSelector、affinity、taints/tolerations 选节点。\n2. kubelet 拉镜像（imagePullPolicy=IfNotPresent/Always），启动 init containers（顺序串行，全部成功才进入主容器）。init containers 常用于等依赖、做 schema migration。\n3. 主容器启动后并发跑 startupProbe（首次就绪前用，避免慢启动被 liveness 误杀）→ readinessProbe（决定是否进 Service endpoints）→ livenessProbe（失败则 kubelet restart 容器，按 restartPolicy 决定是否拉起）。\n4. postStart hook 与主进程并发执行，不保证在进程之前。\n\n终止阶段（最容易答错）：\n1. 用户 kubectl delete 或 controller 触发删除，apiserver 给 Pod 打 deletionTimestamp。同时 endpoints controller 把 Pod 从 Service endpoints 摘除。但这一步是异步的，Pod 仍可能收到几百毫秒的旧请求。\n2. kubelet 调用 preStop hook（同步执行，常用 sleep 5/10s 等待 endpoints 同步与连接 drain）。\n3. 给容器发 SIGTERM，应用应捕获并优雅退出（关闭监听、等存量请求完成）。\n4. 等到 terminationGracePeriodSeconds（默认 30s）超时仍未退出，发 SIGKILL 强杀。\n\nrestartPolicy 只对 Pod 内容器生效：Always（Deployment/StatefulSet/DaemonSet 默认）、OnFailure（Job 常用）、Never。控制器层面的副本拉起是另一回事（Deployment 删除 Pod 后 ReplicaSet 会建新的）。"
     },
     {
-      "type": "diagram",
-      "title": "Kubernetes 工作负载访问链路",
-      "format": "mermaid",
-      "content": "flowchart LR\nA[Deployment 期望状态] --> B[ReplicaSet 管理副本]\nB[ReplicaSet 管理副本] --> C[Pod 调度运行]\nC[Pod 调度运行] --> D[Service 选择标签]\nD[Service 选择标签] --> E[Endpoint 负载访问]",
-      "fallback": "Deployment 期望状态 -> ReplicaSet 管理副本 -> Pod 调度运行 -> Service 选择标签 -> Endpoint 负载访问",
-      "caption": "图示展示 Deployment 到 Pod，再由 Service 选择端点对外提供访问。"
+      "type": "explain",
+      "title": "Service/Ingress 与 ConfigMap/Secret 的边界",
+      "content": "服务发现与暴露：\n\n- ClusterIP（默认）：集群内虚拟 IP，kube-proxy 通过 iptables/IPVS 把 VIP DNAT 到后端 Pod。selector 匹配 Pod label 生成 Endpoints（或 EndpointSlice，1.21+ 默认）。selector 写错或 Pod label 改了会出现 Endpoints 为空。kubectl get endpoints svc-name 是排查首选。\n- NodePort：在每个节点开一个 30000-32767 端口，外部 LB 转到任意节点都能访问，适合本地或简单场景。\n- LoadBalancer：云厂商 LB（ELB/SLB）打通公网，每个 Service 一个 LB，成本高。\n- Headless Service（clusterIP: None）：不分配 VIP，DNS 直接返回所有 Pod IP，配合 StatefulSet 做点对点发现。\n- Ingress：七层入口，一个 Ingress Controller（nginx-ingress、Traefik、ALB Controller）背后挂多个 Service，按 host/path 路由，支持 TLS termination。Ingress 资源本身不工作，必须有 Controller 实现。\n\n配置注入：\n\n- ConfigMap：明文配置（feature flag、JVM 参数、配置文件），可通过 env、envFrom 或 volumeMount 注入。volumeMount 方式支持热更新（kubelet 周期性同步，约 1 分钟），env 方式不会更新（要重启 Pod）。\n- Secret：base64 编码（不是加密），适合 DB 密码、TLS 证书、镜像拉取凭证（type=kubernetes.io/dockerconfigjson）。生产应配合 KMS/sealed-secrets/external-secrets-operator 做静态加密。size 上限 1MiB。\n\n常见坑：把密码写进 ConfigMap、改了 ConfigMap 但用 env 方式注入导致没生效、Service selector 与 Pod label 大小写不一致导致空 endpoints、Ingress 配了 TLS 但 Secret 不在同 namespace。"
     },
     {
       "type": "compareTable",
-      "title": "Kubernetes 对象职责对比",
+      "title": "六类工作负载控制器对比",
       "columns": [
-        "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
+        "控制器",
+        "Pod 标识",
+        "更新策略",
+        "存储",
+        "典型场景",
+        "选错代价"
       ],
       "rows": [
         [
-          "Pod",
-          "一个或多个容器组合",
-          "共享网络和卷",
-          "不应直接长期管理"
+          "Deployment",
+          "随机名，可替换",
+          "RollingUpdate/Recreate，maxSurge/maxUnavailable",
+          "emptyDir 或共享 PVC",
+          "无状态 API、Web",
+          "用它跑有状态服务会丢数据"
         ],
         [
-          "Deployment",
-          "声明副本和版本",
-          "无状态服务发布",
-          "配置错误会滚动失败"
+          "StatefulSet",
+          "有序稳定名 mysql-0",
+          "OnDelete/RollingUpdate，按逆序",
+          "每 Pod 独立 PVC（volumeClaimTemplates）",
+          "MySQL、Kafka、ES、Redis Cluster",
+          "用它跑无状态服务发布慢且没必要"
+        ],
+        [
+          "DaemonSet",
+          "按节点一份",
+          "RollingUpdate/OnDelete",
+          "通常 hostPath 或 emptyDir",
+          "日志采集、监控、CNI、kube-proxy",
+          "用 Deployment 替代会漏节点"
+        ],
+        [
+          "Job",
+          "完成即终止",
+          "无滚动，按 backoffLimit 重试",
+          "按需 PVC",
+          "数据迁移、批量计算、报表",
+          "当成长服务跑会反复重启"
+        ],
+        [
+          "CronJob",
+          "按时间生成 Job",
+          "concurrencyPolicy 控制重叠",
+          "继承 Job",
+          "定时清理、对账、备份",
+          "concurrencyPolicy=Allow 时任务堆积"
         ],
         [
           "ReplicaSet",
-          "维持副本数量",
-          "Deployment 内部对象",
-          "通常不直接操作"
-        ],
-        [
-          "Service",
-          "稳定虚拟访问入口",
-          "服务发现和负载均衡",
-          "selector 错误会无端点"
+          "随机名",
+          "无独立更新策略",
+          "同 Deployment",
+          "Deployment 内部使用",
+          "直接用会失去版本管理与回滚"
         ]
+      ]
+    },
+    {
+      "type": "diagram",
+      "title": "Pod 生命周期与探针时序",
+      "format": "mermaid",
+      "content": "flowchart TD\nA[apiserver 写 etcd] --> B[scheduler 选节点]\nB --> C[kubelet 拉镜像]\nC --> D[init containers 串行]\nD --> E[主容器启动 postStart]\nE --> F[startupProbe]\nF --> G[readinessProbe 进 endpoints]\nG --> H[livenessProbe 持续巡检]\nH --> I[收到 deletionTimestamp]\nI --> J[endpoints 异步摘除 preStop]\nJ --> K[SIGTERM 优雅退出]\nK --> L[gracePeriod 超时]\nL --> M[SIGKILL 强杀]",
+      "fallback": "创建：apiserver→scheduler→kubelet 拉镜像→init containers→主容器+postStart→startupProbe→readinessProbe 进 endpoints→livenessProbe 巡检；终止：deletionTimestamp→endpoints 异步摘除+preStop→SIGTERM→gracePeriod 超时→SIGKILL。",
+      "caption": "本图展示 Kubernetes Pod 从 apiserver 创建到 Terminated 的完整生命周期。重点标注 readinessProbe、livenessProbe、preStop 三个关键钩子与 Endpoints 异步摘除的时序关系。"
+    },
+    {
+      "type": "code",
+      "title": "Deployment + Service + ConfigMap 最小可用片段",
+      "language": "yaml",
+      "content": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 3\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 1\n      maxUnavailable: 0\n  selector:\n    matchLabels: { app: web }\n  template:\n    metadata:\n      labels: { app: web }\n    spec:\n      terminationGracePeriodSeconds: 60\n      containers:\n      - name: app\n        image: registry/web:v1.2.3\n        ports: [{ containerPort: 8080 }]\n        envFrom:\n        - configMapRef: { name: web-config }\n        readinessProbe:\n          httpGet: { path: /healthz/ready, port: 8080 }\n          periodSeconds: 5\n          failureThreshold: 3\n        livenessProbe:\n          httpGet: { path: /healthz/live, port: 8080 }\n          initialDelaySeconds: 30\n          periodSeconds: 10\n        lifecycle:\n          preStop:\n            exec:\n              command: ['/bin/sh','-c','sleep 10']\n---\napiVersion: v1\nkind: Service\nmetadata: { name: web }\nspec:\n  selector: { app: web }\n  ports: [{ port: 80, targetPort: 8080 }]",
+      "highlights": [
+        {
+          "line": 8,
+          "note": "maxUnavailable: 0 保证滚动更新时始终有 3 个副本在线，配合 preStop 实现零中断发布。"
+        },
+        {
+          "line": 18,
+          "note": "terminationGracePeriodSeconds: 60 给优雅退出留足时间，必须大于最长请求耗时 + preStop sleep。"
+        },
+        {
+          "line": 24,
+          "note": "readinessProbe 决定 Pod 是否进入 Service endpoints，必须真实反映业务可用性。"
+        },
+        {
+          "line": 28,
+          "note": "livenessProbe 失败会触发容器重启，但不会摘流量；摘流量是 readinessProbe 的职责。"
+        },
+        {
+          "line": 33,
+          "note": "preStop sleep 10s 等待 endpoints 异步摘除完成，避免 SIGTERM 期间仍收到新请求。"
+        }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：Kubernetes Pod、Deployment 与 Service 要从目标、关键机制、风险边界和观测验证四层回答。\n\n我会按这几层展开：\n1. 先说明它解决的核心工程问题是  Pod 抽象、Deployment 滚动更新、ReplicaSet 和 Service 服务发现。\n2. 再沿着 Deployment 期望状态、ReplicaSet 管理副本、Pod 调度运行、Service 选择标签、Endpoint 负载访问 说明执行链路\n3. 然后讲清 Pod 和 Deployment 的适用边界\n4. 最后补充用 kubectl describe、events、pod status、endpoints、rollout history 验证效果和定位异常\n\n最后补充边界：云原生能力提升交付和治理效率，但配置错误、权限过大和观测缺失会把故障影响放大。",
+      "content": "**30 秒结论**\n\nK8s 把工作负载抽象成 Pod，通过五类控制器声明期望状态。Service 提供集群内稳定访问入口，Ingress 做七层暴露，ConfigMap/Secret 注入配置。整套机制围绕「控制器对齐期望状态 + Pod 生命周期 + 服务发现」三件事。\n\n**机制主线**\n\n1. **选控制器**：无状态选 Deployment（滚动更新、随机名）；有状态选 StatefulSet（稳定名、独立 PVC、按序启动）；节点级选 DaemonSet；一次性任务选 Job；定时任务选 CronJob。\n2. **Pod 生命周期**：scheduler 调度后 kubelet 拉镜像、跑 init containers、启动主容器。readinessProbe 决定进不进 Service endpoints，livenessProbe 决定要不要重启容器。删除时打 deletionTimestamp，endpoints 异步摘除的同时跑 preStop，再发 SIGTERM，超过 terminationGracePeriodSeconds 才 SIGKILL。\n3. **服务发现**：Service 通过 selector 找 Pod 生成 Endpoints，kube-proxy 用 iptables/IPVS 实现 VIP 转发。headless Service 配合 StatefulSet 做点对点，Ingress 由 Controller 实现七层路由与 TLS。\n4. **配置注入**：ConfigMap 给明文配置，Secret 给敏感信息。volumeMount 方式支持热更新，env 方式不会更新。\n\n**边界与追问**\n\n- preStop + 优雅退出是高可用发布的关键。\n- selector 与 Pod label 不一致会出现 Endpoints 为空。\n- ConfigMap 改了但 env 注入不会更新。\n- StatefulSet 缩容不会删 PVC，需要手动清理。",
       "followUpQuestions": [
         {
-          "question": "Kubernetes Pod、Deployment 与 Service 出问题时你先看哪些信号？",
-          "answer": "我会先看 kubectl describe、events、pod status、endpoints、rollout history，把异常定位到 ReplicaSet 管理副本、Pod 调度运行、Service 选择标签，再决定是回滚、降级、扩容还是修配置。"
+          "question": "滚动更新时为什么会出现 502/连接被重置？怎么彻底解决？",
+          "answer": "根因是 endpoints 摘除与 SIGTERM 是并行异步的：kube-proxy 还没把 iptables 规则刷掉，新请求继续打到正在退出的 Pod。解决方案是三件事一起做：preStop 里 sleep 5-10s 等 endpoints 同步；应用收到 SIGTERM 后停止接受新连接但继续处理存量请求；terminationGracePeriodSeconds 设到大于最长请求耗时（一般 60s）。另外 readinessProbe 必须真实反映服务可用性，否则 Pod 一启动就被打流量也会 502。"
         },
         {
-          "question": "Kubernetes Pod、Deployment 与 Service 最容易忽略的边界是什么？",
-          "answer": "最容易忽略的是自动化本身也会放大错误，所以必须保留审批、审计、回滚、灰度和人工接管路径。"
+          "question": "什么时候必须用 StatefulSet 而不是 Deployment？只是为了固定 Pod 名吗？",
+          "answer": "三个核心差异：稳定的网络标识（mysql-0.mysql.default.svc 配合 headless Service 做主从发现）、稳定的存储（每个 Pod 通过 volumeClaimTemplates 绑独立 PVC，重建后还是同一块盘）、有序部署与缩容（按序启动逆序终止，避免主从同时挂）。MySQL 主从、Kafka broker、ES data node、Redis Cluster 这种需要点对点寻址 + 持久化数据 + 启动顺序的场景必须用。固定名字只是表象，本质是身份与存储的绑定。"
+        },
+        {
+          "question": "ConfigMap 改了 Pod 没生效，怎么排查与修复？",
+          "answer": "先看注入方式：env/envFrom 是注入时一次性读的，ConfigMap 改了不会更新，必须重启 Pod（kubectl rollout restart deployment/xxx）。volumeMount 方式 kubelet 会周期性同步（约 1 分钟），但应用必须自己监听文件变化或定期 reload，否则进程内的配置仍然是旧的。常见做法是给 Deployment 加一个基于 ConfigMap hash 的 annotation（很多 Helm chart 用 sha256sum 计算 ConfigMap 内容写到 spec.template.metadata.annotations），ConfigMap 一变 hash 变 Pod template 变就触发滚动更新，绕开热更新不可靠的问题。"
         }
       ]
     },
@@ -94,31 +160,41 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 Kubernetes Pod、Deployment 与 Service 的目标和边界",
-        "能沿 Deployment 期望状态 -> ReplicaSet 管理副本 -> Pod 调度运行 -> Service 选择标签 -> Endpoint 负载访问 讲清链路",
-        "能解释关键配置和失败模式",
-        "能用观测指标验证效果"
+        "六类控制器分别解决什么场景，选错的代价",
+        "Pod 从 apiserver 写入到 Terminated 的完整链路，以及 init/start/readiness/liveness/preStop 各自负责什么",
+        "endpoints 摘除与 SIGTERM 的异步关系，以及为什么需要 preStop sleep",
+        "StatefulSet 与 Deployment 在身份、存储、启动顺序上的差异",
+        "Service 四种类型与 headless Service 的用途",
+        "Ingress 资源与 Ingress Controller 的关系",
+        "ConfigMap/Secret 注入方式（env vs volumeMount）对热更新的影响"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "devops.container-k8s.kubernetes-objects.recall.1",
-      "prompt": "请讲一下 Kubernetes Pod、Deployment 与 Service 的核心链路和它解决的工程问题。",
+      "prompt": "讲一下 Pod 从创建到终止的完整生命周期，重点说 readinessProbe、livenessProbe、preStop 各在哪个阶段、解决什么问题。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "devops.container-k8s.kubernetes-objects.recall.2",
-      "prompt": "Kubernetes Pod、Deployment 与 Service 在生产环境里最常见的失败模式有哪些？",
+      "prompt": "Deployment 滚动更新时为什么会出现 502 或连接被重置？要让发布做到零中断需要在哪几层做哪些动作？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "devops.container-k8s.kubernetes-objects.recall.3",
+      "prompt": "MySQL 主从、日志采集、夜间报表、对外 API 这四个场景分别用什么控制器？为什么不能互换？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
-      "id": "devops.container-k8s.kubernetes-objects.recall.3",
-      "prompt": "如果 Kubernetes Pod、Deployment 与 Service 相关变更上线后异常，你会如何回滚和验证？",
+      "id": "devops.container-k8s.kubernetes-objects.recall.4",
+      "prompt": "Service 的 endpoints 为空可能是哪些原因？你会按什么顺序排查？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -126,20 +202,26 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说明 Kubernetes Pod、Deployment 与 Service 的核心目标",
-      "能讲清 Deployment 期望状态、ReplicaSet 管理副本、Pod 调度运行 的关系",
-      "能指出 Pod 和 Deployment 的差异",
-      "能给出可观测验证和回滚思路"
+      "区分 Deployment/StatefulSet/DaemonSet/Job/CronJob 五类控制器的适用场景",
+      "讲清 Pod 创建链路：scheduler 调度→kubelet 拉镜像→init containers→主容器+postStart→startupProbe→readinessProbe→livenessProbe",
+      "讲清 Pod 终止链路：deletionTimestamp→endpoints 异步摘除+preStop→SIGTERM→terminationGracePeriodSeconds 超时→SIGKILL",
+      "说明 readinessProbe 与 livenessProbe 的差别（前者只摘流量、后者会重启容器）",
+      "说明 Service selector 与 Pod label 一致性对 Endpoints 的决定作用",
+      "区分 ConfigMap 的 env 注入与 volumeMount 注入对热更新的影响"
     ],
     "goodToHave": [
-      "能结合 kubectl describe、events、pod status、endpoints、rollout history 做定位",
-      "能说明多环境差异和权限边界",
-      "能把自动化、审计和回滚串成闭环"
+      "能解释 maxSurge/maxUnavailable 在滚动更新中的取舍",
+      "能讲 StatefulSet 通过 volumeClaimTemplates + headless Service 实现身份与存储绑定",
+      "能解释 kube-proxy iptables/IPVS 模式下 endpoints 同步延迟带来的 502",
+      "能用 ConfigMap hash annotation 触发滚动更新解决热更新不生效",
+      "了解 Secret 静态加密、external-secrets-operator、sealed-secrets 等生产方案"
     ],
     "commonMistakes": [
-      "只背 Kubernetes Pod、Deployment 与 Service 的命令或组件，不说明交付链路和运行时对象",
-      "忽略 Kubernetes Pod、Deployment 与 Service 的回滚、权限、容量或人工接管边界",
-      "没有把指标、日志、告警和用户影响关联到 Kubernetes Pod、Deployment 与 Service"
+      "把 ConfigMap 用 env 注入后期望热更新生效",
+      "用 Deployment 跑 MySQL 主从，导致 Pod 重建后主从关系错乱",
+      "认为 livenessProbe 失败会摘流量（实际是重启容器，摘流量是 readinessProbe）",
+      "preStop 不做 sleep，发布期间出现 502 误以为是应用 bug",
+      "Service selector 与 Pod label 大小写不一致导致 Endpoints 永远为空，却去看 Pod 状态"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -148,5 +230,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

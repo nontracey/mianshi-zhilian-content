@@ -4,7 +4,7 @@
   "category": "principles",
   "group": "principles",
   "title": "设计模式在 Spring 中的应用",
-  "summary": "Spring框架是设计模式的集大成者，理解Spring中的设计模式有助于深入理解框架原理。",
+  "summary": "Spring 框架是 GoF 模式的活样本，掌握 BeanFactory、AOP 代理、JdbcTemplate、ApplicationEvent 这几条主线就能从框架反推模式动机。",
   "tags": [
     "设计模式",
     "Spring",
@@ -18,62 +18,85 @@
   "learningCards": [
     {
       "type": "explain",
-      "title": "最高频的四个：工厂/单例/代理/模板方法",
-      "content": "这道题的答法不是背一张清单，而是**每个模式说清“Spring 在哪用、为什么用”**，并能就一两个展开源码。先记最常被深入问题的四个：\n\n- **工厂模式**：`BeanFactory`/`ApplicationContext` 是超级工厂，按名字/类型产出 Bean；`FactoryBean` 让你自定义某个 Bean 的复杂创建。解决“创建和使用解耦”。\n- **单例模式**：Bean 默认 `singleton` 作用域，容器用 `ConcurrentHashMap` 缓存——注意这是**容器级**单例，不是 GoF 的类级单例。\n- **代理模式**：AOP 靠动态代理实现，有接口用 JDK、无接口用 CGLIB；`@Transactional`、`@Cacheable` 都是代理织入的。这是被深入问题最多的一个。\n- **模板方法**：`JdbcTemplate` 封装“拿连接→执行→处理异常→释放”的骨架，`AbstractApplicationContext.refresh()` 定义容器启动的固定步骤序列。"
+      "title": "工厂方法与单例在 Spring 中的实现机制",
+      "content": "Spring 框架的核心机制几乎每个都对应一个经典设计模式，理解这些模式的关键是落到具体类和它解决的问题。\n\n- **工厂模式**：`org.springframework.beans.factory.BeanFactory#getBean(String)` 是经典工厂方法，按名字/类型产出 Bean；`FactoryBean<T>` 是工厂接口的开放扩展点，`getObject()` 让你接管复杂创建（典型如 `SqlSessionFactoryBean`、`ProxyFactoryBean`）。区别于 `@Configuration` 类里的 `@Bean` 方法，那个更像静态工厂方法 + CGLIB 增强保证单例。\n- **单例模式**：Bean 默认 `singleton` 作用域，由 `DefaultSingletonBeanRegistry.singletonObjects`（一个 `ConcurrentHashMap<String,Object>`）缓存。**这是容器级单例不是 GoF 类级单例**：同一个类换个容器或直接 `new` 都能再造一份。三级缓存（`singletonObjects` / `earlySingletonObjects` / `singletonFactories`）解决的是循环依赖，不是单例本身。\n- **代理模式**：AOP 由 `ProxyFactory` 在运行时生成代理；有接口走 `JdkDynamicAopProxy`（`Proxy.newProxyInstance`），无接口走 `CglibAopProxy`（继承目标类）。`@Transactional` 经 `TransactionInterceptor`、`@Cacheable` 经 `CacheInterceptor` 织入。著名坑是**同类自调用 `this.method()` 不走代理**——因为 `this` 是原对象不是代理对象，`@Async` / `@Transactional` 自调用失效都是这个原因。\n- **模板方法**：`JdbcTemplate#execute(PreparedStatementCreator, PreparedStatementCallback<T>)` 把「拿连接 → 创建 PS → 执行 → 转译 SQLException → 释放连接」固化在模板里，把「业务 SQL」作为回调传入；`AbstractApplicationContext#refresh()` 也是模板方法，固定 12 个步骤（`prepareRefresh` → `obtainFreshBeanFactory` → `prepareBeanFactory` → `postProcessBeanFactory` → `invokeBeanFactoryPostProcessors` → `registerBeanPostProcessors` → `initMessageSource` → `initApplicationEventMulticaster` → `onRefresh` → `registerListeners` → `finishBeanFactoryInitialization` → `finishRefresh`），子类只覆盖钩子。"
     },
     {
       "type": "explain",
-      "title": "其余四个与怎么答这类题",
-      "content": "- **观察者模式**：事件机制 `ApplicationEvent` + `ApplicationListener`/`@EventListener`，发布订阅式解耦（默认同步，可 `@Async`）。\n- **策略模式**：`Resource` 接口的多种实现（ClassPath/FileSystem/Url）、`HandlerMapping`/`HandlerAdapter` 体系，按场景选不同实现。\n- **适配器模式**：`HandlerAdapter` 把不同类型的 Handler（注解 Controller、HttpRequestHandler 等）适配成统一调用方式。\n- **装饰器模式**：`TransactionAwareCacheDecorator` 给 Cache 包一层事务感知、`BeanWrapper` 等。\n\n**怎么答这类“Spring 用了哪些设计模式”**：① 别一口气背八个，挑 3-4 个你能讲透的（首选工厂、代理、模板方法、单例）；② 每个都落到“具体类 + 解决什么问题”；③ 主动展开一个源码细节（如 AOP 代理选择、refresh 的模板方法），体现深度。这比罗列清单更得分。"
+      "title": "代理、模板方法、策略与适配器在 Spring 中的落地",
+      "content": "Spring 中还有四个常考模式，每个同样落到具体类和它解决的问题：\n\n- **观察者模式**：`ApplicationEventPublisher#publishEvent` + `ApplicationListener<E>` / `@EventListener`。默认同步串行通知，加 `@Async` 才异步；Spring 4.2 起支持泛型事件 + `condition` SpEL 过滤。注意监听器抛异常会中断后续监听器（除非自己捕获）。\n- **策略模式**：`Resource` 接口的 `ClassPathResource` / `FileSystemResource` / `UrlResource` / `ServletContextResource`，由 `ResourceLoader` 按 `classpath:` / `file:` / `http:` 前缀选实现；Spring MVC 的 `HandlerMapping`（`RequestMappingHandlerMapping` / `BeanNameUrlHandlerMapping`）也是请求路由策略。\n- **适配器模式**：`HandlerAdapter` 把不同形态的 Handler 统一适配为 `handle(req, resp, handler) → ModelAndView`。`@Controller` 注解方法由 `RequestMappingHandlerAdapter` 处理，实现 `HttpRequestHandler` 的由 `HttpRequestHandlerAdapter` 处理，让 `DispatcherServlet` 不必关心 Handler 真实类型。\n- **装饰器模式**：`TransactionAwareCacheDecorator` 给底层 `Cache` 包一层「事务提交后才真正写入」的语义；`BufferedReader` 包 `Reader`、`HttpServletRequestWrapper` 都是同一思路。\n\n**GoF 原版与 Spring 实现的差异**：Spring 单例是容器级不是类级——`DefaultSingletonBeanRegistry.singletonObjects` 缓存保证同一容器唯一，但换个容器或直接 `new` 就能再造一份。Spring 工厂模式是开放扩展——`FactoryBean.getObject()` 让用户接管创建，跟 `@Bean` 方法（CGLIB 增强保证单例）是两条不同路径。Spring 模板方法用回调注入变化点——不用为每个 SQL 写子类，而是传 `PreparedStatementCallback`，本质是模板方法与策略模式的融合。"
     },
     {
       "type": "diagram",
-      "title": "设计模式在 Spring 中的应用 学习主线图",
-      "content": "flowchart LR\nA[设计模式在 Spring 中的应用] --> B[设计模式]\nB --> C[设计模式应用]\nC --> D[至少 6 种模式在 Spring 中的体现]\nD --> E[每种模式的具体类]\nE --> F[为什么 Spring 大量用设计模式]",
-      "fallback": "设计模式在 Spring 中的应用 -> 设计模式 -> 设计模式应用 -> 至少 6 种模式在 Spring 中的体现 -> 每种模式的具体类 -> 为什么 Spring 大量用设计模式",
+      "title": "Spring 设计模式落点速查图",
+      "content": "flowchart TB\nA[Spring 框架] --> B[BeanFactory / FactoryBean: 工厂模式]\nA --> C[singletonObjects ConcurrentHashMap: 容器级单例]\nA --> D[ProxyFactory + JDK/CGLIB: 代理模式]\nA --> E[JdbcTemplate.execute / refresh: 模板方法]\nA --> F[ApplicationEventPublisher: 观察者]\nA --> G[Resource / HandlerMapping: 策略模式]\nA --> H[HandlerAdapter: 适配器]\nA --> I[TransactionAwareCacheDecorator: 装饰器]\nD --> D1[at-Transactional / at-Cacheable 织入]\nD --> D2[自调用失效: this 不走代理]",
+      "fallback": "Spring 框架 -> 工厂(BeanFactory/FactoryBean) / 单例(singletonObjects 缓存) / 代理(ProxyFactory + JDK/CGLIB, @Transactional 织入, 自调用失效) / 模板方法(JdbcTemplate.execute, refresh 12 步) / 观察者(ApplicationEventPublisher) / 策略(Resource, HandlerMapping) / 适配器(HandlerAdapter) / 装饰器(TransactionAwareCacheDecorator)",
       "items": [
-        "1. 工厂模式管理Bean生命周期",
-        "2. 代理模式实现AOP切面",
-        "3. 观察者模式实现事件驱动",
-        "4. 模板方法封装通用流程",
-        "5. 策略模式支持多种实现"
+        "工厂：BeanFactory.getBean / FactoryBean.getObject",
+        "单例：DefaultSingletonBeanRegistry.singletonObjects 容器级缓存",
+        "代理：JdkDynamicAopProxy / CglibAopProxy + 自调用失效坑",
+        "模板方法：JdbcTemplate.execute / AbstractApplicationContext.refresh",
+        "观察者：ApplicationEventPublisher + @EventListener (默认同步)",
+        "策略：Resource 多实现、HandlerMapping 路由",
+        "适配器：HandlerAdapter 统一 Handler 调用形态",
+        "装饰器：TransactionAwareCacheDecorator 给 Cache 加事务语义"
       ],
       "format": "mermaid",
-      "caption": "从 设计模式 到 为什么 Spring 大量用设计模式，这张图帮助区分 设计模式在 Spring 中的应用 的核心机制、边界条件和常见误区。"
+      "caption": "把 Spring 八个常考模式分别钉到具体类，记住每个箭头末端的类名比记模式名更有用。"
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 设计模式 | Spring应用 | 具体类/接口 | 解决的问题 |\n| ---------- | ------------ | ------------- | ------------ |\n| 工厂模式 | Bean管理 | BeanFactory, FactoryBean | 对象创建解耦 |\n| 代理模式 | AOP切面 | JdkDynamicAopProxy | 横切关注点 |\n| 观察者模式 | 事件机制 | ApplicationEvent | 组件间解耦 |\n| 模板方法 | 数据访问 | JdbcTemplate | 代码复用 |\n| 策略模式 | 资源访问 | Resource接口 | 算法替换 |\n| 单例模式 | Bean作用域 | @Scope(\"singleton\") | 对象唯一性 |\n| 适配器模式 | MVC | HandlerAdapter | 接口适配 |\n| 装饰器模式 | 缓存 | TransactionAwareCacheDecorator | 功能增强 |"
+      "title": "八大模式在 Spring 中的具体落点",
+      "content": "| 设计模式 | Spring 应用场景 | 具体类 / 接口 | 关键源码或方法 | 容易踩的坑 |\n| --- | --- | --- | --- | --- |\n| 工厂模式 | Bean 创建 | BeanFactory / FactoryBean | getBean(String) / getObject() | FactoryBean.getObject 返回的是产品而非工厂本身，要 &xxx 才能拿到工厂 |\n| 单例模式 | 默认作用域 | DefaultSingletonBeanRegistry | singletonObjects ConcurrentHashMap | 是容器级单例不是 GoF 类级；不同容器各有一份 |\n| 代理模式 | AOP 织入 | JdkDynamicAopProxy / CglibAopProxy | ProxyFactory.getProxy() | 同类 this.method() 自调用不走代理；@Transactional 失效高频原因 |\n| 模板方法 | 流程骨架 | JdbcTemplate / AbstractApplicationContext | execute(...) / refresh() 12 步 | 钩子方法别在子类里手动 new 模板，应该交给容器 |\n| 观察者 | 事件机制 | ApplicationEventPublisher / @EventListener | publishEvent / onApplicationEvent | 默认同步串行；监听器异常会阻断后续，需要自己捕获或加 @Async |\n| 策略模式 | 资源/路由 | Resource / HandlerMapping | ClassPathResource / RequestMappingHandlerMapping | 多个策略并存时记得给 @Order 或 @Primary |\n| 适配器 | MVC 调度 | HandlerAdapter | RequestMappingHandlerAdapter.handle | 自定义 Handler 类型必须配套自定义 Adapter，否则 DispatcherServlet 找不到 |\n| 装饰器 | 缓存增强 | TransactionAwareCacheDecorator | put/evict 推迟到事务提交后 | 没开事务时装饰器表现等同原 Cache，别误以为它就是事务 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// 1. 工厂模式 - BeanFactory\npublic interface BeanFactory {\n    Object getBean(String name) throws BeansException;\n    <T> T getBean(Class<T> requiredType) throws BeansException;\n}\npublic interface FactoryBean<T> {\n    T getObject() throws Exception;\n    Class<?> getObjectType();\n    boolean isSingleton();\n}\n\n// 2. 代理模式 - AOP\n// JDK动态代理\npublic class JdkDynamicAopProxy implements InvocationHandler {\n    @Override\n    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {\n        // 执行拦截器链\n        return new ReflectiveMethodInvocation(target, method, args, interceptors).proceed();\n    }\n}\n\n// 3. 观察者模式 - ApplicationEvent\npublic class ApplicationEventPublisher {\n    public void publishEvent(ApplicationEvent event) {\n        // 通知所有监听器\n    }\n}\n@Component\npublic class MyListener implements ApplicationListener<ApplicationEvent> {\n    @Override\n    public void onApplicationEvent(ApplicationEvent event) {\n        // 处理事件\n    }\n}\n\n// 4. 模板方法 - JdbcTemplate\npublic class JdbcTemplate {\n    public <T> T execute(PreparedStatementCreator psc, PreparedStatementCallback<T> action) {\n        Connection con = DataSourceUtils.getConnection(dataSource);\n        try {\n            PreparedStatement ps = psc.createPreparedStatement(con);\n            return action.doInPreparedStatement(ps);\n        } finally {\n            DataSourceUtils.releaseConnection(con, dataSource);\n        }\n    }\n}\n\n// 5. 策略模式 - Resource\npublic interface Resource extends InputStreamSource {\n    boolean exists();\n    URL getURL() throws IOException;\n    File getFile() throws IOException;\n}\n// 不同策略实现\nclass ClassPathResource implements Resource { ... }\nclass FileSystemResource implements Resource { ... }\nclass UrlResource implements Resource { ... }\n\n// 6. 单例模式 - Bean作用域\n@Scope(\"singleton\")  // 默认\n@Component\npublic class SingletonBean { ... }\n\n// 7. 适配器模式 - HandlerAdapter\npublic interface HandlerAdapter {\n    boolean supports(Object handler);\n    ModelAndView handle(HttpServletRequest request, HttpServletResponse response, Object handler);\n}\n\n// 8. 装饰器模式\npublic class TransactionAwareCacheDecorator implements Cache {\n    private final Cache targetCache;\n    // 装饰Cache，添加事务感知\n}",
+      "title": "Spring 中四个最常被追问的模式落点",
+      "content": "// 1) 工厂模式：BeanFactory + FactoryBean (org.springframework.beans.factory)\npublic interface BeanFactory {\n    Object getBean(String name) throws BeansException;\n    <T> T getBean(Class<T> requiredType) throws BeansException;\n}\npublic interface FactoryBean<T> {\n    T getObject() throws Exception;       // 返回产品对象 (面试坑：getBean(\"name\") 拿到的是它)\n    Class<?> getObjectType();\n    default boolean isSingleton() { return true; }\n}\n// 想拿到 FactoryBean 本身要加 & 前缀：context.getBean(\"&mySqlSessionFactory\")\n\n// 2) 代理模式：AOP 选择 JDK 还是 CGLIB (DefaultAopProxyFactory)\nclass DefaultAopProxyFactory implements AopProxyFactory {\n    public AopProxy createAopProxy(AdvisedSupport config) {\n        if (config.isOptimize() || config.isProxyTargetClass() || !hasInterfaces(config)) {\n            return new ObjenesisCglibAopProxy(config);   // 无接口 / 强制类代理\n        }\n        return new JdkDynamicAopProxy(config);            // 有接口走 JDK 动态代理\n    }\n}\n// 自调用失效根因：this.foo() 调到原对象，AOP 拦截器链根本没机会触发\n// 解法：注入自身 (@Autowired XxxService self) 或 AopContext.currentProxy()\n\n// 3) 模板方法：JdbcTemplate.execute 把 SQL 作为回调传入\npublic <T> T execute(PreparedStatementCreator psc, PreparedStatementCallback<T> action) {\n    Connection con = DataSourceUtils.getConnection(getDataSource());\n    PreparedStatement ps = null;\n    try {\n        ps = psc.createPreparedStatement(con);\n        applyStatementSettings(ps);\n        return action.doInPreparedStatement(ps);          // 业务回调\n    } catch (SQLException ex) {\n        throw translateException(\"PreparedStatementCallback\", getSql(psc), ex); // 异常转译\n    } finally {\n        JdbcUtils.closeStatement(ps);\n        DataSourceUtils.releaseConnection(con, getDataSource()); // 模板兜底释放\n    }\n}\n\n// 4) 观察者模式：事件发布 (默认同步, 加 @Async 才并行)\n@Component\nclass OrderListener {\n    @EventListener(condition = \"#event.amount > 1000\")    // SpEL 过滤\n    public void onPaid(OrderPaidEvent event) { /* ... */ }\n}\n@Service\nclass OrderService {\n    @Autowired ApplicationEventPublisher publisher;\n    @Transactional\n    public void pay(Order o) {\n        publisher.publishEvent(new OrderPaidEvent(o));    // 默认在当前线程串行通知\n    }\n}",
       "language": "java",
       "highlights": [
         {
-          "line": 18,
-          "note": "这里给出最终结果或提前退出条件，需要补充空值、失败和边界场景。"
+          "line": 7,
+          "note": "FactoryBean.getObject() 是工厂模式的开放扩展点：getBean('mySqlSessionFactory') 返回的是产品 SqlSessionFactory，要加 & 前缀才拿到工厂自己。"
+        },
+        {
+          "line": 16,
+          "note": "DefaultAopProxyFactory.createAopProxy 是代理选择的总闸：proxyTargetClass=true 或目标无接口走 CGLIB，否则 JDK 动态代理。"
+        },
+        {
+          "line": 36,
+          "note": "DataSourceUtils.releaseConnection 在 finally 里兜底，是模板方法把『资源释放』强制收编、不让业务回调忘记关连接的关键。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：设计模式在 Spring 中的应用 要先说清它解决什么问题，再展开机制、边界和验证方式。Spring框架是设计模式的集大成者，理解Spring中的设计模式有助于深入理解框架原理。\n\n我会这样回答：\n1. 先定位核心问题：至少6种模式在Spring中的体现。\n2. 再串起关键机制：每种模式的具体类，并说明它和 为什么Spring大量用设计模式 的关系。\n3. 接着补充边界和风险：只给出结论，不能说明至少6种模式在Spring中的体现的。\n4. 最后落到验证方式：结合对象职责、协作关系、扩展点和滥用边界验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
+      "content": "结论：Spring 几乎把 GoF 23 个模式用了一遍，但被深挖的就是工厂、代理、模板方法、单例这四条主线，每条都能落到具体类和源码。\n\n我会这样回答：\n1. 一句话定位：Spring 的核心抽象 BeanFactory 是工厂，AOP 是代理，JdbcTemplate 是模板方法，事件机制是观察者。\n2. 挑两个深讲：代理模式——`ProxyFactory` 通过 `DefaultAopProxyFactory` 选择 JDK 或 CGLIB，`@Transactional`、`@Cacheable` 都是 `TransactionInterceptor` / `CacheInterceptor` 织入。著名坑是同类 `this.method()` 自调用不走代理。模板方法——`JdbcTemplate.execute` 把拿连接、转译 `SQLException`、释放连接固化在模板里，业务只传 `PreparedStatementCallback`。`AbstractApplicationContext.refresh()` 也是模板方法，固定 12 个步骤。\n3. 再补两个差异：Spring 的单例是**容器级**不是 GoF 的类级，由 `DefaultSingletonBeanRegistry.singletonObjects` 这个 `ConcurrentHashMap` 缓存。`FactoryBean.getObject()` 是工厂模式的开放扩展点，跟 `@Bean` 方法（CGLIB 增强保证单例）是两条不同路径。\n4. 收尾：项目里我借鉴最多的是模板方法封装外部调用骨架（重试 + 熔断 + 日志），把变化点暴露成回调，接入新接口只写业务，不再重写横切逻辑。",
       "followUpQuestions": [
         {
-          "question": "在Spring框架中，设计模式在 Spring 中的应用有哪些经典应用？能结合源码说说吗？",
-          "answer": "Spring中的设计模式：工厂（BeanFactory）、单例（Bean默认单例）、代理（AOP）、模板方法（JdbcTemplate）、观察者（ApplicationEvent）、策略（ResourceLoader）、适配器（HandlerAdapter）、装饰器（BeanWrapper）。理解这些模式在Spring中的应用比死记类图更实用。"
+          "question": "Spring 的 Bean 默认单例，和 GoF 单例模式是一回事吗？",
+          "answer": "不是。GoF 单例是**类级别**——靠私有构造函数 + 静态字段，在类内部强制『一个 JVM 只有一个实例』；Spring 的单例是**容器级别**——Bean 本身是普通类，可以被 new 出多个，只是 `DefaultSingletonBeanRegistry.singletonObjects`（一个 `ConcurrentHashMap<String,Object>`）保证同一个容器里只给你这一个实例。所以多个 `ApplicationContext` 各有一份；自己 `new` 也能再造一份。Spring 单例本质是『由容器管理的作用域策略』，不是语言层面的强制唯一，这也是 `@Scope('prototype')` 能轻松切换、而 GoF 单例切作用域要改类的根因。"
         },
         {
-          "question": "面试官问‘Spring 用了哪些设计模式’，怎么答才不像背书？",
-          "answer": "不要一口气报八个名词，挑三四个你能讲透的，每个落到‘具体类+解决什么问题’，再主动展开一个源码细节。比如：代理模式——AOP 用 JDK/CGLIB 动态代理实现 @Transactional，可以顺势讲有接口走 JDK、无接口走 CGLIB、以及自调用失效的坑；模板方法——JdbcTemplate 把拿连接/释放资源的骨架固定、把执行 SQL 作为回调传入；工厂+单例——容器是超级工厂、Bean 默认容器级单例。这样既覆盖广度又有深度，比罗列清单得分高。"
+          "question": "AOP 代理选择 JDK 还是 CGLIB，怎么决定？为什么会出现『自调用 @Transactional 失效』？",
+          "answer": "选择由 `DefaultAopProxyFactory.createAopProxy(AdvisedSupport)` 决定：① 如果 `proxyTargetClass=true`（Spring Boot 2.x 起默认 true）或目标类没有实现接口，走 `CglibAopProxy`，生成目标类的子类；② 否则走 `JdkDynamicAopProxy`，生成接口代理。自调用失效根因：`this.method()` 调到的是**原对象**，不是 Spring 注入的代理对象，`MethodInvocation` 的拦截器链（`TransactionInterceptor` 等）根本没机会执行。解法：① 注入 `ApplicationContext`，通过 `ctx.getBean(this.getClass()).method()` 走代理；② 注入自己（`@Autowired private XxxService self`，Spring 4.3+ 支持）；③ 直接拆成两个 Bean 跨类调用；④ 用 `AopContext.currentProxy()`（需 `@EnableAspectJAutoProxy(exposeProxy=true)`）。`@Async`、`@Cacheable` 同样有这个坑。"
         },
         {
-          "question": "Spring 的 Bean 默认单例，和 GoF 的单例模式是一回事吗？",
-          "answer": "不是。GoF 单例是类级别的——靠私有构造在类内部强制‘一个 JVM 只有一个实例’；Spring 的单例是容器级别的——Bean 本身是普通类，可以被 new 出多个，只是容器用 ConcurrentHashMap 缓存它、保证‘同一个容器里只给你这一个实例’，换个容器或自己 new 就不止一个。所以 Spring 单例是一种‘由容器管理的作用域策略’，不是语言层面的强制唯一，这也是面试常设的混淆点。"
+          "question": "JdbcTemplate 是模板方法的典型吗？它和策略模式、回调函数有什么关系？",
+          "answer": "严格说 `JdbcTemplate.execute(PreparedStatementCreator, PreparedStatementCallback<T>)` 更准确叫『**模板方法 + 回调（Template Method with Callback）**』，是 Rod Johnson 在 Spring 里推广的变种：模板方法骨架是『拿连接 → 创建 PS → 执行 → 转译 SQLException 为 DataAccessException → 释放连接』，固定不变；变化点不是用『子类继承 + 抽象方法』暴露（GoF 原版），而是用 `PreparedStatementCallback<T>` 这个**接口回调**注入，业务在 lambda 里写 SQL。这本质上让模板方法和策略模式融合：每次调用就是注入一种策略。好处是不用为每个 SQL 写一个子类，缺点是回调内部能拿到的上下文有限（只有 PreparedStatement）。`TransactionTemplate.execute(TransactionCallback)`、`RestTemplate.execute(RequestCallback, ResponseExtractor)` 都是同一套路。"
+        },
+        {
+          "question": "线上单例 Bean 在高并发下出现数据错乱，你怎么排查？",
+          "answer": "排查路径：\n\n1. 确认 Bean 作用域：默认 singleton，有状态 Bean 必然线程不安全。\n2. 检查是否有成员变量被并发修改：看 Bean 类是否声明了非 final 成员。\n3. 确认是否误用 @RequestScope 或 @SessionScope。\n\n修复方案：\n- 无状态化：把成员变量改成本地变量或 ThreadLocal。\n- 改 prototype 作用域：`@Scope(\"prototype\")`，但要注意性能开销。\n- 加锁：对共享状态加 synchronized 或 ReentrantLock，但要评估吞吐量影响。"
+        },
+        {
+          "question": "线上发现 @Transactional 自调用失效导致数据没回滚，怎么快速定位和修复？",
+          "answer": "定位步骤：1. 在自调用方法上打断点，检查 this 的类名是否带 `$Proxy` 或 `$$EnhancerBySpringCGLIB`——如果是原类名，说明 this 不是代理对象。2. 开启 `@EnableAspectJAutoProxy(exposeProxy=true)`，在自调用处用 `AopContext.currentProxy()` 获取代理对象调用。3. 如果不想改代码，把方法拆到另一个 Bean 中跨类调用。根因是 `this.method()` 绕过了 AOP 拦截器链，`TransactionInterceptor` 根本没机会执行。"
+        },
+        {
+          "question": "项目里需要选型：什么时候用 FactoryBean，什么时候用 @Bean 方法？",
+          "answer": "FactoryBean 适合创建逻辑复杂的对象（如 `SqlSessionFactoryBean` 需要解析 XML、构建 Configuration、创建 SqlSession），因为 `getObject()` 可以封装多步初始化，且 FactoryBean 本身也是 Bean，能被容器管理生命周期。@Bean 方法适合简单创建逻辑（如 `@Bean public RestTemplate restTemplate()`），配合 `@Configuration` 的 CGLIB 增强保证单例。选型依据：创建逻辑超过 5 行且有初始化依赖 → FactoryBean；简单 new 或 builder → @Bean。"
         }
       ]
     },
@@ -81,32 +104,33 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "至少6种模式在Spring中的体现",
-        "每种模式对应的具体类和接口",
-        "Spring为什么大量使用设计模式",
-        "自己项目中如何借鉴Spring的设计",
-        "设计模式的选型建议"
+        "工厂模式落到 BeanFactory.getBean 与 FactoryBean.getObject，能解释 & 前缀的用途",
+        "Spring 单例是容器级（DefaultSingletonBeanRegistry.singletonObjects）不是 GoF 类级",
+        "AOP 代理由 DefaultAopProxyFactory 在 JDK 动态代理与 CGLIB 之间选择，能复述自调用失效的根因和 4 种解法",
+        "JdbcTemplate.execute 是模板方法 + 回调，refresh() 是模板方法的另一典型（12 步骨架）",
+        "观察者模式落到 ApplicationEventPublisher，默认同步串行，@Async 才并行",
+        "能挑 3–4 个模式各讲一段源码细节（不是罗列八个名字）"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "design-pattern.principles.topic-spring-she-ji-mo-shi.recall.1",
-      "prompt": "面试官问你：Spring框架中使用了哪些设计模式？请举例说明每种模式的具体应用。",
+      "prompt": "面试官问『Spring 用了哪些设计模式』，怎么挑 3-4 个深讲而不是背八个名词？请给出你的串讲思路并展开一个源码细节。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "design-pattern.principles.topic-spring-she-ji-mo-shi.recall.2",
-      "prompt": "假设你要设计一个类似Spring的IoC容器，你会使用哪些设计模式？为什么？",
+      "prompt": "Spring 的 Bean 默认单例和 GoF 单例有何本质区别？请用 DefaultSingletonBeanRegistry 与多容器场景说明。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "design-pattern.principles.topic-spring-she-ji-mo-shi.recall.3",
-      "prompt": "设计模式在 Spring 中的应用 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "为什么同类自调用的 @Transactional / @Async 会失效？AOP 代理是如何在 JDK 与 CGLIB 之间选择的？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -114,20 +138,22 @@
   ],
   "rubric": {
     "mustHave": [
-      "至少6种模式在Spring中的体现",
-      "每种模式的具体类",
-      "为什么Spring大量用设计模式",
-      "自己项目中如何借鉴"
+      "工厂模式：BeanFactory.getBean 与 FactoryBean.getObject 的角色与 & 前缀",
+      "单例模式：DefaultSingletonBeanRegistry.singletonObjects 容器级缓存，不是 GoF 类级",
+      "代理模式：JdkDynamicAopProxy 与 CglibAopProxy 的选择条件 + 自调用失效根因",
+      "模板方法：JdbcTemplate.execute 回调结构与 AbstractApplicationContext.refresh 的 12 步骨架"
     ],
     "goodToHave": [
-      "Spring设计模式的最佳实践",
-      "设计模式在微服务架构中的应用",
-      "能用具体示例、运行现象或可观测指标验证「设计模式在 Spring 中的应用」的判断"
+      "FactoryBean 与 @Bean 方法（CGLIB 增强）两条工厂路径的差异",
+      "ApplicationEvent 默认同步串行 + @Async / @EventListener condition 的进阶用法",
+      "TransactionAwareCacheDecorator 把缓存写入推迟到事务提交后的具体语义",
+      "能借模板方法 + 回调模式封装外部调用骨架（重试 + 熔断 + 日志）的项目案例"
     ],
     "commonMistakes": [
-      "只列出 设计模式、Spring、设计模式应用，但说不出触发条件、状态变化和验证证据",
-      "把「设计模式在 Spring 中的应用」的适用场景、失效条件和相邻概念混在一起",
-      "遇到设计模式里的真实问题时，不能说明「设计模式在 Spring 中的应用」应该观察哪些状态、日志或指标"
+      "一口气报八个模式名字但每个都说不清具体类名和源码位置，被追问源码就露怯",
+      "以为 Spring 单例是 GoF 类级单例（不能 new），实际普通类 + 容器缓存，换个容器就能造新实例",
+      "不知道自调用 @Transactional 失效是 this 不走代理，归因到『事务本身有 BUG』",
+      "混淆 FactoryBean 的产品与工厂本身——以为 getBean 返回的是 FactoryBean 实例，实际是 getObject() 的产品"
     ],
     "scoreWeights": {
       "coverage": 35,
@@ -140,6 +166,6 @@
     "design-pattern.principles.topic-solid-yuan-ze"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「设计模式在 Spring 中的应用」说清至少6种模式在Spring中的体现、每种模式的具体类，并放到设计模式场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-12"
+  "interviewerFocus": "考察候选人能否将每个 GoF 模式名落定到 Spring 的具体类与源码位置（如 JdkDynamicAopProxy / DefaultSingletonBeanRegistry.singletonObjects / JdbcTemplate.execute / AbstractApplicationContext.refresh），并深入解释一两个核心机制（AOP 代理选择策略与自调用失效、容器级单例与 GoF 类级单例的区别），而不是泛泛罗列模式名称。",
+  "updatedAt": "2026-06-13"
 }

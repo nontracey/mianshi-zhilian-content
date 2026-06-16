@@ -4,7 +4,7 @@
   "category": "microservice",
   "group": "microservice",
   "title": "分布式锁实现方案",
-  "summary": "掌握Redis SETNX、Redlock、Zookeeper分布式锁的原理和适用场景",
+  "summary": "讲清分布式锁解决跨进程互斥、Redis（SET NX PX + Lua + 看门狗）与 ZooKeeper 两类实现，以及 Redlock 争议和危险窗口等边界。",
   "tags": [
     "架构设计",
     "微服务",
@@ -31,17 +31,11 @@
     },
     {
       "type": "diagram",
-      "title": "分布式锁实现方案 学习主线图",
-      "content": "flowchart LR\nA[分布式锁实现方案] --> B[微服务]\nB --> C[分布式锁]\nC --> D[Redis]\nD --> E[Zookeeper]\nE --> F[Redlock]",
-      "fallback": "分布式锁实现方案 -> 微服务 -> 分布式锁 -> Redis -> Zookeeper -> Redlock",
-      "items": [
-        "Redis：SET key value NX PX 30000获取锁",
-        "Redis：Lua脚本判断value后删除释放锁",
-        "Redisson：看门狗自动续期",
-        "ZK：创建临时顺序节点，最小节点获得锁"
-      ],
       "format": "mermaid",
-      "caption": "从 微服务 到 Redlock，这张图帮助区分 分布式锁实现方案 的核心机制、边界条件和常见误区。"
+      "title": "分布式锁的两类实现",
+      "content": "flowchart TD\nA[\"跨进程竞争共享资源\"] --> B[\"Redis：SET NX PX + uniqueValue\"]\nB --> C[\"Lua 脚本比对 value 再删，防误删\"]\nB --> D[\"Redisson 看门狗续期，防业务没做完锁过期\"]\nB --> F[\"Redlock 多节点多数成功，仍有争议\"]\nA --> E[\"ZooKeeper 临时顺序节点：强一致，性能略低\"]",
+      "caption": "分布式锁实现：Redis 用 SET NX PX 加唯一值加锁、Lua 原子释放、Redisson 看门狗续期，性能优先；ZooKeeper 用临时顺序节点，一致性优先。",
+      "fallback": "跨进程竞争资源时：Redis 用 SET NX PX 加 uniqueValue 加锁、Lua 脚本比对 value 再删、Redisson 看门狗续期；ZooKeeper 用临时顺序节点，强一致但性能略低；Redlock 多节点多数成功但有争议。"
     },
     {
       "type": "compareTable",
@@ -57,18 +51,12 @@
       "type": "code",
       "title": "代码示例",
       "content": "// 1. Redis分布式锁 - 手动实现\npublic class RedisLock {\n    private final StringRedisTemplate redis;\n    private static final String LOCK_PREFIX = \"lock:\";\n\n    public boolean tryLock(String key, String value, long expireMs) {\n        Boolean result = redis.opsForValue()\n            .setIfAbsent(LOCK_PREFIX + key, value, expireMs, TimeUnit.MILLISECONDS);\n        return Boolean.TRUE.equals(result);\n    }\n\n    public void unlock(String key, String value) {\n        String luaScript = \"if redis.call('get', KEYS[1]) == ARGV[1] \" +\n            \"then return redis.call('del', KEYS[1]) else return 0 end\";\n        redis.execute(new DefaultRedisScript<>(luaScript, Long.class),\n            Collections.singletonList(LOCK_PREFIX + key), value);\n    }\n}\n\n// 2. Redisson分布式锁（推荐）\n@Service\npublic class OrderService {\n    @Autowired\n    private RedissonClient redisson;\n\n    public void createOrder(String userId) {\n        RLock lock = redisson.getLock(\"lock:order:\" + userId);\n        try {\n            // waitTime: 等待获取锁的时间\n            // leaseTime: 锁过期时间（看门狗会自动续期）\n            if (lock.tryLock(5, -1, TimeUnit.SECONDS)) {\n                // 业务逻辑\n                doCreateOrder(userId);\n            } else {\n                throw new BusyException(\"系统繁忙，请稍后重试\");\n            }\n        } finally {\n            if (lock.isHeldByCurrentThread()) {\n                lock.unlock();\n            }\n        }\n    }\n}\n\n// 3. Zookeeper分布式锁\npublic class ZookeeperLock {\n    private final CuratorFramework client;\n    private final InterProcessMutex lock;\n\n    public ZookeeperLock(CuratorFramework client, String path) {\n        this.client = client;\n        this.lock = new InterProcessMutex(client, path);\n    }\n\n    public void executeWithLock(Runnable task, long timeout, TimeUnit unit) {\n        try {\n            if (lock.acquire(timeout, unit)) {\n                try {\n                    task.run();\n                } finally {\n                    lock.release();\n                }\n            } else {\n                throw new TimeoutException(\"获取锁超时\");\n            }\n        } catch (Exception e) {\n            throw new RuntimeException(\"分布式锁异常\", e);\n        }\n    }\n}\n\n// 4. 使用示例\n@Autowired\nprivate CuratorFramework zkClient;\n\npublic void deductStock(String skuId, int quantity) {\n    ZookeeperLock lock = new ZookeeperLock(zkClient, \"/locks/stock/\" + skuId);\n    lock.executeWithLock(() -> {\n        // 扣减库存\n        Inventory inv = inventoryRepo.findBySkuId(skuId);\n        if (inv.getQuantity() < quantity) {\n            throw new InsufficientStockException();\n        }\n        inv.setQuantity(inv.getQuantity() - quantity);\n        inventoryRepo.save(inv);\n    }, 10, TimeUnit.SECONDS);\n}",
-      "language": "java",
-      "highlights": [
-        {
-          "line": 13,
-          "note": "这里是边界条件分支，回答 分布式锁实现方案 时要说明它为什么会改变执行路径。"
-        }
-      ]
+      "language": "java"
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：分布式锁实现方案 要先说清它解决什么问题，再展开机制、边界和验证方式。掌握Redis SETNX、Redlock、Zookeeper分布式锁的原理和适用场景\n\n我会这样回答：\n1. 先定位核心问题：Redis SETNX加锁原理和参数含义。\n2. 再串起关键机制：Lua脚本释放锁的原因，并说明它和 Redlock算法的基本原理 的关系。\n3. 接着补充边界和风险：释放锁时没有判断锁的持有者（可能释放别人的锁）。\n4. 最后落到验证方式：结合容量、延迟、一致性、故障演练和业务约束验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
+      "content": "结论：分布式锁解决「多个进程或实例竞争同一共享资源」的互斥问题——单机的 synchronized、Lock 只在一个 JVM 内有效，跨进程要靠外部存储（Redis、ZooKeeper）实现。它保护的是跨进程临界区，不是事务一致性的替代。\n\n一把可靠的分布式锁要满足：互斥、防死锁（持锁者崩了能自动释放）、不能误删别人的锁、锁不能在业务没做完时提前过期。\n\nRedis 实现（最常用）：\n\n1. 加锁：SET key uniqueValue NX PX ttl，NX 保证互斥、PX 设过期防死锁、uniqueValue 标识持锁者。\n2. 释放：用 Lua 脚本「先比对 value 再删」，保证原子，避免删了别人的锁。\n3. 看门狗：业务没做完锁就过期是大坑，Redisson 用后台线程定期续期解决，所以生产直接用 Redisson。\n4. Redlock：为解决主从切换丢锁，向多个独立节点加锁、多数成功才算成功；但 Martin Kleppmann 质疑它在 GC 停顿、时钟漂移下仍不安全，有争议。\n\nZooKeeper 实现：用临时顺序节点，最小序号获得锁、后一个 watch 前一个，强一致、临时节点自动清理，但性能不如 Redis。\n\n选型：性能优先用 Redis（Redisson），一致性或正确性优先用 ZooKeeper。边界。① 网络分区、GC 暂停、主从切换都会让「看似持有锁」进入危险窗口，关键业务要给锁保护的操作加幂等或版本号兜底、别只靠锁。② 锁粒度要小、持锁时间要短。",
       "followUpQuestions": [
         {
           "question": "在你的项目中，分布式锁实现方案是怎么落地的？遇到了什么权衡取舍？",
@@ -76,11 +64,11 @@
         },
         {
           "question": "分布式锁实现 在高并发（万级 QPS）和数据一致性要求高的场景下，有哪些关键设计决策？",
-          "answer": "分布式锁实现方案 在高并发场景下要先识别核心约束，再拆成容量、延迟、一致性、故障隔离和可观测性几个维度设计。回答时应说明关键瓶颈在哪里、哪些链路可以异步或降级、哪些数据必须保持一致，以及出现积压、超时或部分失败时如何恢复。"
+          "answer": "分布式锁实现方案 在高并发场景下要先识别核心约束，再拆成容量、延迟、一致性、故障隔离和可观测性几个维度设计。回答 分布式锁实现方案 时，要说明 架构设计、微服务 的关键瓶颈、可异步或降级的链路、必须一致的数据以及积压或超时时的恢复方式。"
         },
         {
           "question": "如果现有系统需要引入 分布式锁实现，你会怎么评估改造风险和制定迁移计划？",
-          "answer": "引入 分布式锁实现 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。建议分阶段推进：先在非核心模块试点，验证后逐步推广。迁移过程中要做好灰度、回滚、监控，确保业务不受影响。"
+          "answer": "引入 分布式锁实现 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。引入 分布式锁实现方案 时建议分阶段推进：先选择 架构设计、微服务、分布式锁 中风险较低的链路试点，验证 降级策略 后再推广。分布式锁实现方案 迁移时要先灰度小流量，再绑定回滚条件、监控指标和业务验收口径。"
         }
       ]
     },
@@ -121,20 +109,20 @@
   ],
   "rubric": {
     "mustHave": [
-      "Redis SETNX加锁原理和参数含义",
-      "Lua脚本释放锁的原因",
-      "Redlock算法的基本原理",
-      "看门狗机制的作用"
+      "能说出分布式锁解决跨进程互斥、单机锁不够用",
+      "能写出 Redis 锁的 SET NX PX + uniqueValue + Lua 释放",
+      "能解释看门狗续期解决锁提前过期",
+      "能对比 Redis 与 ZooKeeper 分布式锁的取舍"
     ],
     "goodToHave": [
-      "Redlock的争议（Kleppmann的批评）",
-      "Redisson的可重入锁实现",
-      "分布式锁的性能对比"
+      "能说明 Redlock 的思路及其争议",
+      "能指出 GC 暂停/主从切换的危险窗口",
+      "能说明关键业务要加幂等兜底、不能只靠锁"
     ],
     "commonMistakes": [
-      "释放锁时没有判断锁的持有者（可能释放别人的锁）",
-      "不了解Redlock算法的争议（Martin Kleppmann的批评）",
-      "锁超时时间设置不当"
+      "释放锁不校验 value 导致误删别人的锁",
+      "锁设固定过期、业务超时后锁失效未续期",
+      "以为加了分布式锁就绝对安全、不做幂等兜底"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -147,6 +135,6 @@
     "architecture.microservice.topic-split-principles"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能围绕「分布式锁实现方案」说清Redis SETNX加锁原理和参数含义、Lua脚本释放锁的原因，并放到架构设计场景中解释关键流程、边界条件和出错后的处理思路。",
+  "interviewerFocus": "考察能否写出 Redis 锁的正确实现、解释看门狗续期、对比 Redis 与 ZooKeeper，并意识到 GC 暂停、主从切换等危险窗口要靠幂等兜底。",
   "updatedAt": "2026-06-12"
 }

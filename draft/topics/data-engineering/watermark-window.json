@@ -4,7 +4,7 @@
   "category": "realtime",
   "group": "realtime",
   "title": "Watermark、窗口与乱序数据",
-  "summary": "理解事件时间、处理时间、Watermark 推进、窗口触发、迟到数据和补偿。",
+  "summary": "事件时间 vs 处理时间、Watermark 推进策略、Tumbling/Sliding/Session 窗口触发与 allowedLateness 迟到补偿。",
   "tags": [
     "数据工程",
     "Flink",
@@ -19,74 +19,114 @@
   "status": "draft",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能说明流计算如何在乱序数据下按事件时间得到可控结果。",
+  "interviewerFocus": "重点考察候选人能否说清 Watermark = max(eventTime) − maxOutOfOrderness，并讲清窗口触发条件 watermark ≥ window.end 与 allowedLateness、sideOutputLateData 的协同。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Watermark、窗口与乱序数据 的职责边界",
-      "content": "事件时间是业务事件发生的时间，处理时间是系统看到事件的时间。Watermark 表示系统认为早于某个时间的数据大概率已经到齐，用它推动事件时间窗口触发。\n\n学习 Watermark、窗口与乱序数据 时，可以先沿「事件携带时间戳 -> Watermark 推进 -> 窗口状态累积 -> 窗口触发计算 -> 迟到数据处理」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- 事件时间：事件真实发生时间，适合 乱序流统计，风险是 需要时间戳和 Watermark\n- 处理时间：系统处理时刻，适合 低延迟粗略统计，风险是 结果受机器和排队影响\n- Watermark：事件时间进度估计，适合 窗口触发，风险是 延迟阈值影响准确性\n- 迟到数据：窗口触发后到达，适合 补偿和修正，风险是 处理复杂度增加\n\n把这条路径落回 Watermark、窗口与乱序数据 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "Watermark 是事件时间进度的水位线，不是单条事件",
+      "content": "事件时间（event time）是日志里 ts 字段记录的业务发生时间，处理时间（processing time）是算子调用 System.currentTimeMillis() 看到的时刻。在 Flink 里 Watermark 是一条特殊的标记记录，由 source 或 WatermarkStrategy 周期性插入流中（默认 200ms 一次，可通过 pipeline.auto-watermark-interval 调整），算子收到 Watermark(t) 等于宣告：t 之前的事件几乎都已到达，可以触发结束时间 ≤ t 的窗口。\n\n核心机制是 Watermark = observedMaxEventTime − maxOutOfOrderness。Flink 1.11+ 推荐写法：WatermarkStrategy.forBoundedOutOfOrderness(Duration.ofSeconds(5))，等价于 BoundedOutOfOrdernessWatermarks 内部维护 maxTimestamp，每次发射 Watermark(maxTimestamp − 5000ms − 1ms)。多并行度 source 时下游算子取上游所有 channel 的 min(watermark) 作为本算子的当前水位，这意味着一个慢分区会拖住整条流的窗口触发——这是生产里 watermark lag 飙升最常见的根因。\n\n需要 idleness 处理空分区：WatermarkStrategy.withIdleness(Duration.ofMinutes(1)) 让无数据分区被标记为空闲，min watermark 计算时跳过它，避免某 Kafka 分区无流量直接卡死全局窗口。"
     },
     {
       "type": "explain",
-      "title": "Watermark、窗口与乱序数据 的失败模式与排查",
-      "content": "难点在延迟和准确性的取舍。Watermark 太激进会丢迟到数据，太保守会增加结果延迟；迟到数据要通过 allowed lateness、侧输出或补算处理。\n\nWatermark、窗口与乱序数据 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 「Watermark、窗口与乱序数据 的核心目标」决定这个知识点的主线，必须先说清触发条件\n- 「事件携带时间戳、Watermark 推进、窗口状态累积 的关系」决定方案能否稳定落地，不能只停留在名称层面\n- 「只讲工具名不讲数据语义和链路」是常见失效点，需要提前说明防护或修复方式\n- 可以用「能结合 watermark 延迟、窗口触发日志、迟到数据量、端到端延迟、补算记录 做定位」验证自己是否能说出关键路径\n\n排查时不要先猜结论，应把现象映射到 Watermark 推进、窗口状态累积、窗口触发计算 这些环节，再结合 watermark 延迟、窗口触发日志、迟到数据量、端到端延迟、补算记录 验证。"
+      "title": "三种窗口的触发语义与 allowedLateness 补偿链路",
+      "content": "窗口分配器决定一条事件落入哪些窗口，触发器决定何时计算。Tumbling（滚动）窗口固定长度不重叠，TumblingEventTimeWindows.of(Time.minutes(1)) 把事件按 ts 切成 [0,60s)、[60,120s)；Sliding（滑动）窗口长度 + 滑动步长，size=10min/slide=1min 时一条事件会被复制进 10 个窗口（状态膨胀 10 倍，是滑动窗口最大成本）；Session（会话）窗口按 gap 动态合并，EventTimeSessionWindows.withGap(Time.minutes(30))，事件来了先开新窗口，gap 内若新事件到达则合并相邻窗口，触发要等 watermark 推过 lastEvent + gap。\n\n默认 EventTimeTrigger 在 watermark ≥ window.maxTimestamp 时触发一次 onEventTime 调用 fire()。窗口触发后状态默认立即清理，迟到数据会被丢弃。开启 allowedLateness(Time.minutes(10)) 后，窗口状态保留到 window.end + allowedLateness，期间每条迟到事件触发一次增量重算并向下游发送更新结果（注意下游必须支持 retract 或 upsert，否则会产生重复）。再迟的事件用 sideOutputLateData(lateTag) 路由到侧输出流单独处理，常见做法是写入对账表或 Kafka late-events topic 由离线 Spark 任务每天补算。\n\n失败模式有三类：（1）watermark lag 持续上涨——某个 source 分区慢或 idleness 没配，用 Flink Web UI 的 Watermarks 标签页定位卡顿算子；（2）状态膨胀——Sliding 窗口或 allowedLateness 过长导致 RocksDB state 爆掉，看 metrics flink_taskmanager_job_task_operator_currentInputWatermark 与 state size；（3）下游重复——开了 allowedLateness 但 sink 不支持 retract，需切换到 upsert-kafka 或加幂等写。"
     },
     {
       "type": "diagram",
-      "title": "事件时间窗口触发链路",
+      "title": "Watermark 推进与窗口触发时序",
       "format": "mermaid",
-      "content": "flowchart LR\nA[事件携带时间戳] --> B[Watermark 推进]\nB[Watermark 推进] --> C[窗口状态累积]\nC[窗口状态累积] --> D[窗口触发计算]\nD[窗口触发计算] --> E[迟到数据处理]",
-      "fallback": "事件携带时间戳 -> Watermark 推进 -> 窗口状态累积 -> 窗口触发计算 -> 迟到数据处理",
-      "caption": "图示展示事件时间、Watermark、窗口状态和迟到数据处理的关系。"
+      "content": "flowchart TB\nKafka[Kafka source 多分区] --> WS[WatermarkStrategy<br/>forBoundedOutOfOrderness 5s]\nWS --> MIN[下游算子 min watermark<br/>含 idleness 跳过空闲分区]\nMIN --> WIN[窗口分配器<br/>Tumbling Sliding Session]\nWIN --> ST[窗口状态<br/>RocksDB keyed state]\nMIN --> TRIG{watermark ≥<br/>window.end ?}\nTRIG -->|是| FIRE[EventTimeTrigger.fire<br/>计算并发射结果]\nFIRE --> LATE{允许 allowedLateness?}\nLATE -->|是 保留状态 10min| RECOMP[迟到事件<br/>触发增量重算 + retract]\nLATE -->|否| CLEAN[清理状态<br/>更迟事件到 sideOutput]\nST --> TRIG",
+      "fallback": "Kafka 多分区 → WatermarkStrategy 按 max(eventTime)−5s 发射 → 下游取 min(watermark) 并跳过 idle 分区 → 窗口分配器把事件写入 RocksDB keyed state → 当 watermark ≥ window.end 时 EventTimeTrigger 触发 fire() → 若开 allowedLateness(10min) 则保留状态接收迟到事件并 retract，否则清理状态、更迟数据走 sideOutputLateData。",
+      "caption": "图中关键节点是 min(watermark) 与 idleness、EventTimeTrigger 触发条件、allowedLateness 的 retract 路径，对应面试常追问的三个边界。"
     },
     {
       "type": "compareTable",
-      "title": "时间语义对比",
+      "title": "三种窗口与时间语义对比",
       "columns": [
         "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
+        "事件时间窗口",
+        "处理时间窗口",
+        "Sliding 窗口",
+        "Session 窗口"
       ],
       "rows": [
         [
-          "事件时间",
-          "事件真实发生时间",
-          "乱序流统计",
-          "需要时间戳和 Watermark"
+          "触发条件",
+          "watermark ≥ window.end",
+          "本机时钟到达 window.end",
+          "watermark ≥ slide 的每个窗口 end",
+          "watermark ≥ lastEvent + gap"
         ],
         [
-          "处理时间",
-          "系统处理时刻",
-          "低延迟粗略统计",
-          "结果受机器和排队影响"
+          "乱序容忍",
+          "靠 maxOutOfOrderness 调",
+          "完全不容忍，重启即漂移",
+          "同事件时间窗口",
+          "依赖 gap 大小"
         ],
         [
-          "Watermark",
-          "事件时间进度估计",
-          "窗口触发",
-          "延迟阈值影响准确性"
+          "状态成本",
+          "每窗口一份 keyed state",
+          "最低，无 watermark 状态",
+          "每事件复制 size/slide 份",
+          "动态合并，长会话状态大"
         ],
         [
-          "迟到数据",
-          "窗口触发后到达",
-          "补偿和修正",
-          "处理复杂度增加"
+          "典型用途",
+          "分钟级精确 PV/UV",
+          "实时大盘粗略指标",
+          "近 10 分钟滚动均值",
+          "用户一次访问行为聚合"
+        ],
+        [
+          "迟到补偿",
+          "allowedLateness + sideOutput",
+          "无概念，迟到即丢",
+          "同事件时间窗口",
+          "迟到事件可能再次合并旧会话"
         ]
+      ]
+    },
+    {
+      "type": "code",
+      "title": "Flink 1.17 事件时间窗口 + allowedLateness + 侧输出",
+      "language": "java",
+      "content": "OutputTag<Event> lateTag = new OutputTag<Event>(\"late-events\"){};\n\nWatermarkStrategy<Event> ws = WatermarkStrategy\n    .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(5))\n    .withTimestampAssigner((e, ts) -> e.eventTimeMs)\n    .withIdleness(Duration.ofMinutes(1));   // 关键 1：避免空 Kafka 分区卡 watermark\n\nDataStream<Event> src = env.fromSource(kafkaSource, ws, \"events\");\n\nSingleOutputStreamOperator<Result> out = src\n    .keyBy(Event::userId)\n    .window(TumblingEventTimeWindows.of(Time.minutes(1)))\n    .allowedLateness(Time.minutes(10))     // 关键 2：保留状态 10 分钟接收迟到\n    .sideOutputLateData(lateTag)            // 关键 3：再迟的路由到侧输出\n    .aggregate(new PvAggregator());\n\nout.getSideOutput(lateTag)\n    .sinkTo(KafkaSink.<Event>builder()\n        .setBootstrapServers(brokers)\n        .setRecordSerializer(/* 写入 late-events topic 由离线补算 */)\n        .build());",
+      "highlights": [
+        {
+          "line": 4,
+          "note": "forBoundedOutOfOrderness(5s) 决定 Watermark = max(eventTime)−5s−1ms；这个值要按业务真实乱序 P99 设，过小会把正常乱序判为迟到。"
+        },
+        {
+          "line": 7,
+          "note": "withIdleness 是生产事故高发点：没有它一旦某分区无流量整条 pipeline 的 watermark 就被该分区的旧值钉死，所有窗口停止触发。"
+        },
+        {
+          "line": 13,
+          "note": "allowedLateness 期间每条迟到事件都会触发一次增量计算并向下游 retract 旧结果，sink 必须是 upsert 语义（如 upsert-kafka、JDBC PRIMARY KEY），否则结果重复。"
+        },
+        {
+          "line": 14,
+          "note": "sideOutputLateData 是兜底通道：超过 allowedLateness 的事件不会被丢弃，而是写入独立流交给离线 Spark 每天对账补算，避免历史数据悄悄不一致。"
+        }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：Watermark、窗口与乱序数据 要从目标、关键机制、风险边界和观测验证四层回答。\n\n我会按这几层展开：\n1. 先说明它解决的核心工程问题是 事件时间、处理时间、Watermark 推进、窗口触发、迟到数据和补偿。\n2. 再沿着 事件携带时间戳、Watermark 推进、窗口状态累积、窗口触发计算、迟到数据处理 说明执行链路\n3. 然后讲清 事件时间 和 处理时间 的适用边界\n4. 最后补充用 watermark 延迟、窗口触发日志、迟到数据量、端到端延迟、补算记录 验证效果和定位异常\n\n最后补充边界：数据工程方案必须同时关注口径、时效、成本和可追溯性，不能只追求跑通任务。",
+      "content": "Watermark 和窗口我会从「为什么需要事件时间」讲起：业务关心订单 23:59:58 这条记录归属当天，但它可能 00:00:03 才进 Kafka，按处理时间会算到第二天。所以 Flink 用 Watermark 这条特殊记录在流里推进事件时间进度，公式是 max(eventTime) − maxOutOfOrderness。\n\n核心机制三条：第一，Watermark 由 source 的 WatermarkStrategy.forBoundedOutOfOrderness(5s) 周期性发射，下游算子取所有上游 channel 的 min 作为当前水位，所以慢分区或空分区会卡住整条流，必须配 withIdleness。第二，窗口分 Tumbling、Sliding、Session 三种，触发条件都是 watermark ≥ window.end，Sliding 窗口因为一条事件落入 size/slide 份，状态成本最高。第三，迟到数据走两层兜底：allowedLateness 期间状态保留并触发增量重算+retract，超出后 sideOutputLateData 路由到侧输出流离线补算。\n\n边界提醒：（1）开启 allowedLateness 必须确认下游 sink 支持 upsert 或 retract，否则结果重复；（2）排查 watermark lag 飙升先看 Flink Web UI 的 Watermarks 标签页定位是哪个 subtask 慢；（3）Session 窗口在迟到数据到达时可能合并已触发的旧会话，要谨慎使用 allowedLateness。",
       "followUpQuestions": [
         {
-          "question": "Watermark、窗口与乱序数据 出问题时你先看哪些信号？",
-          "answer": "我会先看 watermark 延迟、窗口触发日志、迟到数据量、端到端延迟、补算记录，把异常定位到 Watermark 推进、窗口状态累积、窗口触发计算，再决定是回滚、降级、扩容还是修配置。"
+          "question": "为什么 Flink 下游算子的 watermark 取所有上游的 min？取 max 行不行？",
+          "answer": "取 min 是为了正确性：watermark 含义是「t 之前的数据已到齐」，只要还有任何一个上游分区只推到 t1，就不能宣称 t1 之后的数据到齐了，否则那个慢分区的事件全部会被当成迟到。取 max 会让所有窗口提前触发，丢大量数据。生产中如果某分区长期无数据要配 withIdleness 把它标空闲跳过，而不是改成 max。"
         },
         {
-          "question": "Watermark、窗口与乱序数据 最容易忽略的边界是什么？",
-          "answer": "最容易忽略的是自动化本身也会放大错误，所以必须保留审批、审计、回滚、灰度和人工接管路径。"
+          "question": "allowedLateness 设了 10 分钟，但下游报表还是会出现重复数据，是什么原因？",
+          "answer": "allowedLateness 期间每条迟到事件触发一次窗口重算并 emit 新结果，下游 sink 必须有去重或 upsert 能力。常见踩坑是用 KafkaSink 普通模式或 JDBC INSERT，每次重算都 append 一条，导致一个窗口可能写出多条。解决方案是切到 upsert-kafka（按 key 覆盖）、JDBC sink 加 PRIMARY KEY/ON DUPLICATE KEY UPDATE，或者在下游用 LAST_VALUE 按 window_start 聚合。"
+        },
+        {
+          "question": "watermark lag 持续上涨到几分钟，怎么定位？",
+          "answer": "三步：第一打开 Flink Web UI 的 Watermarks 子标签页，看每个 subtask 的 currentInputWatermark，最小那个就是瓶颈；第二看该 subtask 对应的 Kafka 分区是否有数据倾斜或长期无流量（需要 withIdleness）；第三检查 source 的 maxOutOfOrderness 是否被实际乱序超过，可以临时打印 max(eventTime) − currentWatermark 看真实 gap。常见根因是上游某个 producer 时钟漂移、Kafka 分区 rebalance 卡住、或 idleness 没配置。"
         }
       ]
     },
@@ -94,31 +134,33 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 Watermark、窗口与乱序数据 的目标和边界",
-        "能沿 事件携带时间戳 -> Watermark 推进 -> 窗口状态累积 -> 窗口触发计算 -> 迟到数据处理 讲清链路",
-        "能解释关键配置和失败模式",
-        "能用观测指标验证效果"
+        "Watermark 公式：max(eventTime) − maxOutOfOrderness，由 WatermarkStrategy.forBoundedOutOfOrderness 周期性发射",
+        "下游算子取所有上游 channel 的 min(watermark)，必须配 withIdleness 处理空闲分区",
+        "Tumbling/Sliding/Session 三种窗口的触发条件都是 watermark ≥ window.end，Sliding 状态成本是 size/slide 倍",
+        "allowedLateness 保留状态 + 增量重算 + retract，下游 sink 必须支持 upsert",
+        "sideOutputLateData 是超出 allowedLateness 的兜底，走离线补算",
+        "排查 watermark lag 看 Flink Web UI Watermarks 标签页找最小 subtask"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "data-engineering.realtime.watermark-window.recall.1",
-      "prompt": "请讲一下 Watermark、窗口与乱序数据 的核心链路和它解决的工程问题。",
+      "prompt": "请讲一下 Flink 中 Watermark 是怎么计算和推进的，为什么下游算子要取上游所有 channel 的 min？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "data-engineering.realtime.watermark-window.recall.2",
-      "prompt": "Watermark、窗口与乱序数据 在生产环境里最常见的失败模式有哪些？",
+      "prompt": "Tumbling、Sliding、Session 三种窗口在触发条件、状态成本、迟到处理上分别有什么区别？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "data-engineering.realtime.watermark-window.recall.3",
-      "prompt": "如果 Watermark、窗口与乱序数据 相关变更上线后异常，你会如何回滚和验证？",
+      "prompt": "线上某个事件时间窗口下游报表出现重复数据，怀疑是 allowedLateness 引起的，你会怎么验证和修复？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
@@ -126,20 +168,22 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说明 Watermark、窗口与乱序数据 的核心目标",
-      "能讲清 事件携带时间戳、Watermark 推进、窗口状态累积 的关系",
-      "能指出 事件时间 和 处理时间 的差异",
-      "能给出可观测验证和回滚思路"
+      "说出 Watermark = max(eventTime) − maxOutOfOrderness 公式与 forBoundedOutOfOrderness API",
+      "解释下游算子取上游 min(watermark) 的正确性原因，以及 withIdleness 解决空分区卡顿",
+      "讲清 Tumbling/Sliding/Session 三种窗口的触发条件 watermark ≥ window.end 及 Sliding 的 size/slide 倍状态成本",
+      "描述 allowedLateness 增量重算 + retract、sideOutputLateData 兜底两层迟到处理"
     ],
     "goodToHave": [
-      "能结合 watermark 延迟、窗口触发日志、迟到数据量、端到端延迟、补算记录 做定位",
-      "能说明多环境差异和权限边界",
-      "能把自动化、审计和回滚串成闭环"
+      "提到 pipeline.auto-watermark-interval 默认 200ms 与多并行 source 的 watermark 合并",
+      "能根据业务乱序 P99 给出 maxOutOfOrderness 经验值",
+      "说出 allowedLateness 必须配合 upsert-kafka/JDBC PK 等 retract 友好 sink",
+      "用 Flink Web UI Watermarks 标签页或 currentInputWatermark metric 定位 lag"
     ],
     "commonMistakes": [
-      "只讲 Watermark、窗口与乱序数据 的工具名，不说明数据语义、状态变化和上下游影响",
-      "忽略 Watermark、窗口与乱序数据 在重跑、补数、迟到数据或口径变更下的边界",
-      "没有用质量指标、血缘、SLA 或成本数据验证 Watermark、窗口与乱序数据 的结果"
+      "把 Watermark 当成单条事件的时间戳，而不是整条流的进度水位",
+      "认为下游算子 watermark 取上游 max，忽略慢分区会让所有窗口提前误触发",
+      "Sliding 窗口没意识到一条事件落入 size/slide 份，导致 RocksDB state 膨胀爆盘",
+      "开了 allowedLateness 但下游用 append 模式 sink，结果出现重复行还以为是计算 bug"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -148,5 +192,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

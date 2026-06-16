@@ -2,25 +2,27 @@
 
 ## 项目概述
 
-面试智练的公共知识内容源。这是一个 **JSON 内容分发仓库**，通过 Cloudflare Pages 部署为静态站点，供移动端 App 消费。App 通过 `manifest.json` 发现领域、分类、知识点和资源；新增知识无需修改 App 代码。
+面试智练的公共知识内容源。这是一个 **JSON 内容分发仓库**，通过 GitHub Actions + Wrangler CLI 部署为 Cloudflare Pages 静态站点，供移动端 App 消费。App 通过 `manifest.json` 发现领域、分类、知识点和资源；新增/修改知识无需改动 App 代码。
 
 **核心原则**：App 是内容驱动的，用户侧知识结构只有"领域 -> 分类 -> 知识点"三层。不使用阶段、天数或排期概念。
 
-**当前规模**：16 个领域、425 个知识点（2026-06-12）。
+**当前规模**：16 个领域、425 个知识点（`manifest.json` 中 `contentVersion: 2026.06.12`）。
 
 **关联项目**：
-- [mianshi-zhilian-app](https://github.com/nontracey/mianshi-zhilian-app) — 面向终端用户的 App 和官网
+- [mianshi-zhilian-app](https://github.com/nontracey/mianshi-zhilian-app) — 终端 App 和官网
 - [mianshi-zhilian-studio](https://github.com/nontracey/mianshi-zhilian-studio) — 内容维护工具
 
 ## 技术栈
 
-| 技术               | 用途                   |
-| ------------------ | ---------------------- |
-| Node.js 22         | 脚本运行环境           |
-| JSON / JSON Schema | 内容格式与校验 (Ajv)   |
-| Cloudflare Pages   | 静态部署               |
-| GitHub Actions     | CI/CD: 验证 + 自动部署 |
-| Wrangler CLI       | Pages 部署工具         |
+| 技术                | 用途                                                    |
+| ------------------- | ------------------------------------------------------- |
+| Node.js 22 (ESM)    | 脚本运行环境（`package.json` 中 `"type":"module"`）     |
+| JSON / JSON Schema  | 内容格式与校验（`ajv` + `ajv-formats`，Draft 2020-12）  |
+| Cloudflare Pages    | 静态部署                                                |
+| GitHub Actions      | CI/CD：验证 + 自动部署                                  |
+| Wrangler CLI        | Cloudflare Pages 部署工具                               |
+
+仓库无运行时依赖，仅 `devDependencies`：`ajv@^8.17.1`、`ajv-formats@^3.0.1`。
 
 ## 目录结构
 
@@ -29,273 +31,227 @@
 ├── manifest.json              # 正式内容入口（生产环境）
 ├── staging-manifest.json      # 测试内容入口
 ├── draft-manifest.json        # 草稿内容入口
-├── package.json               # npm 脚本和依赖 (ajv + ajv-formats)
-├── schemas/                   # JSON Schema
+├── package.json               # npm 脚本和依赖
+├── .gitmessage                # commit message 模板
+├── .githooks/                 # 本地 git hooks（pre-commit / commit-msg）
+├── schemas/                   # JSON Schema (Draft 2020-12)
 │   ├── manifest.schema.json
 │   ├── domain.schema.json
 │   └── topic.schema.json
-├── domains/                   # 领域与分类定义 (16个领域)
-│   ├── java.json
-│   ├── go.json
-│   ├── dotnet.json
-│   ├── python.json
-│   ├── frontend.json
-│   ├── database.json
-│   ├── devops.json
-│   ├── data-engineering.json
-│   ├── security.json
-│   ├── agent.json
-│   ├── algorithm.json
-│   ├── design-pattern.json
-│   ├── architecture.json
-│   ├── os.json
-│   ├── network.json
-│   └── self-media.json
-├── topics/                    # 知识点 JSON (按领域分目录)
-│   ├── java/                  # 59 topics
-│   ├── go/                    # 12 topics
-│   ├── dotnet/                # 35 topics
-│   ├── python/                # 25 topics
-│   ├── frontend/              # 52 topics
-│   ├── database/              # 17 topics
-│   ├── devops/                # 14 topics
-│   ├── data-engineering/      # 14 topics
-│   ├── security/              # 13 topics
-│   ├── agent/                 # 30 topics
-│   ├── algorithm/             # 70 topics
-│   ├── design-pattern/        # 16 topics
-│   ├── architecture/          # 19 topics
-│   ├── os/                    # 19 topics
-│   ├── network/               # 16 topics
-│   └── self-media/            # 14 topics
-├── staging/                   # 测试环境隔离副本
-│   ├── domains/
-│   └── topics/
-├── draft/                     # 草稿环境隔离副本
-│   ├── domains/
-│   └── topics/
-├── scripts/                   # 生成、校验、质量扫描脚本
-│   ├── generate_content.mjs   # 从 Markdown 源生成内容 JSON
-│   ├── validate_content.mjs   # Schema + 语义校验
-│   ├── sync_environment_content.mjs  # 同步 staging/draft 副本
-│   ├── quality_scan.mjs       # 模板文本、泛化追问等质量扫描
-│   └── *.py                   # 一次性修复脚本
-├── docs/                      # 文档
-│   ├── content-format.md      # 详细内容格式规范
-│   ├── content-improvement-plan.md
+├── domains/                   # 16 个领域与分类定义
+├── topics/                    # 425 个知识点 JSON（按领域分目录）
+│   ├── java/ (59) ├── go/ (12) ├── dotnet/ (35) ├── python/ (25)
+│   ├── frontend/ (52) ├── database/ (17) ├── devops/ (14)
+│   ├── data-engineering/ (14) ├── security/ (13) ├── agent/ (30)
+│   ├── algorithm/ (70) ├── design-pattern/ (16) ├── architecture/ (19)
+│   ├── os/ (19) ├── network/ (16) └── self-media/ (14)
+├── staging/                   # 测试环境隔离副本（domains/ + topics/）
+├── draft/                     # 草稿环境隔离副本（domains/ + topics/）
+├── assets/diagrams/           # 33 个 SVG 图解 + 5 个 GIF 动画
+├── scripts/                   # 生成、校验、质量、精修脚本
+│   ├── generate_content.mjs            # 从 Markdown 源生成内容 JSON
+│   ├── sync_environment_content.mjs    # 同步 staging/draft 副本
+│   ├── validate_content.mjs            # Schema + 语义校验
+│   ├── quality_scan.mjs                # 模板/泛化文本扫描
+│   ├── content_quality_audit.mjs       # 确定性质量打分（0-100）
+│   ├── quality_gate_staged.mjs         # pre-commit 暂存 topic 门禁
+│   ├── quality_refine.mjs              # LLM 精修主程序
+│   ├── quality_refine_interactive.sh   # 交互式精修启动器
+│   ├── quality_llm_*.mjs               # LLM packet/run/verify/prune 流水线
+│   └── refine-tests/                   # 精修脚本测试
+├── docs/                      # 内容规范、知识目录、精修器文档
+│   ├── content-format.md
 │   ├── knowledge-content-standard.md
-│   └── knowledge-directory.md
-├── assets/diagrams/           # SVG 图解 + GIF 动画资源 (31 SVG + 5 GIF)
+│   ├── knowledge-directory.md
+│   ├── content-improvement-plan.md
+│   ├── llm-quality-review.md
+│   ├── quality-refine.md
+│   └── quality-refine-v2-plan.md
 └── .github/workflows/
-    ├── deploy-content.yml     # 自动部署到 Cloudflare Pages
-    ├── validate.yml           # PR/push 自动校验 + contentVersion 自动管理
-    └── codeql.yml             # 安全扫描
+    ├── validate.yml         # PR/push 校验 + contentVersion 自动管理 + 触发下游
+    ├── deploy-content.yml   # main push 自动部署到 Cloudflare Pages + 主备验证
+    └── codeql.yml           # 安全扫描
 ```
 
-## 内容结构
+## 内容数据模型
 
-### 三层数据模型
+### 三层结构
 
 ```
-manifest.json  (入口，包含领域列表 + 版本号)
-  └── domains/{domain}.json  (领域定义，包含分类列表)
-        └── topics/{domain}/{topic}.json  (具体的知识点)
+manifest.json
+  └── domains/{domain}.json        # 领域定义 + categories[]，每个 category 有 topics[]
+        └── topics/{domain}/{file}.json   # 具体知识点
 ```
 
-### Topic 格式要求
+### Topic 必需字段（`schemas/topic.schema.json`）
 
-每个 topic JSON 文件必须包含：
+| 字段             | 类型      | 约束                                                                                |
+| ---------------- | --------- | ----------------------------------------------------------------------------------- |
+| id               | string    | 正则 `^[a-z0-9-]+\.[a-z0-9-]+\.[a-z0-9-]+$`，即 `{domain}.{category}.{slug}`        |
+| domain, category | string    | 小写 kebab-case，与父级引用一致                                                     |
+| title, summary   | string    | 非空                                                                                |
+| tags             | array     | ≥1 项                                                                               |
+| difficulty       | int 1-5   |                                                                                     |
+| estimatedMinutes | int       | ≥1                                                                                  |
+| order            | int       | 排序序号                                                                            |
+| recommendWeight  | int 0-100 |                                                                                     |
+| learningCards    | array     | 必含 `explain` / `interviewAnswer` / `checklist`，至少一项 `compareTable` / `diagram` / `code` |
+| recallPrompts    | array     | ≥1，每条含 `id`、`prompt`、`mode`（text/code/voice）                                |
+| rubric           | object    | `mustHave`(≥1) / `goodToHave` / `commonMistakes` / `scoreWeights`，4 项 score 总和 = 100 |
 
-| 字段             | 类型      | 说明                                                                   |
-| ---------------- | --------- | ---------------------------------------------------------------------- |
-| id               | string    | 格式 `{domain}.{category}.{slug}`，匹配 `^[a-z0-9-]+\.[a-z0-9-]+\.[a-z0-9-]+$` |
-| domain           | string    | 所属领域 ID                                                            |
-| category         | string    | 所属分类 ID                                                            |
-| title            | string    | 知识点标题                                                             |
-| summary          | string    | 一句话概述                                                             |
-| tags             | array     | 标签（至少1个）                                                        |
-| difficulty       | 1-5 int   | 难度等级                                                               |
-| estimatedMinutes | int       | 预估学习时长（≥1）                                                     |
-| order            | int       | 排序序号                                                               |
-| recommendWeight  | 0-100 int | 推荐权重                                                               |
-| learningCards    | array     | **必须包含**: explain, interviewAnswer, checklist                      |
-|                  |           | **至少一项**: compareTable / diagram / code                            |
-| recallPrompts    | array     | 回顾提醒问题 (至少1个, 含 id/prompt/mode)                              |
-| rubric           | object    | 评分标准 (mustHave, goodToHave, commonMistakes, scoreWeights 总和=100) |
-
-**可选字段**：prerequisites（前置依赖）、interviewFrequency（high/medium/low）、interviewerFocus、status（production/staging/draft）、group
+可选字段：`prerequisites`、`interviewFrequency` (high/medium/low)、`interviewerFocus`、`status` (production/staging/draft)、`group`。
 
 ### learningCard 类型
 
-| 类型            | 用途                     | 必需字段                          |
-| --------------- | ------------------------ | --------------------------------- |
-| explain         | 知识全景拆解             | type, title, content              |
-| interviewAnswer | 面试回答模板             | type, title, content, followUpQuestions (≥1) |
-| checklist       | 学习检查项               | type, title, items                |
-| compareTable    | 对比边界                 | type, title, columns + rows 或 content |
-| code            | 代码抓手                 | type, title, content, language    |
-| diagram         | 图解                     | type, title, format (mermaid/svg/image/text), content 或 svgPath/asset |
-| animation       | 动画                     | type, title, asset                |
+| type            | 必需附加字段                                                                            |
+| --------------- | --------------------------------------------------------------------------------------- |
+| explain         | `content`                                                                               |
+| interviewAnswer | `content` + `followUpQuestions` (≥1 条 `question`/`answer`)                             |
+| checklist       | `items[]`                                                                               |
+| compareTable    | `content` 或 `columns` + `rows`                                                         |
+| code            | `content` + `language`，可选 `highlights[].line/note`                                   |
+| diagram         | `format` (mermaid/svg/image/text) + `content` 或 `svgPath`/`asset`/`svg`，可有 `fallback`/`caption` |
+| animation       | `asset`                                                                                 |
+
+mermaid 卡只能使用 App 轻量解析器支持的子集（`flowchart`/`graph` + 基础边），禁止 `subgraph`/`classDef`/`style`/`linkStyle`/`click`/`direction`/带标签虚线边。
 
 ### 三个环境入口
 
-| 文件                    | 用途                         | 指向路径                  |
-| ----------------------- | ---------------------------- | ------------------------- |
-| `manifest.json`         | 生产环境 - 线上 App 正式使用 | `domains/` + `topics/`    |
-| `staging-manifest.json` | 测试环境 - 预发布验证        | `staging/domains/` + `staging/topics/` |
-| `draft-manifest.json`   | 草稿环境 - 开发中的内容      | `draft/domains/` + `draft/topics/` |
+| 入口文件                | 指向                                       | 用途         |
+| ----------------------- | ------------------------------------------ | ------------ |
+| `manifest.json`         | `domains/` + `topics/`                     | 生产 App     |
+| `staging-manifest.json` | `staging/domains/` + `staging/topics/`     | 预发布验证   |
+| `draft-manifest.json`   | `draft/domains/` + `draft/topics/`         | 草稿/工作台  |
 
-staging 和 draft manifest 中的 `environment` 字段标识环境类型。调用方必须按 `manifest.domains[].entry` 加载 domain，按 `domain.categories[].topics[]` 加载 topic，不要硬编码路径。
+`staging-` / `draft-` manifest 通过顶层 `environment` 字段标识。**调用方必须按 `manifest.domains[].entry` 加载 domain，再按 `domain.categories[].topics[]` 加载 topic，禁止硬编码路径。**
 
 ### 16 个领域
 
-| 领域              | topic 数 | 分类                                                                            |
-| ----------------- | -------- | ------------------------------------------------------------------------------- |
-| Java 核心与中间件 | 59       | java-fundamentals, jvm, concurrency, collections, spring, database, middleware, microservice |
-| Go 语言           | 12       | (待确认)                                                                        |
-| .NET 开发         | 35       | csharp, dotnet-core, aspnet, ef-core, client, microservice-dotnet, advanced    |
-| Python 开发       | 25       | Python 基础, 进阶, 面向对象, 并发, 工程实践, Web 开发, 编码面试                 |
-| 前端八股          | 52       | js-fundamentals, typescript, css-layout, react, vue, nodejs, engineering, frontend-architecture, client-dev, network-security |
-| 数据库            | 17       | (待确认)                                                                        |
-| DevOps 与云原生   | 14       | (待确认)                                                                        |
-| 数据工程          | 14       | (待确认)                                                                        |
-| 网络安全          | 13       | (待确认)                                                                        |
-| Agent 开发        | 30       | llm, embedding-retrieval, rag, agent-architecture, ai-engineering               |
-| 算法与数据结构    | 70       | array-list, tree-graph, dynamic-programming, string-search, stack-queue, hash-greedy, backtracking |
-| 设计模式          | 16       | creational, structural, behavioral, principles                                  |
-| 架构设计          | 19       | methodology, microservice, system-design, project-design                        |
-| 操作系统与 Linux  | 19       | 进程线程, 内存管理, IO 模型, Linux 基础                                        |
-| 计算机网络        | 16       | TCP/UDP, HTTP/HTTPS, DNS, WebSocket                                             |
-| 自媒体运营        | 14       | (待确认)                                                                        |
+`java` (59) · `go` (12) · `dotnet` (35) · `python` (25) · `frontend` (52) · `database` (17) · `devops` (14) · `data-engineering` (14) · `security` (13) · `agent` (30) · `algorithm` (70) · `design-pattern` (16) · `architecture` (19) · `os` (19) · `network` (16) · `self-media` (14)
 
-**总计：425 个知识点**
+各领域分类定义见 `domains/{domain}.json`，分类规则见 README.md「领域分类规则」章节。
 
 ## 构建和运行
 
-### 本地命令
+### 本地命令（来自 `package.json`）
 
 ```bash
-npm install              # 安装依赖 (ajv + ajv-formats)
-npm run validate         # 校验所有内容：schema 验证 + 语义检查 + 顺序/权重检查
-npm run generate         # 从原始 Markdown 源文件重新生成内容 JSON (需 CONTENT_SOURCE_ROOT)
-npm run sync:env         # 从正式内容同步生成 staging/draft 隔离副本
-npm run quality:scan     # 质量扫描：检查模板文本、泛化追问等
+npm install                             # 安装 ajv + ajv-formats
+npm run validate                        # Schema + 语义 + 顺序/权重/资源校验
+npm run quality:scan                    # 模板文本、泛化追问质量扫描
+npm run quality:audit                   # 确定性质量打分（默认 --min-score=90）
+npm run generate                        # 从 Markdown 源生成 JSON（需 CONTENT_SOURCE_ROOT），并自动 sync
+npm run sync:env                        # 从正式内容同步 staging/draft 隔离副本
+npm run hooks:install                   # 安装 .githooks（每个 clone 一次）
+
+# 内容精修（LLM 辅助，需要本地有 qwen / codex / claude / gemini / opencode 等 CLI）
+npm run quality:refine:interactive      # 交互式启动（推荐入口）
+npm run quality:refine -- --help        # 直接运行
+npm run quality:refine:test             # 精修脚本测试套件
+
+# LLM packet 流水线（备用，多用于 CI 联动）
+npm run quality:llm:packet|run|verify|prune
+npm run quality:gate                    # 等价于 quality:llm:verify --env=production --scope=changed
 ```
 
-### 生成脚本说明
+### 校验检查项（`scripts/validate_content.mjs`）
 
-`npm run generate` 需要设置 `CONTENT_SOURCE_ROOT` 环境变量，指向原始 Markdown 源目录。脚本会：
+1. JSON Schema 验证（manifest / domain / topic）
+2. 禁止排期文案：`第X天` / `Day X` / `第X阶段` / `今日练习与总结`
+3. `code` 卡片禁止 ASCII 画图字符（`┌┐└┘├┤┬┴┼│─═╔╗╚╝╠╣╦╩╬`）
+4. `interviewAnswer` 禁止行内编号（`1）` / `1.`）
+5. topic ID 全局唯一；`domain` / `category` 引用一致
+6. 必含 `explain` / `interviewAnswer` / `checklist`，且至少一项 `compareTable` / `diagram` / `code`
+7. `rubric.scoreWeights` 4 维总和 = 100
+8. 孤儿文件检查：每个 topic 文件必须被 domain category 引用
+9. 顺序/权重合理性（order 重复/降序、低频高权重等告警）
+10. `diagram` 卡 `svgPath` / `asset` 资源必须存在；`fallback` / `content` 禁止"建议用…"占位文字
+11. mermaid 语法限制：仅 App 解析器支持的子集
 
-1. 扫描 Markdown 文件，按领域规则自动分类
-2. 生成 topic JSON（含 learningCards、recallPrompts、rubric）
-3. 生成 domain JSON 和 manifest JSON（含三个环境）
-4. 自动清理排期文案（"第X天"、"今日练习与总结"等）
-5. 自动同步 staging/draft 隔离副本（调用 `sync_environment_content.mjs`）
+### 三环境同步规则
 
-### CI/CD — GitHub Actions 工作流
+修改正式内容（`topics/`、`domains/`）后必须同步 staging/draft 副本——`npm run generate` 会自动调用 `sync_environment_content.mjs`；手动改动则需 `npm run sync:env`。`status` 字段用于环境隔离，详见 `docs/content-format.md`。
 
-**validate.yml** — 每次 push/PR 触发：
+### CI/CD（GitHub Actions）
 
-1. `npm ci && npm run validate` — 校验内容
-2. PR 检查 contentVersion 不早于当天
-3. Fork PR 只允许修改 `draft/` 目录
-4. main push 时自动设置 contentVersion 为当天日期（`YYYY.MM.DD`）
-5. docs/schemas 变更时触发 Site 仓库重建（需 `SITE_TRIGGER_TOKEN`）
-6. 内容契约变更时触发 App 仓库 smoke 测试（需 `APP_TRIGGER_TOKEN`）
+**`validate.yml`**（PR / push）：
+1. `npm ci && npm run validate && npm run quality:scan && npm run quality:audit`
+2. PR 检查 `contentVersion` 不早于当天
+3. **Fork PR 仅允许修改 `draft/` 目录**
+4. main push 时自动把三个 manifest 的 `contentVersion` 设为当天 (`YYYY.MM.DD`)，并以 `github-actions[bot]` 自动 commit + push
+5. `docs/` 或 `schemas/` 变更触发 `mianshi-zhilian-site` 仓库 dispatch（需 `SITE_TRIGGER_TOKEN`）
+6. 内容契约（schema / manifest / domains / topics / staging / draft）变更触发 App smoke（需 `APP_TRIGGER_TOKEN`）
 
-**deploy-content.yml** — main 分支 push 触发：
+**`deploy-content.yml`**（main push）：
+1. `npm ci && npm run validate && npm run quality:scan && npm run quality:audit`
+2. 准备 `dist/`（复制 manifest、domains、topics、staging、draft、schemas、assets）
+3. **`find dist -name ".DS_Store" -delete`** 清理 macOS 元数据
+4. `wrangler pages deploy dist --project-name=mianshi-zhilian-content`
+5. 抓取主备域名 manifest + 抽样 domain/topic/schema/asset 路径，做 `cmp -s` 比对，最多重试 24×10s
 
-1. `npm ci && npm run validate` — 验证内容
-2. 准备 `dist/` 目录（复制 manifest、domains、topics、staging、draft、schemas、assets）
-3. 清理 `.DS_Store` 文件
-4. `wrangler pages deploy` — 部署到 Cloudflare Pages
-5. 验证主备域名内容一致性（pages.dev vs de5.net），比较 manifest 内容并抽样深路径
-
-**正式入口**：
-
+**主备入口**（必须返回同一份 dist 产物）：
 - 主用：<https://mianshizhilian-content.nontracey.de5.net/manifest.json>
 - 备用：<https://mianshi-zhilian-content.pages.dev/manifest.json>
 
-主备域名必须绑定到同一份 Cloudflare Pages 内容产物，所有 manifest、domains、topics、schemas、assets 路径保持一一对应。
+**必需配置**（GitHub Secrets/Variables）：`CLOUDFLARE_API_TOKEN`（Pages:Edit 权限）、`CLOUDFLARE_ACCOUNT_ID`、可选 `SITE_TRIGGER_TOKEN`、`APP_TRIGGER_TOKEN`。
 
-**必需配置**（GitHub Secrets/Variables）：
+### 本地 git hook（`.githooks/pre-commit`）
 
-- `CLOUDFLARE_API_TOKEN` — 需要 `Cloudflare Pages:Edit` 权限
-- `CLOUDFLARE_ACCOUNT_ID` — Cloudflare 账号 ID
-- `SITE_TRIGGER_TOKEN` — 触发 Site 仓库重建（可选）
-- `APP_TRIGGER_TOKEN` — 触发 App 仓库 smoke 测试（可选）
+仅对**本次暂存**的 `topics/**.json` 做：JSON 可解析 + `quality_gate_staged.mjs` 静态质量分 ≥ 90。历史存量低分文件不连坐。临时跳过：`git commit --no-verify`。`commit-msg` hook 用 `.gitmessage` 模板的中文 `<type>: <描述>` 风格。
 
 ## 开发约定
 
-### 版本管理（自动）
+### Topics 路径约定（最常踩坑）
 
-- **无需手动修改 contentVersion**。`main` 分支 push 时 CI 会自动将三个 manifest 的 `contentVersion` 设为当天日期（`YYYY.MM.DD`），已是当天则跳过
-- App 通过版本号检测内容更新，版本不变则使用本地缓存
+`domains/{domain}.json` 中每个 category 的 `topics[]`：
 
-### Topics 路径约定
-
-`domains/{domain}.json` 中分类的 `topics` 数组：
-
-- 必须是**相对文件路径**：`topics/{domain}/{filename}.json`
-- 不能是 topic ID 字符串或 dict 对象
-- staging/draft 环境路径带前缀：`staging/topics/{domain}/{filename}.json`、`draft/topics/{domain}/{filename}.json`
-- schema 正则约束：`^(?:(?:staging|draft)/)?topics/[a-z0-9-]+/.+\.json$`
+- 必须是**相对文件路径字符串**：`topics/{domain}/{file}.json`
+- 不能是 topic ID、不能是对象、不能省略 `topics/` 前缀
+- staging/draft 环境带前缀：`staging/topics/...` / `draft/topics/...`
+- schema 正则：`^(?:(?:staging|draft)/)?topics/[a-z0-9-]+/.+\.json$`
 
 ### 创建新领域步骤
 
-1. 创建领域 JSON: `domains/{domain}.json`（categories.topics 先留空 `[]`）
-2. 生成知识点文件: `topics/{domain}/{filename}.json`
-3. 重建 topics 数组：扫描 `topics/{domain}/` 目录，按 order 排序后写回路径
-4. 更新 `manifest.json` 的 topicCount
-5. 运行 `npm run validate` 验证
+1. 创建 `domains/{domain}.json`（categories.topics 先空 `[]`）
+2. 创建 `topics/{domain}/{file}.json`
+3. 重建 topics 数组：扫描目录，按 `order` 排序写回路径
+4. 更新 `manifest.json` 的对应 `topicCount`
+5. `npm run validate` + `npm run sync:env`
 
-### 内容结构同步规则
+### contentVersion（自动管理）
 
-内容结构变更（新增/删除领域/分类/知识点、修改字段）须同步更新：
-
-1. **内容维护平台**（本仓库）：文件、manifest、schema、文档
-2. **内容平台**（独立项目）：内容文件、topics 目录、CI 配置
-3. **App 平台**（移动端）：内容解析逻辑、缓存机制、版本检测
-4. **Site 站点**：自定义内容章节的解析/渲染逻辑
-
-### 校验检查项（validate_content.mjs）
-
-1. JSON Schema 验证（manifest / domain / topic）
-2. 禁止排期文案（"第X天"、"Day X"、"今日练习与总结"）
-3. code 卡片禁止 ASCII 画图字符（`┌┐└┘├┤┬┴┼│─═╔╗╚╝╠╣╦╩╬` 等）
-4. interviewAnswer 禁止行内编号列表（`1）` / `1.`）
-5. 语义检查：`今日笔记`、`面试话术`、泛化追问模板等
-6. topic ID 全局唯一、domain/category 引用一致性
-7. 必须包含 explain / interviewAnswer / checklist 卡片
-8. 至少一项 compareTable / diagram / code 深度卡片
-9. rubric.scoreWeights 四维总和必须为 100
-10. topic 文件必须被 domain category 引用（孤儿文件检查）
-11. 顺序/权重合理性（order 重复、降序、低频高权重、高频低权重）
-12. 图解卡资源必须存在（svgPath/asset 指向的文件必须在仓库中）
-13. 图解卡 fallback/content 禁止"建议用…"占位文字
-14. mermaid 语法限制：只允许 App 轻量解析器支持的子集（flowchart/graph + 基本边，禁止 subgraph/classDef/style/labeled-dotted-edges 等）
+**禁止手动修改 `contentVersion`**。`main` push 时 CI 会自动设为当天 (`YYYY.MM.DD`)；当天则跳过。App 通过版本号比较来失效本地缓存。
 
 ### 提交约定
 
-- **禁止中文顿号 `、`** 在 commit message 中（Cloudflare Pages API 不兼容），使用英文逗号 `,` 替代
-- Fork PR 仅允许修改 `draft/` 目录
+- commit message 走 `.gitmessage` 模板：`feat` / `fix` / `refactor` / `perf` / `docs` / `chore` / `ci` / `revert`
+- **避免中文顿号 `、`**：Cloudflare Pages API 对部分非 ASCII 字符不兼容，CI 会清洗 head_commit.message 但建议尽量用 ASCII（英文逗号 `,` 替代）
+- Fork PR 只能改 `draft/`
 
-### App 缓存机制
+### 跨项目同步
 
-```dart
-// 每次启动比较 contentVersion
-if (remoteVersion != localVersion) {
-  // 清除缓存，重新加载所有内容
-}
-```
+内容结构变更（schema / 字段语义 / manifest 形状）需同步：
+1. 本仓库的 `docs/content-format.md`、`docs/knowledge-content-standard.md`、`docs/knowledge-directory.md`
+2. `mianshi-zhilian-app`：内容解析、缓存、版本检测
+3. `mianshi-zhilian-studio`：内容管理逻辑
+4. `mianshi-zhilian-site`：自定义内容章节渲染
 
-用户也可手动：**个人中心 → 知识源配置 → 应用并重载**
+## 内容精修器（LLM 流水线）
 
-## 图解资源
+`scripts/quality_refine.mjs` 是本地维护者使用的 LLM 精修主程序，CI 不参与 LLM 评分。详见 `docs/quality-refine.md`：
 
-`assets/diagrams/` 下存放 SVG 图解和 GIF 动画：
+- 一个 CLI 调用只处理一个 topic；并发只是同时启动多个单 topic 子进程
+- 并发 > 3 时启用自适应降级（限流 / 超时 / 非零退出会把并发降到 3）
+- 子进程通过文件协议输出（带 `//---END---` 标记），主进程严格 JSON 解析，避免 stdout 截断
+- 支持 LLM judge ensemble + 静态分 + invariant 校验三重验收
+- 候选优于现版才整篇接受；否则尝试块级合并；不达标则保留旧版
+- 进度反馈：`--progress-style summary|topic|quiet`，`--heartbeat-seconds` 控制心跳；`summary` 走对齐紧凑进度表
+- `Ctrl-C` 中断当前精修并尝试 kill 子进程；二次 `Ctrl-C` 强制退出
+- 仅审计：`npm run quality:refine -- --audit-only --scope domain:go --min-score 90`
+- 测试预览写 `.quality-refine/preview/`，正式模式只在全部目标达标后才同步到 `staging/` / `draft/`
 
-- **SVG 图解**（31 个）：`01-jvm-runtime-data-area.svg` ~ `31-distributed-transaction.svg`
-- **GIF 动画**（5 个）：`anim-bfs-grid.gif`、`anim-binary-search.gif`、`anim-fast-slow-cycle.gif`、`anim-sliding-window.gif`、`anim-two-pointers.gif`
+## 已知问题与注意事项
 
-topic 的 diagram 卡片通过 `svgPath` 或 `asset` 字段引用这些资源。引用的资源必须实际存在，否则校验报错。
+- 历史 topic 中存在系统性模板污染（`code.highlights[].note`、`explain` 三段式、`commonMistakes`、`interviewerFocus`、`followUpQuestions`），主要影响 `java`、`agent`、`architecture`、`dotnet`、`frontend`，需通过精修器逐域清理
+- 已知少量 P0 JSON/转义错误集中在部分 `dotnet` 和 `java` topic（详见维护者本地审计报告）
+- 修改大量 topic 时优先写一次性 Node.js 脚本批量处理，避免逐文件手编出错（参见项目 skill `batch-content-modification-with-scripts`）

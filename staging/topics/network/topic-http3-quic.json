@@ -18,46 +18,43 @@
   "learningCards": [
     {
       "type": "explain",
-      "title": "HTTP/2 的队头阻塞与 QUIC 的解法",
-      "content": "## HTTP/2 残留的队头阻塞\nHTTP/2 在应用层用多路复用（多个 stream 共享一条连接）消除了 HTTP/1.1 的队头阻塞，但它跑在 **TCP** 上：TCP 保证字节流有序，**一个数据包丢失会阻塞其后所有 stream**的交付（传输层队头阻塞），弱网丢包时尤其明显。\n\n## QUIC：在 UDP 上重做传输层\nHTTP/3 基于 **QUIC（运行在 UDP 之上）**：\n- **多路复用无队头阻塞**：QUIC 的每个 stream **独立保证有序**，某个 stream 丢包只影响自己，其他 stream 照常交付。\n- **握手更快**：QUIC 把传输握手与 **TLS 1.3** 加密握手合并，新连接 **1-RTT**，恢复连接可 **0-RTT**。\n- **连接迁移**：用 **Connection ID** 标识连接而非四元组，手机从 WiFi 切到蜂窝（IP 变了）连接不中断。\n- **内置加密**：QUIC 默认加密，几乎等同强制 HTTPS。"
+      "title": "为什么 HTTP/2 还有队头阻塞，HTTP/3 为什么改用 UDP",
+      "content": "## HTTP/2 多路复用为何没救掉队头阻塞\nHTTP/2 在应用层做多路复用：多个 stream（每个对应一个请求/响应）共用一条 TCP 连接，靠 frame 的 stream id 区分。但 TCP 给上层的承诺是「单一、有序、无丢失」的字节流，**它不知道这条字节流里混了多少个 HTTP stream**。\n\n后果：当 TCP 段 N 丢失，后续段 N+1、N+2 即使属于别的 stream，也只能在内核 socket buffer 里排队，等 N 重传到位、按序拼好，才会交付上层。结果是「应用层多路复用 + 传输层单队列」，弱网丢一个包就把所有流一起卡住——这就是 **TCP 传输层队头阻塞**。\n\n## QUIC 的关键改动\nQUIC 把可靠传输从内核 TCP 上挪到 UDP 之上的用户态协议（Chromium、ngtcp2、msquic 等实现），对每个 stream **单独维护重组与拥塞窗口**：\n- 每个 stream 是独立的有序字节流，stream A 的数据丢了，stream B 的数据可以照常交付，传输层队头阻塞被消掉。\n- 报文用 Packet Number 严格递增（不复用，规避 TCP 的重传歧义），每个 packet 还可以携带多个 stream 的数据。\n- 控制信息和载荷都强制 TLS 1.3 加密（含 Initial 包），中间盒看不到 stream id、ACK 等细节，避免协议僵化。\n\n## 为什么必须是 UDP\nTCP 由内核实现且经过几十年中间盒「优化」，新选项常被丢弃或改写。改造 TCP 等于推不动整条互联网。UDP 协议头简单、中间盒一般直通，QUIC 才能把可靠性、拥塞控制、加密握手都搬到用户态自己定义并快速演进（Google 在 Chrome+服务端做 A/B 实验，IETF QUIC 最终于 RFC 9000 标准化）。"
     },
     {
       "type": "explain",
-      "title": "HTTP/3 与 QUIC 的边界与易错点",
-      "content": "## 代价 / 注意点\n- 跑在 UDP 上，部分企业防火墙/NAT 对 UDP 限制更多，需要回退到 TCP(HTTP/2)。\n- QUIC 协议栈多在**用户态**实现（如 Chromium、ngtcp2），CPU 开销和成熟度与内核 TCP 不同。\n- 队头阻塞只在**传输层**被解决；若应用层仍按序处理，业务层面仍要自行设计。\n\n## 落地现状（2026）\n主流浏览器、CDN（Cloudflare、Akamai）、大厂站点已广泛支持 HTTP/3；通常通过响应头 `Alt-Svc` 通告，客户端再升级到 h3。Nginx、Caddy 等也已支持。\n\n## 一句话\nHTTP/3 = HTTP 语义不变 + 传输层从 TCP 换成 QUIC(UDP)，主要解决 TCP 队头阻塞和移动端连接稳定性。"
+      "title": "0-RTT、连接迁移与落地痛点",
+      "content": "## 握手：1-RTT 新建 / 0-RTT 恢复\nQUIC 把传输握手和 TLS 1.3 握手合并：\n- **首次连接 1-RTT**：客户端发 Initial（含 ClientHello）→ 服务端 Initial+Handshake（含证书与 ServerHello）→ 客户端发 Finished 同时就可以带应用数据。对比 HTTP/2 over TLS 需要 TCP 三次握手 + TLS 1.3 一次握手，至少 2 RTT 才能发请求。\n- **恢复连接 0-RTT**：用之前会话保留的 PSK，客户端在第一个包里就把请求带上，服务端验证后立即响应。\n- **0-RTT 的边界**：0-RTT 数据可被攻击者重放，QUIC 规定只允许放在「重放安全」的请求里（如 GET），写操作仍要等 1-RTT 确认；服务端要做反重放窗口。\n\n## 连接迁移：脱离四元组\nTCP 连接由 (srcIP, srcPort, dstIP, dstPort) 唯一标识，手机从 WiFi 切到 5G IP 变了连接就断。QUIC 用与地址无关的 **Connection ID** 标识连接：\n- 客户端、服务端各持有一组 CID，迁移时换源地址但 CID 不变，对端收到带相同 CID 的包后做地址验证（PATH_CHALLENGE/PATH_RESPONSE）即可继续。\n- 这是直播、IM、移动 Web 在切网时不断流的关键。\n\n## 落地痛点（2026 年现状）\n- **UDP 被限速/丢弃**：部分企业防火墙、NAT、运营商对 UDP 限速明显（曾观测到 UDP 丢包率显著高于 TCP），客户端要保留 HTTP/2 over TCP 回退路径，依赖响应头 `Alt-Svc: h3=\":443\"` 通告升级。\n- **用户态协议栈 CPU 偏高**：早期 QUIC 服务端 CPU 比 HTTP/2 高 2-3 倍，靠 UDP GSO/GRO、kTLS、`SO_REUSEPORT` 多线程接收等内核优化逐步追平。\n- **MTU 与放大攻击**：QUIC 默认 1200 字节最小 MTU；服务端在地址未验证时回包不能超过收到字节的 3 倍，避免被用作 DDoS 反射放大。\n- **运维可见性下降**：报文几乎全加密，传统按 TCP 五元组+明文 header 抓包的链路排查方式失效，得改用 SSLKEYLOGFILE 让 Wireshark 解密、或在网关侧导出 qlog。"
     },
     {
       "type": "diagram",
-      "title": "HTTP/3 与 QUIC 学习主线图",
-      "content": "flowchart LR\nA[HTTP/3 与 QUIC] --> B[计算机网络]\nB --> C[HTTP/3]\nC --> D[QUIC]\nD --> E[队头阻塞]\nE --> F[HTTP/2 的 TCP 队头阻塞]",
-      "items": [
-        "HTTP/2: 多 stream 共享 TCP 字节流，丢一包阻塞全部",
-        "QUIC: 每个 stream 独立有序，丢包只影响该 stream",
-        "握手: QUIC + TLS1.3 合并，1-RTT；恢复 0-RTT",
-        "连接迁移: 用 Connection ID，IP 变更连接不断",
-        "跑在 UDP 上，防火墙受限时回退 HTTP/2"
-      ],
+      "title": "TCP 队头阻塞 vs QUIC 流级独立交付",
+      "content": "flowchart TB\n  T1[Stream A pkt1] --> TCP[(TCP 单一有序字节流)]\n  T2[Stream A pkt2 丢失] -->|丢包| TCP\n  T3[Stream B pkt3] --> TCP\n  T4[Stream B pkt4] --> TCP\n  TCP --> APP1[内核必须等 pkt2 重传<br/>Stream B 也被阻塞]\n  Q1[Stream A pkt1] --> SA[Stream A 重组队列]\n  Q2[Stream A pkt2 丢失] -->|丢包| SA\n  Q3[Stream B pkt3] --> SB[Stream B 重组队列]\n  Q4[Stream B pkt4] --> SB\n  SA --> APP2A[Stream A 等待重传]\n  SB --> APP2B[Stream B 立即交付应用]",
       "format": "mermaid",
-      "fallback": "HTTP/3 与 QUIC -> 计算机网络 -> HTTP/3 -> QUIC -> 队头阻塞 -> HTTP/2 的 TCP 队头阻塞",
-      "caption": "从 计算机网络 到 HTTP/2 的 TCP 队头阻塞，这张图帮助区分 HTTP/3 与 QUIC 的核心机制、边界条件和常见误区。"
+      "fallback": "上半部分：HTTP/2 多个 Stream 共享 TCP 单一有序字节流，Stream A 的某个包丢失会让后续 Stream B 的包也卡在内核 buffer。下半部分：HTTP/3 的 QUIC 给每个 Stream 独立的重组队列，Stream A 等待重传时，Stream B 的数据可以立刻交付应用，传输层队头阻塞被消除。",
+      "caption": "HTTP/2 与 HTTP/3 在传输层重组路径上的差异：QUIC 把 stream 重组从 TCP 单队列拆成每流独立队列。"
     },
     {
       "type": "compareTable",
       "title": "HTTP/1.1 vs HTTP/2 vs HTTP/3",
-      "content": "| 维度 | HTTP/1.1 | HTTP/2 | HTTP/3 |\n| --- | --- | --- | --- |\n| 传输层 | TCP | TCP | QUIC(UDP) |\n| 多路复用 | 无(队头阻塞) | 应用层多路复用 | 流级独立，无队头阻塞 |\n| 队头阻塞 | 应用层有 | 传输层仍有 | 基本消除 |\n| 握手 | TCP+TLS 多 RTT | TCP+TLS | 合并，1-RTT/0-RTT |\n| 连接迁移 | 无 | 无 | 有(Connection ID) |"
+      "content": "| 维度 | HTTP/1.1 | HTTP/2 | HTTP/3 |\n| --- | --- | --- | --- |\n| 传输层 | TCP | TCP | QUIC over UDP |\n| 多路复用 | 无，靠多 TCP 连接+pipelining | 一条 TCP 上多 stream | 一条 QUIC 上多 stream |\n| 队头阻塞 | 应用层和传输层都有 | 应用层消除，传输层仍有 | 传输层基本消除 |\n| 握手成本 | TCP 1-RTT + TLS 1-2 RTT | TCP 1-RTT + TLS 1.3 1-RTT | 合并 1-RTT，恢复 0-RTT |\n| 连接标识 | 四元组 | 四元组 | Connection ID，IP 变化不断连 |\n| 加密 | 可选 HTTPS | 实际强制 HTTPS | 协议内置 TLS 1.3 |\n| 头部压缩 | 无 | HPACK | QPACK（避免编码器队头阻塞） |\n| 适用场景 | 兼容老服务 | 通用 Web | 弱网、移动端、CDN 边缘 |"
     },
     {
       "type": "interviewAnswer",
       "title": "标准面试回答",
-      "content": "结论：HTTP/3 把传输层从 TCP 换成基于 UDP 的 QUIC，HTTP 语义不变。它主要解决 HTTP/2 残留的 TCP 队头阻塞——HTTP/2 多路复用在应用层，但 TCP 有序交付导致一个丢包阻塞所有 stream；QUIC 让每个 stream 独立有序，丢包只影响自己。\n\nQUIC 还把传输握手与 TLS1.3 合并实现 1-RTT/0-RTT，用 Connection ID 支持连接迁移（移动端切网不断连），且默认加密。代价是跑在 UDP 上可能被防火墙限制需回退、协议栈多在用户态。\n\n追问边界：HTTP/3 不改变 HTTP 的语义和方法，改的是底层传输；弱网、移动端、丢包环境收益最大，理想网络下相对 HTTP/2 提升有限。",
+      "content": "结论先行：HTTP/3 把传输层从 TCP 换成跑在 UDP 上的 QUIC，HTTP 语义不变。它要解决的核心痛点是 HTTP/2 残留的 TCP 队头阻塞——HTTP/2 在应用层做多路复用，但 TCP 给的是单条有序字节流，丢一个段就把所有 stream 一起卡住。\n\n核心机制：QUIC 在 UDP 之上为每个 stream 维护独立的重组队列和流控，stream A 丢包不影响 stream B 交付；它把传输握手与 TLS 1.3 合并，新连接 1-RTT、恢复连接 0-RTT；用 Connection ID 替代四元组标识连接，手机从 WiFi 切到 5G IP 变了连接也不会断；报文默认加密，避免中间盒僵化。\n\n边界与代价：QUIC 走 UDP，部分企业防火墙、NAT 会限速或丢弃 UDP，客户端要靠 Alt-Svc 通告并保留 HTTP/2 回退；协议栈多在用户态实现，早期 CPU 开销高于内核 TCP，要靠 UDP GSO、kTLS 等优化；0-RTT 数据可重放，只能放 GET 这类幂等请求，写操作必须 1-RTT；运维上抓包可见性下降，需要导出 qlog 或 keylog 才能调试。",
       "followUpQuestions": [
         {
           "question": "HTTP/2 已经多路复用了，为什么还有队头阻塞？",
-          "answer": "HTTP/2 的多路复用在应用层，多个 stream 复用一条 TCP 连接；但 TCP 提供的是单一有序字节流，只要某个 TCP 段丢失，其后到达的数据即使属于别的 stream 也必须等待重传补齐才能交付上层——这就是传输层队头阻塞，HTTP/2 无法绕过。"
+          "answer": "HTTP/2 的多路复用在应用层：多个 stream 复用一条 TCP 连接，frame 用 stream id 区分。但 TCP 给上层的承诺是单一有序字节流，它不感知 frame 边界。某个 TCP 段丢失后，即便后续段属于其他 stream，也必须留在内核 socket buffer 里排队，等丢失段重传到位才能按序交付上层——这是 TCP 传输层队头阻塞，HTTP/2 在 TCP 上无法绕过。"
         },
         {
-          "question": "QUIC 的连接迁移解决了什么问题？",
-          "answer": "传统 TCP 连接由源/目的 IP+端口四元组标识，手机从 WiFi 切到蜂窝网络 IP 变化会导致连接断开重连。QUIC 用与地址无关的 Connection ID 标识连接，IP/端口变了仍是同一条连接，避免移动场景频繁重连，体验更平滑。"
+          "question": "QUIC 的 0-RTT 是如何做到的？为什么不能放所有请求？",
+          "answer": "0-RTT 依赖 TLS 1.3 的会话恢复：客户端首次连接后保存了和服务端协商的 PSK 与 transport parameters，下次握手时把请求和加密的 PSK 一起塞进第一个 Initial 包发出，服务端解出 PSK 验证后立即响应，相当于发请求不花 RTT。代价是 0-RTT 数据没有完整握手保护，攻击者可以重放整个 Initial 包。所以 QUIC 规定 0-RTT 只能承载重放安全的请求（如幂等的 GET），扣款、下单这类写操作必须等 1-RTT 完成，服务端还要维护反重放窗口。"
+        },
+        {
+          "question": "线上上了 HTTP/3 但部分用户没收益甚至变慢，可能是什么原因？",
+          "answer": "几个常见点：第一，客户端所在网络（企业出口、某些运营商）对 UDP 限速或丢包率高，h3 反而比 h2 慢，需要靠 Happy Eyeballs 之类策略快速回退；第二，服务端只发了 Alt-Svc 但未设合理 max-age 或客户端不缓存，用户每次仍走 h2；第三，用户态 QUIC 栈未开启 UDP GSO/GRO、kTLS 等优化，CPU 成为瓶颈反向拖慢响应；第四，CDN 与回源仍是 TCP，长距离弱网收益有限；第五，0-RTT 被服务端拒绝（反重放窗口命中或会话票据过期），实际仍走 1-RTT。排查靠对比 h2/h3 的 TTFB、抓 qlog、看 CDN 提供的 h3 命中率与 UDP 丢包指标。"
         }
       ]
     },
@@ -65,53 +62,59 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释 HTTP/2 为何仍有 TCP 传输层队头阻塞",
-        "能说明 QUIC 如何用流级独立有序消除队头阻塞",
-        "能讲清 QUIC 的 1-RTT/0-RTT 握手与连接迁移",
-        "能对比 HTTP/1.1/2/3 的传输层与队头阻塞",
-        "能说出 HTTP/3 的代价（UDP 受限、用户态栈）与适用场景"
+        "能解释 HTTP/2 多路复用为何无法消除 TCP 传输层队头阻塞",
+        "能说出 QUIC 用每流独立重组队列消除队头阻塞的机制",
+        "能讲清 1-RTT 新连接 / 0-RTT 恢复连接以及 0-RTT 的重放限制",
+        "能说明 Connection ID 如何支持移动端切网不断连",
+        "能列出落地痛点：UDP 被限速/丢弃、用户态栈 CPU、抓包可见性、Alt-Svc 回退",
+        "能对比 HTTP/1.1/2/3 的传输层、握手成本、连接标识与队头阻塞表现"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "network.http-https.topic-http3-quic.recall.1",
-      "prompt": "HTTP/2 已经多路复用为什么还有队头阻塞？QUIC 如何解决？",
+      "prompt": "HTTP/2 已经多路复用，为什么还有队头阻塞？QUIC 是怎么从机制上消掉的？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "network.http-https.topic-http3-quic.recall.2",
-      "prompt": "QUIC 的 0-RTT 握手和连接迁移分别带来什么好处，有什么代价？",
+      "prompt": "QUIC 的 0-RTT 握手能省掉哪些 RTT？为什么不允许在 0-RTT 里下单或扣款？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "network.http-https.topic-http3-quic.recall.3",
-      "prompt": "HTTP/3 与 QUIC 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "线上灰度 HTTP/3 后，部分用户 TTFB 反而变高甚至连不上，你会从哪些方向排查？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "HTTP/2 的 TCP 队头阻塞",
-      "QUIC 基于 UDP 流级独立有序",
-      "1-RTT/0-RTT 握手",
-      "连接迁移 Connection ID"
+      "HTTP/2 在 TCP 上的传输层队头阻塞机制（单一有序字节流导致跨 stream 阻塞）",
+      "QUIC 给每个 stream 独立重组队列，stream 间互不阻塞",
+      "QUIC 合并传输握手与 TLS 1.3，1-RTT 新建 / 0-RTT 恢复",
+      "Connection ID 替代四元组实现连接迁移，移动端切网不断连",
+      "为什么必须基于 UDP（TCP 中间盒僵化、协议演进困难）"
     ],
     "goodToHave": [
-      "TLS1.3 合并握手",
-      "UDP 受限需回退",
-      "用户态协议栈"
+      "0-RTT 的重放风险与适用范围（仅幂等请求）",
+      "Alt-Svc 通告与 HTTP/2 回退路径",
+      "用户态协议栈 CPU 与 UDP GSO/GRO、kTLS 优化",
+      "QPACK 替代 HPACK 以避免编码器队头阻塞",
+      "qlog/SSLKEYLOGFILE 抓包调试手段"
     ],
     "commonMistakes": [
-      "以为 HTTP/2 已无队头阻塞",
-      "认为 HTTP/3 改了 HTTP 语义",
-      "不知道 QUIC 跑在 UDP 上"
+      "以为 HTTP/2 的多路复用已经彻底消除队头阻塞",
+      "认为 HTTP/3 改了 HTTP 的语义或方法",
+      "不知道 QUIC 跑在 UDP 上，把 QUIC 当成新的 TCP",
+      "把 0-RTT 当万能加速，把写请求也放到 0-RTT 里",
+      "忽视 UDP 被限速/防火墙拦截带来的回退需求"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -120,8 +123,8 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-13",
   "status": "staging",
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察 QUIC 如何解决 TCP 队头阻塞、0-RTT 与连接迁移，以及 HTTP/1.1/2/3 的演进对比。"
+  "interviewerFocus": "重点看候选人能否说清 HTTP/2 残留的 TCP 队头阻塞机制、QUIC 在 UDP 之上做每流独立重组的取舍，以及 0-RTT 重放限制和移动端连接迁移在真实业务里的边界。"
 }

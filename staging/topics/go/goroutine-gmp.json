@@ -20,17 +20,22 @@
     "go.basics.types"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能解释 Goroutine 为什么轻量，G、M、P 如何协同，阻塞、抢占、work stealing 和泄漏如何影响生产系统。",
+  "interviewerFocus": "G/M/P 三者的职责切分、netpoller 与 syscall 阻塞下 P 如何不被卡住、抢占机制从协作式到异步信号的演进、以及 goroutine 泄漏在生产中如何用 pprof/trace 定位。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Goroutine 轻量来自运行时调度而不是没有成本",
-      "content": "Goroutine 是 Go 运行时管理的用户态任务，初始栈小且可增长。运行时用 GMP 模型把大量 G 调度到有限的 M 上执行，P 提供本地队列、调度资源和可并行执行 Go 代码的名额。\n\n从零理解时先抓住这几个点：\n- G 保存 goroutine 的栈、状态和待执行函数\n- M 是操作系统线程，真正执行机器指令\n- P 持有本地运行队列，M 必须拿到 P 才能执行 Go 代码\n- 阻塞系统调用、网络 IO、抢占和 work stealing 会触发调度调整\n\n容易答浅的地方通常在边界：\n- Goroutine 很轻但不是免费，泄漏会持有栈、channel、timer 或外部资源\n- GOMAXPROCS 控制 P 的数量，不是 goroutine 总数\n- CPU 密集任务仍受核心数和调度公平性限制"
+      "title": "为什么 Goroutine 比线程便宜：栈、调度、上下文切换三处省钱",
+      "content": "Goroutine 是 Go 运行时管理的用户态任务，初始栈只有 2KB（Go 1.4 之后），通过 morestack 动态扩容（按 2 倍增长），最大默认 1GB（可用 runtime/debug.SetMaxStack 调整）。对比 Linux pthread 默认栈 8MB，起 10 万个 goroutine 占栈约 200MB，起 10 万个线程要 800GB——这是第一处省钱。\n\n第二处省钱在调度：goroutine 切换发生在用户态，runtime.gopark / runtime.goready 只需保存少量寄存器（rsp、rbp、rip、g 指针），不需要陷入内核、不刷新 TLB、不切换地址空间。一次 goroutine 切换约 200ns，一次内核线程切换约 1-2μs。\n\n第三处省钱在 M:N 复用：runtime 用 GMP 把数万 G 复用到 GOMAXPROCS 个 P 上（默认等于 CPU 核数），实际 OS 线程 M 数量不会爆炸（受 runtime.SetMaxThreads 限制，默认 10000）。\n\n核心三元组：\n- G（goroutine）：保存栈、PC、待执行函数、状态（_Grunnable/_Grunning/_Gwaiting/_Gsyscall/_Gdead）。\n- M（machine）：OS 线程，绑定一个 P 才能执行 Go 代码；脱离 P 时只能跑 syscall 或 cgo。\n- P（processor）：调度上下文，持有本地 runq（容量 256）、mcache、defer pool；GOMAXPROCS 控制 P 的数量。\n\n常见误区：GOMAXPROCS 不限制 goroutine 总数，也不直接等于线程数；线程数会因 syscall 阻塞、cgo 调用临时膨胀。"
     },
     {
       "type": "explain",
-      "title": "阻塞处理、抢占和泄漏是高阶追问",
-      "content": "当 goroutine 进入网络 IO 时，运行时会配合 netpoller 挂起等待，P 可以继续服务其他 G；当进入可能长时间阻塞的系统调用时，M 可能暂时脱离 P，运行时会把 P 交给其他 M，避免整个调度器被卡住。这个过程说明 Go 并发适合大量 IO，但不代表阻塞可以随意写。\n\nGo 也有抢占调度。早期主要依赖函数调用点，现在运行时能在更多位置插入异步抢占，避免某个长循环长期占住 P。线上排查 goroutine 泄漏时，通常看 goroutine profile、阻塞位置、channel 收发是否成对、Context 是否取消、WaitGroup 是否 Done。\n\n把 Goroutine 与 GMP 调度模型 放到真实场景里看，重点是语言语义、运行时调度、并发边界和工程实践。先确认触发条件，再看状态或数据怎样变化，最后用指标、日志、测试结果或复杂度证明判断。"
+      "title": "调度的关键瞬间：阻塞、抢占、work stealing 怎么发生",
+      "content": "三层运行队列：每个 P 有本地 runq（256 容量，FIFO + 末尾的 runnext 槽位），全局 sched.runq 兜底，外加 netpoller 的等待队列。新建 G 优先进 runnext，再溢出到本地 runq，本地满了批量推一半到全局。\n\n网络 IO 阻塞（netpoller 路径）：goroutine 在 net.Conn.Read 上阻塞时，runtime 把 fd 注册到 epoll（Linux）/kqueue（BSD），G 进入 _Gwaiting，M 立刻去本地 runq 拿下一个 G，P 不释放。fd 就绪后 sysmon 或调度循环调用 netpoll() 把 G 重新置为 _Grunnable 入队。这就是 Go 能用少量线程扛住几十万长连接的关键。\n\n系统调用阻塞（handoff 路径）：goroutine 进入 read(2)/write(2) 这种可能长阻塞的 syscall 时，entersyscall 把 M 与 P 解绑（P 进入 _Psyscall），sysmon 每 20μs 巡检一次，发现 P 阻塞超过 10ms 就调用 retake 把 P 交给空闲 M 或新建 M。syscall 返回时 exitsyscall 尝试拿回原 P，拿不到就把 G 扔进全局队列、M 进入空闲列表。这就是为什么 Go 程序的线程数可能远超 GOMAXPROCS。\n\n抢占演进：Go 1.14 之前只能在函数调用前的栈检查处协作式抢占（for { i++ } 这种紧循环抢不到，会卡住整个 P）；Go 1.14 引入基于 SIGURG 的异步抢占——sysmon 发现 G 跑超 10ms 就给 M 发 SIGURG，信号处理函数把 PC 改写到调度入口，强制让出 P。\n\nWork stealing：P 空闲时按顺序找活——先看本地 runq、再 runnext、再全局队列拉一批、再随机偷另一个 P 一半的 G、最后调用 netpoll 看有没有就绪的网络 G；都没有就 stopm 进入睡眠。这套策略保证空闲 CPU 不会闲着、忙碌 P 不会被独占。"
+    },
+    {
+      "type": "explain",
+      "title": "Goroutine 泄漏的真实形态与定位手段",
+      "content": "泄漏不是抽象问题，而是几种固定形态：\n\n1) HTTP handler 起后台 goroutine 不传 ctx：handler 收到请求后 `go doAsync()`，请求 deadline 触发返回了，但 doAsync 仍卡在 channel 接收或 http.Get 上。线上现象：runtime.NumGoroutine() 随 QPS 单调上涨，重启才下降。\n2) channel 收发不对称：生产者 close 之前 panic、消费者 select 没有 default 也没有 ctx 分支，G 永远停在 chanrecv 上。pprof goroutine 栈聚合会出现大量 `chan receive` 帧。\n3) time.After 在循环里：每次循环新建 timer，timer 引用 G，循环退出条件不触发就累积。Go 1.23 之前更明显，建议用 time.NewTimer + Stop 或 ctx.WithTimeout。\n4) sync.WaitGroup.Add/Done 数量不匹配：Wait 永远不返回，调用方 G 卡死。\n\n定位三板斧（按成本由低到高）：\n- 暴露 net/http/pprof，访问 /debug/pprof/goroutine?debug=2 看完整栈聚合，按栈帧 top 几名定位卡点。生产环境定时抓快照对比增量，比单次快照更准。\n- GODEBUG=schedtrace=1000,scheddetail=1 看 P/M/runqueue/idle 数量，判断是 P 不够还是 G 堆积。\n- runtime/trace 抓 5-10 秒，go tool trace 看 goroutine 生命周期、阻塞分布、syscall 时长，能看到具体哪个 channel 把 G 困住。\n\n生产线索：goroutine 数和内存同步上涨 → 通常是泄漏；goroutine 数稳定但 latency 上涨 → 通常是 P 不够或 GC 压力；线程数（/proc/$pid/status 的 Threads）远超 GOMAXPROCS → 通常有大量阻塞 syscall 或 cgo 调用。"
     },
     {
       "type": "diagram",
@@ -42,37 +47,42 @@
     },
     {
       "type": "compareTable",
-      "title": "G、M、P 职责对比",
+      "title": "网络 IO、Syscall、抢占三条路径对比",
       "columns": [
-        "考点",
-        "应该怎么理解",
-        "面试追问",
-        "常见坑"
+        "路径",
+        "触发场景",
+        "P 是否释放",
+        "M 是否阻塞",
+        "面试落点"
       ],
       "rows": [
         [
-          "G",
-          "goroutine 任务状态",
-          "为什么轻量",
-          "泄漏不是免费"
+          "netpoller",
+          "net.Conn.Read/Write、time.Sleep 等可监听 fd",
+          "否，P 立刻调度下一个 G",
+          "否，M 切换 G 不阻塞",
+          "为什么 Go 能扛几十万长连接"
         ],
         [
-          "M",
-          "操作系统线程",
-          "系统调用如何处理",
-          "线程数仍可能增长"
+          "syscall handoff",
+          "read/write 普通文件、CGO、非 netpoller fd",
+          "是，sysmon 10ms 后 retake P",
+          "是，M 卡在内核态",
+          "线程数为什么会超过 GOMAXPROCS"
         ],
         [
-          "P",
-          "调度上下文和本地队列",
-          "GOMAXPROCS 控制什么",
-          "不等于 goroutine 数"
+          "异步抢占",
+          "G 连续跑 >10ms 不让出（Go 1.14+）",
+          "否，发 SIGURG 让 G 让出",
+          "否，信号处理改写 PC",
+          "Go 1.14 解决了什么紧循环死锁"
         ],
         [
           "work stealing",
-          "空闲 P 偷取其他队列任务",
-          "如何保持负载均衡",
-          "不是业务层负载均衡"
+          "P 本地 runq 空闲",
+          "—",
+          "—",
+          "如何避免饥饿和负载倾斜"
         ]
       ]
     },
@@ -84,22 +94,26 @@
       "highlights": [
         {
           "line": 11,
-          "note": "这里体现取消信号的传播，说明 Goroutine 与 GMP 调度模型 时要强调任务必须有退出条件。"
+          "note": "select 的第一个 case 监听 ctx.Done()。父 context 被 cancel 或 timeout 到期时，runtime 会 close ctx 内部的 done channel，select 立刻命中此分支 return；G 栈帧释放、状态从 _Grunning 转 _Gdead 被回收。如果删掉这一行，worker 会一直卡在 jobs 这个无人发送的 channel 上，即使 main 已经返回 G 也不会消失——这是 HTTP handler 起后台 goroutine 时最常见的泄漏形态，pprof 栈会大量出现 `chan receive` 帧。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "GMP 我会先给结论：Go 用运行时调度器把大量 goroutine 复用到较少线程上执行。\n\n我会按这条线展开：\n1. G 是任务，M 是线程，P 是调度资源和本地队列\n2. M 必须持有 P 才能执行 Go 代码，GOMAXPROCS 决定同时执行 Go 代码的 P 数量\n3. 网络阻塞、系统调用和抢占会让调度器重新安排 G，避免少数阻塞拖垮整体\n4. 生产上要关注 goroutine 生命周期，泄漏会表现为内存、句柄和队列持续增长\n\n最后补一句边界：Goroutine 适合高并发任务拆分，但必须设计退出条件；无限创建 goroutine 并不会自动带来吞吐。",
+      "content": "GMP 我会先给结论：Go 用运行时调度器把大量 goroutine 复用到较少 OS 线程上执行，降低并发编程成本，但 goroutine 不是零成本资源。\n\n回答时我会按三层展开：\n- 调度结构：G 表示待执行的 goroutine（含栈和状态），M 是 OS 线程，P 持有本地运行队列和执行 Go 代码所需的调度资源；M 必须拿到 P 才能跑 Go 代码，GOMAXPROCS 控制 P 的数量，默认等于 CPU 核数。\n- 阻塞处理：网络 IO 走 netpoller（epoll/kqueue），G 挂起时 P 不释放，M 立刻调度下一个 G；普通 syscall 走 handoff 路径，M 卡在内核态时 sysmon 10ms 后会把 P 交给其他 M，所以线程数可能超过 GOMAXPROCS。本地队列、全局队列加 work stealing 三层结构防止饥饿。\n- 抢占演进：Go 1.14 之前是协作式抢占，紧循环会卡死整个 P；Go 1.14 引入基于 SIGURG 的异步抢占，sysmon 发现 G 跑超 10ms 就发信号强制让出。\n\n面试追问到生产边界时，我会用 pprof goroutine 抓栈聚合（找卡在 chan receive、select、syscall 的栈），用 GODEBUG=schedtrace=1000 看 P/M/runqueue 数，用 runtime/trace 看 goroutine 生命周期。最常见的泄漏是 HTTP handler 里起后台 goroutine 没传 ctx，请求超时返回了 G 还卡在 channel 上。",
       "followUpQuestions": [
         {
-          "question": "GOMAXPROCS 控制什么？",
-          "answer": "它控制 P 的数量，也就是可同时执行 Go 代码的并行度；它不限制 goroutine 总数，也不等于操作系统线程总数。"
+          "question": "GOMAXPROCS 控制的是线程数还是 goroutine 数？为什么生产上线程数经常超过 GOMAXPROCS？",
+          "answer": "GOMAXPROCS 只控制 P 的数量，即可同时执行 Go 代码的并发度，不限制 goroutine 总数也不等于 OS 线程数。线程数超 GOMAXPROCS 是因为：(1) goroutine 进入阻塞 syscall 时 M 与 P 解绑，sysmon 会让其他 M 接管 P，原 M 卡在内核里，syscall 返回后变成空闲 M；(2) cgo 调用必须在独立 OS 线程上执行；(3) runtime.LockOSThread 会把 G 钉在 M 上。线程上限由 runtime.SetMaxThreads 控制，默认 10000，超过会 panic。"
         },
         {
-          "question": "怎么定位 goroutine 泄漏？",
-          "answer": "先看 goroutine profile 的数量和栈位置，再检查 channel 收发、Context 取消、定时器、WaitGroup Done 和外部调用是否存在永远等待。"
+          "question": "Go 1.14 的异步抢占解决了什么问题？没有它会怎样？",
+          "answer": "Go 1.14 之前是协作式抢占，只能在函数调用前的栈增长检查点让出 P。`for { i++ }` 这种没有函数调用、没有 channel 操作、没有内存分配的紧循环，会一直占住 P 不让出，导致同 P 上其他 G 饿死，GC 的 STW 也无法启动（GC 需要所有 G 进入安全点）。Go 1.14 用 SIGURG 信号实现异步抢占：sysmon 巡检发现 G 跑超 10ms 就给 M 发 SIGURG，信号处理函数检查 G 是否处于安全状态，把 PC 改写到 asyncPreempt 入口强制让出。这之后紧循环不再能卡死调度器，GC STW 时间也更可控。"
+        },
+        {
+          "question": "线上发现 goroutine 数持续上涨，你的排查路径是什么？",
+          "answer": "第一步：访问 /debug/pprof/goroutine?debug=2 抓完整栈，按栈帧聚合 top，绝大多数泄漏会集中在少数几个栈上（典型如 `chan receive`、`select` 卡在某个具体 channel）。第二步：定时抓两次快照（间隔 5-10 分钟）做 diff，看新增的 G 集中在哪个调用路径——这比单次快照能更快定位活跃泄漏点。第三步：回到代码看创建路径，重点检查：HTTP handler 是否起了后台 G 但没传 ctx；select 是否缺 ctx.Done() 分支；channel 是否有人 close；WaitGroup 的 Add/Done 是否平衡。第四步：用 runtime/trace 抓 10 秒，go tool trace 看 goroutine 生命周期，能直观看到哪些 G 是创建后从不退出的。"
         }
       ]
     },
@@ -107,32 +121,32 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 G/M/P 职责",
-        "能解释阻塞系统调用处理",
-        "能说明抢占和 work stealing",
-        "能区分 GOMAXPROCS 和 goroutine 数",
-        "能定位 goroutine 泄漏"
+        "能准确说明 G、M、P、本地 runq、全局队列、work stealing 和 GOMAXPROCS 的职责",
+        "能区分 netpoller 路径（P 不释放）和 syscall handoff 路径（P 被 retake），并解释线程数为什么超 GOMAXPROCS",
+        "能讲清 Go 1.14 异步抢占解决的紧循环死锁问题和 SIGURG 机制",
+        "能识别 channel 阻塞、context 缺失、time.After 累积、WaitGroup 不平衡四种常见泄漏形态",
+        "能用 pprof goroutine、schedtrace、runtime/trace 三种工具完成生产侧定位"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "go.concurrency.goroutine-gmp.recall.1",
-      "prompt": "请讲清楚 Go 的 GMP 调度模型，以及 G、M、P 分别负责什么。",
+      "prompt": "请用 G、M、P 说明 Go 调度器如何把 goroutine 复用到 OS 线程上执行，并解释 GOMAXPROCS 控制的是什么。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "go.concurrency.goroutine-gmp.recall.2",
-      "prompt": "GOMAXPROCS 控制什么？和 goroutine 数量有什么区别？",
+      "prompt": "网络 IO（netpoller）和普通 syscall 走的是不同调度路径，请分别说明 P 是否释放、M 是否阻塞、对线程数的影响。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "go.concurrency.goroutine-gmp.recall.3",
-      "prompt": "Goroutine 泄漏通常怎么产生，如何用 pprof 定位？",
+      "prompt": "线上 goroutine 数持续上涨时，你如何用 pprof 和 trace 定位泄漏路径？请结合一种典型形态（如 HTTP handler 后台 goroutine 不传 ctx）说明排查步骤。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
@@ -140,20 +154,23 @@
   ],
   "rubric": {
     "mustHave": [
-      "G/M/P 职责",
-      "能说明「本地队列」在「Goroutine 与 GMP 调度模型」里的作用和判断标准",
-      "GOMAXPROCS",
-      "能说明「阻塞处理」在「Goroutine 与 GMP 调度模型」里的作用和判断标准"
+      "G/M/P 职责切分：G 是任务、M 是 OS 线程、P 是调度上下文",
+      "P 本地队列 + 全局队列 + work stealing 三层调度结构",
+      "GOMAXPROCS 控制 P 的数量、不限制 goroutine 总数也不等于线程数",
+      "网络 IO 走 netpoller 不占 M、长 syscall 触发 M 与 P 解绑让其他 M 接管"
     ],
     "goodToHave": [
-      "work stealing",
-      "netpoller",
-      "goroutine profile 定位泄漏"
+      "Go 1.14 基于 SIGURG 的异步抢占解决紧循环卡 P 的问题",
+      "sysmon 10ms 巡检 retake 阻塞 P 的机制",
+      "pprof goroutine 栈聚合 + GODEBUG=schedtrace + runtime/trace 三件套定位泄漏",
+      "goroutine 初始栈 2KB、动态扩容、对比线程 8MB 栈的成本差异"
     ],
     "commonMistakes": [
-      "把 goroutine 等同线程",
-      "认为 GOMAXPROCS 限制协程数",
-      "创建 goroutine 不设计退出条件"
+      "把 goroutine 等同线程，认为切换成本一样",
+      "认为 GOMAXPROCS 限制 goroutine 总数或线程总数",
+      "HTTP handler 里 go func() 不传 ctx，请求返回后 G 卡在 channel 上泄漏",
+      "在循环里写 time.After 累积 timer 引用导致 G 不释放",
+      "认为 Go 1.14 之前的协作式抢占足以应对所有场景，忽视紧循环会卡死整个 P"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -162,5 +179,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

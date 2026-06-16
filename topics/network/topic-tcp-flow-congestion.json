@@ -4,133 +4,51 @@
   "category": "tcp-udp",
   "group": "tcp-udp",
   "title": "TCP 流量控制与拥塞控制",
-  "summary": "理解TCP通过滑动窗口实现流量控制和通过拥塞控制四阶段(慢启动/拥塞避免/快重传/快恢复)防止网络拥塞的原理。",
-  "tags": [
-    "TCP",
-    "流量控制",
-    "拥塞控制",
-    "滑动窗口"
-  ],
+  "summary": "流量控制用 rwnd 防止发送方压垮接收方缓冲区，拥塞控制用 cwnd 防止把网络打爆，发送方每次能发的字节等于 min(rwnd, cwnd) - bytes_in_flight。",
+  "tags": ["TCP", "流量控制", "拥塞控制", "滑动窗口", "BBR"],
   "difficulty": 4,
   "estimatedMinutes": 28,
   "order": 40,
   "recommendWeight": 88,
   "learningCards": [
-    {
-      "type": "explain",
-      "title": "TCP 流量控制与拥塞控制：两个问题不同、零窗口不是断开连接",
-      "content": "## 两个问题不同\n流量控制防止发送方把接收方缓冲区打满，接收方通过 TCP 窗口字段通告 `rwnd`。拥塞控制防止发送方把网络打拥塞，发送方根据 ACK、丢包和延迟维护 `cwnd`。实际可发送窗口通常取 `min(rwnd, cwnd)`。\n\n## 零窗口不是断开连接\n当接收方通告零窗口，发送方会暂停发送普通数据，并周期性发送零窗口探测，避免窗口恢复通知丢失导致双方一直等待。"
-    },
-    {
-      "type": "explain",
-      "title": "TCP 流量控制与拥塞控制：慢启动、拥塞避免",
-      "content": "## 慢启动\n连接开始或超时后，`cwnd` 通常从较小值开始。慢启动并不是慢，而是指数增长：每收到 ACK 增加约 1 MSS，因此一个 RTT 内大约翻倍，直到达到 `ssthresh` 或出现拥塞信号。\n\n## 拥塞避免\n超过阈值后进入拥塞避免，窗口线性增长，通常约每 RTT 增加 1 MSS。这样可以更温和地探测网络剩余容量。\n\n## 重复 ACK 的含义\n发送方收到 3 个重复 ACK，通常说明中间某个报文段丢了但后续段到达了，于是触发快重传，不必等超时。\n\n## 超时更严重\n超时通常被视为更强的拥塞信号，会把 `ssthresh` 降低并让 `cwnd` 回到较小值重新慢启动。快恢复则通常把阈值设为原窗口一半，尽量保持管道中已有数据，避免吞吐骤降。"
-    },
-    {
-      "type": "explain",
-      "title": "TCP 流量控制与拥塞控制的边界、调优与面试追问",
-      "content": "TCP 流量控制解决接收端处理不过来的问题，拥塞控制解决网络路径承载不了的问题，两者观察指标不同。前者关注接收窗口、发送窗口和应用读取速度，后者关注慢启动、拥塞窗口、丢包、RTT 和重传。线上排查时要结合抓包、内核指标和应用日志判断是对端读慢、链路拥塞、带宽打满还是服务端线程阻塞。\n\n把 TCP 流量控制与拥塞控制 放到真实场景里看，重点是报文/连接状态、传输路径、异常边界和抓包证据。先确认触发条件，再看状态或数据怎样变化，最后用指标、日志、测试结果或复杂度证明判断。"
-    },
-    {
-      "type": "diagram",
-      "title": "TCP 拥塞控制状态机",
-      "content": "flowchart TD\nA[连接建立 cwnd=1MSS] --> B[慢启动: 每RTT翻倍]\nB --> C{cwnd >= ssthresh?}\nC -->|是| D[拥塞避免: 每RTT+1MSS]\nC -->|否| B\nD --> E{收到3个重复ACK?}\nE -->|是| F[快重传]\nF --> G[快恢复: ssthresh=cwnd/2, cwnd=ssthresh]\nG --> D\nD --> H{超时?}\nH -->|是| I[ssthresh=cwnd/2, cwnd=1MSS]\nI --> B",
-      "caption": "慢启动、拥塞避免、快重传与快恢复四阶段状态转换",
-      "fallback": "TCP 拥塞控制状态机",
-      "format": "mermaid"
-    },
-    {
-      "type": "code",
-      "title": "代码示例",
-      "content": "// 模拟TCP拥塞窗口变化\nclass CongestionControl {\n    double cwnd = 1.0;       // 拥塞窗口(单位: MSS)\n    double ssthresh = 64.0;  // 慢启动阈值\n    String state = \"slow_start\";\n\n    // 每收到一个ACK调用\n    void onAckReceived() {\n        switch (state) {\n            case \"slow_start\":\n                cwnd += 1.0;  // 每个ACK使cwnd增加1 MSS\n                if (cwnd >= ssthresh) {\n                    state = \"congestion_avoidance\";\n                }\n                break;\n            case \"congestion_avoidance\":\n                cwnd += 1.0 / cwnd;  // 每个RTT增加1 MSS\n                break;\n            case \"fast_recovery\":\n                cwnd += 1.0;  // 收到新ACK，保持拥塞避免\n                state = \"congestion_avoidance\";\n                break;\n        }\n        System.out.printf(\"ACK: cwnd=%.2f, ssthresh=%.0f, state=%s%n\",\n                          cwnd, ssthresh, state);\n    }\n\n    // 检测到丢包\n    void onPacketLoss(boolean isTimeout) {\n        ssthresh = cwnd / 2;\n        if (isTimeout) {\n            // 超时: 严重拥塞，重新慢启动\n            cwnd = 1.0;\n            state = \"slow_start\";\n        } else {\n            // 3个重复ACK: 轻度拥塞，快恢复\n            cwnd = ssthresh + 3;\n            state = \"fast_recovery\";\n        }\n    }\n}\n\n// 模拟运行\nCongestionControl cc = new CongestionControl();\nfor (int rtt = 0; rtt < 10; rtt++) {\n    for (int ack = 0; ack < (int)cc.cwnd; ack++) {\n        cc.onAckReceived();\n    }\n}",
-      "language": "java",
-      "highlights": [
-        {
-          "line": 9,
-          "note": "这里是边界条件分支，回答 TCP 流量控制与拥塞控制 时要说明它为什么会改变执行路径。"
-        }
-      ]
-    },
-    {
-      "type": "interviewAnswer",
-      "title": "面试回答思路",
-      "content": "**高频问题1：TCP流量控制和拥塞控制有什么区别？**\n\n流量控制是端到端的机制，由接收方通过窗口字段通告自己的接收能力，防止发送方发太快导致接收方缓冲区溢出。拥塞控制是全局性的机制，由发送方根据网络状况动态调整发送速率，防止网络拥塞。实际发送窗口取两者最小值：min(cwnd, rwnd)。流量控制关注的是接收方的能力，拥塞控制关注的是网络的承载能力。\n\n**高频问题2：请描述拥塞控制的四个阶段。**\n\n拥塞控制分为慢启动、拥塞避免、快重传和快恢复四个阶段。慢启动阶段cwnd从1MSS开始指数增长；当cwnd达到ssthresh后进入拥塞避免阶段，cwnd线性增长；如果收到3个重复ACK触发快重传，然后进入快恢复阶段，ssthresh减半，cwnd设为ssthresh+3；如果是超时丢包，则ssthresh减半，cwnd重置为1重新慢启动。核心思想是AIMD（加性增、乘性减）。\n\n**高频问题3：为什么超时和3个重复ACK的处理不同？**\n\n超时说明网络可能严重拥塞，数据包大量丢失，所以需要激进地降低发送速率（cwnd重置为1）。而连续3个重复ACK说明只是个别数据包丢失，网络状况相对较好，后续数据包还能到达，所以采用温和的策略（cwnd减半后线性增长）。这种区分处理能在保证网络稳定的同时维持较高的吞吐量。",
-      "followUpQuestions": [
-        {
-          "question": "面试官追问「TCP 流量控制与拥塞控制」时，最应该展开哪条机制链？",
-          "answer": "回答「TCP 流量控制与拥塞控制」时先抓住 能区分流量控制(rwnd)和拥塞控制(cwnd)的含义和作用，再展开 能描述慢启动阶段cwnd的指数增长过程。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对网络协议里真实机制的理解。"
-        },
-        {
-          "question": "如果「TCP 流量控制与拥塞控制」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "可以先确认现象是否落在「能描述慢启动阶段cwnd的指数增长过程」，再结合日志、指标、输入规模和依赖状态验证。"
-        }
-      ]
-    },
-    {
-      "type": "checklist",
-      "title": "学完后应能说清楚",
-      "items": [
-        "能区分流量控制(端到端)和拥塞控制(全局)的目标和机制",
-        "能描述拥塞控制四阶段的cwnd变化规律",
-        "能解释慢启动指数增长和拥塞避免线性增长的触发条件",
-        "能说明超时丢包和3个重复ACK触发的不同处理策略",
-        "能画出cwnd随时间变化的典型曲线图",
-        "能解释AIMD(加性增乘性减)策略的含义和作用"
-      ]
-    }
+    {"type": "explain", "title": "rwnd 防接收方溢出，cwnd 防网络拥塞，发送方取两者最小值", "content": "## 两套窗口要分开看\n流量控制是端到端机制：接收方在 TCP 头里通告 16 位 Window 字段（通过 Window Scale 选项可放大到 1GB 级），告诉发送方还能塞多少字节进它的 socket 接收缓冲区（Linux 下由 net.ipv4.tcp_rmem 控制）。拥塞控制是发送方的本地状态：内核维护 cwnd、ssthresh、bytes_in_flight，只能根据 ACK、丢包和 RTT 推断网络承载能力。\n## 实际可发字节 = min(rwnd, cwnd) - bytes_in_flight\n这是 TCP 限速的核心公式。rwnd 是对端通告的，cwnd 是自己估算的，两个都拉起来才能加大发送速率。Linux 下用 ss -tin 可以同时看到 rcv_space、cwnd、ssthresh、bytes_acked 这些值，是排查吞吐瓶颈的第一手证据。\n## 零窗口探测（ZWP）：避免双方互相等待\n接收方应用读得慢，缓冲区被打满后下一个 ACK 通告 Window=0，发送方进入 persist 状态。如果只是被动等接收方发更新报文，那条更新一旦丢失双方就死锁。所以发送方按指数退避（Linux 默认从 200ms 起、上限约 120s）发送 1 字节的零窗口探测包，对端必须回 ACK 报告当前窗口；持续探测超过 tcp_retries2（默认 15 次）才会真正断开连接。"},
+    {"type": "explain", "title": "慢启动指数涨、拥塞避免线性涨，3 个 dupACK 走快重传/快恢复，RTO 退回慢启动", "content": "## 慢启动（Slow Start）：每 RTT 翻倍\n连接建立或 RTO 后 cwnd 重置为 IW（Linux 默认 10 MSS，RFC 6928）。每收到一个 ACK 加 1 MSS，所以一个 RTT 能把 cwnd 翻倍，是指数增长。直到 cwnd ≥ ssthresh 切换到拥塞避免，或者出现丢包。\n## 拥塞避免（Congestion Avoidance）：每 RTT 加 1 MSS\n标准实现是每收到一个 ACK 增加 MSS²/cwnd，累计起来一个 RTT 大约加 1 MSS，呈线性。这是 AIMD 中的 加性增，温和探测剩余带宽。\n## 快重传（Fast Retransmit）：3 个重复 ACK 立即重传\n按序号到达原则，乱序到达的报文会触发接收方对 期待序号 重复 ACK。发送方收到第 3 个 dupACK（RFC 5681）就立即重传被怀疑丢失的那个报文，不用干等 RTO（典型 200ms~1s）。\n## 快恢复（Fast Recovery）：减半但不归零\nReno 在 dupACK 后执行：ssthresh = cwnd/2，cwnd = ssthresh + 3（3 是已经离开网络的那 3 个 dupACK 对应的报文），随后每收到一个 dupACK cwnd += 1 MSS 维持管道，等到新 ACK 回来再 cwnd = ssthresh 进入拥塞避免。这就是 AIMD 的 乘性减。\n## 超时（RTO）：当作严重拥塞处理\n超时说明 ACK 完全没回，更可能是路径性问题：ssthresh = cwnd/2，cwnd = 1 MSS（或 IW），状态退回慢启动。Linux 上能通过 nstat -az TcpRetransSegs、TcpExtTCPLostRetransmit 看到 RTO 重传计数飙升。"},
+    {"type": "explain", "title": "Reno 看丢包、Cubic 抗高 BDP、BBR 测带宽和 RTT，选型看链路特性", "content": "## Reno/NewReno：经典丢包驱动\nLinux 2.4 时代默认算法，AIMD 思路简单但在高带宽长肥管道（高 BDP）下问题明显：丢包后 cwnd 减半再线性增长，恢复慢；同时把所有丢包都当拥塞，遇到无线/移动网络的随机丢包会被错杀。\n## Cubic：Linux 2.6.19+ 默认\n用三次函数 W(t) = C·(t-K)³ + W_max 拟合窗口增长：刚降下来时增长快，靠近上一次的 W_max 时变慢探测，超过后又加速。和 RTT 解耦，因此在跨地域、长肥管道（如跨国 100Gbps 链路）比 Reno 收敛快，公平性也更好。可以用 sysctl net.ipv4.tcp_congestion_control 查看，多数云厂商默认就是 cubic。\n## BBR：Google 2016 提出，Linux 4.9+ 内置\nBBR 不再以丢包为信号，而是连续测量瓶颈带宽 BtlBw（最近 10 个 RTT 的最大投递速率）和最小 RTT RTprop（最近 10 秒的最小 RTT），用 BDP = BtlBw × RTprop 直接控制 inflight。在丢包率不为 0 但链路并未拥塞的场景（公网视频、跨运营商互联）吞吐显著优于 Cubic。代价是会挤占 Cubic 流的带宽（公平性争议），并对浅缓冲交换机不太友好；BBRv2 通过引入显式拥塞通知（ECN）和丢包响应缓解这一问题。开启方式：sysctl -w net.ipv4.tcp_congestion_control=bbr，需配合 net.core.default_qdisc=fq。\n## 选型与排查指标\n国内公网、移动网络、跨境链路通常切 BBR 提升吞吐；同机房、低丢包的内部 RPC 用 Cubic 已足够，且公平性更可控。线上排查吞吐打不上去时按顺序看 ss -tin：rwnd 长期偏小是接收方读慢，cwnd 上不去且 retrans 高是网络丢包，cwnd 高 rwnd 也大但吞吐仍低则查应用层（写入慢、TLS 握手、Nagle 与 delayed ACK 互相等待）。"},
+    {"type": "diagram", "title": "Reno 拥塞控制四阶段状态机", "content": "flowchart TD\nA[连接建立 cwnd=IW=10MSS<br/>ssthresh=64KB] --> B[Slow Start<br/>每ACK cwnd+=1MSS<br/>每RTT 翻倍]\nB --> C{cwnd >= ssthresh?}\nC -->|是| D[Congestion Avoidance<br/>每ACK cwnd+=MSS²/cwnd<br/>每RTT +1MSS]\nC -->|否| B\nD --> E{3 个 dupACK?}\nE -->|是| F[Fast Retransmit<br/>立即重传丢失段]\nF --> G[Fast Recovery<br/>ssthresh=cwnd/2<br/>cwnd=ssthresh+3]\nG --> D\nD --> H{RTO 超时?}\nH -->|是| I[ssthresh=cwnd/2<br/>cwnd=1MSS<br/>退回慢启动]\nI --> B\nB --> H", "caption": "Reno/NewReno 在慢启动、拥塞避免、快重传、快恢复之间的状态转换；Cubic 替换 CA 的增长曲线，BBR 不走这套状态机。", "fallback": "Reno 拥塞控制四阶段：慢启动指数增长 → 达到 ssthresh 后拥塞避免线性增长 → 3 dupACK 触发快重传 + 快恢复（cwnd 减半）→ RTO 超时则 cwnd 归 1 重新慢启动。", "format": "mermaid"},
+    {"type": "compareTable", "title": "Reno、Cubic、BBR 算法对比", "columns": ["维度", "Reno/NewReno", "Cubic", "BBR"], "rows": [["Linux 启用版本", "2.4 之前默认", "2.6.19+ 默认", "4.9+ 可选，需 fq qdisc"], ["拥塞信号", "丢包（dupACK + RTO）", "丢包（dupACK + RTO）", "BtlBw 与 RTprop 的乘积模型"], ["增长曲线", "AIMD：线性 +1 MSS/RTT", "三次函数：靠近 W_max 慢、远离时快", "ProbeBW：周期性探测带宽，不依赖丢包"], ["高 BDP 跨洋链路", "恢复慢，吞吐低", "收敛快，目前主流默认", "吞吐显著优于 Cubic"], ["随机丢包链路（Wi-Fi/4G）", "误判为拥塞，吞吐塌陷", "同样会被丢包压制", "对随机丢包不敏感"], ["共存公平性", "AIMD 公平性好", "Reno 友好（HyStart 优化）", "会挤占 Cubic 流，BBRv2 改善"], ["典型适用场景", "教学、嵌入式、低带宽", "数据中心内网、企业 RPC", "公网视频、跨境传输、CDN 回源"]]},
+    {"type": "code", "title": "Reno 拥塞窗口在四个状态下的演化", "content": "// 模拟 Reno 拥塞窗口随 ACK / 丢包事件的状态变化\n// 关键变量：\n//   cwnd       当前拥塞窗口（单位 MSS）\n//   ssthresh   慢启动阈值，触发 SS -> CA 切换\n//   state      当前阶段：slow_start / congestion_avoidance / fast_recovery\nclass RenoSimulator {\n    double cwnd = 10.0;        // Linux 默认 IW = 10 MSS（RFC 6928）\n    double ssthresh = 64.0;    // 初始阈值，单位 MSS\n    String state = \"slow_start\";\n    int dupAckCount = 0;\n\n    // 收到一个新 ACK\n    void onNewAck() {\n        switch (state) {\n            case \"slow_start\":\n                cwnd += 1.0;                // 每 ACK +1 MSS，一个 RTT 内翻倍\n                if (cwnd >= ssthresh) state = \"congestion_avoidance\";\n                break;\n            case \"congestion_avoidance\":\n                cwnd += 1.0 / cwnd;         // 累计 MSS^2/cwnd，一个 RTT +1 MSS\n                break;\n            case \"fast_recovery\":\n                cwnd = ssthresh;            // 退出快恢复，回到 CA\n                state = \"congestion_avoidance\";\n                break;\n        }\n        dupAckCount = 0;\n    }\n\n    // 收到一个重复 ACK（按序号没前进）\n    void onDupAck() {\n        dupAckCount++;\n        if (state.equals(\"fast_recovery\")) {\n            cwnd += 1.0;                    // 维持管道：每多一个 dupACK 拉一格\n            return;\n        }\n        if (dupAckCount == 3) {             // 触发快重传 + 快恢复\n            ssthresh = Math.max(cwnd / 2, 2);\n            cwnd = ssthresh + 3;            // +3 是已离开网络的 3 个报文\n            state = \"fast_recovery\";\n            // 这里调用底层立即重传 SND.UNA 对应的报文\n        }\n    }\n\n    // RTO 超时：视为严重拥塞，退回慢启动\n    void onRto() {\n        ssthresh = Math.max(cwnd / 2, 2);\n        cwnd = 1.0;                         // 也可改成 IW=10 模拟较新内核\n        state = \"slow_start\";\n        dupAckCount = 0;\n    }\n}", "language": "java", "highlights": [{"line": 7, "note": "IW=10 是 Linux 默认初始窗口，配合 cwnd 单位为 MSS 才能对上线上 ss -tin 输出。"}, {"line": 20, "note": "拥塞避免阶段每 ACK 增加 MSS^2/cwnd，是 AIMD 的加性增。"}, {"line": 37, "note": "3 dupACK 是快重传/快恢复的入口条件，对应 Reno 的乘性减：ssthresh 减半，cwnd 设为 ssthresh+3。"}, {"line": 47, "note": "RTO 是 Reno 中最重的拥塞信号，cwnd 直接归 1 重新慢启动，而不是只减半。"}]},
+    {"type": "interviewAnswer", "title": "面试回答：流量控制 vs 拥塞控制 + 四阶段 + Reno/Cubic/BBR", "content": "## 30 秒结论\nTCP 用两套窗口分别防两类问题：流量控制用接收方通告的 rwnd 防止接收缓冲区被打爆，拥塞控制用发送方维护的 cwnd 防止把网络打拥塞，发送方真正能发的字节等于 min(rwnd, cwnd) - bytes_in_flight。拥塞控制经典走慢启动 → 拥塞避免 → 快重传 → 快恢复，AIMD 思想由 Reno 奠定，Cubic 用三次曲线优化高 BDP，BBR 改用带宽-RTT 模型不再依赖丢包。\n## 核心机制\n慢启动 cwnd 从 IW（Linux 默认 10 MSS）开始，每 ACK +1 MSS，一个 RTT 翻倍；达到 ssthresh 切到拥塞避免，每 RTT 加 1 MSS 线性试探带宽。收到 3 个重复 ACK 触发快重传，立即重传可疑丢失的那一段，并进入快恢复，做 ssthresh=cwnd/2、cwnd=ssthresh+3，新 ACK 回来后回到拥塞避免；如果是 RTO 超时就更狠，ssthresh 减半的同时 cwnd 归 1 重新慢启动。流量控制这边，对端通告 Window=0 时发送方进入 persist 状态，按 200ms 起的指数退避发零窗口探测包，避免窗口更新报文丢失导致死锁。\n## 算法演进\nReno 的痛点是把所有丢包都当拥塞、且高 BDP 下恢复慢；Cubic 用三次函数让 cwnd 在 W_max 附近平稳、远离时快增长，是 Linux 默认；BBR 直接测量瓶颈带宽 BtlBw 和最小 RTT RTprop，按 BDP 控制 inflight，在高随机丢包链路（移动网络、跨境）吞吐明显更好，开启需 tcp_congestion_control=bbr 配 default_qdisc=fq。\n## 边界与排查\n吞吐打不上去先看 ss -tin：rwnd 偏小说明接收方读慢，要排查应用消费速度或调大 tcp_rmem；cwnd 偏小且 retrans 高说明链路丢包，可考虑切 BBR；cwnd、rwnd 都大但吞吐仍低，多半是应用写入慢或 Nagle 与 delayed ACK 互相等待，需要 TCP_NODELAY 或 TCP_QUICKACK。", "followUpQuestions": [{"question": "为什么 3 个重复 ACK 走快恢复，但 RTO 超时要把 cwnd 归 1？两者的隐含假设是什么？", "answer": "3 个重复 ACK 说明对端持续在 ACK 后续段，管道里仍然有数据在流动，丢的多半只是个别报文，所以只把 ssthresh 减半再 cwnd=ssthresh+3，保留管道里的字节继续维持吞吐。RTO 触发时连 ACK 都没回来，可能是路径中断、严重拥塞或缓存被清空，按悲观假设把 cwnd 归 1 重新慢启动，从最小窗口探测网络，避免雪上加霜。"}, {"question": "Linux 上把拥塞控制算法从 cubic 切成 bbr 需要做什么？什么场景会切回去？", "answer": "切换命令是 sysctl -w net.ipv4.tcp_congestion_control=bbr，并把 qdisc 设为 fq：sysctl -w net.core.default_qdisc=fq，否则 BBR 的发包节奏（pacing）失效。适合公网/跨境/移动网络这类丢包率不为 0 但链路并未拥塞的场景。会切回 cubic 的常见情况：和大量 cubic 流共享窄带宽时 BBR 抢占公平性、浅缓冲交换机上 BBR 的 ProbeBW 阶段会引发短暂队列、部分中间盒对 BBR 的 pacing 行为不友好，这时 cubic 表现更稳。"}, {"question": "rwnd=0 持续了 1 分钟，怎么定位是接收方应用慢、TCP 缓冲区配置小，还是中间盒在篡改窗口？", "answer": "先在接收侧抓包看 Window=0 是不是真从对端协议栈发出，再用 ss -tin 查 rcv_space、Recv-Q：Recv-Q 长期堆积大量字节说明应用 read 慢，要看应用线程栈或消费 QPS；如果 Recv-Q 不大但 rwnd 长期上不去，多半是 tcp_rmem 上限或 SO_RCVBUF 太小，调大并确保未禁用窗口缩放（tcp_window_scaling=1）；如果两端抓包看到的 Window 字段不一致，就要怀疑中间负载均衡或防火墙改写了 TCP 头，需要在两端同时抓包对比 SEQ/ACK 和 Window Scale 选项。"}]},
+    {"type": "checklist", "title": "学完后应能说清楚", "items": ["能写出可发字节 = min(rwnd, cwnd) - bytes_in_flight 这一限速公式", "能解释零窗口探测的退避策略和它解决的死锁问题", "能讲清慢启动指数增长、拥塞避免线性增长各自的 cwnd 演化方式", "能区分 3 个重复 ACK 与 RTO 超时触发的不同处理（快恢复 vs 重新慢启动）", "能说出 Reno、Cubic、BBR 在拥塞信号和适用链路上的差异", "能用 ss -tin 的 cwnd / ssthresh / rwnd / retrans 字段定位吞吐瓶颈"]}
   ],
   "recallPrompts": [
-    {
-      "id": "network.tcp-udp.topic-tcp-flow-congestion.recall.1",
-      "prompt": "TCP 流量控制和拥塞控制分别解决什么问题？rwnd、cwnd、ssthresh 如何共同决定发送窗口？",
-      "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 4
-    },
-    {
-      "id": "network.tcp-udp.topic-tcp-flow-congestion.recall.2",
-      "prompt": "慢启动、拥塞避免、快重传、快恢复四个阶段分别在什么条件下触发？cwnd如何变化？",
-      "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 4
-    },
-    {
-      "id": "network.tcp-udp.topic-tcp-flow-congestion.recall.3",
-      "prompt": "TCP 流量控制与拥塞控制 和相邻概念或常见替代方案有什么关键区别？",
-      "mode": "text",
-      "expectedMinutes": 4,
-      "difficulty": 4
-    }
+    {"id": "network.tcp-udp.topic-tcp-flow-congestion.recall.1", "prompt": "rwnd、cwnd、ssthresh、bytes_in_flight 各代表什么？发送方一次最多能发多少字节？零窗口时怎么避免死锁？", "mode": "text", "expectedMinutes": 3, "difficulty": 4},
+    {"id": "network.tcp-udp.topic-tcp-flow-congestion.recall.2", "prompt": "请把慢启动、拥塞避免、快重传、快恢复四个阶段画一遍：cwnd 的初值、增长方式、跳转条件分别是什么？为什么 RTO 超时要比 3 个 dupACK 更激进？", "mode": "text", "expectedMinutes": 4, "difficulty": 4},
+    {"id": "network.tcp-udp.topic-tcp-flow-congestion.recall.3", "prompt": "Reno、Cubic、BBR 三者用什么作为拥塞信号？分别擅长什么链路？在 Linux 上怎么切换、为什么要配合 fq qdisc？", "mode": "text", "expectedMinutes": 4, "difficulty": 4}
   ],
   "rubric": {
     "mustHave": [
-      "能区分流量控制(rwnd)和拥塞控制(cwnd)的含义和作用",
-      "能描述慢启动阶段cwnd的指数增长过程",
-      "能说明拥塞避免阶段cwnd的线性增长过程",
-      "能解释超时丢包和3个重复ACK触发的不同处理"
+      "rwnd 与 cwnd 的职责区分，以及 min(rwnd, cwnd) - bytes_in_flight 的限速公式",
+      "慢启动每 RTT 翻倍、拥塞避免每 RTT +1 MSS 的 cwnd 演化",
+      "3 个 dupACK 触发快重传/快恢复（ssthresh=cwnd/2, cwnd=ssthresh+3），RTO 超时退回慢启动 cwnd=1",
+      "零窗口探测（persist 定时器、指数退避）解决窗口更新报文丢失导致的死锁"
     ],
     "goodToHave": [
-      "了解BBR等新型拥塞控制算法的思路",
-      "能解释AIMD策略为什么能保证网络公平性",
-      "能结合实际网络场景分析拥塞控制行为"
+      "能讲清 Cubic 三次函数曲线相对 Reno 在高 BDP 下的优势",
+      "能说明 BBR 用 BtlBw × RTprop 替代丢包信号，并需要 fq qdisc 才能做 pacing",
+      "能用 ss -tin、nstat -az TcpRetransSegs 等命令定位吞吐瓶颈",
+      "了解 BBRv2 引入 ECN 与丢包响应改善公平性的思路"
     ],
     "commonMistakes": [
-      "只列出 TCP、流量控制、拥塞控制，但说不出触发条件、状态变化和验证证据",
-      "把「TCP 流量控制与拥塞控制」的适用场景、失效条件和相邻概念混在一起",
-      "遇到网络协议里的真实问题时，不能说明「TCP 流量控制与拥塞控制」应该观察哪些状态、日志或指标"
+      "把 rwnd 和 cwnd 混为一谈，认为只要对端窗口够大就能放开发送",
+      "认为快重传后 cwnd 直接归 1，没区分 dupACK 与 RTO 两种丢包信号",
+      "默认丢包就一定是网络拥塞，没意识到 Wi-Fi/4G 随机丢包会让 Reno/Cubic 错杀吞吐",
+      "切到 BBR 后忘记把 default_qdisc 设为 fq，导致 pacing 失效吞吐反而下降"
     ],
-    "scoreWeights": {
-      "coverage": 25,
-      "accuracy": 30,
-      "interviewExpression": 20,
-      "depth": 25
-    }
+    "scoreWeights": {"coverage": 25, "accuracy": 30, "interviewExpression": 20, "depth": 25}
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-13",
   "status": "production",
-  "prerequisites": [
-    "network.tcp-udp.topic-tcp-reliable"
-  ],
-  "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「TCP 流量控制与拥塞控制」说清能区分流量控制(rwnd)和拥塞控制(cwnd)的含义和作用、能描述慢启动阶段cwnd的指数增长过程，并放到网络协议场景中解释关键流程、边界条件和出错后的处理思路。"
+  "prerequisites": ["network.tcp-udp.topic-tcp-reliable"],
+  "interviewFrequency": "high",
+  "interviewerFocus": "面试官会顺着 rwnd 与 cwnd 的差异往下追：能不能写出 min(rwnd, cwnd) - bytes_in_flight 这条限速主线、把慢启动/拥塞避免/快重传/快恢复的 cwnd 演化讲准、解释清楚 RTO 与 3 dupACK 为什么处理不同，并说出 Reno/Cubic/BBR 的拥塞信号差异和 Linux 切换 BBR 时为何要配 fq qdisc。"
 }

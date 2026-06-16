@@ -4,13 +4,15 @@
   "category": "realtime",
   "group": "realtime",
   "title": "Kafka 数据管道语义",
-  "summary": "理解 Topic、Partition、Offset、Consumer Group、顺序性、积压和投递语义。",
+  "summary": "讲清 acks/ISR/min.insync.replicas、分区策略、消费位移管理与 Exactly-Once 语义在数据管道里的取舍。",
   "tags": [
     "数据工程",
     "Kafka",
     "Partition",
     "Offset",
-    "Consumer Group"
+    "Consumer Group",
+    "ISR",
+    "Exactly Once"
   ],
   "difficulty": 4,
   "estimatedMinutes": 35,
@@ -19,74 +21,98 @@
   "status": "staging",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能说明 Kafka 如何通过分区、offset 和消费组实现高吞吐数据管道。",
+  "interviewerFocus": "Producer 端 acks/idempotence/事务、Broker 端 ISR 与 min.insync.replicas、Consumer 端位移提交时机、以及 Kafka Connect 与 Flink/Spark 集成时的端到端语义。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Kafka 数据管道语义 的职责边界",
-      "content": "Kafka 以 Topic 组织消息，Topic 拆成多个 Partition。生产者写入分区，消费者组内每个分区同一时刻只分配给一个消费者实例，通过 offset 记录消费进度。\n\n学习 Kafka 数据管道语义 时，可以先沿「Producer 写 Topic -> Partition 顺序追加 -> Consumer Group 分配 -> Offset 提交 -> 幂等处理和积压监控」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- Partition：并行和顺序单位，适合 高吞吐写入，风险是 只保证分区内有序\n- Offset：消费进度位置，适合 故障恢复，风险是 提交过早会丢处理\n- Consumer Group：横向扩展消费，适合 多个实例并行，风险是 分区数限制并行度\n- Rebalance：重新分配分区，适合 扩缩容和故障，风险是 期间可能暂停消费\n\n把这条路径落回 Kafka 数据管道语义 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "Producer 写入语义：acks、idempotence、事务三层",
+      "content": "Producer 端的投递语义由三个开关决定，越往后语义越强、吞吐越低。\n\n第一层是 acks：acks=0 不等待，丢失风险最高。acks=1 只等 Leader 落本地日志，Leader 宕机未同步给 Follower 就会丢。acks=all（默认 -1）等 ISR 全部确认，配合 min.insync.replicas=2 才有真实意义。只有 1 个副本时，即使 acks=all 也只是退化成 acks=1。\n\n第二层是 enable.idempotence=true：Producer 在 broker 端注册 PID + 单调递增的 sequence number。broker 按 (PID, partition, seq) 去重，可以避免「网络重传导致同一条消息重复写两次」。它默认只在单 Producer 单分区会话内有效，不能跨会话，也不能跨多分区原子写。开启幂等后会强制 acks=all、retries=Integer.MAX_VALUE、max.in.flight.requests.per.connection ≤ 5。\n\n第三层是事务（transactional.id + initTransactions/beginTransaction/commitTransaction）：用于「读 Kafka -> 处理 -> 写 Kafka」这种闭环。它能让多分区写入与 __consumer_offsets 的位移提交在一个事务里原子提交。配合 isolation.level=read_committed 的下游消费者能读到一致快照。这是 Kafka 内部 EOS（Exactly-Once Semantics）的基础，但只在 Kafka 内部闭环成立。写到 MySQL/HDFS 等外部系统仍要靠业务幂等或 2PC sink。"
     },
     {
       "type": "explain",
-      "title": "Kafka 数据管道语义 的失败模式与排查",
-      "content": "难点在语义边界。Kafka 只能保证单分区内有序，多分区全局无序；至少一次消费需要业务幂等，积压要看生产速率、消费速率和分区并行度。\n\nKafka 数据管道语义 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 「Kafka 数据管道语义 的核心目标」决定这个知识点的主线，必须先说清触发条件\n- 「Producer 写 Topic、Partition 顺序追加、Consumer Group 分配 的关系」决定方案能否稳定落地，不能只停留在名称层面\n- 「只讲工具名不讲数据语义和链路」是常见失效点，需要提前说明防护或修复方式\n- 可以用「能结合 consumer lag、offset 提交、分区数、重平衡日志、重复处理记录 做定位」验证自己是否能说出关键路径\n\n排查时不要先猜结论，应把现象映射到 Partition 顺序追加、Consumer Group 分配、Offset 提交 这些环节，再结合 consumer lag、offset 提交、分区数、重平衡日志、重复处理记录 验证。"
+      "title": "Broker 副本与 ISR：unclean.leader.election 是数据安全的最后一道闸",
+      "content": "每个 Partition 有一个 Leader 和若干 Follower。Follower 通过 fetch 拉 Leader 的日志。replica.lag.time.max.ms（默认 30s）内能跟上的副本进入 ISR（In-Sync Replicas），否则被踢出。Leader 选举只从 ISR 中挑，前提是 unclean.leader.election.enable=false（0.11+ 默认关闭）。\n\n关键参数链：\n- replication.factor=3 + min.insync.replicas=2：可以容忍 1 台 broker 宕机仍然可写；如果再挂一台，acks=all 的写入会抛 NotEnoughReplicasException，让上游退避而不是默默写入只剩 1 副本的分区。\n- unclean.leader.election.enable：如果设为 true，ISR 全空时允许从落后副本拉 Leader，可用性高但会丢已 commit 的数据；金融、订单类管道必须保持 false。\n- HW（High Watermark）：消费者只能读到 HW 之前的消息，HW 推进的前提是 ISR 中所有副本都已 fetch 到该 offset，这是「acks=all 不丢」的物理保证。\n\nLeader epoch（KIP-101）解决了老版本「日志截断后数据丢失」的问题。每次 Leader 变更 epoch +1，Follower 重启后用 epoch 和 Leader 对齐截断点，避免按 HW 截断时把已 commit 的数据丢掉。运维 Kafka 0.11 之前的旧集群要特别小心这个坑。"
+    },
+    {
+      "type": "explain",
+      "title": "Consumer 位移与分区策略：先处理还是先提交决定语义",
+      "content": "消费语义的核心是「业务处理」和「位移提交」的先后顺序。\n\n位移提交三种模式：\n- enable.auto.commit=true（默认 5s 一次）：poll 之后异步推进位移，简单但只能做到 at-most-once 或 at-least-once 的灰色地带。如果业务处理还没结束 commit 就发生了，rebalance 后这条消息已经被认为消费过了，就是丢。如果业务处理完了但 commit 前进程挂了，rebalance 后会重新拉到，就是重。\n- 手动 commitSync()/commitAsync() 在业务处理之后调用：明确的 at-least-once，必须配合业务幂等（DB 唯一键、Redis SETNX、状态机判重）。\n- 用事务把「写下游 Kafka topic + sendOffsetsToTransaction」打包：Kafka 内部的 Exactly-Once。\n\n分区策略决定并行度和顺序边界：\n- 默认 DefaultPartitioner：有 key 时 hash(key) % numPartitions，保证同 key 进同一分区；无 key 时 2.4+ 走 sticky partitioner（一批走一个分区），老版本是 round-robin。\n- 同 key 顺序的常见破坏点：扩分区（hash 落点变了）、用业务主键当 key 但主键分布倾斜（90% 流量打到一个分区）、用时间戳当 key 导致同时刻流量挤压在一个分区。\n\nRebalance 期间所有 consumer stop-the-world。新版（KIP-429 cooperative rebalance，2.4+）改为增量再均衡。但旧版客户端、心跳超时（session.timeout.ms 默认 45s）、max.poll.interval.ms 内没调用 poll 仍会触发全量 rebalance。这是消费 lag 突刺的常见根因。"
     },
     {
       "type": "diagram",
-      "title": "Kafka 管道消费语义链路",
+      "title": "Producer acks=all + ISR=2 的写入路径",
       "format": "mermaid",
-      "content": "flowchart LR\nA[Producer 写 Topic] --> B[Partition 顺序追加]\nB[Partition 顺序追加] --> C[Consumer Group 分配]\nC[Consumer Group 分配] --> D[Offset 提交]\nD[Offset 提交] --> E[幂等处理和积压监控]",
-      "fallback": "Producer 写 Topic -> Partition 顺序追加 -> Consumer Group 分配 -> Offset 提交 -> 幂等处理和积压监控",
-      "caption": "图示展示消息如何写入分区，由消费组读取并提交 offset。"
+      "content": "flowchart LR\nP[Producer acks=all] --> L[Leader 写本地 log]\nL --> F1[Follower1 fetch 并写日志]\nL --> F2[Follower2 fetch 并写日志]\nF1 --> HW[HW 推进 = ISR 最小 LEO]\nF2 --> HW\nHW --> ACK[向 Producer 返回 ack]\nL -->|少于 min.insync.replicas| ERR[NotEnoughReplicasException]",
+      "fallback": "Producer(acks=all) -> Leader 写本地日志 -> Follower1/Follower2 fetch 同步 -> ISR 全部跟上后推进 HW -> 返回 ack；ISR 不足 min.insync.replicas 时抛 NotEnoughReplicasException 让上游重试。",
+      "caption": "HW 推进依赖 ISR 中所有副本的 LEO，min.insync.replicas 不足会主动报错而不是降级写入。"
     },
     {
       "type": "compareTable",
-      "title": "Kafka 关键概念对比",
+      "title": "三种端到端语义在 Kafka 管道里的实现方式",
       "columns": [
-        "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
+        "语义",
+        "Producer 配置",
+        "Consumer 提交时机",
+        "下游 Sink 要求",
+        "典型场景"
       ],
       "rows": [
         [
-          "Partition",
-          "并行和顺序单位",
-          "高吞吐写入",
-          "只保证分区内有序"
+          "At-most-once",
+          "acks=0/1，retries=0",
+          "处理前先 commit",
+          "无要求",
+          "可丢的指标日志、采样数据"
         ],
         [
-          "Offset",
-          "消费进度位置",
-          "故障恢复",
-          "提交过早会丢处理"
+          "At-least-once",
+          "acks=all + idempotence",
+          "处理后 commitSync",
+          "下游必须幂等（业务主键去重）",
+          "订单事件、CDC、绝大多数业务管道"
         ],
         [
-          "Consumer Group",
-          "横向扩展消费",
-          "多个实例并行",
-          "分区数限制并行度"
+          "Exactly-once（Kafka 内）",
+          "acks=all + transactional.id",
+          "sendOffsetsToTransaction",
+          "下游也是 Kafka 且 isolation.level=read_committed",
+          "Kafka Streams、Flink Kafka Sink EOS"
         ],
         [
-          "Rebalance",
-          "重新分配分区",
-          "扩缩容和故障",
-          "期间可能暂停消费"
+          "Exactly-once（端到端）",
+          "事务 Producer",
+          "事务内提交",
+          "外部 Sink 支持 2PC 或业务幂等键",
+          "Flink + JDBC 2PC、Iceberg/Hudi 幂等写"
         ]
       ]
     },
     {
+      "type": "code",
+      "title": "Producer 事务 + Consumer 手动提交的最小骨架",
+      "language": "java",
+      "content": "// Producer 端：开启幂等 + 事务\nProperties pp = new Properties();\npp.put(\"acks\", \"all\");\npp.put(\"enable.idempotence\", \"true\");\npp.put(\"transactional.id\", \"order-pipeline-tx-1\"); // 必须稳定且唯一\nKafkaProducer<String, String> producer = new KafkaProducer<>(pp);\nproducer.initTransactions(); // 注册 PID 并 fence 旧实例\n\n// Consumer 端：关闭自动提交，配合事务读\nProperties cp = new Properties();\ncp.put(\"enable.auto.commit\", \"false\");\ncp.put(\"isolation.level\", \"read_committed\"); // 只读已提交事务\nKafkaConsumer<String, String> consumer = new KafkaConsumer<>(cp);\nconsumer.subscribe(List.of(\"orders\"));\n\nwhile (true) {\n  ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));\n  if (records.isEmpty()) continue;\n  producer.beginTransaction();\n  try {\n    for (ConsumerRecord<String, String> r : records) {\n      // 业务处理 + 写下游 topic\n      producer.send(new ProducerRecord<>(\"orders.enriched\", r.key(), enrich(r.value())));\n    }\n    // 把消费位移塞进同一个事务，原子提交\n    Map<TopicPartition, OffsetAndMetadata> offsets = currentOffsets(records);\n    producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());\n    producer.commitTransaction();\n  } catch (KafkaException e) {\n    producer.abortTransaction(); // 下次 poll 会从未提交位移重读\n  }\n}"
+    },
+    {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：Kafka 数据管道语义 要从目标、关键机制、风险边界和观测验证四层回答。\n\n我会按这几层展开：\n1. 先说明它解决的核心工程问题是  Topic、Partition、Offset、Consumer Group、顺序性、积压和投递语义。\n2. 再沿着 Producer 写 Topic、Partition 顺序追加、Consumer Group 分配、Offset 提交、幂等处理和积压监控 说明执行链路\n3. 然后讲清 Partition 和 Offset 的适用边界\n4. 最后补充用 consumer lag、offset 提交、分区数、重平衡日志、重复处理记录 验证效果和定位异常\n\n最后补充边界：数据工程方案必须同时关注口径、时效、成本和可追溯性，不能只追求跑通任务。",
+      "content": "Kafka 数据管道我会按 Producer、Broker、Consumer 三层语义讲。\n\n30 秒结论：默认 acks=all + enable.idempotence=true，配合 broker 端 min.insync.replicas=2，才能在 1 台 broker 宕机时既不丢也不重。只有当下游也是 Kafka 且需要 Exactly-Once 时，才上 transactional.id + initTransactions，因为事务会让吞吐降一档。\n\n核心机制：\n1. Producer 层：acks=all 等 ISR 全部确认，幂等用 PID + seq 去重防网络重传。事务用于 Kafka 内部闭环，多分区写入与位移提交原子化。\n2. Broker 层：副本因子 3、min.insync.replicas 2、unclean.leader.election.enable=false 是金融级标配。HW 推进依赖 ISR 全部副本的 LEO，这是 acks=all 不丢的物理保证。\n3. Consumer 层：关掉 auto.commit，处理完业务再 commitSync，对应 at-least-once，必须配合业务幂等键。Kafka -> Flink/Streams -> Kafka 的闭环用事务 + sendOffsetsToTransaction 做 EOS。sink 是 MySQL/HDFS 等外部系统时，要么 sink 端做 2PC，要么靠业务主键幂等。\n\n边界与排查：\n1. 排查端到端问题时按 consumer lag、rebalance 频率、Producer 端 record-error-rate、broker 端 UnderReplicatedPartitions、ISR 抖动这条链路看。\n2. acks=all 不是银弹，RF=1 或 min.insync.replicas=1 时仍会丢。\n3. enable.idempotence 只防重传，不防业务层重复消费，不能替代业务幂等。",
       "followUpQuestions": [
         {
-          "question": "Kafka 数据管道语义 出问题时你先看哪些信号？",
-          "answer": "我会先看 consumer lag、offset 提交、分区数、重平衡日志、重复处理记录，把异常定位到 Partition 顺序追加、Consumer Group 分配、Offset 提交，再决定是回滚、降级、扩容还是修配置。"
+          "question": "acks=all 一定不丢吗？什么情况下还是会丢？",
+          "answer": "不一定。三种典型丢数据场景：① replication.factor=1 时 acks=all 等价 acks=1，broker 宕就丢。② min.insync.replicas 没设或设成 1，ISR 缩到 1 个副本时仍允许写，那个唯一副本挂了就丢。③ unclean.leader.election.enable=true 时 ISR 全空允许落后副本当 Leader，已 commit 但未同步的数据会被截断丢失。所以「不丢」是 acks=all + RF≥3 + min.insync.replicas=2 + unclean=false 这一整套配置的共同结果。"
         },
         {
-          "question": "Kafka 数据管道语义 最容易忽略的边界是什么？",
-          "answer": "最容易忽略的是自动化本身也会放大错误，所以必须保留审批、审计、回滚、灰度和人工接管路径。"
+          "question": "Kafka 的 Exactly-Once 是真的端到端 Exactly-Once 吗？",
+          "answer": "不是。Kafka 自己的 EOS 只覆盖「Kafka -> 处理 -> Kafka」这种闭环。事务 Producer 把多分区写入 + sendOffsetsToTransaction 原子提交，下游用 read_committed 隔离级别。一旦 sink 是 MySQL、HDFS、Elasticsearch 等外部系统，Kafka 事务管不到，就要靠 sink 端实现。Flink 用 TwoPhaseCommitSinkFunction 配合外部系统的预提交/提交接口。或者业务层用幂等主键（订单号 + 状态版本号）让重复写无害。区分这两个层次就能看出是否真理解。"
+        },
+        {
+          "question": "Consumer Group 频繁 Rebalance 怎么定位？",
+          "answer": "先看 broker 日志里 GroupCoordinator 的 Preparing rebalance 原因，常见三类：① max.poll.interval.ms 内没调 poll，说明单批处理过慢，要么调小 max.poll.records，要么把慢操作异步化。② session.timeout.ms 心跳超时，多半是 GC 或网络抖动。③ 频繁的 consumer 实例上下线，例如 K8s 滚动或 HPA 扩缩。2.4+ 升级到 cooperative-sticky 分配策略可以做增量再均衡，避免每次都 stop-the-world。同时观察 rebalance-rate-per-hour 和 partition-revoked-latency-avg 这两个指标。"
+        },
+        {
+          "question": "怎么用 Kafka Connect 或 Flink 把 MySQL 同步到数仓，保证不丢不重？",
+          "answer": "Kafka Connect 路线：source 用 Debezium，它读 binlog 用 GTID 或 binlog 文件名+pos 做 source offset。崩溃恢复后从 offset 重读，配合下游主键幂等做到 at-least-once。Connect 2.6+ 支持 source connector 的 EOS（exactly.once.source.support=enabled），底层就是事务 Producer。Flink 路线：Kafka Source 用 checkpoint 持久化 offset。Sink 用 KafkaSink 的 DeliveryGuarantee.EXACTLY_ONCE，配合 transaction.timeout.ms 大于 checkpoint 间隔。写 JDBC/Iceberg 时用 TwoPhaseCommitSinkFunction。两条路线的共同点：state（offset 或 checkpoint）和 sink 写入要么同时成功要么同时回滚，这是端到端不丢不重的本质。"
         }
       ]
     },
@@ -94,52 +120,67 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 Kafka 数据管道语义 的目标和边界",
-        "能沿 Producer 写 Topic -> Partition 顺序追加 -> Consumer Group 分配 -> Offset 提交 -> 幂等处理和积压监控 讲清链路",
-        "能解释关键配置和失败模式",
-        "能用观测指标验证效果"
+        "能复述 acks=0/1/all 在不同 RF 和 min.insync.replicas 下的实际丢失边界",
+        "能解释 ISR、HW、LEO、Leader epoch 的关系，以及 unclean.leader.election 为什么默认要关",
+        "能区分 enable.idempotence 和 transactional.id 的作用域，知道前者只防重传、后者才能跨分区原子",
+        "能说出 auto.commit、commitSync、sendOffsetsToTransaction 三种位移提交对应的语义",
+        "能讲清同 key 顺序在扩分区、key 倾斜、sticky partitioner 下的破坏路径",
+        "能用 consumer lag、rebalance 频率、UnderReplicatedPartitions、ISR 抖动定位线上管道问题",
+        "能区分 Kafka 内部 EOS 和端到端 Exactly-Once，知道外部 sink 何时需要 2PC 或业务幂等"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "data-engineering.realtime.kafka-data-pipeline.recall.1",
-      "prompt": "请讲一下 Kafka 数据管道语义 的核心链路和它解决的工程问题。",
+      "prompt": "线上一个订单事件管道，acks=all、replication.factor=3、min.insync.replicas=2，某次故障后业务发现少了一批订单。请按 Producer、Broker、Consumer 三层排查可能的丢失点，并说明配置和现象的对应关系。",
       "mode": "text",
-      "expectedMinutes": 4,
-      "difficulty": 4
+      "expectedMinutes": 6,
+      "difficulty": 5
     },
     {
       "id": "data-engineering.realtime.kafka-data-pipeline.recall.2",
-      "prompt": "Kafka 数据管道语义 在生产环境里最常见的失败模式有哪些？",
+      "prompt": "为什么 enable.idempotence=true 还需要再上 transactional.id 才能做 Exactly-Once？两者解决的问题分别是什么？请举一个只开 idempotence 仍会重复的例子。",
       "mode": "text",
-      "expectedMinutes": 4,
+      "expectedMinutes": 5,
       "difficulty": 4
     },
     {
       "id": "data-engineering.realtime.kafka-data-pipeline.recall.3",
-      "prompt": "如果 Kafka 数据管道语义 相关变更上线后异常，你会如何回滚和验证？",
+      "prompt": "一个 12 分区的 topic 里有 3 个分区 lag 持续上涨，其余分区正常。请说出至少 4 种可能原因和对应的验证方法（要落到具体指标或日志）。",
       "mode": "text",
-      "expectedMinutes": 4,
+      "expectedMinutes": 5,
       "difficulty": 4
+    },
+    {
+      "id": "data-engineering.realtime.kafka-data-pipeline.recall.4",
+      "prompt": "用 Flink Kafka Source + JDBC Sink 把订单同步到 MySQL，要做端到端 Exactly-Once，需要哪些配置和组件协同？只用 Kafka 事务为什么不够？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 5
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明 Kafka 数据管道语义 的核心目标",
-      "能讲清 Producer 写 Topic、Partition 顺序追加、Consumer Group 分配 的关系",
-      "能指出 Partition 和 Offset 的差异",
-      "能给出可观测验证和回滚思路"
+      "acks=0/1/all 与 replication.factor、min.insync.replicas 的组合对丢失风险的影响",
+      "ISR 推进 HW 的机制和 unclean.leader.election 的安全/可用性取舍",
+      "enable.idempotence（防重传）与 transactional.id（跨分区原子）的作用域差异",
+      "三种位移提交方式（auto.commit / commitSync / sendOffsetsToTransaction）对应的端到端语义",
+      "同 key 顺序在扩分区、key 倾斜、sticky partitioner 下的破坏路径"
     ],
     "goodToHave": [
-      "能结合 consumer lag、offset 提交、分区数、重平衡日志、重复处理记录 做定位",
-      "能说明多环境差异和权限边界",
-      "能把自动化、审计和回滚串成闭环"
+      "Leader epoch 解决日志截断丢数据的来龙去脉",
+      "cooperative-sticky 分配策略与传统 rebalance 在停顿上的区别",
+      "Kafka Connect EOS（exactly.once.source.support）和 Flink TwoPhaseCommitSinkFunction 的实现原理",
+      "transaction.timeout.ms 与 checkpoint 间隔的关系，以及 LSO 对消费者可见性的影响",
+      "用 UnderReplicatedPartitions、ISR shrink/expand、record-error-rate 等指标做生产排查"
     ],
     "commonMistakes": [
-      "只讲 Kafka 数据管道语义 的工具名，不说明数据语义、状态变化和上下游影响",
-      "忽略 Kafka 数据管道语义 在重跑、补数、迟到数据或口径变更下的边界",
-      "没有用质量指标、血缘、SLA 或成本数据验证 Kafka 数据管道语义 的结果"
+      "把 acks=all 当成不丢的银弹，忽略 min.insync.replicas 和 RF 的前提",
+      "认为开启 enable.idempotence 就实现了 Exactly-Once",
+      "把 Kafka 内部 EOS 当成端到端 Exactly-Once，忘记外部 sink 还需要 2PC 或业务幂等",
+      "扩分区时不评估 key 哈希落点变化，破坏同 key 顺序假设",
+      "用 enable.auto.commit=true 配业务处理，理不清 at-most-once 和 at-least-once 的边界"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -148,5 +189,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

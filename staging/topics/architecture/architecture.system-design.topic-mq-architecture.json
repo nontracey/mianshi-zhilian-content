@@ -32,7 +32,7 @@
     {
       "type": "explain",
       "title": "消息队列架构设计：幂等消费、顺序消息",
-      "content": "## 二、幂等消费\n- **唯一ID+去重表**：消息带唯一ID，消费前查重\n- **数据库唯一约束**：利用唯一索引去重\n- **Redis SETNX**：用消息ID做key\n\n## 三、顺序消息\n### 3.1 全局有序\n- 单分区/单队列\n- 性能差，一般不用\n\n### 3.2 分区有序\n- 同一业务ID的消息发到同一分区\n- 用业务ID做分区key\n- 例：同一订单的消息有序\n\n## 四、延迟消息\n- RocketMQ原生支持\n- Kafka需要自己实现（延迟队列+轮询）\n- 应用：订单超时取消、定时提醒\n\n## 五、积压处理\n- 增加消费者数量\n- 增加分区数\n- 跳过不重要的消息\n- 临时扩容消费能力\n\n把 消息队列架构设计 放到真实场景里看，重点是业务目标、关键组件、故障边界和权衡依据。先确认触发条件，再看状态或数据怎样变化，最后用指标、日志、测试结果或复杂度证明判断。\n\n学习 消息队列架构设计 时，要把业务目标、关键组件、故障边界和权衡依据对应到具体例子里。遇到异常或效果不符合预期时，先定位触发条件，再判断哪一层状态、数据或假设发生偏移。"
+      "content": "## 二、幂等消费\n- **唯一ID+去重表**：消息带唯一ID，消费前查重\n- **数据库唯一约束**：利用唯一索引去重\n- **Redis SETNX**：用消息ID做key\n\n## 三、顺序消息\n### 3.1 全局有序\n- 单分区/单队列\n- 性能差，一般不用\n\n### 3.2 分区有序\n- 同一业务ID的消息发到同一分区\n- 用业务ID做分区key\n- 例：同一订单的消息有序\n\n## 四、延迟消息\n- RocketMQ原生支持\n- Kafka需要自己实现（延迟队列+轮询）\n- 应用：订单超时取消、定时提醒\n\n## 五、积压处理\n- 增加消费者数量\n- 增加分区数\n- 跳过不重要的消息\n- 临时扩容消费能力\n\n把 消息队列架构设计 放到真实场景里看，重点是业务目标、关键组件、故障边界和权衡依据。判断 消息队列架构设计 是否答到位时，我会先核对 容量峰值，再观察 一致性边界，最后用 降级策略 或 压测指标 证明结论。\n学习 消息队列架构设计 时，要把业务目标、关键组件、故障边界和权衡依据对应到具体例子里。消息队列架构设计 出现异常时，我会先把现象映射到 容量峰值，再检查 一致性边界 是否偏离预期，最后用 降级策略 收敛原因。"
     },
     {
       "type": "diagram",
@@ -62,18 +62,12 @@
       "type": "code",
       "title": "代码示例",
       "content": "// 1. 可靠投递 - 本地消息表\n@Service\npublic class ReliableMessageService {\n    @Transactional\n    public void sendMessage(String topic, Object payload) {\n        // 1. 业务操作\n        doBusiness();\n\n        // 2. 写本地消息表（同一事务）\n        LocalMessage msg = new LocalMessage();\n        msg.setMessageId(UUID.randomUUID().toString());\n        msg.setTopic(topic);\n        msg.setPayload(JSON.toJSONString(payload));\n        msg.setStatus(\"PENDING\");\n        localMessageRepo.save(msg);\n    }\n}\n\n// 后台任务发送\n@Scheduled(fixedDelay = 1000)\npublic void pollAndSend() {\n    List<LocalMessage> msgs = localMessageRepo\n        .findByStatus(\"PENDING\", 100);\n    for (LocalMessage msg : msgs) {\n        try {\n            SendResult result = rocketMQTemplate\n                .syncSend(msg.getTopic(), msg.getPayload());\n            if (result.getSendStatus() == SendStatus.SEND_OK) {\n                msg.setStatus(\"SENT\");\n                localMessageRepo.update(msg);\n            }\n        } catch (Exception e) {\n            msg.setRetryCount(msg.getRetryCount() + 1);\n            localMessageRepo.update(msg);\n        }\n    }\n}\n\n// 2. 幂等消费\n@Component\npublic class IdempotentConsumer {\n    @Autowired\n    private ProcessedMessageRepo processedRepo;\n\n    @RocketMQListener(topic = \"order-topic\")\n    public void handleMessage(OrderMessage msg) {\n        // 去重检查\n        if (processedRepo.exists(msg.getMessageId())) {\n            log.info(\"消息已处理，跳过: {}\", msg.getMessageId());\n            return;\n        }\n\n        try {\n            // 处理消息\n            processOrder(msg);\n            // 标记已处理\n            processedRepo.save(new ProcessedMessage(msg.getMessageId()));\n        } catch (Exception e) {\n            // 消费失败，抛异常触发重试\n            throw new RuntimeException(\"消费失败\", e);\n        }\n    }\n}\n\n// 3. 顺序消息 - 按订单ID分区\npublic void sendOrderly(String orderId, OrderEvent event) {\n    rocketMQTemplate.syncSendOrderly(\n        \"order-topic\",\n        JSON.toJSONString(event),\n        orderId  // 分区key\n    );\n}\n\n// 4. 延迟消息 - 订单超时取消\npublic void sendDelayMessage(String orderId, int delayLevel) {\n    Message<String> message = MessageBuilder\n        .withPayload(orderId)\n        .build();\n    rocketMQTemplate.syncSend(\"order-timeout-topic\",\n        message, 3000, delayLevel);  // delayLevel=3 表示10s\n}",
-      "language": "java",
-      "highlights": [
-        {
-          "line": 28,
-          "note": "这里是边界条件分支，回答 消息队列架构设计 时要说明它为什么会改变执行路径。"
-        }
-      ]
+      "language": "java"
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "消息队列架构设计要解决五个核心问题：\n\n**可靠投递**分三段保证。生产者到Broker：同步发送+重试，或者用RocketMQ的事务消息。Broker存储：同步刷盘+主从同步。Broker到消费者：手动ACK，消费成功才确认，失败重试，多次失败进死信队列。\n\n**幂等消费**用唯一ID+去重表。消息带唯一ID，消费前先查Redis或数据库是否已处理。也可以用数据库唯一约束来去重。\n\n**顺序消息**关键在于分区有序。同一业务ID的消息发到同一分区（用业务ID做分区key），同一个分区内消息是有序的。全局有序性能太差，一般用分区有序就够了。\n\n**延迟消息**用于订单超时取消等场景。RocketMQ原生支持延迟消息，Kafka需要自己实现延迟队列+轮询。\n\n**积压处理**的方案：增加消费者数量、增加分区数、跳过不重要消息、临时扩容消费能力。",
+      "content": "消息队列架构设计要解决五个核心问题：\n\n**可靠投递**分三段保证。生产者到Broker：同步发送+重试，或者用RocketMQ的事务消息。Broker存储：同步刷盘+主从同步。Broker到消费者：手动ACK，消费成功才确认，失败重试，多次失败进死信队列。\n**幂等消费**用唯一ID+去重表。消息带唯一ID，消费前先查Redis或数据库是否已处理。也可以用数据库唯一约束来去重。\n**顺序消息**关键在于分区有序。同一业务ID的消息发到同一分区（用业务ID做分区key），同一个分区内消息是有序的。全局有序性能太差，一般用分区有序就够了。\n**延迟消息**用于订单超时取消等场景。RocketMQ原生支持延迟消息，Kafka需要自己实现延迟队列+轮询。\n**积压处理**的方案：增加消费者数量、增加分区数、跳过不重要消息、临时扩容消费能力。",
       "followUpQuestions": [
         {
           "question": "在你的项目中，消息队列架构设计是怎么落地的？遇到了什么权衡取舍？",
@@ -85,7 +79,7 @@
         },
         {
           "question": "如果现有系统需要引入 消息队列架构，你会怎么评估改造风险和制定迁移计划？",
-          "answer": "引入 消息队列架构 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。建议分阶段推进：先在非核心模块试点，验证后逐步推广。迁移过程中要做好灰度、回滚、监控，确保业务不受影响。"
+          "answer": "引入 消息队列架构 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。建议分阶段推进：先在非核心模块试点，验证后逐步推广消息队列架构设计 迁移时要先灰度小流量，再绑定回滚条件、监控指标和业务验收口径。"
         }
       ]
     },

@@ -4,13 +4,17 @@
   "category": "http-https",
   "group": "http-https",
   "title": "从输入 URL 到页面展示发生了什么",
-  "summary": "串联 DNS、TCP、TLS、HTTP 与浏览器渲染的端到端经典综合题，及各环节优化点。",
+  "summary": "把回车那一刻拆成 URL 解析、DNS、TCP/TLS、HTTP、渲染五段，给出每段的关键 RTT 和优化抓手。",
   "tags": [
     "计算机网络",
     "综合题",
     "DNS",
     "TCP",
-    "渲染"
+    "TLS",
+    "渲染",
+    "HTTP/2",
+    "CDN",
+    "缓存"
   ],
   "difficulty": 3,
   "estimatedMinutes": 22,
@@ -19,42 +23,76 @@
   "learningCards": [
     {
       "type": "explain",
-      "title": "从输入 URL 到页面展示发生了什么 的核心机制",
-      "content": "## 一、URL 解析与缓存检查\n浏览器解析 URL（协议/域名/端口/路径），先查**强缓存**（Cache-Control/Expires）命中则直接用；检查 HSTS 是否强制 HTTPS。\n\n## 二、DNS 解析\n域名→IP：依次查浏览器缓存、系统 hosts/缓存、本地 DNS（递归）、根/顶级/权威 DNS（迭代）。可能命中 CDN 的智能解析返回就近节点。\n\n## 三、建立连接\n- **TCP 三次握手**建立连接（HTTP/1.1、HTTP/2）。\n- **TLS 握手**（HTTPS）：协商密钥、验证证书（TLS1.3 可 1-RTT/0-RTT）。\n- HTTP/3 则基于 **QUIC(UDP)**，握手与加密合并、0-RTT。\n\n## 四、发送 HTTP 请求与服务器响应\n浏览器发请求（含 Cookie、协商缓存头 If-None-Match/If-Modified-Since），服务器返回响应；命中协商缓存返回 304。中间可能经 CDN、负载均衡、反向代理。\n\n## 五、浏览器渲染\n解析 HTML 构建 DOM、解析 CSS 构建 CSSOM → 合并成 Render Tree → 布局(Layout/Reflow) → 绘制(Paint) → 合成(Composite)。遇到 JS 可能阻塞解析（defer/async 影响时机）。"
+      "title": "为什么这是综合题：五段链路决定 LCP",
+      "content": "用户按下回车到首屏画出，浏览器要按顺序走完五件事：URL/缓存判定、DNS 解析、TCP+TLS 建连、HTTP 请求/响应、HTML 解析与渲染。任何一段卡住，都会直接体现在 LCP（最大内容绘制）和 INP（交互响应）上。\n\n理解这条链路的关键是把它当成一条 RTT 流水线：\n\n- 冷启动一次 HTTPS 请求，DNS 往返占 1 个 RTT。TCP 三次握手再占 1 个 RTT。TLS 1.3 握手占 1 个 RTT。此时才能发出第一个字节。服务端处理完后，还要 1 个 RTT 把首字节传回客户端。TTFB 至少 3-4 个 RTT 就是这么来的。\n- HTTP/3 走 QUIC over UDP，把 TCP 握手和 TLS 握手合并成 1-RTT，回头客可以 0-RTT 复用，弱网下 LCP 普遍能压缩 100-300ms。\n- 渲染阶段并不是请求结束才开始。HTML 流式解析时，preload scanner 已经在并行去发 CSS/JS/图片请求。\"请求-渲染\"实际上是叠在一起的。\n\n判断一个候选人是否真讲清楚，看他能不能把每段对应到工具和指标：\n\n- DNS 看 `dig +trace` 和 `chrome://net-internals/#dns`。\n- 建连看 Chrome DevTools Network 面板里的 Connection Start/SSL。\n- HTTP 看 TTFB。\n- 渲染看 Performance 面板里 Recalculate Style/Layout/Paint/Composite Layers。"
     },
     {
       "type": "explain",
-      "title": "从输入 URL 到页面展示发生了什么 的边界与易错点",
-      "content": "## DNS\n- DNS 预解析 `dns-prefetch`、减少域名数、用稳定/就近的 DNS、CDN。\n\n## 连接\n- 连接复用（HTTP/1.1 keep-alive、HTTP/2 多路复用单连接）、TLS 会话复用、`preconnect` 预连接、升级到 HTTP/2/3 消除队头阻塞。\n\n## 传输与缓存\n- 强缓存 + 协商缓存合理配置、Gzip/Brotli 压缩、CDN 就近、资源指纹做长期缓存。\n\n## 渲染\n- CSS 放头部、JS 用 defer/async 避免阻塞、减少重排重绘、关键资源 `preload`、首屏 SSR/骨架屏、图片懒加载、压缩与现代格式。\n- 关注 Core Web Vitals：LCP（加载）、INP（交互响应，2024 起取代 FID）、CLS（布局稳定）。"
+      "title": "渲染管线里 JS 为什么会阻塞 HTML 解析",
+      "content": "很多人能背出 \"DOM + CSSOM → Render Tree → Layout → Paint → Composite\"，但讲不清楚为什么 `<script>` 默认会阻塞解析。原因有两条物理约束：\n\n1. 同步脚本可能调用 `document.write` 或修改正在解析的 DOM 结构，浏览器为了语义正确，必须停下 HTML parser 等脚本下载并执行完。\n2. 脚本访问的样式必须是稳定的，所以遇到同步 `<script>` 时，CSSOM 没构建完之前 V8 也不能执行——这就是\"CSS 也间接阻塞 JS 执行\"的根源。\n\n这条机制直接决定了三个工程结论：\n\n- **CSS 放 `<head>`**：让 CSSOM 尽早完成，避免 FOUC，也避免 JS 等 CSS。\n- **JS 用 `defer` 而不是放底部**：`defer` 在 HTML 解析期间并行下载、在 `DOMContentLoaded` 前按顺序执行，比放底部更早可用且不阻塞解析。`async` 适合无依赖的统计/广告脚本，下载完立即执行，会打断解析。\n- **首屏关键 CSS 内联 + 非关键 CSS 异步加载**（`media=\"print\"` + onload 切换或 `rel=preload`），把 CSSOM 关键路径压到一次往返内。\n\n常见踩坑：把所有第三方 SDK 都标 `async`，结果埋点脚本先于业务脚本执行；或者用 `defer` 加载有 `document.write` 的老脚本，导致脚本被忽略。"
     },
     {
       "type": "diagram",
-      "title": "从输入 URL 到页面展示发生了什么 学习主线图",
-      "content": "flowchart LR\nA[从输入 URL 到页面展示发生了什么] --> B[计算机网络]\nB --> C[综合题]\nC --> D[DNS]\nD --> E[TCP]\nE --> F[渲染]",
-      "items": [
-        "URL 解析 + 强缓存/HSTS 检查",
-        "DNS 解析: 多级缓存 → 递归/迭代 → CDN 就近",
-        "TCP 三次握手 (HTTP/3 用 QUIC/UDP)",
-        "TLS 握手验证证书协商密钥 (HTTPS)",
-        "HTTP 请求/响应 (Cookie、协商缓存 304、CDN/反代)",
-        "渲染: DOM+CSSOM→RenderTree→Layout→Paint→Composite"
-      ],
+      "title": "URL 到首屏的 RTT 时序",
+      "content": "flowchart LR\nU-->|URL 解析 + HSTS + 强缓存|U\nU-->|查询 A/AAAA (可被 dns-prefetch 提前)|DNS\nDNS-->|返回 CDN 就近 IP|U\nU-->|TCP 三次握手 (1 RTT)|CDN\nU-->|TLS 1.3 ClientHello (1 RTT, 0-RTT 可复用)|CDN\nCDN-->|ServerHello + 证书 + Finished|U\nU-->|HTTP 请求 (含 Cookie / If-None-Match)|CDN\nCDN-->|未命中边缘缓存时回源|ORI\nORI-->|200 / 304|CDN\nCDN-->|响应 (TTFB)|U\nU-->|HTML 流式解析 + preload scanner 并行发 CSS/JS/图片|U\nU-->|构建 DOM/CSSOM → Layout → Paint → Composite (LCP)|U",
       "format": "mermaid",
-      "fallback": "从输入 URL 到页面展示发生了什么 -> 计算机网络 -> 综合题 -> DNS -> TCP -> 渲染",
-      "caption": "从 计算机网络 到 渲染，这张图帮助区分 从输入 URL 到页面展示发生了什么 的核心机制、边界条件和常见误区。"
+      "fallback": "URL 解析→DNS→TCP→TLS→HTTP→渲染，HTTPS 冷启动至少 3 个 RTT 才能拿到首字节；CDN 命中可省掉回源那段；preload scanner 让渲染和子资源请求重叠。",
+      "caption": "把每段映射到 RTT，方便面试时讲清\"为什么 HTTP/3 0-RTT 能省 100-300ms\"以及\"CDN 把哪段去掉了\"。"
+    },
+    {
+      "type": "compareTable",
+      "title": "五段链路：阻塞点 × 优化手段 × 验证指标",
+      "columns": [
+        "阶段",
+        "主要耗时/阻塞点",
+        "关键优化",
+        "如何验证"
+      ],
+      "rows": [
+        [
+          "URL 解析与缓存",
+          "强缓存命中可整次跳过网络；HSTS 决定是否走 HTTPS",
+          "合理 Cache-Control max-age + 资源指纹做长期缓存；HSTS preload",
+          "DevTools Network 看 (from disk cache)/(memory cache)；chrome://net-internals/#hsts"
+        ],
+        [
+          "DNS",
+          "递归解析最多走根/TLD/权威三跳，冷启动 20-200ms",
+          "dns-prefetch、HTTPDNS、CDN 智能解析、TTL 调优",
+          "dig +trace 看权威 NS；DevTools 看 DNS Lookup 耗时"
+        ],
+        [
+          "TCP + TLS",
+          "TCP 1 RTT + TLS 1.2 2 RTT / 1.3 1 RTT；TCP 队头阻塞",
+          "preconnect 预热、HTTP/2 单连接多路复用、HTTP/3 QUIC 0-RTT、TLS Session Resumption",
+          "Network 面板 Initial connection / SSL；curl --http3 / openssl s_client"
+        ],
+        [
+          "HTTP 请求/响应",
+          "TTFB 含服务端处理；协商缓存可省 body",
+          "CDN 边缘命中、ETag/Last-Modified、Brotli、SSR + 流式输出",
+          "TTFB 指标；响应头 X-Cache: HIT；304 比例"
+        ],
+        [
+          "渲染",
+          "JS 阻塞解析、CSS 阻塞渲染、布局抖动",
+          "CSS 放 head、JS 用 defer/async、关键 CSS 内联、preload、骨架屏、图片懒加载 + AVIF/WebP",
+          "Performance 面板 Layout/Paint；LCP/INP/CLS（INP 2024 起取代 FID）"
+        ]
+      ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：从输入 URL 到页面展示发生了什么 要先说清它解决什么问题，再展开机制、边界和验证方式。串联 DNS、TCP、TLS、HTTP 与浏览器渲染的端到端经典综合题，及各环节优化点。\n\n我会这样回答：\n1. 先定位核心问题：DNS 解析。\n2. 再串起关键机制：TCP/TLS 建连，并说明它和 HTTP 请求响应与缓存 的关系。\n3. 接着补充边界和风险：漏掉 TLS 握手或缓存检查。\n4. 最后落到验证方式：结合报文、连接状态、抓包、状态码和端到端耗时验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
+      "content": "30 秒结论：从输入 URL 到页面展示，本质是一条由 RTT 串起来的流水线，分五段——URL/缓存判定、DNS、TCP+TLS 建连、HTTP 请求响应、浏览器解析渲染。HTTPS 冷启动至少 3 个 RTT 才拿到首字节，所以每段优化都是在抠 RTT 或者把某段直接跳过。\n\n核心机制（按面试官期待的顺序）：\n\n1. **URL 与缓存**\n   - 浏览器先解析 URL，命中强缓存或 Service Worker 直接返回。\n   - 未命中则查 HSTS 决定是否升级 HTTPS。\n2. **DNS**\n   - 浏览器/系统/递归 DNS 多级缓存。\n   - 未命中走根 → TLD → 权威。\n   - CDN 在这里返回就近边缘 IP。\n3. **建连**\n   - TCP 三次握手占 1 个 RTT。\n   - HTTPS 再叠 TLS 1.3 的 1-RTT。\n   - HTTP/3 用 QUIC 把这两步合并，回头客 0-RTT。\n4. **HTTP**\n   - 带上 Cookie 和 If-None-Match 等条件请求头。\n   - CDN 命中直接回，未命中回源。\n   - 服务端可能流式返回 HTML。\n5. **渲染**\n   - HTML 边下边解析，preload scanner 并行发子资源。\n   - 构建 DOM/CSSOM → Render Tree → Layout → Paint → Composite。\n   - 遇到同步 JS 阻塞解析，CSS 阻塞渲染。\n\n边界与验证：\n\n- 把每段对应到 DevTools 的 Network/Performance 面板。\n- 把 LCP/INP/CLS 指标落到具体阶段。\n- 能讲出\"哪一段慢了用什么工具看、用什么手段降\"，就能跟普通背书拉开差距。",
       "followUpQuestions": [
         {
-          "question": "HTTP/2 和 HTTP/3 在这条链路里分别优化了什么？",
-          "answer": "HTTP/2 用单连接多路复用，消除了 HTTP/1.1 的应用层队头阻塞、减少连接开销；但它跑在 TCP 上仍有 TCP 层队头阻塞。HTTP/3 改用 QUIC(UDP)，把可靠性和多路复用做在 UDP 之上，彻底解决传输层队头阻塞，并合并握手支持 0-RTT，弱网和移动端收益明显。"
+          "question": "HTTP/2 和 HTTP/3 在这条链路上分别消除了什么瓶颈？",
+          "answer": "HTTP/2 用多路复用消除了应用层队头阻塞——同一连接上并行多个请求/响应，但 TCP 层丢包仍会阻塞所有流。HTTP/3 用 QUIC 换掉 TCP，彻底消除了传输层队头阻塞，单个流丢包不影响其他流；同时把 TLS 1.3 拥进握手，冷启动从 TCP+TLS 2 RTT 降到 1 RTT，回头客 0-RTT。"
         },
         {
-          "question": "强缓存和协商缓存的区别，在这条链路哪一步起作用？",
-          "answer": "强缓存（Cache-Control/Expires）在发请求前就命中、直接用本地副本，不走网络；协商缓存（ETag/If-None-Match、Last-Modified/If-Modified-Since）会发请求让服务器判断是否变化，未变返回 304 不传 body。前者省整次请求，后者省传输体积，分别作用在“发请求前”和“服务器响应”阶段。"
+          "question": "如果 DevTools Network 面板显示首个请求的 Waiting (TTFB) 超过 2 秒，你会怎么定位是哪一段慢？",
+          "answer": "按链路倒推：先看 DNS Lookup 耗时是否异常——如果是，切换 DNS 或检查本地缓存；再看 SSL/TLS 握手耗时——证书链太长或 OCSP 没有本地缓存会拉长；然后看服务端处理时间——是否命中 CDN 缓存、回源是否慢、是否有慢查询。最常见的原因是回源慢或 CDN 穿透率高，X-Cache 头能直接判断是否命中边缘。"
         }
       ]
     },
@@ -62,53 +100,65 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能按 DNS→连接→TLS→HTTP→渲染五段讲完整链路",
-        "能说明 TCP 三次握手与 TLS 握手的作用、HTTP/3 用 QUIC",
-        "能讲清强缓存与协商缓存(304)的区别与作用阶段",
-        "能描述渲染流水线 DOM/CSSOM→Layout→Paint→Composite",
-        "能给出各环节优化点并提及 LCP/INP/CLS"
+        "把链路拆成 URL/缓存、DNS、TCP+TLS、HTTP、渲染五段，并说出每段大致占几个 RTT",
+        "解释 HTTP/2 多路复用解决了哪层队头阻塞、为什么 HTTP/3 还要换 QUIC",
+        "说清强缓存和协商缓存分别在哪一步起作用、各自省了什么",
+        "讲出 JS 默认阻塞 HTML 解析的原因，以及 defer 和 async 的差异",
+        "把 LCP/INP/CLS 三个核心指标分别落到链路里的哪一段做优化"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "network.http-https.topic-url-to-page.recall.1",
-      "prompt": "请完整讲一遍从输入 URL 到看到页面发生了什么，按链路分段。",
+      "prompt": "把从输入 URL 到首屏画出的全过程按五段讲一遍，每段说出关键 RTT 数和最容易被忽略的细节。",
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 3
     },
     {
       "id": "network.http-https.topic-url-to-page.recall.2",
-      "prompt": "这条链路里 DNS、连接、缓存、渲染各有哪些优化手段？",
+      "prompt": "HTTP/1.1、HTTP/2、HTTP/3 在这条链路里分别解决了什么问题？为什么 HTTP/2 没解决传输层队头阻塞？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "network.http-https.topic-url-to-page.recall.3",
-      "prompt": "从输入 URL 到首屏展示，按 DNS、建连、传输、渲染四段分别说说可以做哪些性能优化。",
+      "prompt": "同步 <script>、defer 脚本、async 脚本在 HTML 解析过程中的执行时机分别是什么？为什么 CSS 也会间接阻塞 JS 执行？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
+    },
+    {
+      "id": "network.http-https.topic-url-to-page.recall.scenario",
+      "prompt": "线上首页 LCP 从 1.8s 涨到 3.5s，你只能看到 RUM 上报的 DNS、Connect、TLS、TTFB、Render 五段耗时，按什么顺序排查？每种异常对应哪段优化？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明「DNS 解析」在「从输入 URL 到页面展示发生了什么」里的作用和判断标准",
-      "TCP/TLS 建连",
-      "HTTP 请求响应与缓存",
-      "浏览器渲染流水线"
+      "URL 解析、DNS、TCP+TLS 建连、HTTP 请求响应、浏览器渲染五段顺序与各自职责",
+      "TCP 三次握手 + TLS 1.3 1-RTT 的 RTT 构成与 TTFB 的关系",
+      "强缓存（Cache-Control）与协商缓存（ETag/Last-Modified, 304）的触发阶段差异",
+      "DOM + CSSOM → Render Tree → Layout → Paint → Composite 的渲染流水线",
+      "JS 默认阻塞 HTML 解析的原因，以及 defer/async 的执行时机区别"
     ],
     "goodToHave": [
-      "HTTP/2/3 与 QUIC",
-      "强缓存 vs 协商缓存 304",
-      "CDN/负载均衡"
+      "HTTP/2 多路复用与 HTTP/3 QUIC 0-RTT 分别消除了哪一层队头阻塞",
+      "CDN 智能 DNS、边缘缓存、回源链路与 X-Cache 命中判断",
+      "preload/preconnect/dns-prefetch/prefetch 四个资源提示的差别",
+      "preload scanner 让 HTML 解析与子资源下载并行的机制",
+      "LCP/INP/CLS 指标定义以及 INP 2024 起取代 FID 的背景"
     ],
     "commonMistakes": [
-      "漏掉 TLS 握手或缓存检查",
-      "渲染步骤顺序错乱",
-      "说不清强缓存与协商缓存区别"
+      "把渲染说成\"请求结束才开始\"，忽略 HTML 流式解析与 preload scanner",
+      "声称 HTTP/2 解决了所有队头阻塞，未区分应用层与 TCP 传输层",
+      "混淆强缓存和协商缓存，把 304 当成强缓存命中",
+      "认为 JS 放底部和 defer 等价，忽略 defer 在解析期间就并行下载",
+      "讲 HTTPS 时只说\"加密\"，讲不出 TLS 握手在哪一步、占几个 RTT"
     ],
     "scoreWeights": {
       "coverage": 35,
@@ -117,8 +167,8 @@
       "depth": 20
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-13",
   "status": "staging",
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否体系化串联 DNS/TCP/TLS/HTTP/渲染全链路，并在每段点出机制与优化。"
+  "interviewerFocus": "看候选人能否把五段链路对应到具体 RTT、工具和指标，而不是只背流程名词。"
 }

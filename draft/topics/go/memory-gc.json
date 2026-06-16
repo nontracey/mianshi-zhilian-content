@@ -4,12 +4,13 @@
   "category": "runtime",
   "group": "runtime",
   "title": "Go 内存分配与 GC",
-  "summary": "掌握 Go 堆栈分配、逃逸分析、三色标记、写屏障和 GC 调优观察点。",
+  "summary": "掌握 Go 堆栈分配、逃逸分析、三色标记、混合写屏障和 GC 调优观察点。",
   "tags": [
     "Go",
     "GC",
     "逃逸分析",
-    "内存分配"
+    "内存分配",
+    "写屏障"
   ],
   "difficulty": 4,
   "estimatedMinutes": 38,
@@ -20,140 +21,188 @@
     "go.concurrency.goroutine-gmp"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能解释 Go 小对象分配、逃逸、三色标记、并发 GC、写屏障和调优指标之间的关系。",
+  "interviewerFocus": "面试官想确认你能把分配路径(mcache/mcentral/mheap)、逃逸分析、三色标记 + 混合写屏障、GC pacer(GOGC/GOMEMLIMIT)、STW 阶段以及 pprof/gctrace 排查手段串成一条线，而不是只背三色标记口诀。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Go 内存管理围绕快速分配和低停顿回收",
-      "content": "Go 运行时为每个 P 准备 mcache，优先从本地缓存分配小对象；更大的对象走中心缓存或堆。GC 使用并发三色标记，目标是在控制 CPU 开销的同时降低 STW 停顿。\n\n从零理解时先抓住这几个点：\n- 小对象按 size class 分配，减少锁竞争和碎片\n- 逃逸分析决定对象能否放在栈上，逃逸到堆会增加 GC 压力\n- 三色标记把对象分成白、灰、黑，沿引用关系找出存活对象\n- 写屏障保证并发标记期间引用变化不会破坏可达性判断\n\n容易答浅的地方通常在边界：\n- 频繁创建短生命周期对象会提高 GC 频率\n- 只调 GOGC 不看分配速率和堆增长，容易误判\n- sync.Pool 适合复用临时对象，但 GC 时可能被清空，不能当缓存"
+      "title": "分配路径：mcache → mcentral → mheap，size class 决定走哪条线",
+      "content": "Go 的分配器是 tcmalloc 风格的多层结构，理解它先看对象大小落在哪一档：\n\n- **tiny (<16B 且 noscan)**：一种特殊合并分配，把多个 tiny 对象塞进同一个 16B 槽，主要服务于 string、小 struct，能显著降低小对象碎片。\n- **small (16B ~ 32KB)**：按 67 个 size class 切分（class 1=8B, class 2=16B …），每个 P 持有 mcache，命中本地 span 即无锁返回；mcache 缺货时去 mcentral 拿一整条 span，mcentral 再不够才向 mheap 申请页（pageSize=8KB）。\n- **large (>32KB)**：直接走 mheap，按 page 申请，回收时也独立成段。\n\n关键边界：\n- mcache 是 per-P 而不是 per-G，所以 GMP 切换 P 时分配状态会跟着走。\n- size class 表是静态的（runtime/sizeclasses.go），同一档内向上取整带来的浪费叫做 internal fragmentation，最坏接近 12.5%。\n- 大对象不进 mcache，所以频繁 make([]byte, 1<<20) 会直接打到 mheap，触发 mmap/munmap，比小对象更敏感于 GC pacer。\n\n面试想拉开差距：能说出\"为什么我的服务 alloc_objects 飙高但 inuse 不大\"——往往是大量短命的小对象走 mcache 快速分配 + 快速回收，pprof 看 alloc_space 而不是 inuse_space 才能定位。"
     },
     {
       "type": "explain",
-      "title": "调优要看分配速率而不是只看暂停时间",
-      "content": "Go GC 的核心成本来自堆上活跃对象和分配速度。GOGC 控制的是下次 GC 目标堆大小相对上次存活堆的增长比例；调大 GOGC 可以减少 GC 次数但增加内存占用，调小则相反。面试里要把吞吐、延迟和内存三者的权衡说出来。\n\n实际排查一般从 pprof heap、alloc_space、inuse_space 和 `GODEBUG=gctrace=1` 入手。优化方向包括减少无意义分配、复用 buffer、避免把小对象装进 interface 导致逃逸、控制大对象生命周期。不要把“手动调用 runtime.GC”当作常规调优手段。\n\n把 Go 内存分配与 GC 放到真实场景里看，重点是语言语义、运行时调度、并发边界和工程实践。先确认触发条件，再看状态或数据怎样变化，最后用指标、日志、测试结果或复杂度证明判断。\n\n学习 Go 内存分配与 GC 时，要把语言语义、运行时调度、并发边界和工程实践对应到具体例子里。遇到异常或效果不符合预期时，先定位触发条件，再判断哪一层状态、数据或假设发生偏移。"
+      "title": "逃逸分析：编译期决定栈或堆，go build -gcflags=\"-m\" 是唯一证据",
+      "content": "Go 没有 new/delete，对象放栈还是堆完全由编译器逃逸分析决定。常见逃逸场景：\n\n- **返回局部变量地址**：`func f() *T { var t T; return &t }` —— t 必须逃逸到堆。\n- **闭包捕获**：goroutine 里引用外层变量、defer/匿名函数捕获指针，被捕变量逃逸。\n- **接口装箱**：把小值赋给 `interface{}` 通常触发逃逸（值需要堆上有稳定地址才能存到 iface.data）。fmt.Println(i) 里的 int 就会逃逸。\n- **过大或动态大小**：栈帧上放不下的数组/切片（受 stack 检查阈值约束）、`make([]T, n)` 中 n 不是常量时大概率逃逸。\n- **指针写入堆对象**：把局部对象地址塞进堆上的 map / slice / channel。\n\n**验证手段**（面试讲到这一步才算落地）：\n- `go build -gcflags=\"-m -m\" ./...` 打印每个变量的逃逸决策，含原因（\"escapes to heap: flow ...\"）。\n- `go test -bench=. -benchmem` 看 allocs/op 列；零分配的热点函数才是优化到位。\n- `//go:noinline` 偶尔用来防止编译器把函数 inline 后改变逃逸结论（排查时用，不是常规手段）。\n\n栈本身也不是固定大小：goroutine 初始栈 8KB（Go 1.4 起连续栈），用满时 runtime.morestack 触发 copystack，按 2 倍扩张，栈收缩在 GC scan 期间进行。所以\"栈分配很便宜\"成立的前提是栈不抖。"
+    },
+    {
+      "type": "explain",
+      "title": "三色标记 + 混合写屏障：并发标记如何不漏标不错杀",
+      "content": "Go 1.5 起 GC 是并发标记清扫，1.8 起统一为混合写屏障（Yuasa 删除屏障 + Dijkstra 插入屏障的组合），这是面试最容易答浅的地方。\n\n**三色定义**：\n- 白：未访问，结束时仍为白即可回收。\n- 灰：自己已访问、引用尚未扫描，存在于扫描队列。\n- 黑：自己和引用都已扫描，安全。\n\n**为什么需要写屏障**：并发标记期间用户协程仍在跑，如果一个**黑色对象**新指向一个**白色对象**，且原来引用这个白对象的灰对象的引用又被删掉，白对象就会被错判为不可达——这就是\"对象丢失\"问题（强三色不变式被破坏）。\n\n**混合写屏障的做法**（runtime/mbarrier.go）：\n- 任何指针写入 `*slot = ptr` 时：**对被覆盖的旧值上色**（Yuasa，避免删除引用导致丢失），同时**对新写入的指针上色**（Dijkstra，覆盖黑→白的情形）。\n- 引入混合屏障的好处：可以省掉 Go 1.7 之前的 STW re-scan 全部栈的阶段，把每个 goroutine 的栈在调度切换点单独扫一次即可，STW 从 100ms 级降到 sub-millisecond。\n\n**仍然有 STW 的两段**：\n- **GC mark setup（STW1）**：开启写屏障、准备根集合，通常 < 100µs。\n- **GC mark termination（STW2）**：关闭写屏障、收尾 mcache flush，也是 < 1ms 量级。\n- 中间的并发标记和清扫不 STW，但占用约 25% CPU（GOGC 默认配比）。\n\n常见误区：以为\"并发 GC = 没有 STW\"。准确说法是 STW 时间从毫秒级降到亚毫秒级，但 CPU 仍要让出 25%，且写屏障本身有指令开销（每次指针写多几条 mov/cmp）。"
+    },
+    {
+      "type": "explain",
+      "title": "GC pacer：GOGC、GOMEMLIMIT 和触发时机",
+      "content": "Go GC 不是定时跑，而是由 pacer 根据堆增长动态触发。把 GOGC 和 GOMEMLIMIT 的语义讲清楚是高频追问。\n\n- **GOGC 默认 100**：表示\"下一次 GC 触发的目标堆 = 上一次 GC 后存活堆 × (1 + GOGC/100)\"。即默认存活堆翻倍时触发。设 GOGC=200，则等到 3 倍才触发；设 GOGC=off 完全关闭 GC（仅压测调试用）。\n- **GOMEMLIMIT（Go 1.19+）**：软上限，单位字节（如 `GOMEMLIMIT=4GiB`）。当 RSS 接近上限，pacer 会无视 GOGC 提前触发 GC，避免 OOM。容器化部署里这是替代 GOGC 调优的首选——结合 cgroup memory.limit 设个 90% 的软上限，比手撸 GOGC 安全得多。\n- **辅助标记（mark assist）**：分配速率太快、并发标记跟不上时，分配方协程会被强制\"扣\"一段标记工作量再继续分配，体现在 gctrace 里的 `assist` 字段。assist 比例高说明分配速率压过了 GC 节奏，要么减分配要么加 CPU。\n\n**观察手段**：\n- `GODEBUG=gctrace=1 ./app` 每次 GC 打印一行：`gc 12 @1.234s 5%: 0.12+3.4+0.08 ms clock, 0.5+1.2/2.1/0.3+0.3 ms cpu, 64->68->32 MB, 70 MB goal, 8 P`，分别是 STW1+并发+STW2 时间、各阶段 CPU、堆 before→during→after、本次 goal、P 数。\n- `runtime.ReadMemStats(&m)` 拿 NumGC、PauseNs（最近 256 次停顿环形缓冲）、HeapAlloc、HeapInuse、HeapIdle、NextGC（下次 goal）。\n- pprof：`go tool pprof http://host/debug/pprof/heap` 区分 inuse_space（常驻泄漏）和 alloc_space（高频分配）；`go tool pprof -alloc_objects` 看分配次数热点。\n- `go tool trace` 看 GC 与 goroutine 调度交叠，定位长 STW 或 mark assist 异常。\n\n生产口径：先看 gctrace 是否 assist 高 + GC 频繁，再用 alloc_space 找热点，最后才考虑 GOGC/GOMEMLIMIT 调整。手动 runtime.GC() 仅用于压测对照或 main 退出前清理 finalizer，不是调优工具。"
     },
     {
       "type": "diagram",
-      "title": "对象分配与并发标记路径",
+      "title": "Go 内存与 GC 全景：分配路径 + 三色标记 + pacer 触发",
       "format": "mermaid",
-      "content": "flowchart LR\nA[编译器逃逸分析] --> B[优先栈上分配]\nB[优先栈上分配] --> C[堆上按 size class 分配]\nC[堆上按 size class 分配] --> D[GC 并发标记可达对象]\nD[GC 并发标记可达对象] --> E[清扫不可达对象]\nE[清扫不可达对象] --> F[根据 GOGC 设定下轮目标]",
-      "fallback": "编译器逃逸分析 -> 优先栈上分配 -> 堆上按 size class 分配 -> GC 并发标记可达对象 -> 清扫不可达对象 -> 根据 GOGC 设定下轮目标",
-      "caption": "内存问题要同时看分配路径、对象生命周期和 GC 触发策略。"
+      "content": "flowchart TD\nA[新对象 new/make] --> B{逃逸分析<br/>gcflags=-m}\nB -- 不逃逸 --> S[栈分配<br/>初始 8KB 连续栈]\nB -- 逃逸 --> C{对象大小}\nC -- <16B noscan --> T[tiny 合并槽]\nC -- 16B~32KB --> M[per-P mcache<br/>67 个 size class]\nC -- >32KB --> H[mheap 直接申请 page]\nM -- miss --> N[mcentral 取 span]\nN -- miss --> H\nH --> G[heap 增长触发 pacer]\nG --> P{heap >= GC goal?<br/>goal=live*(1+GOGC/100)<br/>或 RSS≈GOMEMLIMIT}\nP -- 是 --> K[STW1 mark setup<br/>开启混合写屏障]\nK --> L[并发三色标记<br/>白/灰/黑 + 写屏障]\nL --> Q[STW2 mark termination<br/>关闭写屏障]\nQ --> R[并发清扫 sweep<br/>归还 span 给 mcentral]\nR --> A",
+      "fallback": "新对象 → 逃逸分析 → 栈分配 或 tiny/mcache/mcentral/mheap 路径 → heap 达到 pacer goal → STW1 → 并发三色标记(混合写屏障) → STW2 → 并发清扫 → 循环",
+      "caption": "面试时按这条主线讲：分配路径决定 GC 压力，pacer 决定何时启动，写屏障保证并发正确性。"
     },
     {
       "type": "compareTable",
-      "title": "GC 调优指标对比",
+      "title": "GC 调优观察指标与误用对比",
       "columns": [
-        "考点",
-        "应该怎么理解",
-        "面试追问",
-        "常见坑"
+        "指标 / 工具",
+        "含义",
+        "正确用法",
+        "常见误用"
       ],
       "rows": [
         [
-          "heap inuse",
-          "当前仍被占用的堆内存",
-          "判断常驻对象规模",
-          "只看总内存不看存活对象"
+          "HeapInuse / inuse_space",
+          "当前仍占用的堆内存",
+          "判断常驻对象规模、定位泄漏",
+          "用它判断分配压力（短命对象不会停留）"
         ],
         [
-          "alloc_space",
-          "累计分配量",
-          "找高分配热点",
-          "和泄漏混淆"
+          "alloc_space / alloc_objects",
+          "进程启动以来累计分配字节/对象数",
+          "找高频分配热点（即使已被回收）",
+          "把它当成内存泄漏证据"
         ],
         [
-          "GOGC",
-          "堆增长触发比例",
-          "权衡内存与 GC 频率",
-          "盲目调大导致内存飙升"
+          "GOGC=100",
+          "下次 GC 触发 = live × (1 + 100%) = live×2",
+          "默认值；调大可降 GC 频率代价是峰值内存翻倍",
+          "盲调 GOGC=off 或 1000 导致 OOM"
+        ],
+        [
+          "GOMEMLIMIT (1.19+)",
+          "RSS 软上限，逼近时强制 GC",
+          "容器内设为 cgroup limit 的 ~90%",
+          "和 GOGC 同时严苛设置导致频繁 mark assist"
+        ],
+        [
+          "gctrace assist 字段",
+          "分配协程被迫做的标记工作量",
+          "高 assist = 分配速率压过 GC，需减分配或加 CPU",
+          "只看 pause 不看 assist，误判为 GC 已优化"
         ],
         [
           "sync.Pool",
-          "临时对象复用",
-          "降低分配压力",
-          "当成长期缓存"
+          "per-P 临时对象池，GC 时被清空",
+          "复用 bytes.Buffer / 大 []byte 等短命对象",
+          "当业务缓存用，结果 GC 后命中率归零"
+        ],
+        [
+          "runtime.SetFinalizer",
+          "对象被回收前回调",
+          "兜底关闭外部资源（fd、cgo 句柄）",
+          "依赖它做主流程清理（执行时机和顺序都不保证）"
         ]
       ]
     },
     {
       "type": "code",
-      "title": "用 sync.Pool 复用临时 buffer",
+      "title": "sync.Pool 复用 buffer + 用 gctrace/pprof 验证",
       "language": "go",
-      "content": "package main\n\nimport (\n\t\"bytes\"\n\t\"sync\"\n)\n\nvar pool = sync.Pool{New: func() any { return new(bytes.Buffer) }}\n\nfunc encode(s string) []byte {\n\tb := pool.Get().(*bytes.Buffer)\n\tb.Reset()\n\tdefer pool.Put(b)\n\tb.WriteString(s)\n\treturn append([]byte(nil), b.Bytes()...) // 返回前复制，避免共享 buffer\n}",
+      "content": "package main\n\nimport (\n\t\"bytes\"\n\t\"net/http\"\n\t_ \"net/http/pprof\" // 暴露 /debug/pprof/heap\n\t\"runtime\"\n\t\"sync\"\n)\n\n// per-P 池化：bytes.Buffer 是典型短命对象，频繁 new 会打到 mcache 但增加 GC 标记量\nvar bufPool = sync.Pool{\n\tNew: func() any { return new(bytes.Buffer) },\n}\n\nfunc encode(s string) []byte {\n\tb := bufPool.Get().(*bytes.Buffer)\n\tb.Reset() // 关键：Get 出来的可能带旧数据\n\tdefer bufPool.Put(b)\n\tb.WriteString(s)\n\t// 必须复制再返回，否则 Put 后底层数组被复用，调用方拿到的 slice 会被改写\n\tout := make([]byte, b.Len())\n\tcopy(out, b.Bytes())\n\treturn out\n}\n\nfunc dumpGC() {\n\tvar m runtime.MemStats\n\truntime.ReadMemStats(&m)\n\t// NumGC: 累计 GC 次数；PauseNs 是最近 256 次停顿的环形缓冲\n\t// HeapAlloc: 当前堆活跃字节；NextGC: 下次触发的 goal\n\t_ = m\n}\n\nfunc main() {\n\t// GODEBUG=gctrace=1 go run main.go 可看每次 GC 一行汇总\n\t// go tool pprof http://localhost:6060/debug/pprof/heap 看 inuse/alloc\n\tgo http.ListenAndServe(\":6060\", nil)\n\tselect {}\n}",
       "highlights": [
         {
-          "line": 8,
-          "note": "这里给出最终结果或提前退出条件，需要补充空值、失败和边界场景。"
+          "line": 19,
+          "note": "Reset 不能省：sync.Pool 不保证 Get 出的对象是空的，遗留数据会写进新结果。"
+        },
+        {
+          "line": 24,
+          "note": "返回前必须 copy。bufPool.Put 之后底层数组可能立刻被另一个 goroutine Get 拿去重写，直接返回 b.Bytes() 是经典踩坑。"
+        },
+        {
+          "line": 31,
+          "note": "ReadMemStats 是观察 GC 的轻量入口；线上更推荐 GODEBUG=gctrace=1 + pprof，避免每次都 stop the world 取 stats。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
-      "title": "面试回答思路",
-      "content": "Go 内存和 GC 我会从分配、可达性标记和调优指标三个层次回答。\n\n我会按这条线展开：\n1. 小对象尽量从 P 本地缓存分配，降低锁竞争\n2. 逃逸到堆的对象会增加 GC 压力，逃逸分析决定很多性能差异\n3. GC 使用并发三色标记和写屏障降低停顿\n4. 调优先看分配热点和对象生命周期，再权衡 GOGC、内存占用和延迟\n\n最后补一句边界：GC 调优不能只背参数；如果分配速率很高，根因往往在对象创建模式和数据结构选择上。",
+      "title": "面试 90 秒讲清 Go 内存与 GC",
+      "content": "Go 的内存与 GC 我会沿\"分配 → 标记 → 调优\"三层讲，每层都给具体抓手。\n\n**结论先行（30 秒）**：Go 用 tcmalloc 风格的 mcache/mcentral/mheap 三级分配器，对象走栈还是堆由编译期逃逸分析决定；GC 是并发三色标记 + 混合写屏障（Go 1.8 起），STW 控制在亚毫秒级；调优靠 GOGC/GOMEMLIMIT 和 pprof，不是手动调用 runtime.GC。\n\n**机制层（45 秒）**：\n- 分配：<16B noscan 走 tiny；16B~32KB 按 67 个 size class 在 per-P mcache 无锁分配，缺货向 mcentral/mheap 升级；>32KB 直接 mheap。\n- 标记：三色不变式，黑对象指向白对象时违反；混合写屏障同时给\"被覆盖旧值\"和\"新写入指针\"上灰，省掉了 Go 1.7 之前重扫栈的 STW，STW 阶段只剩 mark setup 和 mark termination 两段亚毫秒级停顿。\n- 触发：GOGC 默认 100，存活堆翻倍触发 GC；Go 1.19 起 GOMEMLIMIT 提供 RSS 软上限，容器场景比 GOGC 更安全。\n\n**调优层（15 秒）**：先 `GODEBUG=gctrace=1` 看 STW 时间和 assist 比例，再 `pprof -alloc_space` 找分配热点，定位到具体函数后用 `go build -gcflags=\"-m\"` 验证逃逸；常见手段是减少 interface 装箱、buffer 用 sync.Pool 复用、避免 map 持有大 slice 不释放。\n\n**生产判断**：GC 频繁但 inuse 平稳 → 高分配速率问题（找逃逸点）；inuse 持续增长 → 真泄漏（看 goroutine + map/slice 引用）；STW 偶尔毫秒级 → 看是否大对象 mheap 频繁 munmap 或 finalizer 队列堆积。",
       "followUpQuestions": [
         {
-          "question": "GOGC 调大和调小分别有什么影响？",
-          "answer": "调大 GOGC 会允许堆增长更多再触发 GC，GC 次数减少但内存占用上升；调小则降低内存但增加 GC 频率和 CPU 开销。"
+          "question": "Go 1.8 的混合写屏障到底解决了什么？为什么之前必须 STW 重扫栈？",
+          "answer": "Go 1.7 及之前用纯 Dijkstra 插入屏障，标记结束时所有 goroutine 栈上的指针修改没法被屏障捕获（栈写不走屏障，否则函数调用代价太大），所以必须 STW 重扫每个栈，停顿往往 100ms+。1.8 改为混合屏障：对栈上对象在 GC 开始时一次性置黑、之后栈写不再需要屏障，堆写则同时记录旧值（Yuasa 删除屏障）和新值（Dijkstra 插入屏障）。这样标记结束时只需要在各个 goroutine 调度切换点配合做一次栈扫描即可，STW 降到亚毫秒级。"
         },
         {
-          "question": "sync.Pool 为什么不能当普通缓存？",
-          "answer": "sync.Pool 中的对象可能在 GC 后被清理，它适合复用临时对象降低分配，不保证长期保存和命中率。"
+          "question": "线上 RSS 一直涨但 HeapInuse 没涨，可能是什么原因？",
+          "answer": "几种典型情况：(1) HeapIdle 高，Go runtime 还没把空闲 span 通过 madvise(MADV_DONTNEED/FREE) 还给 OS，Linux 上 RSS 不会立刻下降——可看 m.HeapReleased；(2) goroutine 栈泄漏，每个 goroutine 起步 8KB 但能扩到几 MB，runtime.NumGoroutine 持续涨就是信号；(3) cgo / mmap 分配的内存不在 Go heap 统计内（如某些 SDK、JNI 风格调用），需要 RSS 减 HeapSys 看差额；(4) GOMEMLIMIT 没设，pacer 觉得堆翻倍才回收，峰值高于稳态。"
+        },
+        {
+          "question": "什么场景适合用 sync.Pool？什么场景一定不要用？",
+          "answer": "适合：单次请求内创建、生命周期短、构造成本不低的对象——典型如 bytes.Buffer、gzip.Writer、json encoder、protobuf message。Get/Reset/Put 三件套要齐全。不适合：(1) 有状态需要持久存活的业务缓存——sync.Pool 在 GC 时会被清空（Go 1.13 后改为两次 GC 才彻底清，但仍不可依赖）；(2) 大小差异巨大的对象混用——会出现 4MB buffer 被复用到只需 1KB 的场景，造成内存放大；(3) 跨 goroutine 长期持有 Pool 出来的对象再 Put——破坏 per-P 局部性，并发性能反而下降。"
         }
       ]
     },
     {
       "type": "checklist",
-      "title": "学完后应能说清楚",
+      "title": "学完后应能讲清这些具体抓手",
       "items": [
-        "能解释逃逸分析",
-        "能说出三色标记",
-        "能解释写屏障作用",
-        "能用 pprof 看分配热点",
-        "能说明 GOGC 取舍"
+        "能画出 mcache(per-P) → mcentral → mheap 三级分配路径，并说出 size class 数量(67)、tiny 阈值(16B)、大对象阈值(32KB)",
+        "能用 go build -gcflags=\"-m\" 解读一段代码的逃逸结论，举出 3 个典型逃逸场景（返回地址、接口装箱、闭包捕获）",
+        "能讲清楚混合写屏障（Yuasa 删除 + Dijkstra 插入）相比 Go 1.7 纯插入屏障的差别，说出 STW 从 ms 级降到 sub-ms 的原因",
+        "能解读 GODEBUG=gctrace=1 一行输出的 STW1+并发+STW2 时间、堆 before→during→after、goal、assist 比例",
+        "能区分 GOGC 与 GOMEMLIMIT 的语义和适用场景，知道容器部署里推荐用 GOMEMLIMIT 设软上限",
+        "能用 pprof 区分 inuse_space（泄漏）与 alloc_space（高频分配）两类问题，并据此选择优化方向",
+        "能说出 sync.Pool 的 GC 清空特性、Reset/Put 顺序、为什么不能当业务缓存",
+        "能解释 SetFinalizer 的执行时机不保证、不保证顺序，仅作为外部资源兜底"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "go.runtime.memory-gc.recall.1",
-      "prompt": "请讲清楚 Go 对象从分配到 GC 回收的大致过程。",
+      "prompt": "请按 mcache→mcentral→mheap 的层级，描述一个 1KB struct 和一个 1MB []byte 各自的分配路径，并说明哪一档对 GC pacer 更敏感。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "go.runtime.memory-gc.recall.2",
-      "prompt": "逃逸分析和 GC 压力有什么关系，并说明关键机制和边界条件。",
+      "prompt": "为什么 Go 1.8 引入混合写屏障后能省掉 STW 重扫栈？请用三色不变式解释 Yuasa 删除屏障和 Dijkstra 插入屏障各自防住了什么场景。",
       "mode": "text",
-      "expectedMinutes": 4,
-      "difficulty": 4
+      "expectedMinutes": 5,
+      "difficulty": 5
     },
     {
       "id": "go.runtime.memory-gc.recall.3",
-      "prompt": "如果 Go 服务 GC 频繁，你会先看哪些指标？",
+      "prompt": "线上一个 Go 服务 P99 延迟突增、GC 频率从 30s/次变成 2s/次，请按 GODEBUG=gctrace=1 → pprof alloc_space → gcflags=-m 的顺序说出你的排查动作和判断点。",
       "mode": "text",
-      "expectedMinutes": 4,
-      "difficulty": 4
+      "expectedMinutes": 5,
+      "difficulty": 5
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明「逃逸分析」在「Go 内存分配与 GC」里的作用和判断标准",
-      "能说明「堆分配」在「Go 内存分配与 GC」里的作用和判断标准",
-      "能说明「三色标记」在「Go 内存分配与 GC」里的作用和判断标准",
-      "能说明「写屏障」在「Go 内存分配与 GC」里的作用和判断标准"
+      "mcache(per-P) / mcentral / mheap 三级分配器结构 + 67 个 size class + tiny(<16B) / large(>32KB) 边界",
+      "逃逸分析的判定规则与 go build -gcflags=\"-m\" 验证手段，举出返回地址 / interface 装箱 / 闭包捕获 等典型场景",
+      "三色标记 + Go 1.8 混合写屏障（Yuasa 删除 + Dijkstra 插入），并说明 STW 仅剩 mark setup 与 mark termination 两段亚毫秒",
+      "GC pacer：GOGC=100 默认翻倍触发、GOMEMLIMIT 软上限（Go 1.19+）、mark assist 含义"
     ],
     "goodToHave": [
-      "mcache/size class",
-      "pprof heap 指标",
-      "sync.Pool 边界"
+      "GODEBUG=gctrace=1 输出字段解读（STW1+并发+STW2 / before→during→after / goal / assist）",
+      "pprof inuse_space vs alloc_space / alloc_objects 的差异和适用问题",
+      "sync.Pool 的 per-P + GC 清空特性，以及 Reset/复制再返回的踩坑",
+      "栈连续增长（初始 8KB / morestack / copystack）与 GC 期间栈收缩",
+      "SetFinalizer 不保证执行时机与顺序，仅作外部资源兜底"
     ],
     "commonMistakes": [
-      "把 runtime.GC 当常规优化",
-      "只看暂停时间不看分配速率",
-      "把 sync.Pool 当缓存"
+      "把 runtime.GC() 当作常规调优手段（应只在压测对照或退出清理时用）",
+      "用 inuse_space 判断分配压力 / 用 alloc_space 判断泄漏（指标用反）",
+      "把 sync.Pool 当业务缓存，结果 GC 后命中率归零",
+      "GOGC 调到 off 或上千以求降 GC 频率，导致内存峰值翻倍触发 OOM",
+      "认为\"并发 GC 就没有 STW\"，忽略 mark setup / termination 两段停顿和 25% CPU 占用",
+      "看到 RSS 不降就判断泄漏，未区分 HeapIdle/HeapReleased、goroutine 栈、cgo 内存"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -162,5 +211,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

@@ -1,125 +1,140 @@
 {
-  "id": "design-pattern.behavioral.topic-guan-zhe-zhe-mo-shi",
-  "domain": "design-pattern",
   "category": "behavioral",
+  "difficulty": 2,
+  "domain": "design-pattern",
+  "estimatedMinutes": 15,
   "group": "behavioral",
-  "title": "观察者模式",
-  "summary": "定义对象间一对多的依赖关系，当对象状态改变时，所有依赖它的对象都会得到通知。",
+  "id": "design-pattern.behavioral.topic-guan-zhe-zhe-mo-shi",
+  "interviewFrequency": "medium",
+  "interviewerFocus": "考察候选人对 Subject/Observer 解耦边界的判断：能否讲清 Spring 默认同步通知带来的事务与异常传播风险，能否区分进程内观察者与跨进程发布订阅的适用场景，以及在监听器泄漏或慢调用下给出具体的排查与隔离方案。",
+  "learningCards": [
+    {
+      "type": "explain",
+      "title": "一对多通知、事件驱动与工程取舍",
+      "content": "观察者模式是事件驱动架构的底层契约——一个对象（Subject/被观察者）的状态变化会自动广播给所有注册在它身上的依赖方（Observer/观察者），主题不必知道观察者是谁、要干什么，靠「订阅-通知」这一对多契约把变化传出去。GoF 把它归为行为型模式，但工程里它更常以「事件/Event」面目出现：Swing 的 ActionListener、JavaScript 的 addEventListener、Node.js 的 EventEmitter、Spring 的 ApplicationEvent 骨子里都是同一套 Subject/Observer 结构。\n\n**核心结构与契约**：\n- Subject 内部维护一个 Observer 容器（生产里通常是 `List<Observer>`，按订阅顺序遍历），对外暴露 `register/remove/notifyObservers` 三个动作。Spring 实现里这是 `SimpleApplicationEventMulticaster` 的 `retrieverCache`——一个按事件类型分组的 `ListenerRetriever` 列表。\n- Observer 实现统一更新接口（Java 里 `update(EventType)`，Spring 里 `onApplicationEvent(E)` 或任何标了 `@EventListener` 的方法）。\n- 通知触发点一定是「状态变更」后的同一调用栈——`setState()` 内调 `notifyObservers()`，或 `publisher.publishEvent(event)` 内部 `multicastEvent` 遍历 `retrieverCache` 找匹配监听器。\n\n**机制关键点**：\n- **默认同步**：通知跑在发布方线程，共享发布方的事务边界。Spring 的 `SimpleApplicationEventMulticaster.setTaskExecutor(null)` 即同步模式，发布方与所有监听器共用同一个 `ThreadLocal`、同一事务。这是双刃剑——好处是读时一致性，坏处是慢监听器直接拖垮发布方甚至拖到事务超时。\n- **异常传播**：Java `for-each` 循环里某个 `update()` 抛 RuntimeException 会中断循环、后续监听器收不到通知。Spring 在执行阶段不自动捕获业务异常，必须监听方法自己 `try/catch` 或实现 `ErrorHandler` 接口做隔离。\n- **强引用泄漏**：Subject 用 `List<Observer>`（Spring 强引用 `Method` + `beanName`）持有观察者。若观察者生命周期短于 Subject（如 `@RequestScope` Bean、Activity 风格的 UI 组件订阅全局 EventBus 但没在 onDestroy 注销），就会内存泄漏。RxJava/LiveData 用 Lifecycle 绑定解掉这个坑。\n- **顺序保证弱**：框架只承诺「某种顺序」（一般订阅顺序）但不承诺业务语义上的顺序——监听器之间不应有先后依赖。\n\n**生产中的工程取舍**：\n- 同进程、低延迟、要事务一致性 → Spring 同步事件 + `@TransactionalEventListener(phase = AFTER_COMMIT)`，把「发短信/写缓存」这类副作用挂在事务真正提交后再做，避免回滚后通知已发。\n- 同进程、慢或 IO 密集 → `@Async` + 独立线程池（`@EnableAsync` + `ThreadPoolTaskExecutor`），监听器互不阻塞，但要考虑 SecurityContext、RequestAttributes 是否需要 `ContextPropagatingTaskDecorator` 透传。\n- 跨进程/削峰/重试 → 不要硬套观察者模式，换消息队列（RabbitMQ/Kafka），发布者只负责 push 到 broker，消费者侧自己实现幂等 + ack。\n- 反应式场景 → Reactor 的 `Sinks.Many` / `FluxProcessor` 才是观察者的现代写法，天然背压、多订阅者安全。\n\n**易踩的坑**：\n- 误以为 Spring 事件是异步的，结果监听器把发布方事务拖到超时甚至回滚。\n- 监听器里再次 `publishEvent` 触发同类事件，没控制 phase 就递归到 `StackOverflowError`。\n- 在 `OrderEvent` 这种频繁事件上忘了过滤，所有监听器无差别全跑一遍，热路径被拖累。\n- Guava EventBus 不是 GoF 纯观察者——它引入 `EventBus` 作为中介、发布者只面向 `EventBus.post(event)`，订阅者用 `@Subscribe` 注册，发布者对订阅者零感知，更接近「进程内发布订阅」或「中介者+观察者」的混合体。"
+    },
+    {
+      "type": "diagram",
+      "title": "观察者模式通知流程与故障面",
+      "content": "flowchart LR\\nClient[业务调用方] -->|setState 状态变更| Subject\\nSubject[Subject 主题<br/>持有 List<Observer>] -->|notifyObservers| Loop\\nLoop[for-each 同步遍历] --> O1[Observer1 update]\\nLoop --> O2[Observer2 update]\\nLoop --> O3[Observer3 update]\\nNew[新订阅者] -->|registerObserver| Subject\\nOld[离场订阅者] -->|removeObserver| Subject\\nO1 -->|异常未隔离| Break[后续监听器收不到]\\nO3 -->|未注销| Leak[强引用 内存泄漏]",
+      "caption": "Subject 在状态变更入口同步遍历所有已注册 Observer；故障面集中在异常中断和未注销泄漏",
+      "fallback": "Subject 持有 observers 列表，setState 触发 notifyObservers 同步遍历；任一 Observer 抛异常会中断后续，强引用未注销会泄漏",
+      "format": "mermaid"
+    },
+    {
+      "type": "compareTable",
+      "title": "观察者 / 发布订阅 / 进程内事件总线 边界对比",
+      "content": "| 维度 | 观察者模式 | 发布订阅模式 | 进程内事件总线 |\n| --- | --- | --- | --- |\n| 解耦方式 | Subject 直接持有 Observer 引用 | 发布者只面向 broker，互不知道订阅者 | EventBus 作为中介，发布者不持有订阅者 |\n| 通信范围 | 同进程、同线程栈 | 跨进程、跨语言 | 同进程 |\n| 同步性 | 默认同步（共享发布方线程与事务） | 异步 | 都支持（Spring 默认同步、EventBus 默认同步） |\n| 持久化与重试 | 无 | 有（broker 落盘 + ack + 重投） | 无 |\n| 过滤能力 | 需自己加 if / condition | broker 路由键 / 主题过滤 | SpEL 表达式 / @Subscribe 注解 |\n| 故障传播 | 一个观察者抛异常即中断后续 | broker 隔离，订阅者失败不影响发布者 | 取决于实现，Spring 不自动隔离 |\n| 工程代表 | 自定义 Subject/Observer、LiveData、Flow | RabbitMQ、Kafka、RocketMQ | Spring ApplicationEvent、Guava EventBus |\n| 典型选择 | UI 状态绑定、轻量本地联动 | 跨服务削峰、最终一致、事件溯源 | 应用内解耦副作用（发短信/写缓存/审计） |"
+    },
+    {
+      "content": "// 1. 观察者模式基础结构\npublic interface Subject {\n    void registerObserver(Observer observer);\n    void removeObserver(Observer observer);\n    void notifyObservers();\n}\npublic interface Observer {\n    void update(String message);\n}\npublic class ConcreteSubject implements Subject {\n    private List<Observer> observers = new ArrayList<>();\n    private String state;\n    \n    @Override\n    public void registerObserver(Observer observer) {\n        observers.add(observer);\n    }\n    \n    @Override\n    public void removeObserver(Observer observer) {\n        observers.remove(observer);\n    }\n    \n    @Override\n    public void notifyObservers() {\n        for (Observer observer : observers) {\n            observer.update(state);\n        }\n    }\n    \n    public void setState(String state) {\n        this.state = state;\n        notifyObservers();\n    }\n}\n\n// 2. Spring事件机制\n// 定义事件\npublic class OrderEvent extends ApplicationEvent {\n    private String orderId;\n    \n    public OrderEvent(Object source, String orderId) {\n        super(source);\n        this.orderId = orderId;\n    }\n}\n// 发布事件\n@Component\npublic class OrderService {\n    @Autowired\n    private ApplicationEventPublisher publisher;\n    \n    public void createOrder(String orderId) {\n        // 创建订单逻辑\n        publisher.publishEvent(new OrderEvent(this, orderId));\n    }\n}\n// 监听事件\n@Component\npublic class OrderListener implements ApplicationListener<OrderEvent> {\n    @Override\n    public void onApplicationEvent(OrderEvent event) {\n        System.out.println(\"订单创建: \" + event.getOrderId());\n    }\n}\n\n// 3. @EventListener注解\n@Component\npublic class AnnotationListener {\n    @EventListener\n    public void handleOrderEvent(OrderEvent event) {\n        System.out.println(\"注解监听: \" + event.getOrderId());\n    }\n    \n    @EventListener(condition = \"#event.orderId.startsWith('VIP')\")\n    public void handleVipOrder(OrderEvent event) {\n        System.out.println(\"VIP订单处理\");\n    }\n}\n\n// 4. 异步事件\n@Component\npublic class AsyncEventListener {\n    @Async\n    @EventListener\n    public void handleAsync(OrderEvent event) {\n        // 异步处理\n    }\n}",
+      "highlights": [
+        {
+          "line": 11,
+          "note": "`observers` 是 ArrayList<Observer> 强引用容器——Subject 持有它的整个生命周期；若观察者本身是短生命周期（@RequestScope Bean、Activity 风格 UI 组件），未注销就会内存泄漏，dump 后看 GC Root → Subject → Observer 链即可定位"
+        },
+        {
+          "line": 26,
+          "note": "for-each 同步遍历 ArrayList：① 按订阅顺序执行；② 任一 update() 抛 RuntimeException 即中断循环、后续 Observer 收不到；③ 遍历中若 Observer 内部再调 register/remove 改 List，会抛 ConcurrentModificationException，生产里通常换 CopyOnWriteArrayList 或先 snapshot 解决"
+        },
+        {
+          "line": 33,
+          "note": "setState 入口内联调用 notifyObservers——状态变更和通知传播在同一调用栈、同一线程、同一事务里；这是「观察者同步传播」的根因，也是 Spring 监听器默认会拖垮发布方事务的根因"
+        }
+      ],
+      "language": "java",
+      "title": "代码示例",
+      "type": "code"
+    },
+    {
+      "content": "**30 秒结论（一句话定调）**：观察者模式解决的是「一对多」的状态同步——一个对象状态变了，所有订阅它的对象自动收到通知，主题不关心观察者是谁、想干什么。在 Spring 里它的具象化是 `ApplicationEventPublisher` + `@EventListener`：发布方调 `publishEvent(event)`，Spring 在 `SimpleApplicationEventMulticaster.multicastEvent` 里遍历当前事件类型匹配的所有监听器方法依次调用，默认跑在发布方线程。\n\n**机制拆解（按追问顺序）**：\n\n1. **Subject 内部结构**：本质上是一个 `List<Observer>` 加三个方法（`register/remove/notify`）。Spring 把它实现成 `SimpleApplicationEventMulticaster`，监听器在启动期通过 `EventListenerMethodProcessor`（实现 `SmartInitializingSingleton`）扫到 `@EventListener` 注解后，按事件类型分类缓存到 `retrieverCache`。\n2. **同步 vs 异步的开关**：`SimpleApplicationEventMulticaster` 默认 `setTaskExecutor(null)`——同步执行，跟发布方共享线程与事务。异步必须显式 `multicaster.setTaskExecutor(...)` 或在监听方法上加 `@Async` 并配合 `@EnableAsync`，二者缺一不可。\n3. **事务边界**：`@EventListener` 跑在发布方事务里；事务提交后才该做的事（发短信、写缓存）要用 `@TransactionalEventListener(phase = AFTER_COMMIT)`，否则事务回滚后通知已发。\n4. **过滤**：`@EventListener(condition = \"#event.orderId.startsWith('VIP')\")` 在注册期生成 SpEL 谓词，运行时由 `EventExpressionEvaluator` 求值，谓词为 false 直接跳过，省一次方法调用；也可以用 `classes` 限定事件类型减少遍历。\n5. **异常隔离**：JDK 事件里一个监听器抛异常会中断后续；Spring 在匹配阶段用 `ClassFilter.matches` 过滤类型，但执行阶段不自动捕获业务异常——必须在监听方法里 `try/catch`，或实现 `ErrorHandler` 接口统一兜底。\n\n**追问应对**——四个最常被追问的方向：\n\n- 问「Spring 事件是同步还是异步」：明确说「**默认同步、共享发布方线程和事务**，异步需要 `@Async` + `@EnableAsync` 或自定义 TaskExecutor」。\n- 问「和 MQ 什么关系」：观察者模式是进程内一对多，MQ 是进程间一对多（broker 解耦、可持久化、可重试），本质思想相同但工程边界不同。MQ 消费者侧要自己做幂等 + ack，监听器这边没有这套机制。\n- 问「内存泄漏怎么排查」：主题对监听器是强引用（Spring 强引用 `Method` + `beanName`）。短生命周期 Bean（`@RequestScope`、Activity 风格的 UI 组件）订阅全局事件时必须显式注销：实现 `DisposableBean.destroy()` 调 `applicationContext.getApplicationListeners()` 清空，或用 `ApplicationContextAware` 在销毁时调 `multicaster.removeApplicationListener`。MAT 里看 `ApplicationListenerMethodAdapter` 的 `targetBean` 被谁 GC Root 链挂住就是这种症状。\n- 问「Guava EventBus 和 GoF 观察者什么关系」：Guava EventBus 严格说不是 GoF 纯观察者：它引入了 `EventBus` 作为中介、发布者只面向 `EventBus.post(event)`、订阅者用 `@Subscribe` 注解注册，发布者对订阅者零感知；更接近「进程内发布订阅」或「中介者+观察者」的混合体。",
+      "followUpQuestions": [
+        {
+          "question": "在 Spring 框架中，观察者模式有哪些经典应用？能结合源码说说吗？",
+          "answer": "Spring 把观察者模式包装成事件机制，核心是 `ApplicationEventPublisher` 接口和 `ApplicationEventMulticaster` 抽象。默认实现 `SimpleApplicationEventMulticaster` 在 `multicastEvent` 阶段做三件事：用 `getApplicationListeners(event, type)` 从 `retrieverCache`（按事件类型分组的 `ListenerRetriever`）里拿匹配监听器列表；若 `setTaskExecutor` 非空就走异步，否则在当前线程依次调 `invokeListener`。监听器注册由 `EventListenerMethodProcessor`（实现 `SmartInitializingSingleton`）在 `afterSingletonsInstantiated` 阶段扫描所有 Bean 的 `@EventListener` 方法，按事件类型分类缓存。常见场景：用户注册后发邮件/积分（`UserRegisteredEvent` + 多个 `@EventListener`），订单创建后清购物车（用 `@TransactionalEventListener(phase = AFTER_COMMIT)` 避免事务回滚后购物车还空着）。"
+        },
+        {
+          "question": "Spring 事件默认同步，一个监听器抛异常或很慢会怎样？怎么处理？",
+          "answer": "默认同步意味着发布事件的线程会依次执行所有监听器、跟发布方共用一个线程栈和事务：某个监听器抛 RuntimeException 会向上传播到 `multicastEvent` 调用方，可能打断后续监听器甚至污染发布方事务（如果监听器内做了写操作但事务尚未提交，回滚会一起回滚）；某个监听器慢会直接拖慢发布方的 RT，甚至把数据库连接池耗光。处理：① 慢监听器加 `@Async`（配合 `@EnableAsync`）走独立线程池；② 业务异常在监听方法内 `try/catch` 隔离，或给 `SimpleApplicationEventMulticaster` 设 `setErrorHandler(new LoggingErrorHandler())` 统一兜底；③ 真正应该等事务提交后再做的事用 `@TransactionalEventListener(phase = AFTER_COMMIT)` 移出事务边界。"
+        },
+        {
+          "question": "观察者模式和发布订阅（消息队列）是一回事吗？",
+          "answer": "不完全是。观察者模式里主题直接持有 `List<Observer>`、状态变了直接遍历调用，发布者和观察者在同一进程、彼此『半认识』——Spring 同步事件就是这种结构。发布订阅多了一个中间人（broker/消息队列）：发布者只把消息发给 broker，订阅者从 broker 订阅，两边完全不知道对方是谁，可以跨进程、跨机器，还能做持久化、重试、削峰、死信队列。核心差别就一个：有没有 broker 解耦。GoF 经典观察者没有 broker，Guava EventBus 介于两者之间（进程内有 `EventBus` 作为中介，发布者对订阅者零感知），MQ 是纯发布订阅。"
+        },
+        {
+          "question": "如何排查观察者模式引起的内存泄漏？",
+          "answer": "症状：应用长时间运行后 Old Gen 持续增长、Full GC 频繁，dump 出来看大量 `ApplicationListenerMethodAdapter` 或自定义 `Observer` 实例被强引用。排查步骤：① `jmap -dump:live,format=b,file=heap.hprof <pid>` 抓快照；② MAT / VisualVM 打开后看 `List<Observer>` 或 `retrieverCache` 持有的对象，找 `GC Root → Subject → Observer → 业务 Bean` 这条链；③ 看 Observer 是不是短生命周期（带 `@RequestScope`、Activity 风格的 UI 组件）；④ 在 Observer 侧加注销钩子（`@PreDestroy` 调 `multicaster.removeApplicationListener`，或框架侧用 `LiveData` / `Flow` / `LifecycleObserver` 绑生命周期自动解订）。"
+        }
+      ],
+      "title": "面试回答",
+      "type": "interviewAnswer"
+    },
+    {
+      "items": [
+        "能口述 Subject 维护 `List<Observer>` + register/remove/notify 三方法的状态变更触发流程",
+        "能讲清 `ApplicationEventPublisher.publishEvent` 默认在发布方线程同步执行、异步需 `@Async` + `@EnableAsync` 同时配置",
+        "能写出 `@EventListener(condition = \"#event.xxx\")` 的 SpEL 过滤表达式",
+        "能区分观察者模式（进程内、强引用、零中间人）与发布订阅（broker 解耦、跨进程、可持久化）",
+        "能说明 `@TransactionalEventListener(phase=AFTER_COMMIT)` 解决的事务回滚后副作用已落地的问题",
+        "能识别『Subject 强引用 Observer 引发内存泄漏』的根因与解法（注销/弱引用/Lifecycle 绑定）"
+      ],
+      "title": "学完后应能说清楚",
+      "type": "checklist"
+    }
+  ],
+  "order": 30,
+  "prerequisites": [
+    "design-pattern.behavioral.topic-ce-lve-mo-shi"
+  ],
+  "recallPrompts": [
+    {
+      "id": "design-pattern.behavioral.topic-guan-zhe-zhe-mo-shi.recall.1",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 2,
+      "prompt": "面试官问你：Spring 的事件机制是如何实现的？ @EventListener 和 ApplicationListener 有什么区别？"
+    },
+    {
+      "id": "design-pattern.behavioral.topic-guan-zhe-zhe-mo-shi.recall.2",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 2,
+      "prompt": "假设你需要设计一个用户注册后发送邮件、短信、积分通知的系统，你会如何使用观察者模式？"
+    }
+  ],
+  "recommendWeight": 80,
+  "rubric": {
+    "commonMistakes": [
+      "误以为 Spring `ApplicationEventPublisher.publishEvent` 是异步的，实际默认同步跑在发布方线程",
+      "在 `@EventListener` 里做发短信/写缓存等事务边界外副作用，未用 `@TransactionalEventListener(phase=AFTER_COMMIT)`",
+      "Subject 用 `List<Observer>` 强持有短生命周期观察者（如 `@RequestScope` Bean）却未注销，dump 出 GC Root 链可定位",
+      "把 MQ 当作观察者模式的简单等价物，忽略 broker 的持久化、ack、削峰、死信队列能力"
+    ],
+    "goodToHave": [
+      "在『进程内同步事件 / 进程内异步事件 / 跨进程 MQ』三者间做场景化选择",
+      "Subject 强引用 Observer 导致内存泄漏的 GC Root 链定位",
+      "`SimpleApplicationEventMulticaster.retrieverCache` 与 `EventListenerMethodProcessor` 在启动期的注册流程"
+    ],
+    "mustHave": [
+      "Subject 持有 `List<Observer>` + register/remove/notify 三方法的契约",
+      "Spring `ApplicationEventPublisher.publishEvent` 默认同步、共享发布方线程与事务",
+      "`@EventListener` SpEL condition 过滤 + `@TransactionalEventListener(phase=...)` 事务相位",
+      "观察者模式（进程内、零中间人、强引用）vs 发布订阅（broker 解耦、跨进程、持久化）"
+    ],
+    "scoreWeights": {
+      "accuracy": 30,
+      "coverage": 35,
+      "depth": 15,
+      "interviewExpression": 20
+    }
+  },
+  "status": "draft",
+  "summary": "对象间一对多依赖，状态变化时自动通知所有订阅者；工程上对应 Spring 事件机制、Guava EventBus 等进程内事件总线。",
   "tags": [
     "设计模式",
     "行为型模式",
     "观察者模式"
   ],
-  "difficulty": 2,
-  "estimatedMinutes": 15,
-  "order": 30,
-  "recommendWeight": 80,
-  "status": "draft",
-  "learningCards": [
-    {
-      "type": "explain",
-      "title": "一对多通知、事件驱动与常见坑",
-      "content": "观察者模式定义对象间**一对多**的依赖：主题状态变化时，自动通知所有注册的观察者。它把“谁关心这件事”和“事情本身”解耦——主题不用知道有哪些观察者、它们要干什么，是事件驱动编程的基础。\n\n**四个角色**：主题（维护观察者列表、提供注册/注销/通知）、观察者（更新接口）、具体主题（状态变就通知）、具体观察者（实现响应逻辑）。\n\n**典型应用**：Spring 的 `ApplicationEvent` + `@EventListener`（默认同步，加 `@Async` 异步）、Guava `EventBus`、Swing 事件监听。\n\n**常见坑**：① 默认**同步**通知，某个观察者慢会拖累主题流程，必要时异步；② 一个观察者抛异常可能中断后续通知，要做异常隔离；③ 注册后忘了注销会导致**内存泄漏**（主题一直持有观察者引用）。\n\n**和发布订阅的区别**：观察者模式里主题**直接持有**观察者引用、直接通知；发布订阅中间多一个 broker（消息队列），发布者和订阅者互相不知道对方，耦合更松、可跨进程。"
-    },
-    {
-      "type": "diagram",
-      "title": "观察者模式通知流程",
-      "content": "flowchart TD\nA[Subject 状态变更] --> B[notifyObservers]\nB --> C[Observer A update]\nB --> D[Observer B update]\nB --> E[Observer C update]\nF[新观察者] --> G[registerObserver]\nG --> A\nH[观察者离开] --> I[removeObserver]\nI --> A",
-      "caption": "主题状态变更后自动通知所有已注册观察者",
-      "fallback": "观察者模式通知流程"
-    },
-    {
-      "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | 观察者模式 | 发布订阅模式 | 事件总线 |\n| ------ | ------------ | -------------- | ---------- |\n| 通信方式 | 直接通知 | 消息中间件 | 事件总线 |\n| 耦合度 | 中 | 低 | 低 |\n| 实现复杂度 | 简单 | 复杂 | 中 |\n| 典型实现 | Spring Event | RabbitMQ | Guava EventBus |\n| 同步/异步 | 都支持 | 异步 | 都支持 |\n| 过滤能力 | 需自己实现 | 支持 | 支持 |\n| 适用场景 | 应用内解耦 | 系统间解耦 | 应用内解耦 |"
-    },
-    {
-      "type": "code",
-      "title": "代码示例",
-      "content": "// 1. 观察者模式基础结构\npublic interface Subject {\n    void registerObserver(Observer observer);\n    void removeObserver(Observer observer);\n    void notifyObservers();\n}\npublic interface Observer {\n    void update(String message);\n}\npublic class ConcreteSubject implements Subject {\n    private List<Observer> observers = new ArrayList<>();\n    private String state;\n    \n    @Override\n    public void registerObserver(Observer observer) {\n        observers.add(observer);\n    }\n    \n    @Override\n    public void removeObserver(Observer observer) {\n        observers.remove(observer);\n    }\n    \n    @Override\n    public void notifyObservers() {\n        for (Observer observer : observers) {\n            observer.update(state);\n        }\n    }\n    \n    public void setState(String state) {\n        this.state = state;\n        notifyObservers();\n    }\n}\n\n// 2. Spring事件机制\n// 定义事件\npublic class OrderEvent extends ApplicationEvent {\n    private String orderId;\n    \n    public OrderEvent(Object source, String orderId) {\n        super(source);\n        this.orderId = orderId;\n    }\n}\n// 发布事件\n@Component\npublic class OrderService {\n    @Autowired\n    private ApplicationEventPublisher publisher;\n    \n    public void createOrder(String orderId) {\n        // 创建订单逻辑\n        publisher.publishEvent(new OrderEvent(this, orderId));\n    }\n}\n// 监听事件\n@Component\npublic class OrderListener implements ApplicationListener<OrderEvent> {\n    @Override\n    public void onApplicationEvent(OrderEvent event) {\n        System.out.println(\"订单创建: \" + event.getOrderId());\n    }\n}\n\n// 3. @EventListener注解\n@Component\npublic class AnnotationListener {\n    @EventListener\n    public void handleOrderEvent(OrderEvent event) {\n        System.out.println(\"注解监听: \" + event.getOrderId());\n    }\n    \n    @EventListener(condition = \"#event.orderId.startsWith('VIP')\")\n    public void handleVipOrder(OrderEvent event) {\n        System.out.println(\"VIP订单处理\");\n    }\n}\n\n// 4. 异步事件\n@Component\npublic class AsyncEventListener {\n    @Async\n    @EventListener\n    public void handleAsync(OrderEvent event) {\n        // 异步处理\n    }\n}",
-      "language": "java",
-      "highlights": [
-        {
-          "line": 26,
-          "note": "这里体现状态推进或遍历过程，需要说明终止条件、复杂度和异常输入。"
-        }
-      ]
-    },
-    {
-      "type": "interviewAnswer",
-      "title": "面试回答思路",
-      "content": "结论：观察者模式 要先说清它解决什么问题，再展开机制、边界和验证方式。定义对象间一对多的依赖关系，当对象状态改变时，所有依赖它的对象都会得到通知。\n\n我会这样回答：\n1. 先定位核心问题：观察者模式结构。\n2. 再串起关键机制：Spring事件机制，并说明它和 @EventListener用法 的关系。\n3. 接着补充边界和风险：不清楚Spring事件机制是同步的（异步需要@Async。\n4. 最后落到验证方式：结合对象职责、协作关系、扩展点和滥用边界验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
-      "followUpQuestions": [
-        {
-          "question": "在Spring框架中，观察者模式有哪些经典应用？能结合源码说说吗？",
-          "answer": "观察者模式在Spring中的应用：ApplicationEvent+ApplicationListener。@EventListener注解简化注册。Spring事件是同步的，异步需要@Async。MQ本质上是分布式观察者模式。Guava的EventBus也是实现。"
-        },
-        {
-          "question": "Spring 事件默认同步，一个监听器抛异常或很慢会怎样？怎么处理？",
-          "answer": "默认同步意味着发布事件的线程会依次执行所有监听器，和发布者在同一个事务/线程里：某个监听器抛异常会向上传播、可能打断后续监听器甚至回滚发布方事务；某个监听器慢会直接拖慢发布方的响应。处理：对耗时或非关键的监听器加 @Async（配合 @EnableAsync）异步执行，互不阻塞；关键逻辑做好异常捕获和隔离；需要等事务提交后再处理的用 @TransactionalEventListener。"
-        },
-        {
-          "question": "观察者模式和发布订阅（消息队列）是一回事吗？",
-          "answer": "不完全是。观察者模式里主题直接持有观察者列表、状态变了直接挨个调用，发布者和观察者在同一进程、彼此‘半认识’。发布订阅多了一个中间人（broker/消息队列）：发布者只把消息发给 broker，订阅者从 broker 订阅，两边完全不知道对方是谁，可以跨进程、跨机器，还能做持久化、重试、削峰。可以说发布订阅是观察者思想在分布式下的加强版，核心差别就在于‘有没有中间 broker 解耦’。"
-        }
-      ]
-    },
-    {
-      "type": "checklist",
-      "title": "学完后应能说清楚",
-      "items": [
-        "观察者模式的核心结构",
-        "Spring事件机制的使用方法",
-        "@EventListener注解的用法",
-        "观察者模式与发布订阅模式的区别",
-        "同步观察者和异步观察者的区别"
-      ]
-    }
-  ],
-  "recallPrompts": [
-    {
-      "id": "design-pattern.behavioral.topic-guan-zhe-zhe-mo-shi.recall.1",
-      "prompt": "面试官问你：Spring的事件机制是如何实现的？@EventListener和ApplicationListener有什么区别？",
-      "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 2
-    },
-    {
-      "id": "design-pattern.behavioral.topic-guan-zhe-zhe-mo-shi.recall.2",
-      "prompt": "假设你需要设计一个用户注册后发送邮件、短信、积分通知的系统，你会如何使用观察者模式？",
-      "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 2
-    }
-  ],
-  "rubric": {
-    "mustHave": [
-      "观察者模式结构",
-      "Spring事件机制",
-      "@EventListener用法",
-      "与发布订阅区别"
-    ],
-    "goodToHave": [
-      "观察者模式与消息队列的选择",
-      "观察者模式的内存泄漏问题",
-      "能用具体示例、运行现象或可观测指标验证「观察者模式」的判断"
-    ],
-    "commonMistakes": [
-      "不清楚Spring事件机制是同步的（异步需要@Async）",
-      "不了解MQ作为分布式观察者模式的应用",
-      "观察者和被观察者的解耦方式不清楚"
-    ],
-    "scoreWeights": {
-      "coverage": 35,
-      "accuracy": 30,
-      "interviewExpression": 20,
-      "depth": 15
-    }
-  },
-  "prerequisites": [
-    "design-pattern.behavioral.topic-ce-lve-mo-shi"
-  ],
-  "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「观察者模式」说清观察者模式结构、Spring事件机制，并放到设计模式场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-12"
+  "title": "观察者模式",
+  "updatedAt": "2026-06-14"
 }

@@ -3,14 +3,15 @@
   "domain": "devops",
   "category": "container-k8s",
   "group": "container-k8s",
-  "title": "Kubernetes 调度、资源限制与探针",
-  "summary": "理解 requests/limits、调度约束、健康探针、QoS 和驱逐机制。",
+  "title": "K8s 调度与资源管理",
+  "summary": "讲清 kube-scheduler 的 predicates+priorities 两阶段决策、requests/limits 与 QoS 三档、亲和性与污点容忍、超卖驱逐的全链路。",
   "tags": [
     "DevOps",
     "Kubernetes",
     "调度",
-    "资源限制",
-    "探针"
+    "QoS",
+    "亲和性",
+    "驱逐"
   ],
   "difficulty": 3,
   "estimatedMinutes": 30,
@@ -19,74 +20,105 @@
   "status": "production",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能解释 Pod 为什么调度失败、重启、限流或被驱逐。",
+  "interviewerFocus": "Pod 从 Pending 到被调度、被驱逐之间，调度器、kubelet、cgroup 各自扮演什么角色，以及 requests/limits 错配会引发哪些线上故障。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Kubernetes 调度、资源限制与探针 的职责边界",
-      "content": "Kubernetes 调度器根据资源请求、节点标签、亲和性、污点容忍等条件为 Pod 选择节点。requests 影响调度，limits 影响运行时上限，探针影响服务是否被接流量和是否重启。\n\n学习 Kubernetes 调度、资源限制与探针 时，可以先沿「Pod 资源请求 -> 调度器筛选节点 -> 容器运行限制 -> Liveness Readiness 探针 -> QoS 驱逐决策」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n\n- requests：调度预留依据，适合 容量规划，风险是 设置过高导致 Pending\n- limits：运行上限控制，适合 防止资源争抢，风险是 过低导致限流或 OOM\n- readinessProbe：决定是否接流量，适合 启动预热和依赖检查，风险是 失败会摘出 Service\n- livenessProbe：判断是否重启容器，适合 死锁和卡死恢复，风险是 配置过激会反复重启\n\n把这条路径落回 Kubernetes 调度、资源限制与探针 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "kube-scheduler 的两阶段：Filter（predicates）与 Score（priorities）",
+      "content": "调度器从 apiserver watch 到 spec.nodeName 为空的 Pod 后，对每个候选节点跑两轮。\n\n1. Filter 阶段（旧名 predicates）：剔除不满足硬条件的节点。常见过滤器有 NodeResourcesFit（requests 是否够，注意比的是 Allocatable 而不是 Capacity）、NodeAffinity（required 段）、PodTopologySpread、TaintToleration、NodeUnschedulable、VolumeBinding（PV 拓扑）、NodePorts。任何一项不通过节点直接淘汰。\n2. Score 阶段（旧名 priorities）：对幸存节点按多个插件打 0-100 分加权求和。常见打分器：LeastAllocated 偏好空闲多的节点、BalancedAllocation 偏好 CPU/内存使用率均衡的、ImageLocality 偏好已拉好镜像的、InterPodAffinity、TaintToleration（preferredDuringScheduling 走这里）。最高分胜出，并发同分时随机。\n\n胜出后调度器调用 Bind 把 Pod 的 spec.nodeName 写回 apiserver，kubelet 才看见并真正拉起容器。所以 `kubectl describe pod` 里 Events 中 `FailedScheduling 0/12 nodes are available: 6 Insufficient cpu, 4 node(s) had taint ...` 就是 Filter 阶段输出的真实原因。按这一行就能定位到底是资源不足、亲和性、污点还是 PVC 拓扑问题，不用瞎猜。"
     },
     {
       "type": "explain",
-      "title": "Kubernetes 调度、资源限制与探针 的失败模式与排查",
-      "content": "这类问题要把调度前、运行中和故障恢复分开。Pending 常看资源和约束，CrashLoopBackOff 常看进程退出和探针，OOMKilled 常看内存 limit 与应用峰值。\n\nKubernetes 调度、资源限制与探针 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n\n- 「Kubernetes 调度、资源限制与探针 的核心目标」决定这个知识点的主线，必须先说清触发条件\n- 「Pod 资源请求、调度器筛选节点、容器运行限制 的关系」决定方案能否稳定落地，不能只停留在名称层面\n- 「只背工具命令而不讲执行链路」是常见失效点，需要提前说明防护或修复方式\n- 可以用「能结合 events、describe pod、metrics、OOMKilled、probe failure 日志 做定位」验证自己是否能说出关键路径\n\n排查时不要先猜结论，应把现象映射到 调度器筛选节点、容器运行限制、Liveness Readiness 探针 这些环节，再结合 events、describe pod、metrics、OOMKilled、probe failure 日志 验证。"
+      "title": "requests/limits 与 QoS：三档分类决定谁先被驱逐",
+      "content": "requests 是调度依据，limits 是 cgroup 上限，二者搭配决定 Pod 的 QoSClass。而 QoSClass 直接决定节点资源紧张时谁第一个被 kubelet 干掉。\n\n- Guaranteed：每个容器的每种资源 requests == limits（且都显式写了）。OOM score 最低，节点驱逐时最后被赶。\n- Burstable：至少有一个 request 或 limit 设置，但不满足 Guaranteed 的等式条件。最常见档位。\n- BestEffort：requests 和 limits 都没设。OOM score 最高，节点压力一来第一个被驱逐。\n\nCPU 与内存的执行差异要分清：CPU limit 触发的是 cgroup CFS 限流（throttling），表现是 P99 抖动、`container_cpu_cfs_throttled_periods_total` 升高，进程不会死。内存 limit 触发的是 OOMKilled，进程被 SIGKILL，`kubectl describe` 里 Last State Reason 写得很清楚。\n\n超卖来自 requests << limits 的差值：节点 Allocatable 按 requests 之和算，所以你可以把 requests 调小、limits 留大，让更多 Pod 落到同一节点。代价是节点真的吃紧时 kubelet 走 eviction：先按 PriorityClass，再按 QoSClass（BestEffort → Burstable → Guaranteed），同档内按内存使用超 request 的程度排序。这就是为什么生产关键服务必须显式写 requests，否则掉成 BestEffort 一压就被赶。"
+    },
+    {
+      "type": "explain",
+      "title": "亲和性、反亲和性与污点容忍：让 Pod 落到该落的节点",
+      "content": "三套机制按强度从弱到强叠加，调度器在 Filter/Score 两阶段分别消化。\n\n- nodeSelector：最朴素的 label 精确匹配，required 语义，不满足直接 Filter 掉。\n- nodeAffinity：requiredDuringSchedulingIgnoredDuringExecution 走 Filter（必须满足），preferredDuringScheduling 走 Score（加权偏好）。`IgnoredDuringExecution` 表示已调度的 Pod 不会因为节点 label 后改变而被赶走。\n- podAffinity / podAntiAffinity：基于 topologyKey（一般是 `kubernetes.io/hostname` 或 `topology.kubernetes.io/zone`）让 Pod 靠近或远离其他 Pod。最经典是 web 服务用 `podAntiAffinity + topologyKey: hostname` 强制不同副本落在不同节点，避免单机故障一次性带走全部副本。注意 podAffinity 是 O(N²) 计算，大集群上 required 段会显著拖慢调度，能用 PodTopologySpread 替代就替代。\n- taints/tolerations：方向反过来——taint 打在节点上排斥 Pod，Pod 必须显式 toleration 才能落进去。effect 三档：NoSchedule（新 Pod 不进来）、PreferNoSchedule（尽量不进）、NoExecute（连已经在跑的没 toleration 的也踢走，常见于节点 NotReady 后的 `node.kubernetes.io/unreachable:NoExecute` 自动 taint）。GPU 节点、专属租户节点、master 节点都是用 taint 实现隔离的。\n\n排查口诀：`describe pod` 看 Events 报的具体原因；亲和性问题对照 `kubectl get nodes --show-labels`；污点问题对照 `kubectl describe node | grep Taints`。"
     },
     {
       "type": "diagram",
-      "title": "Kubernetes 调度与健康检查链路",
+      "title": "kube-scheduler 调度与节点驱逐全链路",
       "format": "mermaid",
-      "content": "flowchart LR\nA[Pod 资源请求] --> B[调度器筛选节点]\nB[调度器筛选节点] --> C[容器运行限制]\nC[容器运行限制] --> D[Liveness Readiness 探针]\nD[Liveness Readiness 探针] --> E[QoS 驱逐决策]",
-      "fallback": "Pod 资源请求 -> 调度器筛选节点 -> 容器运行限制 -> Liveness Readiness 探针 -> QoS 驱逐决策",
-      "caption": "图示把资源请求、节点选择、运行限制、探针和驱逐串成排查路径。"
+      "content": "flowchart TD\nA[Pod 创建 spec.nodeName 为空] --> B[调度队列]\nB --> C[Filter 阶段]\nC --> D{NodeResourcesFit}\nD -- 否 --> E[淘汰: Insufficient cpu/memory]\nD -- 是 --> F{TaintToleration}\nF -- 否 --> G[淘汰: taint 不匹配]\nF -- 是 --> H{PodTopologySpread}\nH -- 否 --> I[淘汰: 拓扑分布不满足]\nH -- 是 --> J[Score 阶段]\nJ --> K[LeastAllocated 打分]\nK --> L[BalancedAllocation 打分]\nL --> M[ImageLocality 打分]\nM --> N[最高分节点胜出]\nN --> O[Bind: 写入 spec.nodeName]\nO --> P[kubelet 拉起容器]\nP --> Q[cgroup 执行 requests/limits]\nQ --> R{节点压力?}\nR -- 是 --> S[按 PriorityClass 排序]\nS --> T[按 QoSClass 驱逐]\nT --> U[BestEffort最先 Burstable次之 Guaranteed最后]\nR -- 否 --> V[正常运行]",
+      "fallback": "调度链路：Pod 无 nodeName → Filter 阶段按 NodeResourcesFit/TaintToleration/PodTopologySpread 淘汰节点 → Score 阶段按 LeastAllocated/BalancedAllocation/ImageLocality 打分 → Bind 写入 nodeName → kubelet 拉起 → cgroup 执行 limits。节点压力时按 PriorityClass → QoSClass（BestEffort → Burstable → Guaranteed）顺序驱逐。",
+      "caption": "Filter 阶段输出在 kubectl describe pod 的 Events 里可直接看到，是 Pending 排查的第一线索。节点驱逐按 QoSClass 分层，Guaranteed 最后才被赶。"
     },
     {
       "type": "compareTable",
-      "title": "资源与探针机制对比",
+      "title": "QoS 三档行为对比",
       "columns": [
-        "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
+        "QoSClass",
+        "判定条件",
+        "OOM score 倾向",
+        "节点驱逐顺序",
+        "典型用法"
       ],
       "rows": [
         [
-          "requests",
-          "调度预留依据",
-          "容量规划",
-          "设置过高导致 Pending"
+          "Guaranteed",
+          "每容器每资源 requests == limits 且都显式设置",
+          "最低（-997 左右）",
+          "最后被驱逐",
+          "数据库、核心交易服务"
         ],
         [
-          "limits",
-          "运行上限控制",
-          "防止资源争抢",
-          "过低导致限流或 OOM"
+          "Burstable",
+          "至少设置一个 request/limit 但不满足 Guaranteed 等式",
+          "中等（按使用量浮动）",
+          "次于 BestEffort",
+          "Web 服务、大多数业务 Pod"
         ],
         [
-          "readinessProbe",
-          "决定是否接流量",
-          "启动预热和依赖检查",
-          "失败会摘出 Service"
-        ],
-        [
-          "livenessProbe",
-          "判断是否重启容器",
-          "死锁和卡死恢复",
-          "配置过激会反复重启"
+          "BestEffort",
+          "所有容器都不设 requests 和 limits",
+          "最高（1000）",
+          "节点压力下第一个被驱逐",
+          "可重跑的临时 Job、调试 Pod"
         ]
+      ]
+    },
+    {
+      "type": "code",
+      "title": "podAntiAffinity + tolerations 的标准写法",
+      "language": "yaml",
+      "content": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: payment-api\nspec:\n  replicas: 3\n  template:\n    spec:\n      tolerations:\n        - key: dedicated\n          operator: Equal\n          value: payment\n          effect: NoSchedule\n      affinity:\n        nodeAffinity:\n          requiredDuringSchedulingIgnoredDuringExecution:\n            nodeSelectorTerms:\n              - matchExpressions:\n                  - key: workload\n                    operator: In\n                    values: [\"payment\"]\n        podAntiAffinity:\n          requiredDuringSchedulingIgnoredDuringExecution:\n            - labelSelector:\n                matchLabels:\n                  app: payment-api\n              topologyKey: kubernetes.io/hostname\n      containers:\n        - name: app\n          image: registry.example.com/payment-api:v1.8.2\n          resources:\n            requests:\n              cpu: \"500m\"\n              memory: \"512Mi\"\n            limits:\n              cpu: \"1\"\n              memory: \"512Mi\"\n",
+      "highlights": [
+        {
+          "line": 8,
+          "note": "tolerations 必须和 payment 专属节点上的 taint `dedicated=payment:NoSchedule` 完全对上，否则 Filter 阶段直接被刷掉。"
+        },
+        {
+          "line": 14,
+          "note": "nodeAffinity 用 required 段强制只能落到 workload=payment 的节点。和 toleration 是双向门——节点既要让你进，你也要选它。"
+        },
+        {
+          "line": 22,
+          "note": "podAntiAffinity + hostname topologyKey 保证 3 个副本一定散到 3 个节点上，单机宕机不会一次性吃掉所有副本。"
+        },
+        {
+          "line": 32,
+          "note": "memory requests 和 limits 都是 512Mi 但 CPU requests 500m 而 limits 1，所以这是 Burstable 不是 Guaranteed。想做 Guaranteed 必须 CPU 也写成相等。"
+        }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：Kubernetes 调度、资源限制与探针 要从目标、关键机制、风险边界和观测验证四层回答。\n\n我会按这几层展开：\n1. 先说明它解决的核心工程问题是  requests/limits、调度约束、健康探针、QoS 和驱逐机制。\n2. 再沿着 Pod 资源请求、调度器筛选节点、容器运行限制、Liveness Readiness 探针、QoS 驱逐决策 说明执行链路\n3. 然后讲清 requests 和 limits 的适用边界\n4. 最后补充用 events、describe pod、metrics、OOMKilled、probe failure 日志 验证效果和定位异常\n\n最后补充边界：云原生能力提升交付和治理效率，但配置错误、权限过大和观测缺失会把故障影响放大。",
+      "content": "**30 秒结论**\n\nK8s 调度本质是 kube-scheduler 的两阶段决策（Filter 排除硬约束、Score 给候选节点打分），落到节点后由 kubelet 按 cgroup 执行 requests/limits、按 QoSClass 决定驱逐顺序。\n\n**核心机制**\n\n1. **Filter 阶段**：跑 NodeResourcesFit、NodeAffinity、TaintToleration 等过滤插件，任何一项不过节点就被淘汰。这也是 `FailedScheduling Insufficient cpu / had taint` 报错的来源。\n2. **Score 阶段**：跑 LeastAllocated、BalancedAllocation、ImageLocality 等打分器加权求和，最高分胜出。\n3. **kubelet 执行**：Bind 完后 kubelet 拉起容器。CPU limit 触发 CFS 限流（throttle，进程不死），memory limit 触发 OOMKilled（进程被 SIGKILL）。\n\n**边界点**\n\n- requests 决定调度和 QoSClass，limits 决定运行上限。\n- Guaranteed/Burstable/BestEffort 三档驱逐顺序是 BestEffort → Burstable → Guaranteed。\n- 超卖就是把 sum(requests) 调到接近 Allocatable、但 sum(limits) 远大于 Allocatable 来榨容量，代价是节点压力时驱逐风暴。\n- 亲和性里 podAntiAffinity + hostname topologyKey 是高可用副本打散的标配，taints/tolerations 用来做 GPU、专属租户、master 节点隔离。\n\n**生产排查**\n\nPending 看 `describe pod` 的 Events，CrashLoop 看容器退出码和探针配置，OOMKilled 看 `Last State.Reason` 和 `container_memory_working_set_bytes` 是否长期顶到 limit，CPU 抖动看 `container_cpu_cfs_throttled_periods_total`。",
       "followUpQuestions": [
         {
-          "question": "Kubernetes 调度、资源限制与探针 出问题时你先看哪些信号？",
-          "answer": "我会先看 events、describe pod、metrics、OOMKilled、probe failure 日志，把异常定位到 调度器筛选节点、容器运行限制、Liveness Readiness 探针，再决定是回滚、降级、扩容还是修配置。"
+          "question": "线上一个 Pod 一直 Pending，你怎么按调度链路排查？",
+          "answer": "先 `kubectl describe pod` 看 Events，里面会写 `FailedScheduling 0/N nodes are available: X Insufficient cpu, Y node(s) had taint, Z node(s) didn't match Pod's node affinity`——直接告诉你 Filter 阶段是哪个插件刷的。如果是 Insufficient，对照节点 Allocatable（不是 Capacity）和现有 sum(requests)，看看是不是 requests 写太大或者节点真的满了。如果是 taint，对照 `kubectl describe node | grep Taints` 加 toleration。如果是 affinity，`kubectl get nodes --show-labels` 看 label 和 nodeAffinity 里的 matchExpressions 对不对得上。如果是 PVC 拓扑（`had volume node affinity conflict`），就是 PV 绑定的 zone 和节点 zone 不一致，常见于跨可用区调度。"
         },
         {
-          "question": "Kubernetes 调度、资源限制与探针 最容易忽略的边界是什么？",
-          "answer": "最容易忽略的是自动化本身也会放大错误，所以必须保留审批、审计、回滚、灰度和人工接管路径。"
+          "question": "QoS 三档的驱逐顺序是怎么定的，为什么核心服务要做成 Guaranteed？",
+          "answer": "节点出现内存压力（kubelet 触发 eviction signal，比如 `memory.available` 低于阈值）时，kubelet 按这个顺序选受害者：先按 PriorityClass 从低到高、再按 QoSClass 顺序 BestEffort → Burstable → Guaranteed、同档内按内存使用超过 request 的程度排序。Guaranteed 的容器 OOM score 最低（约 -997），同时驱逐排在最后，所以核心服务（支付、数据库）做成 Guaranteed 就能在节点紧张时活到最后一刻。代价是 Guaranteed 占用的是 limits 而不是 requests 的容量，集群整体超卖比降低。BestEffort 一旦出现就要警惕：忘写 requests 的 Pod 在节点压力时第一个被赶，且 OOM score 1000 还容易被内核直接 kill，绝对不能用在生产关键链路。"
+        },
+        {
+          "question": "podAntiAffinity 和 PodTopologySpreadConstraints 在做副本打散上有什么区别，你会选哪个？",
+          "answer": "podAntiAffinity 的 required 段是硬约束：`topologyKey: hostname` 时如果只有 2 个节点你部署 3 副本，第 3 个就永远 Pending，且大集群上 O(N²) 计算开销很大，调度延迟会被拖慢。PodTopologySpreadConstraints 用 `maxSkew` 表达倾斜度容忍，`whenUnsatisfiable: ScheduleAnyway` 是软约束（尽量散但不卡死），`DoNotSchedule` 才是硬约束，且原生支持 zone/region 多层打散。我的选择：副本数 ≤ 节点数且强一致要求（比如 etcd、数据库）用 podAntiAffinity required；普通业务的多 zone 打散用 topologySpread + maxSkew=1 + ScheduleAnyway，既散开又不会因为一个 zone 暂时容量紧张就 Pending。"
         }
       ]
     },
@@ -94,59 +126,66 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 Kubernetes 调度、资源限制与探针 的目标和边界",
-        "能沿 Pod 资源请求 -> 调度器筛选节点 -> 容器运行限制 -> Liveness Readiness 探针 -> QoS 驱逐决策 讲清链路",
-        "能解释关键配置和失败模式",
-        "能用观测指标验证效果"
+        "kube-scheduler 的 Filter 和 Score 两阶段各跑哪些插件，输出在 describe pod 的 Events 里长什么样",
+        "requests 和 limits 的语义差异，以及 CPU limit 触发限流、memory limit 触发 OOMKilled 的区别",
+        "Guaranteed/Burstable/BestEffort 的判定条件和节点压力下的驱逐顺序",
+        "nodeAffinity required 与 preferred、podAntiAffinity 与 PodTopologySpread 的取舍",
+        "taints 三种 effect（NoSchedule/PreferNoSchedule/NoExecute）的差异和典型用法",
+        "超卖的实现方式（requests 紧、limits 松）和它带来的驱逐风暴风险"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "devops.container-k8s.scheduling-resource.recall.1",
-      "prompt": "请讲一下 Kubernetes 调度、资源限制与探针 的核心链路和它解决的工程问题。",
+      "prompt": "kube-scheduler 调度一个 Pod 时，Filter 和 Score 两个阶段分别做什么？常见的过滤插件和打分插件各举几个。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "devops.container-k8s.scheduling-resource.recall.2",
-      "prompt": "Kubernetes 调度、资源限制与探针 在生产环境里最常见的失败模式有哪些？",
+      "prompt": "Guaranteed、Burstable、BestEffort 是怎么判定的？节点出现内存压力时谁先被驱逐？为什么核心服务建议做成 Guaranteed？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "devops.container-k8s.scheduling-resource.recall.3",
-      "prompt": "如果 Kubernetes 调度、资源限制与探针 相关变更上线后异常，你会如何回滚和验证？",
+      "prompt": "线上一个 Pod 长时间 Pending，又一个 Pod 反复 OOMKilled，你分别会从哪些命令和指标入手定位？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明 Kubernetes 调度、资源限制与探针 的核心目标",
-      "能讲清 Pod 资源请求、调度器筛选节点、容器运行限制 的关系",
-      "能指出 requests 和 limits 的差异",
-      "能给出可观测验证和回滚思路"
+      "kube-scheduler 的 Filter（predicates）和 Score（priorities）两阶段流程",
+      "requests 决定调度与 QoS、limits 决定 cgroup 上限的语义差异",
+      "Guaranteed/Burstable/BestEffort 三档判定条件与驱逐顺序",
+      "CPU limit 触发 CFS 限流 vs memory limit 触发 OOMKilled 的执行差异",
+      "taints/tolerations 三种 effect 和 nodeAffinity required/preferred 的语义"
     ],
     "goodToHave": [
-      "能结合 events、describe pod、metrics、OOMKilled、probe failure 日志 做定位",
-      "能说明多环境差异和权限边界",
-      "能把自动化、审计和回滚串成闭环"
+      "podAntiAffinity 与 PodTopologySpreadConstraints 在副本打散上的取舍",
+      "超卖（requests << limits）的容量收益和驱逐风暴代价",
+      "用 describe pod 的 FailedScheduling Events 直接定位 Filter 阶段失败原因",
+      "OOMKilled 排查时看 Last State Reason 和 container_memory_working_set_bytes",
+      "CPU 抖动排查时看 container_cpu_cfs_throttled_periods_total"
     ],
     "commonMistakes": [
-      "只背 Kubernetes 调度、资源限制与探针 的命令或组件，不说明交付链路和运行时对象",
-      "忽略 Kubernetes 调度、资源限制与探针 的回滚、权限、容量或人工接管边界",
-      "没有把指标、日志、告警和用户影响关联到 Kubernetes 调度、资源限制与探针"
+      "把 NodeResourcesFit 比的对象说成 Capacity（实际是 Allocatable，要扣掉 kube-reserved 和 system-reserved）",
+      "认为 CPU 超过 limit 也会 OOMKilled（实际只是 CFS 限流，进程不死）",
+      "忘记 BestEffort 在节点压力下第一个被驱逐，把临时 Job 的写法用到核心服务上",
+      "把 podAntiAffinity required 用在副本数 > 节点数的场景，导致 Pod 永远 Pending",
+      "只设了 limits 没设 requests 就以为是 Guaranteed（必须每容器每资源都显式相等才算）"
     ],
     "scoreWeights": {
       "coverage": 30,
-      "accuracy": 25,
+      "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 25
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-13"
 }

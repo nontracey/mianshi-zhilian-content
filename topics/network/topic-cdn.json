@@ -4,65 +4,114 @@
   "category": "dns-cdn",
   "group": "dns-cdn",
   "title": "CDN 原理与应用",
-  "summary": "理解CDN(内容分发网络)的工作原理，包括边缘节点、回源机制、DNS调度和缓存策略，掌握CDN在Web性能优化中的应用。",
+  "summary": "CDN 通过 GSLB+DNS 智能调度把请求引到就近边缘节点，命中缓存直接返回、未命中按 Cache-Control/ETag 回源，并配合分层缓存、预热与防穿透解决静态资源的延迟、带宽和源站压力问题。",
   "tags": [
     "CDN",
-    "内容分发",
-    "缓存",
-    "边缘节点"
+    "边缘缓存",
+    "GSLB",
+    "回源",
+    "Cache-Control",
+    "ETag"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 22,
   "order": 20,
   "recommendWeight": 85,
   "learningCards": [
     {
       "type": "explain",
-      "title": "CDN 原理与应用：它解决什么、请求怎么走",
-      "content": "## 它解决什么\nCDN 的目标是让用户从离自己更近、更空闲的边缘节点拿静态或半静态内容，而不是所有请求都打到源站。它同时降低延迟、削峰源站压力，并提升跨地域访问稳定性。\n\n## 请求怎么走\n用户访问加速域名时，DNS 会进入 CDN 的调度系统。调度系统根据用户 IP、运营商、地域、节点健康和负载返回合适的边缘节点 IP。用户请求边缘节点，命中缓存就直接返回；未命中或缓存过期时，边缘节点回源获取资源，再按缓存策略保存。\n\n## 命中率是核心指标\nCDN 不是简单代理，效果主要看命中率、回源率、首字节时间和带宽成本。`Cache-Control`、`Expires`、`ETag`、文件名 hash、主动刷新和预热都会影响缓存命中。\n\n## 边界和坑\n强动态接口不适合直接缓存，带 Cookie 或鉴权的资源要谨慎配置缓存 key，避免把用户私有数据缓存成公共内容。更新静态资源时优先使用内容 hash 文件名，而不是频繁全站刷新；大文件和视频还要关注 Range 请求、回源带宽和防盗链。"
+      "title": "CDN 调度链路：从用户 DNS 到边缘命中的完整路径",
+      "content": "## 一句话定位\nCDN 是一张分布在全球的反向代理+缓存网，用 GSLB（Global Server Load Balance）+ 智能 DNS 把用户解析到就近、健康、负载低的边缘节点（Edge / PoP），用边缘缓存替代源站直连，从而压低 RTT 与源站带宽。\n\n## 调度链路（一次用户请求要跑完的 6 步）\n1. 用户访问 `img.example.com`，本地 DNS 递归解析，CNAME 到 CDN 厂商域，例如阿里云 `*.kunlunca.com`、腾讯云 `*.dnsv1.com`、Cloudflare `*.cloudflare.net`。\n2. CDN 的权威 DNS 查 LDNS 出口 IP（或 EDNS Client Subnet 携带的真实用户网段），结合 IP 库判断地域 + 运营商。\n3. GSLB 综合\"地理就近、运营商一致、节点存活探测、当前带宽与连接数水位、容量配额\"选出 N 个候选边缘 IP，TTL 一般 60-300s 返回。\n4. 用户和该边缘节点建 TCP/TLS（边缘普遍支持 TLS 1.3 + 0-RTT、HTTP/2、QUIC），HTTP 请求落到边缘 L1 缓存。\n5. L1 命中（HIT）直接出，未命中（MISS）会先到同集群的 L2/父层（中间源/Shield），再 MISS 才回真正源站，目的是把 N 个 L1 的回源合并成 1 次。\n6. 边缘按响应里的 `Cache-Control`、`Expires`、`ETag`、`Last-Modified`、`Vary` 决定缓存 TTL 和缓存 key，并写入磁盘/内存缓存。\n\n## 三个真正决定效果的指标\n- 命中率：边缘 HIT / 总请求，静态资源生产线一般要求 ≥95%，掉到 90% 以下基本是缓存 key 设计或 TTL 出问题。\n- 回源率与回源带宽：MISS 比例 × 平均体积，直接决定源站带宽账单，秒杀/发版时容易打爆。\n- 首字节时间 TTFB：HIT 节点通常 20-80ms；MISS 回中间源再回源站，常见 200-800ms，差距一个数量级。\n\n## 一句点透\nCDN 不是\"把文件拷到全国\"，而是\"按需缓存 + 分层回源 + 智能调度\"三件事的组合，任何一环（DNS 调度错节点 / 缓存 key 设计错 / 回源策略错）都会让命中率和源站带宽直接崩。"
     },
     {
       "type": "explain",
-      "title": "CDN 原理与应用的边界、坑点与答题抓手",
-      "content": "CDN 的价值在于把静态或可缓存内容推到离用户更近的节点，并通过缓存策略减少源站压力。讲实现时要覆盖 DNS 调度、边缘节点缓存、回源、刷新预热和命中率指标。边界在于动态内容、权限相关资源和强一致更新不能盲目缓存，项目里还要考虑缓存键设计、Header 控制、HTTPS 证书、跨地域故障和灰度发布。"
+      "title": "回源策略与缓存协议：Cache-Control、ETag、回源合并怎么协作",
+      "content": "## 缓存键（Cache Key）是回源命中的根\n边缘默认 cache key = `scheme + host + path + 选定 query`。常踩的坑：\n- 把整串 query 都纳入 key，结果带 `?t=时间戳`、`?utm_*` 的同一资源被切成无数缓存项，命中率塌方。规范做法是按白名单保留必要参数（如 `v=hash`），其余 ignore。\n- `Vary: Cookie` / `Vary: User-Agent` 上线后，每个用户/设备一份缓存，几乎等于关掉 CDN。带登录态的私有内容应改为 `Cache-Control: private` 不让 CDN 缓存，或者用独立的鉴权域名。\n- 鉴权资源未设 `Cache-Control: private`，把带 token 的响应缓存成公共内容，私有数据外泄，是 CDN 经典安全事故。\n\n## 回源协议三件套\n- `Cache-Control: public, max-age=31536000, immutable`：用于带 hash 的构建产物（如 `app.8f3a.js`），客户端和 CDN 都长期缓存，发版只换文件名。\n- `Cache-Control: no-cache` 不等于不缓存，而是\"每次必须 revalidate\"，配合 `ETag` / `Last-Modified` 让边缘带 `If-None-Match` / `If-Modified-Since` 回源；源站返回 304 时边缘不下载 body，回源带宽接近 0。\n- `Cache-Control: s-maxage=300, max-age=60`：让 CDN 缓存 5 分钟、浏览器缓存 1 分钟，这是\"弱动态\"HTML 的常见配置；配合 `stale-while-revalidate=60` 还能在过期瞬间继续返回旧版本，避免回源毛刺。\n\n## 回源合并与分层（防雪崩的关键）\n- 边缘集群对同一 key 的并发 MISS 做请求合并（request coalescing / collapse forwarding），N 个用户只触发 1 次回源。没开启合并时，热点 key 一过期就是\"缓存击穿\"。\n- 多级缓存（L1 边缘 → L2 父层 / Shield / 中间源 → 源站），目的是把跨地域的 MISS 收敛到少数父节点回源，源站只看到一份流量。\n- 防穿透：对源站 404 / 500 也要短 TTL 缓存（如 30s 负缓存），并在边缘做不存在 key 的布隆过滤，避免攻击者用随机 path 把请求全打到源站。\n- 防雪崩：大批资源同一 TTL 同时过期会形成回源洪峰，工程上要给 TTL 加 ±10% 抖动、配合 stale-while-revalidate 平滑过渡。\n\n## 内容更新两条路\n- 推荐：构建产物用内容 hash 文件名（webpack/vite 默认行为），发版即换 URL，旧缓存自然淘汰，零回源风险。\n- 兜底：调用厂商 `refresh`（让缓存失效，下次回源）或 `preload`（预热，提前从源站抓到边缘）API。`refresh` 是失效不预热，配额有限且会瞬时拉高回源；大促前通常先 `preload` 再切流，反过来做就会出事故。"
     },
     {
       "type": "diagram",
-      "title": "CDN 调度与回源流程",
+      "title": "GSLB 调度 + 分层回源 + 缓存协议",
       "format": "mermaid",
-      "content": "flowchart LR\nA[用户访问加速域名] --> B[本地 DNS 查询]\nB --> C[CDN 智能 DNS 调度]\nC --> D[返回边缘节点 IP]\nD --> E[请求边缘节点]\nE --> F{缓存命中?}\nF -->|是| G[边缘直接返回]\nF -->|否| H[回源获取资源]\nH --> I[写入边缘缓存]\nI --> G",
-      "caption": "CDN 的关键链路是 DNS 调度、边缘缓存命中、未命中回源。",
-      "fallback": "CDN 流程：用户 DNS -> CDN 调度 -> 边缘节点 -> 命中返回或回源缓存。"
+      "content": "flowchart LR\nU[用户浏览器] -->|1.查 cdn.example.com| LDNS[本地递归 DNS]\nLDNS -->|CNAME *.kunlunca.com| GSLB[CDN 权威 DNS / GSLB]\nGSLB -->|按 IP 库+健康+负载| LDNS\nLDNS -->|2.返回边缘 IP| U\nU -->|3.HTTP/2 请求| L1[L1 边缘节点]\nL1 -->|HIT 直接返回| U\nL1 -->|MISS + If-None-Match| L2[L2 父层 / Shield]\nL2 -->|MISS + 回源合并| ORI[源站 Origin]\nORI -->|200 + Cache-Control/ETag| L2\nL2 -->|写缓存 按 s-maxage| L1\nL1 -->|响应 + X-Cache: HIT/MISS| U",
+      "caption": "GSLB 在 DNS 层选节点，L1/L2 分层缓存把多次 MISS 合并成一次回源，缓存 TTL 与 ETag 由源站响应头决定。",
+      "fallback": "调度链：用户到 LDNS，CNAME 到 CDN 权威 DNS/GSLB，返回就近边缘 IP；用户请求 L1 边缘，L1 MISS 走 L2/父层，再 MISS 才回源站；源站用 Cache-Control + ETag 控制 TTL 与 304。"
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | 使用CDN | 不使用CDN |\n| --- | --- | --- |\n| 访问延迟 | 低(就近访问边缘节点) | 高(直接访问源站) |\n| 源站压力 | 小(大部分请求被CDN缓存) | 大(所有请求都到源站) |\n| 带宽成本 | 低(CDN带宽通常更便宜) | 高(源站带宽贵) |\n| 可用性 | 高(多节点冗余) | 低(单点故障风险) |\n| 全球访问 | 好(全球节点覆盖) | 差(跨地域延迟大) |\n| 内容更新 | 需要缓存刷新(有延迟) | 实时生效 |\n| 动态内容 | 需要特殊处理(如边缘计算) | 直接处理 |\n| 适用场景 | 静态资源、大文件下载、直播 | 动态API、实时交互 |"
+      "title": "缓存击穿 / 穿透 / 雪崩在 CDN 场景下的差异",
+      "columns": [
+        "场景",
+        "触发条件",
+        "在 CDN 上的表现",
+        "防御手段"
+      ],
+      "rows": [
+        [
+          "缓存击穿",
+          "热点 key 同一时刻过期，大量并发 MISS",
+          "热门资源 TTL 到期瞬间，源站 QPS 飙升、TTFB 变长",
+          "开启回源合并/单飞、stale-while-revalidate、热点资源更长 TTL + 主动预热"
+        ],
+        [
+          "缓存穿透",
+          "请求大量不存在的 key（恶意扫路径或随机 query）",
+          "L1/L2 全部 MISS，源站被 404 流量打爆，CDN 缓存命中率被稀释",
+          "对 404/410 做负缓存（30-300s）、边缘布隆过滤已知 path、收紧 query 白名单进缓存 key"
+        ],
+        [
+          "缓存雪崩",
+          "大批资源 TTL 同时到期，或某个边缘节点故障切换",
+          "瞬时回源带宽飙升、源站连接耗尽、邻近节点接力放大",
+          "TTL 加 ±10% 随机抖动、分层缓存吸收、源站侧加并发上限和限流、关键资源永不过期+主动 refresh"
+        ],
+        [
+          "浏览器+CDN 协作",
+          "浏览器命中本地缓存就不走 CDN；CDN 命中就不回源",
+          "正常态浏览器 200(memory/disk)，回 CDN 时 304 居多，回源最少",
+          "用 max-age 控浏览器、s-maxage 控 CDN、ETag/If-Modified-Since 双向 304；版本化文件名 + immutable 兜底"
+        ]
+      ]
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "# CDN配置和使用示例\n\n# 1. Nginx配置CDN回源\nupstream origin_server {\n    server origin.example.com:80;\n}\n\nserver {\n    listen 80;\n    server_name cdn.example.com;\n\n    # 静态资源缓存配置\n    location ~* \\.(jpg|jpeg|png|gif|css|js|woff2)$ {\n        proxy_pass http://origin_server;\n        proxy_cache_valid 200 1d;      # 200响应缓存1天\n        proxy_cache_valid 404 1m;      # 404缓存1分钟\n        add_header X-Cache-Status $upstream_cache_status;\n        add_header Cache-Control \"public, max-age=86400\";\n    }\n}\n\n# 2. 验证CDN是否生效\n# 检查响应头中的CDN标识\n$ curl -I https://cdn.example.com/image.jpg\n# 查看 X-Cache-Status: HIT (缓存命中) / MISS (回源)\n# 查看 X-Cache: HIT from cdn-node\n# 查看 Via: CDN标识\n\n# 3. 不同CDN提供商的CNAME配置\n# 阿里云CDN: cdn.example.com CNAME → cdn.example.com.w.kunlun.com\n# 腾讯云CDN: cdn.example.com CNAME → cdn.example.com.cdn.dnsv1.com\n# Cloudflare: cdn.example.com CNAME → xxx.cloudflare.net\n\n# 4. 缓存刷新API示例(阿里云)\n# 刷新单个URL\n$ curl -X POST \"https://cdn.aliyuan.com/api/refresh\" \\\n    -d \"objectType=File\" \\\n    -d \"objectPath=https://cdn.example.com/style.css\"\n\n# 目录刷新\n$ curl -X POST \"https://cdn.aliyuan.com/api/refresh\" \\\n    -d \"objectType=Directory\" \\\n    -d \"objectPath=https://cdn.example.com/assets/\"",
+      "title": "回源、缓存键与刷新预热的工程配置",
       "language": "bash",
+      "content": "# 1) Nginx 作为自建 CDN 边缘：缓存键 + 回源 + 回源合并 + stale-while-revalidate\nproxy_cache_path /data/cache levels=1:2 keys_zone=edge:200m max_size=50g inactive=7d use_temp_path=off;\n\nupstream origin {\n    server origin.example.com:443;\n    keepalive 64;\n}\n\nserver {\n    listen 443 ssl http2;\n    server_name cdn.example.com;\n\n    location ~* \\.(?:js|css|png|jpg|woff2)$ {\n        proxy_pass https://origin;\n        proxy_set_header Host origin.example.com;\n        proxy_ssl_server_name on;\n\n        # 缓存键只纳入白名单 query，避免 utm_* / 时间戳把缓存切碎\n        proxy_cache edge;\n        proxy_cache_key \"$scheme://$host$uri?v=$arg_v\";\n        proxy_cache_valid 200 301 7d;\n        proxy_cache_valid 404 30s;                    # 负缓存防穿透\n        proxy_cache_lock on;                          # 回源合并：同一 key 只放一个回源\n        proxy_cache_lock_timeout 5s;\n        proxy_cache_use_stale updating error timeout http_500 http_502 http_503 http_504;\n        proxy_cache_background_update on;             # stale-while-revalidate：过期先返回旧的\n\n        add_header X-Cache-Status $upstream_cache_status always;  # HIT/MISS/EXPIRED/STALE/UPDATING\n        add_header Cache-Control \"public, max-age=86400, stale-while-revalidate=60\";\n    }\n}\n\n# 2) 验证 CDN 是否生效与命中率\ncurl -I -H 'Pragma: ' https://cdn.example.com/app.8f3a.js\n# 关注头：\n#   X-Cache-Status: HIT          // MISS 表示回源\n#   Age: 3217                    // 在边缘已经缓存的秒数\n#   Cache-Control: public, max-age=31536000, immutable\n#   ETag: \"a3f1...\"              // 下次浏览器带 If-None-Match 走 304\n\n# 3) 厂商 API：先预热再刷新（顺序反了会瞬时打爆源站）\n# 预热（preload）：把热点资源主动推到边缘，发版/大促前用\ncurl -X POST https://cdn.aliyuncs.com/?Action=PushObjectCache \\\n  -d 'ObjectPath=https://cdn.example.com/app.8f3a.js' -d 'Area=domestic'\n\n# 刷新（refresh）：让旧缓存失效，下次回源拉新，配额有限\ncurl -X POST https://cdn.aliyuncs.com/?Action=RefreshObjectCaches \\\n  -d 'ObjectPath=https://cdn.example.com/index.html' -d 'ObjectType=File'",
       "highlights": [
         {
-          "line": 4,
-          "note": "这行承载示例的关键数据流，说明时要指出它改变了哪一段状态。"
+          "line": 17,
+          "note": "cache key 只纳入白名单 query（v=hash），避免 utm_* / 时间戳把同一资源切成无数缓存项，是命中率塌方的头号原因。"
+        },
+        {
+          "line": 20,
+          "note": "对 404 设 30s 负缓存：防止攻击者用随机 path 把请求全打回源站，是 CDN 防穿透的标准做法。"
+        },
+        {
+          "line": 21,
+          "note": "proxy_cache_lock 等价于回源合并/请求单飞：同一 key 并发 MISS 时只允许一个连接回源，防缓存击穿。"
+        },
+        {
+          "line": 23,
+          "note": "stale-while-revalidate：TTL 到期先返回旧响应、后台异步回源刷新，回源毛刺被磨平，是雪崩兜底关键。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
-      "title": "面试回答思路",
-      "content": "**高频问题1：CDN的工作原理是什么？**\n\nCDN通过在全球部署边缘节点，将内容缓存到离用户最近的服务器。工作流程：用户访问cdn.example.com时，DNS解析会经过CDN的智能DNS，它根据用户的IP地址和地理位置返回最近的边缘节点IP。用户请求边缘节点，如果有缓存直接返回(命中)，没有缓存则回源到源站获取内容，缓存后返回给用户。核心是DNS调度+就近访问+缓存机制。\n\n**高频问题2：什么是回源？如何减少回源？**\n\n回源是指边缘节点没有缓存时，向源站请求内容的过程。减少回源的方法：\n\n1. 设置合理的缓存过期时间(Cache-Control max-age)\n2. 使用多级缓存(边缘→区域中心→源站)\n3. 预热：提前将热门内容推送到边缘节点\n4. 回源合并：同一资源的多个请求合并为一次回源。缓存时间越长回源越少，但内容更新延迟越大，需要根据业务特点权衡。\n\n**高频问题3：CDN适合什么场景？不适合什么场景？**\n\nCDN适合：\n\n1. 静态资源(图片/CSS/JS/字体)\n2. 大文件下载(软件/游戏包)\n3. 视频点播和直播\n4. 静态HTML页面。\n\nCDN 不适合：\n\n1. 实时动态API(每次请求结果不同)\n2. 需要实时交互的应用\n3. 小规模、用户集中的场景。动态内容可以通过边缘计算(Edge Computing)或动态加速来优化。",
+      "title": "面试回答思路：CDN 原理、回源与击穿穿透雪崩",
+      "content": "**问题 1：讲一下 CDN 的工作原理。**\n\n30 秒结论：CDN 本质是\"智能 DNS 调度 + 边缘缓存 + 分层回源\"，核心目标是把静态可缓存内容放到离用户最近的边缘节点，从而压低 RTT 和源站带宽。\n\n机制主线：用户访问加速域名，本地 DNS 经 CNAME 到 CDN 权威 DNS，GSLB 根据用户出口 IP（或 ECS）+ 节点健康 + 负载，挑出就近边缘 IP，用户请求边缘 L1，命中直接返回；未命中走 L2/父层，再未命中才回源；源站响应里的 Cache-Control、ETag、s-maxage 决定 TTL 和缓存 key。衡量好坏看三个数：命中率、回源带宽、TTFB。\n\n边界：动态接口（每次结果不同、带 Cookie 鉴权）不要直接缓存，要走 `Cache-Control: private` 或独立非缓存域名；带 `Vary: Cookie` 等价于关掉 CDN。\n\n**问题 2：什么是回源？怎么减少回源？**\n\n30 秒结论：回源是边缘 MISS 时去源站取数据，回源率直接等于源站带宽账单。\n\n机制主线：第一是把缓存 key 收敛，只让必要 query 进 key，过滤 utm/时间戳；第二是用 ETag/Last-Modified 让边缘走条件请求拿 304，body 不下载；第三是用分层缓存（L1 到 L2 到源），把跨地域 MISS 收敛到父层；第四是开回源合并（Nginx 的 `proxy_cache_lock`、Varnish 的 request coalescing），同 key 并发只放一个回源；第五是发版用内容 hash 文件名 + `immutable`，让旧缓存自然淘汰，避免主动 refresh 打爆源站。\n\n**问题 3：CDN 场景下的击穿、穿透、雪崩怎么防？**\n\n30 秒结论：三种问题对应三种回源异常：单 key 集中 MISS、不存在 key 大量 MISS、批量 key 同时 MISS。\n\n机制主线：击穿用回源合并 + stale-while-revalidate + 热点资源更长 TTL + 主动预热；穿透用 404 负缓存（30-300s）+ 边缘布隆过滤 + query 白名单收紧 key；雪崩用 TTL 加 ±10% 抖动 + 分层缓存吸收 + 源站限流并发 + 关键资源主动 refresh 替代被动过期。配合浏览器层的 max-age 和 ETag，整条链路就形成\"浏览器命中 → CDN 命中 → 304 → 回源\"四级递减，源站只接到极少量请求。",
       "followUpQuestions": [
         {
-          "question": "面试官追问「CDN 原理与应用」时，最应该展开哪条机制链？",
-          "answer": "回答「CDN 原理与应用」时先抓住 能解释CDN边缘节点、源站、DNS调度的核心概念，再展开 能描述CDN访问流程(DNS调度→边缘节点→回源)。不要停在定义层，要把输入条件、关键状态变化、输出结果和失败边界串起来，这样才能体现对网络协议里真实机制的理解。"
+          "question": "线上发现某个 CDN 域名命中率从 95% 跌到 60%，你会按什么顺序定位？",
+          "answer": "先看 `X-Cache-Status` 分布和回源日志的 URI 样本：如果 MISS 集中在带 `?t=`、`?utm_*` 的 URL，几乎肯定是缓存 key 把 query 全纳入了，把 query 改白名单（只保留 `v=hash`）即可恢复。其次看响应头是否新出现了 `Vary: Cookie/User-Agent`，常见于业务侧加埋点中间件，会把缓存按用户/设备切碎，要么去掉 Vary 要么改 `Cache-Control: private`。再排查是否大批资源刚被 refresh 或 TTL 同时到期（雪崩），可临时把热点资源预热回去并给 TTL 加抖动。最后看是不是源站开始返回 `Cache-Control: no-store` 或者 5xx，让边缘没法缓存，这种要回到源站配置和稳定性问题。"
         },
         {
-          "question": "如果「CDN 原理与应用」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "可以先确认现象是否落在「能描述CDN访问流程(DNS调度→边缘节点→回源)」，再结合日志、指标、输入规模和依赖状态验证。"
+          "question": "为什么发版要优先用'内容 hash 文件名'而不是依赖刷新接口？",
+          "answer": "刷新（refresh）只是让旧缓存失效，下一次请求就要回源，相当于主动制造一波 MISS 风暴；厂商对 refresh 还有每天的配额上限，热门站点全量刷一次就可能超配额。内容 hash（如 `app.8f3a.js`）把版本写进 URL，发版就是换 URL，新旧版本在 CDN 是两个独立 key，旧 key 自然过期，没有一次性回源洪峰，也允许灰度回滚。HTML 入口可以保持短 TTL（如 60s）+ ETag，让浏览器/CDN 通过 304 平滑切到新版本。这是\"不可变资源 + 短 TTL 入口\"组合，CDN 和浏览器缓存协作的最佳实践。"
+        },
+        {
+          "question": "GSLB 调度有哪些常见出错场景？怎么发现？",
+          "answer": "三类：一是 LDNS 出口和用户不在同一区域（用户在四川但用了北京 LDNS），导致被调度到非最优节点，开 EDNS Client Subnet 把真实用户网段透传给 CDN 权威 DNS 可缓解；二是节点存活探测有延迟，故障节点还在被调度进 IP 列表，表现是某地用户大批 5xx，要看 CDN 控制台的节点健康状态并主动摘除；三是新机房上线时 IP 库未更新，调度按地理位置错配，要联系厂商更新 IP 库或临时降权。发现手段是按地域+运营商拆分 RUM 数据看 TTFB 和错误率，单看全网平均会被掩盖。"
         }
       ]
     },
@@ -70,54 +119,57 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释CDN的核心概念(边缘节点、源站、DNS调度)",
-        "能描述用户通过CDN访问资源的完整流程",
-        "能说明DNS调度如何将用户分配到最优节点",
-        "能解释回源机制和缓存策略(Cache-Control/max-age)",
-        "能说出CDN适用和不适用的场景",
-        "能通过响应头(X-Cache-Status/Via)判断CDN是否生效"
+        "讲清 CNAME 到 CDN 权威 DNS 到 GSLB 到边缘节点 IP 这条调度链，并说出 GSLB 的 4 个决策因子（地理、运营商、健康、负载）",
+        "解释 L1/L2 分层缓存与回源合并如何把 N 次 MISS 收敛成 1 次回源",
+        "区分 max-age / s-maxage / no-cache / immutable / stale-while-revalidate 的语义，并能给出典型 HTML 与静态资源配置",
+        "说出缓存 key 设计的三大坑：query 全纳入、Vary: Cookie、鉴权资源未 private",
+        "区分缓存击穿、穿透、雪崩在 CDN 上的表现，并能各自给出至少一种工程对策",
+        "解释为什么发版用内容 hash 文件名优于直接调 refresh API",
+        "通过 curl -I 看 X-Cache-Status / Age / ETag 判断命中状态和回源行为"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "network.dns-cdn.topic-cdn.recall.1",
-      "prompt": "请说明用户访问 CDN 加速域名时，从 DNS 调度到边缘命中或回源的完整流程。",
+      "prompt": "请把用户访问 cdn.example.com 到拿到资源的 6 步链路讲一遍，重点说清 CNAME、GSLB 的调度依据、L1/L2 分层缓存和回源合并各自解决什么问题。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "network.dns-cdn.topic-cdn.recall.2",
-      "prompt": "什么是回源？如何减少回源次数？CDN 适合什么场景？",
+      "prompt": "max-age、s-maxage、no-cache、immutable、stale-while-revalidate 分别控什么？给一份'带 hash 的 JS'和一份'弱动态 HTML 入口'的 Cache-Control 推荐配置并解释理由。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "network.dns-cdn.topic-cdn.recall.3",
-      "prompt": "CDN 缓存命中率低时，你会检查哪些缓存头、缓存 key 和资源发布策略？",
+      "prompt": "CDN 上发生缓存击穿、穿透、雪崩各有什么典型现象？分别用回源合并、负缓存、TTL 抖动 + 限流给出对应的工程对策，并说明为什么发版优先用内容 hash 文件名。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能解释CDN边缘节点、源站、DNS调度的核心概念",
-      "能描述CDN访问流程(DNS调度→边缘节点→回源)",
-      "能说明缓存策略(Cache-Control/max-age)的配置",
-      "能说出CDN适用和不适用的场景"
+      "讲清 GSLB+DNS 调度链路：CNAME 到 CDN 权威 DNS、IP 库判定地域运营商、综合健康与负载选边缘 IP",
+      "区分 L1 边缘 / L2 父层 / 源站三级回源结构，并说明回源合并（proxy_cache_lock / request coalescing）的作用",
+      "说出 Cache-Control 关键字段：max-age 控浏览器、s-maxage 控 CDN、no-cache 走 ETag revalidate、immutable 配合 hash 文件名",
+      "说清缓存击穿、穿透、雪崩在 CDN 上的现象和对应工程对策（回源合并 / 404 负缓存 / TTL 抖动）"
     ],
     "goodToHave": [
-      "了解CDN的缓存刷新和预热机制",
-      "能说明多级缓存(边缘→区域→源站)的作用",
-      "了解边缘计算(Edge Computing)的概念和应用"
+      "了解 EDNS Client Subnet（ECS）解决 LDNS 出口与用户地域不一致的问题",
+      "能给出缓存 key 白名单（按 v=hash）和 Vary: Cookie 的危害示例",
+      "知道发版用内容 hash 文件名 + immutable 优于调 refresh API，且 refresh 与 preload 顺序不能反",
+      "能用 curl -I 看 X-Cache-Status、Age、ETag 判断命中与回源行为"
     ],
     "commonMistakes": [
-      "不清楚CDN的工作流程（用户→Local DNS→CDN DNS→边缘节点）",
-      "不了解回源策略和缓存更新机制",
-      "不知道HTTPS CDN的证书配置"
+      "把整串 query 都纳入缓存 key，导致 utm_* / 时间戳把缓存切碎、命中率从 95% 跌到 60%",
+      "鉴权或带 Cookie 的私有内容没有设 Cache-Control: private，被 CDN 缓存成公共内容造成数据泄露",
+      "大促前先 refresh 再 preload，制造一波 MISS 洪峰把源站打爆（正确顺序是先 preload 再切流）",
+      "把 no-cache 当作'不缓存'来用，实际它是'每次必须 revalidate'，真正的不缓存是 no-store"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -126,11 +178,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-13",
   "status": "production",
   "prerequisites": [
     "network.dns-cdn.topic-dns"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「CDN 原理与应用」说清能解释CDN边缘节点、源站、DNS调度的核心概念、能描述CDN访问流程(DNS调度→边缘节点→回源)，并放到网络协议场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察是否能讲清 GSLB+DNS 调度链路、L1/L2 分层缓存与回源合并机制、Cache-Control/ETag 的浏览器与 CDN 协作，以及缓存击穿/穿透/雪崩在 CDN 场景下的具体防御手段。"
 }

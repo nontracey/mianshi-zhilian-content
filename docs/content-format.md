@@ -314,7 +314,7 @@ content-repo/
 
 ## 6. learningCards 类型
 
-`learningCards` 是知识学习页的核心。App 按 `type` 选择渲染方式。
+`learningCards` 是知识学习页的核心。App 按 `type` 选择渲染方式。卡片必须按以下顺序排列：`explain` → `diagram`/`compareTable`/`code` → `interviewAnswer` → `checklist`。同一类型的卡片之间保持逻辑递进即可，但类型之间的先后顺序不可调换。
 
 所有卡片都应至少包含：
 
@@ -472,8 +472,8 @@ content-repo/
 Mermaid 约束：
 
 1. `format=mermaid` 的 `content` 必须以 `flowchart` 或 `graph` 开头，并带方向声明，例如 `flowchart LR`、`flowchart TD`、`graph LR`。
-2. 只使用 App 已验证的基础流程图子集：节点、连线、分支、简单标签；不要使用 sequence、classDiagram、stateDiagram、mindmap、复杂样式或外部资源引用。
-3. Mermaid 图应该能用纯文本解释兜底，复杂知识建议同时写 `fallback` 或 `caption`。
+2. 只使用 App 已验证的基础流程图子集：节点、连线、分支、简单标签；不要使用 `sequenceDiagram`、`classDiagram`、`stateDiagram`、`mindmap`、`subgraph`、`classDef`、`style` 或外部资源引用。
+3. 禁止使用带标签虚线边 `A -.label.-> B`；App 不渲染虚线边上的标签，会导致信息丢失。需要标注的连线必须改用实线标签 `A -->|标签| B`。
 4. 图示节点必须使用当前 topic 的专属概念、对象、状态或链路名，不得大量使用 `输入`、`处理`、`输出`、`关键流程`、`边界处理` 这类万能节点。
 5. 图示必须表达真实关系，例如调用顺序、数据流、状态转移、依赖关系、隔离边界或失败路径；不能只是把正文关键词横向摆放。
 6. `caption` 或 `fallback` 应说明图在解释哪个机制，不能写成“展示本知识点关键环节”这类模板句。
@@ -625,7 +625,7 @@ Mermaid 约束：
 - [ ] `id` 全局唯一。
 - [ ] `domain` 在 manifest 中存在。
 - [ ] `category` 在领域文件中存在。
-- [ ] `learningCards` 至少包含一个 `explain`。
+- [ ] `learningCards` 至少包含一个 `explain`，且卡片顺序为 explain → 图/表/code → interviewAnswer → checklist。
 - [ ] `interviewAnswer` 卡片的 `followUpQuestions` 至少 2 个，回答必须针对当前知识点。
 - [ ] `recallPrompts` 至少包含一个问题。
 - [ ] `rubric.mustHave` 不为空。
@@ -641,6 +641,7 @@ Mermaid 约束：
 - [ ] `scoreWeights` 总和为 100。
 - [ ] JSON 能通过 schema 校验。
 - [ ] `npm run quality:audit` 通过，单 topic、单领域和总体质量分均不低于 90。
+- [ ] 若是新增、大改或语义质量不确定的发布态 topic，已运行 `npm run quality:refine:interactive` 做本地精修或测试预览。
 
 ## 11. 新增内容示例流程
 
@@ -652,8 +653,9 @@ Mermaid 约束：
 4. 更新 `manifest.json` 的 `contentVersion`、`topicCount`、`updatedAt`。
 5. 运行 schema 校验。
 6. 运行 `npm run quality:audit`，确认内容质量、深度、图示、追问、rubric 和正向证据达到 90 分门槛；95+ 需要例子、边界、验证、取舍和图文贴合都比较扎实。
-7. 发布内容仓库。
-8. App 下次同步后自动出现该知识点，不需要发新版 App。
+7. 如需 LLM 语义检查或改写，运行 `npm run quality:refine:interactive`；测试预览先看单篇效果，正式精修成功后同步到 staging/draft。
+8. 发布内容仓库。
+9. App 下次同步后自动出现该知识点，不需要发新版 App。
 
 ## 12. JSON 结构契约同步规则
 
@@ -688,6 +690,7 @@ Mermaid 约束：
 - [ ] 更新相关 `topicCount`、`updatedAt` 和 domain topic 引用。
 - [ ] 运行 `npm run validate`。
 - [ ] 运行 `npm run quality:audit`。
+- [ ] 若改动发布态 topic 且需要语义精修，运行 `npm run quality:refine:interactive`，确认每次 CLI 调用只处理单篇 topic。
 - [ ] 确认字段名、字段类型、枚举值、卡片类型没有变化。
 - [ ] 若只是内容值变化，通常不需要改 App 或 studio。
 - [ ] 若实际发现 App 渲染、缓存、studio 编辑或生成流程不兼容，再同步修对应项目和文档。

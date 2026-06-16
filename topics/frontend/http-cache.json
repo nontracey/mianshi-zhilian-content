@@ -4,7 +4,7 @@
   "category": "network-security",
   "group": "network-security",
   "title": "HTTP 缓存",
-  "summary": "HTTP 缓存通过强缓存（Cache-Control/Expires）和协商缓存（ETag/Last-Modified）减少网络请求，是前端性能优化的基础手段，面试中常考察缓存策略的选择和优先级。",
+  "summary": "HTTP 缓存分强缓存（Cache-Control/Expires）和协商缓存（ETag/Last-Modified）两个独立决策阶段，是前端性能优化的高频考点，面试中常考察两阶段区分、字段优先级和工程落地。",
   "tags": [
     "HTTP",
     "缓存",
@@ -19,34 +19,48 @@
   "learningCards": [
     {
       "type": "explain",
-      "title": "HTTP 缓存：缓存层次",
-      "content": "强缓存：浏览器直接使用本地副本，不发请求。Cache-Control: max-age=3600 优先级高于 Expires。协商缓存：携带条件请求头（If-None-Match/If-Modified-Since），服务器返回 304 表示未变化。ETag 优先级高于 Last-Modified。优先级：Cache-Control > Expires > ETag > Last-Modified。"
+      "title": "HTTP 缓存：两阶段决策模型",
+      "content": "HTTP 缓存的本质是让浏览器和服务端协商「同一份资源是否需要重新传输」。它由两个**相互独立**的决策阶段组成，**两个阶段不是同一个优先级链**——很多初学者会把 Cache-Control/Expires 和 ETag/Last-Modified 混排成一条线性优先级，这是错的。\n\n**第一阶段：强缓存（浏览器根本不发请求）**\n\n命中条件：响应里有 `Cache-Control: max-age=N` 且本地副本未超过 N 秒，或者 `Expires` 绝对时间未到。命中后浏览器直接复用本地副本，不产生网络流量。\n\nDevTools 现象：Network 面板会显示 `200 (from disk cache)` 或 `200 (from memory cache)`，Size 一栏写 `(memory cache)` / `(disk cache)`，Time 一栏为 0。**这不是真实的 HTTP 状态码**，而是 Chrome DevTools 对「本次没发请求，复用了本地缓存」的展示标注。强缓存命中时根本没有 HTTP 响应，状态码是浏览器自己填的。\n\n阶段内优先级：`Cache-Control` 优先于 `Expires`。原因有两点：\n1. `Cache-Control: max-age=3600` 是相对时间（自本次响应起 3600 秒），不依赖客户端和服务端时钟一致；`Expires: Wed, 21 Oct 2026 07:28:00 GMT` 是绝对时间，客户端时钟被改或跨时区就会失准。\n2. 当两者同时存在且冲突时，HTTP 规范明确 `Cache-Control` 覆盖 `Expires`，这是 RFC 7234 的硬性规定。\n\n未命中或被禁用：当 `Cache-Control: no-store` 出现，或 `max-age=0`，或两个字段都缺失，强缓存阶段直接跳过，进入下一阶段。\n\n**第二阶段：协商缓存（浏览器发条件请求）**\n\n强缓存未命中后，浏览器带上本地副本的标识去问服务端：「资源变没变？」对应两个字段：\n- `ETag`（实体标签，通常是内容指纹或 inode-size-mtime）→ 浏览器发 `If-None-Match: \"abc123\"`。\n- `Last-Modified`（资源最后修改时间，HTTP-date 格式，秒级精度）→ 浏览器发 `If-Modified-Since: Wed, 21 Oct 2026 07:28:00 GMT`。\n\n服务端对比后两种结果：\n- 资源未变 → 返回 `304 Not Modified`，响应体为空，浏览器复用本地副本。\n- 资源已变 → 返回 `200 OK` + 新资源 + 新的缓存头，浏览器用新资源替换本地副本并更新缓存头。\n\n阶段内优先级：`ETag` 优先于 `Last-Modified`。三个具体原因：\n1. **精度**：`Last-Modified` 精度是 1 秒，1 秒内多次构建无法区分；`ETag` 是内容指纹，理论上能识别字节级差异。\n2. **稳定性**：重新部署触发文件 `mtime` 变化但内容完全没变时，`Last-Modified` 会被误判为「已变」而返回 200，`ETag` 仍能正确返回 304。\n3. **强/弱校验**：`ETag` 支持 `W/\"abc123\"` 弱校验（前缀 W/），告诉缓存「内容语义等价即可」；`Last-Modified` 没有这层语义。\n\n强 ETag 与弱 ETag：`ETag: \"abc123\"` 是强校验，要求字节级一致；`ETag: W/\"abc123\"` 是弱校验，只要求语义等价。Apache `FileETag MTime Size` 模式可能因 inode 变化导致 ETag 跳动，生产环境应改用内容 hash（如 `etag: $(sha256sum file | cut -c1-16)`）。\n\n**关键指令区分（高频考点）**\n\n- `Cache-Control: no-cache`：**不是**「不缓存」，而是「缓存但每次都要重新验证」——它跳过强缓存阶段，强制进入协商缓存发条件请求。\n- `Cache-Control: no-store`：**才是**「完全不缓存」，浏览器和中间代理都不能存，连协商都不做，每次都重新下载。\n- `Cache-Control: must-revalidate`：缓存过期后必须验证，不能用陈旧副本（断网时不返回过期内容）。\n- `Cache-Control: public/private`：`public` 允许 CDN/代理缓存，`private` 只允许浏览器缓存（针对带用户态的响应）。\n- `Cache-Control: immutable`：告诉浏览器在 `max-age` 内不要做条件请求（即便用户按 F5 刷新），适合带 hash 的静态资源。\n- `Pragma: no-cache`：HTTP/1.0 时代的等价物，现代浏览器仍兼容，应优先用 `Cache-Control`。\n\n**Vary 与多版本缓存**\n\n`Vary: Accept-Encoding` 告诉缓存「同一 URL 按 Accept-Encoding 字段分别存条目」——gzip 和 br 资源不能共用同一缓存条目。漏配会导致：用 br 缓存响应了 `Accept-Encoding: gzip` 的客户端，解压失败。\n\n**启发式缓存（Heuristic Caching）**\n\n当响应没有任何 `Cache-Control` / `Expires` 字段时，部分浏览器会按启发式规则缓存，通常取 `Last-Modified` 时间到现在差值的 10%。所以纯静态服务器（裸 nginx 不配 expires 指令）也能命中缓存，但时长不可控，生产环境必须显式声明 `Cache-Control`。\n\n**工程取舍与生产策略**\n\n- 带 hash 的 JS/CSS/图片：`Cache-Control: public, max-age=31536000, immutable`。发布时通过文件名 hash（Webpack 的 `[contenthash]`、Vite 的 `?v=abc123`）让旧 URL 自然失效，新 HTML 引用新 URL 完成全网刷新。\n- HTML 入口：`Cache-Control: no-cache` 或 `max-age=300`（短缓存）。**HTML 必须短缓存**——它是带 hash 资源列表的入口，长缓存会导致用户长时间看不到新版本。\n- 业务 API：实时数据用 `no-cache` + `ETag` 协商；字典类静态数据可长缓存；带用户态的响应必须 `private`。\n- Service Worker：可以完全接管缓存策略（Cache API + stale-while-revalidate 模式），但已超出 HTTP 协议层。\n\n**失败路径与定位线索**\n\n- 用户反馈「清缓存前一直看到旧版本」→ 检查 HTML 是否被长缓存。\n- ETag 在多节点环境下命中率断崖下降 → 节点间 ETag 不一致（inode-based），改用内容 hash。\n- 1 秒内多次发版用户看不到新版 → Last-Modified 精度不够，必须靠文件 hash 兜底。\n- gzip 资源解压失败 → 检查 `Vary: Accept-Encoding` 是否漏配。"
     },
     {
       "type": "diagram",
-      "title": "HTTP 缓存决策流程",
+      "title": "HTTP 缓存两阶段决策流程",
       "format": "mermaid",
-      "content": "flowchart TD\nA[浏览器发起资源请求] --> B{强缓存是否有效}\nB -->|是| C[直接使用本地缓存]\nB -->|否| D{是否有 ETag 或 Last-Modified}\nD -->|否| E[请求服务器返回 200 新资源]\nD -->|是| F[发送条件请求]\nF --> G{服务器判断资源变化}\nG -->|未变化| H[返回 304 使用本地缓存]\nG -->|已变化| I[返回 200 和新缓存头]\nI --> J[更新本地缓存]",
-      "caption": "强缓存、协商缓存和 200/304 的判断顺序",
-      "fallback": "HTTP 缓存决策流程"
+      "content": "flowchart TD\nA[浏览器请求资源] --> B{本地是否有该 URL 缓存}\nB -->|否| E[直接发请求到服务端]\nB -->|是| C{Cache-Control 或 Expires 仍在有效期内}\nC -->|是| D[DevTools 标注 200 from cache 实际未发请求]\nC -->|否| F[携带 If-None-Match / If-Modified-Since 条件请求]\nF --> G{服务端对比 ETag 或 Last-Modified}\nG -->|未变| H[304 Not Modified 复用本地副本]\nG -->|已变| I[200 OK 返回新资源与新缓存头]\nI --> J[更新本地缓存和缓存头]\nH --> J\nE --> J",
+      "caption": "强缓存命中走本地不联网，DevTools 标注的 200 不是真实状态码；强缓存失效后进入协商缓存阶段，服务端用 304 / 200 决定是否返回新内容",
+      "fallback": "HTTP 缓存两阶段决策流程：先判强缓存（Cache-Control/Expires）再判协商缓存（ETag/Last-Modified）",
+      "items": [
+        "强缓存命中：DevTools 标注 200 (from cache)，实际未发请求",
+        "强缓存失效：进入协商缓存阶段，浏览器发条件请求",
+        "协商命中：服务端返回 304，浏览器复用本地副本",
+        "协商未命中：服务端返回 200 + 新资源 + 新缓存头"
+      ]
     },
     {
       "type": "compareTable",
       "title": "强缓存 vs 协商缓存",
-      "content": "| 特性 | 强缓存 | 协商缓存 |\n| --- | --- | --- |\n| 是否发请求 | 不发 | 发（条件请求） |\n| 状态码 | 200 (from cache) | 304 Not Modified |\n| 控制字段 | Cache-Control, Expires | ETag, Last-Modified |\n| 适用场景 | 静态资源版本化 | 频繁变化的资源 |"
+      "content": "| 特性 | 强缓存 | 协商缓存 |\n| --- | --- | --- |\n| 是否发请求 | 否，浏览器直接读本地 | 是，发条件请求 |\n| 状态码 | DevTools 标注 200 (from cache)，实际无 HTTP 响应 | 304 Not Modified（未变）/ 200 OK（已变） |\n| 阶段内优先级 | Cache-Control > Expires | ETag > Last-Modified |\n| 控制字段 | Cache-Control（max-age/no-cache/no-store/immutable）、Expires | ETag（If-None-Match）、Last-Modified（If-Modified-Since） |\n| 失效信号 | max-age 到期或被 no-store/no-cache 跳过 | 服务端对比指纹/时间后判定未变 |\n| 适用场景 | 带 hash 的静态资源、长期不变的库 | HTML 入口、频繁更新但可复用的资源 |\n| 工程收益 | 零网络流量，首屏时间最短 | 节省带宽，304 响应体为空 |"
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：HTTP 缓存 要先说清它解决什么问题，再展开机制、边界和验证方式。HTTP 缓存通过强缓存（Cache-Control/Expires）和协商缓存（ETag/Last-Modified）减少网络请求，是前端性能优化的基础手段，面试中常考察缓存策略的选择和优先级。\n\n我会这样回答：\n1. 先定位核心问题：强缓存和协商缓存的判断流程。\n2. 再串起关键机制：Cache-Control 各指令的含义，并说明它和 ETag 和 Last-Modified 的优先级 的关系。\n3. 接着补充边界和风险：混淆 no-cache 和 no-store。\n4. 最后落到验证方式：结合 Network/Performance 面板、构建产物、用户体验指标和错误监控验证判断。\n\n如果继续追问，我会用一个具体场景串起输入、状态变化和失败处理，避免只停留在概念定义。",
+      "content": "**30 秒结论**\n\nHTTP 缓存分两个相互独立的决策阶段。第一阶段是强缓存：浏览器用 `Cache-Control: max-age` 或 `Expires` 判断本地副本是否新鲜，新鲜就直接复用，根本不发请求，DevTools 看到的 `200 (from disk cache)` 是浏览器对「没发请求」的展示标注，不是真实状态码。第二阶段是协商缓存：强缓存过期后浏览器带上 `If-None-Match`（ETag）或 `If-Modified-Since`（Last-Modified）问服务端，服务端用 `304 Not Modified` 或 `200 OK` 告诉浏览器资源有没有变。\n\n**机制要点**\n\n- **两阶段独立**：强缓存阶段（Cache-Control/Expires）和协商缓存阶段（ETag/Last-Modified）属于不同决策层级，不是一条优先级链。混排成 `Cache-Control > Expires > ETag > Last-Modified` 是错的。\n- **强缓存阶段内优先级**：`Cache-Control` 优先于 `Expires`，因为 `max-age` 是相对时间不依赖时钟一致，HTTP 规范明确 `Cache-Control` 覆盖 `Expires`。\n- **协商缓存阶段内优先级**：`ETag` 优先于 `Last-Modified`，因为 `Last-Modified` 精度只有 1 秒、跨秒内多次构建无法识别、`mtime` 波动会误判；而 `ETag` 是内容指纹，能识别字节级差异，支持 `W/` 弱校验。\n- **no-cache vs no-store**：`no-cache` 不是「不缓存」而是「缓存但每次要重新验证」，会跳过强缓存进入协商；`no-store` 才是「完全禁用缓存」，连协商都不做，每次都重新下载。这是高频踩坑点。\n- **生产现象**：强缓存命中时 Network 面板 Size 列写 `(memory cache)` 或 `(disk cache)`，Time 为 0；协商命中时响应体为空，响应头里有 `ETag` 和 `Cache-Control`。\n\n**边界与追问应对**\n\n- HTML 入口必须短缓存（`no-cache` 或 `max-age=300`），否则带 hash 的 JS/CSS 永远拿不到新版本。\n- 分布式 ETag 跳动：CDN/多节点用 inode+size+mtime 生成 ETag 时，不同节点 ETag 不一致导致 304 命中率断崖下降，应改用内容 hash（如 `etag: $(sha256sum file | cut -c1-16)`）。\n- Last-Modified 精度问题：构建系统在 1 秒内多次发版时，用户看到的仍是旧版本，必须靠文件 hash 兜底。\n- Vary 漏配：`Vary: Accept-Encoding` 没设置会让 gzip 资源被 br 客户端解压失败。\n- F5/Ctrl+F5 行为：F5 触发协商缓存（带 `If-None-Match`），Ctrl+F5 跳过协商直接发新请求；如果资源带 `immutable` 则 F5 也直接读本地。\n- 启发式缓存：响应无 `Cache-Control` 也无 `Expires` 时，部分浏览器按 `Last-Modified` 10% 缓存，生产环境必须显式声明缓存策略。",
       "followUpQuestions": [
         {
-          "question": "强缓存和协商缓存分别什么时候生效？",
-          "answer": "强缓存命中时浏览器直接使用本地缓存，不请求服务器；强缓存过期后通过 ETag 或 Last-Modified 发起协商，服务器返回 304 或新资源。"
+          "question": "强缓存命中时浏览器实际行为是什么？为什么 DevTools 显示 200 (from cache)？",
+          "answer": "强缓存命中时浏览器根本不发请求，直接读本地副本。DevTools 显示的 200 (from disk cache) 或 200 (from memory cache) 不是真实 HTTP 状态码，而是 Chrome DevTools 对「本次请求未发出去、复用了本地缓存」的展示标注，Network 面板的 Size 列会写 (memory cache)/(disk cache)，Time 列是 0。可以打开 DevTools 的 Disable cache 选项对比验证。"
         },
         {
-          "question": "前端静态资源通常如何设计缓存策略？",
-          "answer": "带 hash 的静态资源可以长缓存，HTML 入口通常不长缓存或短缓存，接口数据按业务实时性设置。发布时依靠文件名 hash 避免旧资源污染。"
+          "question": "CDN 环境下 ETag 不一致会带来什么问题？生产上如何规避？",
+          "answer": "Apache 默认按 FileETag MTime Size 模式生成 ETag，包含 inode 字段；多节点/CDN 环境下同一文件 inode 不同，会导致 ETag 跳动，浏览器缓存的 ETag 与新节点 ETag 不匹配，304 命中率从预期 80%+ 跌到接近 0，全部回退到 200。规避方式：Nginx 用 etag on 但配合文件内容 hash；或直接在构建产物里写死 ETag；CDN 侧关闭 ETag 改用 Last-Modified；最稳的方案是文件名带 hash + 强缓存。"
+        },
+        {
+          "question": "Last-Modified 精度只到秒会带来什么生产问题？如何解决？",
+          "answer": "1 秒内多次发版时，Last-Modified 时间戳相同，浏览器认为资源没变，304 命中后用户拿不到新版本。Webpack/Vite 等构建系统在 CI 流水线里 1 秒内连续打多个包是常见现象。解决：构建产物用 contenthash 命名（如 main.abc123.js），HTML 入口用 no-cache 或短 max-age，强制每次协商以拿到新 hash 列表。"
+        },
+        {
+          "question": "Vary: Accept-Encoding 在 gzip 与 br 场景下不设置会引发什么问题？",
+          "answer": "不设置 Vary 时，CDN/浏览器可能用同一缓存条目响应不同 Accept-Encoding 的客户端。例如缓存了 gzip 编码的 main.js，但下一个请求带 Accept-Encoding: br，CDN 直接返回 gzip 内容，br 客户端无法解压。必须在响应头加 Vary: Accept-Encoding（或 Vary: Accept-Encoding, User-Agent 视场景）让缓存按字段分别存。"
         }
       ]
     },
@@ -54,10 +68,16 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "强缓存和协商缓存的判断流程",
-        "Cache-Control 各指令的含义",
-        "ETag 和 Last-Modified 的优先级",
-        "静态资源缓存策略设计"
+        "强缓存与协商缓存分属两个独立决策阶段，不是一条线性优先级链",
+        "强缓存阶段内 Cache-Control 优先于 Expires 的两个原因（相对时间 + RFC 覆盖规则）",
+        "协商缓存阶段内 ETag 优先于 Last-Modified 的三个原因（精度、稳定性、强/弱校验）",
+        "200 (from cache) 是 DevTools 展示标注，不是真实 HTTP 状态码，强缓存命中时未发请求",
+        "no-cache（缓存但重新验证）与 no-store（完全禁用缓存）的本质区别",
+        "强 ETag（字节级）与弱 ETag W/ 前缀的语义差异，以及 CDN 环境下 inode-based ETag 跳动的坑",
+        "带 hash 文件名 + immutable 长缓存 + HTML 入口短缓存的静态资源发布策略",
+        "Vary: Accept-Encoding 在 gzip/br 内容协商中的作用与漏配后果",
+        "启发式缓存（Heuristic Caching）取 Last-Modified 10% 的默认行为及显式声明的必要性",
+        "F5 与 Ctrl+F5 触发协商缓存与强制刷新的差异，immutable 对 F5 行为的影响"
       ]
     }
   ],
@@ -86,20 +106,30 @@
   ],
   "rubric": {
     "mustHave": [
-      "强缓存和协商缓存的判断流程",
-      "Cache-Control 各指令的含义",
-      "ETag 和 Last-Modified 的优先级",
-      "静态资源缓存策略设计"
+      "强缓存与协商缓存分属两个独立决策阶段，不是一条线性优先级链",
+      "强缓存阶段 Cache-Control 优先于 Expires（相对时间 + RFC 7234 覆盖规则）",
+      "协商缓存阶段 ETag 优先于 Last-Modified（1 秒精度、mtime 稳定性、W/ 弱校验三点）",
+      "200 (from cache) 是 DevTools 展示标注而非真实 HTTP 状态码，强缓存命中时未发请求",
+      "no-cache（缓存但重新验证）与 no-store（完全禁用缓存）的本质区别",
+      "带 hash 文件名 + Cache-Control: public, max-age=31536000, immutable + HTML 入口 no-cache/短缓存的发布策略",
+      "Vary: Accept-Encoding 在 gzip/br 内容协商中的作用与漏配后果"
     ],
     "goodToHave": [
-      "能描述强缓存和协商缓存的判断流程",
-      "能区分 Cache-Control 各指令的含义",
-      "能设计静态资源缓存策略"
+      "强 ETag（字节级）与弱 ETag W/ 前缀的语义差异",
+      "CDN 分布式 inode-based ETag 跳动导致 304 命中率下降的定位方法",
+      "启发式缓存（Heuristic Caching）取 Last-Modified 10% 的默认行为",
+      "Cache-Control: s-maxage 在 CDN 边缘节点与 max-age 的优先级差异",
+      "F5 触发协商缓存、Ctrl+F5 强制刷新、immutable 对 F5 行为的影响",
+      "Pragma: no-cache 作为 HTTP/1.0 时代兼容兜底的作用"
     ],
     "commonMistakes": [
-      "混淆 no-cache 和 no-store",
-      "忽略 ETag 优先级高于 Last-Modified",
-      "不区分强缓存和协商缓存的适用场景"
+      "把 Cache-Control/Expires/ETag/Last-Modified 混排为单一线性优先级链（实际上分属两个独立阶段）",
+      "误以为强缓存命中时服务端返回 200 状态码（实际未发请求，200 from cache 是 DevTools 标注）",
+      "混淆 no-cache（强制协商缓存）与 no-store（完全禁用缓存）",
+      "HTML 入口也配置长缓存，导致带 hash 的 JS/CSS 永远拿不到新版本",
+      "Last-Modified 精度只有 1 秒，无法识别 1 秒内多次构建的差异",
+      "CDN/多节点用 inode+size+mtime 生成 ETag，导致 ETag 跨节点不一致，304 命中率断崖下降",
+      "Vary: Accept-Encoding 漏配导致 gzip 资源被 br 客户端解压失败"
     ],
     "scoreWeights": {
       "coverage": 40,
@@ -108,8 +138,8 @@
       "depth": 15
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-14",
   "interviewFrequency": "high",
   "status": "production",
-  "interviewerFocus": "考察是否能围绕「HTTP 缓存」说清强缓存和协商缓存的判断流程、Cache-Control 各指令的含义，并放到前端工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察对 HTTP 缓存两阶段决策模型的准确区分能力、Cache-Control 关键指令（max-age、no-cache、no-store、immutable）取舍、ETag 与 Last-Modified 在精度和内容指纹上的差别，以及把缓存策略落到静态资源版本化、HTML 入口、API 分级的工程方案设计能力。"
 }
