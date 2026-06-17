@@ -49,6 +49,7 @@ JUDGE_WARM_CONCURRENCY=""   # 空 = 跟随 CONCURRENCY
 PROGRESS_STYLE="summary"
 HEARTBEAT_SECONDS=60
 STALL_TIMEOUT_SECONDS=150
+RESUME_LAST=1
 QUOTA_PAUSE_POLICY=""  # 空 = 用 .env QUOTA_PAUSE_DEFAULT
 SELECTED_DOMAIN_IDS=()
 SCOPE_ARGS=()
@@ -168,6 +169,24 @@ ask_optional_number() {
       return
     fi
     printf '%s\n' "${YELLOW}请输入 ${min}-${max} 之间的整数，或直接回车。${RESET}" >&2
+  done
+}
+
+ask_yes_no() {
+  local label="$1"
+  local default="$2"
+  local value suffix
+  if [[ "$default" == "1" ]]; then suffix="Y/n"; else suffix="y/N"; fi
+  while true; do
+    printf '%s [%s] %s: ' "$label" "$suffix" "$(prompt_suffix)" >&2
+    IFS= read -r value || exit 1
+    check_nav_input "$value" || return $?
+    value="${value:-$([[ "$default" == "1" ]] && printf y || printf n)}"
+    case "$value" in
+      y|Y|yes|YES|是) ASK_VALUE=1; return 0 ;;
+      n|N|no|NO|否) ASK_VALUE=0; return 0 ;;
+      *) printf '%s\n' "${YELLOW}请输入 y 或 n。${RESET}" >&2 ;;
+    esac
   done
 }
 
@@ -539,7 +558,7 @@ choose_quality_options() {
   # 按 RUN_MODE 动态构造题表（每题一个 id），子题 b 只回退到上一题，第一题 b 才整步退回。
   local -a fields=("min")
   if [[ "$RUN_MODE" == "refine" ]]; then
-    fields+=("conc" "rounds" "limit")
+    fields+=("conc" "rounds" "limit" "resume")
   fi
   if [[ "$RUN_MODE" != "audit" ]]; then
     fields+=("retries" "timeout" "stall" "degrade" "quota")
@@ -556,6 +575,7 @@ choose_quality_options() {
       conc)    ask_number "并发数 concurrency" "$CONCURRENCY" 1 8 >/dev/null; rc=$? ;;
       rounds)  ask_number "最大轮数 max-rounds" "$MAX_ROUNDS" 1 10 >/dev/null; rc=$? ;;
       limit)   ask_optional_number "每轮最多处理篇数 limit" 1 9999 >/dev/null; rc=$? ;;
+      resume)  ask_yes_no "自动续跑最近一次未完成精修（跳过 progress.jsonl 已完成 topic）" "$RESUME_LAST"; rc=$? ;;
       retries) ask_number "单篇失败重试次数 retries" "$RETRIES" 0 5 >/dev/null; rc=$? ;;
       timeout) ask_number "单篇超时秒数" "$TIMEOUT_SECONDS" 30 7200 >/dev/null; rc=$? ;;
       stall)   ask_number "空转看门狗秒数（0=关闭）" "$STALL_TIMEOUT_SECONDS" 0 7200 >/dev/null; rc=$? ;;
@@ -568,6 +588,7 @@ choose_quality_options() {
         conc)    CONCURRENCY="$ASK_VALUE" ;;
         rounds)  MAX_ROUNDS="$ASK_VALUE" ;;
         limit)   LIMIT="$ASK_VALUE" ;;
+        resume)  RESUME_LAST="$ASK_VALUE" ;;
         retries) RETRIES="$ASK_VALUE" ;;
         timeout) TIMEOUT_SECONDS="$ASK_VALUE" ;;
         stall)   STALL_TIMEOUT_SECONDS="$ASK_VALUE" ;;
@@ -919,6 +940,9 @@ run_refine() {
     if [[ -n "$LIMIT" ]]; then
       cmd+=(--limit "$LIMIT")
     fi
+    if [[ "$RESUME_LAST" == "1" ]]; then
+      cmd+=(--resume)
+    fi
     if [[ -n "$topics_csv" ]]; then
       cmd+=(--topics "$topics_csv")
     fi
@@ -985,9 +1009,9 @@ summary() {
   fi
   if [[ "$RUN_MODE" == "refine" ]]; then
     if (( CONCURRENCY > 3 )); then
-      printf '并发：%s（可用性失败自动降到 3），最大轮数：%s，每轮上限：%s\n' "$CONCURRENCY" "$MAX_ROUNDS" "${LIMIT:-不限}"
+      printf '并发：%s（可用性失败自动降到 3），最大轮数：%s，每轮上限：%s，续跑：%s\n' "$CONCURRENCY" "$MAX_ROUNDS" "${LIMIT:-不限}" "$([[ "$RESUME_LAST" == "1" ]] && printf 开 || printf 关)"
     else
-      printf '并发：%s，最大轮数：%s，每轮上限：%s\n' "$CONCURRENCY" "$MAX_ROUNDS" "${LIMIT:-不限}"
+      printf '并发：%s，最大轮数：%s，每轮上限：%s，续跑：%s\n' "$CONCURRENCY" "$MAX_ROUNDS" "${LIMIT:-不限}" "$([[ "$RESUME_LAST" == "1" ]] && printf 开 || printf 关)"
     fi
   fi
 }
@@ -1044,6 +1068,7 @@ save_last_config() {
     printf 'RETRIES=%q\n' "$RETRIES"
     printf 'TIMEOUT_SECONDS=%q\n' "$TIMEOUT_SECONDS"
     printf 'STALL_TIMEOUT_SECONDS=%q\n' "$STALL_TIMEOUT_SECONDS"
+    printf 'RESUME_LAST=%q\n' "$RESUME_LAST"
     printf 'DEGRADE_AFTER=%q\n' "$DEGRADE_AFTER"
     printf 'PROGRESS_STYLE=%q\n' "$PROGRESS_STYLE"
     printf 'HEARTBEAT_SECONDS=%q\n' "$HEARTBEAT_SECONDS"

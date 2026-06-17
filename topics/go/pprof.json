@@ -20,25 +20,25 @@
     "go.runtime.memory-gc"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "重点考察 runtime/pprof 与 net/http/pprof 的差异、六类 profile（cpu/heap/goroutine/block/mutex/threadcreate）的采样原理与开启方式，以及 go tool pprof 的 top/list/web 三件套用法和生产暴露的安全边界。",
+  "interviewerFocus": "重点考察六类 profile 的采样原理与开启开关、flat/cum 与 inuse/alloc 指标口径、block/mutex profile 的纳秒阈值与 fraction 采样机制、生产暴露安全边界，以及 pprof 与 runtime/trace 的能力分界。",
   "learningCards": [
     {
       "type": "explain",
       "title": "pprof 是采样器：runtime/pprof 与 net/http/pprof 两套入口",
-      "content": "pprof 的本质是 Go 运行时内置的采样器，按事件或时间采样函数栈，最后用 protobuf 写成 .pb.gz 让 go tool pprof 可视化。理解它先分清两套入口：\n\n1) runtime/pprof：手动控制采样窗口，适合 CLI 程序或基准测试。典型用法是 pprof.StartCPUProfile(f) + defer pprof.StopCPUProfile()，或者 pprof.Lookup(\"heap\").WriteTo(f, 0)。go test 提供了 -cpuprofile / -memprofile / -blockprofile / -mutexprofile 参数，本质上就是包装了这一套。\n2) net/http/pprof：导入即注册 /debug/pprof/ 路由（profile、heap、goroutine、block、mutex、allocs、threadcreate、trace、cmdline、symbol），适合长跑服务。匿名导入 _ \"net/http/pprof\" 后访问 http://host:port/debug/pprof/profile?seconds=30 即可拉一份 30 秒 CPU profile。\n\n采样原理对每类 profile 不同：\n- CPU profile 用 SIGPROF 信号触发，默认 100Hz（每 10ms 一次），由 runtime.SetCPUProfileRate 调整；超过约 500Hz 在多核机器上会丢样本。\n- heap profile 在每次 mallocgc 累计分配字节数达到 runtime.MemProfileRate（默认 512KB）时记录一次栈，所以小对象高频分配可能被合并。\n- goroutine profile 是同步快照，遍历所有 g 结构体的栈，G 数量过大时本身有暂停开销。\n- block profile 默认关闭，需要 runtime.SetBlockProfileRate(rate)，rate=1 表示采每次 channel/同步等待，rate=N 表示平均每 N 纳秒采一次。\n- mutex profile 默认关闭，需要 runtime.SetMutexProfileFraction(n)，n=1 全采，n=N 每 N 次竞争采一次。\n- threadcreate 记录 OS 线程创建栈，CGO 或 syscall 阻塞导致 m 暴涨时才用。\n\n常见误区：把 pprof 当成一个命令而不是一套采样契约；只在 net/http/pprof 上开 mutex 却忘了调用 SetMutexProfileFraction，结果拉下来全是空 profile。"
+      "content": "pprof 的本质是 Go 运行时内置的采样器，按事件或时间采样函数栈，最后用 protobuf 写成 .pb.gz 让 go tool pprof 可视化。理解它先分清两套入口：\n\n1) runtime/pprof：手动控制采样窗口，适合 CLI 程序或基准测试。典型用法是 pprof.StartCPUProfile(f) + defer pprof.StopCPUProfile()，或者 pprof.Lookup(\"heap\").WriteTo(f, 0)。go test 提供了 -cpuprofile / -memprofile / -blockprofile / -mutexprofile 参数，本质上就是包装了这一套。\n2) net/http/pprof：导入即注册 /debug/pprof/ 路由（profile、heap、goroutine、block、mutex、allocs、threadcreate、trace、cmdline、symbol），适合长跑服务。匿名导入 _ \"net/http/pprof\" 后访问 http://host:port/debug/pprof/profile?seconds=30 即可拉一份 30 秒 CPU profile。\n\n采样原理对每类 profile 不同：\n- CPU profile 用 SIGPROF 信号触发，默认 100Hz（每 10ms 一次），由 runtime.SetCPUProfileRate 调整。超过约 500Hz 在多核机器上会丢样本，因为信号处理本身有开销且 setitimer 精度有限。\n- heap profile 在每次 mallocgc 累计分配字节数达到 runtime.MemProfileRate（默认 512KB）时记录一次栈。小对象高频分配可能被合并到同一栈，导致 alloc_objects 维度比 alloc_space 更能反映真实分配次数。\n- goroutine profile 是同步快照，遍历所有 g 结构体的栈。G 数量过大时快照本身有暂停开销，线上 10 万+ goroutine 时拉一次可能卡几百毫秒。\n- block profile 默认关闭，需要 runtime.SetBlockProfileRate(rate)。rate 的语义是纳秒阈值：阻塞事件持续时间超过 rate 纳秒才会被记录。rate=1 表示几乎所有阻塞都被采（因为最短阻塞也 ≥1ns），rate=10000 表示只记录超过 10μs 的阻塞。rate=0 关闭。这个阈值机制意味着调高 rate 会过滤掉短等待，只保留真正影响延迟的长阻塞。\n- mutex profile 默认关闭，需要 runtime.SetMutexProfileFraction(n)。n=1 全采，n=N 每 N 次竞争采一次。注意 mutex profile 只记录「等待者」的栈，不记录「持有者」的栈（Go 1.18 后可通过 SetMutexProfileFraction 配合竞争分析定位持有方，但 profile 本身仍以等待方视角聚合）。\n- threadcreate 记录 OS 线程创建栈，CGO 或 syscall 阻塞导致 m 暴涨时才用。\n\n常见误区：把 pprof 当成一个命令而不是一套采样契约；只在 net/http/pprof 上开 mutex 却忘了调用 SetMutexProfileFraction，结果拉下来全是空 profile。"
     },
     {
       "type": "explain",
-      "title": "排查闭环：症状→采样→top/list/web→修改→同负载复测",
-      "content": "一次完整的 pprof 排查有四步，每步都有明确产物，不能跳：\n\n第一步 确认症状与负载。CPU 高、RSS 涨、P99 抖动、goroutine 数量曲线只升不降是四类典型入口；同时记录请求 QPS、版本号、环境，否则 profile 没有可比基线。\n第二步 采对应 profile。CPU 高拉 profile?seconds=30；内存涨拉 heap（默认是 inuse_space）；goroutine 漏拉 goroutine?debug=2 拿到完整栈文本；锁慢先 SetMutexProfileFraction(1) 再拉 mutex；channel/sync 等待先 SetBlockProfileRate(1) 再拉 block。\n第三步 用 go tool pprof 三件套。top 看 flat/cum 排序的前 N 个函数，flat 是函数自身耗时（不含被调用者），cum 是包含子调用的累计；list <Func> 把热点定位到具体行号；web 或 -http :8080 打开火焰图、调用图、source view。go tool pprof -base old.pprof new.pprof 还能做差分，专门用来验证优化效果。\n第四步 同负载复测。修改后用相同 QPS、相同版本压测，对比 P95/P99、RSS、CPU%、goroutine 数、GC pause；任何一个指标恶化都要回滚。\n\n四个 profile 的口径要分清：CPU 的 flat vs cum（封装层 flat 低、cum 高，真热点常在被调用者）；heap 的 inuse_space vs alloc_space（前者排查常驻泄漏，后者排查分配速率与 GC 压力）；heap 的 inuse_objects vs alloc_objects（小对象高频分配看 objects 比 space 准）；goroutine 的 debug=1 是聚合视图，debug=2 是逐协程完整栈。除 pprof 外，runtime/trace 是另一个维度——它输出调度器、网络、syscall、GC 的时间线，看 goroutine 在哪一刻被抢占或被网络 poller 唤醒，pprof 看不到这种时序信息。"
+      "title": "排查闭环与工程权衡：采样开销 vs 诊断精度",
+      "content": "一次完整的 pprof 排查有四步，每步都有明确产物，不能跳：\n\n第一步 确认症状与负载。CPU 高、RSS 涨、P99 抖动、goroutine 数量曲线只升不降是四类典型入口。同时记录请求 QPS、版本号、环境，否则 profile 没有可比基线。\n\n第二步 采对应 profile。CPU 高拉 profile?seconds=30；内存涨拉 heap（默认是 inuse_space）；goroutine 漏拉 goroutine?debug=2 拿到完整栈文本；锁慢先 SetMutexProfileFraction(1) 再拉 mutex；channel/sync 等待先 SetBlockProfileRate(1) 再拉 block。\n\n第三步 用 go tool pprof 三件套。top 看 flat/cum 排序的前 N 个函数，flat 是函数自身耗时（不含被调用者），cum 是包含子调用的累计。list <Func> 把热点定位到具体行号。web 或 -http :8080 打开火焰图、调用图、source view。go tool pprof -base old.pprof new.pprof 还能做差分，专门用来验证优化效果。\n\n第四步 同负载复测。修改后用相同 QPS、相同版本压测，对比 P95/P99、RSS、CPU%、goroutine 数、GC pause；任何一个指标恶化都要回滚。\n\n四个 profile 的口径要分清：CPU 的 flat vs cum（封装层 flat 低、cum 高，真热点常在被调用者）；heap 的 inuse_space vs alloc_space（前者排查常驻泄漏，后者排查分配速率与 GC 压力）；heap 的 inuse_objects vs alloc_objects（小对象高频分配看 objects 比 space 准）；goroutine 的 debug=1 是聚合视图，debug=2 是逐协程完整栈。除 pprof 外，runtime/trace 是另一个维度——它输出调度器、网络、syscall、GC 的时间线，看 goroutine 在哪一刻被抢占或被网络 poller 唤醒，pprof 看不到这种时序信息。\n\n工程权衡——采样开销与诊断精度的取舍：\n- CPU profile 的 100Hz 默认值是 Go 团队在「信号处理开销 < 1% CPU」和「统计代表性」之间选的平衡点。线上常驻开 CPU profile 会持续吃约 1%~2% CPU，所以生产环境一般按需采 30 秒窗口而非常开。\n- block profile 的 rate=1 在高并发 channel 场景下可能引入 3%~5% 的额外开销，因为每次阻塞事件都要记录栈。生产实践是先用 SIGUSR1 信号临时设 rate=10000（10μs 阈值）采 1 分钟，看是否有长尾阻塞，再决定是否降低阈值精采。\n- mutex profile 的 fraction=1 同理，全采锁竞争在高锁冲突服务上开销不可忽略。建议先用 fraction=100 粗采定位热点锁，再 fraction=1 精采分析。\n- heap profile 的 MemProfileRate=512KB 是采样间隔，不是每次分配都记录。这意味着单次分配 1MB 的大对象必然被采到，但 1000 次 1KB 小对象只采到约 2 次。排查小对象泄漏时，可以临时设 runtime.MemProfileRate=1（全采），但内存分配速率高的服务会因此 OOM。\n- goroutine profile 在 G 数量 > 5 万时，快照遍历本身可能阻塞调度器数百毫秒，生产环境拉 goroutine profile 要避开流量高峰。"
     },
     {
       "type": "diagram",
-      "title": "六类 profile 的采集入口与开启开关",
+      "title": "六类 profile 的采集入口、开启开关与失败路径",
       "format": "mermaid",
-      "content": "flowchart LR\nA[runtime/pprof 手动采样] --> CPU[CPU profile SIGPROF 100Hz]\nB[net/http/pprof /debug/pprof 路由] --> CPU\nB --> HEAP[heap profile MemProfileRate 512KB]\nB --> GORO[goroutine profile debug=2 全栈]\nB --> BLOCK[block profile 需 SetBlockProfileRate]\nB --> MUTEX[mutex profile 需 SetMutexProfileFraction]\nB --> THREAD[threadcreate OS 线程栈]\nCPU --> TOOL[go tool pprof top/list/web/-http]\nHEAP --> TOOL\nGORO --> TOOL\nBLOCK --> TOOL\nMUTEX --> TOOL",
-      "fallback": "runtime/pprof 与 net/http/pprof 两套入口都通向 6 类 profile：CPU(SIGPROF 100Hz)、heap(MemProfileRate)、goroutine(debug=2)、block(SetBlockProfileRate)、mutex(SetMutexProfileFraction)、threadcreate；最终统一交给 go tool pprof 用 top/list/web/-http 解析。",
-      "caption": "block 和 mutex profile 默认关闭，必须先调对应开关再采样，否则拉到的是空 profile。"
+      "content": "flowchart TD\n    A[runtime/pprof 手动采样] -->|StartCPUProfile/StopCPUProfile| CPU[CPU profile SIGPROF 100Hz]\n    B[net/http/pprof /debug/pprof 路由] -->|profile?seconds=N| CPU\n    B -->|heap?gc=heap| HEAP[heap profile MemProfileRate 512KB]\n    B -->|goroutine?debug=2| GORO[goroutine profile 全量快照]\n    B -->|block| BLOCK[block profile]\n    B -->|mutex| MUTEX[mutex profile]\n    B -->|threadcreate| THREAD[threadcreate OS 线程栈]\n    CPU -->|rate=0 默认关| FAIL1[空 profile 或无数据]\n    BLOCK -->|未调 SetBlockProfileRate| FAIL2[空 profile 200 但无样本]\n    MUTEX -->|未调 SetMutexProfileFraction| FAIL3[空 profile 200 但无样本]\n    GORO -->|G 数 > 5万| SLOW[快照阻塞调度器数百ms]\n    HEAP -->|MemProfileRate=512KB| MERGE[小对象被合并到同一栈]\n    CPU --> TOOL[go tool pprof top/list/web/-http/-base]\n    HEAP --> TOOL\n    GORO --> TOOL\n    BLOCK --> TOOL\n    MUTEX --> TOOL\n    THREAD --> TOOL\n    TOOL -->|flat低 cum高| TRAP[封装层陷阱: 真热点在被调用者]\n    TOOL -->|-base old new| DIFF[差分验证优化效果]",
+      "fallback": "runtime/pprof 与 net/http/pprof 两套入口都通向 6 类 profile。CPU 用 SIGPROF 100Hz；heap 按 MemProfileRate=512KB 采样；goroutine 全量快照；block 和 mutex 默认关闭，不调开关会拉到空 profile；goroutine 数量过大时快照本身阻塞调度器。最终统一交给 go tool pprof 用 top/list/web/-http/-base 解析，flat 低 cum 高时真热点在被调用者。",
+      "caption": "block 和 mutex profile 默认关闭，必须先调对应开关再采样，否则拉到的是空 profile；goroutine 快照在 G 数量大时本身有阻塞开销。"
     },
     {
       "type": "compareTable",
@@ -82,43 +82,51 @@
         [
           "block",
           "默认关",
-          "runtime.SetBlockProfileRate(rate)",
+          "runtime.SetBlockProfileRate(rate)，rate 为纳秒阈值",
           "channel/sync.Cond/select 长等待",
-          "忘记打开 → profile 为空；rate=1 在高并发下开销大"
+          "忘记打开 → profile 为空；rate=1 在高并发下开销 3%~5%"
         ],
         [
           "mutex",
           "默认关",
-          "runtime.SetMutexProfileFraction(n)",
+          "runtime.SetMutexProfileFraction(n)，n=1 全采",
           "sync.Mutex/RWMutex 竞争激烈",
-          "n 设太大几乎采不到；不区分等待和持有时间"
+          "n 设太大几乎采不到；只记录等待方栈不记录持有方"
         ]
       ]
     },
     {
       "type": "code",
-      "title": "生产服务的 pprof 暴露：独立 admin 端口 + 鉴权 + 开关",
+      "title": "生产服务的 pprof 暴露：独立 admin 端口 + 鉴权 + 信号动态开关",
       "language": "go",
-      "content": "package main\n\nimport (\n\t\"net/http\"\n\tnethttppprof \"net/http/pprof\"\n\t\"runtime\"\n)\n\nfunc main() {\n\t// 1) 默认关闭的 profile 必须显式打开，否则拉下来是空文件。\n\truntime.SetBlockProfileRate(1)         // 采每一次阻塞事件\n\truntime.SetMutexProfileFraction(1)     // 采每一次锁竞争\n\t// runtime.SetCPUProfileRate(200)      // 默认 100Hz，超过 500Hz 容易丢样本\n\n\t// 2) pprof 走独立 admin mux，避免和业务路由共用，方便在网关层只放行内网。\n\tadmin := http.NewServeMux()\n\tadmin.HandleFunc(\"/debug/pprof/\", auth(nethttppprof.Index))\n\tadmin.HandleFunc(\"/debug/pprof/cmdline\", auth(nethttppprof.Cmdline))\n\tadmin.HandleFunc(\"/debug/pprof/profile\", auth(nethttppprof.Profile)) // CPU\n\tadmin.HandleFunc(\"/debug/pprof/symbol\", auth(nethttppprof.Symbol))\n\tadmin.HandleFunc(\"/debug/pprof/trace\", auth(nethttppprof.Trace))     // runtime/trace\n\n\t// 3) 仅监听 127.0.0.1，靠 sidecar/跳板机访问；公网暴露等于把堆栈和环境变量送出去。\n\tgo http.ListenAndServe(\"127.0.0.1:6060\", admin)\n\n\thttp.ListenAndServe(\":8080\", businessMux())\n}\n\nfunc auth(h http.HandlerFunc) http.HandlerFunc {\n\treturn func(w http.ResponseWriter, r *http.Request) {\n\t\tu, p, ok := r.BasicAuth()\n\t\tif !ok || u != \"ops\" || p != mustEnv(\"PPROF_TOKEN\") {\n\t\t\thttp.Error(w, \"forbidden\", http.StatusForbidden)\n\t\t\treturn\n\t\t}\n\t\th(w, r)\n\t}\n}",
+      "content": "package main\n\nimport (\n\t\"net/http\"\n\tnethttppprof \"net/http/pprof\"\n\t\"os\"\n\t\"os/signal\"\n\t\"runtime\"\n\t\"syscall\"\n)\n\nfunc main() {\n\t// 1) block/mutex 默认关闭，启动时设一个保守阈值避免全采开销。\n\t// block rate=10000 表示只记录超过 10μs 的阻塞事件，开销可控。\n\truntime.SetBlockProfileRate(10000)\n\t// mutex fraction=100 粗采，每 100 次竞争采一次，定位热点后再精采。\n\truntime.SetMutexProfileFraction(100)\n\n\t// 2) SIGUSR1 动态切换到精采模式，用完 SIGUSR2 恢复保守阈值。\n\tgo func() {\n\t\tch := make(chan os.Signal, 1)\n\t\tsignal.Notify(ch, syscall.SIGUSR1, syscall.SIGUSR2)\n\t\tfor sig := range ch {\n\t\t\tif sig == syscall.SIGUSR1 {\n\t\t\t\truntime.SetBlockProfileRate(1)     // 全采阻塞\n\t\t\t\truntime.SetMutexProfileFraction(1) // 全采锁竞争\n\t\t\t} else {\n\t\t\t\truntime.SetBlockProfileRate(10000)\n\t\t\t\truntime.SetMutexProfileFraction(100)\n\t\t\t}\n\t\t}\n\t}()\n\n\t// 3) pprof 走独立 admin mux，避免和业务路由共用。\n\tadmin := http.NewServeMux()\n\tadmin.HandleFunc(\"/debug/pprof/\", auth(nethttppprof.Index))\n\tadmin.HandleFunc(\"/debug/pprof/cmdline\", auth(nethttppprof.Cmdline))\n\tadmin.HandleFunc(\"/debug/pprof/profile\", auth(nethttppprof.Profile))\n\tadmin.HandleFunc(\"/debug/pprof/symbol\", auth(nethttppprof.Symbol))\n\tadmin.HandleFunc(\"/debug/pprof/trace\", auth(nethttppprof.Trace))\n\n\t// 4) 仅监听 127.0.0.1，靠 sidecar/跳板机访问。\n\tgo http.ListenAndServe(\"127.0.0.1:6060\", admin)\n\n\thttp.ListenAndServe(\":8080\", businessMux())\n}\n\nfunc auth(h http.HandlerFunc) http.HandlerFunc {\n\treturn func(w http.ResponseWriter, r *http.Request) {\n\t\tu, p, ok := r.BasicAuth()\n\t\tif !ok || u != \"ops\" || p != os.Getenv(\"PPROF_TOKEN\") {\n\t\t\thttp.Error(w, \"forbidden\", http.StatusForbidden)\n\t\t\treturn\n\t\t}\n\t\th(w, r)\n\t}\n}\n\nfunc businessMux() http.Handler { return http.NewServeMux() }",
       "highlights": [
         {
-          "line": 11,
-          "note": "block 和 mutex profile 默认关闭，不调 SetBlockProfileRate/SetMutexProfileFraction 就拉，profile 是空的；这是面试和实战最常踩的坑。"
+          "line": 15,
+          "note": "block rate=10000 是纳秒阈值，只记录超过 10μs 的阻塞事件，避免 rate=1 全采在高并发 channel 场景下引入 3%~5% 额外开销。"
         },
         {
-          "line": 19,
-          "note": "/debug/pprof/profile 是 CPU profile（默认采 30 秒），/debug/pprof/trace 是 runtime/trace 时间线，二者 URL 字面接近但语义完全不同。"
+          "line": 17,
+          "note": "mutex fraction=100 粗采每 100 次竞争采一次，先用低开销定位热点锁，再通过 SIGUSR1 切到 fraction=1 精采分析。"
         },
         {
-          "line": 23,
-          "note": "pprof 路由必须独立到 admin 端口并只监听 127.0.0.1：路径会泄露 cmdline、内存内容、goroutine 栈，公网暴露过的服务出现过被人直接 dump heap 拿到 token 的事故。"
+          "line": 26,
+          "note": "SIGUSR1/SIGUSR2 动态切换采样精度，是生产环境平衡诊断精度与运行时开销的常见手段，避免常开精采模式。"
+        },
+        {
+          "line": 38,
+          "note": "/debug/pprof/profile 是 CPU profile（默认采 30 秒），/debug/pprof/trace 是 runtime/trace 时间线，URL 字面接近但语义完全不同。"
+        },
+        {
+          "line": 42,
+          "note": "pprof 路由独立到 admin 端口并只监听 127.0.0.1：路径会泄露 cmdline、内存内容、goroutine 栈，公网暴露有过被直接 dump heap 拿到 token 的事故。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "pprof 我会按“采样器本质 → 选 profile → 工具链分析 → 同负载复测”四步答。\n\n第一层 30 秒结论：pprof 是 Go runtime 内置的采样器，runtime/pprof 用于 CLI 和 benchmark，net/http/pprof 注册 /debug/pprof/ 路由用于长跑服务，最终都用 go tool pprof 解析。\n\n第二层 机制列表，按现象选 profile：\n- CPU% 高 → CPU profile（SIGPROF 100Hz），go tool pprof -http :8080 cpu.pprof，先 top 看 flat/cum，再 list 函数定位行号；封装层 flat 低 cum 高时真热点在被调用者。\n- 内存涨 → heap profile，先看 inuse_space 是否常驻增长（泄漏），再看 alloc_space/alloc_objects 是否分配速率太高（GC 压力），结合 -base 旧 profile 做差分。\n- goroutine 漏 → /debug/pprof/goroutine?debug=2 拿到全栈，看大量 G 卡在 chan recv、select、time.After 还是外部 RPC，回到 context 取消和退出条件。\n- 锁/channel 竞争 → 必须先 SetMutexProfileFraction(1) / SetBlockProfileRate(1) 再采，否则空 profile；mutex 看锁竞争，block 看所有同步等待（含 channel）。\n- 调度时序 → 用 runtime/trace（不是 pprof），看 goroutine 何时被抢占、网络 poller 何时唤醒、GC stop-the-world 多久。\n\n第三层 边界与生产经验：\n- 采样窗口至少 30 秒，配合稳定压测负载；优化前后用 go tool pprof -base 做差分，看 P95/P99/RSS/CPU/G 数同时改善。\n- 生产暴露 pprof 必须独立 admin 端口、内网监听 + 鉴权或 mTLS；公网暴露过的服务被直接 dump heap 拿到 token 的事故有真实案例。\n- 容器里采 CPU profile 要确认宿主 /proc/sys/kernel/perf_event_paranoid ≤ 1，否则 SIGPROF 信号被屏蔽。\n- 基准测试集成：go test -bench . -cpuprofile cpu.pprof -memprofile mem.pprof -benchtime 10s，CI 里跑差分回归是最稳的优化验证方式。",
+      "content": "pprof 我会按「采样器本质 → 选 profile → 工具链分析 → 同负载复测」四步答。\n\n第一层 30 秒结论：pprof 是 Go runtime 内置的采样器，runtime/pprof 用于 CLI 和 benchmark，net/http/pprof 注册 /debug/pprof/ 路由用于长跑服务，最终都用 go tool pprof 解析。\n\n第二层 机制列表，按现象选 profile：\n- CPU% 高 → CPU profile（SIGPROF 100Hz），go tool pprof -http :8080 cpu.pprof，先 top 看 flat/cum，再 list 函数定位行号。封装层 flat 低 cum 高时真热点在被调用者。\n- 内存涨 → heap profile，先看 inuse_space 是否常驻增长（泄漏），再看 alloc_space/alloc_objects 是否分配速率太高（GC 压力），结合 -base 旧 profile 做差分。\n- goroutine 漏 → /debug/pprof/goroutine?debug=2 拿到全栈，看大量 G 卡在 chan recv、select、time.After 还是外部 RPC，回到 context 取消和退出条件。\n- 锁/channel 竞争 → 必须先 SetMutexProfileFraction(1) / SetBlockProfileRate(1) 再采，否则空 profile。mutex 看锁竞争，block 看所有同步等待（含 channel）。\n- 调度时序 → 用 runtime/trace（不是 pprof），看 goroutine 何时被抢占、网络 poller 何时唤醒、GC stop-the-world 多久。\n\n第三层 边界与生产经验：\n- 采样窗口至少 30 秒，配合稳定压测负载。优化前后用 go tool pprof -base 做差分，看 P95/P99/RSS/CPU/G 数同时改善。\n- 生产暴露 pprof 必须独立 admin 端口、内网监听 + 鉴权或 mTLS。公网暴露被直接 dump heap 拿到 token 的事故有真实案例。\n- 容器里采 CPU profile 要确认宿主 /proc/sys/kernel/perf_event_paranoid ≤ 1，否则 SIGPROF 信号被屏蔽。\n- 采样开销权衡：CPU profile 常驻约 1%~2% CPU；block rate=1 在高并发 channel 场景 3%~5% 开销；mutex fraction=1 在高锁冲突服务上不可忽略。生产实践是用 SIGUSR1 信号临时切精采模式，采完用 SIGUSR2 恢复保守阈值。\n- block profile 的 rate 是纳秒阈值而非采样频率：rate=10000 只记录超过 10μs 的阻塞，rate=1 几乎全采。这个语义经常被误解为「平均每 N 纳秒采一次」。\n- 基准测试集成：go test -bench . -cpuprofile cpu.pprof -memprofile mem.pprof -benchtime 10s，CI 里跑差分回归是最稳的优化验证方式。",
       "followUpQuestions": [
         {
           "question": "flat 和 cum 怎么看？为什么只看 flat 经常找错热点？",
@@ -129,12 +137,12 @@
           "answer": "inuse_space/inuse_objects 看当前仍存活的对象，是泄漏和常驻缓存的视角；alloc_space/alloc_objects 看程序启动以来累计分配，反映分配速率与 GC 压力。inuse 持续单调增长 + alloc 增速正常 → 典型泄漏（对象进了 map 没删、goroutine 持有引用没退出）；inuse 平稳 + alloc 飙升 → 不是泄漏而是分配热点，要靠对象池、预分配 slice 容量、避免 fmt.Sprintf 频繁拼接来缓解。"
         },
         {
-          "question": "为什么 mutex profile 经常拉下来是空的？",
-          "answer": "mutex 和 block profile 默认完全关闭（fraction=0/rate=0），必须在程序启动时调 runtime.SetMutexProfileFraction(n) 和 runtime.SetBlockProfileRate(rate) 才会开始记录，n=1 表示全采，rate=1 表示采每一次阻塞事件。生产可以用 SIGUSR1 这类 admin 信号临时打开 1 分钟再关掉，避免常开造成 1%~3% 的额外开销；这一步漏了就会出现 “/debug/pprof/mutex 返回 200 但 profile 为空” 的怪现象。"
+          "question": "block profile 的 rate 参数到底什么语义？rate=1 和 rate=10000 有什么区别？",
+          "answer": "rate 是纳秒阈值，不是采样频率。阻塞事件持续时间超过 rate 纳秒才会被记录到 profile。rate=1 意味着几乎所有阻塞都被采（最短阻塞也 ≥1ns），开销大但最精确；rate=10000 只记录超过 10μs 的阻塞，过滤掉短等待，开销可控但可能漏掉高频小阻塞。rate=0 关闭。生产建议先用 rate=10000 粗采看长尾，再按需降低阈值。这个语义常被误解为「平均每 N 纳秒采一次」，实际是阈值过滤机制。"
         },
         {
           "question": "pprof 和 runtime/trace 各自解决什么问题？什么时候必须用 trace？",
-          "answer": "pprof 回答“时间/内存花在哪个函数”，按聚合统计；runtime/trace 回答“在某一时刻 goroutine、调度器、网络 poller、GC、syscall 在做什么”，是按时间轴的事件流。当现象是“偶发的 P99 尖刺”、“GC STW 卡顿怀疑”、“goroutine 被异常抢占”、“一次请求里多个下游调用是否真并行”这类时序问题，pprof 看不出来，必须用 go tool trace trace.out 打开浏览器视图看 goroutine analysis 和 sync blocking profile。"
+          "answer": "pprof 回答「时间/内存花在哪个函数」，按聚合统计；runtime/trace 回答「在某一时刻 goroutine、调度器、网络 poller、GC、syscall 在做什么」，是按时间轴的事件流。当现象是「偶发的 P99 尖刺」、「GC STW 卡顿怀疑」、「goroutine 被异常抢占」、「一次请求里多个下游调用是否真并行」这类时序问题，pprof 看不出来，必须用 go tool trace trace.out 打开浏览器视图看 goroutine analysis 和 sync blocking profile。"
         }
       ]
     },
@@ -144,9 +152,11 @@
       "items": [
         "能区分 runtime/pprof（手动采样、CLI/benchmark）和 net/http/pprof（/debug/pprof/ 路由）两套入口的适用场景",
         "能列出 6 类 profile（cpu/heap/goroutine/block/mutex/threadcreate）的采样原理和默认是否开启",
-        "能说出 SetCPUProfileRate / MemProfileRate / SetBlockProfileRate / SetMutexProfileFraction 四个开关的作用",
+        "能说出 SetCPUProfileRate / MemProfileRate / SetBlockProfileRate / SetMutexProfileFraction 四个开关的作用与语义",
+        "能解释 block profile 的 rate 是纳秒阈值而非采样频率，rate=1 近似全采、rate=10000 只记录超过 10μs 的阻塞",
         "能解释 flat vs cum、inuse_space vs alloc_space、inuse_objects vs alloc_objects 三组指标的差异",
         "能用 go tool pprof 的 top / list / web / -http :8080 / -base 完成定位和差分验证",
+        "能说明采样开销权衡：CPU 常驻 1%~2%、block rate=1 高并发 3%~5%、mutex fraction=1 高锁冲突不可忽略",
         "能说明生产暴露 pprof 的安全边界（独立 admin 端口、内网监听、鉴权）和容器 perf_event_paranoid 配置",
         "能区分 pprof 与 runtime/trace 的能力边界，知道何时必须用 trace 看时序"
       ]
@@ -169,7 +179,7 @@
     },
     {
       "id": "go.engineering.pprof.recall.3",
-      "prompt": "线上 goroutine 堆积或锁等待时，goroutine、mutex、block profile 应该怎么配合使用？需要先打开哪些开关？",
+      "prompt": "线上 goroutine 堆积或锁等待时，goroutine、mutex、block profile 应该怎么配合使用？block profile 的 rate 参数语义是什么？需要先打开哪些开关？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
@@ -179,20 +189,25 @@
     "mustHave": [
       "runtime/pprof 与 net/http/pprof 两套入口的差异",
       "CPU/heap/goroutine/block/mutex 五类 profile 的采样原理与开启开关",
+      "block profile 的 rate 是纳秒阈值而非采样频率",
       "flat vs cum、inuse_space vs alloc_space 的指标口径",
       "go tool pprof 的 top/list/web/-http/-base 用法"
     ],
     "goodToHave": [
       "SetCPUProfileRate 与 MemProfileRate 默认值（100Hz / 512KB）",
+      "采样开销权衡：CPU 常驻 1%~2%、block rate=1 高并发 3%~5%",
+      "SIGUSR1/SIGUSR2 动态切换采样精度的生产实践",
       "runtime/trace 与 pprof 的能力边界",
       "go test -cpuprofile/-memprofile 在 CI 里做差分回归",
       "生产 admin 端口隔离 + 鉴权 + 容器 perf_event_paranoid 配置"
     ],
     "commonMistakes": [
       "忘记 SetBlockProfileRate/SetMutexProfileFraction 就拉 profile 导致空文件",
+      "把 block profile 的 rate 理解为「平均每 N 纳秒采一次」而非纳秒阈值",
       "采样窗口太短或负载不稳定就下结论",
       "把 heap inuse 当 alloc 看，错判泄漏与高频分配",
       "只看 top 的 flat 列，漏掉封装层背后真正的热点路径",
+      "生产环境常开 block rate=1 或 mutex fraction=1 不评估开销",
       "把 /debug/pprof/ 直接挂在业务公网端口，泄露 cmdline 和堆栈"
     ],
     "scoreWeights": {
@@ -202,5 +217,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-13"
+  "updatedAt": "2026-06-16"
 }

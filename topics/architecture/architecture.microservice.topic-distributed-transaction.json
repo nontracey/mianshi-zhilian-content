@@ -4,7 +4,7 @@
   "category": "microservice",
   "group": "microservice",
   "title": "分布式事务方案选型",
-  "summary": "讲清分布式事务的 2PC、TCC、Saga、本地消息表、Seata 等方案的机制与取舍，以及按一致性强度选型和消费幂等等关键边界。",
+  "summary": "讲清分布式事务的 2PC/XA、TCC、Saga、本地消息表、事务消息、Seata AT 等方案的机制与取舍，重点覆盖 TCC 空回滚/悬挂/幂等、Saga 隔离性、Seata AT 全局锁与脏写、最终一致链路的补偿和消费幂等。",
   "tags": [
     "架构设计",
     "微服务",
@@ -22,53 +22,57 @@
     {
       "type": "explain",
       "title": "分布式事务方案选型：为什么需要分布式事务",
-      "content": "## 一、为什么需要分布式事务\n微服务架构下，一个业务操作可能涉及多个服务的数据库，本地事务无法保证跨服务的数据一致性。"
+      "content": "## 一、为什么需要分布式事务\n微服务拆分后，一个业务动作经常跨越多个独立数据库：下单要写订单库、扣库存库、冻结余额、发优惠券。每个服务的本地事务只能保证本库 ACID，无法覆盖远程 RPC、MQ 投递、另一个数据库提交成功但本服务超时等不确定状态。\n\n真正的矛盾不是“能不能让所有库像一个库一样提交”，而是要在以下约束间做取舍：\n\n- **一致性强度**：用户支付、资金冻结、库存预占更接近强一致；发积分、发券、通知、搜索索引同步通常接受最终一致。\n- **锁持有时间**：2PC/XA 在 prepare 后会持有数据库资源锁；TCC 把数据库锁缩短为 Try 阶段的本地事务，后续靠业务冻结字段表达资源占用。\n- **失败恢复路径**：RPC 超时不能等同于失败，必须能重试、查询事务状态、补偿或人工兜底。\n- **业务侵入性**：TCC 要为每个资源动作设计 Try/Confirm/Cancel；Saga 要为每个正向步骤设计补偿；本地消息表要建设投递、去重、告警和补偿任务。\n- **可观测性**：生产环境必须能按全局事务 ID、业务单号、分支事务 ID、消息 ID 查到当前卡在 Try、Confirm、Cancel、补偿、投递还是消费阶段。\n\n面试中不要把分布式事务讲成一个框架名。更好的切入是：先判断业务是否真的需要强一致，再看能否把强一致边界收敛到单服务或单库；跨服务部分优先考虑最终一致和可补偿设计，只有资金、库存硬约束链路才考虑 TCC/XA/Seata 这类更重的方案。"
     },
     {
       "type": "explain",
       "title": "分布式事务方案选型：核心方案",
-      "content": "## 二、核心方案\n### 2.1 两阶段提交（2PC）\n- **准备阶段**：协调者询问所有参与者能否提交\n- **提交阶段**：所有参与者都同意则提交，否则回滚\n- **缺点**：同步阻塞、单点故障、数据不一致风险\n\n### 2.2 TCC（Try-Confirm-Cancel）\n- **Try**：预留资源（冻结库存、冻结余额）\n- **Confirm**：确认提交（扣减冻结的资源）\n- **Cancel**：取消释放（解冻资源）\n- **优点**：不锁数据库行，性能好\n- **缺点**：业务侵入性强，每个操作要写三个方法\n\n### 2.3 Saga\n- 将长事务拆分为多个本地事务\n- 每个本地事务有对应的补偿事务\n- 失败时按逆序执行补偿\n- **两种实现**：编排式（Orchestration）和协同式（Choreography）\n\n### 2.4 本地消息表\n- 业务操作和消息写入在同一个本地事务中\n- 后台任务轮询消息表，发送到MQ\n- 消费者处理成功后删除消息\n- **优点**：实现简单，可靠\n\n### 2.5 Seata\n- 阿里开源的分布式事务框架\n- 支持AT/TCC/Saga/XA四种模式\n- **AT模式**：自动生成反向SQL，对业务无侵入\n- 需要undo_log表"
+      "content": "## 二、核心方案\n### 2.1 2PC / XA\n2PC 由协调者驱动参与者执行 prepare 和 commit/rollback。XA 是数据库层面的两阶段提交协议，常见数据库和中间件通过 XAResource、XID 等概念管理分支事务。\n\n- **机制**：prepare 阶段各参与者写入可提交状态并持有必要锁；commit 阶段协调者通知所有参与者提交，任何参与者 prepare 失败则回滚。\n- **优势**：一致性语义最强，业务侵入低，适合参与者数量少、事务时间短、吞吐不高的核心记账或清算链路。\n- **失败路径**：协调者故障会造成参与者处于 in-doubt 状态；网络分区会让参与者长时间持锁；参与者 prepare 成功后无法单方面提交或回滚。\n- **工程代价**：锁时间跨越网络往返，吞吐和尾延迟会明显恶化，微服务高并发在线链路通常不直接使用。\n\n### 2.2 TCC（Try-Confirm-Cancel）\nTCC 把“提交前锁资源”改成“业务预留资源”。Try 完成本地检查与资源冻结，Confirm 消耗冻结资源，Cancel 释放冻结资源。它的难点不在三段命名，而在异常语义。\n\n- **Try**：必须完成幂等的资源预留，例如 `available_stock - quantity`、`frozen_stock + quantity`，并写入事务分支记录，常用唯一键为 `xid + branch_id` 或业务单号。\n- **Confirm**：只能处理已经 Try 成功的资源，把冻结库存转为已扣减。Confirm 可能被重复调用，必须根据事务状态表做到幂等。\n- **Cancel**：释放 Try 冻结的资源，同样可能重复执行，不能把库存加回多次。\n- **空回滚**：Cancel 先于 Try 到达，或者 Try 因网络超时实际没有执行成功，Cancel 仍被事务协调器调用。解决方式是在 Cancel 中先查分支事务记录；不存在 Try 记录时插入一条 `CANCELLED`/空回滚标记，后续 Try 看到该标记必须拒绝执行。\n- **悬挂**：Cancel 已经空回滚成功，迟到的 Try 又执行冻结，导致资源永久占用。解决方式是 Try 开始时检查同一 `xid + branch_id` 是否已有 Cancel 标记，有则直接返回失败或幂等拒绝。\n- **幂等控制**：Try/Confirm/Cancel 都要有状态机约束，例如 `INIT -> TRIED -> CONFIRMED` 或 `INIT -> TRIED -> CANCELLED`，禁止 `CANCELLED -> TRIED`、禁止重复 Confirm/Cancel 改写资源。\n\nTCC 适合库存预占、资金冻结、额度占用这类可以显式建模“冻结态”的资源；不适合无法补偿、无法冻结、第三方接口没有幂等键的操作。\n\n### 2.3 Saga\nSaga 将长事务拆成多个本地事务，每个正向步骤配一个补偿动作，失败时按已完成步骤的逆序补偿。它适合订单履约、出行预订、审批流等持续时间长、参与者多、允许最终一致的流程。\n\n- **编排式（Orchestration）**：由一个流程编排器保存状态并调用各服务，便于观察、超时控制、人工干预和重试策略统一管理。\n- **协同式（Choreography）**：服务之间通过事件驱动推进，耦合看起来低，但事件链长后难以追踪，容易出现循环触发和重复消费。\n- **隔离性问题**：Saga 每一步本地事务提交后，中间状态对外可见。例如订单已创建但库存补偿尚未完成，其他流程可能读到“已占用库存”。这不是实现 bug，而是 Saga 缺少传统事务隔离的天然结果。\n- **应对策略**：用语义锁或状态机阻止外部流程误读中间态，例如订单状态为 `PENDING_CONFIRM` 时不允许发货；库存预留记录带过期时间；补偿事务必须幂等；外部查询按业务状态过滤“处理中”数据；必要时增加对账任务修复长时间停留在中间态的实例。\n\n### 2.4 本地消息表与事务消息\n本地消息表的关键是把“业务数据变更”和“待发送消息”放进同一个数据库事务。后台任务扫描 `PENDING` 消息投递到 MQ，成功后标记 `SENT`，消费方用业务唯一键或消息去重表保证幂等。\n\n它和 RocketMQ 事务消息的差别在于事务边界和恢复责任：\n\n- **本地消息表**：消息持久化在业务库，投递由业务系统轮询或 CDC 驱动；优点是可控、易审计、与业务事务天然同库提交；缺点是要自己处理扫描性能、分库分表、积压告警、重复投递。\n- **RocketMQ 事务消息**：先发送半消息，执行本地事务后提交或回滚消息；Broker 在未知状态时回查生产者。它减少了自建消息表投递器，但要求生产者实现可靠的本地事务状态查询，且仍然只能保证“本地事务与消息发送最终一致”，不能保证消费者业务一定成功。\n- **共同边界**：消费者必须幂等，投递至少一次，消息乱序和延迟都要纳入设计；如果消费者处理失败，要有重试、死信、补偿任务和人工修复入口。\n\n### 2.5 Seata\nSeata 提供 AT、TCC、Saga、XA 等模式。面试最常问的是 AT，因为它对业务侵入低，但边界也最容易被误用。\n\n- **AT 模式机制**：业务 SQL 执行前后生成 before image 和 after image，写入 `undo_log`；分支事务提交前向 TC 注册全局锁；全局提交时删除 undo_log，全局回滚时用 undo_log 生成反向补偿 SQL。\n- **全局锁**：Seata 的全局锁是按表和行主键维度注册到 TC，用来避免不同全局事务并发修改同一行造成脏写。拿不到全局锁时分支提交会失败并重试，业务会表现为超时或锁冲突。\n- **脏写防护**：全局回滚前会校验当前数据是否仍等于 after image；如果不一致，说明出现了全局事务之外的更新或未纳入 Seata 管理的写入，AT 无法安全回滚，需要人工介入或业务补偿。\n- **适用边界**：AT 适合关系型数据库、简单 SQL、短事务、业务可接受全局锁冲突的场景；复杂存储过程、跨非关系型资源、强业务语义冻结、外部接口调用，不应只靠 AT 自动回滚。"
     },
     {
       "type": "explain",
       "title": "分布式事务方案选型：选型建议",
-      "content": "## 三、选型建议\n- **强一致**：2PC/XA（性能差）\n- **高性能**：TCC（侵入性强）\n- **长流程**：Saga（补偿复杂）\n- **最终一致**：本地消息表/可靠消息（推荐）\n- **简单场景**：Seata AT模式"
+      "content": "## 三、选型建议\n选型时先把业务动作拆成“必须立即一致”和“可以延迟修复”两部分。不要用一个全局事务框架覆盖所有链路，否则会把性能、可用性和故障半径都压到最差。\n\n- **能收敛到单库单服务的强一致**：优先调整领域边界和数据归属，把强一致留在本地事务内。例如订单创建和订单状态流转由订单服务独占。\n- **数据库级强一致且参与方少**：选择 XA/2PC，但要控制参与者数量、事务时长和锁冲突，适合低并发核心账务，不适合高 QPS 下单主链路。\n- **高并发且资源可预留**：选择 TCC。设计重点是冻结字段、事务状态表、空回滚、悬挂、防重复 Confirm/Cancel，以及 Try 阶段失败时的快速释放。\n- **长流程、跨多个业务系统**：选择 Saga。设计重点是流程状态机、补偿幂等、语义锁、超时推进、人工干预和对账，而不是追求数据库隔离级别。\n- **异步派生动作**：选择本地消息表、CDC outbox 或 RocketMQ 事务消息。设计重点是至少一次投递、消费幂等、消息积压监控、死信处理、补偿任务。\n- **希望快速接入且主要是关系型数据库短事务**：可以评估 Seata AT。上线前必须压测全局锁冲突、验证 undo_log 清理、覆盖全局回滚校验失败和非 Seata 写入造成的脏写风险。\n\n生产落地要补齐四类指标：全局事务成功率、平均/99 线事务耗时、补偿或重试次数、卡在中间态的事务数量。只要存在补偿和重试，就必须有最大重试次数、死信队列或人工修复单，否则“最终一致”会退化成“最终没人知道是否一致”。"
     },
     {
       "type": "diagram",
       "format": "mermaid",
       "title": "分布式事务按一致性强度选型",
-      "content": "flowchart TD\nA[\"跨服务数据一致性需求\"] --> B{\"一致性强度\"}\nB -->|强一致| C[\"2PC/XA：阻塞、性能差\"]\nB -->|强一致高并发| D[\"TCC：Try-Confirm-Cancel，侵入强\"]\nB -->|最终一致| E[\"本地消息表/可靠消息：首选，需幂等\"]\nB -->|长流程| F[\"Saga：拆本地事务 + 逆序补偿\"]",
-      "caption": "分布式事务按一致性强度选型：强一致用 2PC 或 TCC（性能/侵入代价大），最终一致用本地消息表或可靠消息（首选，需消费幂等），长流程用 Saga 补偿。",
-      "fallback": "按一致性强度选型：强一致用 2PC/XA（阻塞、性能差）或 TCC（侵入强）；最终一致用本地消息表或可靠消息（首选，需幂等）；长流程用 Saga（拆本地事务加逆序补偿）。"
+      "content": "flowchart TD\nA[\"业务动作跨服务或跨库\"] --> B{\"能否调整边界到单库事务\"}\nB -->|能| C[\"领域收敛：本地事务保证强一致\"]\nB -->|不能| D{\"是否要求提交前不可见且立即一致\"}\nD -->|是，参与方少且低吞吐| E[\"XA/2PC：prepare 持锁，关注 in-doubt 恢复\"]\nD -->|是，但高并发资源可冻结| F[\"TCC：冻结资源 + 状态机防空回滚/悬挂\"]\nD -->|否，流程长且步骤可补偿| G[\"Saga：状态机 + 语义锁 + 逆序补偿\"]\nD -->|否，派生动作可异步| H[\"本地消息表/事务消息：至少一次投递 + 消费幂等\"]\nF --> I{\"是否有迟到 Try 或重复 Cancel\"}\nI -->|有| J[\"分支事务表记录 CANCELLED/CONFIRMED，拒绝非法状态迁移\"]\nG --> K{\"中间状态是否会被外部读取\"}\nK -->|会| L[\"PENDING 状态过滤、资源预留过期、补偿幂等\"]\nH --> M{\"消息投递或消费失败\"}\nM -->|失败| N[\"重试、死信、补偿任务、人工修复\"]",
+      "caption": "选型先判断能否回到本地事务，再按一致性强度、资源是否可冻结、流程是否可补偿、是否异步派生来选择方案；TCC、Saga、消息方案都必须设计异常状态收敛。",
+      "fallback": "分布式事务选型先尝试收敛到本地事务；不能收敛时，低吞吐强一致用 XA/2PC，高并发资源冻结用 TCC，长流程用 Saga，异步派生用本地消息表或事务消息，并为异常状态设计补偿。"
     },
     {
       "type": "compareTable",
       "title": "对比与边界",
-      "content": "| 维度 | 2PC | TCC | Saga | 本地消息表 | Seata AT |\n| --- | --- | --- | --- | --- | --- |\n| 一致性 | 强一致 | 最终一致 | 最终一致 | 最终一致 | 最终一致 |\n| 性能 | 差 | 好 | 好 | 好 | 中 |\n| 侵入性 | 低 | 高 | 中 | 低 | 低 |\n| 实现复杂 | 中 | 高 | 高 | 低 | 低 |\n| 适用场景 | 金融清算 | 支付/库存 | 长流程 | 异步场景 | 通用 |\n| 补偿机制 | 回滚 | Cancel | 补偿事务 | 重试 | undo_log |"
+      "content": "| 维度 | 2PC | TCC | Saga | 本地消息表 | Seata AT |\n| --- | --- | --- | --- | --- | --- |\n| 一致性 | 数据库协议层强一致，prepare 后等待最终决议 | 业务语义强一致或准强一致，依赖冻结资源和状态机 | 最终一致，中间步骤提交后对外可见 | 最终一致，业务事务与消息记录同库提交 | 最终一致，依赖 undo_log 回滚和全局锁协调 |\n| 性能 | 最差，跨网络持锁，尾延迟受最慢参与者影响 | 较好，本地事务短，但 Try 会占用业务冻结资源 | 较好，步骤异步推进，流程耗时可很长 | 较好，主链路只写业务表和消息表，投递异步 | 中等，全局锁冲突和 undo_log 写入会增加延迟 |\n| 侵入性 | 低到中，业务少改但基础设施要求高 | 高，每个资源动作要设计 Try/Confirm/Cancel | 中到高，每步要有补偿、状态机、超时策略 | 中，需要 outbox 表、投递器、去重和补偿任务 | 低，主要加注解和 undo_log，但 SQL 与数据源受约束 |\n| 典型失败点 | 协调者故障、参与者 in-doubt、锁长时间占用 | 空回滚、悬挂、重复 Confirm/Cancel、冻结资源泄漏 | 补偿失败、补偿重复、中间状态被其他流程误用 | 消息重复、积压、投递成功但标记失败、消费失败 | 全局锁获取失败、after image 不一致、非 Seata 写入导致脏写 |\n| 适用场景 | 低并发核心账务、清算、参与者少的强一致链路 | 库存预占、资金冻结、额度占用等资源可冻结场景 | 订单履约、旅游预订、审批流等长事务 | 下单后发券、积分、通知、搜索同步等异步派生动作 | 关系型数据库短事务、简单 SQL、快速接入的内部系统 |\n| 不适合场景 | 高 QPS 在线主链路、参与者多、长事务 | 无法冻结资源、第三方接口无幂等键、补偿不可控 | 对中间状态不可见有硬要求的资金扣划 | 需要立即强一致、消费者不可幂等 | 复杂 SQL、跨非关系型资源、外部副作用、强语义冻结场景 |\n| 关键治理 | in-doubt 事务恢复、锁等待监控、协调者高可用 | 分支事务表、状态机、空回滚标记、悬挂拒绝 | 语义锁、补偿幂等、流程超时、人工干预 | 去重表、重试退避、死信队列、积压告警 | undo_log 清理、全局锁冲突监控、回滚校验失败处理 |"
     },
     {
       "type": "code",
       "title": "代码示例",
-      "content": "// 1. TCC示例 - 订单扣库存\n// Try: 冻结库存\n@Service\npublic class InventoryTccService {\n    @Transactional\n    public boolean tryDeduct(String skuId, int quantity) {\n        // 检查可用库存\n        Inventory inv = inventoryRepo.selectForUpdate(skuId);\n        if (inv.getAvailable() < quantity) return false;\n        // 冻结库存\n        inv.setAvailable(inv.getAvailable() - quantity);\n        inv.setFrozen(inv.getFrozen() + quantity);\n        inventoryRepo.update(inv);\n        return true;\n    }\n\n    // Confirm: 扣减冻结库存\n    @Transactional\n    public void confirmDeduct(String skuId, int quantity) {\n        Inventory inv = inventoryRepo.findBySkuId(skuId);\n        inv.setFrozen(inv.getFrozen() - quantity);\n        inventoryRepo.update(inv);\n    }\n\n    // Cancel: 解冻库存\n    @Transactional\n    public void cancelDeduct(String skuId, int quantity) {\n        Inventory inv = inventoryRepo.findBySkuId(skuId);\n        inv.setFrozen(inv.getFrozen() - quantity);\n        inv.setAvailable(inv.getAvailable() + quantity);\n        inventoryRepo.update(inv);\n    }\n}\n\n// 2. 本地消息表\n@Service\npublic class OrderService {\n    @Transactional\n    public OrderId createOrder(CreateOrderCmd cmd) {\n        // 1. 创建订单\n        Order order = Order.create(cmd);\n        orderRepo.save(order);\n\n        // 2. 写本地消息表（同一个事务）\n        LocalMessage msg = new LocalMessage();\n        msg.setTopic(\"order-created\");\n        msg.setPayload(JSON.toJSONString(order));\n        msg.setStatus(MessageStatus.PENDING);\n        localMessageRepo.save(msg);\n\n        return order.getId();\n    }\n}\n\n// 后台任务轮询发送\n@Scheduled(fixedDelay = 1000)\npublic void pollAndSend() {\n    List<LocalMessage> messages = localMessageRepo\n        .findByStatus(MessageStatus.PENDING, 100);\n    for (LocalMessage msg : messages) {\n        try {\n            kafkaTemplate.send(msg.getTopic(), msg.getPayload());\n            msg.setStatus(MessageStatus.SENT);\n            localMessageRepo.update(msg);\n        } catch (Exception e) {\n            msg.setRetryCount(msg.getRetryCount() + 1);\n            localMessageRepo.update(msg);\n        }\n    }\n}\n\n// 3. Seata AT模式\n@GlobalTransactional(timeoutMills = 60000, name = \"create-order\")\npublic OrderId createOrder(CreateOrderCmd cmd) {\n    // 本地操作\n    Order order = Order.create(cmd);\n    orderRepo.save(order);\n    // 远程调用（Seata自动管理分布式事务）\n    inventoryClient.deduct(cmd.getItems());\n    return order.getId();\n}",
+      "content": "// 1. TCC示例：库存预占，重点处理幂等、空回滚和悬挂\n@Service\npublic class InventoryTccService {\n    @Transactional\n    public boolean tryDeduct(String xid, String branchId, String skuId, int quantity) {\n        TccBranch branch = branchRepo.find(xid, branchId);\n        if (branch != null && branch.isCancelled()) return false;\n        if (branch != null && branch.isTried()) return true;\n\n        Inventory inv = inventoryRepo.selectForUpdate(skuId);\n        if (inv.getAvailable() < quantity) return false;\n        inv.setAvailable(inv.getAvailable() - quantity);\n        inv.setFrozen(inv.getFrozen() + quantity);\n        inventoryRepo.update(inv);\n        branchRepo.insertTried(xid, branchId, skuId, quantity);\n        return true;\n    }\n\n    @Transactional\n    public void confirmDeduct(String xid, String branchId) {\n        TccBranch branch = branchRepo.findForUpdate(xid, branchId);\n        if (branch == null || branch.isConfirmed()) return;\n        if (branch.isCancelled()) return;\n\n        Inventory inv = inventoryRepo.selectForUpdate(branch.getSkuId());\n        inv.setFrozen(inv.getFrozen() - branch.getQuantity());\n        inventoryRepo.update(inv);\n        branchRepo.markConfirmed(xid, branchId);\n    }\n\n    @Transactional\n    public void cancelDeduct(String xid, String branchId, String skuId, int quantity) {\n        TccBranch branch = branchRepo.findForUpdate(xid, branchId);\n        if (branch == null) {\n            branchRepo.insertCancelled(xid, branchId, skuId, quantity);\n            return;\n        }\n        if (branch.isCancelled() || branch.isConfirmed()) return;\n\n        Inventory inv = inventoryRepo.selectForUpdate(branch.getSkuId());\n        inv.setFrozen(inv.getFrozen() - branch.getQuantity());\n        inv.setAvailable(inv.getAvailable() + branch.getQuantity());\n        inventoryRepo.update(inv);\n        branchRepo.markCancelled(xid, branchId);\n    }\n}\n\n// 2. 本地消息表：业务写入和待投递消息在同一个本地事务\n@Service\npublic class OrderService {\n    @Transactional\n    public OrderId createOrder(CreateOrderCmd cmd) {\n        Order order = Order.create(cmd);\n        orderRepo.save(order);\n\n        LocalMessage msg = new LocalMessage();\n        msg.setMessageId(UUID.randomUUID().toString());\n        msg.setTopic(\"order-created\");\n        msg.setBizKey(order.getId().toString());\n        msg.setPayload(JSON.toJSONString(order));\n        msg.setStatus(MessageStatus.PENDING);\n        localMessageRepo.save(msg);\n        return order.getId();\n    }\n}\n\n@Scheduled(fixedDelay = 1000)\npublic void pollAndSend() {\n    List<LocalMessage> messages = localMessageRepo.lockPending(MessageStatus.PENDING, 100);\n    for (LocalMessage msg : messages) {\n        try {\n            kafkaTemplate.send(msg.getTopic(), msg.getBizKey(), msg.getPayload()).get();\n            msg.markSent();\n            localMessageRepo.update(msg);\n        } catch (Exception e) {\n            msg.increaseRetryCount();\n            if (msg.getRetryCount() >= 10) msg.markFailed();\n            localMessageRepo.update(msg);\n        }\n    }\n}\n\n// 3. Seata AT模式：短事务可快速接入，但要关注全局锁冲突和undo_log\n@GlobalTransactional(timeoutMills = 60000, name = \"create-order\")\npublic OrderId createOrder(CreateOrderCmd cmd) {\n    Order order = Order.create(cmd);\n    orderRepo.save(order);\n    inventoryClient.deduct(cmd.getItems());\n    return order.getId();\n}",
       "language": "java"
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：分布式事务要解决「一个业务跨多个服务或库，本地事务保证不了一致性」。关键是按「一致性强度对性能、侵入性」做权衡——绝大多数互联网场景选最终一致（消息表、可靠消息），强一致才上 2PC。\n\n主流方案：\n\n1. 2PC/XA：协调者两阶段（准备加提交）锁住所有参与者。强一致，但同步阻塞、协调者单点、性能差，适合传统金融、少用。\n2. TCC（Try-Confirm-Cancel）：Try 预留资源、Confirm 提交、Cancel 释放。不锁数据库行、性能好，但业务侵入强（每个操作写三个方法），适合资金等强一致高并发。\n3. Saga：长事务拆成多个本地事务，每步配补偿，失败逆序补偿。适合长流程，但补偿逻辑复杂、且无隔离性（中间状态可见）。\n4. 本地消息表或可靠消息：业务和「发消息」写在同一本地事务，再投递 MQ、消费方幂等处理。实现简单可靠、最终一致，是最常用的方案。\n5. Seata：阿里框架，AT 模式自动生成反向 SQL、对业务几乎无侵入（需 undo_log 表），上手快。\n\n选型口诀：强一致用 2PC 或 TCC；最终一致用本地消息表或可靠消息（首选）；长流程用 Saga；想省事用 Seata AT。关键边界。① 所有最终一致方案都要求消费幂等，因为消息会重投。② 别为不需要强一致的场景硬上 2PC，性能代价巨大。③ 补偿和重试要有上限和人工兜底，避免无限重试或补偿也失败的悬挂事务。",
+      "content": "30 秒结论：分布式事务不是优先选框架，而是先收敛一致性边界。能放进单库本地事务就不要跨服务；必须跨服务时，强一致、资源可冻结、长流程、异步派生分别对应 XA/2PC、TCC、Saga、本地消息表或事务消息。Seata AT 适合关系型数据库短事务快速接入，但全局锁、undo_log 和脏写校验是上线前必须验证的风险点。\n\n机制要点：\n\n- XA/2PC：prepare 阶段参与者进入可提交状态并持锁，commit/rollback 由协调者决议。它一致性强，但锁跨网络持有，协调者故障会产生 in-doubt 事务，高并发在线链路要谨慎。\n- TCC：Try 冻结资源，Confirm 消耗冻结，Cancel 释放冻结。工程关键是分支事务表和状态机：重复 Confirm/Cancel 要幂等；Cancel 先到要记录空回滚；Cancel 后迟到的 Try 要识别悬挂并拒绝。\n- Saga：每一步都是独立本地事务，失败后逆序补偿。它天然缺少隔离性，中间状态会被读到，所以要用 PENDING 状态、语义锁、资源预留过期、补偿幂等和对账任务控制风险。\n- 本地消息表：业务变更和 outbox 消息同库提交，后台投递 MQ，消费方用业务键去重。RocketMQ 事务消息用半消息和事务回查替代自建投递表，但仍要求生产者能查询本地事务状态，消费者仍要幂等。\n- Seata AT：通过 before image、after image、undo_log 和 TC 全局锁自动回滚。全局锁用于防止多个全局事务改同一行；回滚时如果当前值与 after image 不一致，说明可能有脏写，不能盲目自动回滚。\n\n边界/追问应对：\n\n- 如果业务是下单后发积分、通知、同步搜索，优先本地消息表或事务消息，不要上 2PC。\n- 如果是库存预占或资金冻结，TCC 比 AT 更能表达业务语义，但开发成本更高，必须接受三阶段接口和事务状态表。\n- 如果流程持续几分钟甚至几小时，Saga 比长时间持锁更现实，但要向面试官主动说明隔离性缺失和语义锁设计。\n- 如果团队选择 Seata AT，要说明只把它用于短事务和受控 SQL，并监控全局锁等待、undo_log 堆积、回滚校验失败，而不是把外部接口调用也包装成可自动回滚。",
       "followUpQuestions": [
         {
-          "question": "在你的项目中，分布式事务方案选型是怎么落地的？遇到了什么权衡取舍？",
-          "answer": "分布式事务方案：2PC（强一致但阻塞）、TCC（灵活但侵入大）、Saga（长事务但补偿复杂）、本地消息表（可靠但实现复杂）、RocketMQ事务消息（最终一致性）。实际项目中大部分场景用最终一致性就够了。"
+          "question": "TCC 为什么会出现空回滚和悬挂？你会怎样设计表和状态机避免库存被冻结错乱？",
+          "answer": "空回滚来自 Cancel 比 Try 先到，或者 Try 超时但事务协调器无法确认是否执行，于是先触发 Cancel。Cancel 发现没有 Try 记录时不能直接忽略，而要插入同一 xid 和 branchId 的 CANCELLED 标记。悬挂是 Cancel 已经空回滚后，迟到的 Try 又执行冻结。Try 开始时必须查询分支事务表，发现 CANCELLED 就拒绝执行。状态机只允许 INIT 到 TRIED、TRIED 到 CONFIRMED、TRIED 到 CANCELLED，重复 Confirm 或 Cancel 返回幂等结果。"
         },
         {
-          "question": "分布式事务方案选型 在高并发（万级 QPS）和数据一致性要求高的场景下，有哪些关键设计决策？",
-          "answer": "分布式事务方案选型 在高并发场景下要先识别核心约束，再拆成容量、延迟、一致性、故障隔离和可观测性几个维度设计。回答 分布式事务方案选型 时，要说明 架构设计、微服务 的关键瓶颈、可异步或降级的链路、必须一致的数据以及积压或超时时的恢复方式。"
+          "question": "Saga 的中间状态已经提交并对外可见，怎么避免其他业务读到半成品状态后继续推进？",
+          "answer": "要用业务语义隔离而不是数据库隔离硬扛。订单、库存、支付等记录要有 PENDING、RESERVED、CONFIRMED、CANCELLED 这类状态；外部查询和下游动作只消费可推进状态；库存预留要带过期时间；补偿事务用业务键幂等；长时间 PENDING 的流程进入超时重试、对账或人工处理。编排式 Saga 更容易统一做超时、重试和人工干预。"
         },
         {
-          "question": "如果现有系统需要引入 分布式事务方案选型，你会怎么评估改造风险和制定迁移计划？",
-          "answer": "引入 分布式事务方案选型 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。引入 分布式事务方案选型 时建议分阶段推进：先选择 架构设计、微服务、分布式事务 中风险较低的链路试点，验证 降级策略 后再推广。分布式事务方案选型 迁移时要先灰度小流量，再绑定回滚条件、监控指标和业务验收口径。"
+          "question": "Seata AT 的全局锁解决什么问题？为什么仍然可能遇到脏写或回滚失败？",
+          "answer": "AT 的分支事务在本地提交前向 TC 注册表和主键维度的全局锁，防止另一个全局事务同时修改同一行。回滚时 Seata 会用 undo_log 的 after image 校验当前数据，如果当前值已经被非 Seata 事务或绕过全局锁的 SQL 改掉，就不能确定反向 SQL 是否安全，这就是脏写风险。生产上要限制非托管写入，监控全局锁冲突和回滚失败，并保留人工补偿。"
+        },
+        {
+          "question": "本地消息表和 RocketMQ 事务消息都说能保证最终一致，选型时你怎么区分？",
+          "answer": "本地消息表把 outbox 记录放在业务库，业务提交后由投递器扫描发送，优点是审计和补偿完全可控，缺点是要自己治理扫描、积压和重复投递。RocketMQ 事务消息先发半消息，执行本地事务后提交或回滚，Broker 对未知状态回查生产者，减少了自建投递器，但要求生产者提供可靠的本地事务状态查询。两者都不能省掉消费者幂等、重试、死信和补偿。"
         }
       ]
     },
@@ -76,53 +80,68 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "2PC的两阶段流程和缺点（同步阻塞、单点故障）",
-        "TCC的三步设计：Try预留/Confirm确认/Cancel取消",
-        "Saga的补偿机制和两种实现方式（编排/协同）",
-        "本地消息表的实现原理和适用场景",
-        "Seata AT模式的工作原理和undo_log的作用"
+        "2PC/XA 的 prepare、commit/rollback 流程，以及持锁、in-doubt 事务和协调者故障风险",
+        "TCC 的 Try 资源冻结、Confirm 消耗冻结、Cancel 释放冻结，以及分支事务状态机",
+        "TCC 空回滚、悬挂、重复 Confirm/Cancel 的触发条件和治理方式",
+        "Saga 的编排式与协同式差异，以及中间状态可见导致的隔离性问题",
+        "Saga 语义锁、PENDING 状态过滤、补偿幂等、超时重试和人工干预策略",
+        "本地消息表的 outbox 事务边界、后台投递、至少一次语义和消费幂等",
+        "本地消息表与 RocketMQ 事务消息在半消息、事务回查、投递治理责任上的差异",
+        "Seata AT 的 before image、after image、undo_log、TC 全局锁和回滚校验机制",
+        "Seata AT 全局锁冲突、非 Seata 写入导致脏写、undo_log 堆积等生产风险",
+        "按一致性强度、资源是否可冻结、流程长度、业务侵入性和故障恢复成本做方案选型"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "architecture.microservice.topic-distributed-transaction.recall.1",
-      "prompt": "请对比TCC和本地消息表两种分布式事务方案的优缺点和适用场景。",
+      "prompt": "请对比 TCC 和本地消息表两种分布式事务方案的机制、优缺点、异常治理和适用场景。",
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 4
     },
     {
       "id": "architecture.microservice.topic-distributed-transaction.recall.2",
-      "prompt": "Saga模式的编排式和协同式实现有什么区别？各自适合什么场景？",
+      "prompt": "Saga 模式为什么缺少隔离性？编排式和协同式在超时、补偿、可观测性上有什么差异？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "architecture.microservice.topic-distributed-transaction.recall.3",
-      "prompt": "Seata AT 模式和 TCC 的本质区别是什么？什么场景必须放弃 AT 选 TCC？",
+      "prompt": "Seata AT 模式和 TCC 的本质区别是什么？全局锁、undo_log 和脏写校验分别解决什么问题，什么场景必须放弃 AT 选 TCC？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出分布式事务解决跨服务/库的一致性问题",
-      "能区分 2PC、TCC、Saga、本地消息表的机制和适用",
-      "能按一致性强度与性能/侵入做选型",
-      "能指出最终一致方案都要求消费幂等"
+      "跨服务或跨库一致性边界识别",
+      "2PC/XA 的 prepare 持锁与 in-doubt 风险",
+      "TCC 的 Try/Confirm/Cancel 资源冻结模型",
+      "TCC 空回滚、悬挂与幂等状态机",
+      "Saga 正向事务、逆序补偿与中间状态可见",
+      "本地消息表 outbox 事务边界与消费幂等",
+      "Seata AT 的 undo_log、全局锁与回滚镜像校验"
     ],
     "goodToHave": [
-      "能解释 Seata AT 模式自动生成反向 SQL",
-      "能说明 Saga 无隔离性、中间状态可见",
-      "能指出补偿/重试要有上限和人工兜底"
+      "RocketMQ 事务消息的半消息与事务回查机制",
+      "Saga 语义锁、预留过期和人工干预设计",
+      "Seata AT 非托管写入导致脏写的生产风险",
+      "按一致性强度、资源可冻结性、流程长度和侵入性做选型",
+      "补偿重试上限、死信队列、对账任务和可观测指标"
     ],
     "commonMistakes": [
-      "不需要强一致却硬上 2PC，性能代价大",
-      "最终一致方案不做消费幂等导致重复处理",
-      "补偿或重试无上限产生悬挂事务"
+      "把分布式事务等同于直接引入 Seata 或 2PC",
+      "TCC Cancel 在没有 Try 记录时直接返回导致迟到 Try 悬挂",
+      "Confirm 或 Cancel 不做幂等导致冻结库存被重复扣减或释放",
+      "忽略 Saga 中间状态可见，导致其他流程读取半成品数据继续推进",
+      "认为本地消息表或事务消息可以省掉消费者幂等",
+      "Seata AT 包住外部接口调用并期待自动回滚副作用",
+      "非 Seata SQL 修改同一行后仍期待 undo_log 安全回滚",
+      "补偿和重试没有上限、死信和人工修复入口"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -135,6 +154,6 @@
     "architecture.microservice.topic-split-principles"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否区分主流分布式事务方案的机制、按一致性强度与性能/侵入做选型，并指出最终一致需幂等、补偿要有兜底等边界。",
-  "updatedAt": "2026-06-12"
+  "interviewerFocus": "重点看候选人是否能从业务一致性边界出发做取舍，并能讲透 TCC 空回滚/悬挂、Saga 隔离性、Seata AT 全局锁与脏写、本地消息表和事务消息的工程治理，而不是只背方案名称。",
+  "updatedAt": "2026-06-17"
 }

@@ -48,6 +48,7 @@ const maxConcurrency = 8;
 // activeChildren 已弃用 —— CLI 子进程路径已删除,API 模式无 spawn。但 installSignalHandlers / runProcess 仍引用 → 改写为 noop
 const activeChildren = new Map(); // noop 占位,后续 edit 会从 runProcess 里移走
 let shutdownRequested = false; // 保留:Ctrl-C 时设 true,所有循环检查后退出
+let activeRunDir = null;
 
 // 处理顺序：先小后大，便于早期发现问题、降低单次回滚成本（与 manual-refine 一致）。
 const DOMAIN_ORDER = [
@@ -179,6 +180,8 @@ function buildTopicSchema(original) {
 // applyPreset / commandPath / runQwenStructured 等)已彻底删除 —— v3 全 API 模式。
 // 上层调用统一走 callRefineApi(prompt, schema, { model, sampling, signal, onProgress })。
 async function callRefineApi(prompt, schema, { model, sampling, timeoutMs, signal, onProgress } = {}) {
+  await pauseBus.awaitResume();
+  if (shutdownRequested) throw makeInterruptedError();
   const t0 = Date.now();
   const result = await llmRunner.runRefine({
     systemPrompt: "你是内容精修助手,通过 structured_output 工具返回 JSON。",
@@ -493,7 +496,6 @@ function installSignalHandlers() {
 function installPauseKeyboard() {
   if (!process.stdin.isTTY) return;
   process.stdin.setEncoding("utf8");
-  // 进 raw 模式才能逐字符接 Enter / 单键
   let rawOn = false;
   const tryRaw = () => {
     if (rawOn) return;
@@ -503,24 +505,39 @@ function installPauseKeyboard() {
     if (!rawOn) return;
     try { process.stdin.setRawMode(false); rawOn = false; } catch {}
   };
+  const printHelp = () => {
+    process.stdout.write(`\n[KEYS] [p] 暂停/手动模式  [Enter] 继续  [a] 自动探活  [s] 跳过当前  [Ctrl-C] 安全停止\n`);
+  };
+  tryRaw();
+  process.stdin.resume();
+  printHelp();
   pauseBus.on("pause", () => {
     tryRaw();
     process.stdin.resume();
-    process.stdout.write(`\n[PAUSED] 额度耗尽 · ${pauseBus.reason}\n[Enter] 继续 / [a] 自动探活 / [s] 跳过当前 / [p] 手动模式\n`);
+    process.stdout.write(`\n[PAUSED] ${pauseBus.reason}\n[Enter] 继续 / [a] 自动探活 / [s] 跳过当前 / [p] 手动模式\n`);
   });
   pauseBus.on("resume", () => {
-    tryUnraw();
     process.stdout.write(`\n[RESUMED] 已恢复 (${pauseBus.describe().state})\n`);
   });
+  process.on("exit", tryUnraw);
   process.stdin.on("data", (buf) => {
-    if (!pauseBus.isPaused()) return;
     const ch = buf.toString();
+    if (ch === "") {
+      tryUnraw();
+      process.kill(process.pid, "SIGINT");
+      return;
+    }
+    if (!pauseBus.isPaused() && ch.toLowerCase() === "p") {
+      pauseBus.setPolicy("manual");
+      pauseBus.pause({ reason: "用户主动暂停" });
+      return;
+    }
+    if (!pauseBus.isPaused()) return;
     if (ch === "\r" || ch === "\n") {
       pauseBus.resume({ source: "manual-key" });
     } else if (ch.toLowerCase() === "a") {
       pauseBus.setPolicy("auto-probe");
       process.stdout.write("[POLICY] auto-probe(自动探活,额度恢复即续)\n");
-      // resume 一次让 router 自己排上探活循环;但实测应该让 worker 先 retry,触发到 quota error 时再排程
       pauseBus.resume({ source: "manual-key" });
     } else if (ch.toLowerCase() === "s") {
       pauseBus.setPolicy("skip");
@@ -529,10 +546,6 @@ function installPauseKeyboard() {
     } else if (ch.toLowerCase() === "p") {
       pauseBus.setPolicy("manual");
       process.stdout.write("[POLICY] manual(手动继续)\n");
-    } else if (ch === "") {
-      // Ctrl-C:让正常 SIGINT 流程接管
-      tryUnraw();
-      process.kill(process.pid, "SIGINT");
     }
   });
 }
@@ -655,6 +668,8 @@ async function runJudgeProcessJson(prompt, judge, model, ref, index, schema) {
   const attempts = judge?.jsonRetries ? judge.jsonRetries + 1 : 1;
   let lastError = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (shutdownRequested) throw makeInterruptedError();
+    await pauseBus.awaitResume();
     if (shutdownRequested) throw makeInterruptedError();
     const reqId = newReqId();
     liveEvents.emitEvent("llm.request", { reqId, topicRef: ref, kind: "judge", spec: model ?? null, attempt, attempts });
@@ -899,9 +914,14 @@ async function warmJudgeCacheForTargets(refs, judge, cfg = {}) {
       let result;
       try {
         state.activeBatches.push({ idx, refs: batch.map((item) => item.ref), startedAt: Date.now() });
-        if (useDashboard) dashboard.updateJudge(state);
+        if (useDashboard) {
+          dashboard.updateJudge(state);
+        } else if (cfg.progressStyle !== "quiet") {
+          console.log(`[判官] start batch ${idx + 1}/${state.totalBatches} refs=${batch.map((item) => item.ref).join(",")}`);
+        }
         result = await runJudgeBatch(batch, judge);
       } catch (error) {
+        if (cfg.progressStyle !== "quiet") console.log(`[判官] fail batch ${idx + 1}/${state.totalBatches} refs=${batch.map((item) => item.ref).join(",")} error=${error.message}`);
         aborted = error;
         return;
       } finally {
@@ -950,6 +970,9 @@ async function warmJudgeCacheForTargets(refs, judge, cfg = {}) {
   try {
     await Promise.all(Array.from({ length: warmConcurrency }, () => warmWorker()));
     if (aborted) throw aborted;
+    if (cfg.progressStyle !== "quiet") {
+      console.log(`[判官] 判前预热完成 missing=${missing.length} cached=${cachedTopics} batches=${state.doneBatches}/${state.totalBatches} 用时=${formatDuration(Date.now() - state.startedAt)}`);
+    }
   } finally {
     stopHeartbeat();
     if (useDashboard) dashboard.clearJudge();
@@ -2782,6 +2805,63 @@ async function gcJudgeOutputs(outputsDir, keep) {
   }
 }
 
+async function findLatestRunDir(qualityDir) {
+  let entries;
+  try {
+    entries = await readdir(qualityDir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d{4}-\d{2}-\d{2}T/.test(entry.name)) continue;
+    const dir = path.join(qualityDir, entry.name);
+    const st = await stat(dir).catch(() => null);
+    if (st) candidates.push({ dir, mtimeMs: st.mtimeMs });
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return candidates[0]?.dir ?? null;
+}
+
+function resolveResumeRunDir(value, qualityDir) {
+  if (!value) return null;
+  const raw = value === true ? "latest" : String(value).trim();
+  if (!raw || raw === "latest") return null;
+  const direct = path.isAbsolute(raw) ? raw : path.resolve(root, raw);
+  if (direct.startsWith(qualityDir)) return direct;
+  return path.join(qualityDir, raw);
+}
+
+function readCompletedRefsFromProgress(progressPath) {
+  let text;
+  try {
+    text = readFileSync(progressPath, "utf8");
+  } catch {
+    return new Map();
+  }
+  const completed = new Map();
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const item = JSON.parse(line);
+      if (item?.ref && ["good", "written", "merged", "kept"].includes(item.status)) completed.set(item.ref, item);
+    } catch {
+      // 忽略中断时可能写坏的最后一行。
+    }
+  }
+  return completed;
+}
+
+async function writeRunState(runDir, patch) {
+  const file = path.join(runDir, "run-state.json");
+  let prior = {};
+  try {
+    prior = JSON.parse(readFileSync(file, "utf8"));
+  } catch {}
+  const next = { ...prior, ...patch, updatedAt: new Date().toISOString() };
+  await writeFile(file, `${JSON.stringify(next, null, 2)}\n`).catch(() => {});
+}
+
 async function main() {
   const runStartedAt = Date.now(); // 全程墙钟起点：汇总里报“本次执行多久”
   const args = parseArgs();
@@ -2890,13 +2970,23 @@ async function main() {
   // API 模式无 CLI 路径,cliPath 仅作展示标签。
   const cliPath = `__api_mode__/${cfg.cli}`;
 
-  const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${sha256(scope).slice(0, 6)}`;
   const qualityDir = qualityRoot;
-  await gcOldRuns(qualityDir, 3);
+  const resumeRequested = Boolean(args.resume || args["resume-run"]);
+  let resumeRunDir = resolveResumeRunDir(args["resume-run"] ?? args.resume, qualityDir);
+  if (resumeRequested && !resumeRunDir) resumeRunDir = await findLatestRunDir(qualityDir);
+  if (!resumeRequested) await gcOldRuns(qualityDir, 3);
   await gcJudgeOutputs(path.join(qualityDir, "judge-cache", "outputs"), 50);
-  const runDir = path.join(qualityDir, runId);
+  const runId = resumeRunDir
+    ? path.basename(resumeRunDir)
+    : `${new Date().toISOString().replace(/[:.]/g, "-")}-${sha256(scope).slice(0, 6)}`;
+  const runDir = resumeRunDir ?? path.join(qualityDir, runId);
+  activeRunDir = runDir;
   await mkdir(runDir, { recursive: true });
   const progressPath = path.join(runDir, "progress.jsonl");
+  const completedFromProgress = resumeRequested ? readCompletedRefsFromProgress(progressPath) : new Map();
+  if (resumeRequested) {
+    console.log(`[RESUME] runDir=${path.relative(root, runDir)} 已有完成记录 ${completedFromProgress.size} 条`);
+  }
   const modelState = makeModelState(modelChain, degradeAfter, degradeWindowSeconds * 1000);
 
   // ===== 动态判官配置（默认开；模型默认跟精修主模型一致；支持多模型 × 每模型多实例）=====
@@ -3005,12 +3095,54 @@ async function main() {
     lastOk: null,
     lastError: null,
   }]));
+  for (const [ref, item] of completedFromProgress.entries()) {
+    const s = state.get(ref);
+    if (!s) continue;
+    const ok = ["good", "written", "merged"].includes(item.status);
+    s.attempts = Math.max(1, Number(item.attempts ?? 1));
+    s.lastOk = ok;
+    s.lastKeptOld = item.status === "kept";
+    s.lastAlreadyGood = item.status === "good";
+    s.lastError = item.error ?? null;
+    s.lastResult = {
+      ok,
+      keptOld: item.status === "kept",
+      alreadyGood: item.status === "good",
+      merged: item.status === "merged",
+      action: item.action,
+      attempts: item.attempts,
+      decisionReason: item.decisionReason,
+      staticBefore: item.staticBefore,
+      staticAfter: item.staticAfter,
+      dynamicBefore: item.dynamicBefore,
+      dynamicAfter: item.dynamicAfter,
+      changedBlocks: item.changedBlocks,
+      mergedBlocks: (item.mergedBlocks ?? []).map((label) => ({ label })),
+      error: item.error,
+    };
+  }
+  if (completedFromProgress.size) {
+    const inScopeDone = targetRefs.filter((ref) => completedFromProgress.has(ref)).length;
+    console.log(`[RESUME] scope 内跳过已完成 ${inScopeDone}/${targetRefs.length} 篇，未完成项会继续进入后续轮次。`);
+  }
   const stuck = new Set();
   // 跨轮重试累计：每 ref 处理了几轮（rounds）+ 单轮内最多 attempt 次数（maxAttempts），用于汇总“重试后是否成功”。
   const retryStats = new Map();
+  if (!dryRun) {
+    await writeRunState(runDir, {
+      runId,
+      status: resumeRequested ? "resumed" : "running",
+      scope,
+      minScore,
+      targetRefs,
+      completedFromProgress: completedFromProgress.size,
+      startedAt: new Date(runStartedAt).toISOString(),
+    });
+  }
 
   for (let round = 1; round <= maxRounds; round += 1) {
     if (shutdownRequested) throw makeInterruptedError();
+    await writeRunState(runDir, { status: "running", round, stage: "audit" });
     dashboard.setStage("① 全量审计", { round, maxRounds });
     const audit = await runAudit(minScore, cfg);
     const templates = templatesByRef(audit);
@@ -3047,9 +3179,11 @@ async function main() {
       return;
     }
 
+    await writeRunState(runDir, { status: "running", round, stage: "judge-warm", roundTargets: ordered });
     dashboard.setStage("② 判官预热", { round, maxRounds });
     await warmJudgeCacheForTargets(ordered, judge, cfg);
 
+    await writeRunState(runDir, { status: "running", round, stage: "refine", roundTargets: ordered });
     dashboard.setStage("③ 精修", { round, maxRounds });
     const counters = { total: ordered.length, processed: 0, good: 0, written: 0, merged: 0, kept: 0, failed: 0 };
     const results = await refinePoolWithConcurrencyFallback(ordered, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters, corpus, judge);
@@ -3172,6 +3306,7 @@ async function main() {
       .sort((a, b) => a.score - b.score),
   };
   await writeFile(path.join(runDir, "summary.json"), `${JSON.stringify(summary, null, 2)}\n`);
+  await writeRunState(runDir, { status: "completed", stage: "done", summary: "summary.json" });
 
   // 精修结束：关掉 dashboard，让最终汇总用普通滚屏输出。
   dashboard.disable();
@@ -3222,12 +3357,16 @@ const __isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.a
 
 if (__isMain) {
   main()
-    .catch((error) => {
+    .catch(async (error) => {
       if (error?.interrupted) {
-        console.error("[INTERRUPT] 精修已中断。");
+        if (activeRunDir) {
+          await writeRunState(activeRunDir, { status: "interrupted", stage: "stopped", resumeCommand: `node scripts/quality_refine.mjs --resume-run ${path.relative(root, activeRunDir)}` });
+        }
+        console.error(`[INTERRUPT] 精修已中断。可用 --resume 或 --resume-run ${activeRunDir ? path.relative(root, activeRunDir) : "<runDir>"} 续跑。`);
         process.exitCode = 130;
         return;
       }
+      if (activeRunDir) await writeRunState(activeRunDir, { status: "failed", stage: "error", error: error.message });
       console.error(error);
       process.exitCode = 1;
     })

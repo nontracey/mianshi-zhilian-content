@@ -26,12 +26,12 @@
     {
       "type": "explain",
       "title": "ETL 与 ELT 的本质差别：转换发生在源端还是仓内",
-      "content": "ETL（Extract-Transform-Load）在抽取出来后、写入目标库之前，由独立 ETL 引擎（Kettle、Informatica、DataStage、Spark Job）完成 join、清洗、维度查找等转换，最终只把结果表写入目标。ELT（Extract-Load-Transform）则先把原始数据原样落到湖仓的 ODS/raw 层，再由仓库自己的 SQL 引擎（Snowflake、BigQuery、Hive、Doris、StarRocks）做转换。\n\n核心差别有三条：(1) 算力位置——ETL 吃 ETL 集群的 CPU/内存，受限于服务器规模；ELT 把转换下推到数仓，可借 MPP 和列存按需弹性扩。(2) 是否保留原始数据——ETL 的中间状态通常落在临时表，覆盖即丢失；ELT 必须保留 ODS 原始层，下游模型出错可以从 ODS 重算而不重新抽源库。(3) Schema 治理——ETL 在写入前已经强制 schema 对齐，下游表结构稳定；ELT 在原始层允许 schema drift，需要在 stg/dwd 转换层显式处理新增字段。\n\n选型口径：源系统弱（业务库怕全表扫描）、目标平台计算弱、合规要求转换前脱敏 → 选 ETL；目标是云数仓/湖仓、需要保留原始数据用于重算或审计、SQL 团队比 Java/Spark 团队强 → 选 ELT。"
+      "content": "ETL（Extract-Transform-Load）在抽取出来后、写入目标库之前，由独立 ETL 引擎（Kettle、Informatica、DataStage、Spark Job）完成 join、清洗、维度查找等转换，最终只把结果表写入目标。ELT（Extract-Load-Transform）则先把原始数据原样落到湖仓的 ODS/raw 层，再由仓库自己的 SQL 引擎（Snowflake、BigQuery、Hive、Doris、StarRocks）做转换。\n\n核心差别有三条：\n\n- **算力位置**：ETL 吃 ETL 集群的 CPU/内存，受限于服务器规模；ELT 把转换下推到数仓，可借 MPP 和列存按需弹性扩。\n- **是否保留原始数据**：ETL 的中间状态通常落在临时表，覆盖即丢失；ELT 必须保留 ODS 原始层，下游模型出错可以从 ODS 重算而不重新抽源库。\n- **Schema 治理**：ETL 在写入前已经强制 schema 对齐，下游表结构稳定；ELT 在原始层允许 schema drift，需要在 stg/dwd 转换层显式处理新增字段。\n\n选型口径：源系统弱（业务库怕全表扫描）、目标平台计算弱、合规要求转换前脱敏 → 选 ETL；目标是云数仓/湖仓、需要保留原始数据用于重算或审计、SQL 团队比 Java/Spark 团队强 → 选 ELT。"
     },
     {
       "type": "explain",
       "title": "全量、增量、CDC 三种入仓策略的取舍",
-      "content": "入仓策略决定每次同步从源库读多少、如何识别变化、能否捕获删除：\n\n(1) 全量快照：每次 select * 把整张表抽走，目标侧覆盖写或按 dt 分区写新一份。优点是逻辑简单、自然幂等（重跑就是再覆盖一遍）；缺点是大表（千万行以上）压垮源库 IO，且无法捕获中间状态变化。适用维表、配置表、不超过百万行的小表。\n\n(2) 增量抽取：靠 update_time/auto_increment id 做条件查询 where update_time > last_watermark。优点是对源库压力小；缺点是无法捕获物理 delete（软删除字段才能体现），且依赖业务方老老实实更新 update_time——很多老系统 update without touching update_time，会丢更新。watermark 还要处理迟到数据（一般留 5-10 分钟回溯窗口）。\n\n(3) CDC（Change Data Capture）：直接订阅 MySQL binlog/PostgreSQL WAL/Oracle LogMiner，得到 INSERT/UPDATE/DELETE 三种事件流。优点是不扫源表、能捕获 delete、延迟可做到秒级；缺点是需要数据库开启 binlog（row 格式）、需要复制账号权限、需要处理 DDL 变更和 binlog 过期清理。生产典型部署：首次全量 + 之后切 binlog 增量（Flink CDC 的 initial 模式正是这个流程）。\n\n关键边界：增量同步必须设计幂等键（业务主键 + op_ts），CDC 流必须按主键 upsert 写下游（否则 update 事件会变成新行），全量覆盖写要先写临时表再原子 rename，避免下游读到半成品。"
+      "content": "入仓策略决定每次同步从源库读多少、如何识别变化、能否捕获删除：\n\n**(1) 全量快照**：每次 select * 把整张表抽走，目标侧覆盖写或按 dt 分区写新一份。优点是逻辑简单、自然幂等（重跑就是再覆盖一遍）。缺点是大表（千万行以上）压垮源库 IO，且无法捕获中间状态变化。适用维表、配置表、不超过百万行的小表。\n\n**(2) 增量抽取**：靠 update_time/auto_increment id 做条件查询 where update_time > last_watermark。优点是对源库压力小。缺点有两个：一是无法捕获物理 delete（软删除字段才能体现）；二是依赖业务方更新 update_time——很多老系统 update without touching update_time，会丢更新。watermark 还要处理迟到数据，一般留 5-10 分钟回溯窗口。\n\n**(3) CDC（Change Data Capture）**：直接订阅 MySQL binlog/PostgreSQL WAL/Oracle LogMiner，得到 INSERT/UPDATE/DELETE 三种事件流。优点是不扫源表、能捕获 delete、延迟可做到秒级。缺点是需要数据库开启 binlog（row 格式）、需要复制账号权限、需要处理 DDL 变更和 binlog 过期清理。生产典型部署：首次全量 + 之后切 binlog 增量（Flink CDC 的 initial 模式正是这个流程）。\n\n关键边界：增量同步必须设计幂等键（业务主键 + op_ts）。CDC 流必须按主键 upsert 写下游，否则 update 事件会变成新行。全量覆盖写要先写临时表再原子 rename，避免下游读到半成品。"
     },
     {
       "type": "compareTable",
@@ -85,7 +85,13 @@
       "format": "mermaid",
       "content": "flowchart LR\nA[MySQL 业务库<br/>binlog row 模式] --> B[Flink CDC Source<br/>首次全量+增量]\nB --> C[Kafka ODS Topic<br/>按主键分区]\nC --> D[Flink SQL 转换<br/>维表 join + 清洗]\nC --> E[ODS 原始层<br/>Iceberg/Hudi upsert]\nD --> F[DWD 明细层<br/>分区表]\nE -->|重算| D\nF --> G[质量校验<br/>行数/主键唯一/枚举值]\nG --> H[发布 ADS/对外服务]",
       "fallback": "MySQL binlog → Flink CDC（首次全量+增量切换）→ Kafka ODS Topic → 双写 Iceberg ODS 原始层与 Flink SQL 清洗 → DWD → 质量校验 → 发布。原始层保留以便下游异常时回溯重算。",
-      "caption": "核心是：Flink CDC 把 binlog 转成可重放的事件流，ODS 层无脑落原始数据，DWD 转换出错可从 ODS 回放重算，不再回头打扰业务库。"
+      "caption": "核心是：Flink CDC 把 binlog 转成可重放的事件流，ODS 层无脑落原始数据，DWD 转换出错可从 ODS 回放重算，不再回头打扰业务库。",
+      "items": [
+        "Flink CDC Source 负责全量+增量一体化采集",
+        "Kafka 作为 ODS 事件缓冲层，按主键分区保证同键有序",
+        "ODS 原始层保留全量历史，支持回溯重算",
+        "DWD 层做维表 join 与清洗，异常时从 ODS 重放"
+      ]
     },
     {
       "type": "code",
@@ -110,15 +116,15 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "我会按“先讲转换位置差异，再落到入仓策略和工具选型，最后讲幂等和回滚”这三层来答。\n\n30 秒结论：ETL 是抽取后在外部转换再写目标，ELT 是先把原始数据落到湖仓再用仓内 SQL 转换；现在云数仓/湖仓场景几乎都是 ELT + CDC，原因是仓内算力弹性强、可以保留 ODS 原始层用于重算。\n\n机制主线：(a) 入仓策略分全量、增量、CDC 三种——维表小表用全量覆盖；有可靠 update_time 的可以用增量；要捕获 delete 或要求秒级延迟必须 CDC。(b) 工具选型上，离线批同步 DataX 仍是主力（异构数据源最全），实时 CDC 我会用 Flink CDC 2.x，它把首次全量和 binlog 增量做成无锁切换；只做 MySQL 单点分发可以用 Canal；Sqoop 已经停止维护不建议新项目用。(c) CDC 写下游必须 upsert，主键不能丢，server-id 要全局唯一。\n\n边界与坑：覆盖写一定要先写临时表再 rename 切换，避免下游读到半数据；schema drift 必须在 ODS 层兼容落地、在 DWD 层显式处理；CDC 任务挂掉超过 binlog 保留时长（通常 7 天）就只能重做全量，所以监控 binlog 滞后是必须的；行数对账、主键唯一性校验、质量规则要在发布前跑一遍，不要等下游告警。",
+      "content": "我会按「先讲转换位置差异，再落到入仓策略和工具选型，最后讲幂等和回滚」这三层来答。\n\n**30 秒结论**：ETL 是抽取后在外部转换再写目标，ELT 是先把原始数据落到湖仓再用仓内 SQL 转换。现在云数仓/湖仓场景几乎都是 ELT + CDC，原因是仓内算力弹性强、可以保留 ODS 原始层用于重算。\n\n**机制主线**：\n\n- **入仓策略分三种**：维表小表用全量覆盖；有可靠 update_time 的可以用增量；要捕获 delete 或要求秒级延迟必须 CDC。\n- **工具选型**：离线批同步 DataX 仍是主力（异构数据源最全）；实时 CDC 用 Flink CDC 2.x，它把首次全量和 binlog 增量做成无锁切换；只做 MySQL 单点分发可以用 Canal；Sqoop 已停止维护，不建议新项目用。\n- **CDC 写下游要点**：必须 upsert，主键不能丢，server-id 要全局唯一。\n\n**边界与坑**：\n\n- 覆盖写一定要先写临时表再 rename 切换，避免下游读到半数据。\n- Schema drift 必须在 ODS 层兼容落地、在 DWD 层显式处理。\n- CDC 任务挂掉超过 binlog 保留时长（通常 7 天）就只能重做全量，所以监控 binlog 滞后是必须的。\n- 行数对账、主键唯一性校验、质量规则要在发布前跑一遍，不要等下游告警。",
       "followUpQuestions": [
         {
           "question": "DataX 和 Flink CDC 在做 MySQL→Hive 同步时怎么选？",
-          "answer": "看延迟要求和源库压力。DataX 走 JDBC 全表/条件扫描，T+1 离线 OK，但每次会给业务库加 IO 压力，且无法捕获 delete；Flink CDC 走 binlog，几乎不打扰业务库，能拿到 delete 事件，秒级延迟。如果是小时级以下时延要求或需要捕获删除 → Flink CDC；如果只是日级离线、源库白天空闲、且团队 Flink 运维能力弱 → DataX 更省事。还有一种混合用法：首次全量用 DataX 灌底，之后切 Canal/Flink CDC 接增量。"
+          "answer": "看延迟要求和源库压力。DataX 走 JDBC 全表/条件扫描，T+1 离线 OK，但每次会给业务库加 IO 压力，且无法捕获 delete。Flink CDC 走 binlog，几乎不打扰业务库，能拿到 delete 事件，秒级延迟。如果是小时级以下时延要求或需要捕获删除 → Flink CDC；如果只是日级离线、源库白天空闲、且团队 Flink 运维能力弱 → DataX 更省事。还有一种混合用法：首次全量用 DataX 灌底，之后切 Canal/Flink CDC 接增量。"
         },
         {
           "question": "binlog CDC 链路如果任务挂了几天再重启，会有什么问题？怎么处理？",
-          "answer": "MySQL binlog 默认保留 7 天（expire_logs_days），超期会被清理。任务挂了超过保留期再启动，会报 'binlog file not found'，无法续跑。处理方式：(1) 监控 binlog 滞后秒数，超过阈值（比如 1 小时）就告警；(2) 把 binlog 保留期调到 14 天给容灾留余量；(3) 真的丢了位点只能重做全量初始化（Flink CDC 切 initial 模式从头来一遍，下游用主键 upsert 不会重复）；(4) 关键链路双写 Kafka，Kafka 保留期可以更长，作为 binlog 的二级缓冲。"
+          "answer": "MySQL binlog 默认保留 7 天（expire_logs_days），超期会被清理。任务挂了超过保留期再启动，会报 binlog file not found，无法续跑。处理方式：(1) 监控 binlog 滞后秒数，超过阈值（比如 1 小时）就告警；(2) 把 binlog 保留期调到 14 天给容灾留余量；(3) 真的丢了位点只能重做全量初始化（Flink CDC 切 initial 模式从头来一遍，下游用主键 upsert 不会重复）；(4) 关键链路双写 Kafka，Kafka 保留期可以更长，作为 binlog 的二级缓冲。"
         },
         {
           "question": "ELT 的原始层（ODS）保留原始数据，对重跑和审计有什么实际价值？",
@@ -175,7 +181,7 @@
       "能说出 Iceberg/Hudi 时间旅行对审计追溯的价值"
     ],
     "commonMistakes": [
-      "把 ETL/ELT 简单总结成“先转后转”，忽略算力位置和原始数据保留两个真正差异",
+      "把 ETL/ELT 简单总结成先转后转，忽略算力位置和原始数据保留两个真正差异",
       "用 update_time 增量同步却没设计软删除字段，导致下游永远删不掉记录",
       "CDC 链路写下游用 append 模式，update 事件全部变成新行造成数据膨胀",
       "依赖 Sqoop 上新项目，没意识到它已经在 Apache Attic 退役",
@@ -188,5 +194,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-13"
+  "updatedAt": "2026-06-17"
 }

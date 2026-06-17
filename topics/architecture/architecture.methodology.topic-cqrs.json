@@ -4,7 +4,7 @@
   "category": "methodology",
   "group": "methodology",
   "title": "CQRS 架构",
-  "summary": "将系统的读操作和写操作分离到不同的模型中，优化各自的数据结构和性能",
+  "summary": "将系统的读操作和写操作分离到不同的模型中，优化各自的数据结构、扩展路径和一致性边界",
   "tags": [
     "架构设计",
     "CQRS",
@@ -21,57 +21,80 @@
     {
       "type": "explain",
       "title": "CQRS 架构：核心思想、架构分层",
-      "content": "## 一、核心思想\nCQRS（Command Query Responsibility Segregation）即**命令查询职责分离**。核心原则：一个方法要么执行一个命令（改变状态），要么返回查询结果（不改变状态），不能同时做两件事。\n## 二、架构分层\n\n### 2.1 命令侧（Write Side）\n- 处理写操作：创建、更新、删除\n- 使用领域模型（DDD聚合）\n- 关注业务规则和一致性\n- 通常走事件溯源（Event Sourcing）"
+      "content": "## 一、核心思想\nCQRS（Command Query Responsibility Segregation）是**命令查询职责分离**：命令负责改变状态，查询负责返回结果，两者使用不同的模型、接口和扩展策略。\n\n它不是把数据库主从读写分离换个名字，而是承认复杂系统里“写入时需要保护业务不变量”和“读取时需要高效组织展示数据”往往是两套问题。例如订单创建要校验库存、价格、优惠券、支付状态，这些规则适合放在写侧领域模型；订单列表页要按用户、状态、时间、售后标记聚合展示，适合放在读侧物化视图或搜索索引。\n\n## 二、架构分层\n\n### 2.1 命令侧（Write Side）\n- 处理会改变系统状态的请求：创建订单、确认支付、取消订单、调整额度。\n- 使用领域模型，常见做法是围绕 DDD 聚合设计。聚合是 DDD 中保证业务一致性的边界，同一个聚合内的不变量应在一次事务内完成校验和状态变更，例如“已取消订单不能再次确认支付”。\n- 命令侧优先关注业务规则、幂等、并发冲突和事务边界，而不是为了查询方便暴露宽表。\n- 写入成功后通常发布领域事件，例如 `OrderCreatedEvent`、`PaymentConfirmedEvent`。事件可以来自事务内的 outbox 表，也可以来自事件存储；不建议先提交数据库再直接调用消息中间件而没有补偿，否则容易出现“写库成功但事件丢失”。\n\n### 2.2 典型命令链路\n1. API 层接收 `CreateOrderCommand`，做身份、参数和幂等键校验。\n2. Command Handler 加载相关聚合，调用领域方法执行业务校验。\n3. 在同一事务内保存写模型，并记录待发布事件或追加事件流。\n4. 事务提交后由 outbox relay、CDC 或事件总线投递事件。\n5. 读侧事件处理器消费事件，更新订单列表、用户订单数、运营看板等读模型。\n\n这条链路的关键取舍是：写侧用更强的事务边界保护业务正确性，读侧接受短暂滞后换取独立扩展和面向查询的结构。"
     },
     {
       "type": "explain",
       "title": "CQRS 架构：查询侧（Read Side）、同步机制",
-      "content": "### 2.2 查询侧（Read Side）\n- 处理读操作\n- 使用专门的读模型（物化视图/DTO）\n- 可以是完全不同的存储（Elasticsearch/Redis）\n- 可以有多个不同的读模型\n\n### 2.3 同步机制\n- 命令侧发布领域事件\n- 事件处理器更新读模型\n- 最终一致性\n\n补充理解：CQRS 架构：查询侧（Read Side）、同步机制 不是单纯罗列选项，而是要解释 CQRS 架构 在 架构设计、CQRS、读写分离 场景里的因果顺序。先看 容量峰值 怎样进入链路，再看 一致性边界 如何被保存、传递或放大；如果 压测指标 被触发，就用 降级策略 判断是设计选择、实现缺陷还是运行条件变化这样回答 CQRS 架构 时，既能讲清机制，也能解释为什么当前方案适合 架构设计、CQRS 的约束。"
+      "content": "### 2.3 查询侧（Read Side）\n- 只处理不会改变业务状态的查询请求，例如订单详情、订单列表、运营统计、商品搜索。\n- 使用专门的读模型：DTO、物化视图、宽表、倒排索引、缓存键值结构都可以是读模型。\n- 读侧存储可以与写侧完全不同：写侧用关系型数据库保护事务，读侧用 Elasticsearch 做搜索、Redis 做热点聚合、ClickHouse 做分析查询。\n- 一个写事件可以驱动多个读模型更新，例如 `OrderCreatedEvent` 同时更新用户订单列表、商家待发货列表和运营 GMV 看板。\n\n### 2.4 同步机制与最终一致性\nCQRS 的常见同步方式是“命令侧产生事件，读侧消费事件并更新物化视图”。这里的因果顺序必须说清楚：命令成功意味着写侧事实已经成立；事件是这个事实的可传播表示；读模型更新是异步投影，因此查询侧可能在一小段时间内看不到最新事实。\n\n最终一致性的工程挑战主要有三类：\n- **读模型延迟**：消息积压、消费者重启、批量重建索引都会让读侧落后。需要暴露 `event_lag_seconds`、消费者 offset、投影失败数、重试队列长度等指标。\n- **不一致窗口**：用户刚提交订单立即刷新列表可能查不到。可用“写后读主库/写侧查询一次”“返回受理状态并轮询”“前端乐观展示”“按业务 SLA 提示处理中”等方式收敛体验。\n- **补偿与重放**：事件处理器必须幂等，读模型更新失败要进入重试或死信队列；如果发现读模型污染，应能按事件序列号或时间范围重放投影，而不是手工改宽表。\n\n是否接受最终一致性取决于业务语义。账户余额扣减、库存超卖防护这类不变量应留在写侧事务或聚合边界内；订单搜索列表、运营统计、推荐特征这类读体验可以接受秒级或分钟级滞后。"
     },
     {
       "type": "explain",
       "title": "CQRS 架构：事件溯源（Event Sourcing）、适用场景",
-      "content": "## 三、事件溯源（Event Sourcing）\n- 不存储当前状态，存储所有状态变更事件\n- 当前状态通过重放事件得到\n- 天然支持审计和时间旅行\n- 与CQRS配合使用效果最佳\n\n## 四、适用场景\n- 读写比例差异大（读多写少或写多读少）\n- 读写模型差异大\n- 需要审计追踪\n- 复杂业务领域\n\n## 五、不适用场景\n- 简单CRUD应用\n- 强一致性要求极高\n- 团队经验不足\n- 读写模型差异小\n\n把 CQRS 架构 放到真实场景里看，重点是业务目标、关键组件、故障边界和权衡依据。判断 CQRS 架构 是否答到位时，我会先核对 容量峰值，再观察 一致性边界，最后用 降级策略 或 压测指标 证明结论。\n学习 CQRS 架构 时，要把业务目标、关键组件、故障边界和权衡依据对应到具体例子里。CQRS 架构 出现异常时，我会先把现象映射到 容量峰值，再检查 一致性边界 是否偏离预期，最后用 降级策略 收敛原因。"
+      "content": "## 三、事件溯源（Event Sourcing）\nEvent Sourcing 不是 CQRS 的同义词。它的核心是：持久化状态变更事件，而不是只保存当前状态；聚合当前状态通过按顺序重放事件得到。\n\n### 3.1 事件存储设计\n- 事件流通常按 `aggregate_id` 分区，并带有单调递增的 `version`，写入时使用乐观并发控制，避免两个命令基于同一个旧版本同时提交。\n- 事件记录至少包含事件 ID、聚合 ID、聚合类型、版本号、事件类型、payload、schema 版本、发生时间、相关追踪 ID。\n- 事件一旦写入原则上不可修改；需要修正业务事实时追加补偿事件，例如 `OrderCancellationReversedEvent`，而不是覆盖历史。\n\n### 3.2 快照、版本演进与性能\n- 当单个聚合事件数达到几百到几千条、重放耗时影响 P99 写入延迟时，可引入快照。快照保存某个版本的聚合状态，加载时从最近快照之后继续重放事件。\n- 事件 schema 会演进，生产上要维护 upcaster 或版本转换器，把旧事件 payload 转换为当前领域模型可理解的结构。\n- 读模型重建时不要让在线消费者和全量重放互相污染，常见做法是创建新投影表或新索引，回放完成后切换别名。\n\n## 四、CQRS 与 Event Sourcing 的耦合和解耦\n- **只用 CQRS，不用 Event Sourcing**：写侧仍保存当前状态表，通过 outbox、CDC 或领域事件同步读模型。适合订单列表、商品搜索、后台看板等读写模型差异大但不需要完整历史重放的场景。\n- **只用 Event Sourcing，不强调 CQRS**：系统需要完整审计、事件回放和时间旅行，但查询规模不大，可以在同一服务内重放状态并提供简单查询。\n- **CQRS + Event Sourcing**：写侧追加事件流，读侧订阅事件构建多个投影。优点是审计和投影重建能力强；代价是事件版本治理、幂等投影、延迟监控和运维复杂度显著上升。\n\n## 五、适用与不适用场景\n适合：读写模型差异大、读侧 QPS 明显高于写侧、需要审计追踪、需要多个查询视角、复杂业务规则集中在写侧聚合内。\n\n不适合：简单 CRUD、团队缺少事件建模经验、业务要求所有查询都线性一致、读写模型几乎一致、无法接受消息链路和投影维护成本。\n\n面试中要避免把 CQRS 包装成性能银弹。它提升的是模型隔离、独立扩展和复杂查询可维护性；它引入的是最终一致性、事件治理、排障链路变长和数据修复成本。"
     },
     {
       "type": "diagram",
       "title": "CQRS 读写分离架构",
-      "content": "flowchart LR\nA[客户端] --> B[Command]\nA --> C[Query]\nB --> D[Command Handler]\nD --> E[Write Model]\nE --> F[Domain Event]\nF --> G[Event Handler]\nG --> H[Read Model]\nC --> H\nH --> I[查询结果返回]\nE --> J[Write DB]\nH --> K[Read DB]",
-      "caption": "命令走写模型, 查询走读模型, 通过事件同步最终一致",
-      "fallback": "CQRS 读写分离架构"
+      "content": "flowchart LR\nClient[客户端请求] --> CommandAPI[命令接口: 创建或变更]\nClient --> QueryAPI[查询接口: 列表或详情]\nCommandAPI --> Handler[Command Handler]\nHandler --> Aggregate[写侧聚合: 校验业务不变量]\nAggregate --> WriteDB[写库或事件存储]\nWriteDB --> Outbox[Outbox或事件流]\nOutbox --> Bus[消息总线]\nBus --> Projector[读模型投影器]\nProjector --> ReadDB[读库: 宽表索引缓存]\nProjector --> Retry[重试或死信队列]\nRetry --> Projector\nQueryAPI --> ReadDB\nReadDB --> Result[返回可能滞后的查询结果]\nCommandAPI --> Receipt[返回命令受理或写入结果]\nReceipt --> Client\nResult --> Client",
+      "format": "mermaid",
+      "caption": "写侧先保护业务不变量并提交事实，再通过事件投影到读模型；查询只访问读模型，因此要处理投影延迟、重试和死信。",
+      "fallback": "命令写入聚合后产生事件，事件投影更新读模型，查询从读模型读取并接受受控的最终一致性。"
     },
     {
       "type": "compareTable",
       "title": "对比与边界",
-      "content": "| 维度 | CQRS | 传统CRUD | 读写分离 |\n| --- | --- | --- | --- |\n| 模型 | 读写分离 | 同一模型 | 同模型不同实例 |\n| 一致性 | 最终一致 | 强一致 | 最终一致 |\n| 复杂度 | 高 | 低 | 中 |\n| 适用场景 | 复杂业务+高并发读 | 简单业务 | 读多写少 |\n| 存储 | 可不同存储 | 同一存储 | 同构主从 |\n| 审计 | 天然支持 | 需额外实现 | 不支持 |"
+      "content": "| 维度 | CQRS | 传统CRUD | 数据库主从读写分离 |\n| --- | --- | --- | --- |\n| 模型边界 | 命令模型和查询模型可完全不同，分别为业务不变量和查询形态优化 | 同一实体模型同时承担写入校验和页面查询 | 应用模型通常不变，只把读流量路由到从库 |\n| 一致性语义 | 写侧强一致，读侧通常最终一致，需要定义可接受滞后 | 单库事务内通常更容易提供读写一致 | 从库复制延迟导致读旧数据，但业务模型未分离 |\n| 扩展方式 | 读侧可独立扩展为宽表、搜索索引、缓存或分析库 | 扩展常依赖 SQL 优化、索引和缓存 | 主要提升读吞吐，无法解决复杂查询模型污染写模型 |\n| 复杂度来源 | 事件投递、投影幂等、重放修复、延迟监控 | 复杂度低但模型容易膨胀 | 运维主从、延迟和路由策略 |\n| 适用场景 | 复杂领域、高读流量、多查询视图、审计或投影重建需求 | 管理后台、简单资源维护、模型差异小 | 读多写少且查询结构与写表接近 |\n| 失败模式 | 读模型落后、事件重复、投影失败、版本演进困难 | 大查询拖慢事务表、实体耦合页面需求 | 读到旧数据、主从切换和复制中断 |"
     },
     {
       "type": "compareTable",
       "title": "维度对比",
-      "content": "| 维度 | Event Sourcing | 状态存储 |\n| --- | --- | --- |\n| 存储内容 | 事件流 | 当前状态 |\n| 审计 | 天然支持 | 需额外日志 |\n| 查询 | 需重放/物化 | 直接查询 |\n| 时间旅行 | 支持 | 不支持 |\n| 复杂度 | 高 | 低 |"
+      "content": "| 维度 | Event Sourcing | 状态存储 |\n| --- | --- | --- |\n| 持久化内容 | 追加领域事件流，事件表示已经发生的业务事实 | 保存实体当前状态，历史变化依赖审计日志或变更表 |\n| 并发控制 | 常用聚合版本号做乐观并发，追加事件时校验 expected version | 常用行锁、版本号或数据库事务更新当前行 |\n| 查询方式 | 在线写入不直接扫事件，通常靠 CQRS 投影或快照加速 | 直接查询当前表，复杂页面可能需要多表 join 或宽表 |\n| 审计和追溯 | 历史天然完整，可重放到任意版本或构建新投影 | 需要额外设计审计日志，且容易与真实状态脱节 |\n| 演进成本 | 需要事件 schema 版本、upcaster、快照兼容和重放工具 | 表结构迁移更直观，但丢失历史语义后难以补建投影 |\n| 使用建议 | 适合审计强、状态机复杂、需要回放和补偿的核心域 | 适合多数 CRUD、强事务查询和团队事件治理能力不足的场景 |"
     },
     {
       "type": "code",
       "title": "代码示例",
-      "content": "// 1. 命令侧 - 使用领域模型\npublic class CreateOrderCommandHandler {\n    private final OrderRepository orderRepository;\n    private final EventPublisher eventPublisher;\n\n    public OrderId handle(CreateOrderCommand cmd) {\n        Order order = Order.create(\n            cmd.getCustomerId(),\n            cmd.getItems()\n        );\n        orderRepository.save(order);\n        // 发布事件，同步读模型\n        eventPublisher.publish(new OrderCreatedEvent(\n            order.getId(),\n            order.getCustomerId(),\n            order.getTotalAmount(),\n            order.getCreatedAt()\n        ));\n        return order.getId();\n    }\n}\n\n// 2. 查询侧 - 专门的读模型\npublic class OrderQueryService {\n    private final OrderReadRepository readRepo;\n\n    public OrderSummaryDTO getOrderSummary(OrderId orderId) {\n        return readRepo.findById(orderId);\n    }\n\n    public List<OrderListItemDTO> searchOrders(OrderQuery query) {\n        return readRepo.search(query);\n    }\n}\n\n// 3. 事件处理器 - 同步读模型\n@EventHandler\npublic class OrderReadModelUpdater {\n    private final OrderReadRepository readRepo;\n\n    @EventListener\n    public void onOrderCreated(OrderCreatedEvent event) {\n        OrderReadModel readModel = new OrderReadModel();\n        readModel.setOrderId(event.getOrderId());\n        readModel.setCustomerId(event.getCustomerId());\n        readModel.setTotalAmount(event.getTotalAmount());\n        readModel.setCreatedAt(event.getCreatedAt());\n        readRepo.save(readModel);\n    }\n}\n\n// 4. Event Sourcing示例\npublic class OrderAggregate extends EventSourcedAggregate {\n    private OrderStatus status;\n    private Money totalAmount;\n\n    public void apply(OrderCreatedEvent event) {\n        this.id = event.getOrderId();\n        this.status = OrderStatus.CREATED;\n        this.totalAmount = event.getTotalAmount();\n    }\n\n    public void apply(OrderConfirmedEvent event) {\n        this.status = OrderStatus.CONFIRMED;\n    }\n\n    public void confirm() {\n        if (this.status != OrderStatus.CREATED) {\n            throw new DomainException(\"订单状态不允许确认\");\n        }\n        this.registerEvent(new OrderConfirmedEvent(this.id));\n    }\n}",
-      "language": "java"
+      "content": "// 1. 命令侧：围绕聚合处理写入，并在同一事务内记录待发布事件\npublic class CreateOrderCommandHandler {\n    private final OrderRepository orderRepository;\n    private final OutboxRepository outboxRepository;\n\n    @Transactional\n    public OrderId handle(CreateOrderCommand cmd) {\n        Order order = Order.create(cmd.getCustomerId(), cmd.getItems(), cmd.getRequestId());\n        orderRepository.save(order);\n        outboxRepository.append(order.pullDomainEvents());\n        return order.getId();\n    }\n}\n\n// 2. 查询侧：只读物化视图，不反向修改写模型\npublic class OrderQueryService {\n    private final OrderReadRepository readRepo;\n\n    public OrderSummaryDTO getOrderSummary(OrderId orderId) {\n        return readRepo.findById(orderId);\n    }\n\n    public List<OrderListItemDTO> searchOrders(OrderQuery query) {\n        return readRepo.search(query);\n    }\n}\n\n// 3. 投影器：事件处理必须幂等，重复投递不应重复累计金额或订单数\npublic class OrderReadModelProjector {\n    private final OrderReadRepository readRepo;\n\n    public void on(OrderCreatedEvent event) {\n        if (readRepo.hasApplied(event.getEventId())) {\n            return;\n        }\n        OrderReadModel readModel = new OrderReadModel();\n        readModel.setOrderId(event.getOrderId());\n        readModel.setCustomerId(event.getCustomerId());\n        readModel.setTotalAmount(event.getTotalAmount());\n        readModel.setCreatedAt(event.getCreatedAt());\n        readRepo.save(readModel, event.getEventId());\n    }\n}\n\n// 4. Event Sourcing：通过事件流恢复聚合，通过版本号避免并发覆盖\npublic class OrderAggregate {\n    private OrderId id;\n    private OrderStatus status;\n    private Money totalAmount;\n    private long version;\n    private final List<DomainEvent> pendingEvents = new ArrayList<>();\n\n    public static OrderAggregate rehydrate(List<DomainEvent> history) {\n        OrderAggregate order = new OrderAggregate();\n        for (DomainEvent event : history) {\n            order.apply(event);\n            order.version = event.getVersion();\n        }\n        return order;\n    }\n\n    public void confirm() {\n        if (this.status != OrderStatus.CREATED) {\n            throw new DomainException(\"订单状态不允许确认\");\n        }\n        registerEvent(new OrderConfirmedEvent(this.id, this.version + 1));\n    }\n\n    private void registerEvent(DomainEvent event) {\n        apply(event);\n        pendingEvents.add(event);\n    }\n\n    private void apply(DomainEvent event) {\n        if (event instanceof OrderCreatedEvent created) {\n            this.id = created.getOrderId();\n            this.status = OrderStatus.CREATED;\n            this.totalAmount = created.getTotalAmount();\n        }\n        if (event instanceof OrderConfirmedEvent) {\n            this.status = OrderStatus.CONFIRMED;\n        }\n    }\n}",
+      "language": "java",
+      "highlights": [
+        {
+          "line": 8,
+          "note": "写模型保存和 outbox 事件记录处于同一事务，避免订单已创建但读侧永远收不到事件。"
+        },
+        {
+          "line": 23,
+          "note": "查询服务只访问读模型，页面查询不会把 join、排序、搜索条件反向污染聚合模型。"
+        },
+        {
+          "line": 33,
+          "note": "投影器用事件 ID 做幂等判断，消息重复投递时不会重复创建读模型或累计统计值。"
+        },
+        {
+          "line": 52,
+          "note": "事件溯源加载聚合时按历史事件重放，恢复的是业务状态而不是直接读取当前状态行。"
+        },
+        {
+          "line": 62,
+          "note": "确认订单前检查聚合状态，业务不变量仍在写侧聚合内执行，而不是交给读模型判断。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "CQRS的核心思想是将读操作和写操作分离到不同的模型中。写操作使用领域模型，关注业务规则和一致性；读操作使用专门的读模型，可以针对查询场景做优化。\n架构上分为命令侧和查询侧。命令侧处理写请求，使用DDD的聚合根保证业务规则；查询侧处理读请求，可以用Elasticsearch、Redis等存储优化查询。两侧通过事件同步，所以是最终一致性。\n事件溯源是CQRS的常见配合方案，它不存储当前状态，而是存储所有状态变更事件。好处是天然支持审计和时间旅行，但缺点是查询时需要重放事件，所以通常配合CQRS的读模型使用。\n适用场景是读写比例差异大、读写模型差异大的场景。比如电商的商品详情页，写操作很少（商品编辑），但读操作很多（商品浏览），用CQRS可以给读侧做专门的缓存和索引优化。",
+      "content": "30 秒结论：CQRS 是把“改变状态的命令”和“读取数据的查询”拆成两套模型。写侧用聚合和事务保护业务不变量，读侧用物化视图、索引或缓存服务查询体验；两侧通常靠事件同步，因此要把最终一致性、投影延迟和补偿机制一起设计，而不是只说读写分离。\n\n机制要点：\n- 命令侧接收 `Command`，由 Command Handler 调用领域聚合完成校验和状态变更；聚合是业务一致性的边界，例如订单状态流转、库存扣减规则、额度限制。\n- 写入成功后产生领域事件，生产上常用 outbox、CDC 或事件流保证“写库”和“发事件”不丢边界。\n- 查询侧不复用写模型，而是维护订单列表、搜索索引、运营统计等读模型；同一个事件可以投影到多个读模型。\n- 读侧接受最终一致性，所以必须定义延迟 SLA、幂等消费、重试和死信队列、投影重建方案。\n- Event Sourcing 可以和 CQRS 组合，但不是必选。只做 CQRS 时写侧可以保存当前状态表；使用 Event Sourcing 时写侧追加事件流，并用快照、事件版本和 upcaster 控制性能与演进成本。\n\n边界和追问应对：\n- 如果业务要求查询立即看到写入结果，可以对关键路径做写后读写库、返回命令处理状态、短期前端乐观展示，不能假装所有读模型都强一致。\n- 如果只是简单后台 CRUD，读写模型差异小，引入 CQRS 会让消息、投影和排障成本超过收益。\n- 如果读模型落后，先看消息积压、消费者 offset、投影失败日志、死信队列和最近事件版本，再决定重试、按事件区间重放或切换新投影。",
       "followUpQuestions": [
         {
-          "question": "在你的项目中，CQRS 架构是怎么落地的？遇到了什么权衡取舍？",
-          "answer": "CQRS核心：读写分离——Command（写操作）和Query（读操作）使用不同的模型。写模型优化事务一致性，读模型优化查询性能。通常结合Event Sourcing：写操作产生事件，读模型通过消费事件更新。适用场景：读写比例差异大、查询模型和命令模型差异大。"
+          "question": "用户创建订单后立刻刷新订单列表却看不到新订单，你会如何判断这是可接受的最终一致性还是系统故障？",
+          "answer": "先确认该查询是否走读模型，以及产品是否定义了写后可见 SLA。排查顺序是：查命令侧事务是否提交、outbox 或事件流是否生成 `OrderCreatedEvent`、消息消费者 offset 是否落后、投影器是否有异常或死信、读模型里是否记录了对应事件 ID。如果延迟在 SLA 内，可以用受理状态、轮询或前端乐观展示处理体验；如果超出 SLA，要重试投影或按事件版本区间重放读模型。"
         },
         {
-          "question": "CQRS 架构 在高并发（万级 QPS）和数据一致性要求高的场景下，有哪些关键设计决策？",
-          "answer": "CQRS 架构 在高并发场景下要先识别核心约束，再拆成容量、延迟、一致性、故障隔离和可观测性几个维度设计。回答 CQRS 架构 时，要说明 架构设计、CQRS 的关键瓶颈、可异步或降级的链路、必须一致的数据以及积压或超时时的恢复方式。"
+          "question": "什么时候你会只用 CQRS，而不会引入 Event Sourcing？",
+          "answer": "当主要痛点是读写模型差异和读侧扩展，而不是完整历史回放时，只用 CQRS 更合适。例如订单搜索、商品详情页、后台报表可以让写侧保存当前状态表，再通过 outbox 或 CDC 更新读模型。这样能获得读侧独立优化，同时避免事件流作为唯一事实源带来的 schema 演进、快照、聚合重放和事件修正成本。"
         },
         {
-          "question": "如果现有系统需要引入 CQRS 架构，你会怎么评估改造风险和制定迁移计划？",
-          "answer": "引入 CQRS 架构 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。引入 CQRS 架构 时建议分阶段推进：先选择 架构设计、CQRS、读写分离 中风险较低的链路试点，验证 降级策略 后再推广。CQRS 架构 迁移时要先灰度小流量，再绑定回滚条件、监控指标和业务验收口径。"
+          "question": "事件溯源系统中某个聚合有上万条事件，写入 P99 明显变差，你会怎么优化？",
+          "answer": "先确认慢点是否在聚合重放而不是数据库追加事件。常见优化是按聚合版本生成快照，加载时从最近快照后继续重放；控制聚合边界，避免把过多生命周期放进一个聚合；对事件存储按聚合 ID 分区并保证事件流顺序；对读查询不要在线重放事件，而是走投影。还要给快照加 schema 版本，避免领域模型升级后旧快照无法恢复。"
         }
       ]
     },
@@ -80,31 +103,34 @@
       "title": "学完后应能说清楚",
       "items": [
         "CQRS的读写分离思想：命令改变状态，查询返回结果",
-        "命令侧和查询侧的职责划分和模型差异",
-        "事件溯源的基本原理：存储事件而非状态",
-        "CQRS适用场景：读写比例/模型差异大、需要审计",
-        "最终一致性的含义和补偿机制"
+        "命令侧聚合边界、业务不变量、事务和幂等设计",
+        "查询侧物化视图、搜索索引、缓存和宽表的取舍",
+        "事件同步链路：领域事件、outbox或CDC、投影器、重试和死信队列",
+        "最终一致性的用户体验影响、延迟指标和补偿机制",
+        "Event Sourcing的事件存储、聚合版本、快照和事件 schema 演进",
+        "CQRS 与 Event Sourcing 的独立使用场景和组合代价",
+        "简单 CRUD、强查询一致性和团队经验不足时不应强行引入 CQRS"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "architecture.methodology.topic-cqrs.recall.1",
-      "prompt": "CQRS 架构 解决了什么架构问题？有哪些适用和不适用的场景？",
+      "prompt": "CQRS 架构解决了什么问题？请说明命令侧、查询侧、事件同步和最终一致性边界，并给出适用与不适用场景。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "architecture.methodology.topic-cqrs.recall.2",
-      "prompt": "Event Sourcing的优缺点是什么？什么场景适合使用？",
+      "prompt": "Event Sourcing 的事件存储、快照、版本演进和投影重建在生产环境中分别要解决什么问题？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "architecture.methodology.topic-cqrs.recall.3",
-      "prompt": "CQRS 架构 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "CQRS、Event Sourcing、传统 CRUD 和数据库主从读写分离的关键区别是什么？什么时候只用 CQRS 而不用 Event Sourcing？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
@@ -112,20 +138,30 @@
   ],
   "rubric": {
     "mustHave": [
-      "CQRS的读写分离核心思想",
-      "命令侧和查询侧的职责划分",
-      "事件同步机制和最终一致性",
-      "事件溯源的基本原理"
+      "命令查询职责分离",
+      "命令侧聚合与业务不变量",
+      "查询侧物化视图与读模型",
+      "领域事件驱动读模型投影",
+      "最终一致性窗口与读模型延迟",
+      "投影幂等、重试和死信队列",
+      "Event Sourcing事件流、聚合版本和快照",
+      "CQRS与Event Sourcing可独立使用"
     ],
     "goodToHave": [
-      "事件溯源与CQRS的配合",
-      "读模型的物化视图设计",
-      "时间旅行的应用"
+      "outbox或CDC保证写库与发事件一致",
+      "事件 schema 版本和 upcaster",
+      "按事件区间重放投影和新旧索引切换",
+      "写后读、乐观展示和受理状态的用户体验策略",
+      "按业务不变量划分聚合边界"
     ],
     "commonMistakes": [
-      "只列出 架构设计、CQRS、读写分离，但说不出触发条件、状态变化和验证证据",
-      "把「CQRS 架构」的适用场景、失效条件和相邻概念混在一起",
-      "遇到架构设计里的真实问题时，不能说明「CQRS 架构」应该观察哪些状态、日志或指标"
+      "把 CQRS 等同于数据库主从读写分离",
+      "把 Event Sourcing 当成 CQRS 的必选组件",
+      "只强调读性能提升，却不说明投影延迟和补偿成本",
+      "让读模型参与业务状态校验，破坏写侧一致性边界",
+      "事件处理器缺少幂等设计，重复投递导致统计或余额重复变化",
+      "事件 schema 演进没有版本策略，旧事件重放失败",
+      "发现读模型错误时直接手改宽表，而不是按事件重放或补偿"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -139,6 +175,6 @@
     "architecture.methodology.topic-ddd"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「CQRS 架构」说清CQRS的读写分离核心思想、命令侧和查询侧的职责划分，并放到架构设计场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-12"
+  "interviewerFocus": "重点看候选人能否把 CQRS 从“读写分离口号”落到命令聚合、领域事件、读模型投影和一致性窗口上；优秀回答会主动说明 outbox、幂等消费、读模型重建、Event Sourcing 取舍，以及用户写后不可见时的排查路径。",
+  "updatedAt": "2026-06-17"
 }

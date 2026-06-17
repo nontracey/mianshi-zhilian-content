@@ -27,7 +27,7 @@
     {
       "type": "explain",
       "title": "隔离级别要和读类型一起解释",
-      "content": "MySQL 面试常问“可重复读解决幻读了吗”。回答要先区分快照读和当前读：普通 select 是快照读，依赖 MVCC 和 ReadView；`select ... for update`、update、delete 属于当前读，会读取最新版本并加锁。InnoDB 在可重复读下通过 MVCC 让快照读稳定，又通过 next-key lock 在当前读范围场景减少幻读。\n\n事务异常也要能举例：脏读是读到别人未提交的数据，不可重复读是同一行两次读结果不同，幻读是同一范围两次读出现新增或消失的记录。真实系统里还要考虑长事务：它会拖住 undo 版本链，造成历史版本无法清理，并影响备份、DDL 和复制延迟。"
+      "content": "MySQL 面试常问「可重复读解决幻读了吗」。回答必须先区分快照读和当前读：\n\n**快照读**：普通 `SELECT` 语句，依赖 MVCC 可见性算法。InnoDB 为每行数据维护 undo 版本链（通过 `DB_ROLL_PTR` 指针串联），ReadView 包含 `m_ids`（活跃事务 ID 列表）、`min_trx_id`、`max_trx_id` 和 `creator_trx_id`。可见性判断规则：\n- 行的 `DB_TRX_ID` < `min_trx_id`：该版本在 ReadView 之前已提交，可见\n- 行的 `DB_TRX_ID` >= `max_trx_id`：该版本在 ReadView 之后才开启，不可见\n- 行的 `DB_TRX_ID` 在 `m_ids` 中：该事务还未提交，不可见，沿 `DB_ROLL_PTR` 找上一个版本\n- 行的 `DB_TRX_ID` 不在 `m_ids` 中且 >= `min_trx_id`：已提交，可见\n\n**当前读**：`SELECT ... FOR UPDATE`、`SELECT ... LOCK IN SHARE MODE`、`UPDATE`、`DELETE` 等语句，读取最新已提交版本并加锁。在 RR 级别下，当前读使用 next-key lock（前开后闭区间 `(a, b]`），锁住查询范围防止其他事务插入新行，从而减少幻读。\n\nRC 和 RR 在 ReadView 生成时机上的关键差异：\n- RC：`read_view_open_for` 在每条语句执行时调用，每次生成新 ReadView\n- RR：ReadView 在事务首次快照读时生成，后续复用同一 ReadView\n\n事务异常举例：\n- **脏读**：事务 A 读到事务 B 未提交的修改，B 回滚后 A 读到的是不存在的数据\n- **不可重复读**：事务 A 两次读同一行，中间事务 B 提交了修改，两次结果不同\n- **幻读**：事务 A 两次范围查询，中间事务 B 插入了新行，第二次查询多出记录\n\n长事务的工程危害：它会拖住 undo 版本链，导致 `purge` 线程（`trx_purge`）无法清理历史版本，`innodb_undo_log` 膨胀，进而影响备份（物理备份要扫描更多 undo 页）、DDL（需要等待事务结束）和主从复制延迟。可通过 `information_schema.innodb_trx` 查询 `trx_started` 和 `trx_weight` 定位长事务。"
     },
     {
       "type": "diagram",
@@ -36,6 +36,14 @@
       "content": "flowchart LR\nA[开启事务] --> B[写入生成 undo]\nB[写入生成 undo] --> C[修改页并记录 redo]\nC[修改页并记录 redo] --> D[按隔离级别读取]\nD[按隔离级别读取] --> E[提交刷 redo]\nE[提交刷 redo] --> F[后台清理 undo]",
       "fallback": "开启事务 -> 写入生成 undo -> 修改页并记录 redo -> 按隔离级别读取 -> 提交刷 redo -> 后台清理 undo",
       "caption": "事务机制要把隔离级别和日志、MVCC、锁联系起来。"
+    },
+    {
+      "type": "diagram",
+      "title": "事务从执行到提交/回滚的日志路径",
+      "format": "mermaid",
+      "content": "flowchart TD\n    A[开启事务 BEGIN] --> B[写入 undo record 到 undo log]\n    B --> C[修改 buffer pool 数据页]\n    C --> D[生成 redo log 写入 log buffer]\n    D --> E{执行结果}\n    E -->|正常| F[提交 COMMIT: redo log 刷盘 fsync]\n    E -->|异常/ROLLBACK| G[按 undo 链逆序回滚数据页]\n    F --> H[purge 线程异步清理已提交事务的 undo]\n    G --> I[undo 标记为已回滚, 等待 purge 清理]\n    H --> J[并发读事务通过 ReadView 沿 DB_ROLL_PTR 访问历史版本]\n    I --> J\n    F --> K[并发写事务: 当前读加 next-key lock 阻塞范围插入]",
+      "fallback": "开启事务后先写 undo 再改数据页并记 redo；正常提交则 redo 刷盘并异步清理 undo，异常则按 undo 链回滚；并发读事务通过 ReadView 沿版本链访问历史版本，并发写事务通过 next-key lock 阻塞范围插入。",
+      "caption": "事务机制要把隔离级别和 undo/redo 日志、MVCC 版本链、next-key lock 联系起来，提交和回滚是两条不同分支。"
     },
     {
       "type": "compareTable",
@@ -48,28 +56,28 @@
       ],
       "rows": [
         [
-          "读未提交",
-          "允许读未提交版本",
-          "几乎不用",
-          "脏读风险"
+          "读未提交 RU",
+          "不加读锁，可读未提交版本",
+          "几乎不用，仅做理论对比",
+          "误以为 InnoDB 有此级别的 MVCC 优化"
         ],
         [
-          "读已提交",
-          "语句级 ReadView",
-          "多数业务可接受",
-          "同事务两次读可能不同"
+          "读已提交 RC",
+          "每条语句生成新 ReadView",
+          "Oracle/PG 默认，多数业务可接受",
+          "同事务两次读同一行结果可能不同"
         ],
         [
-          "可重复读",
-          "事务级快照读稳定",
-          "MySQL 默认",
-          "当前读仍要理解锁"
+          "可重复读 RR",
+          "事务首次快照读生成 ReadView 并复用，当前读加 next-key lock",
+          "InnoDB 默认，快照读稳定",
+          "误认为所有读都不加锁、完全无幻读"
         ],
         [
-          "串行化",
-          "读写串行执行",
-          "强一致但低并发",
-          "误用于普通高并发业务"
+          "串行化 SER",
+          "所有读加共享锁，写加排他锁，读写互斥",
+          "仅极端一致性场景使用",
+          "误用于普通高并发业务导致锁等待超时"
         ]
       ]
     },
@@ -77,26 +85,42 @@
       "type": "code",
       "title": "当前读和快照读示例",
       "language": "sql",
-      "content": "-- 快照读：使用 MVCC 可见性\nSELECT * FROM orders WHERE id = 7;\n\n-- 当前读：读取最新版本并加锁\nSELECT * FROM orders WHERE id = 7 FOR UPDATE;",
+      "content": "-- 快照读：使用 MVCC 可见性，不加锁\nSELECT * FROM orders WHERE id = 7;\n\n-- 当前读：读取最新已提交版本并加 X 锁\nSELECT * FROM orders WHERE id = 7 FOR UPDATE;\n\n-- 范围当前读：RR 下加 next-key lock 锁住 (5, 10] 范围\nSELECT * FROM orders WHERE id BETWEEN 5 AND 10 FOR UPDATE;\n\n-- 查看当前活跃事务（定位长事务）\nSELECT trx_id, trx_started, trx_weight, trx_query\nFROM information_schema.innodb_trx\nORDER BY trx_started ASC\nLIMIT 10;",
       "highlights": [
         {
           "line": 2,
-          "note": "普通 SELECT 在 InnoDB 中通常是快照读，用 MVCC 可见性避免无谓加锁。"
+          "note": "普通 SELECT 在 InnoDB 中走快照读路径，通过 ReadView 和 DB_ROLL_PTR 版本链判断可见性，不加行锁。"
+        },
+        {
+          "line": 5,
+          "note": "FOR UPDATE 触发当前读，读取最新已提交版本并对匹配行加排他记录锁。"
+        },
+        {
+          "line": 8,
+          "note": "范围查询在 RR 级别下加 next-key lock（record lock + gap lock），锁住前开后闭区间，阻止其他事务在范围内插入。"
+        },
+        {
+          "line": 11,
+          "note": "通过 innodb_trx 视图查询 trx_started 字段定位运行时间最长的事务，trx_weight 反映 undo 记录数量。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "事务隔离我会先讲 ACID，再讲隔离级别解决哪些并发异常，最后落到 MySQL 的 MVCC 和锁。\n\n我会按这条线展开：\n1. 原子性靠 undo，持久性靠 redo，隔离性靠 MVCC 和锁共同实现\n2. 不同隔离级别主要是在脏读、不可重复读和幻读之间做取舍\n3. MySQL 可重复读下，快照读依赖事务级 ReadView，当前读依赖行锁和 next-key lock\n4. 工程上要警惕长事务、锁等待和隔离级别过高导致吞吐下降\n\n最后补一句边界：隔离级别只能提供数据库层的并发语义，跨库、缓存和消息链路还要额外设计一致性。",
+      "content": "事务隔离我会先讲 ACID 各自的底层机制，再讲隔离级别解决哪些并发异常，最后落到 MySQL 的 MVCC 和锁实现。\n\n核心展开线：\n- 原子性靠 undo log（回滚时按 undo 链逆序恢复），持久性靠 redo log WAL 刷盘（`innodb_flush_log_at_trx_commit=1`），隔离性靠 MVCC ReadView + 锁共同实现，一致性是前三者的目标\n- 四种隔离级别在脏读、不可重复读、幻读之间做取舍：RU 全放、RC 放脏读、RR 再放不可重复读、SER 全防但读写串行\n- MySQL RR 下快照读靠事务级 ReadView（首次快照读生成、后续复用）+ undo 版本链可见性判断；当前读靠 next-key lock（record lock + gap lock）锁住范围减少幻读\n- RC 和 RR 的关键差异是 ReadView 生成时机：RC 每条语句生成新的，RR 事务首次快照读生成并复用\n- 工程上要警惕长事务拖住 undo 版本链导致 purge 线程无法清理，可通过 `information_schema.innodb_trx` 定位\n\n边界补充：隔离级别只提供数据库层的并发语义，跨库、缓存和消息链路的一致性需要额外设计（分布式事务、TCC/Saga、最终一致性）。另外 RR 下先快照读再当前读仍可能看到新行，这是部分面试官认为的幻读残留场景。",
       "followUpQuestions": [
         {
-          "question": "读已提交和可重复读最大的区别是什么？",
-          "answer": "读已提交通常每条语句生成新的 ReadView，可看到其他事务已提交的新版本；可重复读通常事务首次快照读生成 ReadView，同一事务内快照读稳定。"
+          "question": "RC 和 RR 在 MVCC 层面的本质区别是什么？为什么 RR 能解决不可重复读？",
+          "answer": "本质区别在 ReadView 的生成时机。RC 在每条语句执行时调用 `read_view_open_for` 生成新 ReadView，所以能看到其他事务在此期间提交的新版本，导致同一事务内两次读同一行可能不同。RR 在事务首次快照读时生成 ReadView 并在整个事务内复用，后续快照读都用同一个 ReadView 判断可见性，因此同一行多次读结果一致。但代价是 RR 下如果其他长事务持续未提交，undo 版本链会一直保留旧版本供该 ReadView 访问，导致 purge 无法清理。"
         },
         {
-          "question": "为什么长事务危险？",
-          "answer": "长事务会让旧版本无法清理，undo 版本链变长，还可能持有锁、影响 DDL、备份和主从复制。"
+          "question": "InnoDB 的 RR 级别下，next-key lock 是如何防止幻读的？有什么局限？",
+          "answer": "当前读（如 `SELECT ... FOR UPDATE`）在 RR 下使用 next-key lock，它等于 record lock 加 gap lock，锁住前开后闭区间 `(a, b]`。当事务 A 对范围 `(5, 10]` 加 next-key lock 后，事务 B 尝试插入 id=7 会触发插入意向锁，与 gap lock 冲突而被阻塞，从而防止幻读。局限有三点：一是 gap lock 之间不冲突，两个事务可以同时持有同一 gap 的 gap lock，但都不能插入，可能导致死锁；二是只对当前读有效，快照读不加锁；三是如果查询条件未走索引，InnoDB 会锁全表所有行和 gap，导致严重锁竞争。"
+        },
+        {
+          "question": "线上发现 undo 表空间持续膨胀，怎么排查和解决？",
+          "answer": "首先查 `information_schema.innodb_trx` 找 `trx_started` 最早的事务，确认是否有长事务或未提交的事务拖住 purge 线程。其次查 `SHOW ENGINE INNODB STATUS` 中的 `TRANSACTIONS` 段，看是否有大量活跃事务。如果确认是长事务导致，kill 掉对应连接后 purge 线程会逐步清理 undo。MySQL 5.7+ 支持 `innodb_undo_log_truncate=ON` 自动截断 undo 表空间，但前提是没有活跃事务引用旧版本。长期方案是设置 `innodb_max_undo_log_size` 和 `innodb_undo_log_truncate`，并在应用层加事务超时控制（如 `innodb_lock_wait_timeout` 和连接池的 `maxLifetime`）。"
         }
       ]
     },
@@ -104,11 +128,13 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释 ACID",
-        "能举例三类并发异常",
-        "能对比四个隔离级别",
-        "能区分快照读和当前读",
-        "能说明长事务风险"
+        "能说出 ACID 各自由 undo log / redo log / MVCC+锁 哪个机制支撑",
+        "能举例脏读、不可重复读、幻读的具体场景",
+        "能对比四个隔离级别在并发异常矩阵中的差异",
+        "能区分快照读和当前读，并说出 ReadView 生成时机的 RC/RR 差异",
+        "能解释 next-key lock = record lock + gap lock 的作用和局限",
+        "能说明长事务对 undo 版本链、purge 线程和备份的影响",
+        "能通过 information_schema.innodb_trx 定位长事务"
       ]
     }
   ],
@@ -159,5 +185,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-17"
 }

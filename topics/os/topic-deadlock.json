@@ -19,54 +19,62 @@
     {
       "type": "explain",
       "title": "什么是死锁，四个必要条件",
-      "content": "## 什么是死锁\n两个或多个线程/进程**互相等待对方持有的资源**，谁都不肯放手，导致全部卡死、无法推进。最经典的例子：线程 A 持有锁 1 等锁 2，线程 B 持有锁 2 等锁 1。\n\n## 四个必要条件（必须同时满足）\n记住它们是因为——**破坏任意一个就能消除死锁**：\n- **互斥**：资源一次只能被一个线程占用。\n- **持有并等待**：已经拿着资源，又去等别的资源、且不放手。\n- **不可剥夺**：资源只能由持有者主动释放，不能被强抢。\n- **循环等待**：存在一条“A 等 B、B 等 C、C 等 A”的环形等待链。\n\n四个条件里，**互斥**通常没法破坏（资源本身要求独占），所以实践中主要从后三个下手。"
+      "content": "## 什么是死锁\n死锁是两个或多个线程/进程形成**相互等待对方释放资源**的等待环，导致参与者都无法继续推进。典型例子是：线程 A 已经持有 `lock1`，继续请求 `lock2`；线程 B 已经持有 `lock2`，继续请求 `lock1`。此时 A 等 B，B 等 A，等待关系闭环。\n\n这里要区分两类现象：\n- **死锁**：线程通常阻塞在锁等待上，CPU 不一定高，但业务请求一直不返回。\n- **活锁**：线程没有阻塞，还在反复重试或让步，CPU 可能较高，但状态没有有效推进。\n- **饥饿**：某个线程长期拿不到资源，例如读多写少的读写锁策略让写线程一直排不上。\n\n## 四个必要条件（必须同时满足）\n这四个条件是死锁成立的判定框架，也是设计避免方案的切入点：\n- **互斥**：资源一次只能被一个执行单元占用，例如互斥锁、数据库行锁、文件锁。\n- **持有并等待**：线程已经持有至少一个资源，同时继续等待其他资源，且等待期间不释放已持有资源。\n- **不可剥夺**：资源不能被外部强制抢走，只能由持有者主动释放；例如普通 mutex 不能被另一个线程安全地强制 unlock。\n- **循环等待**：等待关系中存在闭环，例如 A 等 B 持有的锁，B 又等 A 持有的锁。\n\n四个条件必须同时满足。工程上，**互斥**经常由资源语义决定，不能随便取消；**不可剥夺**在内存锁、文件锁、数据库事务里也很难粗暴破坏，否则会破坏一致性。因此最常见、风险最低的做法是破坏**循环等待**：为资源定义全局顺序，所有代码路径按同一顺序申请锁。"
     },
     {
       "type": "explain",
       "title": "四种处理策略与实战定位",
-      "content": "## 四种处理策略（理论）\n- **预防**：破坏后三个条件之一——一次性申请所有资源（破持有并等待）、允许抢占（破不可剥夺）、**给资源编号、按固定顺序申请（破循环等待，最实用）**。\n- **避免**：动态判断这次分配后系统是否还处于“安全状态”，代表是**银行家算法**（Need = Max − Allocation，需预知最大需求，开销大、实际少用）。\n- **检测与恢复**：先允许死锁发生，用资源分配图检测环路，再靠终止进程或回滚来恢复（数据库就这么干）。\n- **鸵鸟策略**：假装不会发生——Linux/Windows 对普通进程基本如此，卡住了人工重启。\n\n## 实战里怎么避免和定位（高频）\n- **避免**：约定**统一的加锁顺序**（所有线程都先拿锁 1 再拿锁 2）、用 `tryLock` 设**超时**拿不到就回退、缩小锁粒度/持锁时间。\n- **定位**：Java 用 `jstack` 看线程 dump，JVM 会直接标出 `Found one Java-level deadlock` 并打印环；数据库看 `SHOW ENGINE INNODB STATUS` 的 LATEST DETECTED DEADLOCK；C/Linux 用 gdb 看各线程栈互相等锁。"
+      "content": "## 四种处理策略（理论到工程）\n- **预防**：在设计阶段破坏死锁必要条件。一次性申请所有资源可以破坏“持有并等待”，但会降低并发度；允许抢占可以破坏“不可剥夺”，但对普通互斥锁和事务语义不安全；**给资源编号并按固定顺序申请**可以破坏“循环等待”，是业务代码里最常落地的方案。\n- **避免**：每次分配前判断系统是否还处于“安全状态”。银行家算法属于避免，不是预防：它维护 `Available`、`Max`、`Allocation`、`Need = Max - Allocation`，尝试分配后找是否存在一条能让所有进程完成的安全序列。问题是必须预知最大资源需求，且每次分配都要计算，在线上通用操作系统里很少直接采用。\n- **检测与恢复**：允许死锁发生，之后检测等待图中的环，再中止事务、回滚任务或杀掉进程。数据库更常见，例如 InnoDB 会检测事务等待图，发现环后选择代价较小的事务作为 victim 回滚，并在 `SHOW ENGINE INNODB STATUS` 的 `LATEST DETECTED DEADLOCK` 中记录锁等待链。\n- **鸵鸟策略**：不主动处理普通进程间的死锁，把极低概率问题交给人工重启、超时熔断或 watchdog。许多通用 OS 对应用内部锁死并不会自动恢复，因为强制抢锁会破坏应用状态。\n\n## 实战避免\n- **统一加锁顺序**：给锁定义稳定排序，例如账户转账按账户 id 小到大加锁，避免 A->B 与 B->A 两条路径同时存在。\n- **锁等待加超时并回退**：Java 用 `tryLock(timeout, unit)`，POSIX 可用 `pthread_mutex_timedlock`。拿不到第二把锁时释放第一把锁，随机退避后重试，防止无限等待。\n- **缩短持锁区间**：锁内不做 RPC、磁盘 IO、长 SQL、日志批量刷盘；持锁时间越长，等待图成环窗口越大。\n- **拆分资源层级**：明确“应用锁、缓存锁、数据库行锁”的申请顺序，避免代码里先拿 JVM 锁再查库、另一条路径先持有数据库事务再回调应用锁。\n\n## 线上定位线索\n- **Java**：`jstack <pid>` 或 `jcmd <pid> Thread.print -l`。JVM 能识别 Java monitor 和 ownable synchronizer 的死锁，dump 中会出现 `Found one Java-level deadlock`，并列出线程、锁对象地址、`waiting to lock` 与 `locked`。\n- **数据库**：MySQL InnoDB 用 `SHOW ENGINE INNODB STATUS\\G` 看 `LATEST DETECTED DEADLOCK`，重点读 `WAITING FOR THIS LOCK TO BE GRANTED`、`HOLDS THE LOCK(S)`、事务 SQL 和索引记录。\n- **C/C++ on Linux**：用 `gdb -p <pid>` 后 `thread apply all bt` 看线程栈是否卡在 `pthread_mutex_lock`、`futex`；如果有锁封装，需要结合锁地址、日志中的 owner tid 或 eBPF/strace 观察 futex wait。"
     },
     {
       "type": "diagram",
       "format": "mermaid",
       "title": "死锁的循环等待",
-      "content": "flowchart LR\nA[\"线程A 持有锁1\"] -->|请求锁2| L2[\"锁2\"]\nL2 --> B[\"线程B 持有锁2\"]\nB -->|请求锁1| L1[\"锁1\"]\nL1 --> A",
-      "caption": "死锁的循环等待：A 持有锁1 又请求锁2，B 持有锁2 又请求锁1，形成 A→锁2→B→锁1→A 的环；破坏这个环（统一加锁顺序）即可避免。",
-      "fallback": "线程A 持有锁1、请求锁2；锁2 被线程B 持有；线程B 又请求锁1；锁1 被线程A 持有，形成环形等待，谁都拿不到、全卡死。"
+      "content": "flowchart LR\nA[\"线程A: 已持有 lock1\"] -->|继续请求 lock2| L2[\"lock2: 被线程B持有\"]\nL2 -->|持有者是| B[\"线程B: 已持有 lock2\"]\nB -->|继续请求 lock1| L1[\"lock1: 被线程A持有\"]\nL1 -->|持有者是| A\nO[\"统一资源顺序: lock1 先于 lock2\"] -->|禁止持有 lock2 再请求 lock1| B\nT[\"tryLock超时回退\"] -->|释放已持有锁并重试| A",
+      "caption": "图中闭环是死锁的核心证据：线程A持有 lock1 等 lock2，线程B持有 lock2 等 lock1。统一锁顺序直接切断“持有高序资源再请求低序资源”的边，tryLock 超时回退则避免长期持有第一把锁等待第二把锁。",
+      "fallback": "线程A持有 lock1 等 lock2，线程B持有 lock2 等 lock1，形成循环等待；统一加锁顺序或超时回退可以切断等待环。"
     },
     {
       "type": "compareTable",
       "title": "对比与边界",
-      "content": "| 策略 | 方法 | 优点 | 缺点 |\n| --- | --- | --- | --- |\n| 预防 | 破坏必要条件 | 彻底消除死锁 | 限制多、资源利用率低 |\n| 避免 | 银行家算法 | 动态检查安全性 | 需预知资源需求，计算开销大 |\n| 检测+恢复 | 资源分配图 | 灵活性高 | 恢复可能丢失数据 |\n| 忽略 | 不处理 | 无开销 | 死锁发生需人工干预 |"
+      "content": "| 策略 | 方法 | 优点 | 缺点 |\n| --- | --- | --- | --- |\n| 预防 | 设计时破坏持有并等待、不可剥夺或循环等待，工程上常用全局加锁顺序 | 能从源头消除某类等待环，适合核心交易、账户转账、资源编排代码 | 需要梳理所有资源顺序；一次性申请资源会降低并发度，强制抢占可能破坏一致性 |\n| 避免 | 分配前判断安全状态，银行家算法用 Available、Allocation、Need 推安全序列 | 理论上能在运行时拒绝危险分配，适合资源种类和最大需求已知的封闭系统 | 必须预知最大需求，计算和状态维护成本高，通用服务端代码很少直接落地 |\n| 检测+恢复 | 构建等待图查环，发现后回滚事务、终止任务或杀进程 | 保持正常路径的并发度，数据库事务死锁处理成熟 | 恢复有副作用，可能丢失部分工作；如果没有幂等和重试，业务会感知失败 |\n| 忽略 | 不主动检测应用内部死锁，依赖超时、监控、重启或人工介入 | 运行时开销最低，适合极低概率且恢复成本可控的场景 | 一旦发生会造成请求堆积、线程池耗尽、SLA 抖动，定位依赖现场 dump |"
     },
     {
       "type": "code",
       "title": "代码示例",
-      "content": "// 死锁示例：两个线程按不同顺序获取两把锁\n#include <pthread.h>\n#include <stdio.h>\n\npthread_mutex_t lockA = PTHREAD_MUTEX_INITIALIZER;\npthread_mutex_t lockB = PTHREAD_MUTEX_INITIALIZER;\n\n// 线程1：先锁A再锁B\nvoid* thread1(void* arg) {\n    pthread_mutex_lock(&lockA);\n    printf(\"Thread1: holding lockA\\n\");\n    sleep(1); // 模拟处理\n    pthread_mutex_lock(&lockB); // 等待 lockB，但被 thread2 持有\n    printf(\"Thread1: holding lockA and lockB\\n\");\n    pthread_mutex_unlock(&lockB);\n    pthread_mutex_unlock(&lockA);\n    return NULL;\n}\n\n// 线程2：先锁B再锁A（顺序不一致导致死锁）\nvoid* thread2(void* arg) {\n    pthread_mutex_lock(&lockB);\n    printf(\"Thread2: holding lockB\\n\");\n    sleep(1);\n    pthread_mutex_lock(&lockA); // 等待 lockA，但被 thread1 持有\n    printf(\"Thread2: holding lockB and lockA\\n\");\n    pthread_mutex_unlock(&lockA);\n    pthread_mutex_unlock(&lockB);\n    return NULL;\n}\n\n// 解决方案：统一加锁顺序（都先锁A再锁B）\nvoid* thread2_fixed(void* arg) {\n    pthread_mutex_lock(&lockA); // 改为先锁A\n    sleep(1);\n    pthread_mutex_lock(&lockB);\n    // ... 使用资源 ...\n    pthread_mutex_unlock(&lockB);\n    pthread_mutex_unlock(&lockA);\n    return NULL;\n}",
+      "content": "// 死锁示例：两个线程按不同顺序获取两把锁\n#include <pthread.h>\n#include <stdio.h>\n#include <unistd.h>\n\npthread_mutex_t lockA = PTHREAD_MUTEX_INITIALIZER;\npthread_mutex_t lockB = PTHREAD_MUTEX_INITIALIZER;\n\n// 线程1：先锁A再锁B\nvoid* thread1(void* arg) {\n    pthread_mutex_lock(&lockA);\n    printf(\"Thread1: holding lockA\\n\");\n    sleep(1); // 放大两个线程交叉持锁的时间窗口\n    pthread_mutex_lock(&lockB); // 等待 lockB，但可能已被 thread2 持有\n    printf(\"Thread1: holding lockA and lockB\\n\");\n    pthread_mutex_unlock(&lockB);\n    pthread_mutex_unlock(&lockA);\n    return NULL;\n}\n\n// 线程2：先锁B再锁A（顺序不一致导致循环等待）\nvoid* thread2(void* arg) {\n    pthread_mutex_lock(&lockB);\n    printf(\"Thread2: holding lockB\\n\");\n    sleep(1);\n    pthread_mutex_lock(&lockA); // 等待 lockA，但可能已被 thread1 持有\n    printf(\"Thread2: holding lockB and lockA\\n\");\n    pthread_mutex_unlock(&lockA);\n    pthread_mutex_unlock(&lockB);\n    return NULL;\n}\n\n// 解决方案：统一加锁顺序（都先锁A再锁B）\nvoid* thread2_fixed(void* arg) {\n    pthread_mutex_lock(&lockA); // 改为先锁A，等待关系只能从 lockA 指向 lockB\n    sleep(1);\n    pthread_mutex_lock(&lockB);\n    // ... 使用资源 ...\n    pthread_mutex_unlock(&lockB);\n    pthread_mutex_unlock(&lockA);\n    return NULL;\n}",
       "language": "c",
       "highlights": [
         {
-          "line": 17,
-          "note": "这里给出最终结果或提前退出条件，需要补充空值、失败和边界场景。"
+          "line": 14,
+          "note": "thread1 持有 lockA 后请求 lockB，是等待环中的第一条等待边。"
+        },
+        {
+          "line": 26,
+          "note": "thread2 持有 lockB 后请求 lockA，与 thread1 的相反顺序共同构成循环等待。"
+        },
+        {
+          "line": 35,
+          "note": "修复版让 thread2 也先申请 lockA，所有路径按同一资源顺序申请锁，循环等待条件被破坏。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：死锁是两个或多个线程互相等待对方持有的资源、谁都不放手，导致全都卡死。经典场景是 A 持有锁1 等锁2，B 持有锁2 等锁1。\n\n四个必要条件同时满足才会死锁，破坏任意一个就能消除：互斥、持有并等待、不可剥夺、循环等待。互斥通常没法破坏（资源本身要独占），所以实践从后三个下手。\n\n四种处理策略：① 预防——破坏后三个条件，最实用的是给资源编号、按固定顺序申请（破循环等待）。② 避免——动态判断分配后是否仍处于安全状态，代表是银行家算法，要预知最大需求、开销大、实际少用。③ 检测与恢复——先允许死锁，再用资源分配图检测环路、终止或回滚，数据库就这么干。④ 鸵鸟策略——假装不会发生，卡住人工重启。\n\n工程上避免和定位（高频）。避免靠统一加锁顺序、tryLock 带超时拿不到就回退、缩小锁粒度和持锁时间。定位：Java 用 jstack 看线程 dump，JVM 直接标 Found one Java-level deadlock 并打印环；数据库看 SHOW ENGINE INNODB STATUS 的 LATEST DETECTED DEADLOCK；C/Linux 用 gdb 看各线程栈互相等锁。",
+      "content": "**30 秒结论**\n- 死锁是多个线程或进程互相等待对方持有的资源，形成等待环，导致所有参与者都无法推进。\n- 它成立需要四个条件同时存在：互斥、持有并等待、不可剥夺、循环等待。\n- 工程上最常用的预防方式是统一加锁顺序来破坏循环等待；线上定位主要看线程 dump、数据库死锁日志或各线程阻塞栈。\n\n**机制要点**\n- 四个必要条件不是并列背诵项，而是定位和设计的检查表：\n  - 互斥说明资源只能独占，例如 mutex、行锁。\n  - 持有并等待说明线程拿着旧资源不放，又申请新资源。\n  - 不可剥夺说明外部不能安全强抢资源。\n  - 循环等待说明等待图出现闭环，这是 dump 或数据库日志里最关键的证据。\n- 四种处理策略要分清：\n  - 预防是在设计上破坏必要条件，固定加锁顺序最常用。\n  - 避免是在分配前判断安全状态，银行家算法属于这一类。\n  - 检测与恢复是允许发生后查环并回滚或终止，数据库事务常见。\n  - 忽略适合低概率、可重启、恢复成本可控的普通应用场景。\n- 线上排查时我会先保留现场：\n  - Java 进程抓 `jstack` 或 `jcmd Thread.print -l`，找 `Found one Java-level deadlock`、`waiting to lock`、`locked` 和线程栈业务方法。\n  - MySQL 看 `SHOW ENGINE INNODB STATUS\\G` 的 `LATEST DETECTED DEADLOCK`，读出两个事务各自持有哪些锁、等待哪个索引记录、执行了哪条 SQL。\n  - C/C++ 进程用 gdb 查看所有线程栈，重点关注卡在 `pthread_mutex_lock` 或 futex wait 的线程，再结合锁地址和业务日志还原等待环。\n\n**边界和追问应对**\n- `tryLock` 不是天然解决死锁；如果没有超时、释放已持有锁和退避重试，仍可能变成长期等待或活锁。\n- 固定加锁顺序的代价是需要全局资源排序，跨模块、跨数据库事务和应用锁混用时最容易漏掉路径。\n- 死锁和线程池耗尽要分开看：线程池耗尽可能是下游慢、队列堆积或阻塞 IO；死锁的强证据是资源等待图成环。",
       "followUpQuestions": [
         {
-          "question": "线上怀疑发生了死锁，你会用什么手段确认并定位到具体是哪两把锁？",
-          "answer": "死锁四个必要条件：互斥、持有并等待、不可剥夺、循环等待。预防：按顺序加锁破坏循环等待。检测：jstack查看线程状态、SHOW ENGINE INNODB STATUS查看InnoDB死锁。应用层：tryLock超时。数据库层：innodb_lock_wait_timeout。"
+          "question": "线上 Java 服务接口大量超时，怀疑是死锁，你会如何确认到具体是哪两把锁和哪段代码？",
+          "answer": "先不要重启，连续抓两到三次 `jcmd <pid> Thread.print -l` 或 `jstack <pid>`。如果 JVM 识别到 Java 层死锁，会出现 `Found one Java-level deadlock`，下面列出线程名、线程 id、`waiting to lock` 的对象地址、已经 `locked` 的对象地址和对应栈帧。我会把环中的对象地址与栈帧业务方法对应起来，确认是哪些代码路径按相反顺序拿锁；如果没有 JVM 自动标记，也要人工找多个线程长期停在 `BLOCKED`、`parking to wait for`、`ReentrantLock.lock` 等位置，并比较它们持有和等待的锁。修复通常是统一锁顺序，或把第二把锁改成带超时的 `tryLock`，失败时释放第一把锁后重试。"
         },
         {
           "question": "‘统一加锁顺序’为什么能防死锁？它破坏的是哪个必要条件？",
-          "answer": "它破坏的是‘循环等待’。死锁的环来自不同线程以不同顺序获取多把锁：A 先拿锁1再等锁2，B 先拿锁2再等锁1，就形成 A→B→A 的环。如果约定所有线程都必须按同一个全局顺序（比如按锁的编号从小到大）申请锁，那么想拿锁2的线程一定已经先拿到了锁1，不可能出现‘持有高序号锁去等低序号锁’的情况，等待关系只能单向、无法成环，循环等待条件被破坏，死锁自然不会发生。代价是要能给所有锁定义一个稳定顺序，业务复杂时不总是容易做到。"
+          "answer": "它破坏的是循环等待。假设所有资源都有全局序号，代码只能从小到大申请锁，那么等待边只能从低序资源指向高序资源，不可能再出现持有高序资源去等待低序资源的边；没有反向边就无法形成环。以账户转账为例，不按转出/转入顺序加锁，而按账户 id 小到大加锁，就能避免 A 转 B 与 B 转 A 同时发生时互相等待。限制是所有入口都必须遵守同一排序，动态生成资源或跨模块锁很容易破坏约定。"
         },
         {
           "question": "死锁、活锁、饥饿有什么区别？",
-          "answer": "死锁是多个线程互相等待对方资源、全部卡住不动，线程处于阻塞态、CPU 不忙。活锁是线程没被阻塞、一直在运行，但因为不断响应对方的变化而反复重试、谁也推进不了（比如两人过道互相让路反复同步移动），表现是 CPU 很忙但没进展。饥饿是某个线程长期抢不到资源（如低优先级线程总被高优先级抢占、或写锁被源源不断的读锁饿死），它不是死循环，只是迟迟轮不到。简言之：死锁=互相等死、活锁=瞎忙不前、饥饿=长期排不上队。"
+          "answer": "死锁是多个执行单元互相等待资源，通常阻塞不动，等待图有环；活锁是线程仍在运行并反复重试或让步，CPU 可能很忙但没有有效进展；饥饿是某个线程长期得不到调度或资源，例如低优先级线程一直被高优先级任务压制，或非公平读写锁下写线程长期拿不到写锁。定位时，死锁看等待环，活锁看高频重试和状态来回变化，饥饿看调度策略、公平性和等待时间分布。"
         }
       ]
     },
@@ -74,13 +82,14 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能列举死锁的四个必要条件",
-        "能解释每种死锁处理策略的原理和优缺点",
-        "能说明银行家算法的基本思路",
-        "能用资源分配图分析死锁",
-        "能通过统一加锁顺序预防死锁",
-        "能说明实际项目中的死锁排查方法",
-        "能区分死锁、活锁和饥饿的概念"
+        "死锁定义：多个执行单元围绕资源等待形成闭环并停止推进",
+        "四个必要条件：互斥、持有并等待、不可剥夺、循环等待",
+        "统一加锁顺序破坏循环等待的证明思路",
+        "银行家算法属于死锁避免，依赖最大需求和安全序列判断",
+        "预防、避免、检测恢复、鸵鸟策略的适用场景和代价",
+        "Java 线程 dump 中 `Found one Java-level deadlock`、`waiting to lock`、`locked` 的含义",
+        "InnoDB `LATEST DETECTED DEADLOCK` 中持有锁、等待锁、事务 SQL 的阅读方式",
+        "死锁、活锁、饥饿在现象、CPU 表现和等待关系上的区别"
       ]
     }
   ],
@@ -94,9 +103,9 @@
     },
     {
       "id": "os.process-thread.topic-deadlock.recall.2",
-      "prompt": "如果面试官问你在实际项目中遇到过死锁吗，你怎么排查和解决的？",
+      "prompt": "线上接口大量超时，你怀疑是死锁：请说出如何保留现场、如何从线程 dump 或数据库日志还原等待环、以及如何修复。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
@@ -109,20 +118,25 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说清死锁定义和四个必要条件，并知道破坏任一即可",
-      "能说出按固定顺序加锁破坏循环等待是最实用的预防手段",
-      "能区分预防/避免/检测恢复/鸵鸟四种策略",
-      "能用 jstack 或 SHOW ENGINE INNODB STATUS 定位死锁"
+      "死锁等待环定义",
+      "互斥、持有并等待、不可剥夺、循环等待四个必要条件",
+      "固定资源顺序加锁破坏循环等待",
+      "预防、避免、检测恢复、鸵鸟策略四类处理方式",
+      "jstack 或 jcmd 线程 dump 中的 Java-level deadlock 定位线索",
+      "InnoDB LATEST DETECTED DEADLOCK 的等待锁与持有锁信息"
     ],
     "goodToHave": [
-      "能说明互斥条件通常无法破坏",
-      "能解释银行家算法的安全状态判断",
-      "能区分死锁、活锁、饥饿"
+      "银行家算法 Available、Allocation、Need 与安全序列",
+      "tryLock 超时、释放已持有锁、退避重试的组合使用",
+      "应用锁、数据库锁、分布式锁混用时的全局顺序约束",
+      "死锁、活锁、饥饿的现象差异"
     ],
     "commonMistakes": [
-      "只会背四个条件，不知道怎么破坏",
-      "用 tryLock 不设超时，仍可能长期等待",
-      "加锁顺序不统一导致循环等待"
+      "把银行家算法说成死锁预防而不是死锁避免",
+      "只背四个条件但无法说明等待图为什么成环",
+      "认为 tryLock 不设置超时也能解决死锁",
+      "统一加锁顺序只在局部方法生效，跨入口仍存在反向加锁路径",
+      "把线程池耗尽或下游慢调用误判为死锁而不找等待环证据"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -131,11 +145,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-17",
   "status": "production",
   "prerequisites": [
     "os.process-thread.topic-process-vs-thread"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否说清四个必要条件并知道破坏哪个最实用、区分四种处理策略，并能用 jstack/INNODB STATUS 等手段定位线上死锁。"
+  "interviewerFocus": "重点看候选人能否从等待图闭环理解死锁，而不是只背四个条件；能否说明固定资源顺序为何能切断循环等待；遇到线上卡死时，能否用 jstack、jcmd、InnoDB deadlock 日志或 gdb 栈把锁对象、线程和业务代码路径对应起来，并给出有代价意识的修复方案。"
 }
