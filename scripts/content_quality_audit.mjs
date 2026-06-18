@@ -386,7 +386,7 @@ function hasMermaidBranch(content = "") {
 }
 
 function diagramHumanSignals(card, topic) {
-  const analyzed = analyzeMermaid(card.content ?? "");
+  const analyzed = analyzeMermaid(cardMermaidContent(card));
   const labels = analyzed.labels;
   const edgeCount = analyzed.edgeCount;
   const labelText = labels.join(" ");
@@ -399,7 +399,7 @@ function diagramHumanSignals(card, topic) {
     edgeCount,
     matchedTokens: matched.length,
     genericRatio: labels.length ? genericCount / labels.length : 1,
-    hasBranch: hasMermaidBranch(card.content ?? ""),
+    hasBranch: hasMermaidBranch(cardMermaidContent(card)),
     hasReadableFallback: textLength(fallbackText) >= 24,
     isStrong:
       labels.length >= 4 &&
@@ -570,12 +570,25 @@ function isTemplateComparableSentence(sentence) {
   return textLength(sentence) >= 20;
 }
 
+function sourceContents(card) {
+  return (Array.isArray(card.sources) ? card.sources : [])
+    .map((source) => source?.content)
+    .filter((content) => typeof content === "string" && content.trim());
+}
+
+function cardMermaidContent(card) {
+  const source = (Array.isArray(card.sources) ? card.sources : [])
+    .find((item) => item?.kind === "mermaid" && typeof item.content === "string" && item.content.trim());
+  if (source) return source.content;
+  return card.content ?? "";
+}
+
 function topicProseFields(topic, { includeMeta = true } = {}) {
   const fields = [];
   for (const card of topic.learningCards ?? []) {
     if (card.type === "code") continue;
     if (card.type === "diagram" || card.type === "animation") {
-      fields.push(card.caption ?? "", card.fallback ?? "");
+      fields.push(card.caption ?? "", card.fallback ?? "", ...sourceContents(card));
       continue;
     }
     fields.push(card.content ?? "");
@@ -611,7 +624,7 @@ function collectCardProseText(topic) {
   for (const card of topic.learningCards ?? []) {
     fields.push(card.title ?? "");
     if (card.type === "diagram" || card.type === "animation") {
-      fields.push(card.content ?? "", card.caption ?? "", card.fallback ?? "");
+      fields.push(card.content ?? "", card.caption ?? "", card.fallback ?? "", ...sourceContents(card));
       continue;
     }
     fields.push(card.content ?? "");
@@ -1103,8 +1116,10 @@ function scoreTopic(topic, ref, corpus) {
       deduct(4, `图示标题或图注模板化：${card.title}`);
     }
     if (card.type === "diagram") {
-      const mermaid = (card.format ?? "") === "mermaid" ? analyzeMermaid(card.content ?? "") : null;
-      const labels = mermaid ? mermaid.labels : extractMermaidLabels(card.content ?? "");
+      const mermaidContent = cardMermaidContent(card);
+      const hasMermaidSource = (card.format ?? "") === "mermaid" || (Array.isArray(card.sources) && card.sources.some((source) => source?.kind === "mermaid"));
+      const mermaid = hasMermaidSource ? analyzeMermaid(mermaidContent) : null;
+      const labels = mermaid ? mermaid.labels : extractMermaidLabels(mermaidContent);
       const diagramSignals = diagramHumanSignals(card, topic);
       if (mermaid) {
         if (!mermaid.validHeader) {
@@ -1166,7 +1181,7 @@ function scoreTopic(topic, ref, corpus) {
         (mermaid.type === "flowchart" || mermaid.type === "graph") &&
         topic.difficulty >= 4 &&
         mermaid.nodeCount >= 5 &&
-        !hasMermaidBranch(card.content ?? "") &&
+        !hasMermaidBranch(mermaidContent) &&
         !/\|[^|]+\|/.test(card.content ?? "")
       ) {
         deduct(3, `高阶题图是无分支、无边标签的线性链，疑似关键词直链，建议补失败路径/分支或在连线上标注机制：${card.title}`);

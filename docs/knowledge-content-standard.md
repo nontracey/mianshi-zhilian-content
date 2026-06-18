@@ -285,6 +285,17 @@ AI 或人工审查内容时，不能只看单个 topic 是否写得完整，还�
 4. **兜底可读**：复杂 Mermaid 或动画必须提供 `fallback` 或 `caption`，即使图渲染失败，用户也能读懂图在讲什么。
 5. **不替代解释**：图示只帮助理解结构或流程，不能用一张图替代 explain 对机制、边界和误区的解释。
 6. **孤立节点先诊断再处理**：Mermaid 中出现没有连线的节点时，不能直接批量删除。先判断它是否是重复定义、是否应该与上一/下一节点补边、是否引用了错误节点、是否已有更清晰的新图替代；只有确认节点无语义价值或已有更好图承接时，才可以删除。
+7. **降级链可用**：卡片可使用 `sources`，按 svg 资源 → mermaid 结构图 → text 兜底的顺序降级；资源路径允许先作为 backlog 存在，但必须保留可读的 mermaid/text/fallback。
+8. **复杂 Mermaid 有边界**：允许 `subgraph`、`stateDiagram`、`sequenceDiagram` 和 5 色板 `classDef`，但禁止 `classDiagram/gantt/pie/journey/erDiagram/mindmap` 与裸 `style` 行。
+
+**按 topic 类型选择图示**：
+
+| topic 类型 | 推荐图示 | 说明 |
+|---|---|---|
+| 协议/状态机（TCP 握手、Raft、OAuth2、事务状态机） | `mermaid(stateDiagram/sequenceDiagram) + text` | 时序图/状态图已足够 |
+| 架构/跨系统（微服务拓扑、数据血缘、CI/CD 流水线） | `mermaid(flowchart+subgraph) + text` | 模块分组和调用链用 subgraph 最合适 |
+| 概念/对比/分类（设计模式对比、数据结构选型） | `compareTable` | 对比表足够，不要强行画图 |
+| 基础题（difficulty 1-2） | 保持简洁 | 已有简单 flowchart 或对比表保留即可 |
 
 不合格图示包括：
 

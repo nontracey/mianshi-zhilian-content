@@ -44,6 +44,7 @@ const root = process.cwd();
 const qualityRoot = process.env.QUALITY_REFINE_DIR
   ? path.resolve(process.env.QUALITY_REFINE_DIR)
   : path.join(root, ".quality-refine");
+const allowComplexMermaid = /^(1|true|yes)$/i.test(envConfig.getEnv("REFINE_ALLOW_COMPLEX_MERMAID", "false"));
 const maxConcurrency = 8;
 // activeChildren 已弃用 —— CLI 子进程路径已删除,API 模式无 spawn。但 installSignalHandlers / runProcess 仍引用 → 改写为 noop
 const activeChildren = new Map(); // noop 占位,后续 edit 会从 runProcess 里移走
@@ -59,12 +60,12 @@ const DOMAIN_ORDER = [
 
 // ===== 内嵌精修规范（弱模型唯一参照，不读 81KB 大文档；要求只增不减）=====
 // 调用 buildRefinePrompt 时会把字面量 ${todayYmd} 替换为实际的 YYYY-MM-DD 日期串。
-const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任务：把下面这一篇 topic 改写到“真人专家会认可、面试能直接用”的高质量，使其通过确定性质量审计（满分 100，合格线见下，9 个维度各有地板分，强项不能补偿短板）。
+const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任务：把下面这一篇 topic 改写到"真人专家会认可、面试能直接用"的高质量，使其通过确定性质量审计（满分 100，合格线见下，9 个维度各有地板分，强项不能补偿短板）。
 
 【目标层次——技术类对标 P7/P7+，非技术类对标对应专家纵深】
 - 技术域：内容深度按资深/专家（P7、可到 P7+）的知识储备来写。difficulty 4-5 必须达到源码级机制、架构链路、极端规模与工程权衡的深度，能真正区分资深与专家；difficulty 3 至少要能区分资深；difficulty 1-2 的基础题保持诚实标注、紧凑不注水，不强行拔高（拔高基础题等于难度虚标）。
 - 非技术域（如自媒体）：按该职业资深从业者的纵深写——要有可量化方法、真实数据口径与来源、失败复盘和取舍，不停留在常识科普。
-- 区分度天花板：一篇题“能筛到哪个职级”由它的 recallPrompts + followUpQuestions 决定。若全部问题只考“是什么/列举”，区分度封顶“仅中级”；要具备资深（P7）区分度，difficulty≥3 必须至少有一条“为什么这样设计而非另一种 / 线上如何排查 / 取舍权衡 / 极端场景如何应对”的深问，且正文要能支撑该深问的答案。
+- 区分度天花板：一篇题"能筛到哪个职级"由它的 recallPrompts + followUpQuestions 决定。若全部问题只考"是什么/列举"，区分度封顶"仅中级"；要具备资深（P7）区分度，difficulty≥3 必须至少有一条"为什么这样设计而非另一种 / 线上如何排查 / 取舍权衡 / 极端场景如何应对"的深问，且正文要能支撑该深问的答案。
 
 【核心原则——只调内容，不动格式】
 你的唯一任务是优化内容质量（深度、准确性、面试可用性）。不得改变 JSON 结构和字段格式——每个字段的键名、类型、取值范围必须与原 topic 完全一致。如果原 topic 某个字段用的是 A 格式，精修后必须还是 A 格式。格式错误等于精修失败。
@@ -80,9 +81,16 @@ const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任�
 2. 内容深度：每张 explain 要讲清机制/触发条件/关键指标/失败路径/工程取舍，不是清单堆砌、不是大白话复述定义。
 3. 专家证据：给出具体抓手——真实函数名/类名/参数、版本边界、命令与配置项、数值量级、生产现象与定位线索。禁止"通常、一般、很重要"这类空话。
 4. 讲解清晰度：遵循认知顺序——先动机/痛点 → 机制 → 具体例子 → 边界/反例 → 面试如何表达；逻辑连贯不跳跃。
-5. 图示/对比：diagram 节点必须是本题专属概念（不是“输入→处理→输出”这种万能图），且边必须表达真实机制（调用顺序/数据流/状态转移/分支/失败路径）——纯线性关键词链（A→B→C→D→…，无分支/汇合/状态转移）、或终点是“面试结论/答题要点/总结”这类汇聚节点的，即使节点专属也算假图，必须重画；compareTable 行列对齐，且每一行都含真正的结论而非同义复述。
+5. 图示/对比：diagram 节点必须是本题专属概念（不是"输入→处理→输出"这种万能图），且边必须表达真实机制（调用顺序/数据流/状态转移/分支/失败路径）——纯线性关键词链（A→B→C→D→…，无分支/汇合/状态转移）、或终点是"面试结论/答题要点/总结"这类汇聚节点的，即使节点专属也算假图，必须重画；compareTable 行列对齐，且每一行都含真正的结论而非同义复述。
+【何时用什么图——按 topic 类型评估，不是所有 topic 都需要 diagram，也不是所有图都适合做成 Mermaid】
+- 协议/状态机/分布式类（TCP 握手/挥手、拥塞控制、Paxos/Raft、OAuth2 流程、事务状态机）：首选 mermaid stateDiagram 或 sequenceDiagram 展示"参与者交互/状态转移/分支条件"；sources: [{kind: "mermaid", content: ...}, {kind: "text", content: ...}]。
+- 架构/跨系统边界类（微服务拓扑、数据血缘、CI/CD 流水线、消息流转）：首选 mermaid flowchart/graph + subgraph 展示"模块分组/调用链路/隔离边界"；sources: [{kind: "mermaid", content: ...}, {kind: "text", content: ...}]。
+- 纯概念/对比/分类类（设计模式对比、数据结构选型、安全攻击分类）：不需要 diagram 卡，用 compareTable 就够了。不要为了凑"有图"给纯概念对比画流程图。
+- difficulty 1-2 基础题：不主动加复杂图，保持简洁；已有的简单 flowchart 或对比表保留即可。
+- 如有 svg 静态资源（assets/diagrams/*.svg），可放在 sources[0] 作为第一展示层，sources[1]=mermaid、sources[2]=text 作为降级兜底。
+- 降级链最少要有一层 mermaid 或 text 兜底。
 6. 面试可用性：interviewAnswer 用三层结构——30 秒结论 → 机制要点列表 → 边界/追问应对；followUpQuestions ≥2 条，且答案是本题专属、不复述题面。
-7. rubric 评估质量：mustHave 是具体知识点名词（如“本地队列+全局队列+work stealing 三层调度”），不是“能说明「X」在「Y」里的作用和判断标准”这类套娃句；commonMistakes 是真实的坑，不是泛化。mustHave / goodToHave / commonMistakes 只能是知识点名词短语或自然语句，禁止内嵌代码片段（如 throw new ...()、function、=>、带分号的语句、缩进代码块）——代码只放 code 卡。
+7. rubric 评估质量：mustHave 是具体知识点名词（如"本地队列+全局队列+work stealing 三层调度"），不是"能说明「X」在「Y」里的作用和判断标准"这类套娃句；commonMistakes 是真实的坑，不是泛化。mustHave / goodToHave / commonMistakes 只能是知识点名词短语或自然语句，禁止内嵌代码片段（如 throw new ...()、function、=>、带分号的语句、缩进代码块）——代码只放 code 卡。
 8. 模板与语言卫生：逐字消除下列 P0 模板句式（命中必改写成本题专属的具体表达）：
    - explain 结尾三段式："把 X 放到真实场景里看…"/"判断 X 是否答到位时…"/"学透 X 的关键是…追问/复述校验"。
    - code 高亮注释套话："这里定义示例的核心入口或结构…"/"这里给出最终结果或提前退出条件…"/"并发控制点：说明它保护的…"/"这里体现状态推进或遍历过程…"/"需要说明终止条件、复杂度和异常输入"等一切非本题专属的通用说明。
@@ -90,8 +98,8 @@ const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任�
    - rubric.mustHave：所有以"能说明/能解释/能准确解释 X 的 Y"开头的泛化句式，都应替换为具体知识点名词（如"弱引用 key 回收后 value 仍被 Thread 强持有"而非"能说明 value 泄漏原因"）。
    - interviewerFocus：四词排比模板（"考察是否能解释 X 的 a、b、c、d"）和两段式泛化（"考察对 X 的理解深度，能否区分 Y 和 Z"）都应改写为本题考察的具体能力点。
    - followUpQuestions："X 一般怎么定位/怎么排查"这种通用骨架但答案没有本题专属抓手。
-   - 任何“今日笔记/今日练习/第 X 天/Day X”。
-9. 区分度天花板（对标 P7/P7+）：技术类 difficulty≥3 的内容必须深到能区分资深（P7），difficulty 4-5 要到 P7+（源码级机制 / 架构权衡 / 极端规模 / 疑难定位）；非技术类按对应职业的专家纵深。判据见上【目标层次】——只考“是什么/列举”、recallPrompts/followUpQuestions 缺“为什么这样设计 / 如何排查 / 取舍 / 极端场景”深问的，本维不合格。difficulty 1-2 的基础题豁免“区分资深”，但不得为凑深度注水或虚标难度。
+   - 任何"今日笔记/今日练习/第 X 天/Day X"。
+9. 区分度天花板（对标 P7/P7+）：技术类 difficulty≥3 的内容必须深到能区分资深（P7），difficulty 4-5 要到 P7+（源码级机制 / 架构权衡 / 极端规模 / 疑难定位）；非技术类按对应职业的专家纵深。判据见上【目标层次】——只考"是什么/列举"、recallPrompts/followUpQuestions 缺"为什么这样设计 / 如何排查 / 取舍 / 极端场景"深问的，本维不合格。difficulty 1-2 的基础题豁免"区分资深"，但不得为凑深度注水或虚标难度。
 
 【准确性与时效】所有事实、版本、API、默认值、数值必须正确且贴合当前主流实践；不确定的断言宁可不写，不要编造。算法题要给正确复杂度与边界条件。
 
@@ -107,8 +115,8 @@ const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任�
 - checklist：合法字段有 type / title / items。items 必须是字符串数组，每项是一条可核验的能力点。
 - code：合法字段有 type / title / content / language / highlights。language 必填，取值仅限 java / python / javascript / typescript / bash / sql / json / yaml / c / cpp / go / rust 之一。highlights 为 \`[{line, note}]\` 数组，line 是从 1 开始的行号，note 是该行的具体语义说明（禁止"关键行"/"核心入口"等泛化占位，必须是本题专属的具体解释）；禁止在 code 卡片里使用 box-drawing 字符画（┌─┐│└┘ 等），需要画图就用 diagram 卡片。
 - compareTable：合法字段有 type / title / content / columns / rows。两种合法形态——（A）Markdown 表格字符串放在 content（以 \`|\` 开头）；（B）结构化表格，columns 为表头字符串数组、rows 为二维字符串数组。**保留原 topic 用的那种形态，不要互换。** 若原 topic 用 columns+rows 形态，则每行 rows 的列数必须与 columns 对齐；若原 topic 用 content 形态，则精修后仍用 content 形态。
-- diagram：合法字段有 type / title / content / format / items / fallback / caption / svgPath / asset / svg。format 取值 mermaid / svg / image / text 之一；当 format=mermaid 时，content 必须以 \`flowchart\` 或 \`graph\` 开头并紧跟 TB|TD|BT|LR|RL 方向（例如 \`flowchart LR\`），禁止使用 subgraph / classDef / style / sequenceDiagram / classDiagram / stateDiagram / mindmap。items 为字符串数组，是图示要点列表，**原 topic 有 items 字段就必须保留**。必须提供 fallback（一句话纯文本概括）。caption 为图注。节点文案必须紧扣本 topic 主题，禁止使用"输入→处理→输出"这类万能节点。
-- animation：合法字段有 type / title / asset / fallback / caption。asset 为资源路径，fallback 必填。
+- diagram：合法字段有 type / title / content / format / items / fallback / caption / svgPath / asset / svg / sources。format 取值 mermaid / svg / image / text 之一；当 format=mermaid 时，content 必须以 \`flowchart\` 或 \`graph\` 开头并紧跟 TB|TD|BT|LR|RL 方向（例如 \`flowchart LR\`）；若 REFINE_ALLOW_COMPLEX_MERMAID=true，可使用 subgraph(≤2层)、stateDiagram(-v2)、sequenceDiagram、classDef 5 色板。items 为字符串数组，是图示要点列表，**原 topic 有 items 字段就必须保留**。必须提供 fallback（一句话纯文本概括）。caption 为图注。节点文案必须紧扣本 topic 主题，禁止使用"输入→处理→输出"这类万能节点。sources 可选，格式 [{kind:"svg"|"mermaid"|"text", path?:"...", content?:"..."}]，按数组顺序降级（svg 资源 → mermaid 结构图 → text 兜底）。
+- animation：合法字段有 type / title / asset / sources / fallback / caption。asset 为资源路径，fallback 必填。sources 规则同 diagram。
 
 - recallPrompts：至少 1 条；第一条必须是该 topic 最核心、面试官最常开口问的那个问题（首轮练习兼容旧版 App 用）；每条对象结构必须是 \`{id, prompt, mode}\`，id 形如 \`<topic.id>.recall.<n>\`，mode 取值仅限 text / code / voice；可选附加 expectedMinutes（数字，分钟）、difficulty（1-5）。
 - rubric：必须含 mustHave（≥1 条）/ goodToHave / commonMistakes / scoreWeights 四个字段；scoreWeights 必须包含 coverage / accuracy / interviewExpression / depth 四个键，每个值是 0-100 的整数，**四个值之和必须严格等于 100**。mustHave / goodToHave / commonMistakes 的每一项只能是知识点描述短语，禁止内嵌代码片段。
@@ -740,7 +748,7 @@ async function runJudges(topic, ref, judge) {
       } catch (error) {
         if (error.interrupted) throw error;
         // 判官协议失败（多次重试仍写坏 JSON）也只降级、绝不上抛——否则判前 runJudges 会一路抛穿
-        // worker(无 catch) 把整轮 run 崩掉。这里当“该判官此次不可用”，reviews 为空时返回 null → 退回静态护栏。
+        // worker(无 catch) 把整轮 run 崩掉。这里当"该判官此次不可用"，reviews 为空时返回 null → 退回静态护栏。
         const tag = error.judgeProtocolFailure ? "JSON协议失败(降级静态)" : "评审失败";
         console.log(`[JUDGE] ${tag} ${ref} m=${model ?? "默认"} #${index + 1}: ${error.message}`);
       }
@@ -791,7 +799,7 @@ async function runJudgeBatch(items, judge) {
       fallbackQueue.push(item);
     }
   }
-  // 整批拿不到任何结果 -> 退到“单篇 runJudges”模式，避免一篇坏 JSON 把同批 N 篇全部拖垮。
+  // 整批拿不到任何结果 -> 退到"单篇 runJudges"模式，避免一篇坏 JSON 把同批 N 篇全部拖垮。
   if (fallbackQueue.length) {
     console.log(
       `[JUDGE] 批量整批失败，降级为单篇模式重跑 ${fallbackQueue.length}/${items.length} 篇：` +
@@ -809,7 +817,7 @@ async function runJudgeBatch(items, judge) {
       }
     }
   }
-  // 让上层（如 warmJudgeCacheForTargets）能识别“整批 model × count × 单篇兜底全部失败”。
+  // 让上层（如 warmJudgeCacheForTargets）能识别"整批 model × count × 单篇兜底全部失败"。
   out.allFailed = items.length > 0 && out.size === 0 && batchFatal != null;
   out.firstError = batchFatal;
   out.errorSamples = errorSamples;
@@ -1065,7 +1073,7 @@ async function runAudit(minScore, cfg = {}) {
   return audit;
 }
 
-// 进程内构建语料库，供 keep-best 用同一套 scoreTopic 算法给“候选 vs 现版”打分做对比。
+// 进程内构建语料库，供 keep-best 用同一套 scoreTopic 算法给"候选 vs 现版"打分做对比。
 // 用当前磁盘全量内容建库（含本 topic 旧版）：候选若照抄已在 ≥4 篇出现的句子，corpus 里有那些副本即可判出跨 topic 模板；
 // 候选自创、之后才扩散的新句子由下一轮全量审计兜底。每轮建一次即可，本轮内其他篇的新写入造成的轻微滞后可接受。
 function buildRefineCorpus() {
@@ -1112,7 +1120,7 @@ function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministi
   const spec = REFINE_SPEC.split("${todayYmd}").join(todayYmd);
   const issues = failingInfo?.issues ?? [];
   const tmpl = templates ?? [];
-  // 上一次输出解析失败 → 把“具体哪坏了 + 位置上下文”喂回去，让模型精准修格式，而不是同 prompt 再撞一次。
+  // 上一次输出解析失败 → 把"具体哪坏了 + 位置上下文"喂回去，让模型精准修格式，而不是同 prompt 再撞一次。
   // 关键诉求：失败要因为内容不够好，而不是少括号/少逗号/裸引号/中英文标点这种格式问题。
   let retryBlock = "";
   if (previousError) {
@@ -1124,7 +1132,7 @@ function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministi
     retryBlock = `\n【上一次输出无法被程序解析，必须修正——这是 JSON 格式问题，不是内容问题，不要因此删改内容】${message}${locLine}修正要点：① 整份必须是一个能被 JSON.parse 通过的对象；② 字符串值里的双引号一律转义为 \\\\" 或改用中文「」/反引号；③ 换行用 \\\\n，不要写裸换行；④ 不要漏逗号、不要留多余 trailing comma、所有括号要配对闭合。请以下面【当前 topic JSON】为基底重写、只改文字内容，不要解释。\n`;
   }
   const judgeBlock = findingLines.length
-    ? `\n【动态判官（资深评审）指出的具体缺口——这是“每一块更精准”的重点，逐条消除】\n${findingLines
+    ? `\n【动态判官（资深评审）指出的具体缺口——这是"每一块更精准"的重点，逐条消除】\n${findingLines
         .map((line, index) => `${index + 1}. ${line}`)
         .join("\n")}\n`
     : "";
@@ -1136,15 +1144,21 @@ function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministi
         .map((entry) => `- （在 ${entry.count} 篇里重复）${entry.sentence}`)
         .join("\n")}\n`
     : "";
+  const dynamicRules = allowComplexMermaid
+    ? "REFINE_ALLOW_COMPLEX_MERMAID=true: diagram uses subgraph(<=2 levels), stateDiagram(-v2), sequenceDiagram, classDef 5-color palette; banned: classDiagram/gantt/pie/journey/erDiagram/mindmap and bare style. sources: svg -> mermaid -> text."
+    : "REFINE_ALLOW_COMPLEX_MERMAID=false: diagram only simple flowchart/graph + direction header, sources only svg/mermaid/text.";
   return `${spec}
 ${retryBlock}
+【本次精修功能开关】
+${dynamicRules}
+
 【本篇当前确定性审计分】${deterministicScore ?? failingInfo?.score ?? "?"}/100，静态验收线 ${minScore}。
 静态分数只是验收兜底，不是跳过理由。你必须先在内部按真人专家口径重新评分和找问题，再直接输出精修后的完整 JSON；不要输出评分过程。
 
 【本篇被扣分的具体缺口（务必逐条消除）】
 ${issueBlock}
 ${templateBlock}${judgeBlock}
-【降低格式出错的关键做法（务必照做）】下面【当前 topic JSON】本身就是一份格式完全正确的模板。请把它当基底：保持所有字段名、括号层级、引号转义方式与它一致，只改写需要提升的“文字内容”，不要重排结构、不要新造字段名、不要改动你没必要改的部分的标点与转义。这样能把 JSON 格式出错概率降到最低——记住：我们要的失败是“内容不够好”，绝不接受“少括号/少逗号/裸引号/中英文标点”这类格式失败。
+【降低格式出错的关键做法（务必照做）】下面【当前 topic JSON】本身就是一份格式完全正确的模板。请把它当基底：保持所有字段名、括号层级、引号转义方式与它一致，只改写需要提升的"文字内容"，不要重排结构、不要新造字段名、不要改动你没必要改的部分的标点与转义。这样能把 JSON 格式出错概率降到最低——记住：我们要的失败是"内容不够好"，绝不接受"少括号/少逗号/裸引号/中英文标点"这类格式失败。
 
 ${cachePath ? `【输出要求】不要在 stdout 输出 JSON 内容、不要解释、不要 markdown 代码围栏。把改写后的完整 topic JSON 对象（从 { 开始到 } 结束、单一对象、合法 JSON）写入下面这个绝对路径的文件：
 ${cachePath}
@@ -1167,19 +1181,19 @@ ${JSON.stringify(topic, null, 2)}
 `;
 }
 
-// 落盘前的 schema 不变量：只防“身份被改 / 内容被掏空 / 结构损坏”，质量好坏交给审计判。
+// 落盘前的 schema 不变量：只防"身份被改 / 内容被掏空 / 结构损坏"，质量好坏交给审计判。
 function checkInvariants(original, parsed) {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "输出不是 JSON 对象";
   for (const key of ["id", "domain", "category"]) {
     if (parsed[key] !== original[key]) return `${key} 被改动（${original[key]} -> ${parsed[key]}）`;
   }
   if (parsed.status !== "production") return `status 必须保持 production，实际为 ${parsed.status}`;
-  // difficulty 不得下调：下调会软化审计的所有难度阈值（字数/必备 explain 数/取舍-失败 cap），是直白的“把难题伪装成简单题”刷分通道。
+  // difficulty 不得下调：下调会软化审计的所有难度阈值（字数/必备 explain 数/取舍-失败 cap），是直白的"把难题伪装成简单题"刷分通道。
   if (typeof original.difficulty === "number") {
     if (typeof parsed.difficulty !== "number") return `difficulty 缺失或非数字（原 ${original.difficulty}）`;
     if (parsed.difficulty < original.difficulty) return `difficulty 被下调（${original.difficulty} -> ${parsed.difficulty}），禁止下调`;
   }
-  // 元数据值锁定：精修只改“内容”，这些字段是身份/排序/打分输入，改动多半是刷分（如改 tags 让 topicAlignment 虚高）或漂移。
+  // 元数据值锁定：精修只改"内容"，这些字段是身份/排序/打分输入，改动多半是刷分（如改 tags 让 topicAlignment 虚高）或漂移。
   const lockedMetaKeys = ["tags", "group", "order", "interviewFrequency", "recommendWeight", "prerequisites", "leetcodeUrl", "sourceRef"];
   for (const key of lockedMetaKeys) {
     if (key in original && JSON.stringify(parsed[key]) !== JSON.stringify(original[key])) {
@@ -1221,17 +1235,45 @@ function checkInvariants(original, parsed) {
   const newLen = JSON.stringify(parsed).length;
   if (newLen < originalLen * 0.6) return `内容疑似被截断/掏空（${newLen} < 原文 ${originalLen} 的 60%）`;
 
-  // mermaid 子集校验：仅允许 flowchart/graph + 基本边；禁用 subgraph/classDef/style 与其他图种。
-  const mermaidHeadRe = /^\s*(?:flowchart|graph)\s+(?:TB|TD|BT|LR|RL)\b/;
-  const mermaidBlacklist = /\b(?:subgraph|classDef|style|sequenceDiagram|classDiagram|stateDiagram|mindmap|gantt|pie|journey|erDiagram)\b/;
+  const mermaidHeadRe = allowComplexMermaid
+    ? /^\s*(?:(?:flowchart|graph)\s+(?:TB|TD|BT|LR|RL)|stateDiagram(?:-v2)?|sequenceDiagram)\b/
+    : /^\s*(?:flowchart|graph)\s+(?:TB|TD|BT|LR|RL)\b/;
+  const mermaidBlacklist = allowComplexMermaid
+    ? /\b(?:classDiagram|gantt|pie|journey|erDiagram|mindmap)\b/
+    : /\b(?:subgraph|classDef|style|sequenceDiagram|classDiagram|stateDiagram|mindmap|gantt|pie|journey|erDiagram)\b/;
+  const sourceKinds = new Set(["svg", "mermaid", "text"]);
   for (const card of cards) {
-    if (card.type === "diagram" && card.format === "mermaid") {
-      const content = typeof card.content === "string" ? card.content : "";
+    if (Array.isArray(card.sources)) {
+      for (let i = 0; i < card.sources.length; i += 1) {
+        const source = card.sources[i];
+        if (!sourceKinds.has(source?.kind)) return `sources[${i}].kind 非法：${card.title ?? ""}`;
+        const hasPath = typeof source.path === "string" && source.path.trim();
+        const hasContent = typeof source.content === "string" && source.content.trim();
+        if (Boolean(hasPath) === Boolean(hasContent)) return `sources[${i}] 必须且只能提供 path 或 content：${card.title ?? ""}`;
+        if (hasPath && (!source.path.startsWith("assets/") || source.path.includes("..") || path.isAbsolute(source.path))) {
+          return `sources[${i}].path 越界或不在 assets/：${card.title ?? ""}`;
+        }
+      }
+    }
+    const mermaidSources = Array.isArray(card.sources) ? card.sources.filter((source) => source?.kind === "mermaid") : [];
+    const mermaidContents = card.type === "diagram" && card.format === "mermaid"
+      ? [card.content, ...mermaidSources.map((source) => source.content)]
+      : mermaidSources.map((source) => source.content);
+    for (const contentValue of mermaidContents) {
+      const content = typeof contentValue === "string" ? contentValue : "";
       if (!mermaidHeadRe.test(content)) {
-        return `diagram(mermaid) 必须以 flowchart|graph 开头并跟 TB|TD|BT|LR|RL：${card.title ?? ""}`;
+        return `diagram(mermaid) 图类型头不合法：${card.title ?? ""}`;
       }
       if (mermaidBlacklist.test(content)) {
-        return `diagram(mermaid) 含禁用语法（subgraph/classDef/style/其他图种）：${card.title ?? ""}`;
+        return `diagram(mermaid) 含禁用语法：${card.title ?? ""}`;
+      }
+      if (allowComplexMermaid) {
+        if (/^\s*style\s+/m.test(content)) return `diagram(mermaid) 禁止裸 style 行：${card.title ?? ""}`;
+        for (const line of content.split(/\r?\n/).map((entry) => entry.trim()).filter((entry) => entry.startsWith("classDef "))) {
+          if (!/^classDef\s+(ok|warn|fail|async|highlight)\s+fill:#[0-9a-fA-F]{6}(?:,stroke:#[0-9a-fA-F]{6})?(?:,color:#[0-9a-fA-F]{6})?$/.test(line)) {
+            return `diagram(mermaid) classDef 只能使用 5 色板：${card.title ?? ""}`;
+          }
+        }
       }
     }
   }
@@ -1288,7 +1330,7 @@ function recallBaseKey(prompt, index) {
 function normalizeForMatch(text = "") {
   return String(text)
     .toLowerCase()
-    .replace(/[\s、，,。:：/()（）\-_.+【】\[\]#*_`|>~"'“”‘’]+/g, "")
+    .replace(/[\s、，,。:：/()（）\-_.+【】\[\]#*_`|>~"'""‘’]+/g, "")
     .replace(/与/g, "和");
 }
 
@@ -1731,7 +1773,7 @@ async function tryBlockKeepBest({ original, candidate, ref, corpus, beforeStatic
     mergedReview = await runJudges(merged, ref, judge);
     decision = mergedReview
       // 地板用棘轮口径（与纯静态 staticRegressionVectorAccepts 一致）：现版 ≥90 才要求候选 ≥90；
-      // 现版本来 <90 时只要求“候选不低于现版”，让 80->85 这类真实改善也能逐格上挪，而不是被 90 硬地板退回更差旧版。
+      // 现版本来 <90 时只要求"候选不低于现版"，让 80->85 这类真实改善也能逐格上挪，而不是被 90 硬地板退回更差旧版。
       ? acceptByJudge({ before: beforeReview, after: mergedReview, staticBefore: beforeStaticReport.score, staticAfter: mergedStaticReport.score, minStatic: Math.min(90, beforeStaticReport.score) })
       : { accept: false, reason: "块级合并后判官失败，降级整篇接受/拒绝" };
   } else {
@@ -1762,7 +1804,7 @@ async function tryBlockKeepBest({ original, candidate, ref, corpus, beforeStatic
 }
 
 // writeTo 不为空时写到该路径（预览模式，不动仓库）；否则原子写回仓库 ref。
-// corpus 用于落盘前的静态 keep-best：候选静态分不严格高于现版就保留旧版（“越跑越高、不许改烂”）。
+// corpus 用于落盘前的静态 keep-best：候选静态分不严格高于现版就保留旧版（"越跑越高、不许改烂"）。
 // setPhase(phase): 可选回调，用于把当前阶段标签写回 pool 的 active map，
 // 让 summary 心跳能区分子 agent 当前是 judgeBefore/refineCall/blockJudge/judgeAfter/merging 哪个阶段。
 async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, model, writeTo, corpus, judge, setPhase) {
@@ -1784,23 +1826,23 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
   await mkdir(cacheDir, { recursive: true });
   let lastError = null;
   let availabilityFailure = false;
-  let keptOld = false; // 最近一次结果是“候选合法但未优于现版、保留旧版”（非执行失败）
+  let keptOld = false; // 最近一次结果是"候选合法但未优于现版、保留旧版"（非执行失败）
   let bestRejectedAfter = null; // 被 keep-best 拒掉的候选里最高的静态分，用于诊断
   // 静态基线（现版）：候选与现版用同一 corpus/算法对比；original 不随 attempt 变，算一次即可。
   const staticBeforeReport = corpus
     ? scoreTopic(original, ref, corpus)
     : { score: audit.scoreMap.get(ref) ?? 0, issueCount: audit.failingMap.get(ref)?.issues?.length ?? 0, issues: audit.failingMap.get(ref)?.issues ?? [], metrics: { dimensions: {} } };
   const staticBefore = staticBeforeReport.score;
-  // 判前：对现版判一次（按 contentHash 缓存）。用于 ①“已达标则不浪费改写” ②keep-best 基线 ③findings 喂改写。
+  // 判前：对现版判一次（按 contentHash 缓存）。用于 ①"已达标则不浪费改写" ②keep-best 基线 ③findings 喂改写。
   let beforeReview = null;
   let findingLines = [];
   if (!writeTo && judge?.enabled) {
     phase("judgeBefore");
     beforeReview = await runJudges(original, ref, judge);
     if (!beforeReview) {
-      // 判官启用 = 判官必需。判前（已含 judge 内部 jsonRetries）仍拿不到动态评审 → 绝不退回“双静态”（那不是精修），
-      // 直接判该篇失败、计入最终报告的“判官评审失败”。本轮该篇静态若仍 <minScore，下一轮会重新进队列再试（跨轮重试）。
-      if (detailedProgress) console.log(`[TOPIC] 判官评审失败（判前），判该篇失败 ${ref}`);
+      // 判官启用 = 判官必需。判前（已含 judge 内部 jsonRetries）仍拿不到动态评审 → 绝不退回"双静态"（那不是精修），
+      // 直接判该篇失败、计入最终报告的"判官评审失败"。本轮该篇静态若仍 <minScore，下一轮会重新进队列再试（跨轮重试）。
+      console.log(`[TOPIC] 判官评审失败（判前），判该篇失败 ${ref}`);
       return {
         ok: false,
         attempts: 0,
@@ -1816,9 +1858,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
     }
     findingLines = findingsToPromptLines(beforeReview);
     if (staticBefore >= minScore && judgePasses(beforeReview, judge.dynamicSkipMin)) {
-      if (detailedProgress) {
-        console.log(`[TOPIC] 已达标，跳过改写 ${ref}（static ${staticBefore} + 动态 ${beforeReview.score}，9 维全过、无事实问题）`);
-      }
+      console.log(`[TOPIC] 已达标，跳过改写 ${ref}（static ${staticBefore} + 动态 ${beforeReview.score}，9 维全过、无事实问题）`);
       return {
         ok: true,
         attempts: 0,
@@ -1833,7 +1873,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
       };
     }
   }
-  // 上一次 attempt 若是“格式/解析类失败”（非 keptOld），把结构化错误喂回下一次 prompt 让模型精准修格式。
+  // 上一次 attempt 若是"格式/解析类失败"（非 keptOld），把结构化错误喂回下一次 prompt 让模型精准修格式。
   let previousFormatError = null;
   let attemptsMade = 0; // 实际跑了几次（keptOld 会 break，真实次数 < 配置上限），用于汇总重试统计不虚高
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -1846,7 +1886,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
     try {
       // ====== API 模式统一走 callRefineApi（其内部已调 llmRunner.runRefine,自动应用 REFINE_MODEL_CHAIN + 截断重试 + 降级 + 流式 onProgress）======
       const prompt = buildRefinePrompt(original, audit.failingMap.get(ref), templates.get(ref), minScore, audit.scoreMap.get(ref), null, findingLines, previousFormatError);
-      if (detailedProgress) console.log(`[TOPIC] 开始 ${attemptLabel} score=${score}/100（API 模式）`);
+      console.log(`[TOPIC] 开始 ${attemptLabel} score=${score}/100（API 模式）`);
       const reqId = newReqId();
       liveEvents.emitEvent("llm.request", { reqId, topicRef: ref, kind: "refine", spec: model ?? null, attempt, attempts });
       const onTokenProgress = (e) => {
@@ -1881,7 +1921,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
         throw apiError;
       }
       availabilityFailure = false;
-      if (detailedProgress) console.log(`[TOPIC] LLM 已返回（API）${ref}`);
+      console.log(`[TOPIC] LLM 已返回（API）${ref}`);
       // JSON 解析成功，先用黑名单识别错误响应（429/限流/上游错误等），再用白名单确认是 topic 契约。
       // 这样 LLM/网关返回 {code:429,message,details} 之类合法 JSON 但非 topic 契约时，
       // 能给出明确的"限流/上游错误"提示并触发可用性降级，而不是被当成 topic 进 invariant 检查报"id 被改动"。
@@ -1911,20 +1951,20 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
       const bad = checkInvariants(original, parsed);
       if (bad) throw new Error(`schema 不变量失败：${bad}`);
       if (writeTo) {
-        // 预览模式：直接写候选产物，不做 keep-best（预览本就是看“这次会改成什么样”）。
+        // 预览模式：直接写候选产物，不做 keep-best（预览本就是看"这次会改成什么样"）。
         await mkdir(path.dirname(writeTo), { recursive: true });
         await writeFile(writeTo, `${JSON.stringify(parsed, null, 2)}\n`);
-        if (detailedProgress) console.log(`[TOPIC] 预览产物已写入 ${path.relative(root, writeTo)}`);
-        if (detailedProgress) console.log(`[TOPIC] 完成 ${attemptLabel}`);
+        console.log(`[TOPIC] 预览产物已写入 ${path.relative(root, writeTo)}`);
+        console.log(`[TOPIC] 完成 ${attemptLabel}`);
         return { ok: true, attempts: attempt, availabilityFailure: false };
       }
-      // 正式落盘 = keep-best：候选与现版用同一 corpus/算法算静态分；判官开启时再叠加“回归向量”动态判据。
+      // 正式落盘 = keep-best：候选与现版用同一 corpus/算法算静态分；判官开启时再叠加"回归向量"动态判据。
       const afterStaticReport = corpus
         ? scoreTopic(parsed, ref, corpus)
         : { score: staticBefore + 1, issueCount: 0, issues: [], metrics: { dimensions: {} } };
       const after = afterStaticReport.score;
 
-      // Phase 3：块级 keep-best。先只吸收“单独替换也能让静态向量不退且有改善”的块，
+      // Phase 3：块级 keep-best。先只吸收"单独替换也能让静态向量不退且有改善"的块，
       // 再对拼好的整篇复判；复判不过则降级为下面的整篇接受/拒绝。
       let blockResult = null;
       if (corpus) {
@@ -1933,13 +1973,11 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
         if (blockResult.accept) {
           phase("merging");
           await writeTopicAtomic(ref, blockResult.topic);
-          if (detailedProgress) {
-            console.log(
-              `[TOPIC] 块级合并已写回 ${ref}（${blockResult.reason}，吸收 ${blockResult.mergedBlocks.length}/${blockResult.changedBlocks} 块` +
-                `${blockResult.review ? `，动态 ${beforeReview.score}->${blockResult.review.score}` : ""}）`,
-            );
-          }
-          if (detailedProgress) console.log(`[TOPIC] 完成 ${attemptLabel}`);
+          console.log(
+            `[TOPIC] 块级合并已写回 ${ref}（${blockResult.reason}，吸收 ${blockResult.mergedBlocks.length}/${blockResult.changedBlocks} 块` +
+              `${blockResult.review ? `，动态 ${beforeReview.score}->${blockResult.review.score}` : ""}）`,
+          );
+          console.log(`[TOPIC] 完成 ${attemptLabel}`);
           return {
             ok: true,
             attempts: attempt,
@@ -1956,7 +1994,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
             rejectedBlocks: blockResult.rejectedBlocks,
           };
         }
-        if (blockResult.attempted && detailedProgress) {
+        if (blockResult.attempted) {
           console.log(`[TOPIC] 块级合并未采用 ${ref}: ${blockResult.reason}，降级整篇判定`);
         }
       }
@@ -1965,22 +2003,22 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
       let afterReview = null;
       if (judge?.enabled && beforeReview) {
         // 判后：对候选判一次。回归向量（不退步任一维 + 不新增事实问题 + 静态≥90 + 至少一处改善）才接受。
-        // 不拿“总分”当唯一开关，避免误杀“部分更好但总分波动”的候选（这是块级合并前的整篇近似）。
+        // 不拿"总分"当唯一开关，避免误杀"部分更好但总分波动"的候选（这是块级合并前的整篇近似）。
         phase("judgeAfter");
         afterReview = await runJudges(parsed, ref, judge);
         if (afterReview) {
           // 棘轮地板：现版 ≥90 守 90；现版 <90 时只要不低于现版即可接受真实改善（避免把更好的 <90 候选退回更差旧版）。
           decision = acceptByJudge({ before: beforeReview, after: afterReview, staticBefore, staticAfter: after, minStatic: Math.min(90, staticBefore) });
         } else {
-          // 判官启用但判后拿不到评审：绝不退回“双静态”放行（那不是精修）。抛出 → 被 attempt catch 捕获 → 重试；
-          // 重试到上限仍失败 → 该篇计入最终报告的“判官评审失败”。磁盘保留旧版（绝不在无动态信号下覆盖）。
+          // 判官启用但判后拿不到评审：绝不退回"双静态"放行（那不是精修）。抛出 → 被 attempt catch 捕获 → 重试；
+          // 重试到上限仍失败 → 该篇计入最终报告的"判官评审失败"。磁盘保留旧版（绝不在无动态信号下覆盖）。
           const judgeErr = new Error("判官评审失败（判后无法获得动态评审，已重试到上限）");
           judgeErr.judgeFailure = true; // 标记：这是判官坏了，不是精修输出格式坏了 —— 别把它当格式错误喂回 prompt
           throw judgeErr;
         }
       } else {
         // --no-judge（用户显式选择纯静态模式）：Phase 1 静态严格护栏（候选静态分必须严格高于现版）。
-        // 注意：judge 启用时不会走到这里——判前拿不到评审已直接判失败，不存在“judge 启用却退静态”的路径。
+        // 注意：judge 启用时不会走到这里——判前拿不到评审已直接判失败，不存在"judge 启用却退静态"的路径。
         decision = { accept: after > staticBefore, reason: after > staticBefore ? `static ${staticBefore} -> ${after}` : `static ${after} <= ${staticBefore}` };
       }
       const duplicate = duplicateBlockRegression(original, parsed);
@@ -1990,8 +2028,8 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
       if (decision.accept) {
         phase("merging");
         await writeTopicAtomic(ref, parsed);
-        if (detailedProgress) console.log(`[TOPIC] 已写回 ${ref}（${decision.reason}${afterReview ? `，动态 ${beforeReview.score}->${afterReview.score}` : ""}）`);
-        if (detailedProgress) console.log(`[TOPIC] 完成 ${attemptLabel}`);
+        console.log(`[TOPIC] 已写回 ${ref}（${decision.reason}${afterReview ? `，动态 ${beforeReview.score}->${afterReview.score}` : ""}）`);
+        console.log(`[TOPIC] 完成 ${attemptLabel}`);
         return {
           ok: true,
           attempts: attempt,
@@ -2007,26 +2045,24 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
       }
       // 候选未优于现版：保留旧版、本 attempt 不写。记为 keptOld。
       // 不在同一次调用里重试——本轮 prompt/findings 不变，同 prompt 再调一次对确定性模型是纯浪费（实测会 double 调用）；
-      // retries 语义是“失败重试”，keptOld 是“合法但没更好”不算失败。真要再 roll，交给跨轮循环（下一轮带新审计/findings 再试）。
+      // retries 语义是"失败重试"，keptOld 是"合法但没更好"不算失败。真要再 roll，交给跨轮循环（下一轮带新审计/findings 再试）。
       keptOld = true;
       bestRejectedAfter = bestRejectedAfter === null ? after : Math.max(bestRejectedAfter, after);
       lastError = new Error(`候选未优于现版，保留旧版（${decision.reason}）`);
-      if (detailedProgress) console.log(`[TOPIC] 保留旧版 ${attemptLabel}: ${decision.reason}`);
+      console.log(`[TOPIC] 保留旧版 ${attemptLabel}: ${decision.reason}`);
       lastError.decisionReason = decision.reason;
       break;
     } catch (error) {
       if (error.interrupted || shutdownRequested) throw error;
-      keptOld = false; // 本 attempt 是真失败（CLI/解析/契约/不变量），不是“保留旧版”
+      keptOld = false; // 本 attempt 是真失败（CLI/解析/契约/不变量），不是"保留旧版"
       lastError = error;
       // 把本次失败喂回下一次 attempt 的 prompt：解析/格式类错误带上 jsonLocation，让模型精准修格式而不是再撞一次。
-      // 可用性失败（限流/超时）、判官失败（判官坏了不是精修输出坏了）都不喂回——否则会误导模型“你的 JSON 坏了”。
+      // 可用性失败（限流/超时）、判官失败（判官坏了不是精修输出坏了）都不喂回——否则会误导模型"你的 JSON 坏了"。
       previousFormatError = error.availabilityFailure || error.judgeFailure
         ? null
         : { message: error.message, jsonLocation: error.jsonLocation ?? null };
-      if (detailedProgress) {
-        console.log(`[TOPIC] 失败 ${attemptLabel}: ${error.message}`);
-        if (attempt < attempts) console.log(`[RETRY] ${ref} ${attempt}/${attempts}: ${error.message}`);
-      }
+      console.log(`[TOPIC] 失败 ${attemptLabel}: ${error.message}`);
+      if (attempt < attempts) console.log(`[RETRY] ${ref} ${attempt}/${attempts}: ${error.message}`);
     } finally {
       // raw 始终落盘（无论成功失败），用于失败诊断；attempt 编号区分重试。
       if (raw) {
@@ -2039,7 +2075,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
   }
   return {
     ok: false,
-    attempts: attemptsMade, // 实际尝试次数（keptOld break 后 < 配置上限），避免汇总把“一次就保留旧版”误报成触发了重试
+    attempts: attemptsMade, // 实际尝试次数（keptOld break 后 < 配置上限），避免汇总把"一次就保留旧版"误报成触发了重试
     error: lastError?.message ?? "unknown error",
     availabilityFailure,
     keptOld,
@@ -2208,7 +2244,7 @@ class LiveDashboard {
       poolActive: null,
       judge: null,
       lastEvents: [],
-      runStartedAt: null, // 全程墙钟起点：面板顶栏显示“全程已用”
+      runStartedAt: null, // 全程墙钟起点：面板顶栏显示"全程已用"
       stage: "", // 当前阶段：审计 / 判官预热 / 精修 / 收尾审计
       round: 0,
       maxRounds: 0,
@@ -2246,8 +2282,8 @@ class LiveDashboard {
         return ret;
       };
     }
-    // 1s 强制重绘：即便 state 没变，也要刷新顶栏“全程已用”和判官面板的“已用/剩余”等时间字段；
-    // 否则单批长耗（如配错首批超时）阶段，dirty 始终是 false，仪表盘看上去会“卡死”。
+    // 1s 强制重绘：即便 state 没变，也要刷新顶栏"全程已用"和判官面板的"已用/剩余"等时间字段；
+    // 否则单批长耗（如配错首批超时）阶段，dirty 始终是 false，仪表盘看上去会"卡死"。
     this.repaintTimer = setInterval(() => {
       this.paint();
     }, 1000);
@@ -2273,7 +2309,7 @@ class LiveDashboard {
     this.dirty = true;
   }
 
-  // 标记当前所处阶段（审计 / 判官预热 / 精修 / 收尾审计）+ 轮次，顶栏统一展示，让用户随时看清“现在在干嘛、第几轮”。
+  // 标记当前所处阶段（审计 / 判官预热 / 精修 / 收尾审计）+ 轮次，顶栏统一展示，让用户随时看清"现在在干嘛、第几轮"。
   setStage(stage, { round, maxRounds } = {}) {
     if (stage !== undefined) this.state.stage = stage;
     if (round !== undefined) this.state.round = round;
@@ -2359,7 +2395,7 @@ class LiveDashboard {
     const judge = this.state.judge;
 
     lines.push(`╭─ ${this.state.title} ${"─".repeat(Math.max(0, width - this.state.title.length - 4))}`);
-    // 顶栏：当前阶段 + 轮次 + 全程已用，让“总进度/已执行多久”一眼可见（不随单轮重置）。
+    // 顶栏：当前阶段 + 轮次 + 全程已用，让"总进度/已执行多久"一眼可见（不随单轮重置）。
     const runElapsed = this.state.runStartedAt ? Date.now() - this.state.runStartedAt : 0;
     const roundLabel = this.state.maxRounds ? ` · 轮次 ${this.state.round}/${this.state.maxRounds}` : "";
     const stageLabel = this.state.stage ? this.state.stage : "运行中";
@@ -2425,7 +2461,7 @@ class LiveDashboard {
       );
       const activeBatches = Array.isArray(judge.activeBatches) ? judge.activeBatches : [];
       if (activeBatches.length) {
-        // 每个在跑的判官子进程单独一行——之前 slice(0,2) 只显示头两个，导致“并发 3 却只看见俩”。
+        // 每个在跑的判官子进程单独一行——之前 slice(0,2) 只显示头两个，导致"并发 3 却只看见俩"。
         // 现在全部列出（按启动顺序），最多 8（=maxConcurrency），超出再折叠。
         lines.push(` 运行中 ${activeBatches.length} 个判官子进程：`);
         const shown = [...activeBatches].sort((a, b) => (a.idx ?? 0) - (b.idx ?? 0)).slice(0, 8);
@@ -2534,7 +2570,7 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
       const model = currentModel(modelState);
       const itemStartedAt = Date.now();
       // phase = 子 agent 当前所在阶段：starting / judgeBefore / refineCall / blockJudge / judgeAfter / merging
-      // setPhase 由 refineOneTopic 在每个阶段切换时回调，让 summary 心跳能区分“审判 vs 生成”。
+      // setPhase 由 refineOneTopic 在每个阶段切换时回调，让 summary 心跳能区分"审判 vs 生成"。
       active.set(ref, { model: model ?? "默认", startedAt: itemStartedAt, phase: "starting", phaseStartedAt: itemStartedAt });
       if (useDashboard) dashboard.updateRefine({ counters, active });
       const setPhase = (next, detail) => {
@@ -2585,7 +2621,7 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
         result = await refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, model, undefined, corpus, judge, setPhase);
       } catch (error) {
         // 兜底：中断信号照常上抛（让 shutdown 生效）；其余任何意外错误（如 refineOneTopic 顶部读文件/打分抛错）
-        // 都转成“该篇失败”，绝不让单篇的意外把整轮 run 崩掉——这是“跑完不用管”的最后一道防线。
+        // 都转成"该篇失败"，绝不让单篇的意外把整轮 run 崩掉——这是"跑完不用管"的最后一道防线。
         if (error?.interrupted || shutdownRequested) throw error;
         console.log(`[FAIL] ${compactRef(ref, 50)} 意外错误（已隔离为单篇失败）：${error.message}`);
         result = { ok: false, attempts: 0, error: `未捕获异常：${error.message}`, availabilityFailure: false, keptOld: false, action: "failed" };
@@ -2670,7 +2706,7 @@ async function refinePoolWithConcurrencyFallback(targets, audit, templates, cfg,
   // 池级滑动窗口：仅当短时间内频繁可用性失败才降并发；偶发 429 由该篇内重试自行消化。
   const poolFailures = []; // 时间戳数组
   const windowMs = modelState.windowMs;
-  const threshold = Math.max(2, modelState.degradeAfter); // 至少 2 次才算“频繁”
+  const threshold = Math.max(2, modelState.degradeAfter); // 至少 2 次才算"频繁"
   while (pending.length) {
     const results = await refinePool(pending, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters, corpus, judge);
     allResults.push(...results);
@@ -2709,7 +2745,7 @@ async function refinePoolWithConcurrencyFallback(targets, audit, templates, cfg,
   return allResults;
 }
 
-// 把一条失败 error 文本归类，供汇总按原因统计（让用户一眼看出“坏在程序还是内容/上游”）。
+// 把一条失败 error 文本归类，供汇总按原因统计（让用户一眼看出"坏在程序还是内容/上游"）。
 function classifyFailure(error) {
   const text = String(error ?? "");
   if (/判官评审失败|判官.*不可用|动态评审/.test(text)) return "判官评审失败";
@@ -2723,7 +2759,7 @@ function classifyFailure(error) {
   return "其他";
 }
 
-// 汇总重试/恢复：basesByRef 累计每 ref 跨轮/跨 attempt 的处理情况，配合最终状态判断“重试后是否成功”。
+// 汇总重试/恢复：basesByRef 累计每 ref 跨轮/跨 attempt 的处理情况，配合最终状态判断"重试后是否成功"。
 function summarizeRetries(retryStats, state) {
   const triggered = [];
   for (const [ref, info] of retryStats.entries()) {
@@ -2863,7 +2899,7 @@ async function writeRunState(runDir, patch) {
 }
 
 async function main() {
-  const runStartedAt = Date.now(); // 全程墙钟起点：汇总里报“本次执行多久”
+  const runStartedAt = Date.now(); // 全程墙钟起点：汇总里报"本次执行多久"
   const args = parseArgs();
   // qwen 显式模型路由已弃用：API 模式由 env-config 的 baseUrl/apiKey 直管,无需 --qwen-routes。
   if (args["qwen-routes"]) {
@@ -2874,7 +2910,7 @@ async function main() {
   const concurrency = Number(args.concurrency ?? 2);
   const autoConcurrencyMin = Number(args["auto-concurrency-min"] ?? (concurrency > 3 ? 3 : concurrency));
   const maxRounds = Number(args["max-rounds"] ?? 3);
-  const retries = Number(args.retries ?? 2); // 默认 2：给“格式失败带反馈重写”留足自愈空间（keptOld 已 break、不吃重试预算）
+  const retries = Number(args.retries ?? 2); // 默认 2：给"格式失败带反馈重写"留足自愈空间（keptOld 已 break、不吃重试预算）
   const timeoutMs = Number(args["timeout-ms"] ?? 600000);
   const limit = args.limit ? Number(args.limit) : Infinity;
   const dryRun = Boolean(args["dry-run"]);
@@ -2882,7 +2918,7 @@ async function main() {
   const previewMode = Boolean(args.preview);
   const topicFilters = parseTopicList(args);
   const degradeAfter = Number(args["degrade-after"] ?? 3);
-  // 滑动窗口长度：仅当窗口内可用性失败次数 ≥ degradeAfter 才视为“频繁”，触发并发降级 / 模型降级。
+  // 滑动窗口长度：仅当窗口内可用性失败次数 ≥ degradeAfter 才视为"频繁"，触发并发降级 / 模型降级。
   const degradeWindowSeconds = Number(args["degrade-window-seconds"] ?? 60);
   const progressStyle = String(
     args["progress-style"] ?? process.env.QUALITY_REFINE_PROGRESS_STYLE ?? (previewMode ? "topic" : "summary"),
@@ -3087,7 +3123,7 @@ async function main() {
     dashboard.enable(process.stdout);
   }
 
-  // 跨轮状态：bestScore 用于检测“连续无提升 -> 放弃，避免死循环”。
+  // 跨轮状态：bestScore 用于检测"连续无提升 -> 放弃，避免死循环"。
   const state = new Map(targetRefs.map((ref) => [ref, {
     attempts: 0,
     bestScore: initialAudit.scoreMap.get(ref) ?? 0,
@@ -3126,7 +3162,7 @@ async function main() {
     console.log(`[RESUME] scope 内跳过已完成 ${inScopeDone}/${targetRefs.length} 篇，未完成项会继续进入后续轮次。`);
   }
   const stuck = new Set();
-  // 跨轮重试累计：每 ref 处理了几轮（rounds）+ 单轮内最多 attempt 次数（maxAttempts），用于汇总“重试后是否成功”。
+  // 跨轮重试累计：每 ref 处理了几轮（rounds）+ 单轮内最多 attempt 次数（maxAttempts），用于汇总"重试后是否成功"。
   const retryStats = new Map();
   if (!dryRun) {
     await writeRunState(runDir, {
@@ -3216,7 +3252,7 @@ async function main() {
     return s.attempts > 0 && s.lastOk === false && !s.lastKeptOld;
   });
   // keptOld：试过但没产出更优候选、保留了旧版。仍 <minScore 的会同时出现在 stillFailing（真问题）；
-  // 已 ≥minScore 的只是“当前判定下已最优、暂时推不高”，不算失败、不阻断同步。
+  // 已 ≥minScore 的只是"当前判定下已最优、暂时推不高"，不算失败、不阻断同步。
   const keptOldRefs = targetRefs.filter((ref) => state.get(ref).attempts > 0 && state.get(ref).lastKeptOld);
   const goodRefs = targetRefs.filter((ref) => state.get(ref).attempts > 0 && state.get(ref).lastAlreadyGood);
   const writtenRefs = targetRefs.filter((ref) => {
@@ -3257,7 +3293,7 @@ async function main() {
       error: result?.error ?? null,
     };
   });
-  // 失败原因分类统计（按 classifyFailure 归桶），让汇总能说清“几条限流、几条坏 JSON、几条未写入缓存”。
+  // 失败原因分类统计（按 classifyFailure 归桶），让汇总能说清"几条限流、几条坏 JSON、几条未写入缓存"。
   const failureBreakdown = {};
   for (const ref of failedExecutions) {
     const cat = classifyFailure(state.get(ref).lastError);
@@ -3336,8 +3372,8 @@ async function main() {
     console.log(`执行失败明细（前 20）：`);
     for (const ref of failedExecutions.slice(0, 20)) console.log(`- [${classifyFailure(state.get(ref).lastError)}] ${ref}: ${state.get(ref).lastError}`);
   }
-  // 退出码只反映“是否还有目标 <minScore 或没跑完”。keptOld / 已达标篇上的执行失败不阻断同步，
-  // 因为磁盘上留的是合格的旧版内容（“越跑越高、不许改烂”：失败时绝不退步）。
+  // 退出码只反映"是否还有目标 <minScore 或没跑完"。keptOld / 已达标篇上的执行失败不阻断同步，
+  // 因为磁盘上留的是合格的旧版内容（"越跑越高、不许改烂"：失败时绝不退步）。
   if (stillFailing.length || unprocessed.length) {
     process.exitCode = 1;
   }

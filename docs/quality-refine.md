@@ -91,6 +91,9 @@ LLM_STREAM=true
 LLM_LIVE_EVENTS=                                # 留空只渲染 TUI；填路径同时写 JSONL(未来 web shell)
 SUBAGENT_LAST_LINE_MAX=80
 
+# 内容卡片降级链 / Mermaid 解禁（app 已支持复杂图种）
+REFINE_ALLOW_COMPLEX_MERMAID=true
+
 # 交互向导默认值(填满后回车直达确认)
 DEFAULT_SCOPE=failing
 DEFAULT_LIMIT=20

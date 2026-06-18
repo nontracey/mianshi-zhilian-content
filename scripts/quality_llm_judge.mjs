@@ -76,6 +76,7 @@ export function buildJudgePrompt(topic, ref) {
 - clarityFindings / coverageFindings 指出零基础读者会卡住的地方、以及面试该讲却没讲的关键面。
 - rubric.mustHave/goodToHave/commonMistakes 内嵌代码片段（throw new ...()、function、=>、带分号语句、缩进代码块）→ 判 fail 并进 blockingFindings；代码只该在 code 卡。
 - diagram 是纯线性关键词链（无分支/汇合/状态转移）或终点为“面试结论/答题要点/总结”类汇聚节点 → 判为假图，压低 expertVoice 并在 voiceFindings 标记要求重画。
+- diagram 使用 sources 时，要检查降级链是否合理（svg 资源 → mermaid 结构图 → text 兜底）；必须至少有一层 mermaid 或 text 兜底，不能只有 svg path 而无后续层。
 - 不要臆造；无法核验的事实标 suspicious 并在 evidence 说明原因。
 
 输出 JSON schema（仅示意字段，值要按真实评审填）：
@@ -122,7 +123,7 @@ ${JUDGE_DIMENSIONS.map((d, index) => `${index + 1}. ${d}`).join("\n")}
 - factFindings 每篇至少 3 条，覆盖定义、机制、边界/失败路径等关键事实；wrong/outdated 的事实必须同时进 blockingFindings。
 - coverage 必须按“这个 title / difficulty 的知识点，资深面试官真正会考什么”判断，严禁拿本篇自己的 rubric/recallPrompts 当唯一标尺。
 - seniorityDiscrimination 区分度天花板：技术类 difficulty≥3 必须能区分资深（对标 P7）、4-5 须到专家深度（P7+），非技术类按对应专家纵深；只考“是什么/列举”、缺“为什么这样设计/如何排查/取舍/极端场景”深问的给 ≤3；difficulty 1-2 基础题诚实标注即给 4。
-- rubric.mustHave/goodToHave/commonMistakes 内嵌代码片段 → fail；diagram 是纯线性关键词链或终点为“面试结论/答题要点”类汇聚节点 → 判假图、压低 expertVoice。
+- rubric.mustHave/goodToHave/commonMistakes 内嵌代码片段 → fail；diagram 是纯线性关键词链或终点为”面试结论/答题要点”类汇聚节点 → 判假图、压低 expertVoice；sources 降级链（svg→mermaid→text）缺兜底或层级不合理也要指出。
 
 输出 JSON schema（仅示意字段，值要按真实评审填）：
 ${JSON.stringify(schema, null, 2)}

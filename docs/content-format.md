@@ -24,13 +24,11 @@ content-repo/
     domain.schema.json
     topic.schema.json
   assets/
-    java/
-      jvm-memory-flow.webp
-      thread-pool-lifecycle.webp
-    agent/
-      rag-pipeline.webp
-    algorithm/
-      dp-state-transition.webp
+    diagrams/
+      jvm-memory-flow.svg
+      thread-pool-lifecycle.svg
+      rag-pipeline.svg
+      dp-state-transition.svg
   domains/
     java.json
     agent.json
@@ -422,13 +420,18 @@ content-repo/
 
 ### 6.5 animation
 
-动画或动态图卡片。
+动画或动态图卡片。新内容优先使用 `sources` 降级链；旧 `asset` 字段继续兼容，等价于 `sources: [{ kind: "svg", path: asset }]`。
 
 ```json
 {
   "type": "animation",
   "title": "一次方法调用中的 JVM 内存流转",
-  "asset": "assets/java/jvm-memory-flow.webp",
+  "asset": "assets/diagrams/anim-jvm-memory-flow.gif",
+  "sources": [
+    { "kind": "svg", "path": "assets/diagrams/jvm-memory.svg" },
+    { "kind": "mermaid", "content": "flowchart LR\nA[栈帧创建] --> B[对象进堆] --> C[元空间共享]" },
+    { "kind": "text", "content": "左侧线程创建栈帧，右侧堆保存对象实例，元空间保存类信息。" }
+  ],
   "fallback": "如果动画加载失败，用流程图展示栈帧创建、对象进入堆、类信息在元空间共享。",
   "caption": "左侧线程创建栈帧，右侧堆保存对象实例，元空间保存类信息。"
 }
@@ -438,9 +441,9 @@ content-repo/
 
 | 项 | 要求 |
 | --- | --- |
-| 格式 | 优先 `webp`，也可用 `gif`、`mp4`、`svg`。 |
-| 路径 | 放在 `assets/{domain}/` 下。 |
-| 大小 | MVP 建议单个资源小于 2MB。 |
+| 格式 | `sources[].kind` 支持 `svg`（静态资源）、`mermaid`（结构图）、`text`（纯文本）。 |
+| 路径 | 资源 `path` 必须位于 `assets/` 下，推荐 `assets/diagrams/`。 |
+| 降级 | 按 `sources` 顺序尝试渲染，资源缺失时自动降级到下一层，最终兜底 `fallback`。 |
 | 兜底 | 必须提供 `fallback` 文案。 |
 | 内容 | 只表达知识流转，不做纯装饰动画。 |
 
@@ -462,23 +465,40 @@ content-repo/
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `format` | 否 | 图示格式；未填时按文本/Markdown 兜底处理。 |
-| `content` | 条件必填 | `format=mermaid` 时必须提供 Mermaid 源码。 |
-| `svgPath` | 否 | SVG 静态资源路径。 |
-| `asset` | 否 | 图片或动画资源路径。 |
+| `content` | 条件必填 | `format=mermaid` 时必须提供 Mermaid 源码；有 `sources` 时可放在 `sources[].content`。 |
+| `sources` | 否 | 降级链数组，元素为 `{kind, path/content}`；kind 支持 `svg/mermaid/text`。 |
+| `svgPath` | 否 | SVG 静态资源路径，兼容旧字段。 |
+| `asset` | 否 | 图片或动画资源路径，兼容旧字段。 |
 | `svg` | 否 | 内联 SVG 字符串；仅用于受控内容。 |
 | `fallback` | 否 | 图示无法渲染时给用户看的文字说明。 |
 | `caption` | 否 | 图注。 |
 
+`sources` 规则：
+
+1. 每个 source 必须有 `kind`（`svg`/`mermaid`/`text`），并且 `path` 与 `content` 二选一。
+2. `svg` 使用 `path`，必须位于 `assets/` 下，禁止绝对路径、`..` 和隐藏目录。
+3. `mermaid`/`text` 使用 `content`；渲染端按数组顺序尝试，全部失败才显示 `fallback`。
+4. 旧 `asset`、`svgPath`、`svg`、`content+format=mermaid` 字段继续兼容，不要求一次性迁移。
+
 Mermaid 约束：
 
-1. `format=mermaid` 的 `content` 必须以 `flowchart` 或 `graph` 开头，并带方向声明，例如 `flowchart LR`、`flowchart TD`、`graph LR`。
-2. 只使用 App 已验证的基础流程图子集：节点、连线、分支、简单标签；不要使用 `sequenceDiagram`、`classDiagram`、`stateDiagram`、`mindmap`、`subgraph`、`classDef`、`style` 或外部资源引用。
-3. 禁止使用带标签虚线边 `A -.label.-> B`；App 不渲染虚线边上的标签，会导致信息丢失。需要标注的连线必须改用实线标签 `A -->|标签| B`。
-4. 图示节点必须使用当前 topic 的专属概念、对象、状态或链路名，不得大量使用 `输入`、`处理`、`输出`、`关键流程`、`边界处理` 这类万能节点。
-5. 图示必须表达真实关系，例如调用顺序、数据流、状态转移、依赖关系、隔离边界或失败路径；不能只是把正文关键词横向摆放。
-6. `caption` 或 `fallback` 应说明图在解释哪个机制，不能写成“展示本知识点关键环节”这类模板句。
-7. 遇到 Mermaid 孤立节点时必须先判断语义：引用错位就补正确连线，重复定义且已有更好图承接才删除，不能为了通过校验直接批量清理。
-8. 禁止用 `topic 标题 -> 领域 -> 分类 -> 标签` 拼成“关键链路图”；这类图与 topic 表面相关，但没有解释真实机制。
+1. 简单流程图仍使用 `flowchart` 或 `graph` 并带方向声明，例如 `flowchart LR`、`flowchart TD`、`graph LR`。
+2. 允许 `subgraph`（嵌套不超过 2 层）、`stateDiagram`/`stateDiagram-v2`、`sequenceDiagram`、以及 5 色板 `classDef`（`ok/warn/fail/async/highlight`）。
+3. 禁止 `classDiagram`、`gantt`、`pie`、`journey`、`erDiagram`、`mindmap`，禁止裸 `style` 行。
+4. 禁止使用带标签虚线边 `A -.label.-> B`；需要标注的连线必须改用实线标签 `A -->|标签| B`。
+5. 图示节点必须使用当前 topic 的专属概念、对象、状态或链路名，不得大量使用 `输入`、`处理`、`输出`、`关键流程`、`边界处理` 这类万能节点。
+6. 图示必须表达真实关系，例如调用顺序、数据流、状态转移、依赖关系、隔离边界或失败路径；不能只是把正文关键词横向摆放。
+7. `caption` 或 `fallback` 应说明图在解释哪个机制，不能写成“展示本知识点关键环节”这类模板句。
+
+5 色板固定值：
+
+```mermaid
+classDef ok fill:#10b981,stroke:#059669,color:#fff
+classDef warn fill:#f59e0b,stroke:#d97706,color:#fff
+classDef fail fill:#ef4444,stroke:#dc2626,color:#fff
+classDef async fill:#6366f1,stroke:#4f46e5,color:#fff
+classDef highlight fill:#ec4899,stroke:#db2777,color:#fff
+```
 
 ### 6.7 checklist
 
@@ -649,7 +669,7 @@ Mermaid 约束：
 
 1. 在 `topics/java/` 下新增 `thread-pool-core-params.json`。
 2. 在 `domains/java.json` 的 `concurrency` 分类里加入该 topic 路径。
-3. 如果需要动画，把资源放到 `assets/java/thread-pool-lifecycle.webp`。
+3. 如果需要动画/图示，把 SVG 资源放到 `assets/diagrams/` 下，并在 diagram/animation 卡片里用 `sources` 声明降级链（svg → mermaid → text）。
 4. 更新 `manifest.json` 的 `contentVersion`、`topicCount`、`updatedAt`。
 5. 运行 schema 校验。
 6. 运行 `npm run quality:audit`，确认内容质量、深度、图示、追问、rubric 和正向证据达到 90 分门槛；95+ 需要例子、边界、验证、取舍和图文贴合都比较扎实。

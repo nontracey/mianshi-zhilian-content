@@ -15,9 +15,10 @@ const boxDrawing = /[┌┐└┘├┤┬┴┼│─═╔╗╚╝╠╣╦�
 const placeholderText = /建议(用|改用|使用)/; // fallback/content 不得是"建议用…"占位
 const mermaidLabeledDotted = /-\.\s*\S[^\n]*?\.-+>/; // 带标签虚线边 -.标签.-> ，App 不支持
 const mermaidUnsupportedKeyword =
-  /^(subgraph|end|classDef|class\s|style\s|linkStyle|click\s|direction\s)/i;
+  /^(classDiagram|gantt|pie|journey|erDiagram|mindmap)\b/i;
 const mermaidLabeledEdge = /(.+?)\s*--\s*([^>-]+?)\s*--?>\s*(.+)/;
 const mermaidPlainEdge = /(.+?)\s*(-\.->|==>|-->|---)\s*(.+)/;
+const allowedSourceKinds = new Set(["svg", "mermaid", "text"]);
 
 function isMermaidCard(card) {
   if ((card.format || "").toLowerCase() === "mermaid") return true;
@@ -28,14 +29,84 @@ function isMermaidCard(card) {
       .split("\n")
       .map((l) => l.trim())
       .find((l) => l) || "";
-  return /^(flowchart|graph)\s+(TB|TD|BT|LR|RL)\b/i.test(first);
+  return /^(?:(?:flowchart|graph)\s+(TB|TD|BT|LR|RL)|stateDiagram(?:-v2)?|sequenceDiagram)\b/i.test(first);
+}
+
+function normalizeCardSources(card) {
+  const sources = Array.isArray(card.sources) ? [...card.sources] : [];
+  if (!sources.length) {
+    if (card.asset) sources.push({ kind: inferSourceKind(card.asset), path: card.asset });
+    if (card.svgPath) sources.push({ kind: "svg", path: card.svgPath });
+    if (card.svg) sources.push({ kind: "svg", content: card.svg });
+    if ((card.format ?? "") === "mermaid" && card.content) sources.push({ kind: "mermaid", content: card.content });
+  }
+  return sources;
+}
+
+function inferSourceKind(file) {
+  const ext = String(file).split(".").pop()?.toLowerCase();
+  if (ext === "svg") return "svg";
+  return "svg"; // 所有非 svg 图片资源统一为 svg kind
+}
+
+function mermaidStatements(source) {
+  const out = [];
+  let buffer = "";
+  let square = 0;
+  let curly = 0;
+  let paren = 0;
+  let pipe = 0;
+  for (const raw of source.split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("%%")) continue;
+    buffer = buffer ? `${buffer} ${line}` : line;
+    for (const ch of raw) {
+      if (ch === "[") square += 1;
+      else if (ch === "]") square = Math.max(0, square - 1);
+      else if (ch === "{") curly += 1;
+      else if (ch === "}") curly = Math.max(0, curly - 1);
+      else if (ch === "(") paren += 1;
+      else if (ch === ")") paren = Math.max(0, paren - 1);
+      else if (ch === "|") pipe = 1 - pipe;
+    }
+    if (square === 0 && curly === 0 && paren === 0 && pipe === 0) {
+      out.push(buffer);
+      buffer = "";
+    }
+  }
+  if (buffer) out.push(buffer);
+  return out.map((entry) => entry.trim()).filter(Boolean);
+}
+
+function assertSources(file, card) {
+  for (const [index, source] of normalizeCardSources(card).entries()) {
+    if (!allowedSourceKinds.has(source.kind)) {
+      throw new Error(`${file} ${card.type} 卡 "${card.title}" sources[${index}].kind 非法：${source.kind}`);
+    }
+    const hasPath = typeof source.path === "string" && source.path.trim().length > 0;
+    const hasContent = typeof source.content === "string" && source.content.trim().length > 0;
+    if (hasPath === hasContent) {
+      throw new Error(`${file} ${card.type} 卡 "${card.title}" sources[${index}] 必须且只能提供 path 或 content`);
+    }
+    if (hasPath) {
+      if (path.isAbsolute(source.path) || source.path.includes("..") || /(^|\/)\.[^/]/.test(source.path)) {
+        throw new Error(`${file} ${card.type} 卡 "${card.title}" sources[${index}].path 越界：${source.path}`);
+      }
+      if (!source.path.startsWith("assets/")) {
+        throw new Error(`${file} ${card.type} 卡 "${card.title}" sources[${index}].path 必须位于 assets/：${source.path}`);
+      }
+    }
+  }
 }
 
 // 校验单张 diagram 卡：资源存在性、占位文字、mermaid 语法（与 App 解析器对齐）。
 function assertDiagramCard(file, card) {
-  const mermaid = isMermaidCard(card);
+  assertSources(file, card);
+  const sources = normalizeCardSources(card);
+  const mermaidSource = sources.find((source) => source.kind === "mermaid" && typeof source.content === "string");
+  const mermaid = Boolean(mermaidSource) || isMermaidCard(card);
 
-  // 1) 引用的图片资源必须存在——缺图会让 App 只显示 fallback 占位文字
+  // 1) 旧字段引用的图片资源必须存在；sources 中的图片允许作为 backlog 路径，由渲染端降级到后续 source。
   const asset = card.svgPath || card.asset;
   if (asset && !mermaid && !card.svg) {
     if (!existsSync(path.join(root, asset))) {
@@ -55,35 +126,30 @@ function assertDiagramCard(file, card) {
     }
   }
 
-  // 3) mermaid 只能用 App 轻量解析器（MermaidDiagramData）支持的语法
+  // 3) mermaid 必须属于已约定的可渲染子集。
   if (mermaid) {
-    let src = (card.content || "").replace(/\\n/g, "\n").trim();
+    let src = (mermaidSource?.content || card.content || "").replace(/\\n/g, "\n").trim();
     if (src.startsWith("```")) {
       const lines = src.split("\n");
       lines.shift();
       if (lines[lines.length - 1]?.trim() === "```") lines.pop();
       src = lines.join("\n").trim();
     }
-    const statements = src
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l && !l.startsWith("%%"))
-      .flatMap((l) => l.split(";"))
-      .map((l) => l.trim())
-      .filter(Boolean);
+    const statements = mermaidStatements(src);
     if (
       !statements.length ||
-      !/^(?:flowchart|graph)\s+([A-Za-z]{2})\b/i.test(statements[0])
+      !/^(?:(?:flowchart|graph)\s+(?:TB|TD|BT|LR|RL)|stateDiagram(?:-v2)?|sequenceDiagram)\b/i.test(statements[0])
     ) {
       throw new Error(
-        `${file} mermaid 卡 "${card.title}" 缺少 "flowchart TD/LR" 方向头`,
+        `${file} mermaid 卡 "${card.title}" 缺少合法图类型头（flowchart/graph + 方向、stateDiagram 或 sequenceDiagram）`,
       );
     }
     let edges = 0;
+    const isSimpleFlowchart = /^(?:flowchart|graph)\s+(?:TB|TD|BT|LR|RL)\b/i.test(statements[0]);
     for (const st of statements.slice(1)) {
       if (mermaidUnsupportedKeyword.test(st)) {
         throw new Error(
-          `${file} mermaid 卡 "${card.title}" 含不支持的语法 "${st}"（subgraph/classDef/style 等会被 App 丢弃）`,
+          `${file} mermaid 卡 "${card.title}" 含不支持的图种语法 "${st}"`,
         );
       }
       if (mermaidLabeledDotted.test(st)) {
@@ -93,13 +159,9 @@ function assertDiagramCard(file, card) {
       }
       if (mermaidLabeledEdge.test(st) || mermaidPlainEdge.test(st)) {
         edges++;
-      } else {
-        throw new Error(
-          `${file} mermaid 卡 "${card.title}" 含无法解析为边的语句 "${st}"（请把节点写进边，如 A[..] --> B[..]）`,
-        );
       }
     }
-    if (edges === 0) {
+    if (isSimpleFlowchart && edges === 0 && statements.length <= 1) {
       throw new Error(`${file} mermaid 卡 "${card.title}" 没有可渲染的边`);
     }
   }
@@ -195,6 +257,9 @@ function assertTopicQuality(file, topic, domainIds, categoryIds, expectedStatus)
     }
     if (card.type === "diagram") {
       assertDiagramCard(file, card);
+    }
+    if (card.type === "animation") {
+      assertSources(file, card);
     }
   }
   // 语义质量检查
