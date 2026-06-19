@@ -36,10 +36,20 @@
     {
       "type": "diagram",
       "format": "mermaid",
-      "title": ".NET 性能诊断工具链与套路",
-      "content": "flowchart TD\nA[\"先看 dotnet-counters 定大方向\"] --> B[\"CPU 高：dotnet-trace 抓火焰图找热点\"]\nA --> C[\"内存涨：dotnet-gcdump / dump + SOS 找泄漏\"]\nA --> D[\"线程池堆积：常因 .Result/.Wait 同步阻塞\"]\nA --> E[\"GC 压力：看 Gen2/LOH 分配\"]",
-      "caption": ".NET 诊断先用 dotnet-counters 看 CPU/GC/线程池定大方向，再用 dotnet-trace 抓火焰图、dotnet-dump/gcdump 找泄漏；线程池堆积常因同步阻塞 async。",
-      "fallback": ".NET 性能诊断先用 dotnet-counters 看 CPU、GC、线程池定大方向：CPU 高用 dotnet-trace 抓火焰图找热点；内存涨用 dotnet-gcdump 或 dump 加 SOS 找泄漏；线程池堆积常因 .Result/.Wait 同步阻塞；GC 压力看 Gen2 和 LOH 分配。"
+      "title": ".NET 性能诊断闭环：指标定位、Trace、Dump、Profiler 与修复验证",
+      "content": "flowchart TD\nA[\"线上症状\n延迟/CPU/内存/GC/线程池\"] --> B[\"指标和日志圈定时间窗\"]\nB --> C{\"主要瓶颈\"}\nC -->|CPU 高| D[\"dotnet-trace / PerfView\n采样热点\"]\nC -->|内存增长| E[\"dotnet-dump / GC dump\n对象保留链\"]\nC -->|GC 抖动| F[\"GC counters\n分代/LOH/分配率\"]\nC -->|线程池饥饿| G[\"ThreadPool counters\n阻塞调用\"]\nD --> H[\"代码或配置修复\"]\nE --> H\nF --> H\nG --> H\nH --> I[\"压测和发布后验证\"]",
+      "caption": ".NET 性能诊断闭环：指标定位、Trace、Dump、Profiler 与修复验证",
+      "fallback": "图展示 .NET 性能调优应从症状和指标出发，按 CPU、内存、GC、线程池选择工具，最后用压测和线上指标验证。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[\"线上症状\n延迟/CPU/内存/GC/线程池\"] --> B[\"指标和日志圈定时间窗\"]\nB --> C{\"主要瓶颈\"}\nC -->|CPU 高| D[\"dotnet-trace / PerfView\n采样热点\"]\nC -->|内存增长| E[\"dotnet-dump / GC dump\n对象保留链\"]\nC -->|GC 抖动| F[\"GC counters\n分代/LOH/分配率\"]\nC -->|线程池饥饿| G[\"ThreadPool counters\n阻塞调用\"]\nD --> H[\"代码或配置修复\"]\nE --> H\nF --> H\nG --> H\nH --> I[\"压测和发布后验证\"]"
+        },
+        {
+          "kind": "text",
+          "content": "图展示 .NET 性能调优应从症状和指标出发，按 CPU、内存、GC、线程池选择工具，最后用压测和线上指标验证。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -60,7 +70,25 @@
       "type": "code",
       "title": "代码示例",
       "content": "using System;\nusing System.Diagnostics;\nusing System.Diagnostics.Metrics;\nusing System.Threading.Tasks;\nusing BenchmarkDotNet.Attributes;\nusing BenchmarkDotNet.Running;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\n\nnamespace PerformanceDiagnosticsDemo\n{\n    // BenchmarkDotNet 示例\n    [MemoryDiagnoser]\n    [SimpleJob(BenchmarkDotNet.Jobs.RuntimeMoniker.Net80)]\n    public class CollectionBenchmarks\n    {\n        private const int N = 10000;\n\n        [Benchmark]\n        public void ListAdd()\n        {\n            var list = new System.Collections.Generic.List<int>();\n            for (int i = 0; i < N; i++)\n            {\n                list.Add(i);\n            }\n        }\n\n        [Benchmark]\n        public void LinkedListAdd()\n        {\n            var list = new System.Collections.Generic.LinkedList<int>();\n            for (int i = 0; i < N; i++)\n            {\n                list.AddLast(i);\n            }\n        }\n\n        [Benchmark]\n        public void HashSetAdd()\n        {\n            var set = new System.Collections.Generic.HashSet<int>();\n            for (int i = 0; i < N; i++)\n            {\n                set.Add(i);\n            }\n        }\n    }\n\n    [MemoryDiagnoser]\n    public class StringBenchmarks\n    {\n        private const int N = 1000;\n\n        [Benchmark]\n        public string Concat()\n        {\n            var result = \"\";\n            for (int i = 0; i < N; i++)\n            {\n                result += i.ToString();\n            }\n            return result;\n        }\n\n        [Benchmark]\n        public string Builder()\n        {\n            var sb = new System.Text.StringBuilder();\n            for (int i = 0; i < N; i++)\n            {\n                sb.Append(i);\n            }\n            return sb.ToString();\n        }\n\n        [Benchmark(Baseline = true)]\n        public string Create()\n        {\n            return string.Create(N * 4, 0, (span, _) =>\n            {\n                for (int i = 0; i < N; i++)\n                {\n                    i.TryFormat(span, out var written);\n                    span = span.Slice(written);\n                }\n            });\n        }\n    }\n\n    // 自定义计数器\n    public class AppMetrics\n    {\n        private static readonly Meter Meter = new(\"MyApp\", \"1.0\");\n        private static readonly Counter<long> RequestCounter =\n            Meter.CreateCounter<long>(\"requests.total\");\n        private static readonly Histogram<double> RequestDuration =\n            Meter.CreateHistogram<double>(\"requests.duration\", \"ms\");\n        private static readonly UpDownCounter<long> ActiveRequests =\n            Meter.CreateUpDownCounter<long>(\"requests.active\");\n        private static readonly Counter<long> ErrorCounter =\n            Meter.CreateCounter<long>(\"errors.total\");\n\n        public void RecordRequest(string endpoint, double durationMs, bool success)\n        {\n            var tags = new TagList\n            {\n                { \"endpoint\", endpoint },\n                { \"success\", success.ToString() }\n            };\n\n            RequestCounter.Add(1, tags);\n            RequestDuration.Record(durationMs, tags);\n\n            if (!success)\n            {\n                ErrorCounter.Add(1, tags);\n            }\n        }\n\n        public void RequestStarted() => ActiveRequests.Add(1);\n        public void RequestCompleted() => ActiveRequests.Add(-1);\n    }\n\n    // 性能中间件\n    public class PerformanceMiddleware\n    {\n        private readonly RequestDelegate _next;\n        private readonly AppMetrics _metrics;\n        private readonly ILogger<PerformanceMiddleware> _logger;\n\n        public PerformanceMiddleware(\n            RequestDelegate next,\n            AppMetrics metrics,\n            ILogger<PerformanceMiddleware> logger)\n        {\n            _next = next;\n            _metrics = metrics;\n            _logger = logger;\n        }\n\n        public async Task InvokeAsync(HttpContext context)\n        {\n            var stopwatch = Stopwatch.StartNew();\n            _metrics.RequestStarted();\n\n            try\n            {\n                await _next(context);\n                _metrics.RecordRequest(\n                    context.Request.Path,\n                    stopwatch.Elapsed.TotalMilliseconds,\n                    context.Response.StatusCode < 400);\n            }\n            catch (Exception ex)\n            {\n                _metrics.RecordRequest(\n                    context.Request.Path,\n                    stopwatch.Elapsed.TotalMilliseconds,\n                    false);\n                throw;\n            }\n            finally\n            {\n                _metrics.RequestCompleted();\n\n                if (stopwatch.ElapsedMilliseconds > 1000)\n                {\n                    _logger.LogWarning(\n                        \"请求 {Path} 耗时 {Duration}ms\",\n                        context.Request.Path,\n                        stopwatch.ElapsedMilliseconds);\n                }\n            }\n        }\n    }\n\n    // GC 监控\n    public class GCMonitor\n    {\n        private readonly ILogger<GCMonitor> _logger;\n\n        public GCMonitor(ILogger<GCMonitor> logger)\n        {\n            _logger = logger;\n        }\n\n        public void LogGCStats()\n        {\n            _logger.LogInformation(\n                \"GC 统计: Gen0={Gen0}, Gen1={Gen1}, Gen2={Gen2}, 内存={Memory:N0} bytes\",\n                GC.CollectionCount(0),\n                GC.CollectionCount(1),\n                GC.CollectionCount(2),\n                GC.GetTotalMemory(false));\n        }\n    }\n\n    // 配置服务\n    public static class PerformanceServiceCollectionExtensions\n    {\n        public static IServiceCollection AddPerformanceMonitoring(this IServiceCollection services)\n        {\n            services.AddSingleton<AppMetrics>();\n            services.AddSingleton<GCMonitor>();\n\n            // 配置 OpenTelemetry\n            services.AddOpenTelemetry()\n                .WithMetrics(builder => builder\n                    .AddMeter(\"MyApp\")\n                    .AddAspNetCoreInstrumentation()\n                    .AddHttpClientInstrumentation()\n                    .AddPrometheusExporter());\n\n            return services;\n        }\n    }\n\n    // 应用配置\n    public static class PerformanceAppExtensions\n    {\n        public static IApplicationBuilder UsePerformanceMonitoring(this IApplicationBuilder app)\n        {\n            app.UseMiddleware<PerformanceMiddleware>();\n            return app;\n        }\n\n        public static WebApplication MapMetrics(this WebApplication app)\n        {\n            app.MapPrometheusScrapingEndpoint();\n            return app;\n        }\n    }\n}",
-      "language": "csharp"
+      "language": "csharp",
+      "highlights": [
+        {
+          "line": 16,
+          "note": "`public class CollectionBenchmarks` 定义了 性能调优与诊断 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+        },
+        {
+          "line": 24,
+          "note": "`for (int i = 0; i < N; i++)` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+        },
+        {
+          "line": 116,
+          "note": "`if (!success)` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+        },
+        {
+          "line": 21,
+          "note": "`public void ListAdd()` 更新核心数据结构，是解释状态如何推进的抓手。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
@@ -139,5 +167,5 @@
   },
   "interviewFrequency": "medium",
   "interviewerFocus": "考察能否用 dotnet-counters 先定方向、再用 trace/dump 下钻，并定位线程池饥饿、内存泄漏、GC 压力等问题。",
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-18"
 }

@@ -31,10 +31,20 @@
     {
       "type": "diagram",
       "format": "mermaid",
-      "title": "中间件管道的洋葱模型",
-      "content": "flowchart TD\nA[\"请求进入\"] --> B[\"异常处理中间件（最外层）\"]\nB --> C[\"认证/授权中间件\"]\nC --> D[\"路由与业务中间件\"]\nD --> E[\"终端：生成响应\"]\nE --> F[\"响应按相反顺序流回各中间件\"]",
-      "caption": "ASP.NET Core 中间件管道按注册顺序处理请求：请求从外到内（异常处理→认证授权→业务），响应再从内到外流回，所以注册顺序决定行为。",
-      "fallback": "请求进入后按注册顺序经过异常处理、认证授权、路由业务等中间件到终端生成响应，响应再按相反顺序流回每个中间件（洋葱模型）。注册顺序就是执行顺序。"
+      "title": "ASP.NET Core 中间件管道：顺序、短路、路由、认证授权与终结点",
+      "content": "flowchart TD\nA[\"HTTP 请求\"] --> B[\"Exception/Diagnostics Middleware\"]\nB --> C[\"Static Files/Compression/CORS\"]\nC --> D[\"Routing\"]\nD --> E[\"Authentication\"]\nE --> F[\"Authorization\"]\nF --> G[\"Endpoint Middleware\"]\nG --> H[\"Controller/Minimal API\"]\nH --> I[\"响应返回反向经过中间件\"]\nC --> J{\"是否短路\"}\nJ -->|静态文件/错误| I\nJ -->|继续| D",
+      "caption": "ASP.NET Core 中间件管道：顺序、短路、路由、认证授权与终结点",
+      "fallback": "图展示中间件按注册顺序进入、反向返回，路由、认证、授权和 Endpoint 的顺序错误会直接改变行为。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[\"HTTP 请求\"] --> B[\"Exception/Diagnostics Middleware\"]\nB --> C[\"Static Files/Compression/CORS\"]\nC --> D[\"Routing\"]\nD --> E[\"Authentication\"]\nE --> F[\"Authorization\"]\nF --> G[\"Endpoint Middleware\"]\nG --> H[\"Controller/Minimal API\"]\nH --> I[\"响应返回反向经过中间件\"]\nC --> J{\"是否短路\"}\nJ -->|静态文件/错误| I\nJ -->|继续| D"
+        },
+        {
+          "kind": "text",
+          "content": "图展示中间件按注册顺序进入、反向返回，路由、认证、授权和 Endpoint 的顺序错误会直接改变行为。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -50,7 +60,25 @@
       "type": "code",
       "title": "代码示例",
       "content": "using System;\nusing System.Diagnostics;\nusing System.Threading.Tasks;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\n\nnamespace MiddlewarePipelineDemo\n{\n    // 基于类的中间件\n    public class RequestLoggingMiddleware\n    {\n        private readonly RequestDelegate _next;\n        private readonly ILogger<RequestLoggingMiddleware> _logger;\n\n        public RequestLoggingMiddleware(RequestDelegate next, ILogger<RequestLoggingMiddleware> logger)\n        {\n            _next = next;\n            _logger = logger;\n        }\n\n        public async Task InvokeAsync(HttpContext context)\n        {\n            var requestId = Guid.NewGuid().ToString();\n            context.Items[\"RequestId\"] = requestId;\n\n            _logger.LogInformation($\"[{requestId}] 开始处理 {context.Request.Method} {context.Request.Path}\");\n\n            try\n            {\n                await _next(context);\n                _logger.LogInformation($\"[{requestId}] 请求完成，状态码: {context.Response.StatusCode}\");\n            }\n            catch (Exception ex)\n            {\n                _logger.LogError(ex, $\"[{requestId}] 请求处理失败\");\n                throw;\n            }\n        }\n    }\n\n    public class RequestTimingMiddleware\n    {\n        private readonly RequestDelegate _next;\n\n        public RequestTimingMiddleware(RequestDelegate next)\n        {\n            _next = next;\n        }\n\n        public async Task InvokeAsync(HttpContext context)\n        {\n            var stopwatch = Stopwatch.StartNew();\n\n            await _next(context);\n\n            stopwatch.Stop();\n            var duration = stopwatch.ElapsedMilliseconds;\n\n            context.Response.Headers.Add(\"X-Request-Duration\", $\"{duration}ms\");\n\n            if (duration > 1000)\n            {\n                Console.WriteLine($\"警告: 请求 {context.Request.Path} 耗时 {duration}ms\");\n            }\n        }\n    }\n\n    // 中间件扩展方法\n    public static class MiddlewareExtensions\n    {\n        public static IApplicationBuilder UseRequestLogging(this IApplicationBuilder app)\n        {\n            return app.UseMiddleware<RequestLoggingMiddleware>();\n        }\n\n        public static IApplicationBuilder UseRequestTiming(this IApplicationBuilder app)\n        {\n            return app.UseMiddleware<RequestTimingMiddleware>();\n        }\n    }\n\n    class Program\n    {\n        static void Main(string[] args)\n        {\n            var builder = WebApplication.CreateBuilder(args);\n            var app = builder.Build();\n\n            // 注册中间件\n            app.UseRequestLogging();\n            app.UseRequestTiming();\n\n            // 内联中间件示例\n            app.Use(async (context, next) =>\n            {\n                // 添加自定义头\n                context.Response.Headers.Add(\"X-Custom-Header\", \"MiddlewareDemo\");\n                \n                await next();\n            });\n\n            // 路径分支\n            app.Map(\"/api\", apiApp =>\n            {\n                apiApp.Use(async (context, next) =>\n                {\n                    Console.WriteLine(\"API 中间件\");\n                    await next();\n                });\n\n                apiApp.Run(async context =>\n                {\n                    await context.Response.WriteAsync(\"API Response\");\n                });\n            });\n\n            // 条件分支\n            app.MapWhen(\n                context => context.Request.Path.StartsWithSegments(\"/admin\"),\n                adminApp =>\n                {\n                    adminApp.Use(async (context, next) =>\n                    {\n                        // 管理员认证检查\n                        if (!context.User.Identity.IsAuthenticated)\n                        {\n                            context.Response.StatusCode = 401;\n                            return;\n                        }\n                        await next();\n                    });\n\n                    adminApp.Run(async context =>\n                    {\n                        await context.Response.WriteAsync(\"Admin Area\");\n                    });\n                });\n\n            // 终端中间件\n            app.Run(async context =>\n            {\n                await context.Response.WriteAsync(\"Hello World!\");\n            });\n\n            app.Run();\n        }\n    }\n}",
-      "language": "csharp"
+      "language": "csharp",
+      "highlights": [
+        {
+          "line": 11,
+          "note": "`public class RequestLoggingMiddleware` 定义了 中间件管道 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+        },
+        {
+          "line": 62,
+          "note": "`if (duration > 1000)` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+        },
+        {
+          "line": 60,
+          "note": "`context.Response.Headers.Add(\"X-Request-Duration\", $\"{duration}ms\");` 更新核心数据结构，是解释状态如何推进的抓手。"
+        },
+        {
+          "line": 3,
+          "note": "`using System.Threading.Tasks;` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
@@ -132,5 +160,5 @@
   ],
   "interviewFrequency": "high",
   "interviewerFocus": "考察能否解释中间件管道的洋葱模型和 Use/Run/Map、说清注册顺序为何关键（认证授权顺序），并区分中间件与过滤器。",
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-18"
 }

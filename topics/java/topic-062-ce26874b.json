@@ -4,72 +4,95 @@
   "category": "microservice",
   "group": "microservice",
   "title": "Seata 分布式事务",
-  "summary": "在微服务架构中，一个业务操作可能涉及多个服务的数据库操作，每个服务有独立的数据库，无法用本地事务保证一致性。",
+  "summary": "讲清 Seata v2.6 的 TC/TM/RM、XID、AT undo_log 与全局锁，以及 AT/TCC/Saga/XA 选型边界。",
   "tags": [
     "Java",
     "微服务治理",
     "Seata 分布式事务"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 30,
   "order": 50,
-  "recommendWeight": 78,
+  "recommendWeight": 82,
   "learningCards": [
     {
       "type": "explain",
-      "title": "Seata 分布式事务：分布式事务问题、要点",
-      "content": "## 1. 分布式事务问题\n在微服务架构中，一个业务操作可能涉及多个服务的数据库操作，每个服务有独立的数据库，无法用本地事务保证一致性。\n\n### 要点\n- **本地事务**：单个数据库的事务，通过 BEGIN/COMMIT/ROLLBACK 保证 ACID\n- **分布式事务**：跨多个服务/数据库的事务，无法使用单个本地事务保证\n- **典型场景**：下单扣库存 + 扣余额 + 创建订单，三个服务三个数据库\n- **CAP 理论**：一致性（C）、可用性（A）、分区容错（P）不可兼得\n- **BASE 理论**：基本可用（Basically Available）、软状态（Soft State）、最终一致性（Eventually Consistent），是 CAP 中 AP 的延伸\n\n### 分布式事务场景\n```\n用户下单：\n1. 订单服务 → 创建订单（订单库）\n2. 库存服务 → 扣减库存（库存库）\n3. 账户服务 → 扣减余额（账户库）\n问题：如果步骤3失败，步骤1和2已经执行，数据不一致！\n```"
+      "title": "Seata 解决的不是所有一致性问题",
+      "content": "Seata 是 Apache 孵化中的开源分布式事务方案。官方 v2.6 文档描述了 AT、TCC、SAGA、XA 四种事务模型；GitHub release 页面显示 V2.6.0 为当前 latest。回答时不要把 Seata 说成微服务一致性的默认解，而要先判断业务需要强一致、最终一致、补偿编排还是消息驱动。\n\nSeata 的核心模型是全局事务由多个分支事务组成。TC 维护全局和分支事务状态，并驱动全局提交或回滚；TM 定义全局事务范围，负责 begin、commit、rollback；RM 管理本地资源，把本地事务注册成分支，并向 TC 汇报状态。\n\nXID 是贯穿调用链的关键。TM 从 TC 拿到 XID 后，XID 通过 HTTP Header、RPC attachment 或框架拦截器传到下游，客户端再绑定到 RootContext。线程池、异步任务、旁路调用或网关丢 Header，都会导致下游 RM 变成普通本地事务。"
     },
     {
       "type": "explain",
-      "title": "Seata 分布式事务：示例/代码、Seata 架构",
-      "content": "### 示例/代码\n```java\n// 不使用分布式事务的反面示例\n@Service\npublic class OrderService {\n    @Autowired\n    private OrderMapper orderMapper;\n    @Autowired\n    private StockFeignClient stockFeignClient;\n    @Autowired\n    private AccountFeignClient accountFeignClient;\n    public void createOrder(OrderDTO dto) {\n        // 1. 创建订单 - 本地事务\n        orderMapper.insert(order);\n        // 2. 扣减库存 - 远程调用\n        stockFeignClient.deduct(dto.getProductId(), dto.getCount());\n        // 3. 扣减余额 - 远程调用（如果这里失败，订单和库存已经操作了！）\n        accountFeignClient.deduct(dto.getUserId(), dto.getTotalPrice());\n        // 问题：没有分布式事务保证，数据可能不一致\n    }\n}\n```\n\n## 2. Seata架构\nSeata（Simple Extensible Autonomous Transaction Architecture）是阿里巴巴开源的分布式事务解决方案，提供了 AT、TCC、Saga、XA 四种事务模式。\n\n### 要点\n- **三个角色**：TC（Transaction Coordinator，事务协调者）、TM（Transaction Manager，事务管理器）、RM（Resource Manager，资源管理器）\n- **TC**：独立部署的服务端，负责全局事务的提交/回滚协调\n- **TM**：发起全局事务的客户端，定义全局事务的范围\n- **RM**：管理分支事务的客户端，注册/汇报分支事务状态"
+      "title": "AT 模式：业务提交早，回滚靠 undo_log",
+      "content": "AT 模式的前提是关系型数据库支持本地 ACID，Java 应用通过 JDBC 访问数据库。它把两阶段提交做了工程化改造：一阶段把业务数据和 rollback log 放在同一个本地事务提交，然后释放本地锁和连接；二阶段如果全局提交，异步快速清理 undo_log；如果全局回滚，基于一阶段生成的回滚日志做补偿。\n\n一阶段的关键细节是 before image、after image、undo_log 和全局锁。RM 解析业务 SQL，查修改前镜像，执行业务 SQL，再按主键查修改后镜像，把这些信息写入 undo_log。提交本地事务前，RM 需要向 TC 申请对应行的全局锁；拿不到锁就重试，超时后回滚本地事务并释放本地锁。\n\n回滚不是简单反向 SQL。RM 先按 XID 和 branchId 找 undo_log，再校验当前数据是否仍等于 after image。如果已经被旁路写破坏，就出现脏写风险，需要按策略介入处理。Seata AT 的普通 SELECT 默认不加全局读锁；需要全局读已提交语义时，官方文档说明可通过 SELECT FOR UPDATE 参与全局锁判断。"
     },
     {
       "type": "explain",
-      "title": "Seata 分布式事务：Seata 架构图、示例/代码",
-      "content": "### Seata 架构图\n```\nTM（事务发起方）                TC（事务协调者）\n│                            │\n│ 1.开启全局事务               │\n│───────────────────────────→│\n│                            │\n│ 2.执行业务                   │\n│                            │\n│     RM（订单服务）  RM（库存服务）  RM（账户服务）\n│         │              │              │\n│         │←─ 注册分支 ──→│←─ 注册分支 ──→│\n│         │              │              │\n│         │    各自执行本地事务           │\n│         │              │              │\n│ 3.提交/回滚              │              │\n│───────────────────────────→│\n│                            │ 4.TC通知所有RM提交/回滚\n```\n\n### 示例/代码\n```java\n// 使用 @GlobalTransactional 开启分布式事务\n@Service\npublic class OrderService {\n    @GlobalTransactional(name = \"create-order\", timeoutMills = 60000)\n    public void createOrder(OrderDTO dto) {\n        // 1. 创建订单（本地事务，RM自动管理）\n        orderMapper.insert(order);\n        // 2. 扣减库存（远程调用，RM自动管理）\n        stockFeignClient.deduct(dto.getProductId(), dto.getCount());\n        // 3. 扣减余额（远程调用，RM自动管理）\n        accountFeignClient.deduct(dto.getUserId(), dto.getTotalPrice());\n        // 如果任何一步失败，TC会通知所有RM回滚\n    }\n}\n```"
+      "title": "四种模式的选型和生产边界",
+      "content": "AT 低侵入，适合可被 SQL 解析覆盖的单库 CRUD 场景，但要接受全局锁、undo_log、SQL 支持范围和热点写冲突。复杂 SQL、非 JDBC 资源、跨缓存或跨消息系统时，AT 不适合硬套。\n\nTCC 是业务侵入型方案。业务要实现 Try、Confirm、Cancel，优点是资源锁粒度由业务控制，性能和扩展性更好；代价是必须处理幂等、空回滚、悬挂和资源预留过期。资金冻结、额度预占、库存预留这类场景更像 TCC。\n\nSaga 适合长流程和遗留系统编排。每个参与者先提交本地事务，失败时按状态机反向补偿；它锁少、吞吐高，但隔离性弱。XA 依赖资源自身支持 XA 协议，业务侵入低，隔离和一致性更强，但 prepare 后资源进入阻塞阶段，锁周期长，性能较差，常用于旧系统平滑迁移或强一致诉求。"
     },
     {
       "type": "diagram",
-      "title": "Seata AT 模式两阶段提交",
-      "content": "flowchart TD\nA[TM 开启全局事务] --> B[RM 注册分支事务]\nB --> C[执行业务 SQL]\nC --> D[查询修改前镜像]\nD --> E[查询修改后镜像]\nE --> F[生成 undo_log]\nF --> G[提交本地事务]\nG --> H{全局决议}\nH -->|提交| I[异步删除 undo_log]\nH -->|回滚| J[读取 undo_log 反向补偿]\nI --> K[事务完成]\nJ --> K",
-      "caption": "一阶段业务+回滚日志, 二阶段异步提交或回滚补偿",
-      "fallback": "Seata AT 模式两阶段提交"
+      "title": "Seata：角色、AT 机制和四种模型边界",
+      "format": "svg",
+      "content": "assets/diagrams/java-seata-at-tcc-saga-xa-architecture.svg",
+      "caption": "图中把 Seata v2.6 的 TC/TM/RM、XID 传播、AT 的 before/after image、undo_log、全局锁和 AT/TCC/Saga/XA 选型边界放在一起。",
+      "fallback": "Seata 由 TC 协调全局和分支状态，TM 定义全局事务，RM 管理分支资源；AT 一阶段记录 before/after image 和 undo_log 并申请全局锁，二阶段提交清理日志或回滚补偿；TCC、Saga、XA 分别适合业务预留、长流程补偿和 XA 资源强一致场景。",
+      "sources": [
+        {
+          "kind": "svg",
+          "content": "assets/diagrams/java-seata-at-tcc-saga-xa-architecture.svg"
+        },
+        {
+          "kind": "text",
+          "content": "Seata v2.6 文档主线：AT/TCC/SAGA/XA 四种模式，TC/TM/RM 三角色，AT 依赖本地 ACID、JDBC、undo_log 和全局锁。"
+        }
+      ]
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | AT模式 | TCC模式 | Saga模式 | XA模式 |\n| --- | --- | --- | --- | --- |\n| 侵入性 | 低（自动生成undo_log） | 高（需实现try/confirm/cancel） | 中（需实现正向/反向操作） | 低（数据库原生XA协议） |\n| 一致性 | 最终一致 | 最终一致 | 最终一致 | 强一致 |\n| 性能 | 高（本地锁+全局锁） | 高（无全局锁） | 高（无全局锁） | 低（全局锁阻塞） |\n| 回滚方式 | 自动生成反向SQL | 执行cancel方法 | 执行反向补偿操作 | 数据库原生回滚 |\n| 适用场景 | 单库简单CRUD（首选） | 高性能、资金等敏感场景 | 长事务、跨多系统编排 | 强一致性要求场景 |\n| 数据隔离 | 默认读未提交（需全局锁保证） | 业务层保证 | 无隔离保证 | 读已提交 |\n| 实现复杂度 | 最低 | 最高 | 中等 | 低 |"
+      "title": "AT/TCC/Saga/XA 的真实取舍",
+      "content": "| 维度 | AT | TCC | Saga | XA |\n| --- | --- | --- | --- | --- |\n| 侵入性 | 低，主要接入数据源代理和注解 | 高，业务实现 Try/Confirm/Cancel | 中，需要正向和补偿动作或状态机 | 低，依赖资源 XA 能力 |\n| 一阶段 | 业务数据和 undo_log 同本地事务提交 | Try 预留资源 | 各参与者提交本地事务 | XA branch 执行业务并 prepare |\n| 二阶段提交 | 异步删除 undo_log | Confirm 确认资源 | 状态机完成流程 | XA commit |\n| 二阶段回滚 | 校验 after image 后按 before image 补偿 | Cancel 释放预留资源 | 按反向补偿节点执行 | XA rollback |\n| 主要优势 | 接入快，适合普通 JDBC CRUD | 性能高，业务能精细控制资源 | 长流程、跨公司或遗留系统友好 | 隔离和一致性依赖资源协议 |\n| 主要风险 | SQL 支持、全局锁、脏写、热点冲突 | 幂等、空回滚、悬挂复杂 | 隔离弱，补偿语义要设计清楚 | prepare 后阻塞，锁周期长 |\n| 更轻替代 | 本地消息表、事务消息、Outbox | 本地预留表 + 可靠消息 | 编排引擎 + 补偿事件 | 本地事务边界重构 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "用户下单：\n  1. 订单服务 → 创建订单（订单库）\n  2. 库存服务 → 扣减库存（库存库）\n  3. 账户服务 → 扣减余额（账户库）\n问题：如果步骤3失败，步骤1和2已经执行，数据不一致！",
+      "title": "可运行抓手：模拟 AT 的 XID、undo_log、全局锁和脏写检测",
       "language": "java",
+      "content": "import java.util.*;\nimport java.util.function.IntUnaryOperator;\n\npublic class Main {\n    static class RootContext {\n        private static final ThreadLocal<String> XID = new ThreadLocal<>();\n        static void bind(String xid) { XID.set(xid); }\n        static String xid() { return XID.get(); }\n        static void clear() { XID.remove(); }\n    }\n\n    static class Database {\n        private final Map<String, Integer> rows = new LinkedHashMap<>();\n        Database stock(int value) { rows.put(\"stock:sku1\", value); return this; }\n        Database account(int value) { rows.put(\"account:u1\", value); return this; }\n        int get(String key) { return rows.get(key); }\n        void put(String key, int value) { rows.put(key, value); }\n        String snapshot() { return rows.toString(); }\n    }\n\n    static class UndoLog {\n        final long branchId;\n        final String xid;\n        final String rowKey;\n        final int beforeImage;\n        final int afterImage;\n        UndoLog(long branchId, String xid, String rowKey, int beforeImage, int afterImage) {\n            this.branchId = branchId;\n            this.xid = xid;\n            this.rowKey = rowKey;\n            this.beforeImage = beforeImage;\n            this.afterImage = afterImage;\n        }\n    }\n\n    static class Branch {\n        final long id;\n        final String xid;\n        final ResourceManager rm;\n        final String rowKey;\n        Branch(long id, String xid, ResourceManager rm, String rowKey) {\n            this.id = id;\n            this.xid = xid;\n            this.rm = rm;\n            this.rowKey = rowKey;\n        }\n    }\n\n    static class TransactionCoordinator {\n        private long xidSeq;\n        private long branchSeq;\n        private final Map<String, List<Branch>> branches = new LinkedHashMap<>();\n        private final Map<String, String> globalLocks = new LinkedHashMap<>();\n\n        String begin() { return \"xid-\" + (++xidSeq); }\n\n        long registerBranch(String xid, ResourceManager rm, String rowKey) {\n            String owner = globalLocks.get(rowKey);\n            if (owner != null && !owner.equals(xid)) {\n                throw new IllegalStateException(\"global lock conflict: \" + rowKey);\n            }\n            globalLocks.put(rowKey, xid);\n            long branchId = ++branchSeq;\n            branches.computeIfAbsent(xid, k -> new ArrayList<>()).add(new Branch(branchId, xid, rm, rowKey));\n            return branchId;\n        }\n\n        void globalCommit(String xid) {\n            for (ResourceManager rm : participants(xid)) rm.commit(xid);\n            release(xid);\n        }\n\n        void globalRollback(String xid) {\n            for (ResourceManager rm : participants(xid)) rm.rollback(xid);\n            release(xid);\n        }\n\n        int lockCount() { return globalLocks.size(); }\n\n        private List<ResourceManager> participants(String xid) {\n            LinkedHashSet<ResourceManager> rms = new LinkedHashSet<>();\n            for (Branch branch : branches.getOrDefault(xid, List.of())) rms.add(branch.rm);\n            return new ArrayList<>(rms);\n        }\n\n        private void release(String xid) {\n            globalLocks.entrySet().removeIf(e -> e.getValue().equals(xid));\n            branches.remove(xid);\n        }\n    }\n\n    static class ResourceManager {\n        private final String name;\n        private final Database db;\n        private final TransactionCoordinator tc;\n        private final List<UndoLog> undoLogs = new ArrayList<>();\n\n        ResourceManager(String name, Database db, TransactionCoordinator tc) {\n            this.name = name;\n            this.db = db;\n            this.tc = tc;\n        }\n\n        void update(String rowKey, IntUnaryOperator operation) {\n            String xid = RootContext.xid();\n            if (xid == null) throw new IllegalStateException(\"missing XID in \" + name);\n            long branchId = tc.registerBranch(xid, this, rowKey);\n            int before = db.get(rowKey);\n            int after = operation.applyAsInt(before);\n            db.put(rowKey, after);\n            undoLogs.add(new UndoLog(branchId, xid, rowKey, before, after));\n        }\n\n        void commit(String xid) {\n            undoLogs.removeIf(log -> log.xid.equals(xid));\n        }\n\n        void rollback(String xid) {\n            ListIterator<UndoLog> it = undoLogs.listIterator(undoLogs.size());\n            while (it.hasPrevious()) {\n                UndoLog log = it.previous();\n                if (!log.xid.equals(xid)) continue;\n                int current = db.get(log.rowKey);\n                if (current != log.afterImage) {\n                    throw new IllegalStateException(\"dirty write detected on \" + log.rowKey);\n                }\n                db.put(log.rowKey, log.beforeImage);\n                it.remove();\n            }\n        }\n\n        int undoSize() { return undoLogs.size(); }\n    }\n\n    static Database newDb() { return new Database().stock(10).account(100); }\n\n    static void rollbackCase() {\n        Database db = newDb();\n        TransactionCoordinator tc = new TransactionCoordinator();\n        ResourceManager stock = new ResourceManager(\"stock\", db, tc);\n        ResourceManager account = new ResourceManager(\"account\", db, tc);\n        String xid = tc.begin();\n        RootContext.bind(xid);\n        try {\n            stock.update(\"stock:sku1\", v -> v - 2);\n            account.update(\"account:u1\", v -> v - 30);\n            throw new RuntimeException(\"account service timeout\");\n        } catch (RuntimeException ex) {\n            tc.globalRollback(xid);\n        } finally {\n            RootContext.clear();\n        }\n        System.out.println(\"rollback db=\" + db.snapshot() + \", undo=\" + (stock.undoSize() + account.undoSize()) + \", locks=\" + tc.lockCount());\n        assert db.snapshot().equals(\"{stock:sku1=10, account:u1=100}\");\n        assert tc.lockCount() == 0;\n    }\n\n    static void commitCase() {\n        Database db = newDb();\n        TransactionCoordinator tc = new TransactionCoordinator();\n        ResourceManager stock = new ResourceManager(\"stock\", db, tc);\n        String xid = tc.begin();\n        RootContext.bind(xid);\n        try {\n            stock.update(\"stock:sku1\", v -> v - 1);\n            tc.globalCommit(xid);\n        } finally {\n            RootContext.clear();\n        }\n        System.out.println(\"commit db=\" + db.snapshot() + \", undo=\" + stock.undoSize() + \", locks=\" + tc.lockCount());\n        assert db.snapshot().equals(\"{stock:sku1=9, account:u1=100}\");\n    }\n\n    static void dirtyWriteCase() {\n        Database db = newDb();\n        TransactionCoordinator tc = new TransactionCoordinator();\n        ResourceManager stock = new ResourceManager(\"stock\", db, tc);\n        String xid = tc.begin();\n        RootContext.bind(xid);\n        boolean dirtyWriteDetected = false;\n        try {\n            stock.update(\"stock:sku1\", v -> v - 3);\n            db.put(\"stock:sku1\", 0); // bypass Seata and break after image validation\n            tc.globalRollback(xid);\n        } catch (IllegalStateException ex) {\n            dirtyWriteDetected = ex.getMessage().contains(\"dirty write\");\n        } finally {\n            RootContext.clear();\n        }\n        System.out.println(\"dirtyWriteDetected=\" + dirtyWriteDetected + \", lockedRows=\" + tc.lockCount());\n        assert dirtyWriteDetected;\n        assert tc.lockCount() == 1;\n    }\n\n    public static void main(String[] args) {\n        rollbackCase();\n        commitCase();\n        dirtyWriteCase();\n    }\n}",
       "highlights": [
         {
-          "line": 1,
-          "note": "这行承载示例的关键数据流，说明时要指出它改变了哪一段状态。"
+          "line": 5,
+          "note": "RootContext 模拟 XID 在线程上下文中的绑定，线程池或旁路调用丢失 XID 时下游不会进入全局事务。"
+        },
+        {
+          "line": 105,
+          "note": "RM 更新前后记录 before/after image，并把 undo log 与业务变更放在同一条本地事务语义里理解。"
+        },
+        {
+          "line": 123,
+          "note": "回滚前校验当前值是否等于 after image，能暴露旁路更新导致的脏写风险。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**Q1：Seata的AT模式是怎么实现自动回滚的？**\n\nA：AT模式通过拦截业务SQL自动生成undo_log实现。执行SQL前，Seata先查询并记录修改前的数据（beforeImage），执行SQL后再记录修改后的数据（afterImage），两者一起写入undo_log表，和业务操作在同一个本地事务中。提交时只需提交本地事务。回滚时，Seata根据undo_log中的beforeImage生成反向SQL（如INSERT变DELETE，UPDATE变回原值）执行，实现自动回滚。\n\n**Q2：Seata的AT、TCC、Saga模式怎么选？**\n\nA：AT模式侵入性最低，只需加@GlobalTransactional注解，适合大多数CRUD场景，是默认首选。但AT有全局锁，高并发场景可能有性能瓶颈，且默认读未提交隔离级别。TCC需要实现try/confirm/cancel三个方法，侵入性最高，但无全局锁、性能好，适合资金等对性能和一致性要求高的场景。Saga适合长事务和跨多系统编排，通过正向操作+反向补偿实现，不需要全局锁。\n\n**Q3：Seata的全局事务ID（XID）是怎么在微服务间传递的？**\n\nA：XID通过Seata提供的拦截器自动传递。在Feign调用场景下，Seata注册了RequestInterceptor，将XID放入请求Header中传递。下游服务收到请求后，Seata的Filter从Header中取出XID并绑定到当前线程的RootContext中。如果是异步调用（如线程池），需要手动调用RootContext.bind(xid)传递XID，否则全局事务上下文会丢失。",
+      "content": "可以这样回答：Seata 是用 TC、TM、RM 和 XID 协调多个本地事务的分布式事务框架。TM 开启全局事务并拿到 XID，XID 沿调用链传给下游；每个 RM 把本地事务注册成分支事务；最后 TC 根据 TM 的提交或回滚决议驱动所有分支收口。\n\n- 先讲 AT：它要求关系型数据库支持本地 ACID，并通过 JDBC 访问。RM 拦截 SQL，记录 before image 和 after image，写 undo_log，并在本地提交前向 TC 申请全局锁。全局提交时异步清理 undo_log；全局回滚时校验 after image，再用 before image 做补偿。\n- 再讲边界：AT 适合普通 CRUD，不适合复杂 SQL、非 JDBC 资源、热点高冲突写和旁路写。普通 SELECT 没有全局读锁；需要读已提交语义时要使用 SELECT FOR UPDATE 这类会参与全局锁判断的方式。\n- 然后讲选型：TCC 把 Try/Confirm/Cancel 交给业务，性能和控制力更好，但要处理幂等、空回滚、悬挂；Saga 适合长流程和遗留系统，靠补偿但隔离弱；XA 依赖资源协议，侵入低但 prepare 后阻塞，性能代价更高。\n- 最后讲排查：先看 XID 是否传到下游，再看分支注册、全局锁冲突、undo_log、TC 日志和回滚时的 after image 校验。很多只要求最终一致的场景，用本地消息表、Outbox 或事务消息会更轻。\n\n面试里不要说“分布式事务就上 Seata”。真正的结论是：强一致、资源锁、补偿复杂度、吞吐、故障恢复和业务可接受的不一致窗口一起决定方案。",
       "followUpQuestions": [
         {
-          "question": "Seata的AT模式工作原理？",
-          "answer": "AT模式原理：1. 一阶段：拦截SQL，记录before/after image到undo_log；本地事务提交。2. 二阶段提交：删除undo_log。3. 二阶段回滚：根据undo_log反向补偿。核心组件：TC（事务协调者）、TM（事务发起者）、RM（资源管理器）。"
+          "question": "Seata AT 模式为什么能自动回滚？",
+          "answer": "AT 一阶段记录 before image 和 after image，业务变更与 undo_log 在同一个本地事务中提交。全局回滚时，RM 根据 XID 和 branchId 找到 undo_log，先校验当前数据是否仍等于 after image，再按 before image 生成补偿操作。"
         },
         {
-          "question": "Seata的四种事务模式？如何选择？",
-          "answer": "四种模式：1. AT（自动补偿，适合大多数场景）；2. TCC（手动补偿，适合高一致性）；3. Saga（长事务，适合业务流程长）；4. XA（强一致，性能差）。选择：大多数场景用AT；高一致性用TCC；长事务用Saga；数据库支持XA用XA。"
+          "question": "TCC 的幂等、空回滚、悬挂分别是什么？",
+          "answer": "幂等是 Confirm/Cancel 可能被重试，重复执行不能造成多扣或多释放；空回滚是 Try 没成功或没执行，Cancel 仍被调用，必须安全返回；悬挂是 Cancel 先到、Try 后到，需要用事务控制表阻止迟到 Try 再预留资源。"
         },
         {
-          "question": "Seata的全局锁机制？",
-          "answer": "全局锁机制：1. 一阶段申请全局锁；2. 全局锁存储在TC；3. 二阶段提交释放锁；4. 二阶段回滚释放锁。锁冲突处理：默认等待重试，可配置超时时间。避免死锁：按固定顺序访问资源。"
+          "question": "Seata 的 XID 丢失会导致什么现象？怎么排查？",
+          "answer": "下游没有绑定 XID 时，RM 不会注册成全局分支，只会执行普通本地事务。排查先看请求 Header/RPC attachment，再看 RootContext、线程池传递、网关过滤器、Feign/Dubbo 拦截器，以及 TC 上是否有对应 branch session。"
+        },
+        {
+          "question": "为什么很多场景不用 Seata，而用本地消息表或事务消息？",
+          "answer": "如果业务只需要最终一致，而且能接受短暂不一致窗口，消息方案通常更轻，避免全局锁和 TC 依赖。Seata 更适合需要事务框架统一协调分支状态、并且业务能接受对应锁、补偿和运行成本的场景。"
         }
       ]
     },
@@ -77,34 +100,33 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "TC/TM/RM三个角色各自职责",
-        "AT模式的undo_log生成和反向回滚机制",
-        "AT/TCC/Saga/XA四种模式的适用场景和优劣对比",
-        "XID在微服务调用链中的传递方式（Feign拦截器）",
-        "@GlobalTransactional注解的作用和生效原理",
-        "全局锁的作用和对性能的影响",
-        "CAP/BASE理论与最终一致性的关系"
+        "能解释 TC、TM、RM、XID、global transaction、branch transaction 的关系",
+        "能讲清 AT 一阶段 before image、after image、undo_log、global lock 和本地提交的顺序",
+        "能解释 AT 二阶段提交为什么快、二阶段回滚为什么要校验 after image",
+        "能区分 AT、TCC、Saga、XA 的适用场景、侵入性、性能和故障边界",
+        "能排查 XID 丢失、全局锁冲突、undo_log 缺失、旁路写导致回滚失败的问题",
+        "能说明什么时候本地消息表、Outbox 或事务消息比 Seata 更合适"
       ]
     }
   ],
   "recallPrompts": [
     {
-      "prompt": "Seata 的全局事务协调流程是什么？TC、TM、RM 三个角色各自负责什么？",
+      "prompt": "Seata 的 TC、TM、RM 和 XID 如何配合完成一次全局事务？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4,
       "id": "java.microservice.topic-062-ce26874b.recall.1"
     },
     {
-      "prompt": "Seata 的 AT 模式和 TCC 模式各有什么优劣？全局锁是如何管理的？",
+      "prompt": "请按一阶段和二阶段解释 Seata AT 模式的 undo_log、全局锁和脏写检测。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 4,
       "id": "java.microservice.topic-062-ce26874b.recall.2"
     },
     {
       "id": "java.microservice.topic-062-ce26874b.recall.3",
-      "prompt": "Seata 分布式事务 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "AT、TCC、Saga、XA 和本地消息表分别适合什么场景？如果 XID 丢失或全局锁冲突，如何排查？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
@@ -112,20 +134,21 @@
   ],
   "rubric": {
     "mustHave": [
-      "能准确解释分布式事务的一致性问题、常见方案和业务取舍",
-      "说清要点和分布式事务场景的关键机制",
-      "能按 Seata、分布式事务、微服务治理 和 Seata 分布式事务 的顺序讲清「Seata 分布式事务」的关键链路",
-      "TC/TM/RM三个角色各自职责"
+      "能准确解释 TC/TM/RM、XID、全局事务和分支事务",
+      "能讲清 AT 模式 before image、after image、undo_log、global lock 和二阶段补偿",
+      "能区分 AT、TCC、Saga、XA 的适用场景和核心代价",
+      "能说明 XID 丢失、旁路写、全局锁冲突和 undo_log 异常如何影响一致性"
     ],
     "goodToHave": [
-      "能说出 Seata 分布式事务 的源码关键类和扩展点",
-      "能解释 Seata 分布式事务 与 Spring 生态其他组件的协作关系",
-      "能用具体示例、运行现象或可观测指标验证「Seata 分布式事务」的判断"
+      "能结合 Seata v2.6 和 V2.6.0 release 说明当前版本边界",
+      "能解释 TCC 幂等、空回滚、悬挂这三个生产难点",
+      "能把 Seata 与本地消息表、Outbox、事务消息做方案取舍"
     ],
     "commonMistakes": [
-      "不清楚AT模式的undo log机制",
-      "混淆强一致性和最终一致性的适用场景",
-      "以为分布式事务一定要用Seata（实际上很多场景用MQ就够了）"
+      "把 Seata 当成所有微服务一致性问题的默认方案",
+      "只背 AT/TCC/Saga/XA 名称，却说不清 undo_log、全局锁和补偿语义",
+      "以为 AT 可以覆盖任意 SQL、任意资源或旁路写",
+      "忽略 XID 在线程池、异步任务和网关链路中丢失的风险"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -134,11 +157,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-19",
   "status": "production",
   "prerequisites": [
     "java.microservice.topic-055-e51532ee"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「Seata 分布式事务」说清能准确解释分布式事务的一致性问题、常见方案和业务取舍、说清要点和分布式事务场景的关键机制，并放到Java 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察能否围绕 Seata v2.6 讲清 TC/TM/RM、XID 传播、AT undo_log 和全局锁，并能在 AT/TCC/Saga/XA 与消息方案之间做工程取舍。"
 }

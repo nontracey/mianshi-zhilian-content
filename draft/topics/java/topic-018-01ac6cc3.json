@@ -33,10 +33,20 @@
     {
       "type": "diagram",
       "format": "mermaid",
-      "title": "ReentrantLock 的能力",
-      "content": "flowchart TD\nA[\"ReentrantLock 基于 AQS\"] --> B[\"lock/unlock：unlock 必须放 finally\"]\nA --> C[\"tryLock 超时 / lockInterruptibly：避免死锁、可中断\"]\nA --> D[\"公平锁 FIFO vs 非公平锁 默认、吞吐高\"]\nA --> E[\"Condition 多条件精确唤醒，替代 wait/notify\"]",
-      "caption": "ReentrantLock 基于 AQS：lock/unlock（必须 finally 释放）、tryLock/超时/可中断避免死锁、公平与非公平、Condition 多条件精确唤醒，能力比 synchronized 丰富。",
-      "fallback": "ReentrantLock 基于 AQS：lock/unlock（unlock 必须放 finally）、tryLock 加超时和 lockInterruptibly 避免死锁可中断、公平锁 FIFO 与默认非公平锁、Condition 多条件精确唤醒，能力比 synchronized 丰富。"
+      "title": "ReentrantLock 基于 AQS 的获取、重入与 Condition 流程",
+      "content": "flowchart TD\nCall[lock/tryLock/lockInterruptibly] --> Try{state == 0?}\nTry -->|CAS 成功| Owner[设置 owner\nstate=1]\nTry -->|同一线程| Reenter[state++\n可重入]\nTry -->|失败| Queue[加入 AQS 同步队列]\nQueue --> Park[park 等待\n可中断/可超时按 API 处理]\nPark --> Wake[前驱释放后 unpark]\nWake --> Try\nOwner --> Work[临界区]\nReenter --> Work\nWork --> Finally[finally unlock]\nFinally --> Release[state--]\nRelease -->|state==0| Unpark[清 owner\n唤醒后继]\nCondition[Condition.await] --> CondQ[释放锁并进条件队列]\nCondQ --> Signal[signal 转移到同步队列]\nSignal --> Queue",
+      "caption": "ReentrantLock 的核心不是“比 synchronized 快”，而是 AQS 队列、可中断/超时、公平策略和多个 Condition 带来的控制能力。",
+      "fallback": "ReentrantLock 获取失败会进入 AQS 同步队列，释放时唤醒后继；同一线程重入只增加 state。Condition.await 会释放锁进入条件队列，signal 后再回同步队列竞争。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nCall[lock/tryLock/lockInterruptibly] --> Try{state == 0?}\nTry -->|CAS 成功| Owner[设置 owner\nstate=1]\nTry -->|同一线程| Reenter[state++\n可重入]\nTry -->|失败| Queue[加入 AQS 同步队列]\nQueue --> Park[park 等待\n可中断/可超时按 API 处理]\nPark --> Wake[前驱释放后 unpark]\nWake --> Try\nOwner --> Work[临界区]\nReenter --> Work\nWork --> Finally[finally unlock]\nFinally --> Release[state--]\nRelease -->|state==0| Unpark[清 owner\n唤醒后继]\nCondition[Condition.await] --> CondQ[释放锁并进条件队列]\nCondQ --> Signal[signal 转移到同步队列]\nSignal --> Queue"
+        },
+        {
+          "kind": "text",
+          "content": "ReentrantLock 获取失败会进入 AQS 同步队列，释放时唤醒后继；同一线程重入只增加 state。Condition.await 会释放锁进入条件队列，signal 后再回同步队列竞争。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -51,14 +61,14 @@
       "highlights": [
         {
           "line": 19,
-          "note": "这里给出最终结果或提前退出条件，需要补充空值、失败和边界场景。"
+          "note": "读 count 前必须先拿同一把锁，才能与写入侧形成一致的可见性；否则返回值可能不是最新状态。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：ReentrantLock 是 java.util.concurrent 包里基于 AQS 实现的可重入互斥锁，能力比 synchronized 更丰富——可中断、可超时、可公平、支持多个条件变量，代价是必须手动 unlock。\n\n核心能力：\n\n1. 基本用法：lock()/unlock()，unlock 必须放 finally，否则异常时锁不释放、死锁。\n2. 比 synchronized 多的能力：lockInterruptibly()（等锁时可被中断）、tryLock()（非阻塞，立即返回）、tryLock(time)（带超时，可用来避免死锁）。\n3. 公平 vs 非公平：默认非公平——新线程直接 CAS 抢锁、抢不到才入队，吞吐高但可能饥饿；公平锁严格按队列 FIFO 发锁，公平但吞吐低。绝大多数场景用默认非公平。\n4. Condition：替代 wait/notify，一个锁可以建多个 Condition 实现「精确唤醒」（如生产者唤醒消费者、不误唤醒同类），await 要放 while 循环里防虚假唤醒。\n\nReentrantLock vs synchronized：简单互斥优先 synchronized（JVM 优化好、不会忘记释放）；需要可中断、超时、公平、多条件时用 ReentrantLock。\n\n边界和坑。① unlock 忘了放 finally 是最经典的坑。② tryLock 不带超时时立即返回，要处理返回 false 的分支。③ Condition 的 await/signal 必须在 lock 持有期间调用，否则抛 IllegalMonitorStateException。",
+      "content": "结论：ReentrantLock 是基于 AQS 的可重入互斥锁，比 synchronized 多了可中断、可超时、公平锁和多个 Condition，代价是必须手动 unlock。\n\n核心能力：\n\n1. 基本用法：lock 后必须在 finally 里 unlock，否则异常路径会永久占锁。\n2. 可重入：同一线程再次获取锁时 state 递增，释放时递减，减到 0 才真正唤醒后继。\n3. 公平与非公平：默认非公平，锁空闲时新线程可直接 CAS 抢锁，吞吐高但可能饥饿；公平锁会先看 hasQueuedPredecessors，顺序更稳但上下文切换更多。\n4. 可中断/超时：lockInterruptibly 和 tryLock(timeout) 能让等待锁的线程退出等待，常用于避免死锁或实现降级。\n5. Condition：一个 Lock 可以有多个条件队列，await 释放锁并挂起，signal 把节点转移回同步队列，适合精确唤醒。\n\n选型：简单互斥优先 synchronized；需要中断、超时、公平、多条件时再用 ReentrantLock。虚拟线程场景要看 JDK 版本：JDK 21-23 synchronized 阻塞可能 pin carrier，JDK 24 的 JEP 491 已改善，不能再把“虚拟线程一定要换 ReentrantLock”当成固定结论。",
       "followUpQuestions": [
         {
           "question": "ReentrantLock 和 synchronized 在底层和能力上有什么区别？怎么选？",
@@ -149,7 +159,7 @@
       "depth": 15
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-18",
   "status": "draft",
   "prerequisites": [
     "java.concurrency.topic-017-df4531b1",

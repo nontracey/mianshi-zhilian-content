@@ -4,7 +4,7 @@
   "category": "memory-management",
   "group": "memory-management",
   "title": "页面置换算法",
-  "summary": "掌握 FIFO、LRU、LFU、Clock 等页面置换算法的原理和实现，理解 Belady 异常和工作集模型",
+  "summary": "掌握 FIFO、LRU、LFU、Clock、工作集与 WSClock 的页面置换机制，理解 Belady 异常、全局/局部置换取舍以及 Linux active/inactive LRU 回收链路",
   "tags": [
     "操作系统",
     "页面置换",
@@ -18,53 +18,101 @@
   "learningCards": [
     {
       "type": "explain",
-      "title": "为什么要置换，OPT/FIFO/LRU",
-      "content": "## 为什么需要\n物理内存有限，缺页时若内存已满，就得选一个页**换出（evict）**腾地方。选谁换出就是置换算法，目标是**让未来的缺页尽量少**。\n\n## 三个基础算法\n- **OPT 最优**：换出“将来最久才会被用到”的页。缺页率理论最低，但要预知未来、**无法实现**，只作为衡量其他算法好坏的标尺。\n- **FIFO 先进先出**：换出最早进来的页，用队列实现、简单。但“早进来”不等于“没用”，可能把热页换出去，性能差；还有 **Belady 异常**——**增加物理帧数反而缺页更多**（FIFO 特有，LRU/OPT 不会）。\n- **LRU 最近最少使用**：换出“最久没被访问”的页，基于**时间局部性**（最近用过的很可能还会用），效果接近 OPT。但精确 LRU 要维护访问顺序（链表/时间戳），**硬件开销大**，实际多用近似实现。"
+      "title": "缺页后的淘汰决策：OPT/FIFO/LRU 的本质差异",
+      "content": "## 触发条件：什么时候必须置换\n进程访问的虚拟页不在物理内存时会触发缺页异常。若系统没有可直接分配的空闲页框，内核必须选择一个物理页换出，腾出页框给目标页。置换算法的目标不是“换得快”这么简单，而是在**每次缺页时用有限信息预测未来访问**，尽量降低后续缺页率、写回 IO 和抖动风险。\n\n## OPT：理论下界，不是工程方案\n**OPT 最优算法**淘汰“未来最长时间不会再访问”的页。它需要知道完整未来访问序列，因此不能在线实现，但它有两个价值：\n- 作为缺页率下界，用于课程题或仿真评估其他算法。\n- 帮助解释局部性：若访问序列没有时间局部性，任何实际算法都很难接近 OPT。\n\n## FIFO：实现便宜，但错误信号太粗\n**FIFO**只维护进入内存的先后顺序，淘汰最早进入的页。它的工程成本很低，但“驻留时间长”并不等于“不再使用”。一个常驻热页可能因为最早进入而被淘汰，下一次访问马上又缺页。\n\nFIFO 的关键陷阱是 **Belady 异常**：增加页框数反而可能增加缺页数。原因是 FIFO 不满足“栈性质”，N 个页框中的驻留集合不一定是 N+1 个页框驻留集合的子集；页框数变化会改变淘汰序列，可能把原本保留下来的热页提前换出。\n\n## LRU：利用时间局部性，但精确实现代价过高\n**LRU**淘汰最久未被访问的页，依赖时间局部性：刚访问过的页短期内再次访问概率更高。LRU 属于栈算法，不会出现 Belady 异常。\n\n精确 LRU 在缓存题中常用“哈希表 + 双向链表”实现，但操作系统页面置换不能照搬：每次内存访问都更新链表或时间戳会让访存路径承受不可接受的开销。真实系统通常依赖硬件页表项的 Accessed/Referenced 位、Dirty 位，再由内核周期性扫描和老化，得到近似 LRU，而不是为每次 load/store 执行软件链表调整。"
     },
     {
       "type": "explain",
-      "title": "LFU、Clock 近似与抖动",
-      "content": "## LFU 最不经常使用\n换出**访问次数最少**的页。问题：历史访问次数高的“老页”即使现在不用了也很难被换出；对**突发热点**不友好。需要**老化机制**（定期把计数右移衰减）来缓解。\n\n## Clock 时钟算法 —— LRU 的廉价近似（实际常用）\n精确 LRU 太贵，Clock 用一个**引用位**近似：所有页排成环形链表，指针扫描——遇到引用位 = 1 的把它置 0、放过（给一次机会），遇到引用位 = 0 的就换出它。这样只需 1 位 + 一次扫描，开销极小。**改进型 Clock** 再结合“修改位”，优先换出没被改过的页（省一次写回磁盘）。\n\n## 抖动 Thrashing\n当并发进程太多、每个分到的物理页都不够装下自己的**工作集**时，会**频繁缺页→换页→又缺页**，CPU 大量时间耗在换页 IO 上、利用率不升反降。\n- **判断**：缺页率极高、磁盘 IO 飙升而 CPU 使用率低。\n- **解决**：用**工作集模型**给每个进程留够常用页；减少并发进程数；必要时换出/挂起部分进程。"
+      "title": "Clock、WSClock、全局/局部置换与 Linux 回收链路",
+      "content": "## Clock：用引用位近似“最近是否用过”\nClock 把候选页组织成环，指针扫描页框：\n- 引用位为 1：说明最近被访问过，清零并跳过，相当于给第二次机会。\n- 引用位为 0：认为近期未访问，选择淘汰。\n- 若结合修改位，优先淘汰未引用且干净的页，避免把脏页写回磁盘。\n\nClock 的失败路径也很明确：当工作集大于可用页框时，扫描一圈会清掉大量引用位，随后又很快缺页，系统进入频繁扫描与换入换出的状态。\n\n## WSClock：工作集模型的可实现版本\n纯工作集算法要精确维护每个进程最近窗口 Δ 内访问过的页面集合，开销较高。**WSClock**把工作集思想合并到 Clock：每个页记录最近使用时间，扫描时同时看引用位、脏位和年龄。\n- 引用位为 1：清引用位，刷新最近使用时间，继续扫描。\n- 引用位为 0 且页面年龄小于工作集窗口：认为仍属于工作集，跳过。\n- 引用位为 0、年龄超过窗口且干净：可直接淘汰。\n- 引用位为 0、年龄超过窗口但脏：发起异步写回，继续找干净牺牲页。\n\n它的工程取舍是：不用精确维护完整工作集，却能避免把“刚好在窗口内的关键页”淘汰；代价是需要维护时间戳，并在脏页多时触发后台写回。\n\n## 全局置换 vs 局部置换\n**局部置换**限定每个进程只能从自己已分配的页框中淘汰，隔离性强，便于保证单进程工作集，但可能出现某个进程空闲页多而另一个进程缺页严重的内存利用低效。\n\n**全局置换**允许从全系统候选页中回收，Linux 更接近这种思路：在内存压力下按 zone / memcg 等维度扫描 LRU 链表，回收文件页或匿名页。它能提高整体内存利用率，但风险是某些进程的热页被系统性挤出，若并发进程总工作集超过内存，会放大抖动。\n\n## Linux 的 active/inactive 近似 LRU\nLinux 不维护精确 LRU，而是把页放在 active/inactive LRU 链表中，并区分匿名页和文件页。回收链路大致由 `kswapd` 后台回收或直接内存分配路径触发 direct reclaim，核心扫描逻辑集中在 `mm/vmscan.c`，常见函数包括 `shrink_node()`、`shrink_lruvec()`、`shrink_list()`、`shrink_inactive_list()`，历史资料中也常见 `refill_inactive` 这一类“把活跃页老化到 inactive”的过程描述。\n\n关键机制是：\n- active 链表存放近期被认为活跃的页，inactive 链表存放优先回收候选页。\n- 扫描时若发现 inactive 页又被访问过，可重新激活到 active；未访问且可回收的页会被释放或写回。\n- 文件页干净时可直接丢弃，匿名页通常需要 swap 才能回收；脏文件页需要 writeback。\n- memcg 打开后，回收不只是全局维度，还会受 cgroup 内存限制影响。\n\n线上判断页面回收问题不能只背算法名，要看证据：`vmstat 1` 中 `si/so`、`pgscan/pgsteal`、`kswapd` CPU、major fault、磁盘写回延迟、容器 memory.stat 的 `pgfault/pgmajfault`，再结合业务延迟尖刺判断是工作集超内存、脏页写回阻塞，还是文件缓存被反复挤掉。"
     },
     {
       "type": "diagram",
-      "title": "页面置换算法 学习主线图",
-      "content": "flowchart LR\nA[页面置换算法] --> B[操作系统]\nB --> C[页面置换]\nC --> D[LRU]\nD --> E[缺页率]\nE --> F[五种主要页面置换算法的原理]",
-      "fallback": "页面置换算法 -> 操作系统 -> 页面置换 -> LRU -> 缺页率 -> 五种主要页面置换算法的原理",
+      "title": "Clock/WSClock 扫描决策与 Linux active-inactive 回收路径",
+      "content": "flowchart TD\nA[缺页且无空闲页框] --> B{置换范围}\nB --> C[局部置换: 只扫描本进程页框]\nB --> D[全局置换: 扫描系统或 memcg LRU]\nC --> E{Clock 当前页引用位}\nD --> L[Linux inactive/active LRU 候选]\nE -->|1| F[清引用位并移动指针]\nF --> E\nE -->|0| G{WSClock 年龄是否超过工作集窗口}\nG -->|否| H[保留在工作集内并继续扫描]\nH --> E\nG -->|是| I{页面是否为脏页}\nI -->|否| J[选择为牺牲页并换入目标页]\nI -->|是| K[发起写回并继续寻找干净页]\nK --> E\nL --> M{inactive 页最近是否被访问}\nM -->|是| N[提升到 active 链表]\nM -->|否| O{干净文件页或可换出匿名页}\nO -->|是| P[回收页框]\nO -->|否| Q[写回或 swap 后再回收]\nP --> J\nQ --> P",
+      "fallback": "缺页后根据局部或全局范围选择候选页；Clock/WSClock 按引用位、年龄和脏位决策；Linux 通过 active/inactive LRU 扫描、激活、写回和回收页框。",
       "items": [
-        "页面组成环形链表，指针指向下一个候选页面",
-        "扫描时检查引用位：1 -> 清零，指针后移；0 -> 替换该页",
-        "改进型：第一轮扫描(0,0)引用位和修改位都为 0 的页面",
-        "改进型：第二轮扫描(0,1)修改页但未引用的页面",
-        "四轮扫描优先级：(0,0) > (0,1) > (1,0) > (1,1)",
-        "工作集模型：跟踪每个进程最近访问的页面集合"
+        "Clock 的核心分支是引用位：1 表示给第二次机会，0 才进入淘汰判断",
+        "WSClock 在 Clock 基础上增加最近使用时间，用工作集窗口保护仍活跃的页面",
+        "脏页不宜立即淘汰，通常先触发写回，再继续寻找更便宜的牺牲页",
+        "局部置换强调进程隔离，全局置换强调系统整体内存利用率",
+        "Linux active/inactive LRU 用扫描、激活和老化近似 LRU，不维护精确访问序列",
+        "线上回收异常要结合 pgscan、pgsteal、pgmajfault、swap in/out、writeback 延迟观察"
       ],
       "format": "mermaid",
-      "caption": "从 操作系统 到 五种主要页面置换算法的原理，这张图帮助区分 页面置换算法 的核心机制、边界条件和常见误区。"
+      "caption": "这张图把课堂 Clock/WSClock 的淘汰决策和 Linux active/inactive LRU 的回收路径放在同一条缺页处理链路里，重点区分引用位、工作集窗口、脏页写回、局部/全局置换四类决策。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[缺页且无空闲页框] --> B{置换范围}\nB --> C[局部置换: 只扫描本进程页框]\nB --> D[全局置换: 扫描系统或 memcg LRU]\nC --> E{Clock 当前页引用位}\nD --> L[Linux inactive/active LRU 候选]\nE -->|1| F[清引用位并移动指针]\nF --> E\nE -->|0| G{WSClock 年龄是否超过工作集窗口}\nG -->|否| H[保留在工作集内并继续扫描]\nH --> E\nG -->|是| I{页面是否为脏页}\nI -->|否| J[选择为牺牲页并换入目标页]\nI -->|是| K[发起写回并继续寻找干净页]\nK --> E\nL --> M{inactive 页最近是否被访问}\nM -->|是| N[提升到 active 链表]\nM -->|否| O{干净文件页或可换出匿名页}\nO -->|是| P[回收页框]\nO -->|否| Q[写回或 swap 后再回收]\nP --> J\nQ --> P"
+        },
+        {
+          "kind": "text",
+          "content": "缺页后根据局部或全局范围选择候选页；Clock/WSClock 按引用位、年龄和脏位决策；Linux 通过 active/inactive LRU 扫描、激活、写回和回收页框。"
+        }
+      ]
     },
     {
       "type": "compareTable",
       "title": "对比与边界",
-      "content": "| 算法 | 实现 | 性能 | Belady 异常 | 适用场景 |\n| --- | --- | --- | --- | --- |\n| OPT | 不可实现 | 最优 | 无 | 理论基准 |\n| FIFO | 队列 | 差 | 有 | 简单场景 |\n| LRU | 链表/时间戳 | 好 | 无 | 通用场景 |\n| LFU | 计数器 | 中 | 无 | 访问模式稳定 |\n| Clock | 环形链表+引用位 | 较好 | 无 | 实际 OS 常用 |\n| 改进Clock | 环形链表+引用位+修改位 | 好 | 无 | Linux 实际使用 |"
+      "content": "| 算法 | 实现 | 性能 | Belady 异常 | 适用场景 |\n| --- | --- | --- | --- | --- |\n| OPT | 依赖未来访问序列，只能离线模拟 | 理论缺页率最低 | 无 | 用作评估基准，不用于真实内核在线置换 |\n| FIFO | 按进入内存时间维护队列 | 实现简单但可能淘汰热页 | 有 | 教学和极简系统，不能代表现代 OS 的回收策略 |\n| LRU | 精确实现需每次访问更新时间戳或链表 | 利用时间局部性，缺页率通常较好 | 无 | 缓存组件常用精确版，OS 中多用近似版 |\n| LFU | 维护访问计数，通常需要老化衰减 | 对稳定热点有效，对阶段性热点反应慢 | 通常不作为 Belady 异常示例 | 访问频率长期稳定的缓存场景，单独用于 OS 页面置换较少 |\n| Clock | 环形候选集 + 引用位，必要时结合修改位 | 接近 LRU 且扫描开销可控 | 无严格精确 LRU 保证，但避免 FIFO 的进入时间缺陷 | OS 页面置换的经典近似方案 |\n| WSClock | Clock + 最近使用时间 + 工作集窗口 + 脏页写回 | 能保护工作集并减少无意义换出 | 不按 FIFO 队列淘汰 | 工作集压力明显、需要兼顾脏页写回成本的系统 |\n| Linux active/inactive LRU | active/inactive 链表、页引用位、回收扫描、memcg 约束 | 工程上可扩展，兼顾文件页、匿名页和脏页 | 不是教材 FIFO，不以 Belady 异常刻画 | 真实 Linux 内存压力回收与容器内存隔离场景 |"
     },
     {
       "type": "code",
       "title": "代码示例",
-      "content": "// LRU 缓存实现（哈希表 + 双向链表）\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\ntypedef struct Node {\n    int key, value;\n    struct Node *prev, *next;\n} Node;\n\ntypedef struct {\n    int capacity, size;\n    Node *head, *tail;\n    // 简化：用数组模拟哈希表\n    Node *hash[10000];\n} LRUCache;\n\nLRUCache* createCache(int capacity) {\n    LRUCache *cache = malloc(sizeof(LRUCache));\n    cache->capacity = capacity;\n    cache->size = 0;\n    cache->head = malloc(sizeof(Node));\n    cache->tail = malloc(sizeof(Node));\n    cache->head->next = cache->tail;\n    cache->tail->prev = cache->head;\n    memset(cache->hash, 0, sizeof(cache->hash));\n    return cache;\n}\n\n// 访问页面：移到链表头部\nvoid accessPage(LRUCache *cache, int key) {\n    Node *node = cache->hash[key];\n    if (node) {\n        // 已存在，移到头部\n        node->prev->next = node->next;\n        node->next->prev = node->prev;\n        node->next = cache->head->next;\n        node->prev = cache->head;\n        cache->head->next->prev = node;\n        cache->head->next = node;\n    } else {\n        // 新页面，替换尾部（最久未使用）\n        if (cache->size >= cache->capacity) {\n            Node *old = cache->tail->prev;\n            old->prev->next = cache->tail;\n            cache->tail->prev = old->prev;\n            cache->hash[old->key] = NULL;\n            free(old);\n            cache->size--;\n        }\n        // 插入新节点到头部\n        node = malloc(sizeof(Node));\n        node->key = key;\n        node->next = cache->head->next;\n        node->prev = cache->head;\n        cache->head->next->prev = node;\n        cache->head->next = node;\n        cache->hash[key] = node;\n        cache->size++;\n    }\n}",
-      "language": "c"
+      "content": "// LRU 缓存实现（哈希表 + 双向链表），用于说明精确 LRU 为什么适合缓存题、不适合 OS 每次访存路径\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\ntypedef struct Node {\n    int key, value;\n    struct Node *prev, *next;\n} Node;\n\ntypedef struct {\n    int capacity, size;\n    Node *head, *tail;\n    // 简化：用数组模拟哈希表，真实系统需要处理 key 范围和哈希冲突\n    Node *hash[10000];\n} LRUCache;\n\nLRUCache* createCache(int capacity) {\n    LRUCache *cache = malloc(sizeof(LRUCache));\n    cache->capacity = capacity;\n    cache->size = 0;\n    cache->head = malloc(sizeof(Node));\n    cache->tail = malloc(sizeof(Node));\n    cache->head->next = cache->tail;\n    cache->tail->prev = cache->head;\n    memset(cache->hash, 0, sizeof(cache->hash));\n    return cache;\n}\n\n// 访问页面：命中时移动到链表头部，表示最近使用\nvoid accessPage(LRUCache *cache, int key) {\n    Node *node = cache->hash[key];\n    if (node) {\n        // 已存在：从原位置摘下，再插入头部\n        node->prev->next = node->next;\n        node->next->prev = node->prev;\n        node->next = cache->head->next;\n        node->prev = cache->head;\n        cache->head->next->prev = node;\n        cache->head->next = node;\n    } else {\n        // 新页面：容量满时淘汰尾部的最久未使用节点\n        if (cache->size >= cache->capacity) {\n            Node *old = cache->tail->prev;\n            old->prev->next = cache->tail;\n            cache->tail->prev = old->prev;\n            cache->hash[old->key] = NULL;\n            free(old);\n            cache->size--;\n        }\n        // 插入新节点到头部，表示刚刚被访问\n        node = malloc(sizeof(Node));\n        node->key = key;\n        node->next = cache->head->next;\n        node->prev = cache->head;\n        cache->head->next->prev = node;\n        cache->head->next = node;\n        cache->hash[key] = node;\n        cache->size++;\n    }\n}",
+      "language": "c",
+      "highlights": [
+        {
+          "line": 11,
+          "note": "capacity 和 size 对应页框上限与当前驻留页数，超过上限时必须选择牺牲页"
+        },
+        {
+          "line": 14,
+          "note": "数组哈希表让页面号到链表节点的查找为 O(1)，这是精确 LRU 能在缓存题中成立的前提"
+        },
+        {
+          "line": 24,
+          "note": "哨兵头尾节点避免删除头尾时写多套分支，链表头表示最近访问，尾部表示最久未访问"
+        },
+        {
+          "line": 33,
+          "note": "命中后必须从原位置摘下，否则链表中会留下重复位置，LRU 顺序会被破坏"
+        },
+        {
+          "line": 49,
+          "note": "容量满时淘汰 tail->prev，严格对应“最久未使用”的牺牲页"
+        },
+        {
+          "line": 52,
+          "note": "删除牺牲节点时同步清空哈希表引用，否则后续访问会命中已释放内存"
+        },
+        {
+          "line": 59,
+          "note": "新页面插入头部，表示它刚被访问；OS 精确 LRU 若每次访存都做类似操作，开销会过高"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**高频问题1：有哪些页面置换算法？**\n\n主要有五种：最优算法 OPT、先进先出 FIFO、最近最少使用 LRU、最不经常使用 LFU 和时钟算法 Clock。\n\nOPT 替换将来最长时间不用的页面，理论最优但无法实现。FIFO 替换最早进入的页面，实现简单但有 Belady 异常，增加物理帧数反而可能增加缺页率。LRU 替换最久没被访问的页面，基于时间局部性原理，效果好但精确实现开销大。LFU 替换访问次数最少的页面，但对突发访问不友好。时钟算法是 LRU 的近似实现，用环形链表和引用位，开销小且效果接近 LRU，是实际操作系统常用的方案。\n\n**高频问题2：什么是抖动？怎么解决？**\n\n抖动是指系统中进程过多，分配给每个进程的物理帧不足，导致频繁缺页和页面置换。CPU 大量时间花在页面换入换出上，利用率急剧下降。\n\n解决方案主要有：一是使用工作集模型，跟踪每个进程最近访问的页面集合，确保分配的物理帧不小于工作集大小。二是减少并发进程数，通过挂起部分进程释放物理内存。",
+      "content": "**30 秒结论**\n\n页面置换是在缺页且没有空闲页框时选择牺牲页。OPT 是理论最优基准；FIFO 简单但会出现 Belady 异常；LRU 利用时间局部性且不会 Belady 异常，但精确维护访问顺序太贵；Clock 用引用位近似 LRU；WSClock 再把工作集窗口和脏页写回纳入决策。真实 Linux 更接近全局回收的 active/inactive LRU 体系，而不是教科书里的单一 FIFO 或精确 LRU。\n\n**机制要点**\n\n- OPT 淘汰未来最久不用的页，只能离线比较缺页率，不能在线实现。\n- FIFO 淘汰最早进入内存的页，不关心最近是否访问，因此可能把热页换出，并且不满足栈性质。\n- LRU 淘汰最久未访问页，符合时间局部性；缓存题可用哈希表加双向链表实现，但 OS 每次访存都调整链表不可接受。\n- Clock 用引用位做“第二次机会”：引用位为 1 就清零跳过，引用位为 0 才淘汰；改进型会结合修改位，尽量先淘汰干净页。\n- WSClock 在 Clock 扫描时检查最近使用时间，年龄还在工作集窗口内的页不淘汰；老页若是脏页先写回，干净老页可作为牺牲页。\n- 全局置换利用率更高但可能互相干扰，局部置换隔离性更强但可能浪费页框；抖动的根因通常是并发工作集总量超过可用内存。\n- Linux 用 active/inactive LRU 链表、页引用位、匿名/文件页区分、writeback 和 swap 配合回收；排查要看 `vmstat`、major fault、pgscan/pgsteal、swap in/out、kswapd/direct reclaim 和磁盘写回延迟。\n\n**边界与追问应对**\n\n- 如果问“为什么 LRU 不会 Belady 异常”，要回答栈性质：N 页框驻留集合是 N+1 页框驻留集合的子集，页框增多不会让已有热页更早被淘汰。\n- 如果问“OS 为什么不用精确 LRU”，重点不是链表会不会写，而是每次内存访问都维护精确顺序会污染关键访存路径，硬件通常只提供 accessed/dirty 这类粗粒度信号。\n- 如果问“线上服务延迟尖刺是不是页面置换”，要给证据链：major fault 上升、`si/so` 非零、`pgscan` 高但 `pgsteal` 低、`kswapd` 或 direct reclaim 占用、writeback 拖慢，以及容器 memory limit 是否小于业务工作集。",
       "followUpQuestions": [
         {
           "question": "Belady 异常是什么？为什么 LRU 不会有，FIFO 会有？",
-          "answer": "Belady 异常指增加分配的物理帧数，缺页率反而升高的反直觉现象，FIFO 会出现。根因是 FIFO 只按‘进入时间’淘汰，和页面是否还在被使用无关，所以帧数变化时淘汰序列可能变得更糟，不满足‘帧多一定更好’的单调性。LRU 和 OPT 属于‘栈算法’：它们在 N 帧时驻留的页集合一定是 N+1 帧时的子集，帧数增加只会让更多页留下来、不会把本该留的换出去，所以缺页率单调不增，天然不会有 Belady 异常。"
+          "answer": "Belady 异常指增加分配的物理帧数后，缺页次数反而升高。FIFO 会出现，是因为它只按进入内存时间淘汰，驻留集合不满足栈性质；页框数改变后，整个淘汰序列可能变化，热页反而被提前踢出。LRU 和 OPT 属于栈算法，N 个页框中的页面集合一定包含在 N+1 个页框的集合中，所以页框增加只会保留更多候选页，缺页率单调不增。"
         },
         {
           "question": "操作系统里真正用的页面置换是精确 LRU 吗？为什么？",
-          "answer": "不是。精确 LRU 要在每次内存访问时更新该页的访问时间或调整链表位置，而内存访问极其频繁，软件维护代价无法接受、硬件也不会为每次访存做这件事。所以实际系统用近似 LRU：典型是 Clock（时钟）算法，只靠每页一个引用位 + 指针扫描来近似‘最近有没有用过’；Linux 进一步用 active/inactive 两个 LRU 双链表配合引用位做近似老化。这些方案用极小的开销换到接近 LRU 的效果，这才是工程上可行的选择。"
+          "answer": "不是。精确 LRU 要在每次访存时更新访问时间或调整链表，而访存频率远高于缺页频率，把这个动作放到每次 load/store 路径上不可接受。真实 OS 依赖硬件页表项的 accessed/dirty 位，再由内核扫描、清位、老化和移动 LRU 链表来近似 LRU。Linux 的 active/inactive LRU 就是典型工程折中：不保存完整访问序列，但能把近期访问页重新激活，把 inactive 中未访问且可回收的页释放。"
+        },
+        {
+          "question": "全局页面置换和局部页面置换怎么取舍？它们对抖动有什么影响？",
+          "answer": "局部置换把淘汰限制在单个进程的页框内，隔离性好，容易保证某个进程的工作集不被别的进程侵蚀，但内存利用率可能差。全局置换从系统或 memcg 的候选页中回收，整体利用率高，也更接近 Linux 的回收方式；问题是多个进程在内存压力下会互相挤掉热页。如果并发工作集总量超过物理内存，全局回收会表现为 pgscan 很高、major fault 和 swap 增加、CPU 等 IO，最终抖动。"
+        },
+        {
+          "question": "线上怀疑 Linux 页面回收导致延迟升高，你会看哪些指标来验证？",
+          "answer": "先看 `vmstat 1` 的 `si/so`、`wa`、上下文以及是否有明显内存压力；再看 `/proc/vmstat` 中 `pgfault`、`pgmajfault`、`pgscan_*`、`pgsteal_*`，如果扫描很多但回收很少，说明可回收页不足或脏页/匿名页回收困难。容器场景还要看 cgroup 的 `memory.stat`，例如 `pgmajfault`、`workingset_refault`、`inactive_file`、`active_anon`。同时关联 `kswapd` CPU、direct reclaim 栈、磁盘 writeback 延迟和业务 P99，才能判断是工作集超限、swap 抖动还是文件缓存被反复驱逐。"
         }
       ]
     },
@@ -72,55 +120,65 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释为什么需要页面置换",
-        "能说明 OPT、FIFO、LRU、LFU、Clock 的原理",
-        "能解释 Belady 异常及其只出现在 FIFO 中的原因",
-        "能说明时钟算法的实现细节和改进型",
-        "能解释抖动现象的原因和解决方案",
-        "能说明工作集模型的基本思想",
-        "能比较精确 LRU 和近似 LRU 的实现开销"
+        "能从缺页且无空闲页框的触发条件解释为什么需要页面置换",
+        "能区分 OPT、FIFO、LRU、LFU、Clock、WSClock 的淘汰信号和工程成本",
+        "能用栈性质解释 Belady 异常为什么出现在 FIFO 而不是 LRU/OPT",
+        "能说明 Clock 扫描时引用位、修改位和第二次机会的决策顺序",
+        "能解释 WSClock 如何用工作集窗口、最近使用时间和脏页写回改进 Clock",
+        "能比较全局置换与局部置换在隔离性、内存利用率和抖动风险上的取舍",
+        "能描述 Linux active/inactive LRU、匿名页/文件页、writeback、swap 与 memcg 回收的关系",
+        "能给出排查页面回收问题的观测证据，包括 major fault、pgscan、pgsteal、swap in/out、kswapd 和 writeback 延迟",
+        "能比较精确 LRU 的哈希表加双向链表实现与 OS 近似 LRU 的开销差异"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "os.memory-management.topic-page-replacement.recall.1",
-      "prompt": "请解释 OPT、FIFO、LRU、Clock 页面置换算法的核心思想和取舍。",
+      "prompt": "请解释 OPT、FIFO、LRU、Clock、WSClock 页面置换算法的核心思想，并说明真实 OS 为什么更偏向近似 LRU 而不是精确 LRU。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "os.memory-management.topic-page-replacement.recall.2",
-      "prompt": "什么是 Belady 异常？哪些算法会出现，哪些不会？为什么？",
+      "prompt": "什么是 Belady 异常？哪些算法会出现，哪些不会？请用栈性质解释原因。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "os.memory-management.topic-page-replacement.recall.3",
-      "prompt": "页面置换算法 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "线上服务出现 major fault 上升、kswapd CPU 升高和 P99 延迟尖刺时，如何判断是否由页面回收或工作集超内存导致？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "五种主要页面置换算法的原理",
-      "LRU 基于时间局部性的核心思想",
-      "Belady 异常只出现在 FIFO 中",
-      "时钟算法的环形链表和引用位机制"
+      "OPT 理论最优基准",
+      "FIFO 按进入时间淘汰与 Belady 异常",
+      "LRU 时间局部性与栈性质",
+      "Clock 环形扫描与引用位第二次机会",
+      "WSClock 工作集窗口、最近使用时间与脏页写回",
+      "Linux active/inactive LRU 近似回收链路"
     ],
     "goodToHave": [
-      "改进型时钟算法同时考虑修改位",
-      "LRU 的哈希表+双向链表实现",
-      "LFU 的老化机制"
+      "改进型 Clock 的引用位和修改位优先级",
+      "精确 LRU 的哈希表加双向链表实现成本",
+      "LFU 计数老化与阶段性热点问题",
+      "全局置换与局部置换的隔离性和利用率取舍",
+      "pgscan、pgsteal、pgmajfault、swap in/out、writeback 延迟排查证据"
     ],
     "commonMistakes": [
-      "不清楚LRU的实现方式（栈或计数器）",
-      "不了解Clock算法如何近似LRU",
-      "不知道颠簸（Thrashing）的原因和解决"
+      "把 FIFO 的进入时间误认为页面热度",
+      "认为增加页框数一定能降低 FIFO 缺页率",
+      "把缓存题里的精确 LRU 直接等同于操作系统页面回收",
+      "只说 Clock 是环形链表却说不清引用位清零和第二次机会",
+      "忽略脏页写回成本，把所有页面淘汰都说成直接丢弃",
+      "把 Linux 页面回收简单描述成单一 LRU 队列",
+      "排查抖动时只看 CPU 使用率，不看 major fault、swap 和回收扫描指标"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -129,11 +187,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-17",
   "status": "draft",
   "prerequisites": [
     "os.memory-management.topic-paging-segmentation"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「页面置换算法」说清五种主要页面置换算法的原理、LRU 基于时间局部性的核心思想，并放到操作系统与 Linux 排查场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "重点看候选人能否把教科书置换算法落到真实缺页处理：用栈性质解释 Belady 异常，用引用位/脏位/工作集窗口讲清 Clock 与 WSClock 的淘汰决策，并能把 Linux active/inactive LRU、memcg、swap、writeback 与 pgscan/pgsteal 等观测指标串成可验证的排查链路。"
 }

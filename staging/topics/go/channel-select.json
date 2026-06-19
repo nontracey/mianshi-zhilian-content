@@ -38,7 +38,17 @@
       "format": "mermaid",
       "content": "flowchart TB\nH[hchan: buf+qcount+dataqsiz+sendx+recvx+sendq+recvq+closed+lock] --> S{send 进入}\nS -->|closed=1| SP[panic: send on closed]\nS -->|recvq 非空| SD[sendDirect 直接拷到接收方栈]\nS -->|buf 未满| SB[写入 buf-sendx, qcount++]\nS -->|buf 已满| SQ[包成 sudog 挂入 sendq, gopark]\nH --> R{recv 进入}\nR -->|closed=1 且 buf 空| RZ[返回零值, ok=false]\nR -->|sendq 非空且 buf 满| RM[从 buf-recvx 取, 再把 sendq 头数据搬入 buf]\nR -->|buf 非空| RB[从 buf-recvx 读, qcount--]\nR -->|buf 空且 sendq 空| RQ[挂入 recvq, gopark]\nH --> C[close: closed=1, 全部唤醒 recvq, sendq 唤醒后 panic]",
       "fallback": "hchan 结构: buf+qcount+dataqsiz+sendx+recvx+sendq+recvq+closed+lock。send 路径: closed→panic / recvq非空→sendDirect / buf未满→入buf / buf满→挂sendq。recv 路径: closed且buf空→零值ok=false / 有发送方且buf满→取buf并搬sendq头数据 / buf非空→读buf / 全空→挂recvq。close: 置位+唤醒recvq+唤醒sendq(后者会panic)。",
-      "caption": "channel 所有行为都可以从 hchan 的字段状态推出：closed、buf 是否空/满、sendq/recvq 是否有等待者。"
+      "caption": "channel 所有行为都可以从 hchan 的字段状态推出：closed、buf 是否空/满、sendq/recvq 是否有等待者。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TB\nH[hchan: buf+qcount+dataqsiz+sendx+recvx+sendq+recvq+closed+lock] --> S{send 进入}\nS -->|closed=1| SP[panic: send on closed]\nS -->|recvq 非空| SD[sendDirect 直接拷到接收方栈]\nS -->|buf 未满| SB[写入 buf-sendx, qcount++]\nS -->|buf 已满| SQ[包成 sudog 挂入 sendq, gopark]\nH --> R{recv 进入}\nR -->|closed=1 且 buf 空| RZ[返回零值, ok=false]\nR -->|sendq 非空且 buf 满| RM[从 buf-recvx 取, 再把 sendq 头数据搬入 buf]\nR -->|buf 非空| RB[从 buf-recvx 读, qcount--]\nR -->|buf 空且 sendq 空| RQ[挂入 recvq, gopark]\nH --> C[close: closed=1, 全部唤醒 recvq, sendq 唤醒后 panic]"
+        },
+        {
+          "kind": "text",
+          "content": "hchan 结构: buf+qcount+dataqsiz+sendx+recvx+sendq+recvq+closed+lock。send 路径: closed→panic / recvq非空→sendDirect / buf未满→入buf / buf满→挂sendq。recv 路径: closed且buf空→零值ok=false / 有发送方且buf满→取buf并搬sendq头数据 / buf非空→读buf / 全空→挂recvq。close: 置位+唤醒recvq+唤醒sendq(后者会panic)。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -105,7 +115,7 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "我会把 channel 拆成三层来讲：底层数据结构、收发与关闭语义、select 在并发组合中的角色。\n\n底层：channel 在 runtime 里就是 hchan，里面有环形 buf、sendx/recvx 下标、sendq/recvq 两个 sudog 等待队列、closed 标志和一把 mutex。所以 channel 收发是有锁操作，配对成功时 runtime 会做 sendDirect 把数据从发送者栈直接拷到接收者栈。\n\n收发与关闭：无缓冲必须发收同时就绪，缓冲在 buf 未满/非空时可以单边继续。close 不销毁 channel——它把 closed 置位、唤醒 recvq 让它们拿零值+ok=false、唤醒 sendq 让它们 panic。三条死规则：向已关闭 chan 发送 panic、重复 close panic、close(nil) panic；这些 panic 不能 recover 业务正确性，所以靠所有权规避：永远由发送方关闭，多发送方场景用协调者或 sync.Once。\n\nselect：核心是伪随机选择就绪 case，多个就绪时不保证顺序；nil channel 的 case 永久阻塞，所以可以把已耗尽的输入置 nil 来禁用该分支；default 写非阻塞收发可以，但放进 for 循环就是忙轮询，pprof 一查 CPU 就在 selectgo 上转。\n\n生产边界：goroutine 泄漏看 pprof 里的 chansend/chanrecv 栈；time.After 在热路径会泄漏 timer，要换 NewTimer+Stop+Reset；缓冲不能替代消费能力，业务上更愿意把容量设小一点早暴露问题，而不是设大几千遮掩消费瓶颈。",
+      "content": "我会把 channel 拆成三层来讲：底层数据结构、收发与关闭语义、select 在并发组合中的角色。\n\n机制要点：\n- 底层：channel 在 runtime 里就是 hchan，里面有环形 buf、sendx/recvx 下标、sendq/recvq 两个 sudog 等待队列、closed 标志和一把 mutex。所以 channel 收发是有锁操作，配对成功时 runtime 会做 sendDirect 把数据从发送者栈直接拷到接收者栈。\n- 收发与关闭：无缓冲必须发收同时就绪，缓冲在 buf 未满/非空时可以单边继续。close 不销毁 channel——它把 closed 置位、唤醒 recvq 让它们拿零值+ok=false、唤醒 sendq 让它们 panic。三条死规则：向已关闭 chan 发送 panic、重复 close panic、close(nil) panic；这些 panic 不能 recover 业务正确性，所以靠所有权规避：永远由发送方关闭，多发送方场景用协调者或 sync.Once。\n- select：核心是伪随机选择就绪 case，多个就绪时不保证顺序；nil channel 的 case 永久阻塞，所以可以把已耗尽的输入置 nil 来禁用该分支；default 写非阻塞收发可以，但放进 for 循环就是忙轮询，pprof 一查 CPU 就在 selectgo 上转。\n- 生产边界：goroutine 泄漏看 pprof 里的 chansend/chanrecv 栈；time.After 在热路径会泄漏 timer，要换 NewTimer+Stop+Reset；缓冲不能替代消费能力，业务上更愿意把容量设小一点早暴露问题，而不是设大几千遮掩消费瓶颈。",
       "followUpQuestions": [
         {
           "question": "向已关闭 channel send 为什么必然 panic，而 recv 反而能拿到零值？",
@@ -186,5 +196,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-13"
+  "updatedAt": "2026-06-18"
 }

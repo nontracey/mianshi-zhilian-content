@@ -28,11 +28,21 @@
     },
     {
       "type": "diagram",
-      "format": "mermaid",
+      "format": "svg",
       "title": "IPC 的两类机制",
-      "content": "flowchart TD\nA[\"进程虚拟地址空间隔离\"] --> B{\"通信目标是什么\"}\nB -->|\"顺序字节流\"| C[\"匿名 pipe：fork 继承 fd\"]\nB -->|\"无亲缘字节流\"| D[\"FIFO 或 Unix Domain Socket\"]\nB -->|\"保留消息边界/优先级\"| E[\"消息队列：内核保存消息，进程退出后对象可继续存在\"]\nB -->|\"大块本机数据\"| F[\"共享内存：同一物理页映射到多进程\"]\nF --> G{\"是否有并发读写\"}\nG -->|\"是\"| H[\"信号量/进程间互斥锁保护元数据和数据区\"]\nG -->|\"否\"| I[\"只读映射或单写者协议\"]\nB -->|\"生命周期事件\"| J[\"信号：异步通知，普通信号可能合并\"]\nB -->|\"跨机器\"| K[\"TCP/UDP Socket\"]\nE --> L{\"API 族选择\"}\nL -->|\"历史组件/ipcs 运维\"| M[\"System V：msgget/shmget/semget\"]\nL -->|\"新项目/文件模型\"| N[\"POSIX：mq_open/shm_open/sem_open\"]",
-      "caption": "图中按通信目标分支：字节流、消息边界、大块共享、事件通知和跨机器通信会导向不同 IPC；共享内存分支必须再补同步设计，消息队列和共享内存还要区分 System V/POSIX API。",
-      "fallback": "IPC 选型先看目标：字节流用 pipe/FIFO/UDS，消息边界用消息队列，大块本机数据用共享内存并配同步，事件通知用信号，跨机器用 Socket；System V 与 POSIX 是常见 API 族差异。"
+      "content": "assets/diagrams/os-ipc-data-paths.svg",
+      "caption": "图里把管道/消息队列的内核缓冲拷贝、共享内存的同页映射、Socket/UDS 的端点路径放在一起，并把同步、生命周期和清理责任单独标出。",
+      "fallback": "IPC 选型先看目标：字节流用 pipe/FIFO/UDS，消息边界用消息队列，大块本机数据用共享内存并配同步，事件通知用信号，跨机器用 Socket；管道和消息队列经内核缓冲，共享内存映射同一物理页但必须自己处理互斥、消息边界和崩溃恢复。",
+      "sources": [
+        {
+          "kind": "svg",
+          "path": "assets/diagrams/os-ipc-data-paths.svg"
+        },
+        {
+          "kind": "text",
+          "content": "IPC 选型先看目标：字节流用 pipe/FIFO/UDS，消息边界用消息队列，大块本机数据用共享内存并配同步，事件通知用信号，跨机器用 Socket；管道和消息队列经内核缓冲，共享内存映射同一物理页但必须自己处理互斥、消息边界和崩溃恢复。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -41,33 +51,33 @@
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// 1. 匿名管道示例：父子进程通过继承 fd 通信\n#include <unistd.h>\n#include <stdio.h>\n#include <string.h>\n#include <sys/wait.h>\n\nint main() {\n    int fd[2];\n    if (pipe(fd) == -1) {\n        perror(\"pipe\");\n        return 1;\n    }\n\n    pid_t pid = fork();\n    if (pid == -1) {\n        perror(\"fork\");\n        return 1;\n    }\n\n    if (pid == 0) {\n        close(fd[0]);\n        const char *msg = \"Hello from child\";\n        write(fd[1], msg, strlen(msg));\n        close(fd[1]);\n        return 0;\n    }\n\n    close(fd[1]);\n    char buf[100];\n    ssize_t n = read(fd[0], buf, sizeof(buf) - 1);\n    if (n > 0) {\n        buf[n] = '\\0';\n        printf(\"Parent received: %s\\n\", buf);\n    }\n    close(fd[0]);\n    waitpid(pid, NULL, 0);\n    return 0;\n}\n\n// 2. 共享内存示例（POSIX）：真实工程还要配 sem_open/sem_wait 保护写入\n#include <sys/mman.h>\n#include <sys/stat.h>\n#include <fcntl.h>\n#include <unistd.h>\n\nint fd = shm_open(\"/myshm\", O_CREAT | O_RDWR, 0600);\nftruncate(fd, 4096);\nint *ptr = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);\n*ptr = 42;\nmunmap(ptr, 4096);\nclose(fd);\n\nint fd2 = shm_open(\"/myshm\", O_RDONLY, 0600);\nint *ptr2 = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd2, 0);\nprintf(\"Value: %d\\n\", *ptr2);\nmunmap(ptr2, 4096);\nclose(fd2);\nshm_unlink(\"/myshm\");",
+      "title": "C 可运行：pipe 传字节流，POSIX shared memory 共享同一页",
+      "content": "#include <fcntl.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <sys/mman.h>\n#include <sys/stat.h>\n#include <sys/wait.h>\n#include <unistd.h>\n\nstatic void fail(const char *what) {\n    perror(what);\n    exit(1);\n}\n\nint main(void) {\n    int pipefd[2];\n    if (pipe(pipefd) == -1) fail(\"pipe\");\n\n    char shm_name[64];\n    snprintf(shm_name, sizeof(shm_name), \"/ipc_demo_%ld\", (long)getpid());\n    int shmfd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);\n    if (shmfd == -1) fail(\"shm_open\");\n    if (ftruncate(shmfd, 4096) == -1) fail(\"ftruncate\");\n\n    char *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, shmfd, 0);\n    if (shared == MAP_FAILED) fail(\"mmap\");\n    snprintf(shared, 4096, \"shm: parent initialized shared page\");\n\n    pid_t pid = fork();\n    if (pid == -1) fail(\"fork\");\n\n    if (pid == 0) {\n        close(pipefd[0]);\n        const char *msg = \"pipe: child wrote bytes\";\n        if (write(pipefd[1], msg, strlen(msg)) == -1) fail(\"write\");\n        snprintf(shared, 4096, \"shm: child updated the same mapped page\");\n        close(pipefd[1]);\n        munmap(shared, 4096);\n        close(shmfd);\n        return 0;\n    }\n\n    close(pipefd[1]);\n    char pipe_buf[128];\n    ssize_t n = read(pipefd[0], pipe_buf, sizeof(pipe_buf) - 1);\n    if (n == -1) fail(\"read\");\n    pipe_buf[n] = '\\0';\n\n    if (waitpid(pid, NULL, 0) == -1) fail(\"waitpid\");\n    printf(\"%s\\n\", pipe_buf);\n    printf(\"%s\\n\", shared);\n\n    close(pipefd[0]);\n    munmap(shared, 4096);\n    close(shmfd);\n    shm_unlink(shm_name);\n    return 0;\n}",
       "language": "c",
       "highlights": [
         {
-          "line": 9,
-          "note": "pipe 创建内核管道缓冲区和一读一写两个文件描述符；后续 fork 后父子进程各自关闭不用的一端。"
+          "line": 17,
+          "note": "pipe 创建内核管道缓冲区和一读一写两个文件描述符；fork 后父子进程各自关闭不用的一端。"
         },
         {
-          "line": 22,
-          "note": "子进程关闭读端后只保留写端，避免父进程因为仍有写端引用而迟迟读不到 EOF。"
+          "line": 25,
+          "note": "MAP_SHARED 把同一个 POSIX shared memory 对象映射到父子进程虚拟地址空间。"
         },
         {
-          "line": 31,
-          "note": "父进程读取时预留 1 字节放字符串结束符；管道本身只提供字节流，不会自动补消息边界或结束符。"
+          "line": 35,
+          "note": "子进程写 pipe 只是写入字节流；管道不会自动保存业务消息边界。"
         },
         {
-          "line": 44,
-          "note": "shm_open 创建 POSIX 命名共享内存对象，权限 0600 避免其他用户进程误连。"
+          "line": 36,
+          "note": "子进程直接改 shared 映射区，父进程稍后能看到同一物理页上的新内容；这里是单写演示，真实工程要加同步。"
         },
         {
-          "line": 46,
-          "note": "MAP_SHARED 让写入映射页的修改对映射同一对象的其他进程可见；这里没有提供互斥，只适合演示单写场景。"
+          "line": 45,
+          "note": "父进程读取 pipe 时手动补字符串结束符，说明 pipe 本质上只是字节流。"
         },
         {
-          "line": 60,
-          "note": "shm_unlink 删除命名对象，避免进程退出后共享内存名字继续残留在系统中。"
+          "line": 56,
+          "note": "shm_unlink 删除命名共享内存对象，避免示例进程退出后留下持久对象。"
         }
       ]
     },
@@ -168,7 +178,7 @@
       "depth": 15
     }
   },
-  "updatedAt": "2026-06-17",
+  "updatedAt": "2026-06-19",
   "status": "production",
   "prerequisites": [
     "os.process-thread.topic-process-vs-thread"

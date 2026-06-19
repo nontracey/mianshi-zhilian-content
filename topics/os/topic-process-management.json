@@ -4,7 +4,7 @@
   "category": "linux-basics",
   "group": "linux-basics",
   "title": "进程管理与监控",
-  "summary": "掌握 Linux 下进程的查看、控制、优先级调整和资源监控方法，能够快速定位系统性能瓶颈",
+  "summary": "掌握从 R/S/D/Z/T 状态、父子回收、信号语义到 CPU/IO/内存/fd 证据链的 Linux 进程排查闭环，避免只背 top 命令或默认 kill -9。",
   "tags": [
     "Linux",
     "进程管理",
@@ -19,49 +19,71 @@
     {
       "type": "explain",
       "title": "看进程要同时看状态、资源和信号",
-      "content": "## 进程状态说明它在等什么\nLinux 进程有 PID、父子关系和状态。`R` 表示运行或可运行，`S` 表示可中断睡眠，`D` 多见于等待不可中断 IO，`Z` 是子进程已退出但父进程未回收，`T` 是被暂停。看到状态后再决定是查 CPU、IO、锁等待还是父进程回收问题。\n\n## 管理进程本质是发信号\n`ps/top/htop` 看快照和实时资源，`/proc/<pid>`、`lsof`、`strace` 看进程细节。停止进程优先发 `SIGTERM`，让进程清理资源；`SIGKILL` 只能作为兜底；`SIGHUP` 常用于重载配置；`SIGSTOP/SIGCONT` 用于暂停和恢复。\n\n## 线上排查要形成路径\nCPU 高先定位进程和线程，再看线程栈、系统调用或性能剖析；内存高看 RSS、堆和内存映射；IO 高看 `iostat/vmstat` 与进程打开文件。僵尸进程不吃 CPU/内存，但大量存在会占 PID，根因通常是父进程没有 `wait`。"
+      "content": "## 进程状态说明它在等什么\nLinux 进程有 PID、PPID、进程组、会话和状态。`R` 表示正在运行或可运行，通常要看 CPU、run queue 和线程栈；`S` 是可中断睡眠，常见于网络、锁、定时器等待；`D` 是不可中断睡眠，多和块 IO、NFS、驱动或内核路径有关，信号要等内核态返回后才生效；`Z` 是子进程已退出但父进程未 `wait` 回收；`T` 是被 job control 或 `SIGSTOP` 暂停。看到状态后再决定查 CPU、IO、锁等待还是父进程回收问题。\n\n## 管理进程本质是发信号\n`ps/top/htop` 看快照和实时资源，`/proc/<pid>`、`lsof`、`strace`、`perf` 看进程细节。停止进程优先发 `SIGTERM`，给进程关闭连接、落盘和释放锁的机会；超时且确认影响可接受时才升级 `SIGKILL`。`SIGKILL` 和 `SIGSTOP` 不能被捕获；`SIGHUP` 常用于重载配置；`SIGCONT` 用于恢复被暂停的进程。`nice/renice` 调的是调度权重，不是 CPU 硬限制。\n\n## 线上排查要形成路径\nCPU 高先定位进程，再定位线程和栈；内存高看 RSS、堆、native 和映射；IO 高看 `iostat/vmstat`、D 状态和 `wchan`；fd 或连接多看 `lsof`、`/proc/<pid>/fd`、`ss` 和连接池指标。僵尸进程不吃 CPU/内存，但大量存在会占 PID，根因通常是父进程没有 `wait/waitpid` 或 SIGCHLD 处理错误。"
     },
     {
       "type": "diagram",
-      "title": "Linux 进程状态流转",
-      "format": "mermaid",
-      "content": "flowchart TD\nA[fork 创建] --> B[R 运行或就绪]\nB --> C[S 可中断睡眠]\nC -->|事件就绪| B\nB --> D[D 不可中断 IO 等待]\nD -->|IO 返回| B\nB --> E[T 暂停]\nE -->|SIGCONT| B\nB --> F[Z 僵尸]\nF -->|父进程 wait 回收| G[释放进程表项]",
-      "caption": "进程状态不是背字母，关键是判断它在 CPU、IO、信号还是父进程回收链路上。",
-      "fallback": "Linux 进程状态：创建 -> 运行/睡眠/不可中断等待/暂停 -> 僵尸 -> 父进程回收。"
+      "title": "进程状态、信号控制与排查证据链",
+      "format": "svg",
+      "content": "assets/diagrams/os-process-management-triage.svg",
+      "caption": "图中把 fork/exec、R/S/D/Z/T 状态、wait 回收、TERM/KILL/STOP/CONT 信号语义，以及 CPU、D 状态、Z 状态、内存和 fd/连接问题的证据链放在一起，强调先判断状态再选择控制动作。",
+      "fallback": "进程管理先看 R/S/D/Z/T 状态：R 查 CPU 和线程栈，D 查 IO/NFS/内核等待，Z 查父进程 wait，S 查锁/网络/定时等待。终止优先 SIGTERM 并验证，超时且确认影响后才 SIGKILL。",
+      "sources": [
+        {
+          "kind": "svg",
+          "path": "assets/diagrams/os-process-management-triage.svg"
+        },
+        {
+          "kind": "text",
+          "content": "进程管理先看 R/S/D/Z/T 状态：R 查 CPU 和线程栈，D 查 IO/NFS/内核等待，Z 查父进程 wait，S 查锁/网络/定时等待。终止优先 SIGTERM 并验证，超时且确认影响后才 SIGKILL。"
+        }
+      ]
     },
     {
       "type": "compareTable",
       "title": "对比与边界",
-      "content": "| 信号 | 编号 | 作用 | 能否被捕获 |\n| --- | --- | --- | --- |\n| SIGHUP | 1 | 终端挂断/重载配置 | 能 |\n| SIGINT | 2 | Ctrl+C 中断 | 能 |\n| SIGTERM | 15 | 优雅终止（默认） | 能 |\n| SIGKILL | 9 | 强制终止 | 不能 |\n| SIGSTOP | 19 | 暂停进程 | 不能 |\n| SIGCONT | 18 | 恢复进程 | 不能 |"
+      "content": "| 信号 | Linux 常见编号 | 作用 | 能否被捕获 | 生产注意点 |\n| --- | --- | --- | --- | --- |\n| SIGHUP | 1 | 终端挂断/重载配置 | 能 | 常用于让守护进程重载配置，需确认程序是否支持 |\n| SIGINT | 2 | Ctrl+C 中断 | 能 | 交互场景常见，服务治理通常不依赖它 |\n| SIGTERM | 15 | 优雅终止（默认） | 能 | 生产优先使用，给清理资源和摘流时间 |\n| SIGKILL | 9 | 强制终止 | 不能 | 不执行清理逻辑，只应作为超时后的兜底 |\n| SIGSTOP | 19 | 暂停进程 | 不能 | 进程进入 T 状态，不释放资源 |\n| SIGCONT | 18 | 恢复进程 | 能 | 与 STOP 配套，用于恢复暂停进程 |\n| SIGCHLD | 17 | 子进程状态变化通知父进程 | 能 | 父进程应 wait/waitpid 回收，避免僵尸积累 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "#!/bin/bash\n\n# 1. 查看进程\nps aux | head -20                    # 所有进程\nps -ef --forest | head -20           # 进程树\nps aux --sort=-%cpu | head -6        # CPU 最高的进程\nps aux --sort=-%mem | head -6        # 内存最高的进程\n\n# 2. top 命令快捷键\n# top 启动后：\n# P - 按 CPU 排序\n# M - 按内存排序\n# 1 - 显示每个 CPU 核心\n# k - 杀进程\n# q - 退出\n\n# 3. 进程控制\nkill -15 <pid>        # 优雅终止\nkill -9 <pid>         # 强制终止\npkill -f 'java.*app'  # 按名称模式杀进程\nnohup java -jar app.jar > app.log 2>&1 &\n\n# 4. 系统资源监控\nvmstat 1 5            # 每秒采集 5 次\n# procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----\n#  r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st\n\niostat -x 1 3         # 磁盘 IO 详情\n\n# 5. 查看进程详情\nls -la /proc/<pid>/fd          # 打开的文件描述符\ncat /proc/<pid>/status         # 进程状态详情\ncat /proc/<pid>/maps           # 内存映射\nlsof -p <pid>                  # 打开的文件和连接\n\n# 6. 追踪系统调用\nstrace -p <pid> -e trace=network  # 只追踪网络相关系统调用\nstrace -c -p <pid>               # 统计系统调用耗时\n\n# 7. 调整进程优先级\nnice -n 10 ./heavy_task.sh      # 低优先级启动\nrenice -5 -p <pid>              # 提高优先级",
+      "title": "Bash 可运行：安全演示进程快照与 SIGTERM 清理",
+      "content": "#!/usr/bin/env bash\nset -euo pipefail\n\ntmpdir=$(mktemp -d)\ntrap 'rm -rf \"$tmpdir\"' EXIT\n\nworker=\"$tmpdir/worker.sh\"\ncat > \"$worker\" <<'WORKER'\ntrap 'echo \"worker: got SIGTERM, cleaning up\"; exit 0' TERM\necho \"worker $$ started\"\nwhile true; do\n  sleep 1\ndone\nWORKER\nchmod +x \"$worker\"\n\nbash \"$worker\" > \"$tmpdir/worker.log\" 2>&1 &\npid=$!\nsleep 0.2\n\necho \"process snapshot:\"\nps -o pid,ppid,state,comm -p \"$pid\"\n\necho \"send SIGTERM to $pid\"\nkill -TERM \"$pid\"\nwait \"$pid\" || true\n\ncat \"$tmpdir/worker.log\"\nif kill -0 \"$pid\" 2>/dev/null; then\n  echo \"worker still exists\"\nelse\n  echo \"worker exited after SIGTERM\"\nfi",
       "language": "bash",
       "highlights": [
         {
-          "line": 4,
-          "note": "这行承载示例的关键数据流，说明时要指出它改变了哪一段状态。"
+          "line": 10,
+          "note": "worker 捕获 SIGTERM，模拟服务收到优雅终止后执行清理逻辑。"
+        },
+        {
+          "line": 23,
+          "note": "ps 只查看刚启动的子进程，不扫描或改动系统其他进程。"
+        },
+        {
+          "line": 26,
+          "note": "示例只对自己启动的子进程发送 SIGTERM，避免演示代码误伤真实服务。"
+        },
+        {
+          "line": 30,
+          "note": "kill -0 只检查进程是否仍存在，不发送终止信号，适合验证退出结果。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**高频问题1：怎么查看和管理 Linux 进程？**\n\n查看进程主要用 ps 和 top。ps aux 查看所有进程快照，top 实时监控。top 里按 P 按 CPU 排序，按 M 按内存排序。\n\n管理进程主要用 kill 命令发送信号。最常用的是 kill -15 发送 SIGTERM 优雅终止，进程可以捕获信号做清理。如果进程不响应就用 kill -9 强制终止，这个信号不能被捕获。还可以用 pkill 按名称杀进程。\n\n**高频问题2：什么是僵尸进程？怎么处理？**\n\n僵尸进程是子进程已经退出，但父进程没有调用 wait 回收它的退出状态。僵尸进程在进程表中占一个条目（状态为 Z），但不占用 CPU 和内存。少量僵尸进程影响不大，但如果大量积累会耗尽 PID。\n\n处理方法是让父进程调用 wait 回收。如果父进程有 bug 不回收，可以杀死父进程，子进程会被 init 接管并自动回收。也可以在父进程中注册 SIGCHLD 信号处理函数，在回调中调用 waitpid。\n\n**高频问题3：线上服务器 CPU 飙高怎么排查？**\n\n先 top 看是哪个进程占用 CPU 高，找到 PID。然后 top -Hp PID 看是哪个线程。如果是 Java 进程，把线程 ID 转为十六进制，用 jstack PID | grep '十六进制ID' 看线程在执行什么代码。常见原因有死循环、频繁 GC、锁竞争等。",
+      "content": "**30 秒结论**\n进程管理不是先想 kill，而是先读状态和证据。`R/S/D/Z/T` 告诉我进程是在跑、可中断等待、不可中断 IO、已退出待回收，还是被暂停；信号只是控制手段，生产终止默认从 `SIGTERM` 开始，给清理窗口，确认仍存活且影响可接受时才升级 `SIGKILL`。\n\n**排查闭环**\n1. 先看快照和状态：`ps` 看 PID/PPID/STAT/command，`top` 或 `htop` 看 CPU、内存、线程视角；状态决定下一步，不同状态不能用同一套命令硬套。\n2. CPU 高：定位进程后看线程，Java 把线程 ID 转十六进制对 `jstack` 的 `nid`；原生服务用 `perf top/record`、火焰图或采样器，看是业务循环、锁竞争、系统调用还是 GC。\n3. D 状态：不要以为 kill 立刻生效，它通常卡在不可中断内核路径，要查 `wchan`、块设备/NFS、`iostat`、内核日志和调用栈。\n4. Z 僵尸：它已经退出，杀它没有意义；应查 PPID，让父进程 `wait/waitpid`，或修 SIGCHLD 处理逻辑。\n5. 内存、fd、连接问题：看 RSS/smaps/heap/native、`lsof`、`/proc/<pid>/fd`、`ss` 和连接池指标，避免把资源泄漏误判成单纯 CPU 问题。\n\n**边界**\n`nice/renice` 调的是调度权重，不是 CPU 配额；`pkill -f` 和 `kill -9` 都要谨慎，前者可能误杀匹配到的其他进程，后者不会执行清理逻辑。结论要能给出证据、最小动作和验证方式。",
       "followUpQuestions": [
         {
           "question": "僵尸进程为什么杀不掉？应该处理谁？",
-          "answer": "僵尸进程已经退出，只剩进程表里的退出状态，不能再被普通 kill 杀掉。应让父进程调用 wait/waitpid 回收；如果父进程异常，可处理父进程，让子进程被 init/systemd 接管后回收。"
+          "answer": "僵尸进程已经执行完，只剩退出码和少量进程表项，普通 kill 没有目标可杀。应处理父进程：确认 PPID，让父进程调用 wait/waitpid；如果父进程异常且不可修复，终止父进程后让子进程被 init/systemd 接管回收。真正要修的是父进程 SIGCHLD 或 wait 逻辑，否则还会继续产生。"
         },
         {
           "question": "CPU 飙高时，为什么要从进程继续定位到线程？",
-          "answer": "多线程进程里 CPU 往往由少数线程消耗。先 top 找 PID，再 top -H -p PID 找线程 ID，Java 里把线程 ID 转十六进制后用 jstack 对应 nid，才能定位具体代码栈。"
+          "answer": "多线程进程里 CPU 往往由少数线程消耗，只看进程 PID 只能定位到服务，不能定位到代码。先找 PID，再看线程级 CPU；Java 把线程 ID 转十六进制后匹配 jstack 的 nid，原生服务用 perf 或采样器。这样才能区分死循环、锁自旋、频繁 GC、系统调用热点或业务热点。"
         },
         {
           "question": "strace 和 lsof 分别适合回答什么问题？",
-          "answer": "strace 适合看进程卡在哪类系统调用，例如网络、文件、锁或超时；lsof 适合看进程打开了哪些文件、socket 和端口。二者通常用于从资源现象追到进程行为。"
+          "answer": "strace 适合看进程正在进入哪些系统调用，例如网络读写、文件 IO、futex 锁等待或超时；它会带来观测开销，生产要控制范围。lsof 适合回答进程持有哪些文件、socket、端口和被删除但仍打开的文件。两者一起用时，是从“资源现象”追到“进程行为和持有者”。"
         }
       ]
     },
@@ -69,13 +91,13 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能用 ps 和 top 查看进程信息和资源占用",
-        "能区分 SIGTERM 和 SIGKILL 的使用场景",
-        "能解释进程的五种状态（R/S/D/Z/T）",
-        "能说明僵尸进程的产生原因和处理方法",
-        "能用 vmstat 和 iostat 监控系统资源",
-        "能用 strace 追踪进程的系统调用",
-        "能说明 CPU 飙高问题的排查思路"
+        "能用 R/S/D/Z/T 判断进程下一步应查 CPU、IO、锁等待还是父进程回收",
+        "能区分 SIGTERM、SIGKILL、SIGSTOP、SIGCONT、SIGCHLD 的语义和生产边界",
+        "能说明僵尸进程为什么杀不掉，以及父进程 wait/waitpid 的责任",
+        "能给出 CPU 高从进程到线程到栈/采样的定位路径",
+        "能解释 D 状态为什么 kill 不一定立即生效，并能关联 IO/NFS/wchan/iostat",
+        "能用 lsof、fd 数、ss、smaps、vmstat、iostat 组成资源证据链",
+        "能说明 nice/renice 是调度权重而不是 CPU 硬限制"
       ]
     }
   ],
@@ -104,20 +126,22 @@
   ],
   "rubric": {
     "mustHave": [
-      "ps aux 和 top 命令的使用方法",
-      "SIGTERM 可捕获 vs SIGKILL 不可捕获的区别",
-      "僵尸进程的产生原因和处理方法",
-      "进程五种状态（R/S/D/Z/T）的含义"
+      "R/S/D/Z/T 状态的含义和对应排查方向",
+      "SIGTERM 可捕获、SIGKILL 不可捕获、SIGSTOP/SIGCONT 暂停恢复的区别",
+      "僵尸进程的产生原因、为什么杀不掉，以及父进程 wait/waitpid 处理方法",
+      "CPU 高从进程到线程到栈/采样的定位路径"
     ],
     "goodToHave": [
-      "strace 追踪系统调用的使用场景",
-      "lsof 查看进程打开的文件和连接",
-      "nice/renice 调整进程优先级"
+      "strace、lsof、wchan、vmstat、iostat 的适用场景和观测开销",
+      "D 状态和 IO/NFS/内核等待的关系",
+      "nice/renice 调整的是调度权重，不是 CPU 硬限制"
     ],
     "commonMistakes": [
-      "只列出 进程管理、top、系统监控，但说不出触发条件、状态变化和验证证据",
-      "把「进程管理与监控」的适用场景、失效条件和相邻概念混在一起",
-      "遇到操作系统与 Linux 排查里的真实问题时，不能说明「进程管理与监控」应该观察哪些状态、日志或指标"
+      "只背 ps/top/kill 命令，说不出状态背后的等待对象和下一步证据",
+      "默认 kill -9 或 pkill -f，不给优雅退出窗口也不验证误杀风险",
+      "认为僵尸进程能被直接 kill，忽略父进程 wait/waitpid 责任",
+      "看到 D 状态仍期待信号立即生效，不查 IO、NFS、wchan 或内核等待",
+      "把 nice/renice 当成 CPU 配额或限流手段"
     ],
     "scoreWeights": {
       "coverage": 35,
@@ -126,11 +150,11 @@
       "depth": 15
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-19",
   "status": "production",
   "prerequisites": [
     "os.linux-basics.topic-file-permissions"
   ],
   "interviewFrequency": "low",
-  "interviewerFocus": "考察是否能围绕「进程管理与监控」说清ps aux 和 top 命令的使用方法、SIGTERM 可捕获 vs SIGKILL 不可捕获的区别，并放到操作系统与 Linux 排查场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察是否能围绕「进程管理与监控」说清 R/S/D/Z/T 状态、父子进程回收、SIGTERM/SIGKILL/SIGSTOP/SIGCONT/SIGCHLD 的语义，并能把 CPU、D 状态、Z 僵尸、内存、fd/连接等问题串成可验证的 Linux 排查链路，而不是只罗列 ps/top/kill 命令。"
 }

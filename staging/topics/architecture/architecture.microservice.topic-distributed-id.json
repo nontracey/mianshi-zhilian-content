@@ -31,10 +31,20 @@
     {
       "type": "diagram",
       "format": "mermaid",
-      "title": "分布式 ID 主流方案",
-      "content": "flowchart TD\nA[\"分布式唯一 ID 需求\"] --> B[\"UUID：本地生成但无序、伤索引\"]\nA --> C[\"雪花算法：时间戳+机器ID+序列，趋势递增，怕时钟回拨\"]\nA --> D[\"号段模式 Leaf：批量取一段本地分配，少访问 DB\"]\nA --> E[\"Redis INCR：原子自增，需持久化\"]",
-      "caption": "分布式 ID 方案：UUID 本地生成但无序伤索引；雪花算法趋势递增、高性能但怕时钟回拨；号段模式批量取段、少访问 DB；Redis INCR 原子自增需持久化。",
-      "fallback": "分布式唯一 ID 方案：UUID（本地生成但无序、伤 B+ 树索引）、雪花算法（时间戳加机器 ID 加序列、趋势递增、怕时钟回拨）、号段模式 Leaf（批量取一段本地分配、少访问 DB）、Redis INCR（原子自增、需持久化）。"
+      "title": "分布式 ID 选型：唯一性、趋势递增、时钟回拨与号段缓冲",
+      "content": "flowchart TD\nA[\"生成 ID 请求\"] --> B{\"核心诉求\"}\nB -->|简单无序| C[\"UUID/ULID\n注意索引局部性\"]\nB -->|趋势递增低延迟| D[\"Snowflake\n时间戳+机器号+序列\"]\nB -->|DB 可控批量取号| E[\"号段模式\nSegment buffer\"]\nD --> F{\"时钟回拨\"}\nF -->|小幅| G[\"等待/序列借位/告警\"]\nF -->|严重| H[\"拒绝发号/切备用节点\"]\nE --> I[\"双 buffer 预取\nDB 故障短期可用\"]\nC --> J[\"写入业务表/索引\"]\nG --> J\nI --> J",
+      "caption": "分布式 ID 选型：唯一性、趋势递增、时钟回拨与号段缓冲",
+      "fallback": "图展示分布式 ID 根据唯一性、趋势递增和可用性诉求选择 UUID、Snowflake 或号段，并处理时钟回拨。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[\"生成 ID 请求\"] --> B{\"核心诉求\"}\nB -->|简单无序| C[\"UUID/ULID\n注意索引局部性\"]\nB -->|趋势递增低延迟| D[\"Snowflake\n时间戳+机器号+序列\"]\nB -->|DB 可控批量取号| E[\"号段模式\nSegment buffer\"]\nD --> F{\"时钟回拨\"}\nF -->|小幅| G[\"等待/序列借位/告警\"]\nF -->|严重| H[\"拒绝发号/切备用节点\"]\nE --> I[\"双 buffer 预取\nDB 故障短期可用\"]\nC --> J[\"写入业务表/索引\"]\nG --> J\nI --> J"
+        },
+        {
+          "kind": "text",
+          "content": "图展示分布式 ID 根据唯一性、趋势递增和可用性诉求选择 UUID、Snowflake 或号段，并处理时钟回拨。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -50,7 +60,25 @@
       "type": "code",
       "title": "代码示例",
       "content": "// 1. 雪花算法实现\npublic class SnowflakeIdGenerator {\n    // 起始时间戳 (2024-01-01 00:00:00)\n    private static final long START_TIMESTAMP = 1704067200000L;\n    // 各部分位数\n    private static final long WORKER_ID_BITS = 5L;\n    private static final long DATACENTER_ID_BITS = 5L;\n    private static final long SEQUENCE_BITS = 12L;\n    // 最大值\n    private static final long MAX_WORKER_ID = ~(-1L << WORKER_ID_BITS);\n    private static final long MAX_DATACENTER_ID = ~(-1L << DATACENTER_ID_BITS);\n    private static final long SEQUENCE_MASK = ~(-1L << SEQUENCE_BITS);\n    // 左移位数\n    private static final long WORKER_ID_SHIFT = SEQUENCE_BITS;\n    private static final long DATACENTER_ID_SHIFT = SEQUENCE_BITS + WORKER_ID_BITS;\n    private static final long TIMESTAMP_SHIFT = SEQUENCE_BITS + WORKER_ID_BITS + DATACENTER_ID_BITS;\n\n    private long workerId;\n    private long datacenterId;\n    private long sequence = 0L;\n    private long lastTimestamp = -1L;\n\n    public synchronized long nextId() {\n        long current = System.currentTimeMillis();\n        if (current < lastTimestamp) {\n            throw new RuntimeException(\"时钟回拨\");\n        }\n        if (current == lastTimestamp) {\n            sequence = (sequence + 1) & SEQUENCE_MASK;\n            if (sequence == 0) {\n                current = waitNextMillis(lastTimestamp);\n            }\n        } else {\n            sequence = 0L;\n        }\n        lastTimestamp = current;\n        return ((current - START_TIMESTAMP) << TIMESTAMP_SHIFT)\n            | (datacenterId << DATACENTER_ID_SHIFT)\n            | (workerId << WORKER_ID_SHIFT)\n            | sequence;\n    }\n}\n\n// 2. 号段模式实现\n@Service\npublic class SegmentIdGenerator {\n    private final AtomicLong currentId = new AtomicLong(0);\n    private final AtomicLong maxId = new AtomicLong(0);\n    private final IdAllocMapper idAllocMapper;\n\n    public long nextId() {\n        long id = currentId.incrementAndGet();\n        if (id > maxId.get()) {\n            synchronized (this) {\n                if (id > maxId.get()) {\n                    // 从DB批量获取新号段\n                    IdSegment segment = idAllocMapper.allocSegment(\"order_id\");\n                    currentId.set(segment.getStart());\n                    maxId.set(segment.getEnd());\n                    id = currentId.incrementAndGet();\n                }\n            }\n        }\n        return id;\n    }\n}\n\n// 3. UUID生成\npublic class IdUtil {\n    public static String uuid() {\n        return UUID.randomUUID().toString().replace(\"-\", \"\");\n    }\n\n    // 更短的ID\n    public static String shortId() {\n        return Long.toString(UUID.randomUUID().getMostSignificantBits(), 36)\n            + Long.toString(UUID.randomUUID().getLeastSignificantBits(), 36);\n    }\n}",
-      "language": "java"
+      "language": "java",
+      "highlights": [
+        {
+          "line": 2,
+          "note": "`public class SnowflakeIdGenerator {` 定义了 分布式 ID 生成方案 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+        },
+        {
+          "line": 25,
+          "note": "`if (current < lastTimestamp) {` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+        },
+        {
+          "line": 58,
+          "note": "`currentId.set(segment.getStart());` 更新核心数据结构，是解释状态如何推进的抓手。"
+        },
+        {
+          "line": 23,
+          "note": "`public synchronized long nextId() {` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
@@ -135,5 +163,5 @@
   ],
   "interviewFrequency": "high",
   "interviewerFocus": "考察能否解释为什么需要分布式 ID、对比主流方案、讲清雪花算法位结构和时钟回拨，并知道 UUID 无序伤索引、号段预取等要点。",
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-18"
 }

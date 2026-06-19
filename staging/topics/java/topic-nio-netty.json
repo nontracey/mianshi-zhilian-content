@@ -19,25 +19,35 @@
     {
       "type": "explain",
       "title": "BIO / NIO / AIO 与 Reactor",
-      "content": "## 三种 IO 模型\n- **BIO（同步阻塞）**：一连接一线程，`accept`/`read` 都阻塞。连接数多时线程爆炸、大量线程在阻塞，吞吐差。\n- **NIO（同步非阻塞 + 多路复用）**：三件套 **Channel / Buffer / Selector**。一个线程用 `Selector` 同时监听多个 Channel 的就绪事件（底层就是 epoll），就绪才处理，单线程撑大量连接。注意 NIO 的“非阻塞”指 Channel 配置非阻塞 + Selector 多路复用，不是真异步。\n- **AIO（异步非阻塞）**：发起读写后由内核完成再回调（Proactor）。Linux 下 JDK 的 AIO 仍用 epoll 模拟，优势不明显，生产少用。\n\n## Reactor 模型\nNIO 的工程化范式：用一个/一组 `Selector` 线程（Reactor）负责事件分发，IO 就绪后把任务派给处理器。这正是 Netty、Redis、Nginx 的网络骨架。"
+      "content": "## 三种 IO 模型\n- **BIO（同步阻塞）**：一连接一线程，`accept/read/write` 阻塞。连接数多时线程数量和上下文切换成本迅速上升。\n- **NIO（同步非阻塞 + 多路复用）**：Channel 配成非阻塞，Selector 监听多个 Channel 的就绪事件；Linux 常见实现基于 epoll。注意 NIO 不是“异步 IO”，就绪后的读写仍由应用线程执行。\n- **AIO（异步 IO）**：应用提交读写后通过回调/`Future` 获取完成结果。Java AIO 在主流网络服务里的生态和收益有限，生产网络框架更常见的是 NIO/Reactor。\n\n## Reactor 模型\nReactor 是 NIO 的工程化范式：事件循环线程等待就绪事件，分发给 Handler 处理。单 Reactor 简单但一个线程压力大；主从 Reactor 用 boss 接收连接、worker 处理读写，更适合多核和高并发长连接。"
     },
     {
       "type": "explain",
       "title": "Netty：为什么用它，核心组件",
-      "content": "## 为什么不用裸 NIO\n裸 NIO 的 API 繁琐、有 epoll 空轮询导致 CPU 100% 的 JDK bug、还要自己处理拆包粘包与内存管理。Netty 封装了这些并提供高性能抽象。\n\n## 核心组件\n- **EventLoop**：绑定一个线程 + 一个 Selector，串行处理注册到它的所有 Channel 的 IO 事件与任务，无锁化设计。\n- **Channel + ChannelPipeline**：每个连接一个 Channel，Pipeline 是一条 **ChannelHandler 责任链**，入站/出站事件依次流过各 Handler（编解码、业务逻辑）。\n- **ByteBuf**：替代 NIO ByteBuffer，读写双指针、**池化**复用减少 GC、支持**零拷贝**（CompositeByteBuf、slice、文件区域 transferTo）。\n- **主从 Reactor**：`bossGroup`（少量线程）只负责 `accept` 新连接，`workerGroup` 负责已建立连接的读写。对应 epoll 的分工，充分利用多核。\n\n## 选型\n高并发长连接、自定义协议网关、RPC 框架（Dubbo/gRPC-Java 底层）都用 Netty。"
+      "content": "## 为什么用 Netty\n裸 NIO 要自己处理 Selector 生命周期、粘包拆包、半包、连接状态、异常关闭、内存复用和历史 JDK/平台差异。Netty 把这些沉淀成稳定抽象。\n\n## 核心组件\n- **EventLoop**：一个线程循环处理注册到它的 Channel 事件和任务。它靠串行化减少锁竞争，因此绝不能执行慢 SQL、远程 RPC、文件大 IO 这类阻塞逻辑。\n- **ChannelPipeline**：每个 Channel 一条 Handler 链，入站事件从头到尾传播，出站事件反向传播。编解码、鉴权、业务处理、异常处理都放在明确位置。\n- **ByteBuf**：比 ByteBuffer 更适合网络协议，读写指针分离、池化、切片/组合减少拷贝，但引用计数泄漏要用 leak detector 和规范 release。\n- **Frame Decoder**：TCP 是字节流，没有消息边界。自定义协议必须用长度字段、分隔符或固定长度解码器解决粘包拆包。"
     },
     {
       "type": "diagram",
       "format": "mermaid",
-      "title": "从 BIO 到 NIO 到 Netty",
-      "content": "flowchart TD\nA[\"BIO 一连接一线程，阻塞，线程爆炸\"] --> B[\"NIO Channel/Buffer/Selector 多路复用，一线程管多连接\"]\nB --> C[\"Reactor 模型：Selector 分发事件\"]\nC --> D[\"Netty 封装：EventLoop + Pipeline + ByteBuf + 主从 Reactor\"]\nD --> E[\"bossGroup accept，workerGroup 读写，利用多核\"]",
-      "caption": "从 BIO（一连接一线程）到 NIO（Selector 多路复用）到 Netty（EventLoop、Pipeline、ByteBuf、主从 Reactor 封装），是高并发网络编程的演进主线。",
-      "fallback": "BIO 一连接一线程、阻塞；NIO 用 Channel/Buffer/Selector 多路复用、一线程管多连接；Reactor 模型用 Selector 分发事件；Netty 封装成 EventLoop 加 Pipeline 加 ByteBuf 加主从 Reactor，bossGroup accept、workerGroup 读写。"
+      "title": "Netty Reactor 与 Pipeline：连接接入、事件分发、编解码和阻塞隔离",
+      "content": "flowchart LR\nA[\"Client 连接\"] --> B[\"Boss EventLoop\naccept 新连接\"]\nB --> C[\"注册 Channel 到 Worker EventLoop\"]\nC --> D[\"Selector 等待 OP_READ/OP_WRITE\"]\nD --> E[\"ByteBuf 接收字节流\"]\nE --> F[\"FrameDecoder\n解决粘包/半包\"]\nF --> G[\"Inbound Handler\n鉴权/解码/业务入口\"]\nG --> H{\"是否慢操作\"}\nH -->|否| I[\"EventLoop 内快速处理\"]\nH -->|是| J[\"提交业务线程池\nDB/RPC/文件 IO\"]\nI --> K[\"Outbound Handler\n编码/写回\"]\nJ --> K\nK --> L[\"Channel flush\"]\nE --> M[\"引用计数/池化\n防 ByteBuf 泄漏\"]",
+      "caption": "Netty 题要让听者看到一条真实网络请求如何从 accept、read、decode、handler、encode 到 write。",
+      "fallback": "图展示 Netty 主从 Reactor、Worker EventLoop、Pipeline 入站/出站、FrameDecoder 和慢操作隔离的关系。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart LR\nA[\"Client 连接\"] --> B[\"Boss EventLoop\naccept 新连接\"]\nB --> C[\"注册 Channel 到 Worker EventLoop\"]\nC --> D[\"Selector 等待 OP_READ/OP_WRITE\"]\nD --> E[\"ByteBuf 接收字节流\"]\nE --> F[\"FrameDecoder\n解决粘包/半包\"]\nF --> G[\"Inbound Handler\n鉴权/解码/业务入口\"]\nG --> H{\"是否慢操作\"}\nH -->|否| I[\"EventLoop 内快速处理\"]\nH -->|是| J[\"提交业务线程池\nDB/RPC/文件 IO\"]\nI --> K[\"Outbound Handler\n编码/写回\"]\nJ --> K\nK --> L[\"Channel flush\"]\nE --> M[\"引用计数/池化\n防 ByteBuf 泄漏\"]"
+        },
+        {
+          "kind": "text",
+          "content": "图展示 Netty 主从 Reactor、Worker EventLoop、Pipeline 入站/出站、FrameDecoder 和慢操作隔离的关系。"
+        }
+      ]
     },
     {
       "type": "compareTable",
       "title": "BIO / NIO / AIO 对比",
-      "content": "| 对比项 | BIO | NIO | AIO |\n| --- | --- | --- | --- |\n| 阻塞模型 | 同步阻塞 | 同步非阻塞+多路复用 | 异步非阻塞 |\n| 连接:线程 | 1:1 | N:1（Selector） | 回调，无固定绑定 |\n| 底层 | accept/read 阻塞 | epoll/kqueue | Linux 仍 epoll 模拟 |\n| 适用 | 连接少、逻辑简单 | 高并发长连接 | 理论高并发，实践少 |"
+      "content": "| 对比项 | BIO | NIO | AIO |\n| --- | --- | --- | --- |\n| 阻塞模型 | 同步阻塞 | 同步非阻塞 + 多路复用 | 异步完成通知 |\n| 连接:线程 | 通常 1:1 | 多连接复用少量 Selector 线程 | 由实现管理回调/完成通知 |\n| 关键对象 | Socket/ServerSocket | Channel/Buffer/Selector | AsynchronousChannel/Future/CompletionHandler |\n| 适用 | 连接少、开发简单 | 高并发长连接、主流网络框架 | 特定平台/场景评估后使用 |\n| 常见误区 | 线程池能无限解决阻塞 | 把 NIO 说成异步 IO | 以为 Java AIO 一定优于 NIO |"
     },
     {
       "type": "code",
@@ -54,7 +64,7 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：这块要按「BIO 到 NIO 到 Netty」一条线讲。BIO 一连接一线程、阻塞，连接多了线程爆炸；NIO 用 Channel/Buffer/Selector 多路复用、一个线程管大量连接（底层 epoll）；Netty 是对 NIO 的工程化封装，解决了裸 NIO 的各种坑，是高并发网络编程的事实标准。\n\n三种 IO 模型：\n\n1. BIO（同步阻塞）：accept、read 都阻塞，一连接一线程，吞吐差。\n2. NIO（同步非阻塞加多路复用）：三件套 Channel、Buffer、Selector，一个线程用 Selector 监听多个 Channel 的就绪事件、就绪才处理。注意它是「同步非阻塞」不是异步——就绪后那次 read 仍要自己做。\n3. AIO（异步）：发起读写后内核完成再回调，但 Linux 下 JDK AIO 用 epoll 模拟、优势不明显，生产少用。\n\nReactor 模型是 NIO 的工程范式：Selector 线程负责事件分发，就绪后派给处理器。Netty、Redis、Nginx 都是这个骨架。\n\n为什么用 Netty 不用裸 NIO：裸 NIO API 繁琐、有 epoll 空轮询导致 CPU 100% 的 JDK bug、还要自己处理粘包拆包和内存。Netty 核心组件：\n\n1. EventLoop：一个线程加一个 Selector，串行处理它名下所有 Channel 的事件，无锁化。\n2. Channel 加 ChannelPipeline：每连接一个 Channel，Pipeline 是 ChannelHandler 责任链，入站出站事件依次流过（编解码、业务）。\n3. ByteBuf：替代 ByteBuffer，读写双指针、池化复用减少 GC、支持零拷贝。\n4. 主从 Reactor：bossGroup 只 accept 新连接，workerGroup 负责读写，对应 epoll 分工、利用多核。\n\n边界。① EventLoop 线程里绝不能做耗时阻塞操作（DB、远程调用），会卡住它名下所有连接，要丢到业务线程池。② 自定义协议必须自己处理粘包拆包，Netty 提供 LengthFieldBasedFrameDecoder 等解码器。",
+      "content": "结论：按 BIO → NIO → Reactor → Netty 讲最清楚。BIO 一连接一线程，连接多了线程和上下文切换先爆；NIO 用 Channel/Buffer/Selector 让少量线程监听大量连接的就绪事件；Netty 是 NIO/Reactor 的成熟工程化实现。\n\nNetty 的核心是三件事：\n1. EventLoop 串行处理 Channel 事件，避免锁竞争，但因此不能阻塞。\n2. Pipeline 把字节流处理拆成 Handler 链，编解码、鉴权、业务和异常处理各在其位。\n3. ByteBuf 与 FrameDecoder 解决网络协议的内存复用和消息边界问题。\n\n排查线上问题时，我会看 EventLoop 是否被慢任务卡住、Pipeline Handler 顺序是否正确、是否缺 FrameDecoder、ByteBuf 是否泄漏、连接数和 backlog 是否异常。",
       "followUpQuestions": [
         {
           "question": "Netty 的 EventLoop 里能做耗时阻塞操作吗？",
@@ -103,20 +113,21 @@
   ],
   "rubric": {
     "mustHave": [
-      "能区分 BIO/NIO/AIO 三种模型",
-      "能说出 NIO 三件套 Channel/Buffer/Selector 和多路复用",
-      "能讲清 Netty 的 EventLoop、Pipeline、ByteBuf、主从 Reactor",
-      "能指出 EventLoop 不能做阻塞操作"
+      "能区分 BIO/NIO/AIO 的阻塞语义和连接线程关系",
+      "能说清 Channel/Buffer/Selector 与 Reactor 的关系",
+      "能讲清 Netty EventLoop、Pipeline、ByteBuf、FrameDecoder 的职责",
+      "能指出 EventLoop 不能阻塞和 TCP 粘包拆包必须处理"
     ],
     "goodToHave": [
-      "能解释 Reactor 模型和 epoll 的关系",
-      "能说明 ByteBuf 池化和零拷贝",
-      "能说出裸 NIO 的 epoll 空轮询 bug"
+      "能解释主从 Reactor 的 boss/worker 分工",
+      "能说明 ByteBuf 池化、引用计数和零拷贝边界",
+      "能用 EventLoop lag、连接数、ByteBuf leak、Handler 顺序定位问题"
     ],
     "commonMistakes": [
       "把 NIO 当成异步 IO",
-      "在 EventLoop 线程里做阻塞操作卡住所有连接",
-      "自定义协议不处理粘包拆包"
+      "在 EventLoop 线程里做阻塞操作卡住多个连接",
+      "自定义协议不处理粘包/半包",
+      "只背 Netty 组件名，说不出一条请求如何穿过 Pipeline"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -125,7 +136,7 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-18",
   "status": "staging",
   "interviewFrequency": "high",
   "interviewerFocus": "考察能否按 BIO→NIO→Netty 讲清演进、说明 NIO 多路复用和 Reactor、Netty 核心组件，并知道 EventLoop 不能阻塞、粘包处理。",

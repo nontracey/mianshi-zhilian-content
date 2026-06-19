@@ -27,11 +27,21 @@
     },
     {
       "type": "diagram",
-      "title": "RabbitMQ 消息流转与可靠性确认点",
+      "title": "RabbitMQ 原理：Exchange 路由与确认链路",
       "format": "mermaid",
-      "content": "flowchart LR\nP[\"生产者\"] -->|publish| X[\"Exchange\"]\nX -->|按 Routing Key 匹配 Binding| Q[\"Queue\"]\nQ -->|push 或 pull| C[\"消费者\"]\nX -->|Publisher Confirm 回执| P\nC -->|手动 Ack 确认| Q\nQ -->|Nack 或 TTL 或 超长| D[\"死信交换机 DLX\"]",
-      "caption": "RabbitMQ 消息流转与可靠性确认点：生产者 publish 到 Exchange，按 Routing Key 路由到 Queue，消费者 Ack 后删除；Publisher Confirm 保证到达 Broker，死信转投 DLX。",
-      "fallback": "生产者 publish 到 Exchange，按 Routing Key 匹配 Binding 路由到 Queue，消费者 push 或 pull 消费并手动 Ack。Exchange 通过 Publisher Confirm 给生产者回执；消息被 Nack、TTL 过期或队列超长时进入死信交换机 DLX。"
+      "content": "flowchart TD\nA[Producer] --> B[Publisher Confirm 打开]\nB --> C[Exchange]\nC --> D{Exchange 类型}\nD -->|Direct| E[Routing Key 精确匹配]\nD -->|Topic| F[* 和 # 通配符匹配]\nD -->|Fanout| G[广播到所有绑定队列]\nD -->|Headers| H[按 Header 条件匹配]\nE --> I[Binding]\nF --> I\nG --> I\nH --> I\nI --> J[Queue durable/quorum]\nJ --> K[Consumer 手动 Ack]\nK -->|Ack| L[Broker 删除已确认消息]\nK -->|Nack requeue=false| M[Dead Letter Exchange]\nM --> N[DLQ 或延迟/失败处理]\nC -->|mandatory 路由失败| O[Return Callback]",
+      "caption": "把 RabbitMQ 的路由模型和可靠性确认点放在同一张图中：confirm、return、queue、ack、DLX。",
+      "fallback": "RabbitMQ 消息先到 Exchange，再按 Direct/Topic/Fanout/Headers 与 Binding 路由到 Queue；可靠性靠 publisher confirm、return callback、持久化/quorum queue 和消费端手动 ack。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[Producer] --> B[Publisher Confirm 打开]\nB --> C[Exchange]\nC --> D{Exchange 类型}\nD -->|Direct| E[Routing Key 精确匹配]\nD -->|Topic| F[* 和 # 通配符匹配]\nD -->|Fanout| G[广播到所有绑定队列]\nD -->|Headers| H[按 Header 条件匹配]\nE --> I[Binding]\nF --> I\nG --> I\nH --> I\nI --> J[Queue durable/quorum]\nJ --> K[Consumer 手动 Ack]\nK -->|Ack| L[Broker 删除已确认消息]\nK -->|Nack requeue=false| M[Dead Letter Exchange]\nM --> N[DLQ 或延迟/失败处理]\nC -->|mandatory 路由失败| O[Return Callback]"
+        },
+        {
+          "kind": "text",
+          "content": "RabbitMQ 消息先到 Exchange，再按 Direct/Topic/Fanout/Headers 与 Binding 路由到 Queue；可靠性靠 publisher confirm、return callback、持久化/quorum queue 和消费端手动 ack。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -42,12 +52,18 @@
       "type": "code",
       "title": "代码/伪代码抓手",
       "content": "if (!channel.waitForConfirms()) {\n    // 消息发送失败，重试\n}\n// 方式二：异步确认（推荐）\nchannel.addConfirmListener(\n    (deliveryTag, multiple) -> {\n        // ack回调：消息发送成功\n        log.info(\"消息确认成功，tag={}\", deliveryTag);\n    },\n    (deliveryTag, multiple) -> {\n        // nack回调：消息发送失败\n        log.error(\"消息确认失败，tag={}\", deliveryTag);\n        // 重试或记录\n    }\n);\n// 发送消息时记录消息ID",
-      "language": "java"
+      "language": "java",
+      "highlights": [
+        {
+          "line": 5,
+          "note": "`channel.addConfirmListener(` 更新核心数据结构，是解释状态如何推进的抓手。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：RabbitMQ 是基于 AMQP 协议的消息中间件，核心模型是「生产者发消息到 Exchange，Exchange 按 Routing Key 和 Binding 规则路由到 Queue，消费者从 Queue 拉取」。它的强项是灵活的路由和成熟的可靠性机制，适合业务解耦、异步削峰、任务分发。\n\n讲清几块：\n\n1. 四种 Exchange：Direct（Routing Key 精确匹配，点对点和任务分发）、Topic（通配符 * 匹配一个单词、# 匹配多个，做分类路由）、Fanout（忽略 key 广播到所有绑定队列，做事件通知）、Headers（按 header 键值匹配，少用）。\n2. 可靠性靠三道保障一起上：生产端 Publisher Confirm 确保消息到 Broker，消费端手动 Ack 确保处理完才确认，再加 Exchange、Queue、Message 三级持久化，三者缺一都可能丢消息。\n3. 死信队列 DLX：消息被 Nack 或 Reject 且不重回队、TTL 过期、或队列超长时变成死信，转投到死信交换机，常用于消费失败兜底和延迟队列。\n4. 延迟队列：RabbitMQ 没原生延迟，靠「TTL 加 DLX」或官方延迟插件实现。\n\n边界和坑。① 队列级 TTL 做延迟会队头阻塞——队头消息没到期会挡住后面已到期的，要么用消息级 TTL、要么直接用延迟插件。② 自动 Ack 收到即确认，消费端一崩消息就丢，生产环境一律手动 Ack。③ 消费者要做幂等，因为重投和网络抖动都可能导致重复消费。④ 镜像队列在网络分区下有脑裂风险，新版用基于 Raft 的 Quorum Queue 更稳。",
+      "content": "结论：RabbitMQ 是基于 AMQP 协议的消息中间件，核心模型是「生产者发消息到 Exchange，Exchange 按 Routing Key 和 Binding 规则路由到 Queue，消费者从 Queue 接收」。它的强项是灵活的路由和成熟的可靠性机制，适合业务解耦、异步削峰、任务分发。\n\n讲清几块：\n\n1. 四种 Exchange：Direct（Routing Key 精确匹配，点对点和任务分发）、Topic（通配符 * 匹配一个单词、# 匹配多个，做分类路由）、Fanout（忽略 key 广播到所有绑定队列，做事件通知）、Headers（按 header 键值匹配，少用）。\n2. 可靠性靠三道保障一起上：生产端 Publisher Confirm 确保消息到 Broker，消费端手动 Ack 确保处理完才确认，再加 Exchange、Queue、Message 三级持久化，三者缺一都可能丢消息。\n3. 死信队列 DLX：消息被 Nack 或 Reject 且不重回队、TTL 过期、或队列超长时变成死信，转投到死信交换机，常用于消费失败兜底和延迟队列。\n4. 延迟队列：RabbitMQ 没原生延迟，靠「TTL 加 DLX」或官方延迟插件实现。\n\n边界和坑。① 队列级 TTL 做延迟会队头阻塞——队头消息没到期会挡住后面已到期的，要么用消息级 TTL、要么直接用延迟插件。② 自动 Ack 收到即确认，消费端一崩消息就丢，生产环境一律手动 Ack。③ 消费者要做幂等，因为重投和网络抖动都可能导致重复消费。④ 经典镜像队列已经是历史方案，RabbitMQ 4.x 高可用队列优先使用基于 Raft 的 Quorum Queue，流式场景看 Streams。",
       "followUpQuestions": [
         {
           "question": "RabbitMQ的核心概念和架构？",
@@ -110,7 +126,7 @@
     "goodToHave": [
       "能指出队列级 TTL 延迟的队头阻塞问题及解决",
       "能说明消费幂等的必要性",
-      "能对比镜像队列与 Quorum Queue"
+      "能说明经典镜像队列与 Quorum Queue/Streams 的现代取舍"
     ],
     "commonMistakes": [
       "用自动 Ack 导致消费端崩溃时消息丢失",
@@ -124,7 +140,7 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-18",
   "status": "draft",
   "prerequisites": [],
   "interviewFrequency": "high",

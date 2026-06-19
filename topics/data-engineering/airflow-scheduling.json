@@ -39,11 +39,21 @@
     },
     {
       "type": "diagram",
-      "title": "Scheduler / Executor / Worker / Metadata DB 协作链路",
+      "title": "Airflow 调度闭环：DAG 解析、DagRun、TaskInstance 与执行器状态",
       "format": "mermaid",
-      "content": "flowchart LR\nDAG[DAG 文件 dags/*.py] --> SCH[Scheduler 解析+创建 DAG Run]\nSCH --> META[(Metadata DB dag_run/task_instance)]\nSCH -->|state=queued| EXEC[Executor Celery/K8s/Local]\nEXEC -->|派发| WORKER[Worker / Pod]\nWORKER -->|执行 Operator| EXT[外部系统 Spark/SQL/API]\nWORKER -->|心跳+state| META\nWEB[Webserver / UI] --> META\nMETA -->|SLA Miss| CB[on_failure_callback 钉钉/飞书]",
-      "fallback": "DAG 文件被 Scheduler 解析后写入 Metadata DB，Scheduler 按 schedule 创建 DAG Run，把 Task Instance 状态推到 queued；Executor 把 TI 派发给 Worker（Celery 走 Redis、K8s 起 Pod、Local 起子进程），Worker 执行 Operator 调用外部系统并回写状态；Webserver 从 Metadata DB 读状态展示，SLA Miss 与失败触发 callback 走钉钉飞书。",
-      "caption": "Scheduler 只做依赖判断和状态推进，真正执行在 Worker；Metadata DB 是单点真理，挂了整个调度停。"
+      "content": "flowchart TD\nA[\"DAG 文件\"] --> B[\"Dag Processor 解析\n生成 DagBag\"]\nB --> C[\"Scheduler 按 timetable\n创建 DagRun 和 data interval\"]\nC --> D[\"TaskInstance 依赖检查\n上游/重试/池/并发\"]\nD -->|满足| E[\"Executor 派发任务\"]\nE --> F[\"Worker 执行 Operator\"]\nF --> G[\"Metadata DB 更新状态\"]\nG --> H{\"成功/失败/重试\"}\nH -->|成功| I[\"触发下游任务\"]\nH -->|失败可重试| D\nH -->|失败终态| J[\"告警和补数入口\"]",
+      "fallback": "图展示 Airflow 从 DAG 解析到 DagRun 创建、任务依赖检查、Executor 派发、状态回写与重试告警的闭环。",
+      "caption": "Airflow 调度闭环：DAG 解析、DagRun、TaskInstance 与执行器状态",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[\"DAG 文件\"] --> B[\"Dag Processor 解析\n生成 DagBag\"]\nB --> C[\"Scheduler 按 timetable\n创建 DagRun 和 data interval\"]\nC --> D[\"TaskInstance 依赖检查\n上游/重试/池/并发\"]\nD -->|满足| E[\"Executor 派发任务\"]\nE --> F[\"Worker 执行 Operator\"]\nF --> G[\"Metadata DB 更新状态\"]\nG --> H{\"成功/失败/重试\"}\nH -->|成功| I[\"触发下游任务\"]\nH -->|失败可重试| D\nH -->|失败终态| J[\"告警和补数入口\"]"
+        },
+        {
+          "kind": "text",
+          "content": "图展示 Airflow 从 DAG 解析到 DagRun 创建、任务依赖检查、Executor 派发、状态回写与重试告警的闭环。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -97,12 +107,30 @@
       "type": "code",
       "title": "幂等 DAG 与 backfill 安全写法",
       "language": "python",
-      "content": "from datetime import datetime, timedelta\nfrom airflow import DAG\nfrom airflow.operators.python import PythonOperator\nfrom airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator\n\ndefault_args = {\n    \"owner\": \"data-platform\",\n    \"retries\": 3,\n    \"retry_delay\": timedelta(minutes=5),\n    \"retry_exponential_backoff\": True,\n    \"max_retry_delay\": timedelta(minutes=30),\n    \"execution_timeout\": timedelta(hours=2),\n    \"sla\": timedelta(hours=3),\n}\n\nwith DAG(\n    dag_id=\"order_daily_etl\",\n    start_date=datetime(2026, 1, 1),\n    schedule_interval=\"0 2 * * *\",   # 每天 02:00 UTC 跑昨天的数据\n    catchup=False,                    # 上线只跑下一个区间，历史用 backfill 命令显式补\n    max_active_runs=1,                # 串行，避免补数把下游打爆\n    default_args=default_args,\n    tags=[\"etl\", \"order\"],\n) as dag:\n\n    # 反例：写 datetime.now() 会让补数也落到今天\n    # 正例：用 Jinja 模板拿 logical_date 对应的业务分区\n    extract = SparkSubmitOperator(\n        task_id=\"extract_order\",\n        application=\"s3://jobs/order_extract.py\",\n        application_args=[\n            \"--dt={{ ds }}\",                          # logical_date 的日期\n            \"--start={{ data_interval_start }}\",      # 区间起点（含）\n            \"--end={{ data_interval_end }}\",          # 区间终点（不含）\n            \"--mode=overwrite\",                       # 关键：INSERT OVERWRITE PARTITION(dt=...)\n        ],\n    )\n\n    def _verify(**ctx):\n        # 校验分区行数，行数为 0 直接抛错触发 retry / 告警\n        from airflow.providers.apache.hive.hooks.hive import HiveServer2Hook\n        ds = ctx[\"ds\"]\n        rows = HiveServer2Hook().get_first(\n            f\"SELECT COUNT(*) FROM dwd.order WHERE dt='{ds}'\"\n        )[0]\n        if rows == 0:\n            raise ValueError(f\"empty partition dt={ds}\")\n\n    verify = PythonOperator(task_id=\"verify_partition\", python_callable=_verify)\n\n    extract >> verify\n\n# 历史补数（命令行）：\n# airflow dags backfill -s 2026-01-01 -e 2026-01-31 \\\n#   --reset-dagruns order_daily_etl\n# 因为 Spark 用 INSERT OVERWRITE PARTITION，重跑会覆盖同一天分区，幂等。"
+      "content": "from datetime import datetime, timedelta\nfrom airflow import DAG\nfrom airflow.operators.python import PythonOperator\nfrom airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator\n\ndefault_args = {\n    \"owner\": \"data-platform\",\n    \"retries\": 3,\n    \"retry_delay\": timedelta(minutes=5),\n    \"retry_exponential_backoff\": True,\n    \"max_retry_delay\": timedelta(minutes=30),\n    \"execution_timeout\": timedelta(hours=2),\n    \"sla\": timedelta(hours=3),\n}\n\nwith DAG(\n    dag_id=\"order_daily_etl\",\n    start_date=datetime(2026, 1, 1),\n    schedule_interval=\"0 2 * * *\",   # 每天 02:00 UTC 跑昨天的数据\n    catchup=False,                    # 上线只跑下一个区间，历史用 backfill 命令显式补\n    max_active_runs=1,                # 串行，避免补数把下游打爆\n    default_args=default_args,\n    tags=[\"etl\", \"order\"],\n) as dag:\n\n    # 反例：写 datetime.now() 会让补数也落到今天\n    # 正例：用 Jinja 模板拿 logical_date 对应的业务分区\n    extract = SparkSubmitOperator(\n        task_id=\"extract_order\",\n        application=\"s3://jobs/order_extract.py\",\n        application_args=[\n            \"--dt={{ ds }}\",                          # logical_date 的日期\n            \"--start={{ data_interval_start }}\",      # 区间起点（含）\n            \"--end={{ data_interval_end }}\",          # 区间终点（不含）\n            \"--mode=overwrite\",                       # 关键：INSERT OVERWRITE PARTITION(dt=...)\n        ],\n    )\n\n    def _verify(**ctx):\n        # 校验分区行数，行数为 0 直接抛错触发 retry / 告警\n        from airflow.providers.apache.hive.hooks.hive import HiveServer2Hook\n        ds = ctx[\"ds\"]\n        rows = HiveServer2Hook().get_first(\n            f\"SELECT COUNT(*) FROM dwd.order WHERE dt='{ds}'\"\n        )[0]\n        if rows == 0:\n            raise ValueError(f\"empty partition dt={ds}\")\n\n    verify = PythonOperator(task_id=\"verify_partition\", python_callable=_verify)\n\n    extract >> verify\n\n# 历史补数（命令行）：\n# airflow dags backfill -s 2026-01-01 -e 2026-01-31 \\\n#   --reset-dagruns order_daily_etl\n# 因为 Spark 用 INSERT OVERWRITE PARTITION，重跑会覆盖同一天分区，幂等。",
+      "highlights": [
+        {
+          "line": 39,
+          "note": "`def _verify(**ctx):` 定义了 Airflow 调度与任务编排 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+        },
+        {
+          "line": 46,
+          "note": "`if rows == 0:` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+        },
+        {
+          "line": 55,
+          "note": "`# --reset-dagruns order_daily_etl` 更新核心数据结构，是解释状态如何推进的抓手。"
+        },
+        {
+          "line": 35,
+          "note": "`\"--mode=overwrite\", # 关键：INSERT OVERWRITE PARTITION(dt=...)` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答：30 秒结论 + 机制 + 边界",
-      "content": "我会先把 Airflow 定位成「调度编排层」：它管 DAG 依赖、按 schedule 生成 DAG Run、派发 Task、处理 retry 和补数，但真正的计算交给 Spark/SQL/Python/外部 API。Scheduler 是常驻进程做触发和依赖判断，Executor（Local/Celery/Kubernetes）决定 TI 在哪跑，Metadata DB 是单点真理。\n\n机制上要讲清三件事。第一，时间语义：DAG Run 的 `data_interval_start/end` 表示「这次要处理的数据区间」，2026-06-02 触发的 daily DAG 处理的是 6-01 那天的数据；catchup=True 会从 start_date 把缺失的 Run 全补出来，生产一般 catchup=False、用 `airflow dags backfill` 显式补历史。第二，幂等：补数会重跑历史区间，Task 必须用 INSERT OVERWRITE PARTITION 或先 DELETE 再 INSERT，否则会重复行；写路径要用 `{{ ds }}` 而不是 `datetime.now()`。第三，可靠性：Task 级 retries + retry_exponential_backoff 处理瞬时失败，Trigger Rule（all_success/all_done/one_failed）控制下游分支，SLA 是「数据按时产出」的告警而不是 timeout，要用 `execution_timeout` 杀超时。\n\n边界上要避开几个坑：把 SLA 当 timeout、把 `datetime.now()` 当业务时间、把重 IO 写在 DAG 顶层导致 Scheduler 解析慢、暂停几天的 DAG 直接打开触发 catchup 雪崩、CeleryExecutor 下 Worker 时区和 Scheduler 不一致。和 DolphinScheduler 比 Airflow 胜在 Python 生态和复杂依赖表达，输在 UI 配置和国内文档；和 Dagster 比 Airflow 胜在成熟度，输在数据资产和血缘的原生表达。",
+      "content": "我会先把 Airflow 定位成「调度编排层」：它管 DAG 依赖、按 schedule 生成 DAG Run、派发 Task、处理 retry 和补数，但真正的计算交给 Spark/SQL/Python/外部 API。Scheduler 是常驻进程做触发和依赖判断，Executor（Local/Celery/Kubernetes）决定 TI 在哪跑，Metadata DB 是单点真理。\n\n机制要点：\n- 机制上要讲清三件事。第一，时间语义：DAG Run 的 `data_interval_start/end` 表示「这次要处理的数据区间」，2026-06-02 触发的 daily DAG 处理的是 6-01 那天的数据；catchup=True 会从 start_date 把缺失的 Run 全补出来，生产一般 catchup=False、用 `airflow dags backfill` 显式补历史。第二，幂等：补数会重跑历史区间，Task 必须用 INSERT OVERWRITE PARTITION 或先 DELETE 再 INSERT，否则会重复行；写路径要用 `{{ ds }}` 而不是 `datetime.now()`。第三，可靠性：Task 级 retries + retry_exponential_backoff 处理瞬时失败，Trigger Rule（all_success/all_done/one_failed）控制下游分支，SLA 是「数据按时产出」的告警而不是 timeout，要用 `execution_timeout` 杀超时。\n- 边界上要避开几个坑：把 SLA 当 timeout、把 `datetime.now()` 当业务时间、把重 IO 写在 DAG 顶层导致 Scheduler 解析慢、暂停几天的 DAG 直接打开触发 catchup 雪崩、CeleryExecutor 下 Worker 时区和 Scheduler 不一致。和 DolphinScheduler 比 Airflow 胜在 Python 生态和复杂依赖表达，输在 UI 配置和国内文档；和 Dagster 比 Airflow 胜在成熟度，输在数据资产和血缘的原生表达。",
       "followUpQuestions": [
         {
           "question": "DAG 暂停一周后重新打开，怎么避免 Scheduler 一次性创建几十个 DAG Run 把下游打爆？",
@@ -190,5 +218,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-13"
+  "updatedAt": "2026-06-18"
 }

@@ -19,7 +19,7 @@
     {
       "type": "explain",
       "title": "Upgrade 握手为什么要走 HTTP：复用 80/443 与代理穿透",
-      "content": "## 为什么把握手伪装成 HTTP\nWebSocket 选择把握手做成一次 HTTP GET，核心动机是复用 80/443 端口、穿透企业防火墙和反向代理。同时直接复用 HTTP 的鉴权（Cookie、Authorization、Origin）和 TLS 链路。握手请求带四个关键头：`Upgrade: websocket`、`Connection: Upgrade`、`Sec-WebSocket-Version: 13`、`Sec-WebSocket-Key`（16 字节随机数 base64）。可选 `Sec-WebSocket-Protocol`（子协议如 `mqtt`、`graphql-ws`）和 `Sec-WebSocket-Extensions`（如 `permessage-deflate` 压缩）。\n\n## 服务端如何确认握手\n服务端把客户端 `Sec-WebSocket-Key` 拼接固定 GUID `258EAFA5-E914-47DA-95CA-C5AB0DC85B11`，做 SHA-1 后 base64，写回 `Sec-WebSocket-Accept`，并返回 `101 Switching Protocols`。这一步不是为了安全（key 公开计算），而是证明对端真的实现了 RFC 6455。这样能避免普通 HTTP 服务器或缓存代理误把这条连接当成 HTTP 处理。返回 101 之后，TCP 连接所有权从 HTTP 协议栈转移给 WebSocket 协议栈，后续字节按帧解析，不再是请求/响应模型。\n\n## 握手失败的真实形态\n常见失败：经过 Nginx/ALB 没有透传 `Upgrade`、`Connection` 头，导致服务端拿到的是普通 HTTP 请求。TLS 终止在网关、网关空闲超时短于心跳间隔，连接看起来\"莫名断开\"。浏览器侧 `Origin` 与服务端白名单不匹配返回 403。HTTP/2 环境下要走 RFC 8441 的 `:protocol` 扩展，否则旧网关会拒绝 Upgrade。"
+      "content": "## 为什么握手看起来像 HTTP\nWebSocket 的 HTTP/1.1 握手是一条正常 GET 请求，核心动机是复用 80/443、TLS、Cookie、反向代理和企业网络里已经允许的 HTTP 通路。浏览器发起时通常包含 `Upgrade: websocket`、`Connection: Upgrade`、`Sec-WebSocket-Version: 13`、`Sec-WebSocket-Key`（16 字节随机数 base64），还会带 `Origin` 和同站 Cookie。注意：浏览器 WebSocket API 不能像 `fetch` 那样自定义 `Authorization` 头；生产鉴权常用 Cookie、短期 ticket（query string 要防日志泄露）或 `Sec-WebSocket-Protocol` 约定子协议。\n\n## 服务端如何确认握手\n服务端把客户端 `Sec-WebSocket-Key` 拼接固定 GUID `258EAFA5-E914-47DA-95CA-C5AB0DC85B11`，做 SHA-1 后 base64，写回 `Sec-WebSocket-Accept`，并返回 `101 Switching Protocols`。这一步不是安全机制（key 和 GUID 都公开），而是确认对端理解 RFC 6455 的 WebSocket 握手，避免普通 HTTP 客户端、缓存代理或错误路由把这条连接误当普通 HTTP 处理。返回 101 之后，同一条 TCP/TLS 连接上的后续字节按 WebSocket 帧解析，不再是请求/响应模型。\n\n## 握手失败的真实形态\n常见失败：Nginx/ALB 没有透传 `Upgrade`、`Connection` 头，服务端只看到普通 HTTP 请求；TLS 终止在网关后，网关空闲超时短于心跳响应，连接看起来\"莫名断开\"；服务端把 `Origin` 当 CORS 一样完全忽略，导致浏览器页面可被跨站滥用；token 过期后客户端固定间隔重连，引发风暴。HTTP/2 不是用 HTTP/1.1 Upgrade，而是 RFC 8441 的 Extended CONNECT 和 `:protocol = websocket`；HTTP/3 对应 RFC 9220，前提是客户端、服务端和中间代理都支持该扩展。"
     },
     {
       "type": "explain",
@@ -29,15 +29,25 @@
     {
       "type": "explain",
       "title": "心跳、重连与 vs SSE/长轮询：工程上真正会踩的坑",
-      "content": "## 心跳：谁来发、间隔多少\nTCP keepalive 默认 2 小时，根本兜不住 NAT/网关的空闲超时（云厂商 LB 通常 60-350 秒、Nginx 默认 60 秒）。所以必须做应用层心跳：服务端按固定间隔（建议 25-30 秒）发 ping，客户端回 pong。如果 2-3 个周期没收到 pong 就主动 close 并重连。心跳间隔要小于链路上最短的 idle timeout，否则连接会被中间设备静默回收，应用却以为还活着。\n\n## 断线重连的关键细节\n重连不能写成固定 3 秒：要用指数退避 + 抖动（如 1s、2s、4s、8s，封顶 30s，叠加 ±20% 随机），避免服务端重启时所有客户端同时回连打雪崩。重连后必须重新鉴权（token 可能过期）、重新订阅（服务端不会记得上次订阅了什么），并基于服务端下发的消息序号或游标做补发，否则断线期间的行情/消息会丢。\n\n## vs SSE 与长轮询\nSSE（Server-Sent Events）走普通 HTTP，单向\"服务端推、客户端只读\"。浏览器原生 EventSource 自带断线重连和 Last-Event-ID 续传，适合行情推送、通知、AI 流式输出这类只下行的场景。缺点是不能上行（要靠另一条 HTTP 请求），HTTP/1.1 下还受 6 个连接的限制。WebSocket 是全双工，适合 IM、协同编辑、游戏等需要上下行的场景，代价是要自己实现心跳、重连、消息确认。长轮询每次请求都要重建 HTTP，延迟大、空连接多，只在不能用 WS/SSE 的兼容场景下使用。多实例部署时 WebSocket 还得解决\"消息要广播到所有实例\"的问题，常见做法是接入 Redis Pub/Sub、Kafka 或 NATS 做后端总线。"
+      "content": "## 心跳：协议 ping/pong 和应用心跳要分清\nTCP keepalive 常常按小时级生效，兜不住网关、NAT、反向代理的分钟级 idle timeout。生产上必须让心跳间隔小于链路上最短的 idle timeout：Nginx 代理 WebSocket 时默认 60 秒无上游数据就可能关闭连接，所以服务端最好每 25-30 秒发送协议 ping 或应用心跳响应。浏览器会自动回复协议 pong，但 JS 的 WebSocket API 不暴露发送 ping 控制帧的能力；前端常见的 `{\"type\":\"ping\"}` 是应用消息，必须由服务端回 `pong` 才能同时证明上下行都通。\n\n## 断线重连的关键细节\n重连不能写成固定 3 秒：要用指数退避 + 抖动（如 1s、2s、4s、8s，封顶 30s，叠加 ±20% 随机），避免服务端重启时所有客户端同时回连打雪崩。重连后必须重新鉴权（token 可能过期）、重新订阅（连接状态和订阅关系通常只在当前节点内存里），并基于服务端下发的消息序号或游标做补发，否则断线期间的行情/消息会丢。\n\n## vs SSE 与长轮询\nSSE（Server-Sent Events）走普通 HTTP，单向\"服务端推、客户端只读\"。浏览器原生 EventSource 自带断线重连和 Last-Event-ID 续传，适合行情推送、通知、AI 流式输出这类只下行的场景。缺点是不能上行（要靠另一条 HTTP 请求），HTTP/1.1 下还受同源连接数限制。WebSocket 是全双工，适合 IM、协同编辑、游戏等需要上下行的场景，代价是要自己实现心跳、重连、消息确认。长轮询每次请求都要走一次 HTTP 请求/响应，延迟和头部开销更高，只在不能用 WS/SSE 的兼容场景下使用。多实例部署时 WebSocket 还得解决\"连接在 A 节点、消息在 B 节点\"的问题：用 Redis Pub/Sub、Kafka 或 NATS 做后端总线，订阅状态也要外部化或保证重连粘性。"
     },
     {
       "type": "diagram",
-      "title": "Upgrade 握手到全双工帧传输的状态流转",
-      "content": "flowchart LR\nA[客户端 GET + Upgrade websocket] --> B[服务端校验 Origin 与子协议]\nB --> C[计算 Sec-WebSocket-Accept]\nC --> D[101 Switching Protocols]\nD --> E[OPEN 全双工通道]\nE --> F[数据帧 opcode 0x1/0x2 含 mask]\nE --> G[心跳帧 ping 0x9 与 pong 0xA]\nG -->|超过 2 个周期无 pong| H[主动发 close 0x8]\nF -->|业务异常| H\nH --> I[CLOSING 等待对端 close]\nI --> J[CLOSED TCP FIN]\nJ -->|指数退避 + 抖动| A",
-      "caption": "握手 → OPEN → 心跳/数据帧并行 → CLOSING → CLOSED，断开后客户端按指数退避重连",
-      "fallback": "握手阶段建立连接后进入 OPEN，数据帧与 ping/pong 并行；心跳超时或业务异常触发 close 帧，双向 close 后 TCP 关闭，客户端按退避重连。",
-      "format": "mermaid"
+      "title": "握手、帧结构与生产链路总览",
+      "content": "assets/diagrams/network-websocket-protocol.svg",
+      "caption": "图里把三个容易混淆的层次拆开：先通过 HTTP 兼容握手切协议，再按帧规则校验 mask/控制帧，最后用心跳、退避重连、序号补拉和后端总线保证生产可用性。",
+      "fallback": "浏览器通过 HTTP/1.1 Upgrade 或 HTTP/2/3 Extended CONNECT 建立 WebSocket；服务端返回 101 或扩展 CONNECT 成功后进入帧协议。客户端发服务端的帧必须 mask，控制帧 payload 不超过 125 字节且不可分片；生产环境还要处理服务端 ping/应用心跳响应、指数退避重连、重新鉴权订阅、sequence 补拉，以及 Redis/Kafka/NATS 跨实例广播。",
+      "format": "svg",
+      "sources": [
+        {
+          "kind": "svg",
+          "path": "assets/diagrams/network-websocket-protocol.svg"
+        },
+        {
+          "kind": "text",
+          "content": "浏览器通过 HTTP/1.1 Upgrade 或 HTTP/2/3 Extended CONNECT 建立 WebSocket；服务端返回 101 或扩展 CONNECT 成功后进入帧协议。客户端发服务端的帧必须 mask，控制帧 payload 不超过 125 字节且不可分片；生产环境还要处理服务端 ping/应用心跳响应、指数退避重连、重新鉴权订阅、sequence 补拉，以及 Redis/Kafka/NATS 跨实例广播。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -89,44 +99,36 @@
     },
     {
       "type": "code",
-      "title": "客户端：心跳 + 指数退避重连 + 鉴权刷新骨架",
-      "content": "// 关键点：心跳间隔 < 链路 idle timeout；重连指数退避 + 抖动；重连后必须重新鉴权和重订阅\nclass WSClient {\n  constructor(url, getToken) {\n    this.url = url;\n    this.getToken = getToken; // 每次重连都拿最新 token，避免过期\n    this.retry = 0;\n    this.heartbeatTimer = null;\n    this.pongTimer = null;\n    this.connect();\n  }\n\n  connect() {\n    const token = this.getToken();\n    this.ws = new WebSocket(`${this.url}?token=${token}`);\n\n    this.ws.onopen = () => {\n      this.retry = 0;\n      this.startHeartbeat();\n      this.resubscribe(); // 服务端不会记得上次订阅，必须重新发\n    };\n\n    this.ws.onmessage = (e) => {\n      const msg = JSON.parse(e.data);\n      if (msg.type === 'pong') {\n        clearTimeout(this.pongTimer); // 收到 pong 取消超时\n        return;\n      }\n      this.handle(msg);\n    };\n\n    this.ws.onclose = (e) => {\n      this.stopHeartbeat();\n      // 1000 正常关闭不重连；1008 策略违反（如 token 过期）通常重连后能恢复\n      if (e.code === 1000) return;\n      const backoff = Math.min(30000, 1000 * 2 ** this.retry++);\n      const jitter = backoff * (0.8 + Math.random() * 0.4);\n      setTimeout(() => this.connect(), jitter);\n    };\n  }\n\n  startHeartbeat() {\n    // 25s < 常见网关 30-60s idle timeout\n    this.heartbeatTimer = setInterval(() => {\n      if (this.ws.readyState !== WebSocket.OPEN) return;\n      this.ws.send(JSON.stringify({ type: 'ping' }));\n      // 5s 内没收到 pong 视为链路死，主动 close 触发 onclose 重连\n      this.pongTimer = setTimeout(() => this.ws.close(4000, 'pong-timeout'), 5000);\n    }, 25000);\n  }\n\n  stopHeartbeat() {\n    clearInterval(this.heartbeatTimer);\n    clearTimeout(this.pongTimer);\n  }\n}",
+      "title": "Node 可运行：计算 Accept、编码 mask 帧并校验控制帧",
+      "content": "const { createHash, randomBytes } = require('node:crypto');\n\nconst GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';\n\nfunction websocketAccept(secWebSocketKey) {\n  return createHash('sha1').update(secWebSocketKey + GUID).digest('base64');\n}\n\nfunction encodeClientTextFrame(text, maskKey = Buffer.from([0x12, 0x34, 0x56, 0x78])) {\n  const payload = Buffer.from(text, 'utf8');\n  if (payload.length > 125) throw new Error('demo only handles short payloads');\n  const frame = Buffer.alloc(2 + 4 + payload.length);\n  frame[0] = 0x81; // FIN=1, opcode=0x1(text)\n  frame[1] = 0x80 | payload.length; // MASK=1, len<=125\n  maskKey.copy(frame, 2);\n  for (let i = 0; i < payload.length; i++) {\n    frame[6 + i] = payload[i] ^ maskKey[i % 4];\n  }\n  return frame;\n}\n\nfunction decodeFrame(frame, { fromClient }) {\n  const fin = (frame[0] & 0x80) !== 0;\n  const opcode = frame[0] & 0x0f;\n  const masked = (frame[1] & 0x80) !== 0;\n  let len = frame[1] & 0x7f;\n  let offset = 2;\n  if (len === 126) throw new Error('demo omitted 16-bit extended length');\n  if (len === 127) throw new Error('demo omitted 64-bit extended length');\n  if (fromClient && !masked) throw new Error('client frame must be masked');\n  if (!fromClient && masked) throw new Error('server frame must not be masked');\n  const isControl = opcode === 0x8 || opcode === 0x9 || opcode === 0xA;\n  if (isControl && (!fin || len > 125)) throw new Error('invalid fragmented/oversized control frame');\n  const maskKey = masked ? frame.subarray(offset, offset + 4) : null;\n  if (masked) offset += 4;\n  const payload = Buffer.alloc(len);\n  for (let i = 0; i < len; i++) {\n    payload[i] = masked ? frame[offset + i] ^ maskKey[i % 4] : frame[offset + i];\n  }\n  return { fin, opcode, masked, payload: payload.toString('utf8') };\n}\n\nconst key = randomBytes(16).toString('base64');\nconsole.log('Sec-WebSocket-Accept:', websocketAccept(key));\nconst clientFrame = encodeClientTextFrame('hello');\nconsole.log('decoded client frame:', decodeFrame(clientFrame, { fromClient: true }));\nconst serverPing = Buffer.from([0x89, 0x00]); // FIN=1, opcode=0x9, len=0, unmasked\nconsole.log('decoded server ping:', decodeFrame(serverPing, { fromClient: false }));\ntry {\n  decodeFrame(Buffer.from([0x81, 0x05, ...Buffer.from('hello')]), { fromClient: true });\n} catch (err) {\n  console.log('protocol error:', err.message);\n}",
       "language": "javascript",
       "highlights": [
         {
-          "line": 5,
-          "note": "getToken 回调每次重连取最新 token，避免连接复用过期凭证导致 1008 策略违反"
+          "line": 6,
+          "note": "Sec-WebSocket-Accept 只证明服务端理解 RFC 6455 握手，不提供加密或鉴权能力。"
         },
         {
           "line": 14,
-          "note": "URL 查询参数携带 token，握手阶段完成鉴权，服务端在 101 前可拒绝非法 token"
+          "note": "客户端帧必须把 MASK 位设为 1，并携带 4 字节 masking key。"
         },
         {
-          "line": 19,
-          "note": "重连后重新订阅，服务端无状态不会保留上次订阅关系，漏掉这步会导致消息静默丢失"
+          "line": 30,
+          "note": "服务端收到浏览器客户端未 mask 的数据帧，应按协议错误处理。"
         },
         {
-          "line": 35,
-          "note": "指数退避 base=1000ms 倍增，封顶 30s，retry 计数在 onclose 时递增"
+          "line": 33,
+          "note": "close/ping/pong 控制帧不能分片，payload 也不能超过 125 字节。"
         },
         {
-          "line": 36,
-          "note": "叠加 0.8-1.2 倍随机抖动，防止服务端重启时所有客户端同步回连引发雪崩"
-        },
-        {
-          "line": 45,
-          "note": "应用层 ping 间隔 25s，小于 Nginx 默认 60s 和云 LB 60-350s idle timeout"
-        },
-        {
-          "line": 47,
-          "note": "pong 超时 5s 后主动 close(4000)，触发 onclose 进入重连流程而非无限等待"
+          "line": 51,
+          "note": "最后故意解码未 mask 的客户端帧，演示协议校验会抛出错误。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答：30 秒结论 + 机制主线 + 边界追问",
-      "content": "30 秒结论：WebSocket 是在一条 TCP 上通过 HTTP Upgrade 切换出来的全双工协议，握手复用 80/443 与 HTTP 鉴权，握手后按 opcode/mask/payload 帧传输，配合应用层心跳和重连支撑 IM、行情、协同编辑这类低延迟双向场景。\n\n机制主线：第一步握手是一次 GET，带 Upgrade、Connection、Sec-WebSocket-Key、Version 13。服务端把 key 拼固定 GUID 做 SHA-1 后 base64 回 Sec-WebSocket-Accept，返回 101 Switching Protocols，TCP 连接所有权交给 WebSocket 协议栈。第二步帧结构核心是 opcode（text/binary/close/ping/pong）+ MASK + payload length，控制帧不能分片且 ≤125 字节，浏览器发出的每一帧都必须 mask（防代理缓存投毒）。第三步工程层面要做应用心跳（25-30 秒，小于网关 idle timeout）、断线指数退避重连、重连后重新鉴权和订阅，并在多实例部署时用 Redis Pub/Sub 或 Kafka 做消息广播。\n\n边界追问：和 SSE 的差别是 SSE 单向下行但自带重连和 Last-Event-ID 续传，适合通知和 AI 流式输出。WebSocket 双向但要自己处理心跳、广播和补发。常见线上故障：Nginx 没透传 Upgrade、网关空闲超时短于心跳、TLS 终止后内网链路被回收、token 过期后重连风暴。这些点决定了为什么\"看起来正常的 WebSocket\"会在生产环境莫名断线。",
+      "content": "30 秒结论：WebSocket 是通过 HTTP 兼容握手建立的一条全双工消息通道。HTTP/1.1 下用 Upgrade + 101 切换协议；HTTP/2/3 下用扩展 CONNECT。握手后按 opcode、mask、payload length 解析帧，生产上还要处理心跳、指数退避重连、重新鉴权订阅、消息补拉和跨实例广播。\n\n机制要点：\n- 机制主线：第一步握手是 GET /ws，带 Upgrade、Connection、Sec-WebSocket-Key、Version 13。服务端校验 Origin/鉴权后，把 key 拼固定 GUID 做 SHA-1 再 base64，回 `Sec-WebSocket-Accept` 和 101。浏览器不能自定义 Authorization 头，所以鉴权通常靠 Cookie、短期 ticket 或子协议约定。第二步帧结构核心是 FIN/opcode/MASK/payload length：浏览器发出的每一帧都必须 mask，服务端帧不能 mask；close/ping/pong 控制帧不能分片且 payload ≤125 字节。第三步工程层面要做服务端 ping 或应用心跳响应（间隔小于最短 idle timeout）、指数退避 + 抖动重连、重连后重新鉴权/订阅，并通过 sequence 补拉断线缺口。多实例部署要用 Redis Pub/Sub、Kafka 或 NATS 做房间广播。\n- 边界追问：SSE 单向下行但自带重连和 Last-Event-ID，适合通知、行情、AI 流式输出。WebSocket 双向，但协议本身不保证断线期间消息不丢，也不提供业务级 ack。常见线上故障包括：Nginx 没透传 Upgrade、Nginx 60 秒 proxy_read_timeout 被空闲连接触发、浏览器跨站页面绕过 Origin 校验、token 过期后固定间隔重连打满服务端。",
       "followUpQuestions": [
         {
           "question": "为什么 RFC 6455 强制客户端发出的每一帧都要 mask，服务端不需要？",
@@ -134,7 +136,7 @@
         },
         {
           "question": "线上 WebSocket 隔一段时间就断，但应用代码看起来没问题，怎么排查？",
-          "answer": "先看断开时机是否规律：如果稳定在 60s/350s，多半是 Nginx 或云 LB 的 idle timeout，应用心跳间隔大于这个值就会被中间设备静默回收，把心跳调到 25-30 秒并确认 LB 配置。其次抓包看是 TCP RST 还是 close 帧：RST 通常是中间设备超时杀连接；close 帧带 1011 是服务端崩、1008 是策略违反（常见为 token 过期）。再看 Nginx 是否有 `proxy_set_header Upgrade $http_upgrade`、`Connection \"upgrade\"`、`proxy_read_timeout` 的完整配置，缺一项都会导致 Upgrade 不透传或读超时杀连接。最后看多实例部署时是否做了消息总线（Redis Pub/Sub / Kafka），否则用户连到 A 实例、消息发到 B 实例会表现为\"消息丢了\"被误判成连接问题。"
+          "answer": "先看断开时机是否规律：如果稳定在 60 秒附近，优先怀疑 Nginx `proxy_read_timeout` 或上游没有任何数据下行。解决不是只让浏览器发应用 ping，而是要确认服务端会回 pong 或主动发协议 ping，让反代能读到上游数据。其次抓包看是 TCP RST 还是 close 帧：RST 常见于中间设备超时；close 1008 常见于鉴权/策略失败，1011 常见于服务端异常。再检查 Nginx 是否有 `proxy_http_version 1.1`、`proxy_set_header Upgrade $http_upgrade`、`proxy_set_header Connection \"upgrade\"` 和足够大的 `proxy_read_timeout`。最后看集群广播与订阅状态：用户连到 A 节点、消息落到 B 节点却没有消息总线，会被误判成连接断了。"
         },
         {
           "question": "什么场景该选 SSE 而不是 WebSocket？",
@@ -146,14 +148,15 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "Upgrade 握手为什么要走 HTTP：复用 80/443、HTTP 鉴权与 TLS、穿透代理",
+        "HTTP/1.1 Upgrade 握手为什么要走 HTTP：复用 80/443、Cookie/TLS 与代理链路；浏览器不能自定义 Authorization 头",
         "Sec-WebSocket-Key + 固定 GUID + SHA-1 + base64 推出 Accept 的目的：验证对端实现 RFC 6455，不是安全",
         "帧结构 FIN/opcode/MASK/payload length 的字节布局与 126/127 扩展长度规则",
         "控制帧（close/ping/pong）的两条硬约束：payload ≤125、必须 FIN=1 不可分片",
         "客户端帧必须 mask 的真实原因：防中间代理缓存投毒，而非加密",
-        "应用层心跳间隔为何要 < 链路最短 idle timeout（25-30 秒），TCP keepalive 为何兜不住",
+        "协议 ping/pong 与应用层 ping/pong 的区别：浏览器自动 pong 但 JS 不能发协议 ping，心跳间隔要 < 链路最短 idle timeout",
         "断线重连要做指数退避 + 抖动 + 重新鉴权 + 重新订阅 + 基于序号的消息补发",
         "WebSocket vs SSE vs 长轮询的方向、重连、代理友好度、典型场景对比",
+        "HTTP/2 用 RFC 8441 Extended CONNECT，HTTP/3 用 RFC 9220，而不是继续套 HTTP/1.1 Upgrade",
         "多实例部署时如何用 Redis Pub/Sub / Kafka 解决消息广播问题",
         "Nginx 代理 WebSocket 时必须透传 Upgrade、Connection 头并调大 proxy_read_timeout"
       ]
@@ -176,7 +179,7 @@
     },
     {
       "id": "network.websocket.topic-websocket.recall.3",
-      "prompt": "线上 WebSocket 客户端每隔约 60 秒就断一次但代码无异常，从心跳间隔、Nginx 配置、网关 idle timeout、TLS 终止四个方向你会怎么定位？",
+      "prompt": "线上 WebSocket 客户端每隔约 60 秒就断一次但代码无异常，从服务端是否有下行心跳、Nginx proxy_read_timeout、Upgrade 透传、网关 idle timeout 四个方向你会怎么定位？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
@@ -195,18 +198,19 @@
       "Sec-WebSocket-Accept = base64(SHA1(key + 固定 GUID))，用途是证明对端实现 RFC 6455 而非安全",
       "帧结构 opcode + MASK + payload length，控制帧 ≤125 字节且不可分片",
       "客户端帧必须 mask 的真实原因：防中间代理缓存投毒",
-      "应用层心跳必须小于链路最短 idle timeout，TCP keepalive 兜不住"
+      "协议 ping/pong 与应用层心跳的区别，心跳必须小于链路最短 idle timeout，TCP keepalive 兜不住"
     ],
     "goodToHave": [
       "WebSocket vs SSE vs 长轮询在通信方向、断线续传、代理友好度上的对比",
       "断线重连用指数退避 + 抖动 + 重新鉴权 + 重新订阅 + 消息序号补发",
       "多实例部署用 Redis Pub/Sub / Kafka 做消息广播总线",
       "Nginx 透传 Upgrade、Connection 头并配置 proxy_read_timeout 的关键项",
-      "HTTP/2 下 WebSocket 走 RFC 8441 :protocol 扩展"
+      "HTTP/2 下 WebSocket 走 RFC 8441 Extended CONNECT，HTTP/3 下走 RFC 9220"
     ],
     "commonMistakes": [
       "把 Sec-WebSocket-Accept 当安全机制，认为它能防中间人",
       "认为 mask 是为了加密 payload，省掉服务端 mask 校验",
+      "只让浏览器发应用 ping，却没有服务端下行 ping/pong，Nginx proxy_read_timeout 仍会关闭连接",
       "心跳间隔设成 60-120 秒甚至依赖 TCP keepalive，导致被网关静默回收",
       "重连写死 3 秒固定间隔，服务端重启时被重连风暴打挂",
       "Nginx 只配 proxy_pass 没透传 Upgrade/Connection，握手直接退化成 HTTP 400",
@@ -219,8 +223,8 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-17",
+  "updatedAt": "2026-06-19",
   "status": "production",
   "interviewFrequency": "medium",
-  "interviewerFocus": "握手为何复用 HTTP、Sec-WebSocket-Accept 的真实用途、客户端为何必须 mask、心跳与 idle timeout 的关系，以及和 SSE/长轮询的边界选型"
+  "interviewerFocus": "握手为何复用 HTTP、Sec-WebSocket-Accept 的真实用途、浏览器客户端为何必须 mask、协议 ping/pong 与应用心跳的区别、idle timeout 排查，以及和 SSE/长轮询的边界选型"
 }

@@ -27,12 +27,12 @@
     {
       "type": "explain",
       "title": "Interface 是行为契约，运行时是 (type, data) 双指针",
-      "content": "Go 的 interface 表达「能做什么」，类型只要实现方法集合就自动满足接口，不需要显式 implements。但要答得有深度，必须穿透到运行时表示：\n\n- 非空接口在运行时是 `runtime.iface{ tab *itab; data unsafe.Pointer }`。`itab` 里挂着具体类型 `_type`、接口类型 `inter`、以及方法地址表 `fun[0..n]`。itab 是「接口类型 + 具体类型」这一对组合首次使用时由 runtime 缓存生成的，后续相同组合直接查缓存。\n- 空接口（interface{}/any）是 `runtime.eface{ _type *_type; data unsafe.Pointer }`，没有方法表，所以 any 赋值不需要查 itab。\n- 接口方法调用是 `i.tab.fun[k](i.data, args...)` 这种间接跳转，不是虚函数表内嵌在对象里。因此调用比直接调用多一次内存解引用，编译器在 inline、devirtualize 上比结构体方法保守。\n- 接口赋值会发生「装箱」：当具体值小于一个指针、或非指针类型时，data 字段必须指向堆/栈上的副本。常见的 escape analysis 报告 `... escapes to heap` 就来自这里。把 int 反复塞进 any 是热路径上的隐形分配点。\n\n理解了这层结构，typed nil、方法集合、性能差异、reflect 的 Kind/Type 区分都能从同一个模型推出来，而不是各背一条规则。"
+      "content": "Go 的 interface 表达「能做什么」，类型只要实现方法集合就自动满足接口，不需要显式 implements。但要答得有深度，必须穿透到运行时表示：\n\n- 非空接口在运行时是 `runtime.iface{ tab *itab; data unsafe.Pointer }`。`itab` 里挂着具体类型 `_type`、接口类型 `inter`、以及方法地址表 `fun[0..n]`。itab 是「接口类型 + 具体类型」这一对组合首次使用时由 runtime 缓存生成的，后续相同组合直接查缓存。\n- 空接口（interface{}/any）是 `runtime.eface{ _type *_type; data unsafe.Pointer }`，没有方法表，所以 any 赋值不需要查 itab。\n- 接口方法调用是 `i.tab.fun[k](i.data, args...)` 这种间接跳转，不是虚函数表内嵌在对象里。因此调用比直接调用多一次内存解引用，编译器在 inline、devirtualize 上比结构体方法保守。\n- 接口赋值会发生「装箱」：data 字段保存的是动态值的表示。指针、map、chan、func 等指针形态通常可直接放入 data；非指针值需要一份可被接口引用的副本，这份副本可能留在栈上，也可能因逃逸进入堆。常见的 escape analysis 报告 `... escapes to heap` 就来自这里。把值类型反复塞进 any 是热路径上的隐形分配风险。\n\n理解了这层结构，typed nil、方法集合、性能差异、reflect 的 Kind/Type 区分都能从同一个模型推出来，而不是各背一条规则。"
     },
     {
       "type": "explain",
       "title": "方法集合规则与 typed nil：高频翻车点",
-      "content": "方法集合决定一个类型是否实现接口。Go spec 规定：值接收者方法 `func (t T) M()` 同时进入 `T` 和 `*T` 的方法集；指针接收者方法 `func (t *T) M()` 只进入 `*T` 的方法集。原因是 `*T → T` 需要解引用一次副本，而 `T → *T` 没法凭空取地址。所以 `var x T; var i I = x` 在接口需要指针接收者方法时会编译报错：`T does not implement I (method M has pointer receiver)`。在 map/slice 元素、`reflect.Value` 上拿不到地址也是同样原因。\n\ntyped nil 是另一类高频坑，本质是 iface 的 (tab, data) 必须双双为零才等于 nil：\n\n```go\nvar buf *bytes.Buffer = nil\nvar r io.Reader = buf\nfmt.Println(r == nil)      // false：tab 非空（itab(io.Reader,*bytes.Buffer)），data=nil\nfmt.Println(buf == nil)    // true：具体指针本身是 nil\n```\n\n工程上最常见的发病点是返回 `error`：\n\n```go\nfunc do() error {\n    var e *MyError = nil\n    if somethingWrong { e = &MyError{...} }\n    return e // 即使 e 是 nil，外层 if err != nil 也成立\n}\n```\n\n修法只有两条：要么提前 `if e != nil { return e }; return nil`（让接口拿到真正的 nil），要么签名改成具体类型 `*MyError`。`go vet` 的 `nilness` pass 能扫出常见模式，但跨函数返回它看不到。code review 时要特别警觉「函数声明返回 error，内部却维护具体错误指针」这类写法。"
+      "content": "方法集合决定一个类型是否实现接口。Go spec 规定：值接收者方法 `func (t T) M()` 同时进入 `T` 和 `*T` 的方法集；指针接收者方法 `func (t *T) M()` 只进入 `*T` 的方法集。原因是 `*T → T` 需要解引用一次副本，而 `T → *T` 没法凭空取地址。所以 `var x T; var i I = x` 在接口需要指针接收者方法时会编译报错：`T does not implement I (method M has pointer receiver)`。在 map/slice 元素、`reflect.Value` 上拿不到地址也是同样原因。\n\ntyped nil 是另一类高频坑，本质是 iface 的 (tab, data) 必须双双为零才等于 nil：\n\n```go\nvar buf *bytes.Buffer = nil\nvar r io.Reader = buf\nfmt.Println(r == nil)      // false：tab 非空（itab(io.Reader,*bytes.Buffer)），data=nil\nfmt.Println(buf == nil)    // true：具体指针本身是 nil\n```\n\n工程上最常见的发病点是返回 `error`：\n\n```go\nfunc do() error {\n    var e *MyError = nil\n    if somethingWrong { e = &MyError{...} }\n    return e // 即使 e 是 nil，外层 if err != nil 也成立\n}\n```\n\n修法优先是提前 `if e != nil { return e }; return nil`（让接口拿到真正的 nil）；如果调用方确实需要区分具体错误对象，也可以把签名改成 `*MyError`，但这会牺牲 error 抽象。静态分析可以用 nilness 类 analyzer、Staticcheck 和 code review 辅助发现常见模式，跨函数、跨包返回仍要靠接口语义判断。"
     },
     {
       "type": "explain",
@@ -45,7 +45,17 @@
       "format": "mermaid",
       "content": "flowchart LR\nA[var r io.Reader = buf] --> B[runtime.iface]\nB --> C[tab *itab]\nB --> D[data unsafe.Pointer]\nC --> E[itab.inter = io.Reader]\nC --> F[itab._type = *bytes.Buffer]\nC --> G[itab.fun = Read 方法地址]\nD --> H[堆/栈上的 *bytes.Buffer]\nI[var a any = 42] --> J[runtime.eface]\nJ --> K[_type *_type]\nJ --> L[data 指向装箱的 int]\nM[r.Read p] --> N[tab.fun 0 data p]\nO[i == j] --> P{tab 相同?}\nP -->|否| Q[不相等]\nP -->|是| R{动态类型可比较?}\nR -->|否| S[panic: uncomparable]\nR -->|是| T[比较 data 指向的值]",
       "fallback": "iface = (itab, data)，itab 内含接口类型、具体类型、方法地址表；eface = (_type, data) 没有方法表；调用 r.Read 时走 tab.fun[k](data, ...)；接口比较先比 tab 再比动态值，动态类型不可比较则 panic。",
-      "caption": "iface 多一层 itab 用来挂方法表，eface 只是 (_type, data)；nil 判断、装箱、方法分派、接口值比较都从这张图推出来。"
+      "caption": "iface 多一层 itab 用来挂方法表，eface 只是 (_type, data)；nil 判断、装箱、方法分派、接口值比较都从这张图推出来。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart LR\nA[var r io.Reader = buf] --> B[runtime.iface]\nB --> C[tab *itab]\nB --> D[data unsafe.Pointer]\nC --> E[itab.inter = io.Reader]\nC --> F[itab._type = *bytes.Buffer]\nC --> G[itab.fun = Read 方法地址]\nD --> H[堆/栈上的 *bytes.Buffer]\nI[var a any = 42] --> J[runtime.eface]\nJ --> K[_type *_type]\nJ --> L[data 指向装箱的 int]\nM[r.Read p] --> N[tab.fun 0 data p]\nO[i == j] --> P{tab 相同?}\nP -->|否| Q[不相等]\nP -->|是| R{动态类型可比较?}\nR -->|否| S[panic: uncomparable]\nR -->|是| T[比较 data 指向的值]"
+        },
+        {
+          "kind": "text",
+          "content": "iface = (itab, data)，itab 内含接口类型、具体类型、方法地址表；eface = (_type, data) 没有方法表；调用 r.Read 时走 tab.fun[k](data, ...)；接口比较先比 tab 再比动态值，动态类型不可比较则 panic。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -177,7 +187,7 @@
         "能说清两个接口值相等的条件（动态类型相同且动态值相等），以及动态类型不可比较时比较会 panic",
         "能区分 v,ok := i.(T)、type switch、errors.As 三种取回具体类型的方式及失败行为",
         "能解释 1.18 之后 any、interface{}、泛型 type set 的运行时差异",
-        "能给出至少一种排查 typed nil 的命令或工具（fmt %T、go vet nilness、pprof）"
+        "能给出至少一种排查 typed nil 的方法或工具（fmt %T、nilness 类静态分析、code review）"
       ]
     }
   ],
@@ -247,5 +257,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-16"
+  "updatedAt": "2026-06-18"
 }

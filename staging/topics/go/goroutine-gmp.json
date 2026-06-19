@@ -41,9 +41,19 @@
       "type": "diagram",
       "title": "GMP 调度与阻塞处理",
       "format": "mermaid",
-      "content": "flowchart LR\nA[创建 G] --> B[进入 P 本地队列]\nB[进入 P 本地队列] --> C[M 绑定 P 执行 G]\nC[M 绑定 P 执行 G] --> D[G 发生阻塞或被抢占]\nD[G 发生阻塞或被抢占] --> E[P 继续调度其他 G]\nE[P 继续调度其他 G] --> F[阻塞结束后重新入队]",
-      "fallback": "创建 G -> 进入 P 本地队列 -> M 绑定 P 执行 G -> G 发生阻塞或被抢占 -> P 继续调度其他 G -> 阻塞结束后重新入队",
-      "caption": "P 是调度资源，M 是执行线程，G 是被调度任务；阻塞处理决定并发吞吐。"
+      "content": "flowchart LR\nA[新建 G: newproc] --> B{当前 P 是否有可用 runnext/runq}\nB -->|有空间| C[P 本地 runq 或 runnext]\nB -->|本地队列满| D[批量转移到全局 sched.runq]\nC --> E[M 绑定 P 执行 G]\nD --> E\nE --> F{G 的下一步行为}\nF -->|网络 IO 等待| G[netpollblock: G 进入 _Gwaiting]\nG --> H[P 和 M 继续运行其他 G]\nG -->|fd 就绪 netpoll| C\nF -->|阻塞 syscall/cgo| I[entersyscall: M 与 P 解绑]\nI --> J[sysmon retake P 给其他 M]\nI -->|exitsyscall 拿不到 P| D\nF -->|CPU 运行过久| K[sysmon 请求抢占]\nK -->|Go 1.14+ SIGURG| C\nF -->|正常结束| L[G 进入 _Gdead 等待复用/回收]\nH --> M{P 无本地任务}\nM -->|全局队列有 G| D\nM -->|其他 P 忙| N[work stealing 偷取约一半 G]\nN --> C\nM -->|仍无任务| O[M stopm 休眠]",
+      "fallback": "G 优先进入 P 本地队列；网络 IO 只挂起 G，P/M 继续工作；阻塞 syscall 会解绑 P 并由 sysmon retake；CPU 长跑 G 由异步抢占让出；空闲 P 通过全局队列和 work stealing 找任务。",
+      "caption": "这张图刻意区分了 netpoll、syscall handoff、异步抢占和 work stealing 四条路径；面试时能解释这些分支，比只背 G/M/P 定义更有区分度。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart LR\nA[新建 G: newproc] --> B{当前 P 是否有可用 runnext/runq}\nB -->|有空间| C[P 本地 runq 或 runnext]\nB -->|本地队列满| D[批量转移到全局 sched.runq]\nC --> E[M 绑定 P 执行 G]\nD --> E\nE --> F{G 的下一步行为}\nF -->|网络 IO 等待| G[netpollblock: G 进入 _Gwaiting]\nG --> H[P 和 M 继续运行其他 G]\nG -->|fd 就绪 netpoll| C\nF -->|阻塞 syscall/cgo| I[entersyscall: M 与 P 解绑]\nI --> J[sysmon retake P 给其他 M]\nI -->|exitsyscall 拿不到 P| D\nF -->|CPU 运行过久| K[sysmon 请求抢占]\nK -->|Go 1.14+ SIGURG| C\nF -->|正常结束| L[G 进入 _Gdead 等待复用/回收]\nH --> M{P 无本地任务}\nM -->|全局队列有 G| D\nM -->|其他 P 忙| N[work stealing 偷取约一半 G]\nN --> C\nM -->|仍无任务| O[M stopm 休眠]"
+        },
+        {
+          "kind": "text",
+          "content": "G 优先进入 P 本地队列；网络 IO 只挂起 G，P/M 继续工作；阻塞 syscall 会解绑 P 并由 sysmon retake；CPU 长跑 G 由异步抢占让出；空闲 P 通过全局队列和 work stealing 找任务。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -101,7 +111,7 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "GMP 我会先给结论：Go 用运行时调度器把大量 goroutine 复用到较少 OS 线程上执行，降低并发编程成本，但 goroutine 不是零成本资源。\n\n回答时我会按三层展开：\n- 调度结构：G 表示待执行的 goroutine（含栈和状态），M 是 OS 线程，P 持有本地运行队列和执行 Go 代码所需的调度资源；M 必须拿到 P 才能跑 Go 代码，GOMAXPROCS 控制 P 的数量，默认等于 CPU 核数。\n- 阻塞处理：网络 IO 走 netpoller（epoll/kqueue），G 挂起时 P 不释放，M 立刻调度下一个 G；普通 syscall 走 handoff 路径，M 卡在内核态时 sysmon 10ms 后会把 P 交给其他 M，所以线程数可能超过 GOMAXPROCS。本地队列、全局队列加 work stealing 三层结构防止饥饿。\n- 抢占演进：Go 1.14 之前是协作式抢占，紧循环会卡死整个 P；Go 1.14 引入基于 SIGURG 的异步抢占，sysmon 发现 G 跑超 10ms 就发信号强制让出。\n\n面试追问到生产边界时，我会用 pprof goroutine 抓栈聚合（找卡在 chan receive、select、syscall 的栈），用 GODEBUG=schedtrace=1000 看 P/M/runqueue 数，用 runtime/trace 看 goroutine 生命周期。最常见的泄漏是 HTTP handler 里起后台 goroutine 没传 ctx，请求超时返回了 G 还卡在 channel 上。",
+      "content": "30 秒结论：Go 的并发模型不是为每个 goroutine 创建一个线程，而是由 runtime 调度器把大量 G 映射到少量 M 上执行；真正限制同时执行 Go 代码数量的是 P，GOMAXPROCS 调整的是 P 的数量。理解 GMP 要同时说明正常调度、阻塞让路、抢占和生产定位。\n\n机制要点：\n- G 是被调度任务，保存栈、PC、状态和待执行函数；M 是 OS 线程；P 是执行 Go 代码所需的调度资源，包含本地 runq、runnext、mcache 等。M 必须拿到 P 才能运行普通 Go 代码。\n- 可运行 G 优先进入当前 P 的本地队列，本地队列满会向全局队列转移；P 空闲时会从全局队列取任务，或者从其他 P 偷取一部分 G，避免负载倾斜。\n- 网络 IO 阻塞通常走 netpoller：G 挂起，P/M 继续跑别的 G，fd 就绪后 G 再入队。普通阻塞 syscall 或 cgo 会让 M 卡住，runtime.entersyscall 解绑 P，sysmon 通过 retake 让其他 M 接管 P，所以线程数可能高于 GOMAXPROCS。\n- Go 1.14 后有基于 SIGURG 的异步抢占，sysmon 发现 CPU G 运行过久会请求抢占，解决早期紧循环长期占住 P、影响调度和 GC 安全点的问题。\n\n边界和追问应对：\n- GOMAXPROCS 不是 goroutine 数上限，也不是线程数上限；它限制的是同时执行 Go 代码的 P 数。\n- goroutine 便宜但不是免费资源，高频创建、无退出条件、timer/channel 持有引用都会变成内存和调度负担。\n- 线上 goroutine 数持续上涨时，我会先看 /debug/pprof/goroutine?debug=2 的重复栈，再用两次快照 diff 确认增长路径；如果需要调度视角，用 GODEBUG=schedtrace=1000,scheddetail=1 看 runqueue、threads、idleprocs；复杂场景再抓 runtime/trace 看 G 的生命周期和阻塞原因。",
       "followUpQuestions": [
         {
           "question": "GOMAXPROCS 控制的是线程数还是 goroutine 数？为什么生产上线程数经常超过 GOMAXPROCS？",
@@ -179,5 +189,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-13"
+  "updatedAt": "2026-06-17"
 }

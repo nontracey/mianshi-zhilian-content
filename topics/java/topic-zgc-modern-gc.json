@@ -1,64 +1,101 @@
 {
   "id": "java.jvm.topic-zgc-modern-gc",
+  "title": "ZGC/Shenandoah 与现代低延迟 GC 选型",
   "domain": "java",
   "category": "jvm",
   "group": "jvm",
-  "title": "ZGC/Shenandoah 与现代低延迟 GC 选型",
-  "summary": "理解 ZGC 的着色指针与读屏障如何做到亚毫秒停顿，以及 G1/ZGC/Shenandoah 的选型。",
+  "status": "production",
+  "order": 95,
+  "difficulty": 4,
+  "estimatedMinutes": 30,
+  "interviewFrequency": "medium",
+  "recommendWeight": 82,
   "tags": [
     "Java",
     "JVM",
     "ZGC",
     "GC"
   ],
-  "difficulty": 4,
-  "estimatedMinutes": 28,
-  "order": 95,
-  "recommendWeight": 80,
+  "prerequisites": [
+    "java.jvm.topic-007-e93284f6",
+    "java.jvm.topic-001-ebcc71cb"
+  ],
+  "summary": "基于 OpenJDK 版本事实理解 ZGC/Shenandoah 的并发转移原理、G1/ZGC/Shenandoah/Parallel 的选型边界，以及上线验证和回退信号。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "低延迟 GC 为什么能做到亚毫秒停顿",
-      "content": "## 痛点\nG1 仍有 STW 的标记和转移阶段，停顿随堆增大而上升；大堆（几十上百 GB）服务对延迟敏感时不可接受。\n\n## ZGC 的关键技术\n- **着色指针（Colored Pointers）**：把 GC 元信息（是否已标记/已转移）直接编码进 64 位对象指针的高位，不用额外对象头或映射表，GC 状态随指针流动。\n- **读屏障（Load Barrier）**：读对象引用时插入一小段检查，若发现指向的是“旧地址/未转移”，**当场修正指针并触发转移**（self-healing）。这让**转移阶段可以和应用并发**进行。\n- **并发标记 + 并发转移**：几乎所有工作并发完成，STW 只剩根扫描等极短操作，停顿 **< 1ms 且与堆大小无关**。\n\n## Generational ZGC\nJDK 21 引入分代 ZGC（JDK 23/24 起成为默认 ZGC 形态），按弱分代假说分代回收，大幅降低 CPU 和内存开销。"
+      "title": "低延迟 GC 的核心是把转移并发化",
+      "content": "G1 已经能通过 Region、并发标记和混合回收控制停顿，但 Evacuation Pause、根处理和部分整理工作仍会进入 STW。堆很大、对象存活集高、尾延迟 SLO 严格时，几十毫秒停顿也可能放大成 p99/p999 抖动，ZGC 和 Shenandoah 解决的就是这类矛盾。\n\nZGC 的关键思路是：对象标记和对象转移尽量与应用线程并发执行，只把少量同步阶段留给 STW。它使用着色指针把标记/重映射状态编码到引用里，应用线程加载引用时经过读屏障；如果引用仍指向旧地址，读屏障会把它修正到新地址。这样对象搬迁期间应用仍能继续读对象，停顿主要来自根处理、同步点等短阶段，而不是把大堆对象一次性停下来搬完。\n\n这不是“没有 STW”，也不是免费午餐。读屏障会增加每次引用加载附近的执行成本，并发 GC 线程会消耗 CPU，堆和容器还要留足余量给复制、页面缓存、native memory 和业务突增。回答时要把“用持续开销换尾延迟”说出来。"
     },
     {
       "type": "explain",
-      "title": "G1 / ZGC / Shenandoah 选型",
-      "content": "## 三者定位\n- **G1（默认，JDK 9+）**：Region 化、可预测停顿目标（`-XX:MaxGCPauseMillis`），停顿通常几十毫秒。通用、稳定，绝大多数服务的默认选择。\n- **ZGC（JDK 15 正式，21 分代）**：着色指针+读屏障，亚毫秒停顿、支持 TB 级堆。OpenJDK 主推的低延迟方案。\n- **Shenandoah（Red Hat）**：同样并发转移（用 Brooks 转发指针 + 读屏障），目标与 ZGC 类似，OpenJDK/部分发行版可用。\n\n## 怎么选\n- 吞吐优先 / 普通在线服务：**G1**。\n- 延迟敏感（金融、实时、大堆）：**ZGC**（首选，分代后开销已很低）。\n- 用 Red Hat 系发行版且要低延迟：Shenandoah 也可。\n- 批处理/吞吐极致且可接受长停顿：Parallel GC。\n\n## 代价、验证和失败路径\n低延迟 GC 用读屏障换停顿，CPU 和内存（着色指针/转发）有额外开销；分代 ZGC 已显著缓解。上线前不要只看平均响应时间，要同时观察 `jvm_gc_pause_seconds`、p99/p999 延迟、CPU 使用率、Allocation Rate、Old Region 占用、业务超时日志和 Full GC / Allocation Stall 告警。\n\n如果切到 ZGC 后 CPU 持续升高、分配速率超过回收能力、p999 延迟没有改善，或者容器内存余量过小导致 page cache 与堆争抢，就应回退到 G1 或调低堆/并发线程参数。选型判断不是“低延迟 GC 一定更好”，而是用 GC 日志和压测指标验证停顿、吞吐和内存余量是否同时满足目标。"
+      "title": "ZGC 版本口径要按 JDK 21/23/24 讲",
+      "content": "截至 2026-06，ZGC 的面试口径应围绕分代 ZGC，而不是早期非分代模式。关键节点是：JDK 11 引入实验版 ZGC，JDK 15 变成 product 特性；JDK 21 引入 Generational ZGC，把堆分成年轻代和老年代；JDK 23 把 ZGC 的默认模式切到 generational；JDK 24 移除非分代 ZGC 模式，`-XX:+UseZGC` 即使用分代 ZGC，旧的 `ZGenerational` 选项不应再作为新配置依赖。\n\n分代的价值来自弱分代假说：多数对象朝生夕死，年轻代更值得高频回收。非分代 ZGC 对所有对象用同一套回收节奏，短命对象多的服务会让并发回收承受不必要的扫描和转移压力；分代 ZGC 让 young collection 更聚焦，可以降低 allocation stall 风险、堆内存余量需求和 GC CPU 开销。\n\nShenandoah 与 ZGC 目标接近，也把对象转移并发化，但实现路径不同，常用 forwarding pointer/屏障组合来处理对象移动期间的引用一致性。它的可用性与发行版、平台、团队运维经验相关，不能只按名字选。"
+    },
+    {
+      "type": "explain",
+      "title": "选型看业务目标，不看收集器名气",
+      "content": "一般线上服务先以 G1 为基线：JDK 9+ 服务端默认是 G1，它的稳定性、日志、生态经验和吞吐/停顿平衡更适合多数场景。批处理、离线任务或吞吐优先且可接受较长停顿时，Parallel GC 仍有价值。\n\nZGC 适合尾延迟敏感、堆较大、Full/Old GC 风险高、p99/p999 受 GC pause 影响明显的服务。Shenandoah 适合类似低停顿目标，但还要确认运行的 OpenJDK 发行版、平台支持和团队是否熟悉其日志与参数。G1 的几十毫秒停顿若已经满足 SLO，贸然切 ZGC 可能只是把停顿换成更高 CPU 或内存压力。\n\n验证时不要只看平均响应时间。至少要对比同等负载下的 GC pause 分布、业务 p99/p999、CPU、RSS/容器 limit、allocation rate、allocation stall、young/old 占用变化、Full GC、超时日志和错误率。若切换后 CPU 长期升高、并发回收跟不上分配、RSS 触顶、业务尾延迟没有改善，应回到 G1 或重新评估堆大小、并发线程、对象分配速率和缓存策略。"
     },
     {
       "type": "diagram",
-      "title": "ZGC/Shenandoah 与现代低延迟 GC 选型 学习主线图",
-      "content": "flowchart LR\nA[ZGC/Shenandoah 与现代低延迟 ] --> B[ZGC]\nB --> C[GC]\nC --> D[着色指针 + 读屏障]\nD --> E[并发标记 + 并发转移]\nE --> F[停顿与堆大小无关]",
-      "items": [
-        "着色指针：GC 状态编码进指针高位",
-        "并发标记：与应用线程并发，标记存活对象",
-        "并发转移/重定位：对象搬到新区，应用同时运行",
-        "读屏障：读引用时发现旧地址即修正并触发转移（self-healing）",
-        "STW 仅根扫描等极短阶段，停顿<1ms 与堆大小无关",
-        "Generational ZGC：分代降低 CPU/内存开销"
-      ],
-      "format": "mermaid",
-      "fallback": "ZGC/Shenandoah 与现代低延迟  -> ZGC -> GC -> 着色指针 + 读屏障 -> 并发标记 + 并发转移 -> 停顿与堆大小无关",
-      "caption": "从 ZGC 到 停顿与堆大小无关，这张图帮助区分 ZGC/Shenandoah 与现代低延迟 GC 选型 的核心机制、边界条件和常见误区。"
+      "title": "ZGC 低停顿路径与选型验证",
+      "format": "svg",
+      "content": "assets/diagrams/java-zgc-generational-low-latency.svg",
+      "caption": "图中把 ZGC 的分代堆、并发标记/转移、着色指针、读屏障修正、短 STW 阶段和上线验证指标放在一起，突出“低停顿来自并发转移和资源换取”。",
+      "fallback": "ZGC 在分代堆上进行并发标记和并发转移，引用状态由着色指针携带，应用线程读取引用时经读屏障修正旧地址。STW 仍存在但集中在根处理等短阶段。选型时以 G1 为基线，只有在尾延迟、大堆或 Full GC 风险确实成为主要矛盾时才压测 ZGC/Shenandoah，并同时观察 pause、p99/p999、CPU、RSS、allocation stall 和业务超时。",
+      "sources": [
+        {
+          "kind": "svg",
+          "path": "assets/diagrams/java-zgc-generational-low-latency.svg"
+        },
+        {
+          "kind": "text",
+          "content": "ZGC 在分代堆上进行并发标记和并发转移，引用状态由着色指针携带，应用线程读取引用时经读屏障修正旧地址。STW 仍存在但集中在根处理等短阶段。选型时以 G1 为基线，只有在尾延迟、大堆或 Full GC 风险确实成为主要矛盾时才压测 ZGC/Shenandoah，并同时观察 pause、p99/p999、CPU、RSS、allocation stall 和业务超时。"
+        }
+      ]
     },
     {
       "type": "compareTable",
-      "title": "主流 GC 对比",
-      "content": "| 对比项 | Parallel | G1 | ZGC | Shenandoah |\n| --- | --- | --- | --- | --- |\n| 目标 | 吞吐 | 平衡/可预测停顿 | 超低延迟 | 超低延迟 |\n| 典型停顿 | 较长 | 几十 ms | <1 ms | <1~10 ms |\n| 停顿随堆增长 | 是 | 一定 | 几乎无关 | 几乎无关 |\n| 关键技术 | 多线程并行 | Region+混合回收 | 着色指针+读屏障 | 转发指针+读屏障 |\n| 适用 | 批处理 | 通用默认 | 大堆低延迟 | 大堆低延迟 |"
+      "title": "主流 GC 的目标和代价",
+      "content": "| 收集器 | 核心目标 | 关键机制 | 适合场景 | 需要警惕 |\n| --- | --- | --- | --- | --- |\n| Parallel | 吞吐优先 | 多线程 STW 并行回收 | 离线任务、批处理、可接受较长停顿 | pause 可能较长，在线尾延迟不友好 |\n| G1 | 通用平衡、可控停顿 | Region、并发标记、Mixed GC、暂停目标 | 多数在线服务默认基线 | `MaxGCPauseMillis` 是目标不是硬承诺，Humongous/to-space 等仍会带来抖动 |\n| ZGC | 极低停顿、大堆友好 | 着色指针、读屏障、并发标记/转移、分代回收 | 尾延迟严格、大堆、Full GC 风险高 | 读屏障、并发线程、内存余量和日志口径变化 |\n| Shenandoah | 极低停顿、大堆友好 | forwarding pointer/屏障、并发转移 | 支持该收集器的发行版与平台上的低停顿服务 | 发行版支持差异、参数和日志经验要求 |\n\n| 验证指标 | 说明 |\n| --- | --- |\n| GC pause 分布 | 看 p95/p99/p999 和最大停顿，不只看均值 |\n| Allocation Stall | 说明并发回收可能跟不上分配速率 |\n| CPU 与并发 GC 线程 | 低停顿换来的 CPU 开销是否压缩业务线程 |\n| RSS/容器 limit | ZGC/Shenandoah 需要额外余量，不能只看 heap used |\n| 业务超时和错误率 | GC 指标改善但业务无改善，说明瓶颈可能不在 GC |"
+    },
+    {
+      "type": "code",
+      "title": "可运行命令：探测当前 JDK 支持哪些 GC",
+      "content": "#!/usr/bin/env bash\nset -u\n\njava -version 2>&1 | sed -n '1,3p'\n\njava -XX:+PrintFlagsFinal -version 2>&1 \\\n  | grep -E 'Use(ZGC|G1GC|ShenandoahGC|ParallelGC)|ZGenerational' \\\n  | sort\n\ntry_gc() {\n  name=\"$1\"\n  shift\n  log_file=\"$(mktemp)\"\n  if java -Xms64m -Xmx64m \"$@\" -Xlog:gc -version >\"$log_file\" 2>&1; then\n    printf '\\n%s supported\\n' \"$name\"\n    grep -E 'Using|ZGC|Shenandoah|G1|Parallel' \"$log_file\" | sed -n '1,8p'\n  else\n    printf '\\n%s unavailable on this JDK/build\\n' \"$name\"\n    sed -n '1,5p' \"$log_file\"\n  fi\n}\n\ntry_gc G1 -XX:+UseG1GC\ntry_gc ZGC -XX:+UseZGC\ntry_gc Shenandoah -XX:+UseShenandoahGC",
+      "language": "bash",
+      "highlights": [
+        {
+          "line": 6,
+          "note": "先打印本机 JVM 的实际 flags，避免把某个 JDK/发行版的支持情况当成通用事实。"
+        },
+        {
+          "line": 13,
+          "note": "逐个启动小堆 smoke test，能支持就打印 GC 初始化日志，不支持也给出本机错误。"
+        },
+        {
+          "line": 24,
+          "note": "Shenandoah 支持受发行版和平台影响，探测失败不是内容错误，而是环境差异。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
-      "title": "标准面试回答",
-      "content": "结论：现代低延迟 GC（ZGC、Shenandoah）通过并发标记 + 并发转移，把停顿压到亚毫秒且与堆大小无关，适合大堆、延迟敏感场景；G1 仍是通用默认，停顿几十毫秒、可预测。\n\nZGC 的核心是着色指针（把 GC 状态编码进指针高位）和读屏障（读引用时发现指向旧地址就当场修正并触发转移），从而让转移阶段也能与应用并发；JDK 21 起的分代 ZGC 进一步降低开销。\n\n选型时我会先定目标：如果 p99/p999 延迟和大堆停顿是主要矛盾，再考虑 ZGC；如果吞吐、CPU 成本和成熟度更重要，G1 往往更稳。验证要看 GC pause、业务超时日志、CPU、Allocation Rate、内存余量和压测曲线。若出现 Allocation Stall、CPU 明显升高或延迟收益不明显，就不能继续只因为“低延迟”而坚持 ZGC。",
+      "title": "面试回答思路",
+      "content": "我会先给结论：G1 仍是多数在线服务的默认基线；ZGC 和 Shenandoah 用持续的屏障/并发线程开销换更短 STW，适合尾延迟严格或大堆停顿明显的服务。\n\n原理上，ZGC 用着色指针记录标记和重映射状态，用读屏障在应用线程读取引用时检查并修正旧地址；标记和对象转移大部分并发执行，STW 主要保留在根处理和同步点等短阶段。它不是没有 STW，也不保证吞吐更高。JDK 21 引入分代 ZGC，JDK 23 默认分代，JDK 24 移除非分代模式，所以新版本讨论 ZGC 要按 generational 口径讲。\n\n选型上，我会先看业务目标和证据。如果 G1 pause 已满足 SLO，就不需要为了收集器名气切换；如果 p99/p999、Full GC 风险或大堆停顿是主要矛盾，就压测 ZGC，发行版合适时也可比较 Shenandoah。验证看 GC pause 分布、Allocation Stall、CPU、RSS、allocation rate、业务超时和错误率；若 CPU 或内存压力上升而业务尾延迟没改善，要回退或重新调对象分配与堆边界。",
       "followUpQuestions": [
         {
-          "question": "ZGC 为什么停顿和堆大小几乎无关？",
-          "answer": "因为标记和对象转移几乎全部并发执行，STW 只剩根扫描这类与存活对象数量无关的极短操作；着色指针 + 读屏障让应用在转移进行时也能安全访问对象（读到旧地址会被 self-healing 修正），所以停顿不随堆/存活对象规模线性增长。"
+          "question": "ZGC 为什么能把大部分停顿压得很短？",
+          "answer": "因为对象标记和对象转移主要并发执行，应用线程读引用时由读屏障处理旧地址修正；着色指针携带引用状态，帮助 GC 和应用线程在对象移动期间保持一致。剩余 STW 集中在根处理、重标记或同步点等短阶段，所以 pause 不再随堆大小或存活对象规模线性增长。"
         },
         {
-          "question": "什么时候不该用 ZGC，仍用 G1？",
-          "answer": "当服务对吞吐比延迟更敏感、堆不大、几十毫秒停顿可接受时，G1 更稳更省 CPU。ZGC 的读屏障有持续开销，分代前在小堆上未必划算；通用在线服务默认 G1 即可。"
+          "question": "为什么 JDK 21 之后要重点讲分代 ZGC？",
+          "answer": "分代 ZGC 利用大多数对象短命的事实，把年轻代和老年代分开回收，让 GC 更频繁地处理收益高的年轻对象。JDK 21 引入该能力，JDK 23 设为默认，JDK 24 移除非分代模式；新配置只写 `-XX:+UseZGC` 即是分代 ZGC，旧的 `ZGenerational` 选项不应作为长期配置依赖。"
+        },
+        {
+          "question": "线上从 G1 切到 ZGC 后怎么判断要不要回退？",
+          "answer": "用同等流量或压测对比：GC pause 是否明显降低，业务 p99/p999 是否改善，CPU 是否挤压业务线程，RSS 是否靠近容器 limit，是否出现 Allocation Stall，错误率和超时是否变化。若只有 GC pause 好看但业务尾延迟没改善，或者 CPU/RSS 成本不可接受，就应该回退 G1 或先治理分配速率、缓存、堆外内存和容器余量。"
         }
       ]
     },
@@ -66,53 +103,59 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释着色指针和读屏障如何让转移阶段并发、停顿亚毫秒",
-        "能说明 ZGC 停顿为何与堆大小几乎无关",
-        "能区分 G1/ZGC/Shenandoah 的定位",
-        "能给出按延迟与堆大小的选型建议",
-        "能说出低延迟 GC 的 CPU/内存代价和分代 ZGC 的改进"
+        "能说明 ZGC 的着色指针、读屏障、并发标记、并发转移如何配合",
+        "能准确说出 JDK 21/23/24 对分代 ZGC 的版本节点",
+        "能解释低停顿 GC 仍有 STW，并且会带来 CPU、屏障和内存余量成本",
+        "能区分 G1、ZGC、Shenandoah、Parallel 的目标和选型场景",
+        "能用 GC pause、p99/p999、CPU、RSS、Allocation Stall 和业务超时验证选型",
+        "能设计压测、灰度和回退标准，而不是只凭收集器名称做迁移"
       ]
     }
   ],
+  "interviewerFocus": "考察候选人能否把 ZGC/Shenandoah 的并发转移原理、分代 ZGC 版本事实、G1 基线选择和上线验证指标讲成可落地的选型判断。",
   "recallPrompts": [
     {
       "id": "java.jvm.topic-zgc-modern-gc.recall.1",
-      "prompt": "解释 ZGC 的着色指针和读屏障如何实现亚毫秒、与堆大小无关的停顿。",
+      "prompt": "请解释 ZGC 的着色指针、读屏障和并发转移如何降低 STW 停顿，并说明仍有哪些短暂停顿。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "java.jvm.topic-zgc-modern-gc.recall.2",
-      "prompt": "在通用在线服务、延迟敏感大堆、批处理三种场景下分别选什么 GC，为什么？",
+      "prompt": "请按 JDK 21、23、24 三个节点说明分代 ZGC 的版本口径，以及新配置为什么不再依赖 ZGenerational。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "java.jvm.topic-zgc-modern-gc.recall.3",
-      "prompt": "如果切换到 ZGC 后 CPU 升高或 p999 延迟没有改善，你会如何用 GC 日志、指标和压测结果判断是否回退到 G1？",
+      "prompt": "在通用在线服务、延迟敏感大堆、批处理三种场景下分别如何选择 G1、ZGC/Shenandoah、Parallel？如何验证和回退？",
       "mode": "text",
-      "expectedMinutes": 4,
+      "expectedMinutes": 5,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "着色指针 + 读屏障",
-      "并发标记+并发转移",
-      "停顿与堆大小无关",
-      "G1/ZGC 选型"
+      "能解释 ZGC 着色指针、读屏障、并发标记、并发转移的配合关系",
+      "能准确说明 Generational ZGC 的 JDK 21/23/24 版本口径",
+      "能区分 G1、ZGC、Shenandoah、Parallel 的目标、场景和代价",
+      "能指出低延迟 GC 不是零 STW，也不等于吞吐更高",
+      "能用业务指标和 JVM 指标验证选型，而不是只看 GC pause 均值"
     ],
     "goodToHave": [
-      "Generational ZGC（JDK21）",
-      "Shenandoah 转发指针",
-      "低延迟 GC 的 CPU/内存代价"
+      "能说明分代 ZGC 降低 allocation stall、heap headroom 和 GC CPU 的原因",
+      "能结合容器 RSS、direct memory、page cache 和业务线程 CPU 解释迁移风险",
+      "能给出压测、灰度、回退标准和日志指标观察项",
+      "能说明 Shenandoah 可用性受发行版与平台影响"
     ],
     "commonMistakes": [
-      "以为 ZGC 没有任何 STW",
-      "认为低延迟 GC 一定吞吐也最好",
-      "把 G1 和 ZGC 适用场景搞反"
+      "把 ZGC 说成完全没有 STW",
+      "只按收集器名气迁移，忽略 G1 已满足 SLO 的场景",
+      "继续把非分代 ZGC 当作新版本主口径",
+      "只看平均响应时间，不看尾延迟、CPU、RSS 和 allocation stall",
+      "在容器里只按 heap 使用率判断低延迟 GC 是否安全"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -121,12 +164,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
-  "status": "production",
-  "interviewFrequency": "medium",
-  "interviewerFocus": "考察 ZGC 着色指针/读屏障的低延迟原理，以及 G1/ZGC/Shenandoah 的选型权衡。",
-  "prerequisites": [
-    "java.jvm.topic-007-e93284f6",
-    "java.jvm.topic-001-ebcc71cb"
-  ]
+  "updatedAt": "2026-06-19"
 }

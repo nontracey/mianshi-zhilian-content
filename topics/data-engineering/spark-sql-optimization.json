@@ -38,11 +38,21 @@
     },
     {
       "type": "diagram",
-      "title": "Catalyst + AQE 完整执行链",
+      "title": "Spark SQL 优化链路：逻辑计划、统计信息、物理计划与 AQE",
       "format": "mermaid",
-      "content": "flowchart LR\nSQL[SQL/DataFrame] --> P[Parser]\nP --> A[Analyzer + Catalog]\nA --> R[RBO 规则集]\nR --> CBO{CBO?}\nCBO -- 有统计 --> J[ReorderJoin/JoinSelection]\nCBO -- 无统计 --> J\nJ --> SP[SparkPlanner 物理计划]\nSP --> EX[EnsureRequirements 插 Exchange]\nEX --> WS[WholeStageCodegen]\nWS --> ST[Stage 执行]\nST --> AQE{AQE 改写}\nAQE -- coalesce --> ST\nAQE -- skew split --> ST\nAQE -- demote SMJ->BHJ --> ST",
-      "fallback": "Parser -> Analyzer -> RBO（PushDown/Pruning）-> CBO 重排 Join -> 物理计划 -> Exchange/Sort -> WholeStageCodegen -> Stage 执行 -> AQE 在 stage 边界做 coalesce/skew/Join 降级，再回到下一 stage。",
-      "caption": "RBO 在编译期一次跑完，CBO 影响 Join 顺序，AQE 在每个 stage 完成后基于真实 shuffle 统计回写计划。"
+      "content": "flowchart TD\nA[\"SQL/DataFrame\"] --> B[\"Parser + Analyzer\n解析和绑定列表\"]\nB --> C[\"Catalyst Optimizer\n谓词下推/列裁剪/规则改写\"]\nC --> D[\"统计信息/CBO\n表大小/基数/直方图\"]\nD --> E[\"Physical Plan\nJoin 策略/Shuffle\"]\nE --> F[\"执行并收集 runtime stats\"]\nF --> G[\"AQE\n合并分区/处理倾斜/改 Join\"]\nG --> H[\"最终任务执行\"]\nI[\"EXPLAIN/SQL UI\"] --> C\nI --> G",
+      "fallback": "图展示 Spark SQL 优化不是只加参数，而是逻辑规则、统计信息、物理计划、运行时统计和 AQE 共同作用。",
+      "caption": "Spark SQL 优化链路：逻辑计划、统计信息、物理计划与 AQE",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[\"SQL/DataFrame\"] --> B[\"Parser + Analyzer\n解析和绑定列表\"]\nB --> C[\"Catalyst Optimizer\n谓词下推/列裁剪/规则改写\"]\nC --> D[\"统计信息/CBO\n表大小/基数/直方图\"]\nD --> E[\"Physical Plan\nJoin 策略/Shuffle\"]\nE --> F[\"执行并收集 runtime stats\"]\nF --> G[\"AQE\n合并分区/处理倾斜/改 Join\"]\nG --> H[\"最终任务执行\"]\nI[\"EXPLAIN/SQL UI\"] --> C\nI --> G"
+        },
+        {
+          "kind": "text",
+          "content": "图展示 Spark SQL 优化不是只加参数，而是逻辑规则、统计信息、物理计划、运行时统计和 AQE 共同作用。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -84,12 +94,22 @@
       "type": "code",
       "title": "用 explain formatted 定位 PushedFilters 失效",
       "language": "scala",
-      "content": "// 1. 不下推：date() 包裹分区列\nspark.sql(\"\"\"\n  SELECT user_id, amount\n  FROM orders\n  WHERE date(event_ts) = '2026-06-13'\n\"\"\").explain(\"formatted\")\n// FileScan parquet … PartitionFilters: [], PushedFilters: []\n// → 全表扫描\n\n// 2. 下推成功：直接对原始列做范围过滤\nspark.sql(\"\"\"\n  SELECT user_id, amount\n  FROM orders\n  WHERE event_ts >= '2026-06-13 00:00:00'\n    AND event_ts <  '2026-06-14 00:00:00'\n\"\"\").explain(\"formatted\")\n// FileScan parquet … PartitionFilters: [isnotnull(dt#12), (dt#12 = 2026-06-13)],\n//                  PushedFilters: [IsNotNull(event_ts), GreaterThanOrEqual(event_ts, ...)]\n\n// 3. 强制广播 + 关闭 AQE 看看走没走 BHJ\nspark.conf.set(\"spark.sql.adaptive.enabled\", \"false\")\nval big   = spark.table(\"fact_orders\")\nval small = spark.table(\"dim_user\")\nbig.join(broadcast(small), \"user_id\").explain(\"formatted\")\n// BroadcastHashJoin [user_id], Inner, BuildRight\n//   BroadcastExchange HashedRelationBroadcastMode(...)\n\n// 4. 打开 AQE 后看 SortMergeJoin 是否被降级\nspark.conf.set(\"spark.sql.adaptive.enabled\", \"true\")\nspark.conf.set(\"spark.sql.adaptive.localShuffleReader.enabled\", \"true\")\n// 运行后 Spark UI 的 SQL Tab 会标 'AQEShuffleRead' 与 'BroadcastHashJoin (was SortMergeJoin)'"
+      "content": "// 1. 不下推：date() 包裹分区列\nspark.sql(\"\"\"\n  SELECT user_id, amount\n  FROM orders\n  WHERE date(event_ts) = '2026-06-13'\n\"\"\").explain(\"formatted\")\n// FileScan parquet … PartitionFilters: [], PushedFilters: []\n// → 全表扫描\n\n// 2. 下推成功：直接对原始列做范围过滤\nspark.sql(\"\"\"\n  SELECT user_id, amount\n  FROM orders\n  WHERE event_ts >= '2026-06-13 00:00:00'\n    AND event_ts <  '2026-06-14 00:00:00'\n\"\"\").explain(\"formatted\")\n// FileScan parquet … PartitionFilters: [isnotnull(dt#12), (dt#12 = 2026-06-13)],\n//                  PushedFilters: [IsNotNull(event_ts), GreaterThanOrEqual(event_ts, ...)]\n\n// 3. 强制广播 + 关闭 AQE 看看走没走 BHJ\nspark.conf.set(\"spark.sql.adaptive.enabled\", \"false\")\nval big   = spark.table(\"fact_orders\")\nval small = spark.table(\"dim_user\")\nbig.join(broadcast(small), \"user_id\").explain(\"formatted\")\n// BroadcastHashJoin [user_id], Inner, BuildRight\n//   BroadcastExchange HashedRelationBroadcastMode(...)\n\n// 4. 打开 AQE 后看 SortMergeJoin 是否被降级\nspark.conf.set(\"spark.sql.adaptive.enabled\", \"true\")\nspark.conf.set(\"spark.sql.adaptive.localShuffleReader.enabled\", \"true\")\n// 运行后 Spark UI 的 SQL Tab 会标 'AQEShuffleRead' 与 'BroadcastHashJoin (was SortMergeJoin)'",
+      "highlights": [
+        {
+          "line": 7,
+          "note": "`// FileScan parquet … PartitionFilters: [], PushedFilters: []` 更新核心数据结构，是解释状态如何推进的抓手。"
+        },
+        {
+          "line": 3,
+          "note": "`SELECT user_id, amount` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试 30 秒结论 + 机制 + 边界",
-      "content": "结论：Spark SQL 优化的主线是 Catalyst 的 Parser→Analyzer→Optimizer→SparkPlanner 四阶段，加上运行期的 AQE 改写；调优要先看 explain formatted 和 Spark UI，再回到数据布局和统计信息，而不是先加资源。\n\n机制：编译期 RBO 做 PushDownPredicate、ColumnPruning、PartitionFilter 下推；CBO 在有 ANALYZE TABLE 统计时做 ReorderJoin 和 Join 策略选择；物理计划阶段在 BroadcastHashJoin/SortMergeJoin/ShuffleHashJoin 之间挑一个。AQE 在每个 stage 边界基于真实 shuffle 统计做三件事：合并小分区到 advisoryPartitionSizeInBytes、把 SortMergeJoin 降级成 BroadcastHashJoin、对倾斜分区切片复制对侧。\n\n边界与坑：第一类是下推失效，列被 date()/cast/UDF 包裹时 PushedFilters 为空；第二类是误广播，autoBroadcastJoinThreshold 判错或没收集统计，10MB 小表被估成 GB 级走 SMJ，反过来大表被广播打爆 driver；第三类是 AQE 不是万能药，纯 BHJ 不会触发改写，统计缺失会让 CBO 直接退化成 RBO。",
+      "content": "结论：Spark SQL 优化的主线是 Catalyst 的 Parser→Analyzer→Optimizer→SparkPlanner 四阶段，加上运行期的 AQE 改写；调优要先看 explain formatted 和 Spark UI，再回到数据布局和统计信息，而不是先加资源。\n\n机制要点：\n- 机制：编译期 RBO 做 PushDownPredicate、ColumnPruning、PartitionFilter 下推；CBO 在有 ANALYZE TABLE 统计时做 ReorderJoin 和 Join 策略选择；物理计划阶段在 BroadcastHashJoin/SortMergeJoin/ShuffleHashJoin 之间挑一个。AQE 在每个 stage 边界基于真实 shuffle 统计做三件事：合并小分区到 advisoryPartitionSizeInBytes、把 SortMergeJoin 降级成 BroadcastHashJoin、对倾斜分区切片复制对侧。\n- 边界与坑：第一类是下推失效，列被 date()/cast/UDF 包裹时 PushedFilters 为空；第二类是误广播，autoBroadcastJoinThreshold 判错或没收集统计，10MB 小表被估成 GB 级走 SMJ，反过来大表被广播打爆 driver；第三类是 AQE 不是万能药，纯 BHJ 不会触发改写，统计缺失会让 CBO 直接退化成 RBO。",
       "followUpQuestions": [
         {
           "question": "explain formatted 里你具体看哪几行就能判断优化是否生效？",
@@ -97,7 +117,7 @@
         },
         {
           "question": "AQE 的动态合并分区和 spark.sql.shuffle.partitions=200 是什么关系？",
-          "answer": "spark.sql.shuffle.partitions 是 shuffle 后的初始分区数，AQE 的 coalescePartitions 是在 shuffle 写完之后，按 advisoryPartitionSizeInBytes（默认 64MB）把过小的相邻分区合并。所以最佳实践是把 shuffle.partitions 调大（比如 1000-2000）让 AQE 有合并空间，而不是手动调到刚好；同时 minPartitionNum 兜底防止合并过头丢并行度。"
+          "answer": "spark.sql.shuffle.partitions 是 shuffle 前的初始分区数，AQE 的 coalescePartitions 会在 shuffle 统计信息出来后合并过小分区。不能固定背 1000 或 2000；应结合输入规模、集群核数、目标文件大小和并行度设置一个“足够但不过度”的初始值，再看 SQL UI 里的任务耗时、shuffle size、倾斜分区和输出文件大小。Spark 官方配置里 advisoryPartitionSizeInBytes 默认是 64MB，但 parallelismFirst 等选项会影响是否严格按该目标合并，所以面试要讲“看运行时统计调参”，不是套数字。"
         },
         {
           "question": "线上一个 join 突然从 BroadcastHashJoin 退化成 SortMergeJoin，怎么排查？",
@@ -166,5 +186,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-13"
+  "updatedAt": "2026-06-18"
 }

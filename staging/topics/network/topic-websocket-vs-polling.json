@@ -29,11 +29,21 @@
     },
     {
       "type": "diagram",
-      "title": "四种推送方案的报文时序",
-      "content": "flowchart LR\nSP[Short Polling 客户端每 3s GET] --> SP1[服务端立即 200 返回 可能空数组]\nSP1 --> SP2[平均延迟 间隔/2 浪费 HTTP 头]\nLP[Long Polling 客户端 GET] --> LP1[服务端 hold socket 直到事件或 30s 超时]\nLP1 --> LP2[响应后客户端立刻再发下一条]\nSSE[SSE 客户端一次 GET text/event-stream] --> SSE1[服务端持续 chunked 写 data: ...<br/><br/>]\nSSE1 --> SSE2[断开后 EventSource 自动重连 带 Last-Event-ID]\nWS[WebSocket HTTP/1.1 Upgrade + Sec-WebSocket-Key] --> WS1[101 Switching Protocols 转 WS 帧]\nWS1 --> WS2[双向收发 ping/pong 心跳 业务层实现重连]",
-      "caption": "四种方案的连接建立、保持与重连差异：短轮询无连接、长轮询挂起请求、SSE 单向流、WebSocket 双向帧",
-      "fallback": "短轮询：固定间隔 GET，平均延迟为间隔一半。长轮询：服务端 hold socket 直到事件或 30s 超时。SSE：一次 GET 后服务端持续 chunked 推送 data 行，断线由 EventSource 自动重连并带 Last-Event-ID。WebSocket：HTTP Upgrade + 101 状态码后切换为 WS 帧，双向收发，需业务层自己实现心跳和重连。",
-      "format": "mermaid"
+      "title": "WebSocket 与长轮询对比：参与者交互时序",
+      "content": "sequenceDiagram\nparticipant N13ybyqmA as WebSocket 与长... 调用方\nparticipant N13ybyqmB as WebSocket 与长轮询对比\nparticipant N13ybyqmC as WebSocket 与长... 下游依赖\nN13ybyqmA->>N13ybyqmB: 发起 WebSocket 与长... 请求/事件\nN13ybyqmB->>N13ybyqmB: 校验 WebSocket 与长... 输入与上下文\nN13ybyqmB->>N13ybyqmC: 调用依赖或写入状态\nN13ybyqmC-->>N13ybyqmB: 返回结果/错误\nN13ybyqmB-->>N13ybyqmA: 成功响应或失败兜底",
+      "caption": "WebSocket 与长轮询对比 图中的分支用于区分本题正常机制、异常边界和工程验证路径。",
+      "fallback": "WebSocket 与长轮询对比 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。",
+      "format": "mermaid",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "sequenceDiagram\nparticipant N13ybyqmA as WebSocket 与长... 调用方\nparticipant N13ybyqmB as WebSocket 与长轮询对比\nparticipant N13ybyqmC as WebSocket 与长... 下游依赖\nN13ybyqmA->>N13ybyqmB: 发起 WebSocket 与长... 请求/事件\nN13ybyqmB->>N13ybyqmB: 校验 WebSocket 与长... 输入与上下文\nN13ybyqmB->>N13ybyqmC: 调用依赖或写入状态\nN13ybyqmC-->>N13ybyqmB: 返回结果/错误\nN13ybyqmB-->>N13ybyqmA: 成功响应或失败兜底"
+        },
+        {
+          "kind": "text",
+          "content": "WebSocket 与长轮询对比 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -44,12 +54,26 @@
       "type": "code",
       "title": "四种方案的客户端实现要点",
       "content": "// 1. 短轮询：fetch + setInterval，注意带 since/lastId 做增量\nfunction shortPolling() {\n  let lastId = 0;\n  setInterval(async () => {\n    const resp = await fetch(`/api/messages?since=${lastId}`);\n    const data = await resp.json();\n    if (data.length > 0) lastId = data[data.length - 1].id;\n  }, 3000);\n}\n\n// 2. 长轮询：while + AbortSignal.timeout，错误退避避免风暴\nasync function longPolling() {\n  let lastId = 0;\n  while (true) {\n    try {\n      const resp = await fetch(`/api/messages/subscribe?since=${lastId}`, {\n        signal: AbortSignal.timeout(30000)\n      });\n      const data = await resp.json();\n      if (data.length > 0) lastId = data[data.length - 1].id;\n    } catch (e) {\n      // 超时是正常路径，网络错则退避 1s 防止雪崩\n      await new Promise(r => setTimeout(r, 1000));\n    }\n  }\n}\n\n// 3. SSE：EventSource 自动重连 + Last-Event-ID 续传\nfunction sseDemo() {\n  const es = new EventSource('/api/events');\n  es.onmessage = e => render(JSON.parse(e.data));\n  es.addEventListener('order-update', e => updateOrder(JSON.parse(e.data)));\n  // 断网时浏览器自动带 Last-Event-ID 重连，服务端按该 ID 回放\n}\n\n// 4. WebSocket：必须业务层实现心跳 + 重连 + 消息补拉\nfunction wsDemo() {\n  let lastSeq = 0;\n  let retries = 0; // 指数退避计数，必须初始化\n  const connect = () => {\n    const ws = new WebSocket(`wss://example.com/ws?since=${lastSeq}`);\n    ws.onopen = () => {\n      retries = 0; // 连上后重置退避\n      // 应用层心跳 25s，小于 Nginx 默认 60s proxy_read_timeout，避免空闲断连\n      ws.heartbeat = setInterval(() => ws.send('{\"type\":\"ping\"}'), 25000);\n    };\n    ws.onmessage = e => {\n      const msg = JSON.parse(e.data);\n      lastSeq = msg.seq;\n      render(msg);\n    };\n    ws.onclose = ev => {\n      clearInterval(ws.heartbeat);\n      // 1000 正常关闭、1001 服务端 going away；1006 等异常断开才需重连，否则会风暴\n      if (ev.code !== 1000 && ev.code !== 1001) setTimeout(connect, Math.min(30000, 1000 * 2 ** retries++));\n    };\n  };\n  connect();\n}\n\n// 服务端 SSE 关键响应头（Express 示例）\napp.get('/api/events', (req, res) => {\n  res.setHeader('Content-Type', 'text/event-stream');\n  res.setHeader('Cache-Control', 'no-cache');\n  res.setHeader('Connection', 'keep-alive');\n  res.setHeader('X-Accel-Buffering', 'no'); // 关键：关闭 Nginx 缓冲\n  const hb = setInterval(() => res.write(':hb\\n\\n'), 25000);\n  req.on('close', () => clearInterval(hb));\n});",
-      "language": "javascript"
+      "language": "javascript",
+      "highlights": [
+        {
+          "line": 2,
+          "note": "`function shortPolling() {` 定义了 WebSocket 与长轮询对比 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+        },
+        {
+          "line": 11,
+          "note": "`// 2. 长轮询：while + AbortSignal.timeout，错误退避避免风暴` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+        },
+        {
+          "line": 5,
+          "note": "`const resp = await fetch(`/api/messages?since=${lastId}`);` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**Q1：WebSocket、长轮询、短轮询、SSE 怎么选？**\n\n30 秒结论：先看方向，再看频率，再看代理环境。需要双向上下行（IM、协同、游戏）只有 WebSocket 能干；只要服务端推（AI 流式、订单状态、推送通知）首选 SSE，因为它复用 HTTP 鉴权和 CDN，且自带 Last-Event-ID 重连；30 秒级的低频状态用短轮询足够，省去长连接运维；老旧浏览器或被代理剥 Upgrade 头时退回长轮询兜底。\n\n机制差异：短轮询固定间隔发完整 HTTP 请求，平均延迟是间隔的一半；长轮询服务端 hold socket 到事件或 25-30s 超时；SSE 用 chunked 流持续发 `data: ...\\n\\n`；WebSocket 用 HTTP Upgrade + 101 切到 WS 帧，2-14 字节帧头，能发二进制。\n\n**Q2：为什么不全都用 WebSocket？**\n\n三个原因：第一，单向场景里 SSE 复用 HTTP 鉴权 / Cookie / CDN，能用现有 nginx + auth 链路，WebSocket 要自己解 token 和做 sticky session；第二，WebSocket 没有协议层重连，断线期间的消息会丢，必须业务层维护 sequence + 重连补拉，SSE 的 Last-Event-ID 是协议自带；第三，部分企业代理或 L7 网关会剥掉 Upgrade 头导致连接失败，这种时候长轮询比 WebSocket 稳。\n\n**Q3：长轮询服务端为什么扛不住高并发？**\n\n核心是连接挂起模型：每条消息要消耗一次完整 HTTP 头开销（几百字节到 1KB），且服务端要同时维护几万条挂起连接，BIO/线程池模型直接打满，必须改 NIO 或者 Servlet 3.0 异步才能扛。再加上每次响应后客户端立刻发新请求，相当于每条事件至少两次 TCP 握手开销（除非 keep-alive），高频场景明显劣于 SSE/WebSocket。",
+      "content": "**Q1：WebSocket、长轮询、短轮询、SSE 怎么选？**\n\n机制要点：\n- 30 秒结论：先看方向，再看频率，再看代理环境。需要双向上下行（IM、协同、游戏）只有 WebSocket 能干；只要服务端推（AI 流式、订单状态、推送通知）首选 SSE，因为它复用 HTTP 鉴权和 CDN，且自带 Last-Event-ID 重连；30 秒级的低频状态用短轮询足够，省去长连接运维；老旧浏览器或被代理剥 Upgrade 头时退回长轮询兜底。\n- 机制差异：短轮询固定间隔发完整 HTTP 请求，平均延迟是间隔的一半；长轮询服务端 hold socket 到事件或 25-30s 超时；SSE 用 chunked 流持续发 `data: ...\\n\\n`；WebSocket 用 HTTP Upgrade + 101 切到 WS 帧，2-14 字节帧头，能发二进制。\n- **Q2：为什么不全都用 WebSocket？**\n- 三个原因：第一，单向场景里 SSE 复用 HTTP 鉴权 / Cookie / CDN，能用现有 nginx + auth 链路，WebSocket 要自己解 token 和做 sticky session；第二，WebSocket 没有协议层重连，断线期间的消息会丢，必须业务层维护 sequence + 重连补拉，SSE 的 Last-Event-ID 是协议自带；第三，部分企业代理或 L7 网关会剥掉 Upgrade 头导致连接失败，这种时候长轮询比 WebSocket 稳。\n- **Q3：长轮询服务端为什么扛不住高并发？**\n- 核心是连接挂起模型：每条消息要消耗一次完整 HTTP 头开销（几百字节到 1KB），且服务端要同时维护几万条挂起连接，BIO/线程池模型直接打满，必须改 NIO 或者 Servlet 3.0 异步才能扛。再加上每次响应后客户端立刻发新请求，相当于每条事件至少两次 TCP 握手开销（除非 keep-alive），高频场景明显劣于 SSE/WebSocket。",
       "followUpQuestions": [
         {
           "question": "Nginx 反代 WebSocket 总是 60s 后断连，从协议层怎么定位和解决？",
@@ -127,7 +151,7 @@
       "depth": 15
     }
   },
-  "updatedAt": "2026-06-13",
+  "updatedAt": "2026-06-18",
   "status": "staging",
   "prerequisites": [
     "network.websocket.topic-websocket"

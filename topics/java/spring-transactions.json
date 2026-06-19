@@ -4,7 +4,7 @@
   "category": "spring",
   "group": "spring",
   "title": "Spring 事务传播与失效场景",
-  "summary": "掌握 @Transactional 的代理机制、传播行为、隔离级别、回滚规则和常见失效原因。",
+  "summary": "讲清 @Transactional 代理入口、REQUIRED/REQUIRES_NEW/NESTED 传播、回滚规则、线程边界和常见失效。",
   "tags": [
     "Java",
     "Spring",
@@ -13,66 +13,88 @@
     "数据库"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 30,
   "order": 42,
   "recommendWeight": 94,
   "learningCards": [
     {
       "type": "explain",
-      "title": "Spring 事务传播与失效场景：@Transactional 的本质",
-      "content": "## @Transactional 的本质\n`@Transactional` 不是编译器魔法，而是 Spring AOP 在方法调用前后织入事务逻辑。调用进入代理对象后，事务拦截器根据事务属性开启、加入、挂起或提交/回滚事务。\n\n所以事务的边界是「代理对象的方法调用」：从外部调用进来、经过代理，事务拦截器才会开启或加入事务；方法正常返回则提交，抛出符合回滚规则的异常则回滚。"
+      "title": "@Transactional 的真实入口",
+      "content": "`@Transactional` 是事务元数据，真正执行事务逻辑的是 Spring AOP 代理上的 `TransactionInterceptor`。调用从另一个 Bean 进入 proxy 后，拦截器读取 `TransactionAttribute`，再交给 `PlatformTransactionManager` 开启、加入、挂起、提交或回滚事务。\n\n这条链解释了大部分失效：同类 `this.method()` 不会进入 proxy；对象不是 Spring 容器创建的，没有代理；切点或方法可见性不匹配，事务拦截器拿不到机会。Spring 官方文档也强调，proxy 模式只拦截外部通过代理进入的方法调用。\n\n事务还有线程边界。`@Transactional` 通常绑定当前线程中的资源和状态，不能自动传播到方法里新启动的线程。响应式事务则依赖 Reactor context，不是普通 ThreadLocal。把这点讲清，才能解释 `@Async`、线程池、RPC 和 MQ 场景为什么要重新设计边界。"
     },
     {
       "type": "explain",
-      "title": "Spring 事务传播与失效场景：生效前提",
-      "content": "## 生效前提\n常见前提包括：方法通过 Spring 管理的代理对象调用、方法可被代理、事务管理器配置正确、数据库引擎支持事务、异常类型符合回滚规则。\n\n## 七种传播行为（最常考三种）\n传播行为决定一个方法被调用时如何对待已有事务：\n- REQUIRED（默认）：有事务就加入、没有就新建，最常用。\n- REQUIRES_NEW：总是新建事务、把外层事务挂起，内外互不影响，内层回滚不连累外层。\n- NESTED：在当前事务里建一个保存点 savepoint，内层回滚只回到保存点、不影响外层，但外层回滚会连带内层。\n其余 SUPPORTS、NOT_SUPPORTED、MANDATORY、NEVER 用得较少。"
+      "title": "三种传播行为的物理事务差异",
+      "content": "`REQUIRED` 是默认传播行为。没有事务时新建；已有事务时加入同一个物理事务，但每个带事务注解的方法仍有自己的逻辑 scope。内层 scope 如果把事务标记为 rollback-only，外层即使捕获异常并继续提交，也会在提交点收到 `UnexpectedRollbackException`，避免调用方误以为提交成功。\n\n`REQUIRES_NEW` 会挂起外层事务，并为内层开启独立物理事务。内层提交或回滚不直接影响外层，适合审计流水、操作日志这类要独立落库的动作。但外层连接仍被占用，内层还要再拿一个连接。Spring 文档明确建议连接池大小要比并发线程数至少多 1，否则容易连接池耗尽甚至死锁。\n\n`NESTED` 不新开物理事务，而是在当前物理事务内创建 JDBC savepoint。内层失败可以回滚到保存点，外层还能继续；外层最终回滚时，内层已保留的修改也会消失。它通常映射到 `DataSourceTransactionManager` 的 JDBC 保存点能力，不能把它当成独立提交。"
     },
     {
       "type": "explain",
-      "title": "Spring 事务传播与失效场景：关键边界",
-      "content": "## 关键边界\n同类内部 `this.method()` 自调用不会经过代理；默认只对 `RuntimeException` 和 `Error` 回滚；`private` 方法、final 方法或未被 Spring 管理的对象上标注事务通常不会按预期生效。\n\n## 失效场景清单\n除了自调用，常见失效还有：① 异常被 try-catch 吞了没抛出，拦截器感知不到、不回滚；② 抛的是受检异常（非 RuntimeException）而没配 rollbackFor；③ 方法是 private 或 final，或类没被 Spring 管理；④ 数据库引擎不支持事务（如 MyISAM）；⑤ 多线程里子线程的操作不在主线程事务内。"
+      "title": "回滚规则、版本锚点与工程风险",
+      "content": "默认回滚规则很容易被说错：未配置自定义规则时，Spring 会对 `RuntimeException` 和 `Error` 回滚，对 checked exception 默认提交。需要 checked exception 回滚时，用 `rollbackFor` 或类型安全的 rollback rule。不要轻易用字符串模式 `Exception`，它可能匹配过宽，掩盖更精确的规则。\n\n截至 2026-06-19，Spring 事务文档页面列出的稳定线包含 7.0.8 和 6.2.19。还有一个容易忽略的版本事实：Spring Framework 6.1 开始，对返回时已经 exceptional completion 的 `CompletableFuture`/`Future` 有特殊回滚处理，主要服务于 `@Async` 组合场景。\n\n工程上要防长事务。事务里放 RPC、发 MQ、大循环或慢查询，会拉长连接和锁的持有时间。消息发送也要放到事务提交之后，比如用 `TransactionSynchronization.afterCommit`，或用本地消息表把业务写入和消息记录放在同一本地事务里，再异步投递。"
     },
     {
       "type": "diagram",
-      "format": "mermaid",
-      "title": "事务传播行为与失效场景",
-      "content": "flowchart TD\nA[\"外部调用 → 代理对象\"] --> B[\"事务拦截器按传播行为处理\"]\nB --> C[\"REQUIRED：有则加入、无则新建\"]\nB --> D[\"REQUIRES_NEW：挂起外层、新建事务\"]\nB --> E[\"NESTED：建保存点\"]\nF[\"自调用 this.method 不过代理\"] --> G[\"事务失效\"]\nH[\"异常被 catch 吞掉\"] --> G\nI[\"默认只回滚 RuntimeException\"] --> G",
-      "caption": "@Transactional 靠 AOP 代理生效：拦截器按传播行为（REQUIRED/REQUIRES_NEW/NESTED）处理事务；自调用不过代理、异常被吞、只回滚 RuntimeException 等会导致事务失效。",
-      "fallback": "外部调用经代理对象，事务拦截器按传播行为处理：REQUIRED 有则加入无则新建、REQUIRES_NEW 挂起外层新建、NESTED 建保存点。常见失效：自调用 this.method 不过代理、异常被 catch 吞掉、默认只回滚 RuntimeException。"
+      "title": "Spring 事务：代理、传播、回滚与失效边界",
+      "format": "svg",
+      "content": "assets/diagrams/java-spring-transaction-propagation-rollback.svg",
+      "caption": "图中把 @Transactional 的代理入口、TransactionInterceptor、三种核心传播行为、默认回滚规则、Spring 6.1 Future 边界和常见失效点放在同一张图里。",
+      "fallback": "Spring 事务必须从外部进入代理；TransactionInterceptor 根据 REQUIRED、REQUIRES_NEW、NESTED 决定加入、挂起或保存点；默认只对 RuntimeException/Error 回滚，checked exception 要配置 rollbackFor；自调用、吞异常、新线程和长事务是常见风险。",
+      "sources": [
+        {
+          "kind": "svg",
+          "content": "assets/diagrams/java-spring-transaction-propagation-rollback.svg"
+        },
+        {
+          "kind": "text",
+          "content": "Spring 事务的关键链路是 proxy -> TransactionInterceptor -> PlatformTransactionManager -> 物理事务/保存点 -> 回滚规则。"
+        }
+      ]
     },
     {
       "type": "compareTable",
-      "title": "传播行为对比",
-      "content": "| 传播行为 | 含义 | 典型场景 |\n| --- | --- | --- |\n| REQUIRED | 有事务就加入，没有就新建 | 默认选择，单个业务用例 |\n| REQUIRES_NEW | 挂起当前事务并新建事务 | 审计日志、独立流水 |\n| NESTED | 在当前事务内创建保存点 | 部分失败可回滚到保存点 |\n| SUPPORTS | 有事务就加入，没有就非事务执行 | 可事务可非事务读操作 |\n| NOT_SUPPORTED | 挂起事务，非事务执行 | 不希望长事务包住慢操作 |\n| MANDATORY | 必须已有事务，否则报错 | 强制由上层控制事务 |\n| NEVER | 必须没有事务，否则报错 | 禁止事务的特殊操作 |"
+      "title": "传播行为与失效边界对照",
+      "content": "| 场景 | REQUIRED | REQUIRES_NEW | NESTED |\n| --- | --- | --- | --- |\n| 已有外层事务 | 加入同一个物理事务 | 挂起外层，开启独立物理事务 | 使用同一物理事务并创建保存点 |\n| 内层失败 | 可能标记 rollback-only，外层提交时抛 UnexpectedRollbackException | 内层独立回滚，外层可继续 | 回滚到保存点，外层可继续 |\n| 内层提交 | 依赖外层最终提交 | 内层可先提交并释放锁 | 保存点释放后仍依赖外层提交 |\n| 资源占用 | 通常仍是外层那一个连接 | 外层连接占用中，内层再拿连接 | 通常仍是同一个连接 |\n| 典型场景 | 主业务用例默认选择 | 审计、流水、失败也要保留的记录 | 批处理局部失败后继续 |\n| 主要风险 | 内层 rollback-only 被外层捕获后误判 | 连接池不足时耗尽或死锁 | 依赖 JDBC savepoint，不是独立提交 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
+      "title": "可运行抓手：模拟传播行为、保存点和回滚规则",
       "language": "java",
-      "content": "@Service\npublic class OrderService {\n    private final PaymentService paymentService;\n    private final AuditService auditService;\n\n    public OrderService(PaymentService paymentService, AuditService auditService) {\n        this.paymentService = paymentService;\n        this.auditService = auditService;\n    }\n\n    @Transactional(rollbackFor = Exception.class)\n    public void createOrder(OrderCommand command) throws Exception {\n        saveOrder(command);\n        paymentService.pay(command);\n        auditService.writeAudit(command); // REQUIRES_NEW 独立提交\n    }\n}\n\n@Service\nclass AuditService {\n    @Transactional(propagation = Propagation.REQUIRES_NEW)\n    public void writeAudit(OrderCommand command) {\n        // 即使外层订单事务回滚，审计流水也可以独立提交\n    }\n}\n\n// 典型失效：this 调用不会经过代理\n@Transactional\npublic void outer() {\n    this.inner(); // inner 的事务属性不会被代理拦截\n}\n\n@Transactional(propagation = Propagation.REQUIRES_NEW)\npublic void inner() { }",
+      "content": "import java.util.*;\n\npublic class Main {\n    enum Propagation { REQUIRED, REQUIRES_NEW, NESTED }\n\n    interface TxCallable<T> { T call() throws Exception; }\n\n    static class BusinessException extends Exception {\n        BusinessException(String message) { super(message); }\n    }\n\n    static class UnexpectedRollbackException extends RuntimeException {\n        UnexpectedRollbackException(String message) { super(message); }\n    }\n\n    static class Tx {\n        final String name;\n        final List<String> operations = new ArrayList<>();\n        boolean rollbackOnly;\n        Tx(String name) { this.name = name; }\n    }\n\n    static class MiniTxManager {\n        private final Deque<Tx> active = new ArrayDeque<>();\n        private final Deque<Tx> suspended = new ArrayDeque<>();\n        private final List<String> committed = new ArrayList<>();\n\n        List<String> committed() { return new ArrayList<>(committed); }\n\n        void addOperation(String op) {\n            Tx tx = active.peek();\n            if (tx == null) throw new IllegalStateException(\"no transaction\");\n            tx.operations.add(op);\n        }\n\n        <T> T run(String name, Propagation propagation, Set<Class<? extends Throwable>> rollbackFor,\n                 TxCallable<T> action) throws Exception {\n            Tx suspendedTx = null;\n            Tx tx;\n            boolean owner = false;\n            Integer savepoint = null;\n\n            if (propagation == Propagation.REQUIRES_NEW) {\n                if (!active.isEmpty()) {\n                    suspendedTx = active.pop();\n                    suspended.push(suspendedTx);\n                }\n                tx = begin(name);\n                owner = true;\n            } else if (propagation == Propagation.NESTED && !active.isEmpty()) {\n                tx = active.peek();\n                savepoint = tx.operations.size();\n            } else if (active.isEmpty()) {\n                tx = begin(name);\n                owner = true;\n            } else {\n                tx = active.peek();\n            }\n\n            try {\n                T result;\n                try {\n                    result = action.call();\n                } catch (Throwable ex) {\n                    if (shouldRollback(ex, rollbackFor)) {\n                        if (savepoint != null) {\n                            rollbackToSavepoint(tx, savepoint);\n                        } else if (owner) {\n                            rollbackOwner(tx);\n                        } else {\n                            tx.rollbackOnly = true;\n                        }\n                    } else if (owner) {\n                        commitOwner(tx);\n                    }\n                    throw ex;\n                }\n                if (owner) commitOwner(tx);\n                return result;\n            } finally {\n                if (suspendedTx != null) {\n                    Tx restored = suspended.pop();\n                    active.push(restored);\n                }\n            }\n        }\n\n        private Tx begin(String name) {\n            Tx tx = new Tx(name);\n            active.push(tx);\n            return tx;\n        }\n\n        private void commitOwner(Tx tx) {\n            if (tx.rollbackOnly) {\n                rollbackOwner(tx);\n                throw new UnexpectedRollbackException(tx.name + \" was marked rollback-only\");\n            }\n            removeActive(tx);\n            committed.addAll(tx.operations);\n        }\n\n        private void rollbackOwner(Tx tx) {\n            removeActive(tx);\n            tx.operations.clear();\n        }\n\n        private void removeActive(Tx tx) {\n            if (active.peek() == tx) active.pop();\n            else active.remove(tx);\n        }\n\n        private void rollbackToSavepoint(Tx tx, int savepoint) {\n            while (tx.operations.size() > savepoint) {\n                tx.operations.remove(tx.operations.size() - 1);\n            }\n        }\n\n        private boolean shouldRollback(Throwable ex, Set<Class<? extends Throwable>> rollbackFor) {\n            if (ex instanceof RuntimeException || ex instanceof Error) return true;\n            for (Class<? extends Throwable> type : rollbackFor) {\n                if (type.isInstance(ex)) return true;\n            }\n            return false;\n        }\n    }\n\n    static Set<Class<? extends Throwable>> noRollbackRules() {\n        return Set.<Class<? extends Throwable>>of();\n    }\n\n    static void requiredRollbackOnlyCase() throws Exception {\n        MiniTxManager tx = new MiniTxManager();\n        try {\n            tx.run(\"outer\", Propagation.REQUIRED, noRollbackRules(), () -> {\n                tx.addOperation(\"outer-before\");\n                try {\n                    tx.run(\"innerRequired\", Propagation.REQUIRED, noRollbackRules(), () -> {\n                        tx.addOperation(\"inner-change\");\n                        throw new RuntimeException(\"inner failed\");\n                    });\n                } catch (RuntimeException ignored) {\n                    tx.addOperation(\"outer-caught\");\n                }\n                tx.addOperation(\"outer-after\");\n                return null;\n            });\n        } catch (UnexpectedRollbackException ex) {\n            System.out.println(\"required outcome=\" + ex.getClass().getSimpleName() + \", committed=\" + tx.committed());\n        }\n        assert tx.committed().isEmpty();\n    }\n\n    static void requiresNewCase() throws Exception {\n        MiniTxManager tx = new MiniTxManager();\n        try {\n            tx.run(\"createOrder\", Propagation.REQUIRED, noRollbackRules(), () -> {\n                tx.addOperation(\"order#1\");\n                tx.run(\"audit\", Propagation.REQUIRES_NEW, noRollbackRules(), () -> {\n                    tx.addOperation(\"audit#1\");\n                    return null;\n                });\n                throw new RuntimeException(\"payment failed\");\n            });\n        } catch (RuntimeException ignored) {\n            System.out.println(\"requires_new committed=\" + tx.committed());\n        }\n        assert tx.committed().equals(List.of(\"audit#1\"));\n    }\n\n    static void nestedCase() throws Exception {\n        MiniTxManager tx = new MiniTxManager();\n        tx.run(\"batch\", Propagation.REQUIRED, noRollbackRules(), () -> {\n            tx.addOperation(\"batch-start\");\n            try {\n                tx.run(\"importItem\", Propagation.NESTED, noRollbackRules(), () -> {\n                    tx.addOperation(\"bad-item\");\n                    throw new RuntimeException(\"bad row\");\n                });\n            } catch (RuntimeException ignored) {\n                tx.addOperation(\"skip-bad-item\");\n            }\n            tx.addOperation(\"batch-end\");\n            return null;\n        });\n        System.out.println(\"nested committed=\" + tx.committed());\n        assert tx.committed().equals(List.of(\"batch-start\", \"skip-bad-item\", \"batch-end\"));\n    }\n\n    static void checkedExceptionCase() throws Exception {\n        MiniTxManager defaultRule = new MiniTxManager();\n        try {\n            defaultRule.run(\"checkedDefault\", Propagation.REQUIRED, noRollbackRules(), () -> {\n                defaultRule.addOperation(\"checked-default\");\n                throw new BusinessException(\"business checked exception\");\n            });\n        } catch (BusinessException ignored) { }\n\n        MiniTxManager rollbackFor = new MiniTxManager();\n        try {\n            rollbackFor.run(\"checkedRollbackFor\", Propagation.REQUIRED,\n                Set.<Class<? extends Throwable>>of(BusinessException.class), () -> {\n                    rollbackFor.addOperation(\"checked-rollback-for\");\n                    throw new BusinessException(\"business checked exception\");\n                });\n        } catch (BusinessException ignored) { }\n\n        System.out.println(\"checked default=\" + defaultRule.committed() + \", rollbackFor=\" + rollbackFor.committed());\n        assert defaultRule.committed().equals(List.of(\"checked-default\"));\n        assert rollbackFor.committed().isEmpty();\n    }\n\n    public static void main(String[] args) throws Exception {\n        requiredRollbackOnlyCase();\n        requiresNewCase();\n        nestedCase();\n        checkedExceptionCase();\n    }\n}",
       "highlights": [
         {
-          "line": 2,
-          "note": "这里定义示例的核心入口或结构，后续逻辑都围绕这个职责展开。"
+          "line": 36,
+          "note": "进入 `run` 时先按传播行为决定加入、挂起、新建或保存点，这对应 TransactionInterceptor 的核心决策。"
+        },
+        {
+          "line": 65,
+          "note": "参与外层 REQUIRED 的内层异常会把同一个物理事务标记为 rollback-only，外层提交时会暴露 UnexpectedRollbackException。"
+        },
+        {
+          "line": 112,
+          "note": "回滚规则模拟了 Spring 默认行为：RuntimeException/Error 回滚，checked exception 需要 rollbackFor。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：@Transactional 不是编译魔法，而是 Spring AOP 在方法前后织入事务逻辑——调用经过代理对象，事务拦截器据传播行为决定开启、加入、挂起还是提交回滚。所以讲它必须从「代理」和「传播行为」两条线展开。\n\n传播行为（最常考三种）：\n\n1. REQUIRED（默认）：有事务加入、没有新建。\n2. REQUIRES_NEW：总是新建事务、挂起外层，内外互不影响——内层回滚不连累外层，适合「日志、审计无论主流程成败都要落库」。\n3. NESTED：用保存点，内层回滚只回到保存点、不影响外层，但外层回滚连带内层。\n\n失效场景（高频必问）：\n\n1. 自调用：同类里 this.method() 不经过代理，事务不生效，最经典。解法：注入自身、AopContext.currentProxy()、或拆到别的 Bean。\n2. 异常被吞：try-catch 了没往外抛，拦截器感知不到、不回滚。\n3. 默认只对 RuntimeException 和 Error 回滚，抛受检异常要配 rollbackFor。\n4. private 或 final 方法、非 Spring 管理的对象、不支持事务的引擎（MyISAM）。\n5. 多线程：子线程操作不在主线程事务里。\n\n边界和取舍。① REQUIRES_NEW 会占用额外的数据库连接（挂起的外层加新事务），高并发下注意连接池耗尽。② 事务范围要小，别把 RPC、发 MQ、大循环放进事务，长事务会长时间持有连接和锁。③ 事务里发的 MQ 消息应在事务提交后再发（用事务同步回调），否则可能事务回滚了消息却发出去了。",
+      "content": "可以这样回答：`@Transactional` 是 Spring AOP 代理上的事务拦截器，不是编译器直接改方法。外部调用进入 proxy 后，`TransactionInterceptor` 读取传播行为、隔离级别、超时、readOnly 和回滚规则，再由事务管理器处理连接与提交回滚。\n\n- 先讲默认传播：`REQUIRED` 没有事务就新建，有事务就加入同一个物理事务。内层标记 rollback-only 后，外层即使 catch 住异常，提交时也会抛 `UnexpectedRollbackException`。\n- 再讲独立事务：`REQUIRES_NEW` 会挂起外层并新开物理事务。它适合独立审计，但会多占一个连接；连接池至少要比并发线程数多 1，否则有耗尽和死锁风险。\n- 然后讲保存点：`NESTED` 使用同一物理事务里的 JDBC savepoint。它能做局部回滚，但最终提交仍依赖外层事务。\n- 接着讲回滚规则：默认只对 `RuntimeException` 和 `Error` 回滚；checked exception 要配置 `rollbackFor`。Spring Framework 6.1 还对返回时已异常完成的 `Future`/`CompletableFuture` 做了回滚支持。\n- 最后讲失效：this 自调用、非 Spring Bean、private/final 或方法可见性不符合代理规则、异常被 catch 后吞掉、新线程不在同一事务上下文、数据库引擎或事务管理器不支持，都会导致和预期不一致。\n\n工程取舍要补一句：事务范围越小越好。不要把 RPC、MQ、慢查询、大循环放进事务。要在事务后发消息，优先用 afterCommit 或本地消息表，避免数据库回滚了但消息已经被下游消费。",
       "followUpQuestions": [
         {
-          "question": "REQUIRES_NEW 和 NESTED 有什么区别？",
-          "answer": "REQUIRES_NEW 会挂起外层事务并开启一个独立事务，内外提交回滚互不直接绑定；NESTED 依赖外层事务的保存点，内层可以回滚到保存点，但最终提交仍依赖外层事务。"
+          "question": "REQUIRES_NEW 和 NESTED 的区别是什么？",
+          "answer": "REQUIRES_NEW 挂起外层并开启独立物理事务，内外可以独立提交或回滚，但会额外占用连接。NESTED 仍在同一个物理事务里，只是创建 JDBC savepoint；内层可回滚到保存点，最终结果仍受外层提交或回滚控制。"
         },
         {
-          "question": "@Transactional 为什么同类自调用会失效？",
-          "answer": "因为 `this.inner()` 没有经过 Spring 代理对象，事务拦截器不会被触发。可以拆到另一个 Bean、注入自身代理、使用 TransactionTemplate，或调整调用边界。"
+          "question": "为什么内层 REQUIRED 异常被 catch 后，外层提交还会失败？",
+          "answer": "因为内层参与的是同一个物理事务。内层异常触发回滚规则后，会把当前事务标记为 rollback-only。外层 catch 住异常只能让代码继续走到提交点，不能清掉 rollback-only，所以提交时 Spring 会抛 UnexpectedRollbackException。"
         },
         {
-          "question": "事务里要发 MQ 消息或调远程接口，会有什么问题？怎么处理？",
-          "answer": "两个问题：一是事务里调 RPC、发 MQ 这些慢操作会拉长事务时间，长事务长时间持有数据库连接和行锁，高并发下容易连接耗尽、锁等待甚至死锁；二是一致性——如果在事务提交前就把 MQ 消息发出去，万一事务最后回滚了、消息却已发出、下游已处理，就数据不一致了。处理：① 尽量把 RPC、发 MQ 移出事务，事务只包数据库操作。② 必须在事务内触发的消息，用事务同步回调（TransactionSynchronization 的 afterCommit）在事务真正提交后再发；要可靠就用本地消息表，把发消息和业务写在同一本地事务、再异步投递。"
+          "question": "事务方法里 catch 了异常，怎么保证仍然回滚？",
+          "answer": "最清晰的方式是重新抛出能匹配回滚规则的异常，比如 RuntimeException 或配置了 rollbackFor 的业务异常。少数场景可以调用 TransactionAspectSupport.currentTransactionStatus().setRollbackOnly()，但它把业务代码和 Spring 事务 API 绑定得更紧，优先级低于让异常自然越过事务边界。"
+        },
+        {
+          "question": "事务里发 MQ 或调 RPC 有什么风险？",
+          "answer": "RPC 和慢操作会拉长数据库连接和锁的持有时间，增加锁等待和连接池耗尽风险。MQ 在事务提交前发送会有一致性问题：数据库回滚了，消息可能已经被消费。更稳的做法是 afterCommit 发送，或用本地消息表保证业务写入和消息记录处在同一本地事务。"
         }
       ]
     },
@@ -80,67 +102,69 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "@Transactional 的 AOP 代理机制",
-        "七种传播行为的区别",
-        "默认回滚规则和 rollbackFor",
-        "REQUIRES_NEW 与 NESTED 的区别",
-        "常见事务失效场景和修复方式"
+        "能解释 @Transactional 从外部 proxy 进入 TransactionInterceptor 的生效入口",
+        "能区分 REQUIRED 的同一物理事务、REQUIRES_NEW 的独立物理事务和 NESTED 的保存点",
+        "能解释 rollback-only 与 UnexpectedRollbackException 的关系",
+        "能说清 RuntimeException/Error、checked exception、rollbackFor/noRollbackFor 的默认回滚规则",
+        "能定位 this 自调用、吞异常、非容器对象、新线程、private/final、长事务导致的问题",
+        "能给出 afterCommit 或本地消息表处理事务后发消息的一致性方案"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "java.spring.spring-transactions.recall.1",
-      "prompt": "请解释 REQUIRED、REQUIRES_NEW、NESTED 的区别和适用场景。",
-      "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 4
-    },
-    {
-      "id": "java.spring.spring-transactions.recall.2",
-      "prompt": "列举 @Transactional 常见失效场景，并说明原因。",
+      "prompt": "请解释 REQUIRED、REQUIRES_NEW、NESTED 的物理事务差异、资源占用和适用场景。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
-      "id": "java.spring.spring-transactions.recall.3",
-      "prompt": "事务方法里把异常 catch 住没有抛出，事务还会回滚吗？rollbackFor 的默认行为是什么、该怎么正确配置？",
+      "id": "java.spring.spring-transactions.recall.2",
+      "prompt": "内层 REQUIRED 抛 RuntimeException 后被外层 catch，为什么外层提交时可能出现 UnexpectedRollbackException？",
       "mode": "text",
       "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
+      "id": "java.spring.spring-transactions.recall.3",
+      "prompt": "列举 @Transactional 常见失效场景，并说明如何通过 proxy、异常传播、线程上下文和日志指标排查。",
+      "mode": "text",
+      "expectedMinutes": 4,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出 @Transactional 靠 AOP 代理生效",
-      "能讲清 REQUIRED/REQUIRES_NEW/NESTED 的区别",
-      "能列出自调用、异常被吞、受检异常不回滚等失效场景",
-      "能给出自调用失效的解法"
+      "能说出 @Transactional 依赖 Spring AOP 代理和 TransactionInterceptor 生效",
+      "能讲清 REQUIRED、REQUIRES_NEW、NESTED 的物理事务差异",
+      "能解释 rollback-only、UnexpectedRollbackException 和默认回滚规则",
+      "能列出自调用、异常被吞、checked exception 未配置 rollbackFor、新线程等失效场景"
     ],
     "goodToHave": [
-      "能说明 REQUIRES_NEW 占用额外连接的风险",
-      "能指出事务范围要小、别放 RPC/MQ/大循环",
-      "能说明事务消息应在提交后发送"
+      "能说明 REQUIRES_NEW 额外占用连接以及连接池至少多 1 的风险边界",
+      "能说明 Spring Framework 6.1 对异常完成 Future 的回滚支持",
+      "能把事务后发 MQ 的一致性问题落到 afterCommit 或本地消息表方案"
     ],
     "commonMistakes": [
-      "同类自调用导致事务失效",
-      "try-catch 吞掉异常导致不回滚",
-      "抛受检异常未配 rollbackFor"
+      "以为同类 this 调用能触发 REQUIRES_NEW",
+      "catch 住异常后不重新抛出，却期待事务自动回滚",
+      "把 NESTED 当成独立提交，忽略它依赖外层物理事务和 JDBC savepoint",
+      "在事务里放 RPC、MQ 或大循环，导致锁等待和连接池耗尽"
     ],
     "scoreWeights": {
-      "coverage": 30,
-      "accuracy": 35,
+      "coverage": 25,
+      "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-19",
   "status": "production",
   "prerequisites": [
     "java.spring.topic-043-d09a2ea2",
     "java.spring.topic-044-d91e99aa"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能围绕「Spring 事务传播与失效场景」说清能解释事务 AOP 代理机制、能区分 REQUIRED、REQUIRES_NEW、NESTED，并放到Java 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察能否从 Spring AOP 代理入口讲到 TransactionInterceptor、三种核心传播行为、rollback-only、默认回滚规则、线程边界和工程失效排查。"
 }

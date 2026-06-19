@@ -4,53 +4,87 @@
   "category": "io-model",
   "group": "io-model",
   "title": "零拷贝技术",
-  "summary": "从传统 read+write 的 4 拷贝 4 切换出发，讲清 mmap、sendfile、DMA gather 逐级优化到真零拷贝，以及 Kafka/Netty 的应用和适用前提。",
+  "summary": "从 read/write 的 payload CPU 拷贝、用户/内核态往返和 DMA 路径出发，讲清 mmap、sendfile、splice、MSG_ZEROCOPY、kTLS/硬件卸载的收益、前提和 fallback。",
   "tags": [
     "操作系统",
     "零拷贝",
     "sendfile",
     "mmap"
   ],
-  "difficulty": 3,
-  "estimatedMinutes": 20,
+  "difficulty": 4,
+  "estimatedMinutes": 28,
   "order": 40,
-  "recommendWeight": 85,
+  "recommendWeight": 86,
   "learningCards": [
     {
       "type": "explain",
-      "title": "零拷贝技术 的核心机制",
-      "content": "## 场景：把磁盘文件发到网络（如静态文件服务）\n传统 `read()` + `write()` 要经历 **4 次数据拷贝 + 4 次上下文切换**：\n```\n1. DMA：磁盘 → 内核 Page Cache         （读）\n2. CPU：内核 Page Cache → 用户缓冲区     （read 返回）\n3. CPU：用户缓冲区 → Socket 缓冲区       （write 进入）\n4. DMA：Socket 缓冲区 → 网卡             （发送）\n```\n- 2 次系统调用（read/write）各带来 2 次用户态/内核态切换 = 4 次切换。\n- 其中第 2、3 次是 **CPU 拷贝**，数据在内核和用户态之间来回搬，纯属浪费（应用并不修改数据，只是转发）。\n\n## 优化目标\n去掉无意义的 CPU 拷贝和多余的上下文切换。"
+      "title": "零拷贝先数清楚：省的是 payload 的 CPU 拷贝",
+      "content": "## 传统 read + write 的成本账本\n以“把磁盘文件原样发到网络”为例，传统路径通常是：磁盘通过 DMA 到内核 Page Cache；`read()` 把 Page Cache 的 payload CPU 拷贝到用户缓冲区；`write()` 再把用户缓冲区 CPU 拷贝回内核 socket buffer；最后网卡 DMA 发送。read/write 两个系统调用会带来 4 次用户态/内核态往返。这里的浪费点不是 DMA，而是应用并不修改数据，却让 payload 在内核和用户态之间来回搬两次。\n\n## 零拷贝不是“没有任何移动”\n工程里说零拷贝，通常指热路径上没有 payload 的 CPU 数据拷贝，或至少减少不必要的 CPU 拷贝和用户态往返。协议头、描述符、页引用、校验和、DMA、系统调用和 socket 队列管理仍然存在。更准确的说法是“0 次 payload CPU copy”，而不是“数据完全不移动”。\n\n## 适用前提\n零拷贝最适合文件原样转发：静态文件、Kafka segment、日志片段、下载服务。只要用户态要解密、压缩、改协议头、做业务解析，通常就必须接触 payload，sendfile 路径会被破坏；除非使用 kTLS、NIC offload、预格式化数据或把处理下推到内核/硬件。"
     },
     {
       "type": "explain",
-      "title": "mmap / sendfile / DMA gather",
-      "content": "## mmap + write\n`mmap` 把内核 Page Cache **映射到用户空间**，省掉“内核→用户”这次 CPU 拷贝（用户和内核共享同一份）。仍有 write 把数据 CPU 拷到 Socket 缓冲区 → **3 次拷贝、4 次切换**。\n\n## sendfile\n`sendfile()` 让数据**直接在内核内**从 Page Cache 送到 Socket，不经过用户态 → **2 次切换**；数据：DMA 入 Page Cache、(CPU) Page Cache→Socket、DMA→网卡 = **3 次拷贝**（少 1 次且不经用户态）。\n\n## sendfile + DMA gather（真零拷贝）\n网卡支持 **scatter-gather DMA** 时，sendfile 只把 Page Cache 的**描述符（地址+长度）**给 Socket，网卡直接从 Page Cache 取数据 → **0 次 CPU 拷贝**，只剩 2 次 DMA。这才是“零拷贝”。\n\n## splice\n通过管道在两个 fd 间移动数据，同样避免用户态拷贝。\n\n## 应用\n- **Kafka**：消费者拉消息用 sendfile，日志文件直接发网卡，吞吐极高。\n- **Netty**：FileRegion/transferTo 走 sendfile；CompositeByteBuf 做用户态“逻辑零拷贝”。"
+      "title": "mmap、sendfile、splice、MSG_ZEROCOPY 的边界",
+      "content": "## mmap + write\n`mmap` 把文件的 Page Cache 映射到用户空间，省掉 Page Cache 到用户缓冲区的那次 CPU 拷贝；但如果随后 `write()` 到 socket，payload 通常仍要从映射页进入 socket buffer。它适合随机读、共享映射、避免 read 拷贝，但要考虑缺页、TLB、page cache 一致性和 SIGBUS（文件被截断等）边界。\n\n## sendfile / transferTo\n`sendfile()` 让内核把文件页直接送到 socket，不经过用户缓冲区，减少系统调用往返和用户态 payload copy。若网卡和内核路径支持 scatter-gather DMA，socket 可以引用 Page Cache 中的页，由 NIC 按描述符取数据，实现 0 次 payload CPU copy；若硬件或协议路径不支持，仍可能在内核内发生 copy，但依然省掉了用户态往返和用户缓冲区拷贝。\n\n## splice 与 MSG_ZEROCOPY\n`splice()` 通过 pipe 在 fd 间转移页引用，避免把数据拷到用户态，但接口约束更强。`MSG_ZEROCOPY` 面向从用户缓冲区发网络数据：内核 pin 用户页，发送完成后通过 error queue 通知应用释放/复用；它适合大块发送，小包上页 pin、完成通知和内存管理成本可能抵消收益。\n\n## 框架和中间件\nKafka 能高效使用 sendfile，是因为消息以 segment 文件存储，消费者拉取时常可按文件区间原样发送；如果开启需要用户态处理 payload 的 TLS、压缩重写或协议变换，就可能降级。Netty 的 `DefaultFileRegion`/`FileChannel.transferTo` 可走 sendfile；TLS pipeline 下常要走 chunked/普通写，除非 kTLS 或其他 offload 生效。`CompositeByteBuf` 是用户态逻辑零拷贝：减少 buffer 合并复制，不等同内核 sendfile。"
     },
     {
       "type": "diagram",
-      "format": "mermaid",
-      "title": "零拷贝逐级优化",
-      "content": "flowchart TD\nA[\"传统 read+write：4 拷贝 4 切换\"] --> B[\"mmap+write：省一次拷贝，3 拷贝 4 切换\"]\nB --> C[\"sendfile：数据不过用户态，3 拷贝 2 切换\"]\nC --> D[\"sendfile+DMA gather：0 次 CPU 拷贝，真零拷贝\"]",
-      "caption": "零拷贝逐级优化：从传统 read+write 的 4 拷贝 4 切换，到 mmap、sendfile，最终 sendfile 加 DMA gather 做到 0 次 CPU 拷贝。",
-      "fallback": "传统 read+write 是 4 次拷贝 4 次切换；mmap+write 省一次 CPU 拷贝（3 拷贝 4 切换）；sendfile 数据不过用户态（3 拷贝 2 切换）；sendfile 加 DMA gather 描述符传递做到 0 次 CPU 拷贝、真零拷贝。"
+      "title": "零拷贝数据路径、API 选择与降级边界",
+      "content": "assets/diagrams/os-zero-copy-data-paths.svg",
+      "caption": "图中对比 read/write、sendfile+scatter-gather DMA 的 payload 流动，并列出 mmap+write、sendfile/transferTo、splice、MSG_ZEROCOPY、DPDK 的优化点和 TLS/压缩/协议加工等降级条件。",
+      "fallback": "传统 read/write 会让 payload 从 Page Cache 拷到用户缓冲区，再从用户缓冲区拷回 socket buffer；sendfile 让文件页在内核路径进入 socket，SG-DMA 支持时网卡可直接按页描述符取数据，做到 0 次 payload CPU copy。mmap、splice、MSG_ZEROCOPY、DPDK 解决的问题不同，TLS、压缩、协议加工和小包发送都可能让零拷贝收益下降或走 fallback。",
+      "format": "svg",
+      "sources": [
+        {
+          "kind": "svg",
+          "path": "assets/diagrams/os-zero-copy-data-paths.svg"
+        },
+        {
+          "kind": "text",
+          "content": "传统 read/write 会让 payload 从 Page Cache 拷到用户缓冲区，再从用户缓冲区拷回 socket buffer；sendfile 让文件页在内核路径进入 socket，SG-DMA 支持时网卡可直接按页描述符取数据，做到 0 次 payload CPU copy。mmap、splice、MSG_ZEROCOPY、DPDK 解决的问题不同，TLS、压缩、协议加工和小包发送都可能让零拷贝收益下降或走 fallback。"
+        }
+      ]
     },
     {
       "type": "compareTable",
       "title": "拷贝方式对比",
-      "content": "| 方式 | CPU 拷贝次数 | 上下文切换 | 说明 |\n| --- | --- | --- | --- |\n| read+write | 2 | 4 | 数据进出用户态各一次 |\n| mmap+write | 1 | 4 | 映射省去内核→用户拷贝 |\n| sendfile | 1(或0) | 2 | 内核内直传，不经用户态 |\n| sendfile+DMA gather | 0 | 2 | 真零拷贝，只剩 DMA |"
+      "content": "| 方式 | 省掉什么 | 仍然存在什么 | 适用边界 |\n| --- | --- | --- | --- |\n| read + write | 无 | 2 次 payload CPU copy、2 个 syscall、DMA | 应用需要加工 payload 或逻辑简单时最通用 |\n| mmap + write | Page Cache 到用户缓冲区的 copy | write 到 socket 通常仍有 payload CPU copy；缺页和 SIGBUS 风险 | 随机读、共享映射、避免 read 拷贝 |\n| sendfile / transferTo | 用户缓冲区和一次 syscall 往返 | 协议头、描述符、DMA；无 SG-DMA 时可能仍有内核 copy | 文件原样发 socket，静态文件/Kafka segment |\n| sendfile + SG-DMA | payload CPU copy | DMA、系统调用、页引用、socket/TCP 元数据 | NIC/内核路径支持，payload 不被用户态修改 |\n| splice | 用户态 payload copy | pipe 参与、接口和 fd 类型限制 | fd 到 fd 搬运、管道链路 |\n| MSG_ZEROCOPY | 用户缓冲区到内核的 payload copy | 页 pin、完成通知、error queue、fallback | 大块网络发送，小包未必划算 |\n| 用户态逻辑零拷贝 | buffer 合并/复制 | 仍在用户态处理 payload | Netty CompositeByteBuf、协议编解码优化 |"
+    },
+    {
+      "type": "code",
+      "title": "Python 可运行：sendfile 把文件直接发送到 socket",
+      "content": "import os\nimport socket\nimport tempfile\n\npayload = b\"zero-copy-demo:\" + b\"x\" * 64\n\nwith tempfile.NamedTemporaryFile(delete=False) as f:\n    f.write(payload)\n    path = f.name\n\ntry:\n    in_fd = os.open(path, os.O_RDONLY)\n    sender, receiver = socket.socketpair()\n    try:\n        sent = os.sendfile(sender.fileno(), in_fd, 0, len(payload))\n        data = receiver.recv(4096)\n\n        print(\"sendfile bytes:\", sent)\n        print(\"received bytes:\", len(data))\n        print(\"payload equal:\", data == payload)\n\n        assert sent == len(payload)\n        assert data == payload\n    finally:\n        sender.close()\n        receiver.close()\n        os.close(in_fd)\nfinally:\n    os.unlink(path)",
+      "language": "python",
+      "highlights": [
+        {
+          "line": 15,
+          "note": "os.sendfile 让内核从文件 fd 直接向 socket fd 发送；示例验证接口和 payload 正确性。"
+        },
+        {
+          "line": 18,
+          "note": "程序能证明数据原样到达；CPU copy 是否消失、是否走 SG-DMA，要结合内核/硬件路径和 perf/strace 观察。"
+        },
+        {
+          "line": 22,
+          "note": "用断言验证发送长度和接收内容，避免只展示不可验证的命令。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：零拷贝是为了去掉「把磁盘文件转发到网络」时那些无意义的 CPU 拷贝和多余的态切换。传统 read 加 write 要 4 次拷贝加 4 次上下文切换，其中数据在内核和用户态之间来回搬的两次 CPU 拷贝纯属浪费——应用只是转发、并不修改数据。\n\n逐级优化：\n\n1. mmap + write：把内核 Page Cache 映射到用户空间，省掉「内核到用户」那次 CPU 拷贝，但还有 write 把数据拷到 Socket 缓冲区，3 次拷贝、4 次切换。\n2. sendfile：数据直接在内核内从 Page Cache 送到 Socket，不经用户态，2 次切换、3 次拷贝。\n3. sendfile + DMA gather（真零拷贝）：网卡支持 scatter-gather DMA 时，只把 Page Cache 的描述符给 Socket，网卡直接从 Page Cache 取数据，0 次 CPU 拷贝、只剩 2 次 DMA。\n4. splice：通过管道在两个 fd 间移动数据，同样避免用户态拷贝。\n\n应用：Kafka 消费者拉消息用 sendfile，日志文件直接发网卡，吞吐极高；Netty 的 FileRegion 和 transferTo 走 sendfile。\n\n边界：零拷贝的前提是应用不碰数据、只转发。一旦需要在用户态加工数据（加密、压缩、协议解析），就必须把数据拷到用户态，用不了内核零拷贝，这时只能退一步做用户态「逻辑零拷贝」，如 Netty CompositeByteBuf 用组合避免合并拷贝。",
+      "content": "**30 秒结论**\n零拷贝不是数据完全不动，而是减少或消除 payload 的 CPU 数据拷贝，尤其适合文件原样转发到网络。回答时先数传统 read/write 的拷贝路径，再讲 mmap、sendfile、splice、MSG_ZEROCOPY 分别省掉哪一步，最后补上 TLS、压缩、用户态加工和硬件支持这些边界。\n\n**路径拆解**\n传统 read/write：磁盘 DMA 到 Page Cache；read 把 Page Cache CPU 拷到用户 buffer；write 把用户 buffer CPU 拷到 socket buffer；网卡 DMA 发出。两个 syscall 带来 4 次用户/内核态往返，其中两次 payload CPU copy 对“只转发”没有价值。\n\nmmap+write：把 Page Cache 映射到用户态，省掉内核到用户 buffer 的 copy，但写 socket 时通常仍要把 payload 拷到 socket buffer。sendfile/transferTo：让内核把文件页送到 socket，省用户 buffer 和一次 syscall 往返；SG-DMA 支持时，socket 引用文件页，NIC 按描述符取数据，实现 0 次 payload CPU copy。splice 是通过 pipe 转页引用；MSG_ZEROCOPY 是发送用户页并异步通知完成，适合大块发送。\n\n**工程边界**\nKafka/静态文件服务适合 sendfile，因为 payload 通常不需要用户态改写；Netty FileRegion/transferTo 也能走这个路径。若开启用户态 TLS、压缩、协议改写、鉴权插入字段，就可能退回普通拷贝；kTLS、NIC offload、预格式化数据可部分恢复。上线验证看 `strace -c` 的 read/write/sendfile 调用，看 perf 中 copy_user 热点和 CPU per Gbps，再看吞吐、P99、fallback 次数和错误。",
       "followUpQuestions": [
         {
-          "question": "为什么需要在用户态处理数据时就用不了零拷贝？",
-          "answer": "零拷贝的前提是数据原样从磁盘/Page Cache 送到网卡，应用不碰数据。一旦要加密、压缩、改协议头，就必须把数据拷进用户空间处理再写回，这正是被零拷贝省掉的那次拷贝，所以无法零拷贝（除非用内核态/硬件卸载）。"
+          "question": "为什么说零拷贝不是完全没有拷贝？",
+          "answer": "因为磁盘到内存、内存到网卡通常仍是 DMA，协议头和描述符也要处理；零拷贝主要指 payload 不再由 CPU 在内核缓冲区和用户缓冲区之间搬来搬去。更精确的表达是 0 次 payload CPU copy，而不是系统里没有任何数据移动。"
         },
         {
-          "question": "Kafka 为什么能用零拷贝，它的消息是怎么存的？",
-          "answer": "Kafka 把消息以与网络协议兼容的格式顺序追加到日志文件；消费者拉取时服务端用 sendfile 直接把文件中对应区间从 Page Cache 送到 socket，不经用户态、不做格式转换，所以能零拷贝、吞吐极高。"
+          "question": "Kafka 为什么适合 sendfile？什么时候会降级？",
+          "answer": "Kafka 的消息以 segment 文件顺序存储，消费者拉取时服务端经常可以按文件 offset/length 原样发送给 socket，不需要把 payload 拷到用户态加工，所以 sendfile 很合适。如果启用需要用户态处理 payload 的 TLS、压缩重写、消息格式转换或过滤，就可能无法走纯 sendfile；要靠 kTLS、硬件卸载或预格式化来恢复部分路径。"
+        },
+        {
+          "question": "MSG_ZEROCOPY 和 sendfile 有什么不同？",
+          "answer": "sendfile 典型是文件页到 socket，不经过用户缓冲区；MSG_ZEROCOPY 是应用已有用户态 buffer，要发送时让内核 pin 这些用户页并让网卡从这些页 DMA，完成后通过 error queue 通知应用可以安全复用。它适合大块发送，小包会被页 pin、通知和内存管理成本吃掉收益。"
         }
       ]
     },
@@ -58,65 +92,69 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能数清 read+write 的 4 次拷贝和 4 次切换并指出哪两次是浪费",
-        "能说明 mmap 省了哪次拷贝",
-        "能解释 sendfile 为何不经用户态、DMA gather 为何是 0 CPU 拷贝",
-        "能举出 Kafka/Netty 的零拷贝应用",
-        "能说明需要在用户态加工数据时为何无法零拷贝"
+        "能数清 read/write 路径中的 2 次 payload CPU copy、2 次 DMA 和 4 次用户/内核态往返",
+        "能说明 mmap+write、sendfile、SG-DMA、splice、MSG_ZEROCOPY 分别省掉什么",
+        "能准确表述零拷贝是 0 次 payload CPU copy，不是没有 DMA、系统调用或协议处理",
+        "能说清 Kafka/Netty 使用 sendfile/transferTo 的前提和 TLS/压缩/协议加工下的 fallback",
+        "能区分内核零拷贝和 Netty CompositeByteBuf 这类用户态逻辑零拷贝",
+        "能用 strace、perf、CPU per Gbps、P99、fallback 次数验证优化是否有效"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "os.io-model.topic-zero-copy.recall.1",
-      "prompt": "画出传统 read+write 发送文件的拷贝与上下文切换次数，指出哪些是可以省掉的。",
+      "prompt": "画出传统 read/write 发送文件到 socket 的数据路径，标出 payload CPU copy、DMA 和用户/内核态往返。",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "expectedMinutes": 4,
+      "difficulty": 4
     },
     {
       "id": "os.io-model.topic-zero-copy.recall.2",
-      "prompt": "对比 mmap、sendfile、sendfile+DMA gather 的拷贝次数，并说明 Kafka 如何利用零拷贝。",
+      "prompt": "对比 mmap+write、sendfile/transferTo、sendfile+SG-DMA、splice、MSG_ZEROCOPY 各自省掉什么，适用前提是什么。",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "expectedMinutes": 5,
+      "difficulty": 4
     },
     {
       "id": "os.io-model.topic-zero-copy.recall.3",
-      "prompt": "传统 read 加 write 发送文件有几次拷贝和上下文切换？sendfile 和 mmap 分别省掉了什么？",
+      "prompt": "Kafka 或 Netty 在 TLS、压缩、协议改写场景下为什么可能无法走 sendfile？你会怎样验证是否发生 fallback？",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "expectedMinutes": 5,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出传统 read+write 的 4 次拷贝 4 次切换及哪两次是多余的 CPU 拷贝",
-      "能讲清 mmap、sendfile、sendfile+DMA gather 各优化掉什么",
-      "能说明真零拷贝（DMA gather）做到 0 次 CPU 拷贝",
-      "能举出 Kafka、Netty 使用零拷贝的例子"
+      "能说出传统 read/write 的 payload CPU copy、DMA 和用户/内核态往返路径",
+      "能讲清 mmap、sendfile/transferTo、SG-DMA、splice、MSG_ZEROCOPY 各自优化掉什么",
+      "能准确限定零拷贝是减少或消除 payload CPU copy，不是没有 DMA/系统调用/协议处理",
+      "能说明 Kafka、Netty 使用 sendfile 的前提和 TLS/压缩/用户态加工的降级边界"
     ],
     "goodToHave": [
-      "能说明零拷贝的前提是应用不加工数据",
-      "能区分内核零拷贝与用户态逻辑零拷贝",
-      "能解释 splice 的作用"
+      "能区分 sendfile 无 SG-DMA 与 SG-DMA 支持下的 copy 差异",
+      "能说明 MSG_ZEROCOPY 的页 pin、error queue completion、小包成本和 fallback",
+      "能区分内核零拷贝与用户态逻辑零拷贝，如 CompositeByteBuf",
+      "能用 strace、perf/copy_user、CPU per Gbps、P99、fallback 次数验证收益"
     ],
     "commonMistakes": [
-      "说不清哪几次拷贝是 CPU 拷贝、哪几次是 DMA",
-      "以为需要在用户态处理数据时还能用零拷贝",
-      "混淆 mmap 和 sendfile 的优化点"
+      "把零拷贝说成完全没有数据移动，忽略 DMA、描述符和协议头处理",
+      "把用户/内核态往返误说成一定发生调度级上下文切换",
+      "以为 TLS、压缩、协议解析后仍天然可以走 sendfile",
+      "混淆 mmap、sendfile、splice、MSG_ZEROCOPY 的优化点",
+      "只背 Kafka/Netty 例子，不知道如何观测 fallback 和 CPU/Gbps 改善"
     ],
     "scoreWeights": {
-      "coverage": 30,
+      "coverage": 25,
       "accuracy": 30,
-      "interviewExpression": 15,
+      "interviewExpression": 20,
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-19",
   "status": "production",
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否说清传统拷贝的浪费、mmap/sendfile/DMA gather 各优化什么、真零拷贝的含义和前提，并举出 Kafka、Netty 的应用。",
+  "interviewerFocus": "考察是否能围绕「零拷贝技术」精确数清 payload CPU copy、DMA 和用户/内核态往返，讲清 mmap、sendfile/transferTo、SG-DMA、splice、MSG_ZEROCOPY、kTLS/硬件卸载的收益与边界，并能用 strace、perf、CPU per Gbps、P99 和 fallback 次数验证。 ",
   "prerequisites": [
     "os.io-model.topic-io-models"
   ]

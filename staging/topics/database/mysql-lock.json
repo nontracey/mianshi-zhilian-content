@@ -4,7 +4,7 @@
   "category": "mysql-core",
   "group": "mysql-core",
   "title": "MySQL 锁机制",
-  "summary": "理解全局锁、表锁、行锁、间隙锁、临键锁和死锁排查。",
+  "summary": "理解全局锁、表锁、行锁、间隙锁、临键锁、意向锁、插入意向锁和死锁排查。",
   "tags": [
     "数据库",
     "MySQL",
@@ -17,86 +17,129 @@
   "status": "staging",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能解释 InnoDB 行锁、间隙锁、临键锁、意向锁、死锁形成和锁等待排查。",
+  "interviewerFocus": "考察 InnoDB 行锁基于索引的本质、不同 SQL 语句的加锁规则差异、间隙锁与插入意向锁的交互、死锁日志解读与线上排查优化能力。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "InnoDB 锁通常锁的是索引记录和索引范围",
-      "content": "MySQL 锁机制服务于并发写入和事务隔离。InnoDB 的行锁是建立在索引上的，范围查询在可重复读下可能产生间隙锁或临键锁，以防止其他事务在范围内插入新记录。\n先抓住这些机制：\n- 记录锁锁住具体索引记录\n- 间隙锁锁住两个索引记录之间的范围，不锁已有记录本身\n- 临键锁是记录锁加间隙锁，常见于范围扫描\n- 意向锁是表级标记，用于协调表锁和行锁兼容性\n\n容易答错的边界：\n- 没有命中合适索引时，锁范围可能被放大\n- 死锁不是数据库坏了，而是事务互相等待形成环\n- 长事务持锁时间长，会放大锁等待和死锁概率"
+      "title": "InnoDB 行锁锁的是索引而非数据行本身",
+      "content": "InnoDB 的行锁是索引锁，不是在数据页上锁某一行。这意味着加锁的粒度和范围完全取决于 SQL 走了哪个索引、命中了哪些索引记录。\n\n**核心锁类型与触发条件：**\n- **记录锁（Record Lock）**：锁住索引上一条具体记录。等值查询命中唯一索引且记录存在时，退化为纯记录锁。\n- **间隙锁（Gap Lock）**：锁住两条索引记录之间的范围，防止其他事务在这个间隙插入新记录。间隙锁之间是兼容的——多个事务可以同时持有同一个间隙的 gap lock，它们都在阻止别人插入，但互不阻塞。\n- **临键锁（Next-Key Lock）**：记录锁 + 前方间隙锁，是 InnoDB 在 RR 隔离级别下范围扫描的默认加锁方式，锁住的是「左开右闭」区间 `(前一条记录, 当前记录]`。\n- **插入意向锁（Insert Intention Lock）**：一种特殊间隙锁，INSERT 操作在插入前获取。它表示「我打算在这个间隙插入」，与已有的间隙锁冲突——如果别的事务已经持有该间隙的 gap lock 或 next-key lock，INSERT 会被阻塞。但多个插入意向锁之间不冲突（只要插入位置不同）。\n\n**意向锁（Intention Lock）是表级标记：**\n- 事务在获取行锁前，先在表上加意向共享锁（IS）或意向排他锁（IX）。\n- 作用是让 `LOCK TABLES` 等表级操作能快速判断是否有行锁冲突，而不必逐行扫描。\n- IS 与 IX 之间互相兼容，IX 与行级 X 锁配合时，表锁会被阻塞。\n\n**容易答错的边界：**\n- 没有命中合适索引时，UPDATE/DELETE 会对聚簇索引的全部记录加锁（每条记录都是 next-key lock），等价于锁全表。\n- 唯一索引等值命中记录时，next-key lock 退化为 record lock，不再加间隙锁——因为唯一性约束已经保证不会有第二条相同记录插入。\n- 唯一索引等值未命中时，仍然会加间隙锁（锁住应该插入的位置间隙）。\n- RC 隔离级别下间隙锁基本不生效（除外键约束检查），所以 RC 下并发插入性能更好但可能出现幻读。"
     },
     {
       "type": "explain",
-      "title": "锁等待排查要回到 SQL、索引和事务顺序",
-      "content": "遇到锁等待，不能只看“谁在等”。要结合执行 SQL、执行计划、索引命中、事务开始时间和当前隔离级别。比如 `where status = 0` 没有合适索引，update 可能扫描大量记录并加锁；范围条件在可重复读下可能产生 next-key lock，阻塞范围内插入。\n死锁排查通常看 `SHOW ENGINE INNODB STATUS` 的 latest detected deadlock，找到两个事务各自持有什么锁、等待什么锁，再从业务顺序上统一访问资源，缩短事务，补索引或拆分大事务。调大 lock wait timeout 只是让等待更久，不会消除死锁根因。\n把 MySQL 锁机制 放到真实场景里看，重点是数据模型、读写路径、隔离边界和故障表现。先确认触发条件，再看状态或数据怎样变化，最后用指标、日志、测试结果或复杂度证明判断"
+      "title": "不同 SQL 语句的加锁规则差异",
+      "content": "面试官经常追问「这条 SQL 到底加了什么锁」，需要按语句类型和索引类型分别回答。\n\n**SELECT ... FOR UPDATE / LOCK IN SHARE MODE（当前读）：**\n- 等值命中唯一索引：record lock。\n- 等值命中普通索引：命中记录上加 record lock，同时在记录前后加 gap lock（防止其他事务在相同值位置插入）。\n- 等值未命中任何索引：在扫描到的每条记录上加 next-key lock，如果走聚簇索引全扫描则锁全表。\n- 范围查询：对扫描范围内每条记录加 next-key lock，最后一条记录之后也会加 gap lock。例如 `WHERE id > 10 AND id < 20`，会锁住 `(10, 20]` 以及 `20` 之后的间隙。\n\n**UPDATE / DELETE：**\n- 加锁规则与 `SELECT ... FOR UPDATE` 一致——先做当前读找到目标记录，再对每条记录加 X 型 next-key lock。\n- 如果 WHERE 条件列无索引，走聚簇索引全表扫描，每条记录加 next-key lock，效果等同锁表。\n- 如果 WHERE 命中二级索引，二级索引记录和对应聚簇索引记录都会加锁。\n\n**INSERT：**\n- 在插入位置获取插入意向锁，如果该间隙已被其他事务的 gap lock / next-key lock 占据，则阻塞等待。\n- 插入成功后，新记录上有 record lock（X 型）。\n- 唯一键冲突时，会对冲突记录加 S 型 next-key lock（不是 record lock），这会导致并发 INSERT 同一唯一键时更容易死锁。\n\n**实际案例：**\n表 `orders(id PK, order_no UNIQUE, status INDEX)`，事务 A 执行 `SELECT * FROM orders WHERE status = 0 FOR UPDATE`，命中 3 条记录。在 RR 下，status 索引上这 3 条记录各加 next-key lock，同时 status 索引最后一条命中记录之后的间隙也被锁。此时事务 B 执行 `INSERT INTO orders(order_no, status) VALUES('NEW', 0)`，如果插入位置的 status 值落在被锁间隙内，会被阻塞。"
+    },
+    {
+      "type": "explain",
+      "title": "线上死锁定位与优化的完整链路",
+      "content": "死锁是两个或多个事务互相持有对方需要的锁，形成等待环。InnoDB 的死锁检测（`innodb_deadlock_detect` 默认 ON）会在每次锁等待时检测等待图（wait-for graph）中是否出现环，发现环后回滚 undo 量较小的事务。\n\n**定位步骤：**\n1. **获取死锁日志**：`SHOW ENGINE INNODB STATUS` 的 `LATEST DETECTED DEADLOCK` 段。重点看两个事务分别持有和等待的锁——日志会打印锁类型（RECORD LOCK）、锁模式（S/X）、索引名、事务 ID 和具体 SQL。\n2. **解析锁关系**：从日志中提取 `HOLDS THE LOCK` 和 `WAITING FOR THIS LOCK TO BE GRANTED`，画出等待图。例如事务 A 持有 orders 表 idx_status 上的 X 型 next-key lock，等待 order_no 唯一索引上的 S 锁；事务 B 持有 order_no 上的锁，等待 idx_status 上的锁——这就是典型的交叉等待。\n3. **查 performance_schema**：`SELECT * FROM performance_schema.data_locks` 可以看当前所有锁的 `INDEX_NAME`、`LOCK_TYPE`、`LOCK_MODE`、`LOCK_DATA`；`data_lock_waits` 看等待关系。MySQL 8.0.1+ 默认开启。\n4. **结合业务代码**：定位两个事务的执行路径，确认资源访问顺序是否不一致。\n\n**常见死锁模式与优化：**\n- **交叉更新**：事务 A 先更新表 X 再更新表 Y，事务 B 先更新 Y 再更新 X。优化：全局统一表访问顺序。\n- **唯一键并发插入**：多个事务并发 INSERT 相同唯一键，冲突时加 S 锁形成环。优化：使用 `INSERT ... ON DUPLICATE KEY UPDATE` 或先 SELECT 判断。\n- **间隙锁互等**：事务 A 在 gap1 加锁后尝试在 gap2 插入，事务 B 反过来。优化：缩短事务、减少范围查询的当前读、降低隔离级别到 RC。\n- **大事务持锁过久**：事务中包含 RPC 调用或慢查询，持锁时间拉长，死锁窗口变大。优化：事务内只做数据库操作，RPC 移到事务外。\n\n**关键参数：**\n- `innodb_lock_wait_timeout`（默认 50s）：行锁等待超时，超时后报 `Lock wait timeout exceeded`，注意这不是死锁，是单方面等太久。\n- `innodb_deadlock_detect`（默认 ON）：高并发场景下死锁检测本身有性能开销，可在已知无死锁风险的场景关闭，但需配合缩短 `innodb_lock_wait_timeout`。\n- `innodb_status_output_locks`（默认 OFF）：开启后 `SHOW ENGINE INNODB STATUS` 会输出详细的锁信息。"
     },
     {
       "type": "diagram",
-      "title": "锁申请和死锁排查路径",
+      "title": "不同 SQL 与索引命中下的加锁决策路径",
       "format": "mermaid",
-      "content": "flowchart LR\nA[MySQL 事务执行 UPDATE] --> B[优化器选择索引]\nB --> C[InnoDB 申请记录锁/间隙锁]\nC --> D[锁等待或加锁成功]\nD --> E[死锁检测等待环]\nE --> F[回滚事务并释放锁]",
-      "fallback": "MySQL 事务执行 UPDATE -> 优化器选择索引 -> InnoDB 申请记录锁/间隙锁 -> 锁等待或加锁成功 -> 死锁检测等待环 -> 回滚事务并释放锁",
-      "caption": "锁等待要同时看 SQL 条件、索引命中、事务顺序和 InnoDB 等待关系。"
+      "content": "flowchart TD\n    A[事务执行 SQL] --> B{语句类型?}\n    B -->|INSERT| C[申请插入意向锁]\n    C --> D{目标间隙被 gap/next-key lock 占据?}\n    D -->|是| E[阻塞等待, 可能形成死锁环]\n    D -->|否| F[插入成功, 新记录加 X record lock]\n    B -->|SELECT FOR UPDATE / UPDATE / DELETE| G{WHERE 条件列有索引?}\n    G -->|否| H[聚簇索引全扫描, 每条记录加 next-key lock, 等效锁表]\n    G -->|是| I{索引类型与命中情况?}\n    I -->|唯一索引等值命中| J[退化为 record lock, 无间隙锁]\n    I -->|唯一索引等值未命中| K[加 gap lock 锁住目标间隙]\n    I -->|普通索引等值命中| L[命中记录加 next-key lock, 前后间隙也锁]\n    I -->|范围查询| M[扫描范围每条记录加 next-key lock, 末尾记录后加 gap lock]\n    E --> N[innodb_deadlock_detect 检测等待环]\n    N --> O{检测到环?}\n    O -->|是| P[回滚 undo 量较小的事务]\n    O -->|否| Q[继续等待至 lock_wait_timeout]",
+      "fallback": "事务执行 SQL 后按语句类型分支：INSERT 申请插入意向锁，若目标间隙被占则阻塞等待并可能触发死锁检测；SELECT FOR UPDATE / UPDATE / DELETE 先判断 WHERE 条件列有无索引，无索引则全表加 next-key lock，有索引再按唯一索引等值命中（退化为 record lock）、唯一索引未命中（gap lock）、普通索引命中（next-key lock）、范围查询（next-key lock + 末尾 gap lock）分支处理。死锁检测发现等待环则回滚 undo 量小的事务。",
+      "caption": "加锁范围由语句类型、索引类型和命中情况共同决定；死锁检测在每次锁等待时检查等待图。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\n    A[事务执行 SQL] --> B{语句类型?}\n    B -->|INSERT| C[申请插入意向锁]\n    C --> D{目标间隙被 gap/next-key lock 占据?}\n    D -->|是| E[阻塞等待, 可能形成死锁环]\n    D -->|否| F[插入成功, 新记录加 X record lock]\n    B -->|SELECT FOR UPDATE / UPDATE / DELETE| G{WHERE 条件列有索引?}\n    G -->|否| H[聚簇索引全扫描, 每条记录加 next-key lock, 等效锁表]\n    G -->|是| I{索引类型与命中情况?}\n    I -->|唯一索引等值命中| J[退化为 record lock, 无间隙锁]\n    I -->|唯一索引等值未命中| K[加 gap lock 锁住目标间隙]\n    I -->|普通索引等值命中| L[命中记录加 next-key lock, 前后间隙也锁]\n    I -->|范围查询| M[扫描范围每条记录加 next-key lock, 末尾记录后加 gap lock]\n    E --> N[innodb_deadlock_detect 检测等待环]\n    N --> O{检测到环?}\n    O -->|是| P[回滚 undo 量较小的事务]\n    O -->|否| Q[继续等待至 lock_wait_timeout]"
+        },
+        {
+          "kind": "text",
+          "content": "事务执行 SQL 后按语句类型分支：INSERT 申请插入意向锁，若目标间隙被占则阻塞等待并可能触发死锁检测；SELECT FOR UPDATE / UPDATE / DELETE 先判断 WHERE 条件列有无索引，无索引则全表加 next-key lock，有索引再按唯一索引等值命中（退化为 record lock）、唯一索引未命中（gap lock）、普通索引命中（next-key lock）、范围查询（next-key lock + 末尾 gap lock）分支处理。死锁检测发现等待环则回滚 undo 量小的事务。"
+        }
+      ]
     },
     {
       "type": "compareTable",
-      "title": "InnoDB 锁类型边界",
+      "title": "InnoDB 锁类型边界与兼容性",
       "columns": [
-        "考点",
-        "机制含义",
-        "面试要点",
-        "常见误区"
+        "锁类型",
+        "锁对象",
+        "触发场景",
+        "与其他锁的兼容性",
+        "面试易错点"
       ],
       "rows": [
         [
-          "记录锁",
-          "锁单条索引记录",
-          "精确更新和当前读",
-          "忽略索引前提"
+          "记录锁（Record Lock）",
+          "单条索引记录",
+          "唯一索引等值命中记录",
+          "S-S 兼容，S-X / X-X 互斥",
+          "唯一索引命中时才退化为纯 record lock，普通索引不会"
         ],
         [
-          "间隙锁",
-          "锁索引范围间隙",
-          "防止范围插入",
-          "以为锁住已有记录"
+          "间隙锁（Gap Lock）",
+          "两条索引记录之间的间隙",
+          "RR 下范围查询或等值未命中",
+          "gap-gap 互相兼容，gap-insert intention 互斥",
+          "间隙锁不锁已有记录本身，只阻止插入"
         ],
         [
-          "临键锁",
-          "记录锁加间隙锁",
-          "范围扫描和可重复读",
-          "不知道会阻塞插入"
+          "临键锁（Next-Key Lock）",
+          "记录 + 前方间隙 (前记录, 当前记录]",
+          "RR 下范围扫描的默认加锁方式",
+          "与插入意向锁冲突，与 gap lock 部分兼容",
+          "范围查询末尾记录之后也会加 gap lock"
         ],
         [
-          "意向锁",
-          "表级意向标记",
-          "协调表锁和行锁",
-          "误认为直接锁全表"
+          "插入意向锁（Insert Intention Lock）",
+          "待插入位置的间隙",
+          "INSERT 操作在插入前获取",
+          "插入意向锁之间互相兼容，与 gap/next-key lock 冲突",
+          "不是行锁，是特殊间隙锁，多个 INSERT 不同位置不冲突"
+        ],
+        [
+          "意向锁（IS/IX）",
+          "整张表（表级标记）",
+          "获取行锁前自动加",
+          "IS-IS/IX 兼容，IS-IX 兼容，与表级 S/X 锁冲突",
+          "意向锁之间互相兼容，不会阻塞行级操作"
         ]
       ]
     },
     {
       "type": "code",
-      "title": "查看锁等待和死锁线索",
+      "title": "死锁日志解读与锁等待排查命令",
       "language": "sql",
-      "content": "SHOW ENGINE INNODB STATUS;\n\nSELECT *\nFROM performance_schema.data_locks;\n\nSELECT *\nFROM performance_schema.data_lock_waits;",
+      "content": "-- 死锁日志：重点看 HOLDS THE LOCK 和 WAITING FOR THIS LOCK\nSHOW ENGINE INNODB STATUS;\n\n-- MySQL 8.0+ 查看当前所有锁（含锁类型、索引名、锁数据）\nSELECT\n    ENGINE_TRANSACTION_ID,\n    OBJECT_NAME,\n    INDEX_NAME,\n    LOCK_TYPE,\n    LOCK_MODE,\n    LOCK_STATUS,\n    LOCK_DATA\nFROM performance_schema.data_locks;\n\n-- 查看锁等待关系：谁在等谁的锁\nSELECT\n    r.ENGINE_TRANSACTION_ID AS waiting_trx,\n    r.REQUESTING_ENGINE_LOCK_ID AS waiting_lock,\n    b.ENGINE_TRANSACTION_ID AS blocking_trx,\n    b.OBJECT_NAME,\n    b.INDEX_NAME,\n    b.LOCK_MODE AS blocking_lock_mode\nFROM performance_schema.data_lock_waits w\nJOIN performance_schema.data_locks r ON w.REQUESTING_ENGINE_LOCK_ID = r.ENGINE_LOCK_ID\nJOIN performance_schema.data_locks b ON w.BLOCKING_ENGINE_LOCK_ID = b.ENGINE_LOCK_ID;\n\n-- 开启详细锁信息输出（排查时临时开启）\nSET GLOBAL innodb_status_output_locks = ON;",
       "highlights": [
         {
-          "line": 1,
-          "note": "SHOW ENGINE INNODB STATUS 会输出最近一次死锁，重点看两个事务分别持有和等待的锁。"
+          "line": 2,
+          "note": "LATEST DETECTED DEADLOCK 段会打印两个事务各自 HOLDS THE LOCK 和 WAITING FOR 的锁类型、索引名和具体记录值"
+        },
+        {
+          "line": 6,
+          "note": "LOCK_MODE 值为 S,REC_NOT_GAP / X,INSERT_INTENTION / X,GAP / X 等组合，直接反映锁类型"
+        },
+        {
+          "line": 18,
+          "note": "JOIN data_locks 两次分别拿到等待方和阻塞方的锁详情，可快速画出等待图"
+        },
+        {
+          "line": 25,
+          "note": "开启后 SHOW ENGINE INNODB STATUS 的 TRANSACTIONS 段会列出每个事务持有的所有锁记录"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "MySQL 锁机制我会按锁粒度、索引范围和死锁排查三层回答。\n我会按这条线展开：\n1. InnoDB 行锁依赖索引，命中索引越精确，锁范围通常越可控\n2. 记录锁锁具体记录，间隙锁锁范围，临键锁同时覆盖记录和间隙\n3. 死锁是事务等待关系形成环，数据库会回滚其中一个事务打破环\n4. 优化锁问题要补索引、缩短事务、统一访问顺序，并避免大范围当前读\n\n最后补一句边界：锁问题不是靠延长超时时间解决，关键是减少锁范围和持锁时间。",
+      "content": "**30 秒结论：** InnoDB 行锁本质是索引锁，加锁范围由语句类型、索引类型和命中情况共同决定。RR 隔离级别下范围查询产生 next-key lock 防幻读，INSERT 通过插入意向锁与间隙锁交互。死锁靠 wait-for graph 检测，排查从死锁日志入手。\n\n**机制要点：**\n- 行锁依赖索引：无索引的 UPDATE 走聚簇索引全扫描，每条记录加 next-key lock，等效锁表\n- 唯一索引等值命中退化为 record lock（无间隙锁）；普通索引等值命中仍加 next-key lock\n- 间隙锁之间互相兼容，但与插入意向锁冲突——这是 INSERT 被范围查询阻塞的根因\n- 意向锁（IS/IX）是表级标记，协调表锁与行锁，意向锁之间互相兼容\n- 死锁检测默认开启，每次锁等待时检查等待图，发现环则回滚 undo 量较小的事务\n\n**边界与追问应对：**\n- RC 隔离级别下间隙锁基本不生效，并发性能更好但可能幻读\n- 唯一键并发 INSERT 冲突时加 S 型 next-key lock（非 record lock），更容易死锁\n- `innodb_deadlock_detect` 在高并发下有 CPU 开销，可在确认无死锁风险时关闭并缩短 lock wait timeout\n- 优化方向：补索引缩小锁范围、统一资源访问顺序、事务内不混入 RPC、大事务拆分",
       "followUpQuestions": [
         {
-          "question": "为什么没有索引的 update 会放大锁范围？",
-          "answer": "InnoDB 需要扫描更多记录来判断条件，扫描过程中可能对大量索引记录加锁，导致本来很小的更新影响很多并发事务。"
+          "question": "为什么没有索引的 UPDATE 会锁全表？底层扫描和加锁过程是怎样的？",
+          "answer": "InnoDB 执行无索引的 UPDATE 时，只能走聚簇索引全表扫描。扫描过程中对聚簇索引的每条记录加 X 型 next-key lock（记录 + 前方间隙），由于覆盖了所有记录和间隙，其他事务的任何 INSERT/UPDATE/DELETE 都会被阻塞，效果等同锁表。即使只更新一条记录也是如此——因为数据库在扫描到目标记录之前无法知道哪些行满足条件。"
         },
         {
-          "question": "死锁发生后应该怎么优化？",
-          "answer": "先看死锁日志确认两个事务持锁和等待关系，再统一资源访问顺序、补充索引、缩短事务或拆分批量操作。"
+          "question": "两个事务并发 INSERT 同一个唯一键，为什么会死锁？",
+          "answer": "事务 A 和 B 同时 INSERT 相同唯一键值，假设都先做唯一性检查。A 先插入成功并持有 record lock，B 检查到冲突，需要对已存在记录加 S 型 next-key lock（不是 record lock，因为要防止范围内新增），但 A 持有 X 锁，B 等待。如果此时 A 又尝试在同一范围操作需要等待 B 的 S 锁（或 B 之前获取的其他锁），就形成环。优化方案是用 INSERT ... ON DUPLICATE KEY UPDATE 替代先查后插，或用幂等设计避免并发写同一键。"
+        },
+        {
+          "question": "线上频繁出现死锁，你的排查和优化步骤是什么？",
+          "answer": "第一步从 `SHOW ENGINE INNODB STATUS` 的 LATEST DETECTED DEADLOCK 段提取两个事务的持锁和等待关系，画出等待图确认死锁模式。第二步用 `performance_schema.data_locks` 和 `data_lock_waits` 查看实时锁状态，确认 INDEX_NAME 和 LOCK_MODE。第三步结合业务代码定位两个事务的 SQL 执行路径，检查资源访问顺序是否一致。常见优化：统一表和行的访问顺序、补索引缩小锁范围、事务内移除 RPC 调用缩短持锁时间、大范围当前读改为批量分片、必要时降级到 RC 隔离级别消除间隙锁。"
         }
       ]
     },
@@ -104,11 +147,16 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释行锁依赖索引",
-        "能区分记录锁/间隙锁/临键锁",
-        "能说明意向锁作用",
-        "能读死锁等待关系",
-        "能给出锁优化方向"
+        "行锁本质是索引锁，加锁范围取决于走了哪个索引",
+        "唯一索引等值命中退化为 record lock，普通索引不退化",
+        "间隙锁之间互相兼容，但与插入意向锁冲突",
+        "INSERT 在插入前获取插入意向锁，被 gap/next-key lock 阻塞",
+        "意向锁（IS/IX）是表级标记，之间互相兼容，与表级 S/X 锁冲突",
+        "SELECT FOR UPDATE / UPDATE / DELETE 加锁规则一致，先当前读再逐条加锁",
+        "无索引 UPDATE 走聚簇索引全扫描，每条记录加 next-key lock 等效锁表",
+        "从死锁日志中提取 HOLDS THE LOCK 和 WAITING FOR 的锁类型与索引名",
+        "死锁检测基于 wait-for graph，回滚 undo 量较小的事务",
+        "优化死锁的四个方向：统一访问顺序、补索引、缩短事务、降低隔离级别"
       ]
     }
   ],
@@ -131,26 +179,33 @@
       "id": "database.mysql-core.mysql-lock.recall.3",
       "prompt": "线上出现死锁时，你会如何定位和优化？",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "expectedMinutes": 4,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明「记录锁」在「MySQL 锁机制」里的作用和判断标准",
-      "能说明「间隙锁」在「MySQL 锁机制」里的作用和判断标准",
-      "能说明「临键锁」在「MySQL 锁机制」里的作用和判断标准",
-      "索引命中影响锁范围"
+      "行锁本质是索引锁，加锁范围取决于索引类型和命中情况",
+      "唯一索引等值命中退化为 record lock，普通索引等值命中仍加 next-key lock",
+      "间隙锁之间互相兼容，与插入意向锁冲突",
+      "插入意向锁是 INSERT 在插入前获取的特殊间隙锁",
+      "意向锁 IS/IX 是表级标记，之间互相兼容",
+      "无索引 UPDATE 走聚簇索引全扫描加 next-key lock 等效锁表",
+      "死锁检测基于 wait-for graph 回滚 undo 量较小的事务"
     ],
     "goodToHave": [
-      "performance_schema 锁表",
-      "SHOW ENGINE INNODB STATUS",
-      "统一访问顺序"
+      "performance_schema.data_locks 查看 LOCK_MODE 和 INDEX_NAME",
+      "SHOW ENGINE INNODB STATUS 解读 LATEST DETECTED DEADLOCK",
+      "唯一键并发 INSERT 冲突时加 S 型 next-key lock 更易死锁",
+      "innodb_deadlock_detect 高并发下的 CPU 开销权衡",
+      "RC 隔离级别下间隙锁基本不生效"
     ],
     "commonMistakes": [
-      "认为行锁一定只锁一行",
-      "把 lock wait timeout 当优化手段",
-      "忽略长事务持锁时间"
+      "认为行锁一定只锁一行，忽略无索引时锁全表",
+      "把 innodb_lock_wait_timeout 调大当作死锁优化手段",
+      "认为间隙锁之间互斥，实际上 gap lock 之间互相兼容",
+      "忽略唯一键冲突 INSERT 加的是 S 型 next-key lock 而非 record lock",
+      "事务中混入 RPC 调用拉长持锁时间放大死锁窗口"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -159,5 +214,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-17"
 }

@@ -44,7 +44,17 @@
         "人工确认结果写回状态后才能继续后续节点"
       ],
       "format": "mermaid",
-      "caption": "图示强调状态不是聊天历史，而是可恢复、可审计、可校验副作用的工作流快照。"
+      "caption": "图示强调状态不是聊天历史，而是可恢复、可审计、可校验副作用的工作流快照。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart LR\nA[用户请求和线程ID] --> B[读取状态快照]\nB --> C[执行图节点]\nC --> D[写入工具结果和计划版本]\nD --> E{需要人工确认或失败重试}\nE -->|暂停| F[保存 checkpoint]\nE -->|继续| G[进入下一节点]\nF --> H[恢复时校验外部副作用]\nH --> G"
+        },
+        {
+          "kind": "text",
+          "content": "用户请求和线程ID -> 读取状态快照 -> 执行图节点 -> 写入工具结果和计划版本 -> 暂停/恢复 -> 校验外部副作用 -> 继续下一节点"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -55,12 +65,30 @@
       "type": "code",
       "title": "代码示例",
       "content": "# 完整的Agent 状态管理示例\nfrom langgraph.graph import StateGraph, END\nfrom langgraph.checkpoint.memory import MemorySaver\nfrom typing import TypedDict, Annotated\nimport operator\n\nclass AgentState(TypedDict):\n    messages: Annotated[list, operator.add]  # 消息自动追加\n    intermediate_steps: list  # 中间步骤\n    current_task: str  # 当前任务\n\ndef think_node(state: AgentState):\n    \"\"\"思考节点：分析当前状态，决定下一步\"\"\"\n    messages = state[\"messages\"]\n    response = llm.invoke(messages)\n    return {\n        \"messages\": [response],\n        \"current_task\": \"analyzing\"\n    }\n\ndef act_node(state: AgentState):\n    \"\"\"行动节点：调用工具\"\"\"\n    last_message = state[\"messages\"][-1]\n    tool_call = last_message.tool_calls[0]\n    result = tools_by_name[tool_call[\"name\"]].invoke(tool_call[\"args\"])\n    return {\n        \"messages\": [ToolMessage(content=str(result), tool_call_id=tool_call[\"id\"])],\n        \"intermediate_steps\": [(tool_call, result)]\n    }\n\ndef should_continue(state: AgentState):\n    \"\"\"条件路由：是否继续\"\"\"\n    last_message = state[\"messages\"][-1]\n    if last_message.tool_calls:\n        return \"act\"\n    return END\n\n# 构建工作流\nworkflow = StateGraph(AgentState)\nworkflow.add_node(\"think\", think_node)\nworkflow.add_node(\"act\", act_node)\nworkflow.add_edge(\"think\", \"act\")\nworkflow.add_conditional_edges(\"act\", should_continue, {\"think\": \"think\", END: END})\nworkflow.set_entry_point(\"think\")\n\n# 编译并执行\ncheckpointer = MemorySaver()\napp = workflow.compile(checkpointer=checkpointer)\n\nconfig = {\"configurable\": {\"thread_id\": \"conversation-1\"}}\nresult = app.invoke({\"messages\": [HumanMessage(content=\"帮我搜索...\")]}, config)\n\n# 查看状态历史\nfor state in app.get_state_history(config):\n    print(f\"Step: {state.metadata.get('step')}, Messages: {len(state.values['messages'])}\")",
-      "language": "python"
+      "language": "python",
+      "highlights": [
+        {
+          "line": 7,
+          "note": "`class AgentState(TypedDict):` 定义了 Agent 状态管理 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+        },
+        {
+          "line": 54,
+          "note": "`for state in app.get_state_history(config):` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+        },
+        {
+          "line": 34,
+          "note": "`if last_message.tool_calls:` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+        },
+        {
+          "line": 8,
+          "note": "`messages: Annotated[list, operator.add] # 消息自动追加` 更新核心数据结构，是解释状态如何推进的抓手。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "30 秒结论：Agent 状态管理解决的是长任务、多轮协作和失败恢复问题，不只是“保存聊天记录”。我会把状态拆成任务目标、消息历史、计划、工具结果、错误、人工确认和外部副作用记录，再用 checkpoint 把每个可靠节点的输出持久化。\n\n机制上，LangGraph 这类状态图会把工作流节点和状态结构绑定起来：节点读入当前 state，返回增量更新；checkpointer 按 thread_id 保存快照，恢复时从最近 checkpoint 继续。难点不在保存，而在恢复前确认外部副作用是否已经发生，例如邮件是否已发、订单是否已创建、数据库是否已写入。这里要配合幂等键、事务日志、补偿动作和审计 trace。\n\n边界上，短期状态服务当前任务，长期记忆只保存经授权且可更新的偏好或知识；高风险动作要 Human-in-the-Loop 暂停确认；并发写状态要用版本号、锁或合并策略，否则会出现计划覆盖和工具结果错配。",
+      "content": "30 秒结论：Agent 状态管理解决的是长任务、多轮协作和失败恢复问题，不只是“保存聊天记录”。我会把状态拆成任务目标、消息历史、计划、工具结果、错误、人工确认和外部副作用记录，再用 checkpoint 把每个可靠节点的输出持久化。\n\n机制要点：\n- 机制上，LangGraph 这类状态图会把工作流节点和状态结构绑定起来：节点读入当前 state，返回增量更新；checkpointer 按 thread_id 保存快照，恢复时从最近 checkpoint 继续。难点不在保存，而在恢复前确认外部副作用是否已经发生，例如邮件是否已发、订单是否已创建、数据库是否已写入。这里要配合幂等键、事务日志、补偿动作和审计 trace。\n- 边界上，短期状态服务当前任务，长期记忆只保存经授权且可更新的偏好或知识；高风险动作要 Human-in-the-Loop 暂停确认；并发写状态要用版本号、锁或合并策略，否则会出现计划覆盖和工具结果错配。",
       "followUpQuestions": [
         {
           "question": "Agent 执行到付款工具后超时，恢复时你如何避免重复扣款？",
@@ -135,7 +163,7 @@
       "depth": 15
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-18",
   "prerequisites": [
     "agent.tool-agent.topic-124-6e95a1cd"
   ],

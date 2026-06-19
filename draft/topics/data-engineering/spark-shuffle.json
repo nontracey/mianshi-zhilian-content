@@ -38,11 +38,21 @@
     },
     {
       "type": "diagram",
-      "title": "Sort Shuffle Write 与 Reduce Fetch 链路",
+      "title": "Spark Shuffle：Map 写块、Reduce 拉取、倾斜与 AQE 调整",
       "format": "mermaid",
-      "content": "flowchart LR\nA[Map Task 处理分区数据] --> B[PartitionedAppendOnlyMap 内存缓冲]\nB --> C{内存阈值或强制 spill}\nC -->|溢写| D[多个 spill 文件 按 partitionId,key 排序]\nC -->|未溢写| E[内存中排序]\nD --> F[归并: shuffle_data + shuffle_index]\nE --> F\nF --> G[External Shuffle Service 托管文件]\nG --> H[Reduce Task 通过 Netty 拉取 maxSizeInFlight=48MB]\nH --> I{需要聚合?}\nI -->|是| J[ExternalAppendOnlyMap 聚合 spill]\nI -->|否| K[ExternalSorter 排序 spill]",
-      "fallback": "Map Task -> 内存缓冲 -> spill 排序 -> 归并为 data+index 两文件 -> External Shuffle Service 托管 -> Reduce Task 通过 Netty 限流拉取 -> 视情况走 ExternalAppendOnlyMap 或 ExternalSorter",
-      "caption": "图示对应 Sort Shuffle 的完整路径：map 端最终只留 data/index 两个文件，reduce 端按 maxSizeInFlight 限流拉取，External Shuffle Service 让 executor 释放后中间数据仍可被消费。"
+      "content": "flowchart TD\nA[\"上游 Stage\nMap Tasks\"] --> B[\"Shuffle Write\n按分区写 block\"]\nB --> C[\"Shuffle 文件/服务\"]\nC --> D[\"下游 Stage\nReduce Tasks 拉取 block\"]\nD --> E[\"聚合/Join/排序\"]\nE --> F[\"输出结果\"]\nG[\"数据倾斜\"] --> H[\"少数 reduce 处理超大分区\"]\nH --> I[\"AQE skew split\n或加盐/预聚合\"]\nJ[\"小分区过多\"] --> K[\"AQE coalesce partitions\"]\nK --> D",
+      "fallback": "图展示 Spark Shuffle 的 map 写、reduce 拉取、数据倾斜和 AQE 合并/拆分分区的真实执行关系。",
+      "caption": "Spark Shuffle：Map 写块、Reduce 拉取、倾斜与 AQE 调整",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[\"上游 Stage\nMap Tasks\"] --> B[\"Shuffle Write\n按分区写 block\"]\nB --> C[\"Shuffle 文件/服务\"]\nC --> D[\"下游 Stage\nReduce Tasks 拉取 block\"]\nD --> E[\"聚合/Join/排序\"]\nE --> F[\"输出结果\"]\nG[\"数据倾斜\"] --> H[\"少数 reduce 处理超大分区\"]\nH --> I[\"AQE skew split\n或加盐/预聚合\"]\nJ[\"小分区过多\"] --> K[\"AQE coalesce partitions\"]\nK --> D"
+        },
+        {
+          "kind": "text",
+          "content": "图展示 Spark Shuffle 的 map 写、reduce 拉取、数据倾斜和 AQE 合并/拆分分区的真实执行关系。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -119,7 +129,7 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "Spark Shuffle 我会分三层讲。\n\n第一层是写入演进：1.2 之前的 Hash Shuffle 会产生 M×R 个文件，executor 文件句柄很容易爆；1.6 之后默认 Sort Shuffle，Map Task 用 PartitionedAppendOnlyMap 攒数据，超内存 spill 排序，最后归并成 data + index 两个文件，shuffle 文件数降到 2M。reduce 分区不多且无 map 端聚合时还会走 BypassMergeSortShuffleWriter 跳过排序。\n\n第二层是 Shuffle Read 和稳定性：Reduce 端 ShuffleBlockFetcherIterator 按 maxSizeInFlight=48MB 限流从 Netty 拉块，External Shuffle Service 是动态资源分配的前提，让 executor 释放后中间结果仍能被消费。FetchFailedException 会触发上游 ShuffleMapStage 重算，连环 retry 多半是 OOM 被放大，排查顺序是 executor 日志、Shuffle Service 日志、网络，最后才是加资源。\n\n第三层是数据倾斜与 AQE：判定倾斜要看 Stage Tasks 的 Shuffle Read max/median 比值、Spill 分布，再用 groupBy(key).count() 复算。3.0 之前靠 salting、调 shuffle.partitions、广播小表手工治理；3.0 之后 AQE 自动做三件事——合并空分区、把 join 端大于 skewedPartitionFactor×median 的分区切开复制 join、运行期把 SortMergeJoin 切成 BroadcastHashJoin。AQE 解决不了 groupBy 单 key 聚合倾斜，那种还是得两阶段 salting。",
+      "content": "Spark Shuffle 我会分三层讲。\n\n机制要点：\n- 第一层是写入演进：1.2 之前的 Hash Shuffle 会产生 M×R 个文件，executor 文件句柄很容易爆；1.6 之后默认 Sort Shuffle，Map Task 用 PartitionedAppendOnlyMap 攒数据，超内存 spill 排序，最后归并成 data + index 两个文件，shuffle 文件数降到 2M。reduce 分区不多且无 map 端聚合时还会走 BypassMergeSortShuffleWriter 跳过排序。\n- 第二层是 Shuffle Read 和稳定性：Reduce 端 ShuffleBlockFetcherIterator 按 maxSizeInFlight=48MB 限流从 Netty 拉块，External Shuffle Service 是动态资源分配的前提，让 executor 释放后中间结果仍能被消费。FetchFailedException 会触发上游 ShuffleMapStage 重算，连环 retry 多半是 OOM 被放大，排查顺序是 executor 日志、Shuffle Service 日志、网络，最后才是加资源。\n- 第三层是数据倾斜与 AQE：判定倾斜要看 Stage Tasks 的 Shuffle Read max/median 比值、Spill 分布，再用 groupBy(key).count() 复算。3.0 之前靠 salting、调 shuffle.partitions、广播小表手工治理；3.0 之后 AQE 自动做三件事——合并空分区、把 join 端大于 skewedPartitionFactor×median 的分区切开复制 join、运行期把 SortMergeJoin 切成 BroadcastHashJoin。AQE 解决不了 groupBy 单 key 聚合倾斜，那种还是得两阶段 salting。",
       "followUpQuestions": [
         {
           "question": "Sort Shuffle 的 Map Task 最终只生成两个文件，data 和 index 各起什么作用？为什么这样设计能比 Hash Shuffle 省一个数量级的文件数？",
@@ -206,5 +216,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-13"
+  "updatedAt": "2026-06-18"
 }

@@ -22,8 +22,8 @@
     },
     {
       "type": "explain",
-      "title": "spring.factories 与配置加载",
-      "content": "## 二、@EnableAutoConfiguration 原理\n\n### 2.1 注解结构\n```java\n@Target(ElementType.TYPE)\n@Retention(RetentionPolicy.RUNTIME)\n@Documented\n@Inherited\n@AutoConfigurationPackage                    // 1. 自动配置包\n@Import(AutoConfigurationImportSelector.class) // 2. 导入自动配置选择器\npublic @interface EnableAutoConfiguration {\n    Class<?>[] exclude() default {};\n    String[] excludeName() default {};\n}\n```\n\n### 2.2 @AutoConfigurationPackage\n`AutoConfigurationPackages.Registrar` 会将主类所在的包路径注册到Spring容器中，后续MyBatis-Plus等框架可以通过 `AutoConfigurationPackages.get()` 获取到扫描包路径。\n### 2.3 AutoConfigurationImportSelector\n这是自动装配的核心类，实现了 `DeferredImportSelector` 接口：\n```java\npublic class AutoConfigurationImportSelector implements DeferredImportSelector {\n    @Override\n    public String[] selectImports(AnnotationMetadata annotationMetadata) {\n        if (!isEnabled(annotationMetadata)) {\n            return NO_IMPORTS;\n        }\n    AutoConfigurationEntry autoConfigurationEntry = getAutoConfigurationEntry(annotationMetadata);\n    return StringUtils.toStringArray(autoConfigurationEntry.getConfigurations());\n}\nprotected AutoConfigurationEntry getAutoConfigurationEntry(AnnotationMetadata annotationMetadata) {\n    // 1. 获取@EnableAutoConfiguration注解的属性（exclude等）\n    AnnotationAttributes attributes = getAttributes(annotationMetadata);\n    // 2. 从META-INF/spring.factories获取所有自动配置类 ★\n    List<String> configurations = getCandidateConfigurations(annotationMetadata, attributes);\n    // 3. 去重\n    configurations = removeDuplicates(configurations);\n    // 4. 获取需要排除的配置类\n    Set<String> exclusions = getExclusions(annotationMetadata, attributes);\n    configurations.removeAll(exclusions);\n    // 5. 根据条件注解过滤 ★\n    configurations = getConfigurationClassFilter().filter(configurations);\n    // 6. 发布事件并返回\n    fireAutoConfigurationImportEvents(configurations, exclusions);\n    return new AutoConfigurationEntry(configurations, exclusions);\n}\n}\n```\n\n## 三、spring.factories 机制\n\n### 3.1 什么是spring.factories\n`spring.factories` 是Spring SPI机制的实现文件，位于每个jar包的 `META-INF/` 目录下。\n```properties\n# META-INF/spring.factories 示例（spring-boot-autoconfigure包中）\norg.springframework.boot.autoconfigure.EnableAutoConfiguration=\\\norg.springframework.boot.autoconfigure.aop.AopAutoConfiguration,\\\norg.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration,\\\norg.springframework.boot.autoconfigure.web.servlet.WebMvcAutoConfiguration,\\\norg.springframework.boot.autoconfigure.redis.RedisAutoConfiguration\n```\n\n### 3.2 加载过程\n```java\n// SpringFactoriesLoader.loadFactoryNames()\npublic static List<String> loadFactoryNames(Class<?> factoryType, ClassLoader classLoader) {\n    String factoryTypeName = factoryType.getName();\n    return loadSpringFactories(classLoader).getOrDefault(factoryTypeName, Collections.emptyList());\n}\nprivate static Map<String, List<String>> loadSpringFactories(ClassLoader classLoader) {\n    // 从所有jar的META-INF/spring.factories中加载\n    Enumeration<URL> urls = classLoader.getResources(\"META-INF/spring.factories\");\n    Map<String, List<String>> result = new LinkedHashMap<>();\n    while (urls.hasMoreElements()) {\n        URL url = urls.nextElement();\n        Properties properties = PropertiesLoaderUtils.loadProperties(new UrlResource(url));\n        for (Map.Entry<?, ?> entry : properties.entrySet()) {\n            String factoryTypeName = ((String) entry.getKey()).trim();\n            String[] factoryImplementationNames =\n            StringUtils.commaDelimitedListToStringArray((String) entry.getValue());\n            for (String name : factoryImplementationNames) {\n                result.computeIfAbsent(factoryTypeName, key -> new ArrayList<>())\n                .add(name.trim());\n            }\n    }\n}\nreturn result;\n}\n```\n\n### 3.3 SpringBoot 2.7+ 的新变化\n从SpringBoot 2.7开始，推荐使用新文件替代 `spring.factories`：\n```\n# META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports\norg.springframework.boot.autoconfigure.aop.AopAutoConfiguration\norg.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration\norg.springframework.boot.autoconfigure.web.servlet.WebMvcAutoConfiguration\n```\n> **注意**：`spring.factories` 中的 `EnableAutoConfiguration` 在SpringBoot 3.0中已被移除，必须使用新的imports文件。"
+      "title": "AutoConfiguration.imports 与条件装配",
+      "content": "## 二、@EnableAutoConfiguration 原理\n\n### 2.1 启动入口\n`@SpringBootApplication` 组合了 `@EnableAutoConfiguration`。后者通过 `@Import(AutoConfigurationImportSelector.class)` 把自动配置候选类交给 Spring 的配置类解析流程。\n\n```java\n@AutoConfigurationPackage\n@Import(AutoConfigurationImportSelector.class)\npublic @interface EnableAutoConfiguration {\n    Class<?>[] exclude() default {};\n    String[] excludeName() default {};\n}\n```\n\n### 2.2 候选类从哪里来\n当前主线是 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`，文件里一行一个自动配置类。Spring Boot 官方文档明确要求外部 jar 通过这个 imports 文件暴露自动配置类；Boot 2.7 之前常见的 `spring.factories` 中 `EnableAutoConfiguration` key 是旧方式，升级到 Boot 3.x 时必须迁移。\n\n```properties\n# META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports\ncom.example.starter.MyServiceAutoConfiguration\ncom.example.starter.MyServiceWebAutoConfiguration\n```\n\n### 2.3 ImportSelector 做了什么\n`AutoConfigurationImportSelector` 的关键不是“把所有配置无脑注册”，而是先读取候选类、去重、处理 exclude，再交给条件过滤器。真正进入容器的只是不被排除、且条件匹配的自动配置类。\n\n```java\nprotected AutoConfigurationEntry getAutoConfigurationEntry(AnnotationMetadata metadata) {\n    AnnotationAttributes attributes = getAttributes(metadata);\n    List<String> candidates = getCandidateConfigurations(metadata, attributes);\n    candidates = removeDuplicates(candidates);\n    Set<String> exclusions = getExclusions(metadata, attributes);\n    candidates.removeAll(exclusions);\n    candidates = getConfigurationClassFilter().filter(candidates);\n    fireAutoConfigurationImportEvents(candidates, exclusions);\n    return new AutoConfigurationEntry(candidates, exclusions);\n}\n```\n\n### 2.4 自动配置类应怎么写\n自动配置类通常用 `@AutoConfiguration`，再配合 `@ConditionalOnClass`、`@ConditionalOnMissingBean`、`@ConditionalOnProperty` 等条件。`@AutoConfigureBefore/After` 只影响 BeanDefinition 定义顺序，不等于 Bean 实例创建顺序；实例创建仍由依赖关系和 `@DependsOn` 等决定。"
     },
     {
       "type": "explain",
@@ -33,15 +33,25 @@
     {
       "type": "diagram",
       "format": "mermaid",
-      "title": "SpringBoot 自动装配加载链",
-      "content": "flowchart TD\nA[\"@SpringBootApplication\"] --> B[\"@EnableAutoConfiguration\"]\nB --> C[\"AutoConfigurationImportSelector\"]\nC --> D[\"SpringFactoriesLoader 读 .imports / spring.factories\"]\nD --> E[\"拿到候选自动配置类\"]\nE --> F[\"@Conditional 条件注解按需生效\"]\nF --> G[\"@ConditionalOnMissingBean 保证用户配置优先\"]",
-      "caption": "SpringBoot 自动装配：@EnableAutoConfiguration 经 AutoConfigurationImportSelector 用 SpringFactoriesLoader 读候选配置类，再由 @Conditional 系列按条件生效，@ConditionalOnMissingBean 保证用户配置优先。",
-      "fallback": "@SpringBootApplication 含 @EnableAutoConfiguration，经 AutoConfigurationImportSelector 用 SpringFactoriesLoader 读取 .imports 或 spring.factories 里的候选自动配置类，再由 @Conditional 条件注解按需生效，@ConditionalOnMissingBean 保证用户自定义 Bean 优先。"
+      "title": "自动装配原理：imports 候选到条件生效",
+      "content": "flowchart TD\nA[SpringBootApplication] --> B[EnableAutoConfiguration]\nB --> C[AutoConfigurationImportSelector]\nC --> D[读取 AutoConfiguration.imports]\nD --> E[去重和 exclude 排除]\nE --> F{条件注解匹配}\nF -->|OnClass 命中| G[类路径依赖存在]\nF -->|OnMissingBean 命中| H[用户未自定义 Bean]\nF -->|OnProperty 命中| I[配置开关允许]\nG --> J[注册自动配置 BeanDefinition]\nH --> J\nI --> J\nF -->|不匹配| K[进入 conditions 报告说明原因]\nJ --> L[用户 Bean 优先于默认 Bean]\nL --> M[Actuator conditions 或 debug 日志排查]",
+      "caption": "自动装配从 imports 候选类开始，经过 exclude 与条件注解过滤，最终只注册符合上下文的 Bean。",
+      "fallback": "自动装配不是扫描所有类，而是从 AutoConfiguration.imports 读取候选类，经 exclude、@ConditionalOnClass、@ConditionalOnMissingBean、@ConditionalOnProperty 等条件过滤后注册。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[SpringBootApplication] --> B[EnableAutoConfiguration]\nB --> C[AutoConfigurationImportSelector]\nC --> D[读取 AutoConfiguration.imports]\nD --> E[去重和 exclude 排除]\nE --> F{条件注解匹配}\nF -->|OnClass 命中| G[类路径依赖存在]\nF -->|OnMissingBean 命中| H[用户未自定义 Bean]\nF -->|OnProperty 命中| I[配置开关允许]\nG --> J[注册自动配置 BeanDefinition]\nH --> J\nI --> J\nF -->|不匹配| K[进入 conditions 报告说明原因]\nJ --> L[用户 Bean 优先于默认 Bean]\nL --> M[Actuator conditions 或 debug 日志排查]"
+        },
+        {
+          "kind": "text",
+          "content": "自动装配不是扫描所有类，而是从 AutoConfiguration.imports 读取候选类，经 exclude、@ConditionalOnClass、@ConditionalOnMissingBean、@ConditionalOnProperty 等条件过滤后注册。"
+        }
+      ]
     },
     {
       "type": "compareTable",
       "title": "对比与边界",
-      "content": "| 对比项 | SpringBoot自动装配 | Spring手动配置 |\n| --- | --- | --- |\n| 配置方式 | 引入starter + 条件注解自动生效 | 手动编写@Configuration + @Bean |\n| 条件控制 | @ConditionalOnClass/OnBean/OnProperty等 | 无条件控制，全部加载 |\n| 配置来源 | META-INF/spring.factories（2.x）/ META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports（3.x） | 开发者自己编写的配置类 |\n| 学习成本 | 引入依赖即可，几乎零配置 | 需要了解每个框架的配置细节 |\n| 灵活性 | 可通过exclude/属性覆盖自定义 | 完全可控但代码量大 |\n| 调试难度 | 需要理解条件注解匹配过程 | 配置一目了然 |"
+      "content": "| 对比项 | Spring Boot 自动装配 | Spring 手动配置 |\n| --- | --- | --- |\n| 配置方式 | 引入 starter，imports 声明候选类，条件注解决定是否生效 | 手动编写 `@Configuration` + `@Bean` |\n| 条件控制 | `@ConditionalOnClass`、`@ConditionalOnMissingBean`、`@ConditionalOnProperty` 等 | 默认无条件，除非开发者显式加条件 |\n| 配置来源 | Boot 2.7+/3.x 主线是 `AutoConfiguration.imports`；`spring.factories` 是旧版迁移点 | 开发者自己的配置类 |\n| 用户优先 | 通过 `@ConditionalOnMissingBean` 给用户 Bean 让位 | 完全由开发者控制 |\n| 调试方式 | `debug=true`、Actuator `conditions`、启动日志 | 直接看配置类和 Bean 定义 |\n| 常见风险 | 老 starter 没迁移 imports、条件不满足、顺序误解 | 配置重复、覆盖默认能力、维护成本高 |"
     },
     {
       "type": "code",
@@ -58,15 +68,15 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：SpringBoot 自动装配的本质是「根据 classpath 依赖、已有 Bean、配置属性等条件，自动配置应用需要的 Bean」，实现「约定优于配置」——你引入一个 Starter，相关 Bean 就自动配好了。\n\n原理主线：\n\n1. 入口是 @SpringBootApplication 里的 @EnableAutoConfiguration，它通过 @Import 引入 AutoConfigurationImportSelector。\n2. 这个 Selector 用 SpringFactoriesLoader 读取所有 jar 包 META-INF 下的自动配置类列表（SpringBoot 2.7 前是 spring.factories 的 EnableAutoConfiguration key，2.7+ 改用 META-INF/spring 下的 AutoConfiguration.imports）。\n3. 加载到的自动配置类不是无脑全开，而是靠 @Conditional 系列条件注解按需生效：@ConditionalOnClass（类路径有某类才配）、@ConditionalOnMissingBean（用户没配才配，保证用户优先）、@ConditionalOnProperty（配置开关）等。\n\n@ConditionalOnMissingBean 是关键——它保证「用户自定义的 Bean 优先于自动配置」，所以你自己定义了数据源，自动配置就不会覆盖。\n\n自定义 Starter：命名 xxx-spring-boot-starter，核心是 autoconfigure 模块里写 @Configuration 加 @Conditional 的自动配置类、ConfigurationProperties 配置类，并在 AutoConfiguration.imports 里注册。\n\n边界。① spring.factories 在 SpringBoot 3 已彻底移除自动配置 key，老 Starter 升级要迁移到 .imports 文件。② 自动配置太多会拖慢启动，可用 actuator 的 conditions 端点或 debug=true 看哪些配置生效或未生效。③ 顺序问题用 @AutoConfigureBefore/After/Order 控制。",
+      "content": "结论：Spring Boot 自动装配的本质是“把 starter 提供的候选配置类按上下文条件筛出来，再注册需要的 Bean”。入口是 `@EnableAutoConfiguration`，主线是 `AutoConfigurationImportSelector` 读取 `AutoConfiguration.imports`，再用条件注解过滤。\n\n原理主线：\n\n1. `@SpringBootApplication` 间接启用 `@EnableAutoConfiguration`，它通过 `@Import` 接入 `AutoConfigurationImportSelector`。\n2. Selector 读取 jar 包里的 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`，得到自动配置候选类；Boot 2.7 前常见的 `spring.factories` 是旧方式，Boot 3.x starter 必须迁移到 imports。\n3. 候选类会先去重、处理 `exclude/excludeName`，再被 `@ConditionalOnClass`、`@ConditionalOnMissingBean`、`@ConditionalOnProperty` 等条件过滤。满足条件的配置类才会注册 BeanDefinition。\n\n最关键的是 `@ConditionalOnMissingBean`：它让用户自定义 Bean 优先于默认自动配置，所以你自己定义了 DataSource、ObjectMapper 或线程池，自动配置通常会让位。\n\n自定义 starter 的核心步骤是：写 autoconfigure 模块、用 `@AutoConfiguration` 声明自动配置类、加条件注解和 `@ConfigurationProperties`，再把配置类写入 `AutoConfiguration.imports`。排查不生效时看三件事：候选类是否进 imports、条件是否匹配、是否被 exclude 或用户 Bean 覆盖；工具上用 `debug=true`、Actuator `conditions` 和启动日志。",
       "followUpQuestions": [
         {
           "question": "Spring Boot自动装配的原理是怎样的？",
-          "answer": "自动装配流程：1. @EnableAutoConfiguration导入AutoConfigurationImportSelector；2. 读取META-INF/spring.factories中的自动配置类；3. 通过@Conditional系列注解过滤；4. 注册符合条件的Bean。核心注解：@ConditionalOnClass、@ConditionalOnMissingBean、@ConditionalOnProperty。"
+          "answer": "流程：1. `@EnableAutoConfiguration` 导入 `AutoConfigurationImportSelector`；2. 读取 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` 中的自动配置候选类；3. 处理去重和 exclude；4. 用 `@ConditionalOnClass`、`@ConditionalOnMissingBean`、`@ConditionalOnProperty` 等过滤；5. 注册符合条件的 BeanDefinition。Boot 2.7 前的 `spring.factories` 是旧方式，Boot 3.x starter 要迁移到 imports。"
         },
         {
           "question": "如何自定义一个Starter？",
-          "answer": "自定义Starter步骤：1. 创建autoconfigure模块，编写配置类和@Conditional条件；2. 创建starter模块，依赖autoconfigure；3. 在META-INF/spring.factories中注册配置类；4. 提供配置元数据（spring-configuration-metadata.json）。命名规范：第三方xxx-spring-boot-starter，官方spring-boot-starter-xxx。"
+          "answer": "自定义 Starter：1. 创建 autoconfigure 模块，编写 `@AutoConfiguration` 自动配置类、`@ConfigurationProperties` 配置属性和条件注解；2. 在 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` 注册自动配置类；3. 创建 starter 模块，只负责引入 autoconfigure 和第三方依赖；4. 可补充 configuration metadata 让 IDE 有配置提示。第三方命名通常是 `xxx-spring-boot-starter`。"
         },
         {
           "question": "@Conditional系列注解有哪些？工作原理是怎样的？",
@@ -78,13 +88,13 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能否说清自动装配从@EnableAutoConfiguration到Bean注册的完整链路",
-        "能否列举4个以上常用条件注解及其作用",
-        "能否解释@ConditionalOnMissingBean为什么能让用户配置覆盖默认配置",
-        "能否说清spring.factories文件的作用和格式",
-        "能否说明SpringBoot 3.x自动装配的变化（imports文件替代factories）",
-        "能否解释自动装配的配置类排序机制",
-        "能否说明如何排查自动装配不生效的问题（debug日志、条件评估报告）"
+        "能否说清 @EnableAutoConfiguration 到 AutoConfigurationImportSelector 的链路",
+        "能否说明 Boot 2.7+/3.x 主线是 AutoConfiguration.imports，而不是旧 spring.factories 自动配置 key",
+        "能否解释 @ConditionalOnMissingBean 如何保证用户配置优先",
+        "能否列举常见条件注解及其匹配语义",
+        "能否说明自定义 starter 的 autoconfigure 模块、imports 注册和 metadata",
+        "能否用 debug=true 或 Actuator conditions 排查自动装配不生效",
+        "能否区分自动配置顺序和 Bean 实例创建顺序"
       ]
     }
   ],
@@ -114,12 +124,12 @@
   "rubric": {
     "mustHave": [
       "能说出自动装配的本质：按条件自动配 Bean、约定优于配置",
-      "能讲清 @EnableAutoConfiguration 到 ImportSelector 到 SpringFactoriesLoader 的加载链",
+      "能讲清 @EnableAutoConfiguration 到 ImportSelector 到 AutoConfiguration.imports 的加载链",
       "能解释 @Conditional 系列和 @ConditionalOnMissingBean 用户优先",
       "能说明自定义 Starter 的组成和注册"
     ],
     "goodToHave": [
-      "能说明 SpringBoot 2.7+/3 从 spring.factories 迁移到 .imports",
+      "能说明 Spring Boot 2.7+/3.x 从 spring.factories 自动配置 key 迁移到 imports",
       "能用 debug=true 或 actuator conditions 看配置生效情况",
       "能用 @AutoConfigureBefore/After 控制顺序"
     ],
@@ -135,7 +145,7 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-18",
   "status": "draft",
   "prerequisites": [
     "java.spring.topic-043-d09a2ea2"

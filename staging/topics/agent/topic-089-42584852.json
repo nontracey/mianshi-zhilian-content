@@ -4,7 +4,7 @@
   "category": "rag",
   "group": "rag",
   "title": "RAG 进阶",
-  "summary": "理解RAG 进阶的将具体问题抽象为更通用的\"后退\"问题，先获取背景知识，掌握其在面试中的高频考点和实际应用场景",
+  "summary": "在基础 RAG 之上，通过查询改写、混合召回、重排序、父子分块、GraphRAG 和生成校验解决复杂查询、证据噪声和多跳问题。",
   "tags": [
     "Agent",
     "LLM 基础",
@@ -18,7 +18,7 @@
     {
       "type": "explain",
       "title": "RAG 进阶：RAG 进阶架构、高级检索策略",
-      "content": "## 一、RAG 进阶架构\n### 1.1 Naive RAG的局限\n```\nNaive RAG流程：\n用户问题 → Embedding → 向量检索Top-K → 注入Prompt → LLM生成\n问题：\n1. 检索不精准——单一Embedding可能遗漏关键信息\n2. 上下文质量差——Top-K中可能混入不相关文档\n3. 无法处理复杂问题——多跳推理、跨文档综合困难\n4. 信息过时——知识库更新后需要重建索引\n```\n### 1.2 Advanced RAG架构\n```\nAdvanced RAG三层优化：\n第一层：索引优化\n├── 结构感知分块\n├── 元数据标注\n├── 父子文档关系\n└── 多粒度Embedding\n第二层：检索优化\n├── 混合检索（向量+BM25）\n├── 重排序（Cross-Encoder）\n├── 查询改写（Multi-Query）\n└── 路由（按问题类型选检索策略）\n第三层：生成优化\n├── 引用溯源\n├── 答案校验\n├── 自检与重试\n└── 流式输出\n```\n\n## 二、高级检索策略\n### 2.1 查询改写（Query Transformation）\n#### Multi-Query\n```python\nfrom langchain.retrievers.multi_query import MultiQueryRetriever\n# LLM将原始问题改写为多个不同角度的查询\nprompt = \"\"\"\n你是一位查询优化专家。请将用户问题改写为3个不同角度的搜索查询，\n以便从知识库中检索到最相关的信息。\n原始问题：{question}\n请输出3个改写后的查询，每行一个：\n\"\"\"\n# 效果：原始问题\"系统性能差怎么办\"\n# 改写1：\"系统性能优化的方法\"\n# 改写2：\"如何排查系统性能问题\"\n# 改写3：\"系统响应慢的原因分析\"\n```\n#### HyDE（Hypothetical Document Embeddings）\n```\nHyDE流程：\n1. 用户问题 → LLM生成假设性答案\n2. 假设性答案 → Embedding\n3. 用假设性答案的Embedding去检索\n4. 检索到的真实文档 → LLM生成最终答案\n为什么有效：\n- 问题和文档的Embedding空间存在鸿沟\n- 假设性答案的Embedding更接近真实文档\n- 特别适合需要推理的复杂问题\n```\n```python\ndef hyde_retrieval(question, llm, vectorstore, k=5):\n    # 步骤1：生成假设性答案\n    hyde_prompt = f\"可以说明以下问题（即使你不确定，也请给出一个假设性答案）：\\n{question}\"\n    hypothetical_answer = llm.invoke(hyde_prompt).content\n    # 步骤2：用假设性答案检索\n    hyde_embedding = embedding_model.embed(hypothetical_answer)\n    docs = vectorstore.similarity_search_by_vector(hyde_embedding, k=k)\n    # 步骤3：用真实文档生成最终答案\n    final_prompt = f\"基于以下上下文回答问题：\\n{question}\\n\\n上下文：\\n{format_docs(docs)}\"\n    return llm.invoke(final_prompt).content\n```\n#### Step-Back Prompting\n```\n原理：将具体问题抽象为更通用的\"后退\"问题，先获取背景知识\n示例：\n原始问题：\"2025年Q3我们的营收比Q2增长了多少？\"\n后退问题：\"公司季度营收数据的计算方法和数据来源是什么？\"\n流程：\n1. 生成后退问题\n2. 用后退问题检索背景知识\n3. 用原始问题+背景知识生成答案\n```\n### 2.2 重排序（Reranking）\n#### Cross-Encoder vs Bi-Encoder\n```\nBi-Encoder（向量检索用的）：\n- 查询和文档分别独立编码为向量\n- 用向量相似度计算相关性\n- 优点：可以预计算文档向量，检索极快\n- 缺点：无法建模查询-文档的细粒度交互\nCross-Encoder（重排序用的）：\n- 查询和文档拼接后一起编码\n- 直接输出相关性分数\n- 优点：精度高，能捕获细粒度语义\n- 缺点：每对查询-文档都要重新计算，慢\n最佳实践：\nBi-Encoder召回Top-50 → Cross-Encoder重排序 → 取Top-5\n```\n#### 主流Reranker模型\n```python\n# 使用BGE-Reranker\nfrom FlagEmbedding import FlagReranker\nreranker = FlagReranker('BAAI/bge-reranker-v2-m3', use_fp16=True)\n# 重排序\npairs = [(query, doc.page_content) for doc in candidate_docs]\nscores = reranker.compute_score(pairs)\n# 按分数排序\nranked = sorted(zip(candidate_docs, scores), key=lambda x: x[1], reverse=True)\ntop_docs = [doc for doc, score in ranked[:5]]\n```\n### 2.3 路由检索（Routing）\n```python\nfrom langchain_core.output_parsers import StrOutputParser\n# 路由器：根据问题类型选择检索策略\nrouter_prompt = \"\"\"\n根据用户问题，选择最合适的检索策略：\n- 如果是精确的事实查询（如\"XX的定义是什么\"），返回 \"exact\"\n- 如果是探索性问题（如\"如何实现XX\"），返回 \"explore\"\n- 如果是比较性问题（如\"XX和YY的区别\"），返回 \"compare\"\n- 如果是多跳推理问题，返回 \"multi_hop\"\n问题：{question}\n返回策略名称（只返回一个词）：\n\"\"\"\nrouter = router_prompt | llm | StrOutputParser()\ndef route_and_retrieve(question):\n    strategy = router.invoke({\"question\": question})\n    if strategy == \"exact\":\n        return exact_search(question)        # 精确匹配\n    elif strategy == \"explore\":\n        return multi_query_search(question)  # 多查询检索\n    elif strategy == \"compare\":\n        return compare_search(question)      # 分别检索再综合\n    elif strategy == \"multi_hop\":\n        return multi_hop_search(question)    # 多跳检索\n    else:\n        return default_search(question)\n```"
+      "content": "## 一、RAG 进阶架构\n### 1.1 Naive RAG的局限\n```\nNaive RAG流程：\n用户问题 → Embedding → 向量检索Top-K → 注入Prompt → LLM生成\n问题：\n1. 检索不精准——单一Embedding可能遗漏关键信息\n2. 上下文质量差——Top-K中可能混入不相关文档\n3. 无法处理复杂问题——多跳推理、跨文档综合困难\n4. 信息过时——知识库更新后需要重建索引\n```\n### 1.2 Advanced RAG架构\n```\nAdvanced RAG三层优化：\n第一层：索引优化\n├── 结构感知分块\n├── 元数据标注\n├── 父子文档关系\n└── 多粒度Embedding\n第二层：检索优化\n├── 混合检索（向量+BM25）\n├── 重排序（Cross-Encoder）\n├── 查询改写（Multi-Query）\n└── 路由（按问题类型选检索策略）\n第三层：生成优化\n├── 引用溯源\n├── 答案校验\n├── 自检与重试\n└── 流式输出\n```\n\n## 二、高级检索策略\n### 2.1 查询改写（Query Transformation）\n#### Multi-Query\n```python\nfrom langchain.retrievers.multi_query import MultiQueryRetriever\n# LLM将原始问题改写为多个不同角度的查询\nprompt = \"\"\"\n你是一位查询优化专家。请将用户问题改写为3个不同角度的搜索查询，\n以便从知识库中检索到最相关的信息。\n原始问题：{question}\n请输出3个改写后的查询，每行一个：\n\"\"\"\n# 效果：原始问题\"系统性能差怎么办\"\n# 改写1：\"系统性能优化的方法\"\n# 改写2：\"如何排查系统性能问题\"\n# 改写3：\"系统响应慢的原因分析\"\n```\n#### HyDE（Hypothetical Document Embeddings）\n```\nHyDE流程：\n1. 用户问题 → LLM生成假设性答案\n2. 假设性答案 → Embedding\n3. 用假设性答案的Embedding去检索\n4. 检索到的真实文档 → LLM生成最终答案\n为什么有效：\n- 问题和文档的Embedding空间存在鸿沟\n- 假设性答案的Embedding更接近真实文档\n- 特别适合需要推理的复杂问题\n```\n```python\ndef hyde_retrieval(question, llm, vectorstore, k=5):\n    # 步骤1：生成假设性答案\n    hyde_prompt = f\"可以说明以下问题（即使你不确定，也请给出一个假设性答案）：\\n{question}\"\n    hypothetical_answer = llm.invoke(hyde_prompt).content\n    # 步骤2：用假设性答案检索\n    hyde_embedding = embedding_model.embed(hypothetical_answer)\n    docs = vectorstore.similarity_search_by_vector(hyde_embedding, k=k)\n    # 步骤3：用真实文档生成最终答案\n    final_prompt = f\"基于以下上下文回答问题：\\n{question}\\n\\n上下文：\\n{format_docs(docs)}\"\n    return llm.invoke(final_prompt).content\n```\n#### Step-Back Prompting\n```\n原理：将具体问题抽象为更通用的\"后退\"问题，先获取背景知识\n示例：\n原始问题：\"2025年Q3我们的营收比Q2增长了多少？\"\n后退问题：\"公司季度营收数据的计算方法和数据来源是什么？\"\n流程：\n1. 生成后退问题\n2. 用后退问题检索背景知识\n3. 用原始问题+背景知识生成答案\n```\n### 2.2 重排序（Reranking）\n#### Cross-Encoder vs Bi-Encoder\n```\nBi-Encoder（向量检索用的）：\n- 查询和文档分别独立编码为向量\n- 用向量相似度计算相关性\n- 优点：可以预计算文档向量，检索极快\n- 缺点：无法建模查询-文档的细粒度交互\nCross-Encoder（重排序用的）：\n- 查询和文档拼接后一起编码\n- 直接输出相关性分数\n- 优点：精度高，能捕获细粒度语义\n- 缺点：每对查询-文档都要重新计算，慢\n最佳实践：\nBi-Encoder 召回候选 → Cross-Encoder/LLM rerank → 按上下文预算取证据\n```\n#### 主流Reranker模型\n```python\n# 使用BGE-Reranker\nfrom FlagEmbedding import FlagReranker\nreranker = FlagReranker('BAAI/bge-reranker-v2-m3', use_fp16=True)\n# 重排序\npairs = [(query, doc.page_content) for doc in candidate_docs]\nscores = reranker.compute_score(pairs)\n# 按分数排序\nranked = sorted(zip(candidate_docs, scores), key=lambda x: x[1], reverse=True)\ntop_docs = [doc for doc, score in ranked[:5]]\n```\n### 2.3 路由检索（Routing）\n```python\nfrom langchain_core.output_parsers import StrOutputParser\n# 路由器：根据问题类型选择检索策略\nrouter_prompt = \"\"\"\n根据用户问题，选择最合适的检索策略：\n- 如果是精确的事实查询（如\"XX的定义是什么\"），返回 \"exact\"\n- 如果是探索性问题（如\"如何实现XX\"），返回 \"explore\"\n- 如果是比较性问题（如\"XX和YY的区别\"），返回 \"compare\"\n- 如果是多跳推理问题，返回 \"multi_hop\"\n问题：{question}\n返回策略名称（只返回一个词）：\n\"\"\"\nrouter = router_prompt | llm | StrOutputParser()\ndef route_and_retrieve(question):\n    strategy = router.invoke({\"question\": question})\n    if strategy == \"exact\":\n        return exact_search(question)        # 精确匹配\n    elif strategy == \"explore\":\n        return multi_query_search(question)  # 多查询检索\n    elif strategy == \"compare\":\n        return compare_search(question)      # 分别检索再综合\n    elif strategy == \"multi_hop\":\n        return multi_hop_search(question)    # 多跳检索\n    else:\n        return default_search(question)\n```"
     },
     {
       "type": "explain",
@@ -26,31 +26,27 @@
       "content": "## 三、高级分块策略\n### 3.1 父子分块（Parent-Child Chunking）\n```\n原理：\n- 将文档切分为小块（Child，用于检索）\n- 每个小块关联其所属的大块（Parent，用于生成）\n- 检索时匹配Child，返回时注入Parent的完整上下文\n优势：\n- 检索精度高（小块更精准匹配查询）\n- 生成质量好（大块提供完整上下文）\n```\n```python\n# 实现父子分块\nfrom langchain.text_splitter import RecursiveCharacterTextSplitter\n# 父块（大块，用于生成）\nparent_splitter = RecursiveCharacterTextSplitter(\nchunk_size=2000,\nchunk_overlap=200\n)\n# 子块（小块，用于检索）\nchild_splitter = RecursiveCharacterTextSplitter(\nchunk_size=500,\nchunk_overlap=50\n)\n# 创建父子关系\nparent_docs = parent_splitter.split_documents(docs)\nchild_docs = []\nfor i, parent in enumerate(parent_docs):\n    children = child_splitter.split_documents([parent])\n    for child in children:\n        child.metadata[\"parent_id\"] = parent.metadata[\"doc_id\"]\n        child.metadata[\"parent_content\"] = parent.page_content\n        child_docs.extend(children)\n        # 检索时\n        def retrieve_with_parent(query, vectorstore, k=5):\n            # 检索子块\n            child_results = vectorstore.similarity_search(query, k=k)\n            # 返回父块内容\n            parent_contents = []\n            seen_parents = set()\n            for child in child_results:\n                parent_id = child.metadata.get(\"parent_id\")\n                if parent_id and parent_id not in seen_parents:\n                    parent_contents.append(child.metadata[\"parent_content\"])\n                    seen_parents.add(parent_id)\n                    return parent_contents\n```\n### 3.2 语义分块（Semantic Chunking）\n```\n原理：按语义边界而非固定长度切分\n方法：\n1. 计算相邻句子之间的Embedding相似度\n2. 相似度突降的位置就是切分点\n3. 将连续的高相似度句子合并为一个块\n优势：保持语义连贯性，避免在句子中间截断\n```\n```python\nfrom langchain_experimental.text_splitter import SemanticChunker\nsplitter = SemanticChunker(\nembeddings=embedding_model,\nbreakpoint_threshold_type=\"percentile\",  # 按百分位确定阈值\nbreakpoint_threshold_amount=90           # 相似度低于90%时切分\n)\nchunks = splitter.create_documents(text)\n```\n\n## 四、GraphRAG\n### 4.1 什么是GraphRAG\n```\n传统RAG的局限：\n- 文档块之间是独立的，无法捕获实体关系\n- 无法回答\"全局性\"问题（如\"文档中提到了哪些主要人物及其关系\"）\nGraphRAG的解决：\n- 从文档中提取实体和关系，构建知识图谱\n- 将图谱信息融入检索过程\n- 支持全局性查询和多跳推理\n```\n### 4.2 GraphRAG流程\n```\n1. 文档处理\n↓\n2. 实体提取（人名、组织、地点、概念等）\n↓\n3. 关系提取（A是B的CEO，A公司在B城市等）\n↓\n4. 构建知识图谱（实体为节点，关系为边）\n↓\n5. 社区发现（将图谱划分为多个社区）\n↓\n6. 为每个社区生成摘要\n↓\n7. 检索时：\n- 全局查询 → 使用社区摘要\n- 具体查询 → 使用实体/关系 + 原文档\n```\n### 4.3 Microsoft GraphRAG\n```python\n# 使用Microsoft GraphRAG\nfrom graphrag import GraphRAG\n# 索引\ngraphrag.index(\ninput_dir=\"./documents\",\noutput_dir=\"./graphrag_output\",\nentity_types=[\"person\", \"organization\", \"location\", \"concept\"]\n)\n# 查询\n# 全局查询（全局性问题）\nresult = graphrag.query(\n\"文档中讨论了哪些主要主题？\",\nmethod=\"global\"\n)\n# 局部查询（具体事实）\nresult = graphrag.query(\n\"张三在项目中担任什么角色？\",\nmethod=\"local\"\n)\n```"
     },
     {
-      "type": "explain",
-      "title": "RAG 进阶：面试高频问题、参考资料",
-      "content": "## 五、面试高频问题\n**Q1: RAG系统如何评估效果？**\n> 分层评估：\n1. 检索层——Recall@K、MRR、NDCG，评估检索质量\n2. 重排序层——Precision@K，评估排序质量\n3. 生成层——Faithfulness（是否忠实于上下文）、Answer Relevancy（答案是否切题）、Context Precision（上下文是否精准），用RAGAS框架自动评估。关键：建立Golden Dataset（500+标注样本），每次迭代后自动跑评估Pipeline。\n**Q2: 重排序有必要吗？性能开销大不大？**\n> 有必要。实践中发现，向量检索+重排序比纯向量检索的NDCG提升15-25%。性能方面：Bi-Encoder检索Top-50约10ms，Cross-Encoder重排序50对约50ms，总延迟60ms，对用户体验影响不大。如果延迟敏感，可以用更轻量的Reranker模型或减少候选集大小。\n**Q3: GraphRAG和传统RAG怎么选？**\n> 判断标准：\n1. 如果主要是事实查询（\"XX是什么\"），传统RAG足够\n2. 如果需要全局分析（\"文档中有哪些主题\"）、关系查询（\"A和B的关系\"）、多跳推理，GraphRAG效果更好\n3. GraphRAG构建成本高（需要实体/关系提取），适合文档量稳定、查询复杂的场景\n4. 实际项目中，可以先用传统RAG验证需求，再根据查询类型决定是否引入GraphRAG。\n**Q4: 如何处理RAG中的多语言场景？**\n>\n1. Embedding模型选多语言的（BGE-M3支持100+语言）\n2. 分块时注意不同语言的标点符号（中文句号vs英文句号）\n3. 检索时查询和文档用同一个Embedding模型\n4. 如果知识库是混合语言，可以分别建索引，检索时根据查询语言路由到对应索引。\n## 七、参考资料\n- [Advanced RAG论文](https://arxiv.org/abs/2312.10997)\n- [HyDE论文](https://arxiv.org/abs/2212.10496)\n- [Step-Back Prompting论文](https://arxiv.org/abs/2310.06117)\n- [Microsoft GraphRAG](https://microsoft.github.io/graphrag/)\n- [RAGAS评估框架](https://docs.ragas.io/)\n- [BGE-Reranker](https://huggingface.co/BAAI/bge-reranker-v2-m3)\n- [LangChain MultiQueryRetriever](https://python.langchain.com/docs/modules/data_connection/retrievers/multi-query-retriever)"
-    },
-    {
       "type": "diagram",
-      "title": "RAG 进阶 学习主线图",
+      "title": "Advanced RAG 决策链：查询改写、多路召回、重排、图谱与校验",
+      "content": "flowchart LR\nA[\"复杂用户问题\"] --> B{\"问题类型\"}\nB -->|术语/编号/事实| C[\"混合召回\n向量 + BM25 + metadata\"]\nB -->|表述模糊| D[\"Multi-Query / HyDE\n扩展查询视角\"]\nB -->|跨文档/关系| E[\"GraphRAG / 多跳检索\n实体关系与社区摘要\"]\nC --> F[\"候选证据池\"]\nD --> F\nE --> F\nF --> G[\"Reranker 精排\nquery-doc 交互打分\"]\nG --> H[\"上下文构建\n父子块/去重/引用/压缩\"]\nH --> I[\"生成 + 引用约束\"]\nI --> J{\"评估归因\"}\nJ -->|漏证据| K[\"调分块/召回/查询改写\"]\nJ -->|噪声多| L[\"调 rerank/压缩/TopK\"]\nJ -->|答案不忠实| M[\"调 prompt/校验/拒答\"]",
       "format": "mermaid",
-      "content": "flowchart LR\nA[RAG 进阶] --> B[Naive RAG 的局限以及 Advanc]\nB --> C[查询改写、混合检索、重排和上下文压缩的作用]\nC --> D[可观测的 RAG 评估闭环]\nD --> E[能识别幻觉、过期知识和引用不一致风险]\nE --> F[能说出 RAG 进阶 的评估指标和优化方法]",
-      "caption": "从 Naive RAG 的局限以及 Advanc 到 能说出 RAG 进阶 的评估指标和优化方法，这张图帮助区分 RAG 进阶 的核心机制、边界条件和常见误区。",
-      "fallback": "RAG 进阶 -> Naive RAG 的局限以及 Advanc -> 查询改写、混合检索、重排和上下文压缩的作用 -> 可观测的 RAG 评估闭环 -> 能识别幻觉、过期知识和引用不一致风险 -> 能说出 RAG 进阶 的评估指标和优化方法",
-      "items": [
-        "RAG 进阶核心：从\"能用\"到\"好用\"的三层优化",
-        "索引优化：结构感知分块、元数据标注、多粒度Embedding",
-        "检索优化三板斧：混合检索（向量+BM25）、重排序（Cross-Encoder）、查询改写（Multi-Query/HyDE）",
-        "生成优化：引用溯源、答案校验、自检重试、流式输出",
-        "混合检索原理：向量擅长语义+BM25擅长关键词，结合后Recall@K提升10-20%",
-        "重排序流程：向量检索Top-50 → Cross-Encoder精排 → 取Top-5",
-        "面试表达：先讲Naive RAG的局限，再讲三层优化，最后讲实际效果数据"
+      "fallback": "图展示 Advanced RAG 如何根据问题类型选择查询改写、混合召回或 GraphRAG，再经过重排、上下文构建和评估归因。",
+      "caption": "高级 RAG 不是堆功能，而是按失败类型选择最小有效增强。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart LR\nA[\"复杂用户问题\"] --> B{\"问题类型\"}\nB -->|术语/编号/事实| C[\"混合召回\n向量 + BM25 + metadata\"]\nB -->|表述模糊| D[\"Multi-Query / HyDE\n扩展查询视角\"]\nB -->|跨文档/关系| E[\"GraphRAG / 多跳检索\n实体关系与社区摘要\"]\nC --> F[\"候选证据池\"]\nD --> F\nE --> F\nF --> G[\"Reranker 精排\nquery-doc 交互打分\"]\nG --> H[\"上下文构建\n父子块/去重/引用/压缩\"]\nH --> I[\"生成 + 引用约束\"]\nI --> J{\"评估归因\"}\nJ -->|漏证据| K[\"调分块/召回/查询改写\"]\nJ -->|噪声多| L[\"调 rerank/压缩/TopK\"]\nJ -->|答案不忠实| M[\"调 prompt/校验/拒答\"]"
+        },
+        {
+          "kind": "text",
+          "content": "图展示 Advanced RAG 如何根据问题类型选择查询改写、混合召回或 GraphRAG，再经过重排、上下文构建和评估归因。"
+        }
       ]
     },
     {
       "type": "compareTable",
       "title": "对比与边界",
-      "content": "| 对比项 | Naive RAG | Advanced RAG | GraphRAG |\n| --- | --- | --- | --- |\n| 检索方式 | 单一向量检索Top-K | 混合检索+重排序+查询改写 | 知识图谱+向量检索 |\n| 检索精度 | 中等（60-70%） | 高（85-95%） | 很高（复杂推理场景） |\n| 多跳推理 | 不支持 | 有限支持 | 原生支持 |\n| 实现复杂度 | 低 | 中 | 高 |\n| 延迟 | 低（<200ms） | 中（200-500ms） | 高（500ms+） |\n| 适用场景 | 简单问答、Demo | 企业知识库、客服 | 复杂推理、跨文档综合 |\n| 面试关键词 | 向量检索、Top-K | 混合检索、Cross-Encoder | 知识图谱、社区摘要 |\n| 核心优化点 | 无 | 检索质量三板斧 | 图结构+语义聚合"
+      "content": "| 对比项 | Naive RAG | Advanced RAG | GraphRAG |\n| --- | --- | --- | --- |\n| 核心思路 | 单路召回后直接生成 | 查询改写、混合召回、重排、上下文治理 | 实体关系图、社区摘要、多跳检索 |\n| 解决问题 | 简单事实问答 | 召回噪声、排序靠后、复杂表达 | 全局主题、跨文档关系、多跳推理 |\n| 主要代价 | 能力有限但链路简单 | 延迟、调参和评估复杂度上升 | 建图、实体关系质量和更新成本高 |\n| 适用阶段 | Demo 或低风险知识库 | 企业 RAG 的主力优化方向 | 关系密集且查询复杂的稳定语料 |\n| 验证方式 | Recall@K、引用命中、忠实度 | 分层归因：召回、重排、上下文、生成 | 图谱质量、社区摘要质量、多跳任务成功率 |"
     },
     {
       "type": "code",
@@ -60,14 +56,14 @@
       "highlights": [
         {
           "line": 1,
-          "note": "这行承载示例的关键数据流，说明时要指出它改变了哪一段状态。"
+          "note": "「Naive RAG流程：」 把「RAG 进阶」的讨论入口先固定住；后面需要沿着输入、处理、输出和风险点展开，而不是只背概念。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**Q1: Naive RAG有哪些局限？如何优化？**\n\nNaive RAG的四大问题：\n\n1. 检索不精准，单一Embedding可能遗漏关键信息\n2. 上下文质量差，Top-K中混入不相关文档\n3. 无法处理多跳推理和跨文档综合\n4. 知识库更新后需要重建索引。\n优化方向分三层：索引优化（结构感知分块、元数据标注、多粒度Embedding）；检索优化（混合检索向量+BM25、Cross-Encoder重排序、Multi-Query查询改写）；生成优化（引用溯源、答案校验、自检重试）。\n**Q2: 混合检索和重排序是怎么提升检索质量的？**\n\n混合检索结合向量检索和BM25关键词检索的优势。向量检索擅长语义理解但可能漏掉关键词精确匹配，BM25擅长关键词匹配但不理解语义。两者结合后Recall@K通常能提升10-20%。\n重排序（Reranking）是检索后的精排步骤。用Cross-Encoder模型对查询和每个候选文档做联合编码，比Bi-Encoder更能捕捉细粒度相关性。典型做法是先向量检索Top-50，再Cross-Encoder重排序取Top-5。延迟增加约100ms，但准确率提升15-25%。\n**Q3: 查询改写有哪些方法？**\n\n三种主要方法：\n\n1. Multi-Query，将原始问题改写为多个不同角度的查询，扩大召回范围\n2. HyDE，让LLM先生成假设性答案，用答案的Embedding去检索（答案比问题更接近文档）\n3. Step-Back Prompting，将具体问题抽象为更通用的问题，先获取背景知识再回答。实践中Multi-Query最常用，HyDE对复杂推理问题效果最好。",
+      "content": "**Q1: Naive RAG有哪些局限？如何优化？**\n\nNaive RAG的四大问题：\n\n1. 检索不精准，单一Embedding可能遗漏关键信息\n2. 上下文质量差，Top-K中混入不相关文档\n3. 无法处理多跳推理和跨文档综合\n4. 知识库更新后需要重建索引。\n优化方向分三层：索引优化（结构感知分块、元数据标注、多粒度Embedding）；检索优化（混合检索向量+BM25、Cross-Encoder重排序、Multi-Query查询改写）；生成优化（引用溯源、答案校验、自检重试）。\n**Q2: 混合检索和重排序是怎么提升检索质量的？**\n\n混合检索结合向量检索和BM25关键词检索的优势。向量检索擅长语义理解但可能漏掉关键词精确匹配，BM25擅长关键词匹配但不理解语义。两者结合是否收益取决于语料和查询类型，要用离线评估集比较 Recall@K、MRR、nDCG、延迟和噪声。\n重排序（Reranking）是检索后的精排步骤。用Cross-Encoder模型对查询和每个候选文档做联合编码，比Bi-Encoder更能捕捉细粒度相关性。典型做法是先向量检索Top-50，再Cross-Encoder重排序取Top-5。延迟和质量收益取决于候选数量、reranker 模型和硬件，不能背固定数字；上线前要压测并做 A/B。\n**Q3: 查询改写有哪些方法？**\n\n三种主要方法：\n\n1. Multi-Query，将原始问题改写为多个不同角度的查询，扩大召回范围\n2. HyDE，让LLM先生成假设性答案，用答案的Embedding去检索（答案比问题更接近文档）\n3. Step-Back Prompting，将具体问题抽象为更通用的问题，先获取背景知识再回答。实践中Multi-Query最常用，HyDE对复杂推理问题效果最好。",
       "followUpQuestions": [
         {
           "question": "Advanced RAG 相比 Naive RAG 主要解决哪些问题？",
@@ -144,7 +140,7 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-18",
   "prerequisites": [
     "agent.rag.topic-106-bf5350b9"
   ],

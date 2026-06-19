@@ -4,77 +4,80 @@
   "category": "spring",
   "group": "spring",
   "title": "Bean 生命周期",
-  "summary": "梳理 Spring Bean 实例化→属性填充→初始化→销毁的完整生命周期与扩展点，重点讲清 AOP 代理的织入时机和两类 PostProcessor 的区别。",
+  "summary": "讲清 BeanDefinition 阶段、createBean 主链路、初始化回调顺序、AOP 代理时机、单例发布和销毁边界。",
   "tags": [
     "Java",
     "Spring生态",
     "Bean 生命周期"
   ],
-  "difficulty": 4,
-  "estimatedMinutes": 30,
+  "difficulty": 3,
+  "estimatedMinutes": 24,
   "order": 20,
-  "recommendWeight": 94,
+  "recommendWeight": 86,
   "learningCards": [
     {
       "type": "explain",
-      "title": "Bean 完整生命周期",
-      "content": "# Bean 生命周期\n\n## 一、Bean完整生命周期\nSpring Bean的生命周期可以分为以下阶段：\n```\nBeanDefinition解析\n│\n▼\n1. 实例化（Instantiation）\n│  ← InstantiationAwareBeanPostProcessor.postProcessBeforeInstantiation()\n│  ← 构造器注入 / 反射创建对象\n│  ← InstantiationAwareBeanPostProcessor.postProcessAfterInstantiation()\n▼\n2. 属性填充（Populate）\n│  ← InstantiationAwareBeanPostProcessor.postProcessProperties()\n│  ← @Autowired / @Resource / @Value 注入\n▼\n3. Aware接口回调\n│  ← BeanNameAware.setBeanName()\n│  ← BeanClassLoaderAware.setBeanClassLoader()\n│  ← BeanFactoryAware.setBeanFactory()\n▼\n4. BeanPostProcessor前置处理\n│  ← BeanPostProcessor.postProcessBeforeInitialization()\n│  ← CommonAnnotationBeanPostProcessor → @PostConstruct\n▼\n5. 初始化（Initialization）\n│  ← InitializingBean.afterPropertiesSet()\n│  ← 自定义init-method\n▼\n6. BeanPostProcessor后置处理\n│  ← BeanPostProcessor.postProcessAfterInitialization()\n│  ← AOP代理在此创建\n▼\n7. 使用Bean\n│\n▼\n8. 销毁（Destruction）\n← @PreDestroy\n← DisposableBean.destroy()\n← 自定义destroy-method\n```"
+      "title": "生命周期不是一条口令，而是三层对象视角",
+      "content": "讲 Bean 生命周期时，先把三个视角分开：\n\n1. **BeanDefinition 阶段**：容器里只有“怎么创建 Bean”的元数据，还没有业务对象实例。`BeanFactoryPostProcessor` 在这个阶段改 BeanDefinition，例如占位符、条件装配、配置类解析结果。\n2. **目标对象生命周期**：容器按 BeanDefinition 实例化目标对象、填充依赖、执行 Aware 回调、调用初始化回调。\n3. **发布对象视角**：`BeanPostProcessor` 可以在初始化后返回另一个对象，例如 AOP 代理。调用方从容器拿到的对象可能是代理，而 init 方法通常运行在目标对象上。\n\n**createBean 主链路**\n- 实例化：通过构造器、静态工厂方法、实例工厂方法或 Supplier 创建对象。\n- 属性填充：解析依赖并注入构造参数、setter、字段、配置属性。\n- Aware 回调：如 `BeanNameAware`、`BeanFactoryAware`、`ApplicationContextAware`。官方文档明确 `BeanNameAware` 在普通属性填充之后、初始化回调之前触发。\n- `BeanPostProcessor#postProcessBeforeInitialization`：初始化前扩展点，常见的注解回调处理也经由 BPP 体系完成。\n- 初始化回调：顺序是 `@PostConstruct`、`InitializingBean.afterPropertiesSet()`、自定义 `initMethod`。\n- `BeanPostProcessor#postProcessAfterInitialization`：初始化后扩展点，AOP、事务、异步、缓存等代理包装常在这里发生。\n- 单例发布：singleton 进入单例缓存，Spring 容器通过 singleton lock 和安全发布保证其他线程可见。\n\n**AOP 时机要说准**\nSpring 官方文档强调：配置的初始化回调在目标 Bean 已获得所有依赖后执行，AOP 拦截器此时还没有应用到目标 Bean 的 init 方法。目标对象先完成初始化，随后才可能被 BPP 包装成代理返回给容器调用方。这个边界能解释为什么 `@Transactional` 放在 `@PostConstruct` 触发的方法上经常不符合预期。"
     },
     {
       "type": "explain",
-      "title": "实例化与初始化阶段",
-      "content": "## 二、实例化阶段\n\n### 2.1 实例化方式\n```java\n// 1. 反射（最常用）- 通过构造器创建\n// Spring默认使用无参构造器\n@Component\npublic class UserService {\n    public UserService() {\n        // 默认无参构造器\n    }\n}\n// 2. 有参构造器注入\n@Component\npublic class OrderService {\n    private final UserService userService;\n    @Autowired  // Spring 4.3+ 可省略\n    public OrderService(UserService userService) {\n        this.userService = userService;\n    }\n}\n// 3. 工厂方法\n@Configuration\npublic class AppConfig {\n    @Bean\n    public DataSource dataSource() {\n        return DataSourceBuilder.create().build();\n    }\n}\n```\n\n### 2.2 InstantiationAwareBeanPostProcessor\n这是实例化阶段的关键扩展点：\n```java\npublic interface InstantiationAwareBeanPostProcessor extends BeanPostProcessor {\n    // 实例化前（可以返回代理对象，跳过正常实例化）\n    default Object postProcessBeforeInstantiation(Class<?> beanClass, String beanName) {\n        return null;\n    }\n// 实例化后（返回false则跳过属性填充）\ndefault boolean postProcessAfterInstantiation(Object bean, String beanName) {\n    return true;\n}\n// 属性填充前（可以修改属性值）\ndefault PropertyValues postProcessProperties(PropertyValues pvs, Object bean, String beanName) {\n    return null;\n}\n}\n```\n\n## 三、属性填充阶段\n属性填充就是依赖注入发生的地方：\n```java\n// 属性填充的源码流程\nprotected void populateBean(String beanName, RootBeanDefinition mbd, BeanWrapper bw) {\n    // 1. InstantiationAwareBeanPostProcessor.postProcessProperties()\n    //    @Autowired、@Resource、@Value 在这里处理\n    PropertyValues pvs = (mbd.hasPropertyValues() ? mbd.getPropertyValues() : null);\n    for (InstantiationAwareBeanPostProcessor bp : getBeanPostProcessors(InstantiationAwareBeanPostProcessor.class)) {\n        PropertyValues pvsToUse = bp.postProcessProperties(pvs, bw.getWrappedInstance(), beanName);\n        if (pvsToUse == null) {\n            return;\n        }\n    pvs = pvsToUse;\n}\n// 2. 按名称注入（byName）\nif (mbd.getResolvedAutowireMode() == AUTOWIRE_BY_NAME) {\n    autowireByName(beanName, mbd, bw, newPvs);\n}\n// 3. 按类型注入（byType）\nif (mbd.getResolvedAutowireMode() == AUTOWIRE_BY_TYPE) {\n    autowireByType(beanName, mbd, bw, newPvs);\n}\n// 4. 应用属性值\napplyPropertyValues(beanName, mbd, bw, pvs);\n}\n```\n\n## 四、初始化阶段\n\n### 4.1 Aware接口回调\nAware接口让Bean能够感知Spring容器的内部组件：\n```java\n@Component\npublic class AwareDemo implements BeanNameAware, BeanFactoryAware, ApplicationContextAware {\n    private String beanName;\n    private BeanFactory beanFactory;\n    private ApplicationContext applicationContext;\n    @Override\n    public void setBeanName(String name) {\n        this.beanName = name;  // 获取Bean名称\n        System.out.println(\"BeanNameAware: \" + name);\n    }\n@Override\npublic void setBeanFactory(BeanFactory beanFactory) {\n    this.beanFactory = beanFactory;  // 获取BeanFactory\n    System.out.println(\"BeanFactoryAware\");\n}\n@Override\npublic void setApplicationContext(ApplicationContext ctx) {\n    this.applicationContext = ctx;  // 获取ApplicationContext\n    System.out.println(\"ApplicationContextAware\");\n}\n}\n```\n**常用Aware接口**：\n\n### 4.2 @PostConstruct\n```java\n@Component\npublic class MyService {\n    @PostConstruct  // JSR-250标准注解，在依赖注入完成后执行\n    public void init() {\n        System.out.println(\"@PostConstruct: 初始化操作\");\n        // 常用于：初始化资源、建立连接、校验依赖等\n    }\n}\n```\n\n### 4.3 InitializingBean\n```java\n@Component\npublic class MyService implements InitializingBean {\n    @Override\n    public void afterPropertiesSet() throws Exception {\n        System.out.println(\"InitializingBean.afterPropertiesSet(): 初始化操作\");\n    }\n}\n```\n\n### 4.4 自定义init-method\n```java\n// 方式1：@Bean指定\n@Configuration\npublic class AppConfig {\n    @Bean(initMethod = \"init\")\n    public MyService myService() {\n        return new MyService();\n    }\n}\n// 方式2：XML配置\n// <bean id=\"myService\" class=\"com.example.MyService\" init-method=\"init\"/>\n```\n\n### 4.5 初始化顺序\n```\n@PostConstruct → InitializingBean.afterPropertiesSet() → 自定义init-method\n```\n> 推荐使用 `@PostConstruct`，它是JSR-250标准，不依赖Spring接口。"
-    },
-    {
-      "type": "explain",
-      "title": "Bean 生命周期 的边界与易错点",
-      "content": "## 五、销毁阶段\n\n### 5.1 @PreDestroy\n```java\n@Component\npublic class MyService {\n    @PreDestroy  // JSR-250标准注解\n    public void cleanup() {\n        System.out.println(\"@PreDestroy: 清理资源\");\n        // 常用于：关闭连接、释放资源等\n    }\n}\n```\n\n### 5.2 DisposableBean\n```java\n@Component\npublic class MyService implements DisposableBean {\n    @Override\n    public void destroy() throws Exception {\n        System.out.println(\"DisposableBean.destroy(): 清理资源\");\n    }\n}\n```\n\n### 5.3 自定义destroy-method\n```java\n@Configuration\npublic class AppConfig {\n    @Bean(destroyMethod = \"cleanup\")\n    public MyService myService() {\n        return new MyService();\n    }\n}\n```\n\n### 5.4 销毁顺序\n```\n@PreDestroy → DisposableBean.destroy() → 自定义destroy-method\n```\n> **注意**：`prototype` 作用域的Bean不会调用销毁方法，Spring不管理其生命周期。\n## 六、BeanPostProcessor 扩展\n\n### 6.1 BeanPostProcessor接口\n```java\npublic interface BeanPostProcessor {\n    // 初始化前（@PostConstruct之后，InitializingBean之前）\n    Object postProcessBeforeInitialization(Object bean, String beanName);\n    // 初始化后（AOP代理在此创建）\n    Object postProcessAfterInitialization(Object bean, String beanName);\n}\n```\n\n### 6.2 自定义BeanPostProcessor\n```java\n@Component\npublic class MyBeanPostProcessor implements BeanPostProcessor, Ordered {\n    @Override\n    public Object postProcessBeforeInitialization(Object bean, String beanName) {\n        if (bean instanceof MyService) {\n            System.out.println(\"初始化前处理: \" + beanName);\n            // 可以修改Bean或返回代理对象\n        }\n    return bean;\n}\n@Override\npublic Object postProcessAfterInitialization(Object bean, String beanName) {\n    if (bean instanceof MyService) {\n        System.out.println(\"初始化后处理: \" + beanName);\n        // AOP代理在此创建\n    }\nreturn bean;\n}\n@Override\npublic int getOrder() {\n    return 0;  // 控制执行顺序\n}\n}\n```\n\n## 七、完整生命周期代码演示\n```java\n@Component\npublic class FullLifecycleBean implements BeanNameAware, BeanFactoryAware,\nInitializingBean, DisposableBean {\n    private String beanName;\n    // 构造器 - 实例化\n    public FullLifecycleBean() {\n        System.out.println(\"1. 构造器 - 实例化\");\n    }\n// BeanNameAware\n@Override\npublic void setBeanName(String name) {\n    this.beanName = name;\n    System.out.println(\"2. BeanNameAware: \" + name);\n}\n// BeanFactoryAware\n@Override\npublic void setBeanFactory(BeanFactory factory) {\n    System.out.println(\"3. BeanFactoryAware\");\n}\n// @PostConstruct\n@PostConstruct\npublic void postConstruct() {\n    System.out.println(\"4. @PostConstruct\");\n}\n// InitializingBean\n@Override\npublic void afterPropertiesSet() {\n    System.out.println(\"5. InitializingBean.afterPropertiesSet()\");\n}\n// 自定义init-method\npublic void customInit() {\n    System.out.println(\"6. 自定义init-method\");\n}\n// 业务方法\npublic void doBusiness() {\n    System.out.println(\"7. 业务方法执行\");\n}\n// @PreDestroy\n@PreDestroy\npublic void preDestroy() {\n    System.out.println(\"8. @PreDestroy\");\n}\n// DisposableBean\n@Override\npublic void destroy() {\n    System.out.println(\"9. DisposableBean.destroy()\");\n}\n// 自定义destroy-method\npublic void customDestroy() {\n    System.out.println(\"10. 自定义destroy-method\");\n}\n}\n```\n\n## 八、面试高频问题\n\n### Q1: 请描述Spring Bean的完整生命周期？\n**答**：\n1. **实例化**：通过反射创建Bean实例（构造器注入）\n2. **属性填充**：依赖注入（@Autowired、@Resource）\n3. **Aware回调**：BeanNameAware → BeanFactoryAware → ApplicationContextAware\n4. **BeanPostProcessor前置处理**：CommonAnnotationBeanPostProcessor处理@PostConstruct\n5. **InitializingBean.afterPropertiesSet()**\n6. **自定义init-method**\n7. **BeanPostProcessor后置处理**：AOP代理在此创建\n8. **使用Bean**\n9. **销毁**：@PreDestroy → DisposableBean.destroy() → 自定义destroy-method\n\n### Q2: BeanPostProcessor和BeanFactoryPostProcessor的区别？\n**答**：\n- **BeanFactoryPostProcessor**：在BeanDefinition加载后、Bean实例化前执行，可以修改BeanDefinition（如修改类名、属性值）\n- **BeanPostProcessor**：在Bean实例化后、初始化前后执行，可以修改Bean实例（如创建AOP代理）\n- 执行时机：BeanFactoryPostProcessor → 实例化 → BeanPostProcessor\n\n### Q3: @PostConstruct和InitializingBean.afterPropertiesSet()的执行顺序？\n**答**：`@PostConstruct` 先执行。顺序是：@PostConstruct → afterPropertiesSet() → 自定义init-method。@PostConstruct是JSR-250标准注解，不依赖Spring接口，推荐使用。\n### Q4: prototype作用域的Bean 生命周期有什么不同？\n**答**：\n- prototype作用域的Bean每次获取都会创建新实例\n- Spring**不管理**prototype Bean的完整生命周期\n- `@PreDestroy`、`DisposableBean.destroy()`、自定义destroy-method**不会被调用**\n- 开发者需要手动管理prototype Bean的销毁\n\n### Q5: AOP代理是在Bean 生命周期的哪个阶段创建的？\n**答**：在 `BeanPostProcessor.postProcessAfterInitialization()` 阶段创建。具体是 `AbstractAutoProxyCreator` 这个BeanPostProcessor在初始化后检查Bean是否需要创建代理，如果需要则通过JDK动态代理或CGLIB创建代理对象并返回。"
+      "title": "初始化和销毁：顺序、锁和作用域边界",
+      "content": "**初始化回调顺序**\n- `@PostConstruct`：现代 Spring 应用更推荐的方式，因为业务类不需要实现 Spring 特定接口。Spring 6 / Boot 3 生态下通常来自 `jakarta.annotation.PostConstruct`。\n- `InitializingBean.afterPropertiesSet()`：Spring 专用接口，适合基础设施组件，业务代码使用它会增加框架耦合。\n- 自定义 `initMethod`：XML 的 `init-method` 或 Java 配置 `@Bean(initMethod = \"...\")`，适合保持 POJO 风格。\n\n如果同一个方法名被多个机制配置，Spring 会避免重复执行；如果是不同方法名，就按上述顺序执行。\n\n**@PostConstruct 的锁边界**\nSpring 文档指出，`@PostConstruct` 和一般初始化方法运行在容器的 singleton creation lock 内。此时 Bean 还没有完全发布给其他对象，适合做配置校验、轻量数据结构准备，不适合启动长耗时任务、访问大量外部 Bean 或等待异步结果。耗时初始化可以放到 `SmartInitializingSingleton.afterSingletonsInstantiated()`、`ContextRefreshedEvent` 监听器，或由 `Lifecycle/SmartLifecycle` 管理。\n\n**销毁回调顺序**\n- `@PreDestroy`\n- `DisposableBean.destroy()`\n- 自定义 `destroyMethod`\n\nJava 配置中的 `@Bean` 支持销毁方法推断，常见 `close()`、`shutdown()` 或 `AutoCloseable/Closeable` 会被识别。非 Web 应用要关闭 `ConfigurableApplicationContext` 或注册 shutdown hook，销毁回调才会被触发。\n\n**prototype 和 request/session 边界**\n- singleton：容器创建、缓存、发布并在关闭时销毁。\n- prototype：容器负责创建和依赖注入，创建后交给调用方；容器不会自动执行销毁回调。\n- Web 作用域：request/session/application 的销毁时机由对应 Web 上下文生命周期驱动。\n\n答题时不要只背“实例化、初始化、销毁”。资深回答要补充：BFPP 改元数据，BPP 改实例；AOP 代理在初始化后；init 回调处于单例创建锁内；prototype 不由容器销毁；SmartLifecycle 是启动/停止语义，不等同于普通 init/destroy。"
     },
     {
       "type": "diagram",
-      "title": "Spring Bean 生命周期流程",
-      "format": "mermaid",
-      "content": "flowchart TD\nA[实例化 Bean] --> B[属性填充]\nB --> C[Aware 回调]\nC --> D[BeanPostProcessor 前置处理]\nD --> E[初始化方法]\nE --> F[BeanPostProcessor 后置处理]\nF --> G{是否需要 AOP}\nG -->|是| H[创建代理对象]\nG -->|否| I[放入单例池]\nH --> I\nI --> J[业务使用]\nJ --> K[销毁回调]",
-      "caption": "Spring Bean 从实例化、初始化、代理到销毁的主流程",
-      "fallback": "Spring Bean 生命周期流程"
+      "format": "svg",
+      "title": "Bean 生命周期、AOP 代理与销毁边界",
+      "content": "assets/diagrams/java-spring-bean-lifecycle-proxy-destroy.svg",
+      "caption": "图中把 BeanDefinition 阶段、目标对象初始化、AOP 代理发布、关闭销毁和常见边界放在同一条时间线上。",
+      "fallback": "Bean 生命周期可按 BeanDefinition -> BFPP -> 实例化 -> 属性填充 -> Aware -> BPP before -> @PostConstruct/afterPropertiesSet/init -> BPP after/AOP -> 单例发布 -> SmartLifecycle stop/@PreDestroy/destroy/destroyMethod 理解。"
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | @PostConstruct | InitializingBean.afterPropertiesSet | 自定义init-method |\n| --- | --- | --- | --- |\n| 规范 | JSR-250标准 | Spring特有接口 | Spring XML/注解配置 |\n| 侵入性 | 低，只依赖注解 | 高，需实现接口 | 无侵入 |\n| 执行顺序 | 最先（BeanPostProcessor处理） | 其次 | 最后 |\n| 推荐度 | 推荐 | 不推荐（增加耦合） | XML时代常用，注解时代少用 |\n| 触发时机 | 属性填充之后、InitializingBean之前 | @PostConstruct之后 | 最后执行 |"
+      "title": "生命周期扩展点对比",
+      "content": "| 扩展点 | 操作对象 | 时机 | 典型用途 | 易错点 |\n| --- | --- | --- | --- | --- |\n| `BeanFactoryPostProcessor` | BeanDefinition/BeanFactory 元数据 | Bean 实例化前 | 占位符、条件装配、扫描结果调整 | 拿不到普通业务 Bean 实例 |\n| `BeanPostProcessor.before` | 已创建并填充属性的 Bean 实例 | 初始化回调前 | 注解回调处理、校验、实例增强 | 此时目标对象还不是最终代理 |\n| `@PostConstruct` | 目标 Bean | 属性填充后、`afterPropertiesSet` 前 | 轻量初始化、配置校验 | 位于 singleton 创建锁内，不适合重任务 |\n| `afterPropertiesSet` | 目标 Bean | `@PostConstruct` 后 | Spring 基础设施初始化 | 业务类实现它会耦合 Spring API |\n| 自定义 `initMethod` | 目标 Bean | `afterPropertiesSet` 后 | POJO 风格初始化 | init 方法不会经过最终 AOP 拦截链 |\n| `BeanPostProcessor.after` | Bean 实例或代理 | 初始化回调后 | AOP、事务、缓存、异步代理 | 容器最终暴露的对象可能已经换成代理 |\n| `SmartInitializingSingleton` | 单例 Bean | 常规单例初始化完成后 | 全局索引、预热、延迟重任务 | 只覆盖单例，不是每个 Bean 的 init 替代 |\n| `SmartLifecycle` | 有启动/停止语义的组件 | 容器 refresh/close 阶段 | 消费者、调度器、后台连接 | phase 决定启动/停止顺序 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "import jakarta.annotation.PostConstruct;\nimport jakarta.annotation.PreDestroy;\nimport org.springframework.beans.BeansException;\nimport org.springframework.beans.factory.BeanNameAware;\nimport org.springframework.beans.factory.DisposableBean;\nimport org.springframework.beans.factory.InitializingBean;\nimport org.springframework.context.ApplicationContext;\nimport org.springframework.context.ApplicationContextAware;\nimport org.springframework.stereotype.Component;\n\n@Component\npublic class UserService implements BeanNameAware, ApplicationContextAware,\n        InitializingBean, DisposableBean {\n    private String beanName;\n    private ApplicationContext applicationContext;\n\n    public UserService() {\n        // 1. 实例化：调用构造器\n    }\n\n    @Override\n    public void setBeanName(String name) {\n        // 2. Aware 回调：注入容器上下文信息\n        this.beanName = name;\n    }\n\n    @Override\n    public void setApplicationContext(ApplicationContext context) throws BeansException {\n        this.applicationContext = context;\n    }\n\n    @PostConstruct\n    public void postConstruct() {\n        // 3. 初始化前后：先执行 @PostConstruct\n    }\n\n    @Override\n    public void afterPropertiesSet() {\n        // 4. InitializingBean 初始化回调\n    }\n\n    @PreDestroy\n    public void preDestroy() {\n        // 5. 销毁前：执行 @PreDestroy\n    }\n\n    @Override\n    public void destroy() {\n        // 6. DisposableBean 销毁回调\n    }\n}",
+      "title": "可运行代码：模拟 BPP、AOP 代理和销毁顺序",
       "language": "java",
+      "content": "import java.lang.reflect.Proxy;\nimport java.util.*;\n\npublic class Main {\n    interface BeanNameAware { void setBeanName(String name); }\n    interface InitializingBean { void afterPropertiesSet(); }\n    interface DisposableBean { void destroy(); }\n    interface Worker { String work(); }\n\n    static final class Repository {\n        String load() { return \"data\"; }\n    }\n\n    static final class WorkerBean implements Worker, BeanNameAware, InitializingBean, DisposableBean {\n        private final List<String> events;\n        private Repository repository;\n\n        WorkerBean(List<String> events) {\n            this.events = events;\n            events.add(\"01 constructor target\");\n        }\n\n        void setRepository(Repository repository) {\n            this.repository = repository;\n            events.add(\"02 populate dependency\");\n        }\n\n        @Override\n        public void setBeanName(String name) {\n            events.add(\"03 aware beanName=\" + name);\n        }\n\n        void postConstruct() {\n            events.add(\"05 @PostConstruct\");\n        }\n\n        @Override\n        public void afterPropertiesSet() {\n            events.add(\"06 afterPropertiesSet\");\n        }\n\n        void customInit() {\n            events.add(\"07 custom init\");\n        }\n\n        @Override\n        public String work() {\n            events.add(\"11 target work uses \" + repository.load());\n            return \"ok\";\n        }\n\n        void preDestroy() {\n            events.add(\"12 @PreDestroy\");\n        }\n\n        @Override\n        public void destroy() {\n            events.add(\"13 DisposableBean.destroy\");\n        }\n\n        void customDestroy() {\n            events.add(\"14 custom destroy\");\n        }\n    }\n\n    interface BeanPostProcessor {\n        Object before(Object bean, String name);\n        Object after(Object bean, String name);\n    }\n\n    static final class ProxyCreatingBpp implements BeanPostProcessor {\n        private final List<String> events;\n\n        ProxyCreatingBpp(List<String> events) {\n            this.events = events;\n        }\n\n        @Override\n        public Object before(Object bean, String name) {\n            events.add(\"04 BPP before init\");\n            return bean;\n        }\n\n        @Override\n        public Object after(Object bean, String name) {\n            events.add(\"08 BPP after init -> create proxy\");\n            Worker target = (Worker) bean;\n            return Proxy.newProxyInstance(\n                    Worker.class.getClassLoader(),\n                    new Class<?>[]{Worker.class},\n                    (proxy, method, args) -> {\n                        events.add(\"10 proxy before \" + method.getName());\n                        return method.invoke(target, args);\n                    }\n            );\n        }\n    }\n\n    static final class MiniContainer {\n        private final List<String> events = new ArrayList<>();\n        private final BeanPostProcessor bpp = new ProxyCreatingBpp(events);\n        private WorkerBean rawTarget;\n        private Worker exposedBean;\n\n        Worker refresh() {\n            rawTarget = new WorkerBean(events);\n            rawTarget.setRepository(new Repository());\n            rawTarget.setBeanName(\"workerBean\");\n            Object current = bpp.before(rawTarget, \"workerBean\");\n            WorkerBean target = (WorkerBean) current;\n            target.postConstruct();\n            target.afterPropertiesSet();\n            target.customInit();\n            exposedBean = (Worker) bpp.after(target, \"workerBean\");\n            events.add(\"09 singleton published proxy=\" + Proxy.isProxyClass(exposedBean.getClass()));\n            return exposedBean;\n        }\n\n        void close() {\n            rawTarget.preDestroy();\n            rawTarget.destroy();\n            rawTarget.customDestroy();\n        }\n\n        List<String> events() {\n            return events;\n        }\n    }\n\n    public static void main(String[] args) {\n        MiniContainer container = new MiniContainer();\n        Worker worker = container.refresh();\n        System.out.println(\"business=\" + worker.work());\n        container.close();\n        container.events().forEach(System.out::println);\n    }\n}",
       "highlights": [
         {
-          "line": 12,
-          "note": "这里定义示例的核心入口或结构，后续逻辑都围绕这个职责展开。"
+          "line": 77,
+          "note": "BPP before 发生在初始化回调之前，此时仍是目标对象。"
+        },
+        {
+          "line": 83,
+          "note": "BPP after 可以返回代理对象，容器最终暴露给调用方的对象在这里发生变化。"
+        },
+        {
+          "line": 111,
+          "note": "容器保存 rawTarget 用于销毁，调用方拿到的 exposedBean 是代理，这正是生命周期和 AOP 的关键边界。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：Spring Bean 的生命周期分四大阶段——实例化、属性填充、初始化、销毁，中间穿插一堆扩展点，AOP 代理就是在初始化后的 BeanPostProcessor 阶段织入的。\n\n完整顺序背下来：\n\n1. 实例化：反射调构造器创建实例。\n2. 属性填充：依赖注入（@Autowired、@Resource）。\n3. Aware 回调：BeanNameAware → BeanFactoryAware → ApplicationContextAware，让 Bean 拿到容器组件。\n4. BeanPostProcessor 前置 postProcessBeforeInitialization：@PostConstruct 在这步被处理。\n5. 初始化：InitializingBean.afterPropertiesSet() → 自定义 init-method。\n6. BeanPostProcessor 后置 postProcessAfterInitialization：AOP 代理在这里创建。\n7. 使用。\n8. 销毁：@PreDestroy → DisposableBean.destroy() → 自定义 destroy-method。\n\n要分清两个常被混的扩展点：BeanFactoryPostProcessor 在所有 Bean 实例化之前、改的是 BeanDefinition（元数据）；BeanPostProcessor 在每个 Bean 实例化之后、改的是 Bean 实例（比如包代理）。顺序是 BeanFactoryPostProcessor → 实例化 → BeanPostProcessor。\n\n边界和坑。① 初始化方法推荐 @PostConstruct，它是 JSR-250 标准、不绑定 Spring 接口。② prototype 作用域的 Bean，Spring 只负责创建、不管销毁，@PreDestroy 不会被调用。③ AOP 代理在后置处理才生成，所以构造器和属性填充阶段 this 还是原始对象、不是代理，这也是自调用 AOP 失效的根源之一。\n\n工程取舍和失败模式也要知道：扩展点很强大但别滥用，BeanPostProcessor 会作用于所有 Bean，写得重会拖慢整个容器启动，这是性能代价；@PostConstruct 里抛异常会让 Bean 创建失败、整个 ApplicationContext 启动中断，如果初始化方法里依赖了还没装配好的 Bean，还会拿到半成品或直接 NPE，排查时要看启动堆栈定位到是哪个 Bean 的初始化回调失败。",
+      "content": "我会先说明：Bean 生命周期要分 BeanDefinition、目标对象、最终暴露对象三层看。BeanDefinition 阶段还没有业务对象，`BeanFactoryPostProcessor` 可以改元数据；createBean 阶段才创建目标对象；初始化后 `BeanPostProcessor` 可能返回 AOP 代理，所以从容器拿到的对象可能不是原始 Bean。\n\n主链路我会这样讲：容器加载 BeanDefinition 后，先执行 BFPP；创建 Bean 时通过构造器或工厂方法实例化，再填充依赖；随后执行 Aware 回调，例如 BeanNameAware、BeanFactoryAware、ApplicationContextAware；然后执行 BPP before；初始化回调按 `@PostConstruct`、`InitializingBean.afterPropertiesSet()`、自定义 init 方法的顺序执行；再执行 BPP after，AOP、事务、缓存、异步等代理通常在这里包装；最后 singleton 发布到单例缓存供其他对象使用。\n\n销毁顺序也要说清：关闭容器时，SmartLifecycle 这类有启动/停止语义的组件会先走 stop 流程；普通销毁回调按 `@PreDestroy`、`DisposableBean.destroy()`、自定义 destroy 方法执行。Java 配置的 `@Bean` 还支持推断 `close()`、`shutdown()` 或 AutoCloseable/Closeable。prototype Bean 的创建由容器负责，但创建后交给调用方，容器不会自动执行销毁回调。\n\n最后补边界：`@PostConstruct` 和 init 方法运行在 singleton 创建锁内，目标 Bean 还没有完全发布，适合做配置校验和轻量准备；耗时预热或访问大量外部 Bean，应该放到 SmartInitializingSingleton、ContextRefreshedEvent 或 SmartLifecycle。事务注解放在 init 方法里通常不符合预期，因为 init 执行时 AOP 拦截链还没有套到目标方法上。",
       "followUpQuestions": [
         {
-          "question": "Bean的完整生命周期是怎样的？有哪些扩展点？",
-          "answer": "Bean 生命周期：实例化→属性注入→Aware接口回调→BeanPostProcessor前置→InitializingBean.afterPropertiesSet→自定义init→BeanPostProcessor后置→使用→DisposableBean.destroy→自定义destroy。扩展点：BeanPostProcessor、InstantiationAwareBeanPostProcessor、InitializingBean、DisposableBean。"
+          "question": "BeanPostProcessor 和 BeanFactoryPostProcessor 的区别是什么？",
+          "answer": "BeanFactoryPostProcessor 处理 BeanDefinition/BeanFactory 元数据，发生在普通 Bean 实例化前；BeanPostProcessor 处理已经创建出的 Bean 实例，发生在初始化前后，可以替换实例或返回代理对象。"
         },
         {
-          "question": "BeanPostProcessor和BeanFactoryPostProcessor有什么区别？",
-          "answer": "BeanPostProcessor：作用于Bean实例，修改Bean实例或返回代理对象（如AOP）。BeanFactoryPostProcessor：作用于BeanDefinition，修改Bean元数据（如属性占位符替换）。执行时机：BeanFactoryPostProcessor在Bean实例化前，BeanPostProcessor在Bean实例化后。"
+          "question": "@PostConstruct、afterPropertiesSet、initMethod 的执行顺序是什么？",
+          "answer": "不同方法名同时存在时，顺序是 @PostConstruct -> InitializingBean.afterPropertiesSet() -> 自定义 initMethod。销毁顺序对应为 @PreDestroy -> DisposableBean.destroy() -> 自定义 destroyMethod。"
         },
         {
-          "question": "如何自定义一个BeanPostProcessor？应用场景有哪些？",
-          "answer": "实现BeanPostProcessor接口，重写postProcessBeforeInitialization和postProcessAfterInitialization方法。应用场景：AOP代理创建、属性注入处理（@Autowired）、自定义注解处理、Bean验证、监控埋点。需要注册到容器中（@Component或@Bean）。"
+          "question": "为什么 @PostConstruct 里调用 @Transactional 方法经常不生效？",
+          "answer": "初始化回调发生在目标对象上，AOP 代理通常在 BeanPostProcessor.after 阶段才返回。init 方法执行时事务代理拦截链还没有应用到目标方法上，且自调用也会绕过代理。"
         },
         {
-          "question": "@PostConstruct、InitializingBean、@Bean 的 initMethod 三种初始化方式怎么选？",
-          "answer": "三者都能做初始化，执行顺序是 @PostConstruct → afterPropertiesSet → init-method。优先 @PostConstruct，因为它是 JSR-250 标准注解、不绑定 Spring 接口、可读性最好；InitializingBean 要实现 Spring 接口、侵入性强，一般只在框架代码里用；@Bean 的 initMethod 适合你无法改源码的第三方类。要避免在构造器里做依赖相关的初始化，因为那时属性还没注入完。"
+          "question": "prototype Bean 的生命周期和 singleton 有什么区别？",
+          "answer": "prototype 每次获取都会创建新实例，容器负责实例化和依赖注入，但不会在容器关闭时自动调用 @PreDestroy、destroy 或 destroyMethod；调用方需要自己释放资源，或避免把需销毁资源设计成 prototype。"
         }
       ]
     },
@@ -82,62 +85,57 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能否按顺序说清Bean 生命周期的7-8个核心步骤",
-        "能否说清BeanPostProcessor在生命周期中的两个介入时机",
-        "能否解释@PostConstruct、afterPropertiesSet、init-method的执行顺序",
-        "能否说明AOP代理在生命周期哪个阶段创建",
-        "能否解释InstantiationAwareBeanPostProcessor和BeanPostProcessor的区别",
-        "能否说明@PreDestroy和DisposableBean.destroy()的执行顺序",
-        "能否解释为什么Spring推荐构造器注入而非字段注入"
+        "能把 BeanDefinition 阶段、目标对象生命周期和最终暴露对象区分开",
+        "能说清 BFPP 与 BPP 的时机和操作对象差异",
+        "能按实例化、属性填充、Aware、BPP before、初始化回调、BPP after、AOP 代理、单例发布串起主链路",
+        "能准确说出 @PostConstruct、afterPropertiesSet、initMethod 以及销毁回调顺序",
+        "能解释为什么 init 方法通常不经过最终 AOP 拦截链",
+        "能说明 @PostConstruct 位于 singleton 创建锁内，重任务应延后到合适扩展点",
+        "能说明 prototype Bean 的销毁边界和资源管理风险"
       ]
     }
   ],
   "recallPrompts": [
     {
-      "prompt": "BeanPostProcessor 和 BeanFactoryPostProcessor 各在什么时机执行？AOP 代理是在哪个阶段创建的？",
+      "id": "java.spring.topic-046-75c87cc7.recall.1",
+      "prompt": "从 BeanDefinition 到 singletonObjects，Bean 生命周期的关键步骤是什么？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 4,
-      "id": "java.spring.topic-046-75c87cc7.recall.1"
+      "difficulty": 3
     },
     {
-      "prompt": "为什么在构造器阶段拿不到 AOP 代理对象、只能拿到原始对象？这和生命周期哪个阶段有关？",
+      "id": "java.spring.topic-046-75c87cc7.recall.2",
+      "prompt": "BeanPostProcessor 和 BeanFactoryPostProcessor 的时机、对象和典型用途分别是什么？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 4,
-      "id": "java.spring.topic-046-75c87cc7.recall.2"
+      "difficulty": 3
     },
     {
       "id": "java.spring.topic-046-75c87cc7.recall.3",
-      "prompt": "InitializingBean、@PostConstruct、init-method 三种初始化回调的执行顺序是什么？销毁阶段对应哪些回调？",
+      "prompt": "AOP 代理、@PostConstruct、prototype 销毁这三个边界如何向面试官讲清？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 4
-    },
-    {
-      "id": "java.spring.topic-046-75c87cc7.recall.scenario",
-      "prompt": "一个 Bean 的 @PostConstruct 里依赖了另一个还没初始化好的 Bean，会发生什么？启动失败时你怎么定位？",
-      "mode": "text",
-      "expectedMinutes": 4,
-      "difficulty": 4
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能按顺序说出实例化→属性填充→Aware→BeanPostProcessor 前置→初始化→BeanPostProcessor 后置→销毁",
-      "能指出 AOP 代理在初始化后的 BeanPostProcessor 阶段创建",
-      "能区分 BeanFactoryPostProcessor（改 BeanDefinition）和 BeanPostProcessor（改 Bean 实例）",
-      "能说出 @PostConstruct / InitializingBean / init-method 的关系和推荐用法"
+      "能区分 BeanDefinition 阶段、目标 Bean 生命周期和最终暴露对象",
+      "能说清实例化、属性填充、Aware、BPP before、初始化回调、BPP after/AOP、单例发布、销毁的顺序",
+      "能准确说明 @PostConstruct、afterPropertiesSet、initMethod 与销毁回调顺序",
+      "能解释 BFPP 与 BPP 的时机和操作对象差异"
     ],
     "goodToHave": [
-      "能说明 prototype Bean 不走销毁回调",
-      "能列出常用 Aware 接口",
-      "能解释构造器阶段拿不到 AOP 代理对象的原因"
+      "能说明 @PostConstruct 位于 singleton creation lock 内，以及 SmartInitializingSingleton/ContextRefreshedEvent/SmartLifecycle 的适用场景",
+      "能解释 init 方法通常不经过最终 AOP 代理拦截链",
+      "能讲清 prototype、FactoryBean、循环依赖 early reference 对生命周期理解的影响"
     ],
     "commonMistakes": [
-      "把 BeanPostProcessor 和 BeanFactoryPostProcessor 搞混",
-      "以为 prototype Bean 也会调用 @PreDestroy",
-      "以为构造器里 this 已经是 AOP 代理"
+      "只背实例化、初始化、销毁，漏掉 BeanDefinition、BFPP、BPP 和代理对象",
+      "把 BeanFactoryPostProcessor 和 BeanPostProcessor 混为一谈",
+      "认为 @PostConstruct 可以安全执行重任务或依赖最终代理",
+      "以为 prototype Bean 会在容器关闭时自动销毁",
+      "不知道 destroyMethod 可以推断 close/shutdown，也不知道非 Web 应用要关闭上下文"
     ],
     "scoreWeights": {
       "coverage": 35,
@@ -146,11 +144,11 @@
       "depth": 15
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-19",
   "status": "production",
   "prerequisites": [
     "java.spring.topic-043-d09a2ea2"
   ],
-  "interviewFrequency": "high",
-  "interviewerFocus": "考察能否完整按序说出 Bean 生命周期各阶段和扩展点、指出 AOP 代理的织入时机、区分两类 PostProcessor，并知道 prototype 的销毁特例。"
+  "interviewFrequency": "medium",
+  "interviewerFocus": "考察是否能从 BeanDefinition、BFPP、createBean、BPP、初始化回调、AOP 代理、单例发布和销毁边界完整解释 Bean 生命周期，而不是背流程词。"
 }

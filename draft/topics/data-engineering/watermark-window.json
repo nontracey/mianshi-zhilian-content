@@ -33,11 +33,21 @@
     },
     {
       "type": "diagram",
-      "title": "Watermark 推进与窗口触发时序",
+      "title": "Watermark 与窗口：事件时间、乱序容忍、触发和迟到数据处理",
       "format": "mermaid",
-      "content": "flowchart TB\nKafka[Kafka source 多分区] --> WS[WatermarkStrategy<br/>forBoundedOutOfOrderness 5s]\nWS --> MIN[下游算子 min watermark<br/>含 idleness 跳过空闲分区]\nMIN --> WIN[窗口分配器<br/>Tumbling Sliding Session]\nWIN --> ST[窗口状态<br/>RocksDB keyed state]\nMIN --> TRIG{watermark ≥<br/>window.end ?}\nTRIG -->|是| FIRE[EventTimeTrigger.fire<br/>计算并发射结果]\nFIRE --> LATE{允许 allowedLateness?}\nLATE -->|是 保留状态 10min| RECOMP[迟到事件<br/>触发增量重算 + retract]\nLATE -->|否| CLEAN[清理状态<br/>更迟事件到 sideOutput]\nST --> TRIG",
-      "fallback": "Kafka 多分区 → WatermarkStrategy 按 max(eventTime)−5s 发射 → 下游取 min(watermark) 并跳过 idle 分区 → 窗口分配器把事件写入 RocksDB keyed state → 当 watermark ≥ window.end 时 EventTimeTrigger 触发 fire() → 若开 allowedLateness(10min) 则保留状态接收迟到事件并 retract，否则清理状态、更迟数据走 sideOutputLateData。",
-      "caption": "图中关键节点是 min(watermark) 与 idleness、EventTimeTrigger 触发条件、allowedLateness 的 retract 路径，对应面试常追问的三个边界。"
+      "content": "flowchart TD\nA[\"事件流\nevent_time + arrival_time\"] --> B[\"提取事件时间\"]\nB --> C[\"更新最大事件时间\"]\nC --> D[\"Watermark\nmaxEventTime - allowedLateness\"]\nB --> E[\"窗口状态\nTumbling/Sliding/Session\"]\nD --> F{\"Watermark 是否越过窗口结束\"}\nF -->|否| E\nF -->|是| G[\"触发窗口计算\"]\nG --> H[\"输出结果/更新结果\"]\nA --> I{\"迟到事件\"}\nI -->|在容忍内| E\nI -->|超过容忍| J[\"侧输出/丢弃/补偿\"]",
+      "fallback": "图展示 Watermark 用事件时间推进窗口触发，乱序容忍越大延迟越高，迟到数据需要侧输出或补偿策略。",
+      "caption": "Watermark 与窗口：事件时间、乱序容忍、触发和迟到数据处理",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[\"事件流\nevent_time + arrival_time\"] --> B[\"提取事件时间\"]\nB --> C[\"更新最大事件时间\"]\nC --> D[\"Watermark\nmaxEventTime - allowedLateness\"]\nB --> E[\"窗口状态\nTumbling/Sliding/Session\"]\nD --> F{\"Watermark 是否越过窗口结束\"}\nF -->|否| E\nF -->|是| G[\"触发窗口计算\"]\nG --> H[\"输出结果/更新结果\"]\nA --> I{\"迟到事件\"}\nI -->|在容忍内| E\nI -->|超过容忍| J[\"侧输出/丢弃/补偿\"]"
+        },
+        {
+          "kind": "text",
+          "content": "图展示 Watermark 用事件时间推进窗口触发，乱序容忍越大延迟越高，迟到数据需要侧输出或补偿策略。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -114,7 +124,7 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "Watermark 和窗口我会从「为什么需要事件时间」讲起：业务关心订单 23:59:58 这条记录归属当天，但它可能 00:00:03 才进 Kafka，按处理时间会算到第二天。所以 Flink 用 Watermark 这条特殊记录在流里推进事件时间进度，公式是 max(eventTime) − maxOutOfOrderness。\n\n核心机制三条：第一，Watermark 由 source 的 WatermarkStrategy.forBoundedOutOfOrderness(5s) 周期性发射，下游算子取所有上游 channel 的 min 作为当前水位，所以慢分区或空分区会卡住整条流，必须配 withIdleness。第二，窗口分 Tumbling、Sliding、Session 三种，触发条件都是 watermark ≥ window.end，Sliding 窗口因为一条事件落入 size/slide 份，状态成本最高。第三，迟到数据走两层兜底：allowedLateness 期间状态保留并触发增量重算+retract，超出后 sideOutputLateData 路由到侧输出流离线补算。\n\n边界提醒：（1）开启 allowedLateness 必须确认下游 sink 支持 upsert 或 retract，否则结果重复；（2）排查 watermark lag 飙升先看 Flink Web UI 的 Watermarks 标签页定位是哪个 subtask 慢；（3）Session 窗口在迟到数据到达时可能合并已触发的旧会话，要谨慎使用 allowedLateness。",
+      "content": "Watermark 和窗口我会从「为什么需要事件时间」讲起：业务关心订单 23:59:58 这条记录归属当天，但它可能 00:00:03 才进 Kafka，按处理时间会算到第二天。所以 Flink 用 Watermark 这条特殊记录在流里推进事件时间进度，公式是 max(eventTime) − maxOutOfOrderness。\n\n机制要点：\n- 核心机制三条：第一，Watermark 由 source 的 WatermarkStrategy.forBoundedOutOfOrderness(5s) 周期性发射，下游算子取所有上游 channel 的 min 作为当前水位，所以慢分区或空分区会卡住整条流，必须配 withIdleness。第二，窗口分 Tumbling、Sliding、Session 三种，触发条件都是 watermark ≥ window.end，Sliding 窗口因为一条事件落入 size/slide 份，状态成本最高。第三，迟到数据走两层兜底：allowedLateness 期间状态保留并触发增量重算+retract，超出后 sideOutputLateData 路由到侧输出流离线补算。\n- 边界提醒：（1）开启 allowedLateness 必须确认下游 sink 支持 upsert 或 retract，否则结果重复；（2）排查 watermark lag 飙升先看 Flink Web UI 的 Watermarks 标签页定位是哪个 subtask 慢；（3）Session 窗口在迟到数据到达时可能合并已触发的旧会话，要谨慎使用 allowedLateness。",
       "followUpQuestions": [
         {
           "question": "为什么 Flink 下游算子的 watermark 取所有上游的 min？取 max 行不行？",
@@ -192,5 +202,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-13"
+  "updatedAt": "2026-06-18"
 }

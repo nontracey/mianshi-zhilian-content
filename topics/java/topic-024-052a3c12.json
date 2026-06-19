@@ -1,81 +1,109 @@
 {
   "id": "java.concurrency.topic-024-052a3c12",
+  "title": "ConcurrentHashMap",
   "domain": "java",
   "category": "concurrency",
   "group": "concurrency",
-  "title": "ConcurrentHashMap",
-  "summary": "掌握ConcurrentHashMap中分段锁（Segment）、CAS + synchronized等核心概念，理解其原理和实际应用。",
+  "status": "production",
+  "order": 30,
+  "difficulty": 4,
+  "estimatedMinutes": 32,
+  "interviewFrequency": "high",
+  "recommendWeight": 90,
   "tags": [
     "Java",
     "并发编程",
     "ConcurrentHashMap"
   ],
-  "difficulty": 4,
-  "estimatedMinutes": 30,
-  "order": 30,
-  "recommendWeight": 90,
+  "prerequisites": [
+    "java.concurrency.topic-013-cc70cb0e",
+    "java.java-fundamentals.topic-028-905d9b58"
+  ],
+  "summary": "围绕 JDK 8+ ConcurrentHashMap 的 Node[]、CAS 空桶、桶头 synchronized、ForwardingNode 协助扩容、baseCount/CounterCell 计数和弱一致语义理解线程安全边界。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "ConcurrentHashMap：HashMap 线程不安全、JDK7 ConcurrentHashMap（Segment 分段锁）",
-      "content": "## 一、HashMap线程不安全\nHashMap在多线程环境下是不安全的，主要体现在以下两个方面：\n### 1.1 JDK7：死循环（环形链表）\nJDK7中HashMap采用头插法，在多线程并发扩容时可能形成环形链表，导致get()时死循环。\n```\n扩容前（链表 A -> B -> null）：\n线程1和线程2同时触发扩容\n线程1扩容过程中（头插法）：\n先处理A：A.next = newTable[index] -> A -> null\n再处理B：B.next = A -> B -> A（环形！）\n线程2执行get(key)：\n遍历到B -> A -> B -> A ... 死循环！\n```\n### 1.2 JDK8：数据丢失\nJDK8虽然改为尾插法解决了环形链表问题，但多线程put仍可能导致数据丢失：\n- 两个线程同时put到同一个空桶位置，一个覆盖另一个\n- size计算不准确\n### 1.3 同时put导致数据丢失\n```java\n// 模拟HashMap线程不安全\nMap<String, Integer> map = new HashMap<>();\nCountDownLatch latch = new CountDownLatch(10);\nfor (int i = 0; i < 10; i++) {\n    new Thread(() -> {\n        for (int j = 0; j < 1000; j++) {\n            map.put(\"key\" + j, j);\n        }\n    latch.countDown();\n}).start();\n}\nlatch.await();\n// 期望size <= 1000，但实际可能不一致\nSystem.out.println(\"map size: \" + map.size());\n```\n### 要点\n- JDK7 HashMap并发扩容会产生环形链表，导致死循环\n- JDK8改为尾插法解决了环形链表，但并发put仍会丢数据\n- HashMap的size++操作不是原子性的，多线程下会不准确\n- 这是ConcurrentHashMap存在的根本原因\n\n## 二、JDK7 ConcurrentHashMap（Segment分段锁）\nJDK7的ConcurrentHashMap采用了**分段锁（Segment）**的设计：\n```\nConcurrentHashMap\n+-- Segment[0] (extends ReentrantLock)\n+-- Segment[1] (extends ReentrantLock)\n+-- Segment[2] ...\n...\n+-- Segment[15] (默认16个Segment)\n```\n### 核心设计\n- 将整个Map分成16个Segment（默认），每个Segment就是一个小的HashMap\n- 每个Segment有一把ReentrantLock锁\n- 不同Segment的操作互不影响，可以并发进行\n- 并发度（concurrencyLevel）= Segment数量，默认16\n### put流程\n```\n1. 根据key的hash定位到Segment\n2. 对该Segment加锁（ReentrantLock）\n3. 在Segment内部的HashEntry数组中定位桶\n4. 遍历链表，如果key已存在则覆盖，否则插入（头插法）\n5. 释放锁\n```\n### 要点\n- Segment继承ReentrantLock，每个Segment是一把独立的锁\n- 并发度默认16，意味着最多16个线程同时写\n- get操作不加锁（HashEntry的value用volatile修饰，保证可见性）\n- size()方法先尝试无锁计算（多次比较），不一致则锁住所有Segment\n### 示例/代码\n```java\n// JDK7 ConcurrentHashMap结构（伪代码）\npublic class ConcurrentHashMap<K, V> {\n    final Segment<K, V>[] segments;  // 默认16个Segment\n    static final class Segment<K, V> extends ReentrantLock {\n        transient HashEntry<K, V>[] table;  // 每个Segment内部的HashEntry数组\n    }\nstatic final class HashEntry<K, V> {\n    final int hash;\n    final K key;\n    volatile V value;           // volatile保证可见性\n    final HashEntry<K, V> next;\n}\n}\n// put过程（简化）\npublic V put(K key, V value) {\n    int hash = hash(key);\n    Segment<K, V> segment = segments[(hash >>> segmentShift) & segmentMask];\n    segment.lock();  // 只锁对应的Segment\n    try {\n        // 在segment内部的HashEntry数组中put\n        return segment.put(key, hash, value, false);\n    } finally {\n        segment.unlock();\n    }\n}\n```\n\n## 三、JDK8 ConcurrentHashMap（CAS + synchronized）\nJDK8对ConcurrentHashMap进行了重大重构，放弃了Segment分段锁，采用**CAS + synchronized**实现更细粒度的锁。\n### 数据结构\n```\nConcurrentHashMap (JDK8)\n+-- Node[] table (类似HashMap的Node数组)\n+-- [0] -> Node -> Node -> ... (链表)\n+-- [1] -> null\n+-- [2] -> TreeBin -> TreeNode -> ... (红黑树)\n+-- [3] -> Node\n...\n```\n### 要点\n- JDK8的锁粒度从Segment细化到单个桶，并发度大幅提升\n- synchronized在JDK6+经过优化（偏向锁→轻量级锁→重量级锁），性能不亚于ReentrantLock\n- 放弃Segment可以减少内存占用（Segment数组本身占用内存）\n- 链表长度>=8且数组长度>=64时转红黑树，与HashMap一致"
+      "title": "JDK 8+ 主线不是 Segment",
+      "content": "面试里应先讲 JDK 8+ 的实现，再把 JDK 7 Segment 当历史对比。JDK 7 的 `ConcurrentHashMap` 用 `Segment extends ReentrantLock` 分段保护多个小表，`concurrencyLevel` 主要影响 Segment 数量；JDK 8 以后主结构变成 `Node<K,V>[] table`，桶内是链表或 `TreeBin`，写路径用 CAS 和桶头 `synchronized` 组合，锁粒度细到单个桶。\n\nJDK 8+ 的读写核心是：`table`、`Node.val`、`Node.next` 等关键读路径具备 volatile 可见性；空桶插入用 CAS，不需要加锁；桶非空时锁住桶头节点 `f`，并在锁内再次检查 `tabAt(tab, i) == f`，避免锁住旧桶头后在错误结构上修改；链表过长时先看数组容量，不足 64 优先扩容，容量足够且链表长度达到阈值才树化。\n\nJDK 7 Segment 仍值得了解，因为很多老资料和迁移面试会追问差异。但如果把当前版本仍回答成“默认 16 个 Segment、最多 16 个线程并发写”，就没有达到现代口径。JDK 8+ 的并发能力取决于桶分布、冲突程度、扩容状态和计数竞争，不是固定 Segment 数。"
     },
     {
       "type": "explain",
-      "title": "ConcurrentHashMap：put 流程详解（JDK8）、get 流程详解（JDK8）",
-      "content": "## 四、put流程详解（JDK8）\n```java\nfinal V putVal(K key, V value, boolean onlyIfAbsent) {\n    // 1. key和value都不能为null\n    if (key == null || value == null) throw new NullPointerException();\n    int hash = spread(key.hashCode());  // 扰动函数，减少冲突\n    for (Node<K,V>[] tab = table;;) {\n        Node<K,V> f; int n, i, fh;\n        // 2. 如果table为空，初始化（CAS）\n        if (tab == null || (n = tab.length) == 0)\n        tab = initTable();\n        // 3. 如果目标桶为空，CAS放入新Node\n        else if ((f = tabAt(tab, i = (n - 1) & hash)) == null) {\n            if (casTabAt(tab, i, null, new Node<K,V>(hash, key, value, null)))\n            break;  // CAS成功，跳出循环\n            // CAS失败说明有其他线程抢先插入了，继续循环重试\n        }\n    // 4. 如果正在扩容（MOVED），当前线程帮忙扩容\n    else if ((fh = f.hash) == MOVED)\n    tab = helpTransfer(tab, f);\n    // 5. 桶不为空，synchronized锁住桶的头节点\n    else {\n        V oldVal = null;\n        synchronized (f) {\n            if (tabAt(tab, i) == f) {  // double-check\n                if (fh >= 0) {\n                    // 链表操作：遍历链表，覆盖或尾插\n                    for (Node<K,V> e = f;; ++binCount) {\n                        if (e.hash == hash && e.key.equals(key)) {\n                            oldVal = e.val;\n                            if (!onlyIfAbsent)\n                            e.val = value;\n                            break;\n                        }\n                    if (e.next == null) {\n                        e.next = new Node<>(hash, key, value, null);\n                        if (binCount >= TREEIFY_THRESHOLD - 1)\n                        treeifyBin(tab, i);  // 链表转红黑树\n                        break;\n                    }\n                e = e.next;\n            }\n    } else if (f instanceof TreeBin) {\n        // 红黑树操作\n        // ...\n    }\n}\n}\nif (binCount != 0) {\n    if (binCount >= TREEIFY_THRESHOLD)\n    treeifyBin(tab, i);\n    if (oldVal != null)\n    return oldVal;\n    break;\n}\n}\n}\naddCount(1L, binCount);  // 更新size\nreturn null;\n}\n```\n### 要点\n- 桶为空时使用CAS插入，无锁化提升性能\n- 桶不为空时使用synchronized锁住头节点，粒度极细\n- put过程中如果发现正在扩容，会协助扩容（多线程扩容）\n- key和value都不能为null（与HashMap不同！）\n\n## 五、get流程详解（JDK8）\nget操作是**无锁**的，完全不加锁：\n```java\npublic V get(Object key) {\n    Node<K,V>[] tab; Node<K,V> e, p; int n, eh; K ek;\n    int h = spread(key.hashCode());\n    if ((tab = table) != null && (n = tab.length) > 0 &&\n    (e = tabAt(tab, (n - 1) & h)) != null) {\n        // 1. 检查头节点\n        if ((eh = e.hash) == h) {\n            if ((ek = e.key) == key || (ek != null && key.equals(ek)))\n            return e.val;\n        }\n    // 2. 如果hash<0，说明是TreeBin或正在扩容\n    else if (eh < 0)\n    return (p = e.find(h, key)) != null ? p.val : null;\n    // 3. 遍历链表\n    while ((e = e.next) != null) {\n        if (e.hash == h &&\n        ((ek = e.key) == key || (ek != null && key.equals(ek))))\n        return e.val;\n    }\n}\nreturn null;\n}\n```\n### 要点\n- get操作不加锁，通过Node的val和next字段的volatile语义保证可见性\n- Node的val和next用volatile修饰，读取时能看到最新值\n- 这是ConcurrentHashMap高性能的关键之一"
+      "title": "put 路径：CAS、桶锁和协助扩容",
+      "content": "`put` 先拒绝 null key/value，然后用扰动后的 hash 定位桶。table 未初始化时，线程通过 `sizeCtl` 和 CAS 抢初始化权；初始化中的其他线程会让出或重试。目标桶为空时，直接 CAS 把新 `Node` 放进数组槽，成功即可结束结构修改。\n\n桶非空时有两条重要分支。如果桶头 hash 是 `MOVED`，说明该桶已放置 `ForwardingNode`，当前线程会调用 `helpTransfer` 参与扩容，把旧表的一段桶迁移到 `nextTable`。如果不是迁移桶，就对桶头 `f` 加 `synchronized`，在锁内处理链表或 `TreeBin`：找到相同 key 就覆盖值，找不到就尾插新节点或更新红黑树。\n\n结构修改后会调用 `addCount` 更新计数。低竞争时 CAS 更新 `baseCount`，竞争高时把增量分散到 `CounterCell`，思想类似 `LongAdder`。`addCount` 还会检查是否超过扩容阈值，必要时触发 resize；resize 期间多个线程通过 `transferIndex` 分段领取迁移任务，迁移完成的桶用 `ForwardingNode` 标记。"
     },
     {
       "type": "explain",
-      "title": "ConcurrentHashMap：ConcurrentHashMap 与 Hashtable 对比、面试高频问题",
-      "content": "## 六、ConcurrentHashMap与Hashtable对比\n### 要点\n- Hashtable锁住整个表，并发性能极差，已被淘汰\n- ConcurrentHashMap是Hashtable的替代品，并发性能远优于Hashtable\n- Collections.synchronizedMap()也是锁住整个表，性能与Hashtable类似\n- ConcurrentHashMap的迭代器是弱一致性的，不会抛ConcurrentModificationException\n### 示例/代码\n```java\n// Hashtable：锁住整个方法\npublic synchronized V put(K key, V value) { ... }\npublic synchronized V get(Object key) { ... }\n// ConcurrentHashMap：只锁对应的桶\nfinal V putVal(K key, V value, boolean onlyIfAbsent) {\n    // ...\n    synchronized (f) {  // f是桶的头节点\n        // 只锁当前桶\n    }\n}\n```\n\n## 七、面试高频问题\n### Q1: ConcurrentHashMap在JDK7和JDK8中的实现有什么区别？\n**答**：JDK7使用Segment分段锁，默认16个Segment，每个Segment是一把ReentrantLock，并发度固定为16。JDK8放弃了Segment，采用CAS+synchronized实现桶级别的锁，锁粒度更细，并发度更高。数据结构从Segment>HashEntry变为Node数组+链表+红黑树，与HashMap一致。\n### Q2: ConcurrentHashMap的get操作为什么不加锁？\n**答**：Node节点的val和next字段用volatile修饰，保证了可见性。读取volatile变量时会从主内存获取最新值，因此get操作不需要加锁就能读到最新的数据。这是ConcurrentHashMap读多写少场景下高性能的关键。\n### Q3: ConcurrentHashMap的key和value为什么不能为null？\n**答**：ConcurrentHashMap是多线程环境下的容器，如果允许null值，get(key)返回null时无法区分是key不存在还是value为null。在单线程的HashMap中可以通过containsKey()区分，但在多线程中containsKey和get之间状态可能变化。Doug Lea的设计哲学是：如果key或value为null，说明程序有bug。\n### Q4: ConcurrentHashMap的size()方法是怎么实现的？\n**答**：JDK8中使用baseCount（CAS更新）和CounterCell数组（分散竞争）来计数。类似LongAdder的思想，将计数分散到不同的Cell中，减少CAS竞争。size() = baseCount + 所有CounterCell的值之和。\n### Q5: ConcurrentHashMap能保证复合操作的原子性吗？\n**答**：不能。单个put/get是线程安全的，但\"检查再操作\"（如putIfAbsent）不是原子的。不过ConcurrentHashMap提供了原子的复合操作方法：putIfAbsent()、replace(key, oldValue, newValue)、compute()、merge()等。如果需要更复杂的原子操作，需要额外加锁或使用ConcurrentMap的默认方法。"
+      "title": "读和统计是弱一致，不是全局快照",
+      "content": "`get` 通常不加锁：先 volatile 读 table 槽位，命中桶头就直接读值；桶头 hash 小于 0 时走 `TreeBin` 或 `ForwardingNode` 的查找逻辑；普通链表则沿 `next` 遍历。它能看到已安全发布的节点和值，但在并发修改中不承诺返回某个全局时间点的快照。\n\n迭代器也是弱一致的：遍历期间可以并发修改，不会像 fail-fast 集合那样抛 `ConcurrentModificationException`，但可能看见部分新数据、部分旧数据，也可能错过某些刚发生的修改。`size()` 和 `mappingCount()` 在并发更新中也只能作为观察值；如果需要精确数量用于业务决策，应重新设计同步边界。\n\n`ConcurrentHashMap` 不允许 null key/value。根本原因是并发环境下 `get(key) == null` 必须能可靠表示“没有映射”；如果允许 value 为 null，`get`、`putIfAbsent`、`compute` 等 API 在并发变化中很难区分 absent 和 null value。HashMap 可以配合 `containsKey` 区分，但这个两步判断在并发容器里不是原子观察。"
+    },
+    {
+      "type": "explain",
+      "title": "线程安全方法不等于复合逻辑安全",
+      "content": "`ConcurrentHashMap` 保证单次 `put/get/remove/compute/merge` 等方法内部的线程安全，但不能自动保证外部组合逻辑。例如 `if (!map.containsKey(k)) map.put(k, v)` 是 check-then-act 竞态，两个线程都可能通过检查并覆盖。应使用 `putIfAbsent`、`computeIfAbsent`、`compute`、`merge`、`replace(k, old, new)` 等原子复合 API。\n\n高频计数不要写成 `map.put(k, map.get(k) + 1)`。单 key 计数可以用 `merge(k, 1, Integer::sum)`；极高并发统计常用 `ConcurrentHashMap<K, LongAdder>`，通过 `computeIfAbsent(k, key -> new LongAdder()).increment()` 降低 CAS 热点。跨多个 key 的不变量，例如“两个账户同时转账保持总额不变”，不是单个 `ConcurrentHashMap` 方法能保证的，需要外部锁、事务或重新建模。\n\n选型上，读多写少且 key 分布较好时它非常合适；热点 key 更新、全表精确 size、需要有序遍历、需要跨 key 原子性时，要评估 LongAdder、ConcurrentSkipListMap、分片锁、队列化或数据库事务等方案。"
     },
     {
       "type": "diagram",
-      "title": "ConcurrentHashMap 学习主线图",
-      "format": "mermaid",
-      "content": "flowchart LR\nA[ConcurrentHashMap] --> B[并发编程]\nB --> C[JDK 8 桶级锁]\nC --> D[CAS 插入空桶]\nD --> E[synchronized 锁桶头]\nE --> F[volatile 可见性]",
-      "caption": "从 并发编程 到 volatile 可见性，这张图帮助区分 ConcurrentHashMap 的核心机制、边界条件和常见误区。",
-      "fallback": "ConcurrentHashMap -> 并发编程 -> JDK 8 桶级锁 -> CAS 插入空桶 -> synchronized 锁桶头 -> volatile 可见性",
-      "items": [
-        "JDK 7实现：Segment分段锁 + HashEntry数组",
-        "JDK 8实现：Node数组 + 链表/红黑树 + CAS + synchronized",
-        "put操作：CAS插入→synchronized锁桶→链表/红黑树插入",
-        "get操作：不加锁，volatile保证可见性",
-        "size操作：CounterCell数组分散竞争",
-        "扩容机制：多线程协助扩容，transferIndex分配任务",
-        "与Hashtable区别：锁粒度、性能、null值、迭代器"
+      "title": "JDK 8+ ConcurrentHashMap put/get/resize 主路径",
+      "format": "svg",
+      "content": "assets/diagrams/java-concurrenthashmap-jdk8-put-resize.svg",
+      "caption": "图中把 Node[] 结构、put 的 CAS 与桶锁分支、ForwardingNode 协助扩容、baseCount/CounterCell 计数和弱一致读放到同一张图里。",
+      "fallback": "JDK 8+ ConcurrentHashMap 使用 Node[] 表、链表/TreeBin、空桶 CAS、桶头 synchronized、ForwardingNode 协助扩容和 baseCount/CounterCell 计数。get 依赖 volatile 可见性无锁读取，迭代和 size 是弱一致语义；复合更新应使用 compute/merge/putIfAbsent 或 LongAdder 模式。",
+      "sources": [
+        {
+          "kind": "svg",
+          "path": "assets/diagrams/java-concurrenthashmap-jdk8-put-resize.svg"
+        },
+        {
+          "kind": "text",
+          "content": "JDK 8+ ConcurrentHashMap 使用 Node[] 表、链表/TreeBin、空桶 CAS、桶头 synchronized、ForwardingNode 协助扩容和 baseCount/CounterCell 计数。get 依赖 volatile 可见性无锁读取，迭代和 size 是弱一致语义；复合更新应使用 compute/merge/putIfAbsent 或 LongAdder 模式。"
+        }
       ]
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | JDK 7实现 | JDK 8实现 |\n| --- | --- | --- |\n| 数据结构 | Segment数组+HashEntry数组 | Node数组+链表/红黑树 |\n| 锁机制 | 分段锁(ReentrantLock) | CAS + synchronized |\n| 锁粒度 | 段(Segment) | 桶(bucket) |\n| 并发度 | 段数量(默认16) | 桶数量(可动态扩容) |\n| 查找效率 | O(n) | O(n)或O(logn)(红黑树) |\n| 扩容方式 | 单线程扩容 | 多线程协助扩容 |\n| null值 | 允许 | 不允许 |"
+      "title": "版本、语义和 API 边界",
+      "content": "| 对比项 | JDK 7 ConcurrentHashMap | JDK 8+ ConcurrentHashMap |\n| --- | --- | --- |\n| 主结构 | Segment 数组，每段维护小表 | `Node[] table`，桶内链表或 `TreeBin` |\n| 写锁粒度 | Segment 级 `ReentrantLock` | 空桶 CAS，桶非空锁桶头节点 |\n| 扩容 | Segment 内部扩容 | 多线程协助迁移，`ForwardingNode` 标记已迁移桶 |\n| 计数 | Segment 计数汇总 | `baseCount + CounterCell[]`，类似 LongAdder |\n| get | 依赖 volatile 字段可见性 | 依赖 volatile/安全发布，遇迁移节点转向新表 |\n| 并发度理解 | 受 Segment 数量影响明显 | 受桶分布、冲突、扩容和热点 key 影响 |\n\n| 需求 | 推荐 API | 原因 |\n| --- | --- | --- |\n| 不存在才写入 | `putIfAbsent` / `computeIfAbsent` | 避免 containsKey + put 竞态 |\n| 单 key 累加 | `merge` 或 `LongAdder` | 原子复合更新，降低热点竞争 |\n| 条件替换 | `replace(key, old, new)` | 比 get + put 更安全 |\n| 跨 key 不变量 | 外部同步或事务建模 | 单个 CHM 方法不覆盖跨 key 原子性 |\n| 遍历期间允许修改 | CHM 迭代器 | 弱一致，不抛 fail-fast 异常 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "扩容前（链表 A -> B -> null）：\n  线程1和线程2同时触发扩容\n线程1扩容过程中（头插法）：\n  先处理A：A.next = newTable[index] -> A -> null\n  再处理B：B.next = A -> B -> A（环形！）\n线程2执行get(key)：\n  遍历到B -> A -> B -> A ... 死循环！",
+      "title": "可运行代码：复合更新竞态与 LongAdder 修复",
+      "content": "import java.util.Map;\nimport java.util.concurrent.ConcurrentHashMap;\nimport java.util.concurrent.CountDownLatch;\nimport java.util.concurrent.atomic.LongAdder;\n\npublic class Main {\n    public static void main(String[] args) throws Exception {\n        int threads = 8;\n        int rounds = 20_000;\n        int expected = threads * rounds;\n\n        Map<String, Integer> nonAtomic = new ConcurrentHashMap<>();\n        nonAtomic.put(\"hits\", 0);\n        runWorkers(threads, () -> {\n            for (int i = 0; i < rounds; i++) {\n                Integer old = nonAtomic.get(\"hits\");\n                nonAtomic.put(\"hits\", old + 1);\n            }\n        });\n        System.out.println(\"get+put result = \" + nonAtomic.get(\"hits\") + \" / expected = \" + expected);\n\n        ConcurrentHashMap<String, LongAdder> counters = new ConcurrentHashMap<>();\n        runWorkers(threads, () -> {\n            for (int i = 0; i < rounds; i++) {\n                counters.computeIfAbsent(\"hits\", key -> new LongAdder()).increment();\n            }\n        });\n        long safe = counters.get(\"hits\").sum();\n        System.out.println(\"LongAdder result = \" + safe + \" / expected = \" + expected);\n        assert safe == expected;\n\n        ConcurrentHashMap<String, String> nullCheck = new ConcurrentHashMap<>();\n        try {\n            nullCheck.put(\"k\", null);\n            throw new AssertionError(\"ConcurrentHashMap accepted null value\");\n        } catch (NullPointerException expectedException) {\n            System.out.println(\"null value rejected\");\n        }\n\n        ConcurrentHashMap<Integer, Integer> iterating = new ConcurrentHashMap<>();\n        for (int i = 0; i < 4; i++) {\n            iterating.put(i, i);\n        }\n        int visited = 0;\n        for (Integer key : iterating.keySet()) {\n            visited++;\n            if (key < 4) {\n                iterating.put(100 + key, key);\n            }\n        }\n        System.out.println(\"weak iteration visited=\" + visited + \", finalSize=\" + iterating.size());\n    }\n\n    private static void runWorkers(int threads, Runnable task) throws InterruptedException {\n        CountDownLatch done = new CountDownLatch(threads);\n        for (int i = 0; i < threads; i++) {\n            new Thread(() -> {\n                try {\n                    task.run();\n                } finally {\n                    done.countDown();\n                }\n            }, \"worker-\" + i).start();\n        }\n        done.await();\n    }\n}",
       "language": "java",
       "highlights": [
         {
-          "line": 1,
-          "note": "这行承载示例的关键数据流，说明时要指出它改变了哪一段状态。"
+          "line": 16,
+          "note": "`get` 和 `put` 各自线程安全，但组合起来不是原子复合操作。"
+        },
+        {
+          "line": 25,
+          "note": "`computeIfAbsent` 与 `LongAdder.increment` 是高并发计数的常见模式。"
+        },
+        {
+          "line": 33,
+          "note": "ConcurrentHashMap 拒绝 null key/value，避免并发场景下的 absent/null 歧义。"
+        },
+        {
+          "line": 44,
+          "note": "迭代期间修改不会抛 fail-fast 异常，但遍历结果是弱一致观察。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
-      "title": "标准面试回答",
-      "content": "结论：ConcurrentHashMap 是线程安全的哈希表。JDK 8 取消分段锁，改为数组桶级别的 CAS 与 synchronized 组合，让不同桶可以并发写入，读操作主要依赖 volatile 可见性。\n\n机制上，核心机制可以拆成三层：\n1. 初始化 table 时用 CAS 控制，避免多个线程重复初始化。\n2. put 时桶为空用 CAS 放入节点，桶非空则锁住桶头节点后追加链表或更新红黑树。\n3. size 统计使用 baseCount 加 CounterCell 分散热点，扩容时多个线程通过 transferIndex 协助迁移。\n\n追问边界：常见追问是 JDK 7 与 JDK 8 差异、扩容协助和 null 限制。不允许 null 是为了避免 `get(key) == null` 时无法区分“没有这个 key”和“值就是 null”。高并发下它适合共享 Map，但复合操作仍要用 compute、putIfAbsent 或外部同步保证原子性。",
+      "title": "面试回答思路",
+      "content": "我会先声明版本口径：JDK 7 是 Segment 分段锁，JDK 8+ 已经改成 `Node[] table` 加链表/红黑树，写路径是 CAS 和桶头 `synchronized` 组合。现在回答主线应放在 JDK 8+。\n\nput 流程是：先拒绝 null，spread hash 定位桶；table 未初始化用 `sizeCtl` 控制初始化；桶为空时 CAS 插入；桶头是 `ForwardingNode` 说明正在扩容，当前线程参与 transfer；普通桶则锁住桶头，在锁内更新链表或 `TreeBin`。结构修改后通过 `addCount` 更新 `baseCount/CounterCell`，并可能触发扩容。扩容时多个线程按 `transferIndex` 分段迁移桶，迁移完成放 `ForwardingNode`。\n\nget 通常不加锁，依赖 volatile 读和节点安全发布，遇到树或迁移节点走对应查找逻辑。它的迭代器和 size 是弱一致语义，不是全局快照。CHM 不允许 null，是为了让 `get(key) == null` 能明确代表 absent。\n\n最后补边界：单个方法线程安全不代表外部复合逻辑安全。`containsKey + put`、`get + put` 仍有竞态；应该使用 `putIfAbsent`、`compute`、`merge`、`replace`，热点计数用 `ConcurrentHashMap<K, LongAdder>`。跨 key 事务要外部同步或改模型。",
       "followUpQuestions": [
         {
-          "question": "ConcurrentHashMap 的读操作为什么通常不用加锁？",
-          "answer": "Node 的 value 和 next 具备可见性语义，table 也通过 volatile 方式访问，读线程能看到已发布节点；遇到迁移节点时会顺着 forwarding node 去新表查。"
+          "question": "JDK 8+ 为什么用 synchronized 锁桶头，而不是继续用 Segment？",
+          "answer": "Segment 粒度固定且结构更重，冲突集中在同一 Segment 时并发度受限。JDK 8+ 把锁细化到桶，空桶用 CAS，非空桶才锁桶头；配合链表树化、协助扩容和 LongAdder 式计数，读写并发度更依赖实际桶分布，内存结构也更接近 HashMap。"
         },
         {
-          "question": "size 为什么不是简单维护一个 int？",
-          "answer": "高并发更新同一个计数器会形成热点，所以使用 baseCount 和 CounterCell 分摊竞争，最后汇总得到近似或准确大小。"
+          "question": "ConcurrentHashMap 的 size 为什么在并发更新时不适合作强业务判断？",
+          "answer": "JDK 8+ 用 baseCount 和 CounterCell 分散计数竞争，汇总时可能与并发 put/remove 交错。size/mappingCount 更适合监控和估算；如果业务逻辑要求“数量小于 N 才插入”这种精确不变量，需要把判断和更新放进同一同步边界，或用信号量、队列、数据库约束等重新建模。"
+        },
+        {
+          "question": "为什么 `ConcurrentHashMap` 不允许 null，而 `HashMap` 可以？",
+          "answer": "单线程 HashMap 可以用 `containsKey` 区分 absent 和 null value；并发环境里 containsKey 和 get 之间可能发生变化，所以这个两步观察不可靠。CHM 让 `get(key) == null` 明确表示没有映射，复合 API 也用 null 表达计算结果移除或 absent 语义，因此禁止 null key/value。"
         }
       ]
     },
@@ -83,69 +111,67 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释ConcurrentHashMap在JDK 7和JDK 8的实现差异",
-        "能说明分段锁和桶锁的区别",
-        "能描述put操作的线程安全保证",
-        "能解释get操作为什么不加锁",
-        "能说明size操作的实现原理",
-        "能解释扩容机制的工作流程",
-        "能比较ConcurrentHashMap和Hashtable的区别"
+        "能把 JDK 7 Segment 分段锁与 JDK 8+ Node[]/桶锁结构区分开",
+        "能按 null 检查、hash、初始化、空桶 CAS、ForwardingNode、桶头锁、链表/TreeBin、addCount 讲 put 主路径",
+        "能解释 helpTransfer、transferIndex、nextTable、ForwardingNode 的协助扩容关系",
+        "能说明 get 为什么通常不加锁，以及弱一致读和迭代的边界",
+        "能解释 baseCount/CounterCell 计数机制与 size/mappingCount 的观察语义",
+        "能说明为什么 key/value 不能为 null",
+        "能用 putIfAbsent、compute、merge、LongAdder 修复外部复合操作竞态"
       ]
     }
   ],
+  "interviewerFocus": "考察候选人能否按 JDK 8+ 主线说清 ConcurrentHashMap 的 CAS、桶头 synchronized、协助扩容、计数和弱一致边界，并能指出复合操作不是自动原子的。",
   "recallPrompts": [
     {
       "id": "java.concurrency.topic-024-052a3c12.recall.1",
-      "prompt": "请说明 ConcurrentHashMap 在 JDK 8 中如何保证并发安全，以及 put 的核心流程。",
-      "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 4
-    },
-    {
-      "id": "java.concurrency.topic-024-052a3c12.recall.2",
-      "prompt": "ConcurrentHashMap 为什么不允许 key 或 value 为 null？",
-      "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 4
-    },
-    {
-      "id": "java.concurrency.topic-024-052a3c12.recall.3",
-      "prompt": "ConcurrentHashMap 在 JDK 8 中如何用 CAS、synchronized 和协助扩容保证并发安全？",
-      "mode": "code",
-      "expectedMinutes": 10,
-      "difficulty": 4
-    },
-    {
-      "id": "java.concurrency.topic-024-052a3c12.recall.4",
-      "prompt": "请说明 ConcurrentHashMap putVal 中 CAS、synchronized、链表/红黑树和协助扩容的关键路径。",
+      "prompt": "请按 JDK 8+ 口径讲 ConcurrentHashMap put 的关键路径：CAS、桶头锁、ForwardingNode、TreeBin 和 addCount。",
       "mode": "text",
       "expectedMinutes": 6,
       "difficulty": 4
     },
     {
-      "id": "java.concurrency.topic-024-052a3c12.recall.5",
-      "prompt": "ConcurrentHashMap 的 size 为什么是近似统计？扩容时多个线程如何协助迁移桶？",
+      "id": "java.concurrency.topic-024-052a3c12.recall.2",
+      "prompt": "ConcurrentHashMap 为什么不允许 key 或 value 为 null？它和 HashMap 的 containsKey + get 有什么区别？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "java.concurrency.topic-024-052a3c12.recall.3",
+      "prompt": "请说明 size/mappingCount、弱一致迭代和 get 无锁读取的语义边界。",
       "mode": "text",
       "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "java.concurrency.topic-024-052a3c12.recall.4",
+      "prompt": "请写一个 get+put 计数丢失的例子，并用 compute/merge 或 LongAdder 修复。",
+      "mode": "code",
+      "expectedMinutes": 8,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "JDK 8 桶级锁",
-      "CAS 插入空桶",
-      "synchronized 锁桶头",
-      "volatile 可见性"
+      "能说明 JDK 8+ 主结构是 Node[] + 链表/TreeBin，而不是 Segment 主线",
+      "能讲清空桶 CAS、桶非空 synchronized 锁桶头、ForwardingNode 协助扩容",
+      "能说明 get 通常不加锁依赖 volatile 可见性，但不是全局快照",
+      "能解释 baseCount/CounterCell 计数和 size 观察语义",
+      "能指出复合操作需要 compute/merge/putIfAbsent/replace 等原子 API"
     ],
     "goodToHave": [
-      "CounterCell 计数",
-      "ForwardingNode",
-      "不允许 null 的原因"
+      "能解释 sizeCtl、transferIndex、nextTable 在初始化和扩容中的作用",
+      "能说明 TreeBin、树化阈值和容量不足时优先扩容",
+      "能解释 null key/value 禁止的并发语义原因",
+      "能给出 LongAdder 热点计数模式"
     ],
     "commonMistakes": [
-      "仍按 JDK 7 Segment 分段锁回答",
-      "认为所有操作完全无锁",
-      "把单个线程安全方法等同于复合逻辑安全"
+      "仍按 JDK 7 Segment 分段锁作为当前实现回答",
+      "认为 ConcurrentHashMap 所有操作完全无锁",
+      "把单个线程安全方法等同于外部复合逻辑安全",
+      "把 size 当作并发控制条件",
+      "认为弱一致迭代会抛 ConcurrentModificationException"
     ],
     "scoreWeights": {
       "coverage": 35,
@@ -154,11 +180,5 @@
       "depth": 15
     }
   },
-  "updatedAt": "2026-06-12",
-  "status": "production",
-  "prerequisites": [
-    "java.concurrency.topic-013-cc70cb0e"
-  ],
-  "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能围绕「ConcurrentHashMap」说清JDK 8 桶级锁、CAS 插入空桶，并放到Java 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "updatedAt": "2026-06-19"
 }

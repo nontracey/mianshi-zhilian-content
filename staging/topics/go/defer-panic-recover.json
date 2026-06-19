@@ -38,7 +38,17 @@
       "format": "mermaid",
       "content": "flowchart TD\nA[deferproc 注册<br/>头插到 g._defer 链表] --> B[函数执行中<br/>遇到 panic 调用 runtime.gopanic]\nB --> C[gopanic 沿 g._defer 链<br/>从头到尾依次执行]\nC --> D{deferred 函数体内<br/>直接调用 recover?}\nD -->|是| E[gorecover 校验 sp 匹配<br/>设置 _panic.recovered=true]\nD -->|包了一层 helper| F[recover 返回 nil<br/>panic 继续展开]\nE --> G[deferreturn 跳过剩余链表<br/>函数正常返回]\nF --> H[展开到 goroutine 顶层<br/>runtime.fatalpanic 终止进程]\nC --> I{runtime fatal?<br/>map race/OOM/stack overflow}\nI -->|是| J[直接 fatalthrow<br/>不走 _defer 链]",
       "fallback": "deferproc 注册到 g._defer 链表头 -> panic 调用 runtime.gopanic 沿链遍历 -> 若 deferred 函数直接调用 recover，sp 匹配则标记 recovered 并 deferreturn 正常返回；若 recover 被包在 helper 里则返回 nil，panic 继续展开到顶层 fatalpanic。runtime fatal（concurrent map writes、stack overflow、OOM）走 fatalthrow，绕过 _defer 链，recover 拦不住。",
-      "caption": "关键点：recover 必须直接位于 deferred 函数体；runtime fatal 不进入 _defer 链。"
+      "caption": "关键点：recover 必须直接位于 deferred 函数体；runtime fatal 不进入 _defer 链。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[deferproc 注册<br/>头插到 g._defer 链表] --> B[函数执行中<br/>遇到 panic 调用 runtime.gopanic]\nB --> C[gopanic 沿 g._defer 链<br/>从头到尾依次执行]\nC --> D{deferred 函数体内<br/>直接调用 recover?}\nD -->|是| E[gorecover 校验 sp 匹配<br/>设置 _panic.recovered=true]\nD -->|包了一层 helper| F[recover 返回 nil<br/>panic 继续展开]\nE --> G[deferreturn 跳过剩余链表<br/>函数正常返回]\nF --> H[展开到 goroutine 顶层<br/>runtime.fatalpanic 终止进程]\nC --> I{runtime fatal?<br/>map race/OOM/stack overflow}\nI -->|是| J[直接 fatalthrow<br/>不走 _defer 链]"
+        },
+        {
+          "kind": "text",
+          "content": "deferproc 注册到 g._defer 链表头 -> panic 调用 runtime.gopanic 沿链遍历 -> 若 deferred 函数直接调用 recover，sp 匹配则标记 recovered 并 deferreturn 正常返回；若 recover 被包在 helper 里则返回 nil，panic 继续展开到顶层 fatalpanic。runtime fatal（concurrent map writes、stack overflow、OOM）走 fatalthrow，绕过 _defer 链，recover 拦不住。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -119,7 +129,7 @@
     {
       "type": "interviewAnswer",
       "title": "面试三层回答：runtime 机制 → 易错点 → 工程边界",
-      "content": "一句话先给结论：defer 是 runtime 给每个 G 维护的 _defer 链表 + Go 1.14 起的 open-coded 栈帧 bitmap 两条路径，panic 沿这条链 LIFO 展开，recover 必须直接位于 deferred 函数体内才能截停。\n\n顺着展开讲：\n\n机制层：每条 defer 由 deferproc 把函数指针、参数副本、sp/pc 头插到 g._defer 链表；函数返回时编译器插入的 deferreturn 从头依次弹出，这就是 LIFO 由来。Go 1.13 改栈分配减少堆压力；Go 1.14 上 open-coded：函数内 defer ≤8 个且不在循环路径上时，直接用栈帧位图标记，跳过链表和堆分配，性能基本等同直接调用。循环里写 defer 会退回慢路径，资源还要等外层返回才释放。\n\n语义层：defer 参数在注册时立即求值，闭包则延迟到执行时按引用读——这就是 `defer fmt.Println(i)` 输出 2 1 0 而 `defer func() { fmt.Println(i) }()` 输出三个 3 的根源。命名返回值场景下，return 在编译期拆成『赋值 → deferreturn → ret』，所以 defer 里能改返回值，errors.Wrap、事务回滚都是这个机制。\n\npanic/recover 层：panic 调用 runtime.gopanic 沿当前 G 的 _defer 链遍历执行，遇到 deferred 函数体里直接调用的 recover，runtime.gorecover 校验调用方 sp 与 _defer.sp 匹配后标记 recovered，函数转为正常返回。三条硬边界：（一）recover 包一层 helper 就失效，必须写在匿名函数里直接调；（二）panic 不跨 goroutine，每个 go func() 入口都要自己 defer recover；（三）concurrent map writes、stack overflow、OOM 这类 runtime fatal 走 fatalthrow，不进入 _defer 链，recover 拦不住。\n\n工程层：业务可预期错误一律返回 error，recover 只在框架边界（HTTP handler、消息消费、定时任务入口）做兜底，捕获后必须落 panic value + 堆栈 + 请求 id，否则只是把故障吞掉。`defer file.Close()` 在写文件场景会吞 Close 错误，正确做法是把 Close 错误赋回命名返回值。",
+      "content": "一句话先给结论：defer 是 runtime 给每个 G 维护的 _defer 链表 + Go 1.14 起的 open-coded 栈帧 bitmap 两条路径，panic 沿这条链 LIFO 展开，recover 必须直接位于 deferred 函数体内才能截停。\n\n机制要点：\n- 顺着展开讲：\n- 机制层：每条 defer 由 deferproc 把函数指针、参数副本、sp/pc 头插到 g._defer 链表；函数返回时编译器插入的 deferreturn 从头依次弹出，这就是 LIFO 由来。Go 1.13 改栈分配减少堆压力；Go 1.14 上 open-coded：函数内 defer ≤8 个且不在循环路径上时，直接用栈帧位图标记，跳过链表和堆分配，性能基本等同直接调用。循环里写 defer 会退回慢路径，资源还要等外层返回才释放。\n- 语义层：defer 参数在注册时立即求值，闭包则延迟到执行时按引用读——这就是 `defer fmt.Println(i)` 输出 2 1 0 而 `defer func() { fmt.Println(i) }()` 输出三个 3 的根源。命名返回值场景下，return 在编译期拆成『赋值 → deferreturn → ret』，所以 defer 里能改返回值，errors.Wrap、事务回滚都是这个机制。\n- panic/recover 层：panic 调用 runtime.gopanic 沿当前 G 的 _defer 链遍历执行，遇到 deferred 函数体里直接调用的 recover，runtime.gorecover 校验调用方 sp 与 _defer.sp 匹配后标记 recovered，函数转为正常返回。三条硬边界：（一）recover 包一层 helper 就失效，必须写在匿名函数里直接调；（二）panic 不跨 goroutine，每个 go func() 入口都要自己 defer recover；（三）concurrent map writes、stack overflow、OOM 这类 runtime fatal 走 fatalthrow，不进入 _defer 链，recover 拦不住。\n- 工程层：业务可预期错误一律返回 error，recover 只在框架边界（HTTP handler、消息消费、定时任务入口）做兜底，捕获后必须落 panic value + 堆栈 + 请求 id，否则只是把故障吞掉。`defer file.Close()` 在写文件场景会吞 Close 错误，正确做法是把 Close 错误赋回命名返回值。",
       "followUpQuestions": [
         {
           "question": "Go 1.14 的 open-coded defer 优化在什么条件下生效？为什么循环里 defer 会让性能掉下去？",
@@ -204,5 +214,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-13"
+  "updatedAt": "2026-06-18"
 }

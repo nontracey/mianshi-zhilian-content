@@ -32,11 +32,21 @@
     },
     {
       "type": "diagram",
-      "title": "Redis 类型到编码的执行链路",
+      "title": "Redis 对象编码：命令语义、底层编码切换与性能风险",
       "format": "mermaid",
-      "content": "flowchart LR\nA[命令语义] --> B[RedisObject 类型]\nB[RedisObject 类型] --> C[底层编码选择]\nC[底层编码选择] --> D[命令复杂度]\nD[命令复杂度] --> E[大 key 监控]",
-      "fallback": "命令语义 -> RedisObject 类型 -> 底层编码选择 -> 命令复杂度 -> 大 key 监控",
-      "caption": "图中把外部命令、对象类型、底层编码和复杂度风险连起来，说明性能问题通常落在编码和数据规模上。"
+      "content": "flowchart TD\nA[\"Redis 命令\nString/List/Hash/Set/ZSet\"] --> B[\"Redis Object\ntype + encoding\"]\nB --> C{\"元素数量和大小\"}\nC -->|小对象| D[\"紧凑编码\nint/listpack 等\"]\nC -->|增长超过阈值| E[\"哈希表/跳表/quicklist\"]\nD --> F[\"节省内存\"]\nE --> G[\"更适合查找/范围操作\"]\nC --> H{\"大 key 或热 key\"}\nH -->|是| I[\"拆分 key/限流/异步删除\"]\nH -->|否| J[\"按命令复杂度评估\"]",
+      "fallback": "图展示 Redis 数据结构要同时理解对外命令语义和内部编码，编码切换、大 key、热 key 会改变内存和延迟表现。",
+      "caption": "Redis 对象编码：命令语义、底层编码切换与性能风险",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[\"Redis 命令\nString/List/Hash/Set/ZSet\"] --> B[\"Redis Object\ntype + encoding\"]\nB --> C{\"元素数量和大小\"}\nC -->|小对象| D[\"紧凑编码\nint/listpack 等\"]\nC -->|增长超过阈值| E[\"哈希表/跳表/quicklist\"]\nD --> F[\"节省内存\"]\nE --> G[\"更适合查找/范围操作\"]\nC --> H{\"大 key 或热 key\"}\nH -->|是| I[\"拆分 key/限流/异步删除\"]\nH -->|否| J[\"按命令复杂度评估\"]"
+        },
+        {
+          "kind": "text",
+          "content": "图展示 Redis 数据结构要同时理解对外命令语义和内部编码，编码切换、大 key、热 key 会改变内存和延迟表现。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -75,17 +85,73 @@
       ]
     },
     {
-      "type": "interviewAnswer",
-      "title": "面试回答思路",
-      "content": "结论：Redis 数据结构要从外部类型、内部编码和命令复杂度三层一起回答。\n我会按这几层展开：\n1. 先说明五种常用类型只是命令语义，底层会随数据规模切换编码\n2. 再讲 SDS、hashtable、quicklist、skiplist 各自解决的查找、插入、范围和内存问题\n3. 然后结合 String 计数、Hash 对象、List 队列、ZSet 排行榜说明访问模式\n4. 最后强调大 key、热 key 和全量命令会放大单线程模型的风险\n\n最后补充边界：不要死背某个版本的编码阈值，要能解释复杂度和数据规模如何影响延迟。",
-      "followUpQuestions": [
+      "type": "diagram",
+      "title": "Redis 编码切换决策与排查分支",
+      "format": "mermaid",
+      "content": "flowchart TD\n    CMD[写入命令 SADD/HSET/ZADD/LPUSH] --> CHECK{检查当前编码}\n    CHECK -->|intset/listpack 紧凑编码| THRESHOLD{元素数或单元素大小超阈值?}\n    THRESHOLD -->|否| KEEP[保持紧凑编码 O log N 或 O N 遍历]\n    THRESHOLD -->|是| CONVERT[同步阻塞转换为通用编码]\n    CONVERT --> HASHTABLE[hashtable: 查找 O 1 内存开销增大]\n    CONVERT --> SKIPLIST[skiplist+hashtable: 范围 O log N 内存翻倍]\n    CONVERT --> QUICKLIST[quicklist: 多 node listpack 可压缩]\n    CHECK -->|已是通用编码| DIRECT[直接写入 不可逆]\n    HASHTABLE --> RISK{数据规模持续增长?}\n    SKIPLIST --> RISK\n    QUICKLIST --> RISK\n    RISK -->|是| BIGKEY[大 key: DEL 阻塞 复制延迟 RDB 膨胀]\n    RISK -->|否| NORMAL[正常 O 1 或 O log N 操作]\n    BIGKEY --> DIAG[排查: SLOWLOG + MEMORY USAGE + OBJECT ENCODING]\n    DIAG --> FIX[UNLINK 异步删除 / SSCAN 分批 / 拆分 key]",
+      "fallback": "写入命令检查当前编码，紧凑编码下若元素数或大小超阈值则同步转换为通用编码（hashtable/skiplist/quicklist），转换不可逆；通用编码下数据持续增长会形成大 key，需通过 SLOWLOG、MEMORY USAGE、OBJECT ENCODING 排查并用 UNLINK 或分批拆分处理。",
+      "caption": "编码切换决策树：从写入命令出发，根据阈值判断是否转换编码，转换后不可逆；数据规模增长导致大 key 时走排查与修复分支。",
+      "items": [
+        "编码切换由元素数量和单元素大小阈值触发",
+        "紧凑编码到通用编码的转换是同步阻塞且不可逆的",
+        "大 key 的排查路径：SLOWLOG → MEMORY USAGE → OBJECT ENCODING",
+        "修复手段：UNLINK 异步删除、SSCAN 分批遍历、业务层拆分 key"
+      ],
+      "sources": [
         {
-          "question": "为什么 ZSet 通常同时需要哈希表和跳表？",
-          "answer": "哈希表用于按成员快速查分数，跳表用于按分数做范围和排名；只保留一种结构会让其中一类操作退化。"
+          "kind": "mermaid",
+          "content": "flowchart TD\n    CMD[写入命令 SADD/HSET/ZADD/LPUSH] --> CHECK{检查当前编码}\n    CHECK -->|intset/listpack 紧凑编码| THRESHOLD{元素数或单元素大小超阈值?}\n    THRESHOLD -->|否| KEEP[保持紧凑编码 O log N 或 O N 遍历]\n    THRESHOLD -->|是| CONVERT[同步阻塞转换为通用编码]\n    CONVERT --> HASHTABLE[hashtable: 查找 O 1 内存开销增大]\n    CONVERT --> SKIPLIST[skiplist+hashtable: 范围 O log N 内存翻倍]\n    CONVERT --> QUICKLIST[quicklist: 多 node listpack 可压缩]\n    CHECK -->|已是通用编码| DIRECT[直接写入 不可逆]\n    HASHTABLE --> RISK{数据规模持续增长?}\n    SKIPLIST --> RISK\n    QUICKLIST --> RISK\n    RISK -->|是| BIGKEY[大 key: DEL 阻塞 复制延迟 RDB 膨胀]\n    RISK -->|否| NORMAL[正常 O 1 或 O log N 操作]\n    BIGKEY --> DIAG[排查: SLOWLOG + MEMORY USAGE + OBJECT ENCODING]\n    DIAG --> FIX[UNLINK 异步删除 / SSCAN 分批 / 拆分 key]"
         },
         {
-          "question": "线上发现 Redis 延迟升高，数据结构层面先看什么？",
-          "answer": "先查 slowlog 和 bigkeys，确认是否有大 Hash、大 ZSet、全量集合运算或范围查询，再结合内存占用和网络返回量判断。"
+          "kind": "text",
+          "content": "写入命令检查当前编码，紧凑编码下若元素数或大小超阈值则同步转换为通用编码（hashtable/skiplist/quicklist），转换不可逆；通用编码下数据持续增长会形成大 key，需通过 SLOWLOG、MEMORY USAGE、OBJECT ENCODING 排查并用 UNLINK 或分批拆分处理。"
+        }
+      ]
+    },
+    {
+      "type": "code",
+      "title": "线上排查大 key 与编码状态的常用命令",
+      "content": "# 1. 查看单个 key 的底层编码（确认是否已从紧凑编码升级）\nredis-cli OBJECT ENCODING user:tags:1001\n# intset -> 说明 Set 全整数且 <= 512 元素\n# hashtable -> 说明 Set 已升级，可能含非整数或元素过多\n\n# 2. 精确测量 key 内存占用（SAMPLES 0 表示全量扫描）\nredis-cli MEMORY USAGE user:tags:1001 SAMPLES 0\n# 返回字节数，超过 10MB 通常需要关注\n\n# 3. 采样发现大 key（生产环境低峰执行）\nredis-cli --bigkeys -i 0.1\n# -i 0.1 表示每 100 条命令休眠 0.1 秒，降低对线上影响\n\n# 4. 查看慢命令日志\nredis-cli SLOWLOG GET 10\n# 关注 command 名称、执行时长（微秒）和参数长度\n\n# 5. 异步删除大 key（Redis 4.0+，不阻塞主线程）\nredis-cli UNLINK user:tags:1001\n# 底层通过 bio 线程异步释放内存\n\n# 6. 分批遍历大 Set 替代 SMEMBERS\nredis-cli SSCAN user:tags:1001 0 COUNT 100\n# 返回游标和一批元素，循环直到游标为 0",
+      "language": "bash",
+      "highlights": [
+        {
+          "line": 2,
+          "note": "OBJECT ENCODING 返回当前编码名称，用于判断紧凑编码是否已不可逆升级"
+        },
+        {
+          "line": 7,
+          "note": "SAMPLES 0 全量采样精确测量，默认只采样 5 个元素可能低估"
+        },
+        {
+          "line": 11,
+          "note": "-i 参数控制采样间隔避免阻塞主线程，生产排查必备"
+        },
+        {
+          "line": 19,
+          "note": "UNLINK 通过 bio 后台线程异步释放内存，避免 DEL 的同步阻塞"
+        },
+        {
+          "line": 23,
+          "note": "SSCAN 分批遍历替代 SMEMBERS 全量返回，控制单次网络传输量"
+        }
+      ]
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "面试回答思路",
+      "content": "Redis 数据结构要从外部类型、内部编码和命令复杂度三层一起回答，核心是编码切换机制和它带来的工程影响。\n\n**30 秒结论**：Redis 五种类型只是对外 API，底层编码会随元素数量和大小在紧凑编码（listpack/intset）和通用编码（hashtable/skiplist/quicklist）之间切换，切换是同步阻塞且不可逆的。命令延迟取决于编码后的数据结构复杂度和数据规模，大 key 会放大单线程模型的风险。\n\n**机制要点**：\n- String：embstr（≤44B 一次分配）→ raw（超 44B 两次分配），整数走 int 编码\n- Hash：listpack（≤128 元素且 ≤64B/field）→ hashtable（O(1) 查找，指针开销大）\n- List：quicklist（listpack node 组成的双向链表，可配置压缩深度）\n- Set：intset（全整数 ≤512，有序数组二分查找）→ hashtable（含非整数或超阈值）\n- ZSet：listpack → skiplist+hashtable 双结构，hashtable 查 member→score，skiplist 做范围和排名\n- 编码切换在写入命令的后续检查中触发（如 `setTypeAdd` 中检查 intset 转换条件），转换不可逆\n\n**边界与追问应对**：\n- 不要死背阈值数字，要能解释「小对象省内存用紧凑编码，大对象保效率用通用编码」的设计思想\n- 集合运算（SINTER O(N×M)）和范围查询（ZRANGE 全量返回）是线上延迟高发的命令模式\n- 排查路径：SLOWLOG → MEMORY USAGE → OBJECT ENCODING → UNLINK/SSCAN 分批处理\n- 编码升级不可逆意味着一次误写大 value 会永久改变内存特征，需要监控 OBJECT ENCODING 变化",
+      "followUpQuestions": [
+        {
+          "question": "为什么 ZSet 同时需要哈希表和跳表，只用跳表不行吗？",
+          "answer": "跳表按 score 有序，支持 O(log N) 的范围查询和排名，但按 member 查 score 需要遍历跳表 O(N)。哈希表提供 member→score 的 O(1) 查找，两者互补。如果只用跳表，ZSCORE 命令会退化到 O(N)；如果只用哈希表，ZRANGEBYSCORE 需要全量排序 O(N log N)。双结构的代价是每个元素多存一份指针（约 16 字节），但保证了所有核心操作都在 O(log N) 或 O(1)。"
+        },
+        {
+          "question": "线上发现 Redis 延迟突增，数据结构层面怎么排查？",
+          "answer": "第一步 `SLOWLOG GET 10` 看是否有大集合运算（SINTER/SUNION）或全量范围命令（LRANGE 0 -1 / ZRANGE 0 -1）。第二步 `MEMORY USAGE <key> SAMPLES 0` 确认可疑 key 的实际内存占用。第三步 `OBJECT ENCODING <key>` 看编码是否已从紧凑编码升级——如果一个小 Hash 意外变成 hashtable，说明曾经写入过超阈值的大 value。第四步用 `LATENCY DOCTOR` 看是否有 `big-del` 或 `expire-cycle` 事件。确认后用 `UNLINK` 异步删除或 `SSCAN`/`HSCAN` 分批迁移拆分。"
+        },
+        {
+          "question": "Set 从 intset 升级到 hashtable 后，删除多余元素能降回去吗？为什么这样设计？",
+          "answer": "不能降级。Redis 的编码转换是单向的，`setTypeConvert` 只负责 intset→hashtable，没有反向路径。设计上是为了避免频繁在两种编码间振荡：如果每次删除元素到阈值以下就降级，下次插入又升级，反复的全量数据拷贝开销远大于保持 hashtable 的额外内存开销。工程上的影响是：一次误插入非整数元素到整数 Set，就会永久承受 hashtable 的指针开销，所以写入前应确保元素类型一致。"
         }
       ]
     },
@@ -147,5 +213,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-18"
 }

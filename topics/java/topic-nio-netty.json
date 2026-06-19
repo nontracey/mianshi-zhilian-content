@@ -4,7 +4,7 @@
   "category": "java-fundamentals",
   "group": "java-fundamentals",
   "title": "Java IO/NIO 体系与 Netty",
-  "summary": "讲清 BIO/NIO/AIO 模型、NIO 三件套与 Reactor、Netty 的 EventLoop/Pipeline/ByteBuf/主从 Reactor，以及 EventLoop 不能阻塞等边界。",
+  "summary": "这篇要把 BIO/NIO/AIO、NIO 三件套、Reactor、Netty EventLoop/Pipeline/ByteBuf、拆包和阻塞隔离串成一条真实请求链路。",
   "tags": [
     "Java",
     "NIO",
@@ -14,74 +14,124 @@
   "difficulty": 4,
   "estimatedMinutes": 28,
   "order": 120,
-  "recommendWeight": 85,
+  "recommendWeight": 86,
   "learningCards": [
     {
       "type": "explain",
-      "title": "BIO / NIO / AIO 与 Reactor",
-      "content": "## 三种 IO 模型\n- **BIO（同步阻塞）**：一连接一线程，`accept`/`read` 都阻塞。连接数多时线程爆炸、大量线程在阻塞，吞吐差。\n- **NIO（同步非阻塞 + 多路复用）**：三件套 **Channel / Buffer / Selector**。一个线程用 `Selector` 同时监听多个 Channel 的就绪事件（底层就是 epoll），就绪才处理，单线程撑大量连接。注意 NIO 的“非阻塞”指 Channel 配置非阻塞 + Selector 多路复用，不是真异步。\n- **AIO（异步非阻塞）**：发起读写后由内核完成再回调（Proactor）。Linux 下 JDK 的 AIO 仍用 epoll 模拟，优势不明显，生产少用。\n\n## Reactor 模型\nNIO 的工程化范式：用一个/一组 `Selector` 线程（Reactor）负责事件分发，IO 就绪后把任务派给处理器。这正是 Netty、Redis、Nginx 的网络骨架。"
+      "title": "BIO、NIO、AIO：先分清阻塞语义",
+      "content": "BIO 是同步阻塞模型，常见写法是一连接一线程，`accept/read/write` 会阻塞当前线程。连接数少、逻辑简单时开发成本低；连接多、长连接多或慢客户端多时，线程数量、内存栈和上下文切换会先成为瓶颈。\n\nNIO 是同步非阻塞 + 多路复用：`Channel` 设为非阻塞，`Selector` 等待多个 Channel 的就绪事件，`Buffer` 承载读写数据。Selector 只告诉应用“可以读/可以写/有新连接”，真正的 `read/write` 仍由应用线程执行，所以 NIO 不是异步 IO。Linux 上常见底层是 epoll，macOS 等平台会有不同实现，Java API 统一抽象为 Selector。\n\nAIO 通过异步 Channel、Future 或 CompletionHandler 表达完成通知，但 Java 网络服务生态里，主流高并发框架仍以 NIO/Reactor 为核心。面试回答不要简单把 AIO 说成 NIO 的升级版，要回到平台实现、框架生态、排障经验和收益验证。"
     },
     {
       "type": "explain",
-      "title": "Netty：为什么用它，核心组件",
-      "content": "## 为什么不用裸 NIO\n裸 NIO 的 API 繁琐、有 epoll 空轮询导致 CPU 100% 的 JDK bug、还要自己处理拆包粘包与内存管理。Netty 封装了这些并提供高性能抽象。\n\n## 核心组件\n- **EventLoop**：绑定一个线程 + 一个 Selector，串行处理注册到它的所有 Channel 的 IO 事件与任务，无锁化设计。\n- **Channel + ChannelPipeline**：每个连接一个 Channel，Pipeline 是一条 **ChannelHandler 责任链**，入站/出站事件依次流过各 Handler（编解码、业务逻辑）。\n- **ByteBuf**：替代 NIO ByteBuffer，读写双指针、**池化**复用减少 GC、支持**零拷贝**（CompositeByteBuf、slice、文件区域 transferTo）。\n- **主从 Reactor**：`bossGroup`（少量线程）只负责 `accept` 新连接，`workerGroup` 负责已建立连接的读写。对应 epoll 的分工，充分利用多核。\n\n## 选型\n高并发长连接、自定义协议网关、RPC 框架（Dubbo/gRPC-Java 底层）都用 Netty。"
+      "title": "Reactor 到 Netty：线程模型和事件路径",
+      "content": "Reactor 是 NIO 的工程化范式：事件循环线程等待就绪事件，再分发给 Handler。单 Reactor 模型简单，但 accept、read/write、业务处理都压在少量线程上；主从 Reactor 把 boss 和 worker 拆开，boss 负责接入连接，worker 负责连接上的读写事件，更适合多核和大量长连接。\n\nNetty 把 Reactor 封装成 EventLoopGroup。一个 Channel 注册到一个 EventLoop 后，该 Channel 的 IO 事件在同一个 EventLoop 线程内串行处理，这能减少锁竞争；代价是 EventLoop 不能执行慢 SQL、远程 RPC、阻塞文件 IO、复杂 CPU 任务或长时间同步等待。慢任务要交给业务线程池、DefaultEventExecutorGroup 或异步化组件，完成后再把结果写回 Channel。"
+    },
+    {
+      "type": "explain",
+      "title": "Pipeline、ByteBuf 和网络协议边界",
+      "content": "每个 Netty Channel 有一条 ChannelPipeline。入站事件通常从 head 到 tail 传播，出站事件通常反向传播。常见顺序是：FrameDecoder 切出完整消息，协议解码器把 ByteBuf 变成业务对象，鉴权/限流/业务 Handler 处理，出站编码器再把响应写成字节。\n\nTCP 是字节流，没有消息边界。自定义协议必须用固定长度、分隔符、长度字段或更完整的协议编解码器处理粘包和半包。ByteBuf 比 ByteBuffer 更适合网络协议：读写指针分离、直接内存/池化、slice/composite 减少拷贝；但它有引用计数，retain/release 错误会造成内存泄漏，线上要关注 leak detector、直接内存使用和 Handler ownership。"
+    },
+    {
+      "type": "explain",
+      "title": "线上排查不只背组件名",
+      "content": "Netty 线上问题通常沿着事件路径查：accept 队列和文件描述符是否打满，EventLoop lag 是否升高，是否有 Handler 在 EventLoop 中阻塞，Pipeline 顺序是否把业务 Handler 放在解码前，是否缺少 FrameDecoder，ByteBuf 是否泄漏，写缓冲高水位是否长期不可写。\n\n背压也要说清。写入速度超过对端接收能力时，Channel outbound buffer 会膨胀，Netty 通过高/低水位和 `channelWritabilityChanged` 暴露可写状态。业务层应暂停读、限速、丢弃低优先级消息或降级，而不是持续堆积 ByteBuf。"
     },
     {
       "type": "diagram",
-      "format": "mermaid",
-      "title": "从 BIO 到 NIO 到 Netty",
-      "content": "flowchart TD\nA[\"BIO 一连接一线程，阻塞，线程爆炸\"] --> B[\"NIO Channel/Buffer/Selector 多路复用，一线程管多连接\"]\nB --> C[\"Reactor 模型：Selector 分发事件\"]\nC --> D[\"Netty 封装：EventLoop + Pipeline + ByteBuf + 主从 Reactor\"]\nD --> E[\"bossGroup accept，workerGroup 读写，利用多核\"]",
-      "caption": "从 BIO（一连接一线程）到 NIO（Selector 多路复用）到 Netty（EventLoop、Pipeline、ByteBuf、主从 Reactor 封装），是高并发网络编程的演进主线。",
-      "fallback": "BIO 一连接一线程、阻塞；NIO 用 Channel/Buffer/Selector 多路复用、一线程管多连接；Reactor 模型用 Selector 分发事件；Netty 封装成 EventLoop 加 Pipeline 加 ByteBuf 加主从 Reactor，bossGroup accept、workerGroup 读写。"
-    },
-    {
-      "type": "compareTable",
-      "title": "BIO / NIO / AIO 对比",
-      "content": "| 对比项 | BIO | NIO | AIO |\n| --- | --- | --- | --- |\n| 阻塞模型 | 同步阻塞 | 同步非阻塞+多路复用 | 异步非阻塞 |\n| 连接:线程 | 1:1 | N:1（Selector） | 回调，无固定绑定 |\n| 底层 | accept/read 阻塞 | epoll/kqueue | Linux 仍 epoll 模拟 |\n| 适用 | 连接少、逻辑简单 | 高并发长连接 | 理论高并发，实践少 |"
-    },
-    {
-      "type": "code",
-      "title": "代码示例",
-      "content": "import java.nio.ByteBuffer;\nimport java.nio.channels.*;\nimport java.net.InetSocketAddress;\nimport java.util.Iterator;\n\npublic class NioEchoServer {\n    public static void main(String[] args) throws Exception {\n        Selector selector = Selector.open();\n        ServerSocketChannel ssc = ServerSocketChannel.open();\n        ssc.bind(new InetSocketAddress(8080));\n        ssc.configureBlocking(false);                 // 非阻塞\n        ssc.register(selector, SelectionKey.OP_ACCEPT);\n        while (true) {\n            selector.select();                         // 阻塞直到有就绪事件\n            Iterator<SelectionKey> it = selector.selectedKeys().iterator();\n            while (it.hasNext()) {\n                SelectionKey key = it.next();\n                it.remove();\n                if (key.isAcceptable()) {\n                    SocketChannel ch = ssc.accept();\n                    ch.configureBlocking(false);\n                    ch.register(selector, SelectionKey.OP_READ);\n                } else if (key.isReadable()) {\n                    SocketChannel ch = (SocketChannel) key.channel();\n                    ByteBuffer buf = ByteBuffer.allocate(1024);\n                    if (ch.read(buf) > 0) { buf.flip(); ch.write(buf); }\n                }\n            }\n        }\n    }\n}",
-      "language": "java",
-      "highlights": [
+      "title": "NIO Reactor 与 Netty Pipeline 全链路",
+      "content": "assets/diagrams/java-nio-netty-reactor-pipeline.svg",
+      "caption": "图中从 BIO/NIO/AIO 定位进入 Netty 主从 Reactor，再展开 EventLoop、Pipeline、ByteBuf、FrameDecoder、慢任务隔离和线上诊断指标。",
+      "fallback": "NIO 使用 Channel/Buffer/Selector 做同步非阻塞多路复用；Reactor 用事件循环分发就绪事件。Netty 的 boss EventLoop 接入连接，worker EventLoop 处理读写，Pipeline 组织入站/出站 Handler，ByteBuf 管理网络字节，FrameDecoder 解决粘包半包。EventLoop 不能阻塞，线上关注 EventLoop lag、ByteBuf 泄漏、写缓冲水位和连接队列。",
+      "format": "svg",
+      "sources": [
         {
-          "line": 14,
-          "note": "这里通过多路等待处理并发分支，重点说明不同事件到达时的状态变化。"
+          "kind": "svg",
+          "path": "assets/diagrams/java-nio-netty-reactor-pipeline.svg"
+        },
+        {
+          "kind": "text",
+          "content": "NIO 使用 Channel/Buffer/Selector 做同步非阻塞多路复用；Reactor 用事件循环分发就绪事件。Netty 的 boss EventLoop 接入连接，worker EventLoop 处理读写，Pipeline 组织入站/出站 Handler，ByteBuf 管理网络字节，FrameDecoder 解决粘包半包。EventLoop 不能阻塞，线上关注 EventLoop lag、ByteBuf 泄漏、写缓冲水位和连接队列。"
         }
       ]
     },
     {
-      "type": "interviewAnswer",
-      "title": "面试回答思路",
-      "content": "结论：这块要按「BIO 到 NIO 到 Netty」一条线讲。BIO 一连接一线程、阻塞，连接多了线程爆炸；NIO 用 Channel/Buffer/Selector 多路复用、一个线程管大量连接（底层 epoll）；Netty 是对 NIO 的工程化封装，解决了裸 NIO 的各种坑，是高并发网络编程的事实标准。\n\n三种 IO 模型：\n\n1. BIO（同步阻塞）：accept、read 都阻塞，一连接一线程，吞吐差。\n2. NIO（同步非阻塞加多路复用）：三件套 Channel、Buffer、Selector，一个线程用 Selector 监听多个 Channel 的就绪事件、就绪才处理。注意它是「同步非阻塞」不是异步——就绪后那次 read 仍要自己做。\n3. AIO（异步）：发起读写后内核完成再回调，但 Linux 下 JDK AIO 用 epoll 模拟、优势不明显，生产少用。\n\nReactor 模型是 NIO 的工程范式：Selector 线程负责事件分发，就绪后派给处理器。Netty、Redis、Nginx 都是这个骨架。\n\n为什么用 Netty 不用裸 NIO：裸 NIO API 繁琐、有 epoll 空轮询导致 CPU 100% 的 JDK bug、还要自己处理粘包拆包和内存。Netty 核心组件：\n\n1. EventLoop：一个线程加一个 Selector，串行处理它名下所有 Channel 的事件，无锁化。\n2. Channel 加 ChannelPipeline：每连接一个 Channel，Pipeline 是 ChannelHandler 责任链，入站出站事件依次流过（编解码、业务）。\n3. ByteBuf：替代 ByteBuffer，读写双指针、池化复用减少 GC、支持零拷贝。\n4. 主从 Reactor：bossGroup 只 accept 新连接，workerGroup 负责读写，对应 epoll 分工、利用多核。\n\n边界。① EventLoop 线程里绝不能做耗时阻塞操作（DB、远程调用），会卡住它名下所有连接，要丢到业务线程池。② 自定义协议必须自己处理粘包拆包，Netty 提供 LengthFieldBasedFrameDecoder 等解码器。",
-      "followUpQuestions": [
+      "type": "compareTable",
+      "title": "BIO / NIO / AIO 与 Netty 选型",
+      "content": "| 维度 | BIO | NIO | AIO | Netty |\n| --- | --- | --- | --- | --- |\n| 阻塞语义 | 同步阻塞 | 同步非阻塞 + 多路复用 | 异步完成通知 | 基于 NIO/Reactor 的工程化框架 |\n| 线程关系 | 常见一连接一线程 | 少量线程监听大量 Channel | 由异步 ChannelGroup/实现管理 | boss/worker EventLoopGroup |\n| 编程负担 | 简单但扩展差 | Selector、Buffer、状态机复杂 | 平台和生态差异需评估 | 封装编解码、Pipeline、内存管理 |\n| 协议边界 | 仍需处理字节流 | 仍需处理粘包/半包 | 仍需协议解码 | 提供多类 FrameDecoder |\n| 适合场景 | 连接少、简单内部工具 | 高并发网络框架底层 | 特定场景验证后使用 | RPC、网关、长连接、协议服务器 |\n| 常见误区 | 线程池能兜住所有阻塞 | 把 NIO 当异步 IO | 认为 AIO 是 NIO 的升级版 | 只背组件名，不会讲请求路径 |"
+    },
+    {
+      "type": "code",
+      "title": "Java 可运行：Selector Echo 与长度字段拆包",
+      "content": "import java.io.IOException;\nimport java.net.InetSocketAddress;\nimport java.nio.ByteBuffer;\nimport java.nio.channels.SelectionKey;\nimport java.nio.channels.Selector;\nimport java.nio.channels.ServerSocketChannel;\nimport java.nio.channels.SocketChannel;\nimport java.nio.charset.StandardCharsets;\nimport java.util.ArrayList;\nimport java.util.Iterator;\nimport java.util.List;\nimport java.util.Locale;\n\npublic class Main {\n    static final class LengthFieldCodec {\n        private final ByteBuffer cumulation = ByteBuffer.allocate(1024);\n\n        static ByteBuffer encode(String text) {\n            byte[] body = text.getBytes(StandardCharsets.UTF_8);\n            ByteBuffer out = ByteBuffer.allocate(Integer.BYTES + body.length);\n            out.putInt(body.length).put(body).flip();\n            return out;\n        }\n\n        List<String> feed(ByteBuffer incoming) {\n            cumulation.put(incoming);\n            cumulation.flip();\n            List<String> messages = new ArrayList<>();\n            while (cumulation.remaining() >= Integer.BYTES) {\n                cumulation.mark();\n                int length = cumulation.getInt();\n                if (length < 0 || length > 512) throw new IllegalArgumentException(\"bad frame length: \" + length);\n                if (cumulation.remaining() < length) {\n                    cumulation.reset();\n                    break;\n                }\n                byte[] body = new byte[length];\n                cumulation.get(body);\n                messages.add(new String(body, StandardCharsets.UTF_8));\n            }\n            cumulation.compact();\n            return messages;\n        }\n    }\n\n    public static void main(String[] args) throws Exception {\n        try (Selector selector = Selector.open();\n             ServerSocketChannel server = ServerSocketChannel.open();\n             SocketChannel client = SocketChannel.open()) {\n\n            server.bind(new InetSocketAddress(\"127.0.0.1\", 0));\n            server.configureBlocking(false);\n            server.register(selector, SelectionKey.OP_ACCEPT);\n            int port = ((InetSocketAddress) server.getLocalAddress()).getPort();\n\n            client.configureBlocking(false);\n            client.connect(new InetSocketAddress(\"127.0.0.1\", port));\n            client.register(selector, SelectionKey.OP_CONNECT);\n\n            LengthFieldCodec serverCodec = new LengthFieldCodec();\n            LengthFieldCodec clientCodec = new LengthFieldCodec();\n            ByteBuffer clientOutbound = LengthFieldCodec.encode(\"ping\");\n            SocketChannel accepted = null;\n            String response = null;\n\n            for (int loops = 0; response == null && loops < 1000; loops++) {\n                selector.select(100);\n                Iterator<SelectionKey> keys = selector.selectedKeys().iterator();\n                while (keys.hasNext()) {\n                    SelectionKey key = keys.next();\n                    keys.remove();\n                    if (!key.isValid()) continue;\n\n                    if (key.isAcceptable()) {\n                        accepted = server.accept();\n                        accepted.configureBlocking(false);\n                        accepted.register(selector, SelectionKey.OP_READ);\n                    }\n                    if (key.isConnectable()) {\n                        SocketChannel ch = (SocketChannel) key.channel();\n                        if (ch.finishConnect()) key.interestOps(SelectionKey.OP_WRITE | SelectionKey.OP_READ);\n                    }\n                    if (key.isWritable()) {\n                        SocketChannel ch = (SocketChannel) key.channel();\n                        ch.write(clientOutbound);\n                        if (!clientOutbound.hasRemaining()) {\n                            key.interestOps((key.interestOps() & ~SelectionKey.OP_WRITE) | SelectionKey.OP_READ);\n                        }\n                    }\n                    if (key.isReadable()) {\n                        SocketChannel ch = (SocketChannel) key.channel();\n                        ByteBuffer chunk = ByteBuffer.allocate(64);\n                        int read = ch.read(chunk);\n                        if (read < 0) throw new IOException(\"channel closed\");\n                        chunk.flip();\n                        if (ch == client) {\n                            List<String> messages = clientCodec.feed(chunk);\n                            if (!messages.isEmpty()) response = messages.get(0);\n                        } else {\n                            for (String msg : serverCodec.feed(chunk)) {\n                                ByteBuffer reply = LengthFieldCodec.encode(msg.toUpperCase(Locale.ROOT));\n                                while (reply.hasRemaining()) ch.write(reply);\n                            }\n                        }\n                    }\n                }\n            }\n            if (accepted != null) accepted.close();\n\n            System.out.println(\"server port: \" + port);\n            System.out.println(\"client response: \" + response);\n            assert \"PING\".equals(response);\n        }\n    }\n}",
+      "language": "java",
+      "highlights": [
         {
-          "question": "Netty 的 EventLoop 里能做耗时阻塞操作吗？",
-          "answer": "不能。一个 EventLoop 串行处理绑定到它的所有 Channel，阻塞操作会拖垮这些连接的响应。耗时任务应提交到独立业务线程池（如 DefaultEventExecutorGroup），处理完再写回。"
+          "line": 25,
+          "note": "LengthFieldCodec 模拟 Netty LengthFieldBasedFrameDecoder 的核心：先累计字节，再按长度字段切完整消息。"
         },
         {
-          "question": "Netty 如何解决 TCP 粘包/拆包？",
-          "answer": "TCP 是字节流无消息边界，Netty 在 Pipeline 前置解码 Handler：定长（FixedLengthFrameDecoder）、分隔符（DelimiterBasedFrameDecoder）、或长度字段（LengthFieldBasedFrameDecoder）来切分出完整消息再交给业务 Handler。"
+          "line": 52,
+          "note": "ServerSocketChannel 注册 OP_ACCEPT，Selector 负责等待连接接入事件。"
+        },
+        {
+          "line": 57,
+          "note": "客户端非阻塞 connect 后先监听 OP_CONNECT，连接完成再切到写/读事件。"
+        },
+        {
+          "line": 76,
+          "note": "accept 后的新 SocketChannel 也必须配置非阻塞并注册到 Selector。"
+        },
+        {
+          "line": 93,
+          "note": "Selector 只通知可读；真正 read 仍由当前事件循环线程执行，所以 NIO 不是异步 IO。"
+        },
+        {
+          "line": 102,
+          "note": "服务端收到完整消息后再编码响应；真实 Netty 中这类逻辑通常拆到 Pipeline 的 decoder/handler/encoder。"
+        }
+      ]
+    },
+    {
+      "type": "explain",
+      "title": "面试回答抓手",
+      "content": "回答这题按 BIO → NIO → Reactor → Netty 讲最清楚。BIO 同步阻塞，连接多时线程和上下文切换先顶不住；NIO 用 Channel、Buffer、Selector 做同步非阻塞多路复用，但就绪后的读写仍由应用线程执行；Reactor 把 Selector 事件循环和 Handler 分发组织起来；Netty 则把主从 Reactor、Pipeline、ByteBuf、编解码和内存管理工程化。\n\nNetty 核心要落到请求路径：boss EventLoop accept 新连接，worker EventLoop 处理读写，入站 Pipeline 先做 FrameDecoder，再解码、鉴权、业务处理；慢任务不能卡 EventLoop，应交给业务线程池；出站再编码写回。线上排查看 EventLoop lag、连接队列、写缓冲水位、ByteBuf leak、Handler 顺序和协议拆包。"
+    },
+    {
+      "type": "interviewAnswer",
+      "title": "追问拆解",
+      "content": "如果被问 EventLoop 为什么不能阻塞，回答要强调一个 EventLoop 管多个 Channel，阻塞一个慢任务会拖慢这批连接；如果被问粘包拆包，先说 TCP 是字节流，再说固定长度、分隔符、长度字段和协议编解码器；如果被问 ByteBuf，抓住读写指针分离、池化、直接内存、引用计数、slice/composite 和 leak detector。",
+      "followUpQuestions": [
+        {
+          "question": "NIO 为什么不是异步 IO？",
+          "answer": "Selector 只告诉应用哪些 Channel 已经就绪，应用线程仍要自己调用 read/write 完成数据拷贝和处理。异步 IO 的关注点是提交操作后由系统或运行时在完成时通知。NIO 更准确地说是同步非阻塞加多路复用。"
+        },
+        {
+          "question": "Netty 如何解决 TCP 粘包和半包？",
+          "answer": "在 Pipeline 前置 FrameDecoder，把字节流切成完整协议帧。常见方案包括 FixedLengthFrameDecoder、DelimiterBasedFrameDecoder、LineBasedFrameDecoder、LengthFieldBasedFrameDecoder，生产自定义二进制协议最常用长度字段。"
+        },
+        {
+          "question": "EventLoop 被阻塞时线上会看到什么现象？",
+          "answer": "同一个 EventLoop 负责的一批 Channel 延迟同时升高，心跳超时、读写积压、写缓冲水位升高，线程栈可能停在慢 SQL、RPC、锁等待或文件 IO。排查看 EventLoop lag、线程栈、任务队列、GC 和业务日志时间线。"
         }
       ]
     },
     {
       "type": "checklist",
-      "title": "学完后应能说清楚",
+      "title": "自查清单",
       "items": [
-        "能区分 BIO/NIO/AIO 的阻塞模型和连接线程关系",
-        "能说出 NIO 三件套 Channel/Buffer/Selector 与底层 epoll 的关系",
-        "能讲清 Netty 的 EventLoop、ChannelPipeline、ByteBuf 作用",
-        "能解释主从 Reactor 的 boss/worker 分工",
-        "能说明 Netty 如何处理拆包粘包、EventLoop 为何不能阻塞"
+        "能区分 BIO/NIO/AIO 的阻塞模型、连接线程关系和适用边界",
+        "能说清 Channel、Buffer、Selector 与 Reactor 的关系",
+        "能讲清 Netty 的 boss/worker EventLoop、ChannelPipeline、ByteBuf、FrameDecoder 职责",
+        "能说明 TCP 是字节流，协议必须处理粘包和半包",
+        "能解释 EventLoop 为什么不能阻塞，以及慢任务如何隔离",
+        "能用 EventLoop lag、写水位、ByteBuf leak、连接数和 Handler 顺序定位线上问题"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "java.java-fundamentals.topic-nio-netty.recall.1",
-      "prompt": "请对比 BIO、NIO、AIO 的阻塞模型、连接与线程关系和底层实现。",
+      "prompt": "请对比 BIO、NIO、AIO 的阻塞模型、连接与线程关系，以及为什么 NIO 不是异步 IO。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
@@ -95,28 +145,39 @@
     },
     {
       "id": "java.java-fundamentals.topic-nio-netty.recall.3",
-      "prompt": "Netty 是怎么解决 TCP 粘包拆包的？说说几种常用解码器和各自的适用场景。",
+      "prompt": "Netty 是怎么解决 TCP 粘包拆包的？长度字段解码器为什么要处理半包累计？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "java.java-fundamentals.topic-nio-netty.recall.4",
+      "prompt": "EventLoop 被慢任务阻塞时会出现哪些线上症状？你会看哪些指标、日志和线程栈？",
+      "mode": "text",
+      "expectedMinutes": 4,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能区分 BIO/NIO/AIO 三种模型",
-      "能说出 NIO 三件套 Channel/Buffer/Selector 和多路复用",
-      "能讲清 Netty 的 EventLoop、Pipeline、ByteBuf、主从 Reactor",
-      "能指出 EventLoop 不能做阻塞操作"
+      "能区分 BIO/NIO/AIO 的阻塞语义和连接线程关系",
+      "能说清 Channel/Buffer/Selector 与 Reactor 的关系",
+      "能讲清 Netty EventLoop、Pipeline、ByteBuf、FrameDecoder 的职责",
+      "能指出 EventLoop 不能阻塞和 TCP 粘包拆包必须处理",
+      "能说明 NIO 不是异步 IO，Selector 只通知就绪"
     ],
     "goodToHave": [
-      "能解释 Reactor 模型和 epoll 的关系",
-      "能说明 ByteBuf 池化和零拷贝",
-      "能说出裸 NIO 的 epoll 空轮询 bug"
+      "能解释主从 Reactor 的 boss/worker 分工",
+      "能说明 ByteBuf 池化、引用计数、slice/composite 和泄漏检测",
+      "能用 EventLoop lag、写水位、连接数、ByteBuf leak、Handler 顺序定位问题",
+      "能说明写缓冲高低水位和 channelWritabilityChanged 的背压意义"
     ],
     "commonMistakes": [
       "把 NIO 当成异步 IO",
-      "在 EventLoop 线程里做阻塞操作卡住所有连接",
-      "自定义协议不处理粘包拆包"
+      "在 EventLoop 线程里做阻塞操作卡住多个连接",
+      "自定义协议不处理粘包/半包",
+      "只背 Netty 组件名，说不出一条请求如何穿过 Pipeline",
+      "忽略 ByteBuf 引用计数和直接内存泄漏"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -125,12 +186,12 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-19",
   "status": "production",
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否按 BIO→NIO→Netty 讲清演进、说明 NIO 多路复用和 Reactor、Netty 核心组件，并知道 EventLoop 不能阻塞、粘包处理。",
+  "interviewerFocus": "重点考察候选人能否按 BIO→NIO→Reactor→Netty 讲清演进，并能落到 Selector 就绪语义、EventLoop 阻塞风险、Pipeline 请求路径、ByteBuf 引用计数、FrameDecoder 拆包和线上排查指标。",
   "prerequisites": [
     "os.io-model.topic-select-poll-epoll",
-    "java.java-fundamentals.topic-028-905d9b58"
+    "java.java-fundamentals.topic-stream-api"
   ]
 }

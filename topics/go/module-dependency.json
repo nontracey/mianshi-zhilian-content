@@ -25,12 +25,12 @@
     {
       "type": "explain",
       "title": "go.mod / go.sum 字段拆解：依赖元数据的最小集",
-      "content": "Go Module 在 Go 1.11 引入、Go 1.16 起默认 GO111MODULE=on,把项目依赖固化成 go.mod + go.sum 两个声明文件,目标是让任何机器在同一 commit 上都能编出 byte-identical 的二进制。\n\ngo.mod 是声明文件,只有五个动词需要记牢:\n- module example.com/app: 声明 module path,它同时是导入路径前缀\n- go 1.22: 声明语言版本,Go 1.21 后这一行还会决定 toolchain 选择\n- require example.com/lib v1.4.2: 直接依赖及其最低可用版本; 加 // indirect 表示是依赖的依赖,通常由 go mod tidy 写入\n- replace old => new: 把某个版本/路径替换成另一个,常用于本地调试 (=> ../lib) 或私有 fork (=> github.com/me/lib v1.4.2-fix)\n- exclude module v1.4.0: 排除依赖图中的某个有 bug 版本,MVS 选择时会跳过它\n- retract v1.5.0: 模块作者声明该版本作废 (Go 1.16+),下游 go get 会收到警告\n\ngo.sum 不是版本声明而是哈希清单,每一行形如 'example.com/lib v1.4.2 h1:abc...',h1: 是模块 zip 的 SHA-256 base64。它有两个作用: (1) 本地下载后比对哈希,防止 GOPROXY 或镜像被劫持; (2) 通过 GOSUMDB=sum.golang.org 这个透明日志做 supply chain 审计。把 GOSUMDB 设成 off 或 GONOSUMCHECK=1 等于关掉 checksum 验证,生产线严禁这么干,只有私仓在 GOPRIVATE 命中时才会自动跳过 sumdb。\n\n容易答浅的边界:误删 go.sum 会让 CI 重新下载并写入,但若期间镜像被换掉,新的哈希会被无声写入,这就是为什么 go.sum 必须进 git 而且 PR review 时要看 diff;// indirect 不是 'optional 依赖',而是 lazy loading 留下的可见性记号,Go 1.17 起 main module 只加载本模块直接用到的包。"
+      "content": "Go Module 在 Go 1.11 引入、Go 1.16 起默认 GO111MODULE=on,把项目依赖固化成 go.mod + go.sum 两个声明文件,目标是让同一 commit 上的依赖图、校验和与语言版本约束都可复现。\n\ngo.mod 是声明文件,常见指令要分清:\n- module example.com/app: 声明 module path,它同时是导入路径前缀\n- go 1.22: 声明最低 Go 语言/模块语义版本;Go 1.21 后它也是工具链的最低要求\n- toolchain go1.22.5: Go 1.21+ 可选指令,建议 go 命令在本模块中使用更具体的工具链版本\n- require example.com/lib v1.4.2: 直接依赖及其最低可用版本; 加 // indirect 表示本模块源码未直接 import,但依赖图仍需要它\n- replace old => new: 只在 main module / workspace 生效,常用于本地调试 (=> ../lib) 或临时私有 fork\n- exclude module v1.4.0: 排除依赖图中的某个有 bug 版本,MVS 选择时会跳过它\n- retract v1.5.0: 模块作者声明该版本作废 (Go 1.16+),下游 go get/go list 会看到警告\n\ngo.sum 不是版本声明而是哈希清单,每一行形如 'example.com/lib v1.4.2 h1:abc...' 或 'example.com/lib v1.4.2/go.mod h1:abc...',h1: 是模块 zip 或 go.mod 内容的 SHA-256 base64。它有两个作用: (1) 本地下载后比对哈希,防止 GOPROXY 或镜像被劫持; (2) 通过 GOSUMDB=sum.golang.org 这个透明日志做 supply chain 审计。把 GOSUMDB=off 或把公共依赖误放进 GONOSUMDB 等于绕过 checksum 防线,生产线严禁这么干;私仓应配置 GOPRIVATE/GONOSUMDB 的精确 glob,让内部路径不泄露到公共 proxy/sumdb。\n\n容易答浅的边界:误删 go.sum 会让 CI 重新下载并写入,但若期间镜像被换掉,新的哈希会进入 diff,这就是为什么 go.sum 必须进 git 而且 PR review 时要看 h1 变化;// indirect 不是 'optional 依赖',而是模块图裁剪和 lazy loading 下保留可复现构建所需的依赖记录。"
     },
     {
       "type": "explain",
       "title": "MVS 与 semver 主版本路径：Go 版本选择的两条铁律",
-      "content": "MVS (Minimum Version Selection) 是 Russ Cox 给 Go 设计的版本选择算法,核心一句话: 在依赖图里,对每个 module,选所有 require 中被指定的那些版本里的最高版本,而不是公网上的 latest。\n\n举例: 你 require A v1.2.0,A 又 require B v1.4.0;另一个直接依赖 C 也 require B v1.5.1。最终 B 解析为 v1.5.1 (1.4.0 与 1.5.1 取 max),即使 B 在 GOPROXY 上已经发到 v1.6.3,MVS 也不会主动升上去。这样的好处是: 构建结果稳定可解释、`go.mod diff` 就是依赖变更的全部真相、不会被传递依赖一夜之间换大版本拖崩。代价是: 安全补丁不会自动跟进,需要主动 `go get -u` 或开 dependabot。\n\n第二条铁律是 semver import compatibility。Go 把 SemVer 的 'major version 不兼容' 物理化进 import path: v0/v1 不写后缀,从 v2 开始 module path 必须以 /v2、/v3 结尾,例如 `github.com/google/uuid` 在升 v2 时要改成 `github.com/google/uuid/v2`,代码里 import 也跟着改。这条规则的好处是 v1 和 v2 可以在同一个二进制里共存 (因为 import path 不同,Go 视为两个完全独立的包),坏处是升级 v2 库等于一次代码搬迁。\n\n命令层面的搭配:\n- `go get example.com/lib@v1.4.2`: 锁定到具体版本,会同时更新 go.mod 与 go.sum\n- `go get -u ./...`: 升级到符合 semver minor/patch 的最新版,不会跨主版本\n- `go get example.com/lib/v2@latest`: 跨主版本必须显式带 /v2\n- `go mod tidy`: 删除未使用 require、补全 indirect、对齐 go.sum\n- `go mod why -m example.com/lib`: 追溯某 module 为什么在依赖图里\n- `go mod graph`: 输出 'requirer requiree@version' 形式的边,用 grep 就能查依赖来源\n- `go.work` (Go 1.18+): 在工作区放多个 module 联调,只在本地生效,不会被发布,适合替代过去把 replace 写进 go.mod 的临时调试。"
+      "content": "MVS (Minimum Version Selection) 是 Russ Cox 给 Go 设计的版本选择算法,核心一句话: 在依赖图里,对每个 module,选所有 require 指定版本里的最大值,而不是公网上的 latest。\n\n举例: 你 require A v1.2.0,A 又 require B v1.4.0;另一个直接依赖 C 也 require B v1.5.1。最终 B 解析为 v1.5.1 (1.4.0 与 1.5.1 取 max),即使 B 在 GOPROXY 上已经发到 v1.6.3,MVS 也不会主动升上去。这样的好处是: 构建结果稳定可解释、`go.mod diff` 就是依赖变更的全部真相、不会被传递依赖一夜之间换大版本拖崩。代价是: 安全补丁不会自动跟进,需要主动 `go get -u`、Renovate/Dependabot 或安全扫描流程推动升级。\n\n第二条铁律是 semver import compatibility。Go 把 SemVer 的 'major version 不兼容' 物理化进 import path: v0/v1 不写后缀,从 v2 开始 module path 必须以 /v2、/v3 结尾,例如 `github.com/urfave/cli/v2`,代码里 import 也要带 `/v2`。这条规则的好处是 v1 和 v2 可以在同一个二进制里共存 (因为 import path 不同,Go 视为两个完全独立的包),坏处是升级 v2 库等于一次 import path 搬迁。\n\n命令层面的搭配:\n- `go get example.com/lib@v1.4.2`: 锁定到具体版本,会同时更新 go.mod 与 go.sum\n- `go get -u ./...`: 升级到符合 semver minor/patch 的较新版本,不会跨主版本改 import path\n- `go get example.com/lib/v2@latest`: 跨主版本必须显式带 /v2\n- `go mod tidy`: 删除未使用 require、补全 indirect、对齐 go.sum\n- `go mod why -m example.com/lib`: 追溯某 module 为什么在依赖图里\n- `go mod graph`: 输出 'requirer requiree@version' 形式的边,用 grep 就能查依赖来源\n- `go.work` (Go 1.18+): 在工作区放多个 module 联调,作用于当前 workspace;团队 monorepo 可以提交,但库发布前不能依赖它替代 go.mod 中真实可解析的依赖。"
     },
     {
       "type": "diagram",
@@ -38,7 +38,17 @@
       "format": "mermaid",
       "content": "flowchart TD\nA[go build / go test] --> B[读 go.mod 的 module/go/require/replace/exclude]\nB --> C[向 GOPROXY 拉取 .mod 列表]\nC --> D[递归构建依赖图]\nD --> E[MVS: 每个模块取被要求的最高最低版本]\nE --> F{命中 replace?}\nF -- 是 --> G[改用 replace 指向的路径或版本]\nF -- 否 --> H[下载 .zip 到 GOMODCACHE]\nG --> I[计算 h1: 哈希]\nH --> I\nI --> J{与 go.sum 一致?}\nJ -- 否 --> K[security error: checksum mismatch 退出]\nJ -- 是 --> L[向 GOSUMDB sum.golang.org 校验]\nL --> M[编译并使用锁定版本]",
       "fallback": "go build 触发后:读 go.mod -> GOPROXY 拉 .mod -> 构建依赖图 -> MVS 选最高最低版本 -> 命中 replace 则改写 -> 下载到 GOMODCACHE -> 算 h1 哈希 -> 与 go.sum 比对 -> GOSUMDB 校验 -> 编译.",
-      "caption": "go.sum 校验和 GOSUMDB 透明日志是 supply chain 防线,任何一步不一致都会直接 build fail。"
+      "caption": "go.sum 校验和 GOSUMDB 透明日志是 supply chain 防线,任何一步不一致都会直接 build fail。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[go build / go test] --> B[读 go.mod 的 module/go/require/replace/exclude]\nB --> C[向 GOPROXY 拉取 .mod 列表]\nC --> D[递归构建依赖图]\nD --> E[MVS: 每个模块取被要求的最高最低版本]\nE --> F{命中 replace?}\nF -- 是 --> G[改用 replace 指向的路径或版本]\nF -- 否 --> H[下载 .zip 到 GOMODCACHE]\nG --> I[计算 h1: 哈希]\nH --> I\nI --> J{与 go.sum 一致?}\nJ -- 否 --> K[security error: checksum mismatch 退出]\nJ -- 是 --> L[向 GOSUMDB sum.golang.org 校验]\nL --> M[编译并使用锁定版本]"
+        },
+        {
+          "kind": "text",
+          "content": "go build 触发后:读 go.mod -> GOPROXY 拉 .mod -> 构建依赖图 -> MVS 选最高最低版本 -> 命中 replace 则改写 -> 下载到 GOMODCACHE -> 算 h1 哈希 -> 与 go.sum 比对 -> GOSUMDB 校验 -> 编译."
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -78,13 +88,13 @@
           "replace",
           "把某 module 路径/版本替换成本地目录或 fork,只对 main module 生效",
           "本地多 repo 联调、紧急打补丁等上游合并、临时绕过 broken 依赖",
-          "把指向 ../lib 的 replace 留进 release tag,下游用户直接 build fail"
+          "把本地 replace 当成发布契约,结果作为依赖时被忽略、作为 main module 构建时又找不到本地路径"
         ],
         [
           "go.work",
           "Go 1.18+ 工作区文件,use ./svc-a ./svc-b 同时编辑多 module 不进 go.mod",
           "微服务 monorepo 本地联调、临时跨模块 refactor",
-          "把 go.work 误 commit 进发布产物,或忘了加 .gitignore"
+          "用 go.work 掩盖 go.mod 缺失依赖,离开 workspace 后 CI 或下游构建才暴露"
         ],
         [
           "GOPROXY",
@@ -93,7 +103,7 @@
           "只配 goproxy.cn 不带 ,direct,私仓 module 也走代理直接 404"
         ],
         [
-          "GOPRIVATE / GONOSUMCHECK",
+          "GOPRIVATE / GONOSUMDB",
           "GOPRIVATE 是 module path glob 列表,命中后跳过 GOPROXY 和 GOSUMDB",
           "公司私仓 git.company.com/* 用 SSH + git config insteadOf 直拉",
           "GOPRIVATE 没设,内部 module path 被发到公共 proxy,触发安全告警"
@@ -104,19 +114,19 @@
       "type": "code",
       "title": "go.mod 全字段示例:require/indirect/replace/exclude/retract",
       "language": "go",
-      "content": "module github.com/acme/orderd\n\ngo 1.22\n\nrequire (\n\tgithub.com/google/uuid/v2 v2.0.1\n\tgithub.com/redis/go-redis/v9 v9.5.1\n\tgolang.org/x/sync v0.7.0\n)\n\nrequire (\n\tgithub.com/cespare/xxhash/v2 v2.2.0 // indirect\n\tgithub.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect\n)\n\n// 紧急打热补丁: 用我们自己 fork 的版本绕过上游 v9.5.1 的连接泄漏\nreplace github.com/redis/go-redis/v9 => github.com/acme/go-redis/v9 v9.5.1-acmefix.2\n\n// 本地联调时用相对路径; 发版前必须删掉,否则下游拉不到\n// replace github.com/acme/payments => ../payments\n\n// 这两个版本有已知数据竞争, 让 MVS 跳过它们\nexclude (\n\tgithub.com/redis/go-redis/v9 v9.4.0\n\tgithub.com/redis/go-redis/v9 v9.4.1\n)\n\n// 我们自己发的 v1.3.0 有 bug, 标记作废, 下游 go get 会收到 'retracted' 警告\nretract (\n\tv1.3.0\n\t[v1.2.0, v1.2.5] // 整个区间都作废\n)",
+      "content": "module example.com/orderd\n\ngo 1.22\n\ntoolchain go1.22.5\n\nrequire (\n\tgithub.com/urfave/cli/v2 v2.27.2\n\tgithub.com/redis/go-redis/v9 v9.5.1\n\tgolang.org/x/sync v0.7.0\n)\n\nrequire (\n\tgithub.com/cespare/xxhash/v2 v2.2.0 // indirect\n\tgithub.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect\n)\n\n// 本地联调时可以临时打开; 发版前必须删掉,否则离开 workspace 后不可复现\n// replace github.com/acme/payments => ../payments\n\n// 示例: 如果项目验证某些版本与当前系统不兼容,可让 MVS 跳过它们\nexclude (\n\tgithub.com/redis/go-redis/v9 v9.4.0\n\tgithub.com/redis/go-redis/v9 v9.4.1\n)\n\n// 本模块自己发的 v1.3.0 有 bug, 标记作废, 下游 go get 会收到 'retracted' 警告\nretract (\n\tv1.3.0\n\t[v1.2.0, v1.2.5] // 整个区间都作废\n)",
       "highlights": [
         {
-          "line": 6,
-          "note": "uuid 升到 v2 主版本时,module path 必须带 /v2,代码里 import 也是 'github.com/google/uuid/v2';v1 和 v2 在 Go 看来是两个独立 module,可同时存在。"
+          "line": 8,
+          "note": "urfave/cli 的 v2 主版本把 /v2 写进 module path,代码 import 也必须是 'github.com/urfave/cli/v2';v1 和 v2 在 Go 看来是两个独立 module,可同时存在。"
         },
         {
-          "line": 11,
+          "line": 14,
           "note": "// indirect 由 go mod tidy 自动写入,表示本模块代码没直接 import,但传递依赖需要它;Go 1.17 lazy loading 后 indirect 列表会精简到 main module 实际触达的部分。"
         },
         {
-          "line": 17,
-          "note": "replace 只对 main module 生效:你的下游用户用这个 module 时不会继承这条规则。这就是为什么把 replace 留进发布 tag 不会让下游 fail-import,但当下游也想替换同一依赖时会被你 require 的版本盖掉。"
+          "line": 19,
+          "note": "replace 只对 main module/workspace 生效,下游把本模块当依赖时不会继承这条规则。本地路径 replace 留在发布分支里会制造两套构建结果:你在 workspace 里通过,离开 workspace 就不可复现。"
         },
         {
           "line": 23,
@@ -131,7 +141,7 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路:从字段到 MVS 再到企业私仓",
-      "content": "我会按 '字段 -> 算法 -> 工程' 三层来答,30 秒钟先给结论。\n\n30 秒结论: Go Module 是 Go 1.11 引入、1.16 默认开启的依赖管理方案,核心是 go.mod (声明 require/replace/exclude/retract) + go.sum (h1 哈希校验) 两个文件,版本选择走 MVS '取被要求的最高最低版本',v2+ 主版本必须把 /v2 写进 module path。\n\n机制层:\n1. go.mod 五个动词: require 直接依赖、indirect 是 lazy loading 留的传递依赖标记、replace 调试或私有 fork 时改写、exclude 让 MVS 跳过坏版本、retract 作者声明已发布版本作废。\n2. MVS 算法: 收集依赖图里所有对某 module 的 require,取 max,而不是公网 latest。这让构建可解释,代价是安全补丁不会自动跟进,所以企业里要配合 dependabot 或定期 `go get -u`。\n3. go.sum + GOSUMDB: 每个模块 zip 都有 h1: SHA-256,本地校验 + sum.golang.org 透明日志双重防 supply chain 攻击;GOPRIVATE 命中时会自动跳过 sumdb,不用手工设 GOSUMDB=off。\n4. semver import compatibility: v0/v1 不带后缀,v2+ module path 必须带 /v2,这样 v1 和 v2 才能在同一二进制里共存。\n\n工程边界 (面试官最爱追):\n- 私仓配置: GOPROXY=https://goproxy.cn,direct + GOPRIVATE=git.company.com/* + git config --global url.\"git@git.company.com:\".insteadOf \"https://git.company.com/\",这样私 module 走 SSH 直拉,公网包走代理加速。\n- 多模块本地联调优先用 go.work (Go 1.18+) 而不是把 replace 写进 go.mod,因为 go.work 不进发布。\n- 升级排查三连: `go list -m -u all` 看可升列表、`go mod why -m pkg` 追溯链路、`go mod graph | grep pkg` 看完整边。\n- 排错原则: build fail 先看 go.mod/go.sum diff、再看 GOPROXY/GOPRIVATE 是否漏配,最后才考虑清 GOMODCACHE,千万不要一上来就 GOFLAGS=-insecure 或 GOSUMDB=off。",
+      "content": "我会按 '字段 -> 算法 -> 工程' 三层来答,30 秒钟先给结论。\n\n30 秒结论: Go Module 是 Go 1.11 引入、1.16 默认开启的依赖管理方案,核心是 go.mod (module/go/toolchain/require/replace/exclude/retract) + go.sum (h1 哈希校验) 两个文件,版本选择走 MVS '取被要求版本的最大值',v2+ 主版本必须把 /v2 写进 module path。\n\n机制层:\n1. go.mod 常见指令: go 是最低工具链/模块语义要求,toolchain 是 Go 1.21+ 的建议工具链,require 记录依赖最低版本,indirect 是模块图保留的传递依赖标记,replace/exclude 只影响 main module 或 workspace,retract 是作者声明已发布版本作废。\n2. MVS 算法: 收集依赖图里所有对某 module 的 require,取 max,而不是公网 latest。这让构建可解释,代价是安全补丁不会自动跟进,所以企业里要配合 Renovate/Dependabot 或定期 `go get -u`。\n3. go.sum + GOSUMDB: 每个模块 zip 都有 h1: SHA-256,本地校验 + sum.golang.org 透明日志双重防 supply chain 攻击;GOPRIVATE 命中时默认跳过 public proxy 和 sumdb,不用把全局 GOSUMDB=off。\n4. semver import compatibility: v0/v1 不带后缀,v2+ module path 必须带 /v2,这样 v1 和 v2 才能在同一二进制里共存。\n\n工程边界 (面试官最爱追):\n- 私仓配置: GOPROXY=https://goproxy.cn,direct + GOPRIVATE=git.company.com/* + git config --global url.\"git@git.company.com:\".insteadOf \"https://git.company.com/\",这样私 module 走 SSH 直拉,公网包走代理加速。\n- 多模块本地联调优先用 go.work (Go 1.18+) 或 workspace 级 replace,但发布版本的 go.mod 必须脱离 workspace 也能解析。\n- 升级排查三连: `go list -m -u all` 看可升列表、`go mod why -m pkg` 追溯链路、`go mod graph | grep pkg` 看完整边。\n- 排错原则: build fail 先看 go.mod/go.sum diff、再看 GOPROXY/GOPRIVATE 是否漏配,最后才考虑清 GOMODCACHE,千万不要一上来就 GOINSECURE、GONOSUMDB=* 或 GOSUMDB=off。",
       "followUpQuestions": [
         {
           "question": "MVS 选 'minimum' 听上去很反直觉,它和 npm 的 'latest compatible' 比有什么真实差异?",
@@ -143,11 +153,11 @@
         },
         {
           "question": "为什么有人说 'replace 不能进发布 tag'?它对下游到底有没有影响?",
-          "answer": "关键点是 replace 只对 main module 生效。如果库 A 的 go.mod 里写了 replace B v1.0.0 => ../b-fork,这条规则在 A 被作为依赖引入时会被忽略,下游不会真去拉 ../b-fork。但有两个真实风险: (1) 你本地 build pass、CI 也 pass,因为 main module 是 A;一旦 A 被另一个项目引用,B 走的是真实版本,可能出现行为不一致甚至 panic。(2) 如果 replace 指向的是相对路径 `../b-fork`,把 tag 推上去后,文件就成了悬空引用,下游执行 `go mod download` 会得到 'directory ../b-fork outside available modules' 错误。所以正解: 本地调试用 go.work,临时上游 fork 用绝对的 `replace x => github.com/me/x v1.0.0-fix`,发版前 `git diff go.mod` 必看 replace 行。"
+          "answer": "关键点是 replace 只对 main module 或 workspace 生效。如果库 A 的 go.mod 里写了 replace B v1.0.0 => ../b-fork,这条规则在 A 被另一个 main module 作为依赖引入时会被忽略,下游不会继承 ../b-fork。真实风险有两个: (1) A 自己在 workspace 里 build pass,但作为依赖时 B 走真实版本,行为可能不一致;(2) 如果 A 本身作为 main module 构建、go install 或 CI 不在同一目录结构下,相对路径 replace 会不可解析。所以正解是: 本地多模块调试用 go.work,临时上游 fork 用可下载的 fork 版本,发版前 `git diff go.mod` 必看 replace 行。"
         },
         {
           "question": "go.sum 我们 PR 里经常一改改几十行,到底什么时候该警觉?",
-          "answer": "三种情况要停下来仔细看: (1) 没改 require 但 go.sum 大量增减 — 通常是 GOPROXY 切了或 GOMODCACHE 被清,正常;但若伴随某个 module 的 h1 哈希变了 (同版本号但哈希不同),要查是不是镜像被换或 module 被 force-push 重打 tag。(2) 出现陌生 module path,跑 `go mod why -m pkg` 看是谁拽进来的,警惕 typosquatting (把 github.com/sirupsen/logrus 误装成 github.com/Sirupsen/logrus 这种大小写陷阱)。(3) GOSUMDB 报 'checksum mismatch' 不要立刻设 GOSUMDB=off,先确认 module 是否在 GOPRIVATE 名单内、是不是企业内 Athens 缓存哈希不一致。线上严禁用 GOFLAGS=-insecure 或 GONOSUMCHECK=1 把校验绕过去,这是 supply chain 防线的最后一环。"
+          "answer": "三种情况要停下来仔细看: (1) 没改 require 但 go.sum 大量增减 — 通常是 GOPROXY 切了或 GOMODCACHE 被清;但若伴随某个 module 的 h1 哈希变了 (同版本号但哈希不同),要查是不是镜像被换、tag 被重打或企业代理缓存异常。(2) 出现陌生 module path,跑 `go mod why -m pkg` 看是谁拽进来的,警惕 typosquatting。(3) GOSUMDB 报 'checksum mismatch' 不要立刻设 GOSUMDB=off,先确认 module 是否在 GOPRIVATE/GONOSUMDB 名单内、是不是企业内 Athens 缓存哈希不一致。线上严禁用 GOINSECURE、GONOSUMDB=* 或 GOSUMDB=off 把校验整体绕过去,这是 supply chain 防线的最后一环。"
         }
       ]
     },
@@ -158,10 +168,10 @@
         "能逐字段解释 go.mod 的 module/go/require/replace/exclude/retract,以及 // indirect 标记的来源",
         "能讲清 MVS 选 '被要求的最高最低版本' 而不是 latest 的动机,以及它为何让构建可解释",
         "能说明 v2+ 必须把 /v2 写进 module path 与 import path 的 semver import compatibility 规则",
-        "能解释 go.sum 的 h1: 哈希、GOSUMDB sum.golang.org 透明日志,以及 GONOSUMCHECK/GOSUMDB=off 的风险",
+        "能解释 go.sum 的 h1: 哈希、GOSUMDB sum.golang.org 透明日志,以及 GONOSUMDB/GOSUMDB=off 的风险",
         "能配置企业私仓: GOPRIVATE + GOPROXY=https://goproxy.cn,direct + git config insteadOf 走 SSH",
         "能区分 go get -u (升级)、go get pkg@version (锁定)、go mod tidy (清理)、go mod why (追溯) 的使用场景",
-        "能用 go.work 在 Go 1.18+ 做多模块本地联调,且知道它只在本地生效不会进入发布"
+        "能用 go.work 在 Go 1.18+ 做多模块本地联调,且知道发布版本不能依赖 workspace 才能解析"
       ]
     }
   ],
@@ -175,7 +185,7 @@
     },
     {
       "id": "go.engineering.module-dependency.recall.2",
-      "prompt": "go.mod 中 require、indirect、replace、exclude、retract 五个动词分别什么时候出现?",
+      "prompt": "go.mod 中 go/toolchain、require、indirect、replace、exclude、retract 分别什么时候出现?",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
@@ -190,7 +200,7 @@
   ],
   "rubric": {
     "mustHave": [
-      "go.mod 五个动词: require / replace / exclude / retract / indirect 的语义",
+      "go.mod 常见指令: go / toolchain / require / replace / exclude / retract / indirect 的语义",
       "MVS 算法: 在依赖图中为每个模块选择被要求的最高最低版本",
       "semver import compatibility: v2+ 主版本必须把 /v2 写进 module path 和 import path",
       "go.sum h1: 哈希 + GOSUMDB sum.golang.org 透明日志做 supply chain 校验"
@@ -203,7 +213,7 @@
     ],
     "commonMistakes": [
       "误以为 MVS 等于 'always latest',解释不了为何间接依赖没自动升级",
-      "把 replace 留在发布版本的 go.mod 里,导致下游用户拉不到指向的本地路径或私有 fork",
+      "把 replace 当成发布契约,忽略它只对 main module/workspace 生效,导致本地和下游依赖行为不一致",
       "v2+ 升级时忘记改 module path 的 /v2,引发 ambiguous import 或同时拉到 v1/v2 两份",
       "误删 go.sum 或设 GOSUMDB=off,绕过校验后被 typosquatting 或镜像劫持注入恶意版本",
       "私仓没配 GOPRIVATE,把内部 module path 发到公共 proxy 导致泄露,或被 sum.golang.org 401"
@@ -215,5 +225,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-13"
+  "updatedAt": "2026-06-18"
 }

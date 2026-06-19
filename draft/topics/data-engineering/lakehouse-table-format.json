@@ -24,7 +24,7 @@
     {
       "type": "explain",
       "title": "为什么 Hive 表撑不起湖仓：元数据层解决的 4 个硬伤",
-      "content": "传统 Hive 表把表语义放在 Hive Metastore（库/表/分区列表）+ HDFS 目录里，分区是物理目录、文件列表靠 list 目录获取。这套模型在对象存储（S3/OSS/GCS）上有四个硬伤：\n\n1. 没有原子提交。多个写任务同时 rename/写文件，读者会看到半成品；S3 的 list 还是最终一致的，dynamic partition overwrite 经常丢数。\n2. 分区即目录。分区字段必须出现在过滤条件里才能 partition pruning，改分区策略要重写整张表。\n3. 没有版本概念。要回滚只能拷贝旧目录或重跑作业；CDC/补数不可重放。\n4. list 目录贵。S3 list 一次百万级文件要几秒到几十秒，查询规划阶段就被拖死。\n\nIceberg/Hudi/Delta 的共同思路是把“表由哪些文件组成”从 list 目录变成读一份元数据：Iceberg 用 metadata.json + manifest list + manifest，Delta 用 _delta_log 下的 JSON commit + 周期性 checkpoint，Hudi 用 .hoodie 时间线（instant + commit/deltacommit）。每次写入先落数据文件，再原子追加一条新 commit 指向新的文件集，读者按 commit/snapshot 取一致视图——这就是 ACID、Time Travel、Schema 演进、隐藏分区都能做出来的根。"
+      "content": "传统 Hive 表把表语义放在 Hive Metastore（库/表/分区列表）+ HDFS 目录里，分区是物理目录、文件列表靠 list 目录获取。这套模型在对象存储（S3/OSS/GCS）上有四个硬伤：\n\n1. 提交语义依赖目录和文件操作。传统 Hive 表常把“哪些文件属于表”隐含在目录结构里，遇到并发写、任务失败、跨引擎提交或对象存储 rename/list 成本时，读者可能看到不完整文件集或规划很慢。现代 S3 已提供强一致 LIST，但目录枚举仍不是可靠的表版本管理方式。\n2. 分区即目录。分区字段必须出现在过滤条件里才能 partition pruning，改分区策略要重写整张表。\n3. 没有版本概念。要回滚只能拷贝旧目录或重跑作业；CDC/补数不可重放。\n4. 目录枚举成本高。大表靠递归列目录发现文件，会把查询规划时间、对象存储 API 成本和小文件问题放大。\n\nIceberg/Hudi/Delta 的共同思路是把“表由哪些文件组成”从 list 目录变成读一份元数据：Iceberg 用 metadata.json + manifest list + manifest，Delta 用 _delta_log 下的 JSON commit + 周期性 checkpoint，Hudi 用 .hoodie 时间线（instant + commit/deltacommit）。每次写入先落数据文件，再原子追加一条新 commit 指向新的文件集，读者按 commit/snapshot 取一致视图——这就是 ACID、Time Travel、Schema 演进、隐藏分区都能做出来的根。"
     },
     {
       "type": "explain",
@@ -100,11 +100,21 @@
     },
     {
       "type": "diagram",
-      "title": "Iceberg 写入与读取的元数据链路",
+      "title": "湖仓表格式提交链路：数据文件、元数据日志、快照与读一致性",
       "format": "mermaid",
-      "content": "flowchart LR\n  W[Writer 写 Parquet 数据文件] --> M[生成 manifest 文件]\n  M --> ML[更新 manifest list]\n  ML --> MJ[写新 metadata.json v124]\n  MJ --> CAS{Catalog CAS<br/>v123 -> v124}\n  CAS -- 成功 --> S[snapshot v124 可见]\n  CAS -- 失败 --> RT[Retry 校验冲突]\n  R[Reader 按 snapshot 读] --> ML\n  EX[expireSnapshots] -->|清理过期快照| ML\n  CO[Compaction rewriteDataFiles] -->|合并小文件| M",
-      "fallback": "写入路径：Parquet 数据文件 -> manifest -> manifest list -> 新 metadata.json -> catalog CAS 原子切换；读路径：catalog 拿当前 metadata -> 按 snapshot 读 manifest list/manifest 解析数据文件清单。expireSnapshots 清旧快照、rewriteDataFiles 做 compaction。",
-      "caption": "Iceberg 三层元数据 + catalog CAS 是它实现 ACID 和 Time Travel 的关键路径。"
+      "content": "flowchart TD\nA[\"Writer 任务\"] --> B[\"写入数据文件\nParquet/ORC\"]\nB --> C[\"生成元数据\nmanifest/log/timeline\"]\nC --> D{\"原子提交新版本\"}\nD -->|成功| E[\"新 Snapshot/Commit 可见\"]\nD -->|冲突| F[\"重试或合并冲突\"]\nE --> G[\"Reader 读取指定快照\"]\nG --> H[\"Time Travel / Rollback\"]\nE --> I[\"Compaction / Clustering\"]\nE --> J[\"Schema 和分区演进\"]",
+      "fallback": "图展示 Iceberg/Hudi/Delta 通过元数据版本而不是目录枚举表达表状态，支持快照读、冲突重试、回滚和文件治理。",
+      "caption": "湖仓表格式提交链路：数据文件、元数据日志、快照与读一致性",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[\"Writer 任务\"] --> B[\"写入数据文件\nParquet/ORC\"]\nB --> C[\"生成元数据\nmanifest/log/timeline\"]\nC --> D{\"原子提交新版本\"}\nD -->|成功| E[\"新 Snapshot/Commit 可见\"]\nD -->|冲突| F[\"重试或合并冲突\"]\nE --> G[\"Reader 读取指定快照\"]\nG --> H[\"Time Travel / Rollback\"]\nE --> I[\"Compaction / Clustering\"]\nE --> J[\"Schema 和分区演进\"]"
+        },
+        {
+          "kind": "text",
+          "content": "图展示 Iceberg/Hudi/Delta 通过元数据版本而不是目录枚举表达表状态，支持快照读、冲突重试、回滚和文件治理。"
+        }
+      ]
     },
     {
       "type": "code",
@@ -137,7 +147,7 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "30 秒结论：Iceberg/Hudi/Delta 是建在对象存储之上的表格式，靠一份独立的元数据层（manifest / timeline / _delta_log）把无序的数据文件组织成有 ACID、Schema 演进、Time Travel、隐藏分区能力的表，解决 Hive 在 S3 上没有原子提交、改分区要重写、回滚靠拷贝的硬伤。\n\n机制主线我会按写入-提交-演进-治理串：写入端先把 Parquet 落到对象存储，再以一次原子提交（Iceberg 是 catalog CAS 替换 metadata.json 指针，Delta 是 _delta_log 的 put-if-absent，Hudi 是 timeline 的 inflight->commit）让新 snapshot 对读者可见；Schema 演进靠稳定的 field-id 或 column mapping 改元数据不动数据；Time Travel 就是按 snapshot/version/instant 读老版本；运维端要管 compaction（Iceberg rewrite_data_files、Delta OPTIMIZE、Hudi clustering）和过期清理（expire snapshot / VACUUM / Cleaner），保留期要覆盖业务回滚窗口。\n\n选型上我会按场景分：开放生态、读多写少、分区策略经常变就 Iceberg；CDC、record 级 upsert、近实时入湖就 Hudi 的 MOR；已经在 Databricks/Spark 主栈选 Delta。常见坑包括：没配 catalog CAS 直接在 S3 上跑 Iceberg 导致并发提交丢数；把 Hudi MOR 的 compaction 关掉读越来越慢；Delta VACUUM 保留期设太短破坏 Time Travel；以及 expireSnapshots 和回滚窗口对不齐导致需要回滚时数据文件已被清理。",
+      "content": "30 秒结论：Iceberg/Hudi/Delta 是建在对象存储之上的表格式，靠一份独立的元数据层（manifest / timeline / _delta_log）把无序的数据文件组织成有 ACID、Schema 演进、Time Travel、隐藏分区能力的表，解决 Hive 在 S3 上没有原子提交、改分区要重写、回滚靠拷贝的硬伤。\n\n机制要点：\n- 机制主线我会按写入-提交-演进-治理串：写入端先把 Parquet 落到对象存储，再以一次原子提交（Iceberg 是 catalog CAS 替换 metadata.json 指针，Delta 是 _delta_log 的 put-if-absent，Hudi 是 timeline 的 inflight->commit）让新 snapshot 对读者可见；Schema 演进靠稳定的 field-id 或 column mapping 改元数据不动数据；Time Travel 就是按 snapshot/version/instant 读老版本；运维端要管 compaction（Iceberg rewrite_data_files、Delta OPTIMIZE、Hudi clustering）和过期清理（expire snapshot / VACUUM / Cleaner），保留期要覆盖业务回滚窗口。\n- 选型上我会按场景分：开放生态、读多写少、分区策略经常变就 Iceberg；CDC、record 级 upsert、近实时入湖就 Hudi 的 MOR；已经在 Databricks/Spark 主栈选 Delta。常见坑包括：没配 catalog CAS 直接在 S3 上跑 Iceberg 导致并发提交丢数；把 Hudi MOR 的 compaction 关掉读越来越慢；Delta VACUUM 保留期设太短破坏 Time Travel；以及 expireSnapshots 和回滚窗口对不齐导致需要回滚时数据文件已被清理。",
       "followUpQuestions": [
         {
           "question": "Iceberg 在 S3 上怎么实现原子提交？为什么直接用 S3 PutObject 不行？",
@@ -224,5 +234,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-13"
+  "updatedAt": "2026-06-18"
 }

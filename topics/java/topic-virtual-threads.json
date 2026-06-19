@@ -4,76 +4,89 @@
   "category": "concurrency",
   "group": "concurrency",
   "title": "Virtual Threads（Java 21+）",
-  "summary": "Java 21 虚拟线程轻量级并发方案，大幅降低线程创建成本，简化高并发编程",
+  "summary": "讲清 Java 21 虚拟线程的线程-per-task 模型、mount/unmount 到 carrier 的调度机制、适合阻塞 I/O 而非 CPU 加速、JDK 21-23 与 JDK 24 pinning 差异，以及资源限流和观测迁移边界。",
   "tags": [
     "Java",
     "并发编程",
-    "Virtual Threads（Java 21+）"
+    "Virtual Threads",
+    "Project Loom"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 35,
   "order": 110,
-  "recommendWeight": 88,
+  "recommendWeight": 84,
   "learningCards": [
     {
       "type": "explain",
-      "title": "Virtual Threads（Java 21+）：什么是虚拟线程、与平台线程的关系",
-      "content": "## 一、什么是虚拟线程\n虚拟线程（Virtual Threads）是 Java 21 正式引入的轻量级线程实现（Project Loom），由 JVM 而非操作系统管理。虚拟线程的创建成本极低（几百字节 vs 平台线程的约 1MB 栈空间），可以轻松创建数百万个虚拟线程，特别适合 I/O 密集型的高并发场景。\n## 二、与平台线程的关系\n虚拟线程运行在平台线程（carrier thread）之上。当虚拟线程执行阻塞 I/O 操作时，JVM 会自动将其从平台线程上卸载（unmount），释放平台线程去执行其他虚拟线程。I/O 完成后，虚拟线程会被重新挂载到可用的平台线程上继续执行。这个过程称为载体线程的复用。\n## 三、创建方式\n虚拟线程可通过 `Thread.ofVirtual()` 或 `Executors.newVirtualThreadPerTaskExecutor()` 创建。最简洁的方式是 `Thread.startVirtualThread(runnable)`。虚拟线程默认是 daemon 线程，不需要手动设置。\n## 四、注意事项\n虚拟线程适合 I/O 密集型任务，不适合 CPU 密集型任务。不要池化虚拟线程（每个任务一个新虚拟线程）。JDK 21-23 中要避免在 synchronized 块中执行阻塞操作（会导致 pinning），可用 ReentrantLock 或缩小同步范围；JDK 24 的 JEP 491 已基本消除 synchronized 阻塞时的虚拟线程 pinning。但仍要避免长时间持有锁。虚拟线程的栈可以按需增长和收缩，内存效率极高。"
+      "title": "虚拟线程让 thread-per-task 回来",
+      "content": "Virtual Threads 是 JDK 21 正式特性（OpenJDK JEP 444）。它仍然是 `java.lang.Thread`，但由 JVM 调度，运行时挂载到少量平台线程（carrier）上。它的目标不是让 CPU 变快，而是让“一请求/一任务/一线程”的同步阻塞写法在大量 I/O 等待场景下具备更好的伸缩性。\n\n平台线程直接映射到 OS 线程，创建、栈内存和上下文切换成本较高，所以传统服务常用固定线程池复用平台线程。虚拟线程很便宜，推荐每个任务创建一个：`Executors.newVirtualThreadPerTaskExecutor()`、`Thread.startVirtualThread(...)` 或 `Thread.ofVirtual()`。不要把虚拟线程再池化；如果需要限制并发，限制的是数据库连接、下游 QPS、文件句柄、队列长度等外部资源。\n\n虚拟线程对迁移很友好，因为大量同步阻塞代码可以保留形态；但它不会自动修复慢 SQL、下游限流缺失、ThreadLocal 大对象、锁粒度过大或 CPU 密集计算。"
     },
     {
       "type": "explain",
-      "title": "Virtual Threads（Java 21+）的边界、坑点与答题抓手",
-      "content": "Virtual Threads 适合大量阻塞式 I/O 任务，因为它把线程调度成本从平台线程转移到 JVM 管理的轻量线程上。回答时要说明它不提升 CPU 密集计算能力，也不应该继续依赖 ThreadLocal 大对象、固定线程池大小或阻塞式同步监视器的旧假设。上线评估要看数据库连接池、下游限流、线程 pinning 和监控工具兼容性，否则并发数提升可能只是把瓶颈推到后端资源。"
+      "title": "mount/unmount：等待时释放 carrier",
+      "content": "虚拟线程执行 Java 代码时会 mount 到某个 carrier 平台线程上。遇到 JDK 已适配的阻塞点，例如网络 I/O、`LockSupport.park`、`Thread.sleep`、部分阻塞队列等待，虚拟线程可以 unmount，carrier 被释放去运行其他虚拟线程；等待条件满足后，虚拟线程再 remount 到某个 carrier 继续执行。\n\n这解释了它适合阻塞 I/O 的原因：平台线程不再被大量等待中的请求长期占住。对 CPU 密集任务，虚拟线程仍要消耗真实 CPU 时间，创建再多也不会突破核心数；CPU 密集任务仍要用固定大小执行器、ForkJoin 或并行流等方式控制并行度。\n\n阻塞能否卸载取决于阻塞点是否与虚拟线程协作。老旧 native/foreign 调用、某些不可中断阻塞和长时间持有临界区，仍可能限制伸缩性。"
+    },
+    {
+      "type": "explain",
+      "title": "pinning 的版本边界要讲准",
+      "content": "JDK 21-23 中，一个虚拟线程在 `synchronized` 方法或代码块里执行阻塞操作时，可能 pin 住 carrier，导致 carrier 不能去运行其他虚拟线程。JFR 可观察到 `jdk.VirtualThreadPinned` 事件，线程 dump 也能帮助定位长期占用点。\n\nOpenJDK JEP 491 在 JDK 24 改进了 synchronized 与虚拟线程的协作，目标是让虚拟线程在 synchronized 中阻塞时也能释放底层平台线程，消除几乎所有这类 pinning。这个变化意味着 2026 年不能再简单说“虚拟线程场景要把 synchronized 全换成 ReentrantLock”。正确说法是：JDK 21-23 要重点规避 synchronized 内慢阻塞；JDK 24+ 仍要保持临界区短，锁选择回到语义、可中断、超时、多条件队列等需求。\n\nnative/foreign 调用、长时间 CPU 占用、下游资源耗尽和粗粒度锁仍然是边界。"
+    },
+    {
+      "type": "explain",
+      "title": "上线评估看外部资源和观测",
+      "content": "迁移到虚拟线程后，最常见的错觉是“线程更多，所以并发更高”。真实瓶颈往往转移到数据库连接池、HTTP 连接池、Redis 连接、第三方接口 QPS、消息队列消费速率或本机文件句柄。虚拟线程让等待便宜，但不会让下游容量变大。\n\n因此每任务虚拟线程通常要配合 Semaphore、连接池、bulkhead、限流器和超时。不要用固定虚拟线程池大小表达资源保护；那会把便宜的线程又变成稀缺资源。应该让虚拟线程多，但让外部资源有明确预算。\n\n观测上要关注：JFR pinning 事件、虚拟线程 thread dump、carrier CPU、下游连接池等待、请求延迟分布、ThreadLocal 内存占用、MDC/trace 上下文传播。JEP 444 说明虚拟线程支持 ThreadLocal，但大量虚拟线程持有大对象会放大内存压力；只读上下文可以评估 ScopedValue。"
     },
     {
       "type": "diagram",
-      "title": "Virtual Threads（Java 21+） 机制图",
-      "format": "mermaid",
-      "content": "flowchart LR\nA[问题入口: Virtual Threads（Java 21+）] --> B[核心概念: Java]\nB --> C[关键机制: 并发编程]\nC --> D[边界风险: Virtual Threads（Java 21+）]\nD --> E[验证证据: 日志 / 指标 / 用例]\nE --> F[面试结论: 适用条件和取舍]",
-      "fallback": "Virtual Threads（Java 21+） 的机制图从问题入口开始，依次说明 Java、并发编程、Virtual Threads（Java 21+）、验证证据和面试结论。",
-      "caption": "用这张图回答 Virtual Threads（Java 21+） 时，可以先讲核心概念，再讲机制、边界风险和验证证据。"
+      "format": "svg",
+      "title": "虚拟线程调度、pinning 与资源边界",
+      "content": "assets/diagrams/java-virtual-threads-scheduling.svg"
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | 平台线程 | 虚拟线程 |\n| --- | --- | --- |\n| 管理方 | 操作系统内核 | JVM |\n| 创建成本 | 高（~1MB 栈空间） | 极低（几百字节） |\n| 数量上限 | 数千个 | 数百万个 |\n| 调度方式 | OS 调度器 | ForkJoinPool 调度 |\n| 阻塞影响 | 占用 OS 线程资源 | 自动卸载体线程 |\n| 适用场景 | CPU 密集型 | I/O 密集型 |\n| 线程池 | 推荐使用线程池 | 不要池化 |\n| 与 synchronized | 正常使用 | JDK 21-23 可能 pinning；JDK 24+ 基本消除该问题 |"
+      "title": "平台线程、虚拟线程和响应式对比",
+      "content": "| 维度 | 平台线程池 | 虚拟线程 | 响应式/事件驱动 |\n| --- | --- | --- | --- |\n| 编程模型 | 同步阻塞，线程复用 | 同步阻塞，每任务一个线程 | 非阻塞回调/流式链 |\n| 调度方 | OS + JVM | JVM 调度，挂载到 carrier | 事件循环和回调调度 |\n| 适合场景 | CPU 任务、固定资源池 | 大量阻塞 I/O、请求型服务 | 高吞吐流处理、显式背压链路 |\n| 并发保护 | 线程池大小、队列、拒绝策略 | 下游资源预算、Semaphore、连接池 | 背压协议、限流、事件循环保护 |\n| CPU 密集 | 按核心数控制 | 不提升算力 | 不提升算力 |\n| ThreadLocal | 常用但要清理 | 支持，但数量大时谨慎 | 通常依赖上下文传播机制 |\n| 主要风险 | 线程数不足、队列堆积 | 下游耗尽、pinning、ThreadLocal 内存 | 心智负担、阻塞污染事件循环 |\n\n| 版本边界 | 说明 |\n| --- | --- |\n| JDK 21 | 虚拟线程正式特性，ThreadLocal 始终支持 |\n| JDK 21-23 | synchronized 内阻塞可能 pin carrier |\n| JDK 24+ | JEP 491 改进 synchronized pinning，但仍要控制临界区和外部资源 |\n| JDK 25+ | ScopedValue 正式化后更适合只读上下文作用域传递 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "// 1. 创建虚拟线程\nThread vThread = Thread.ofVirtual().start(() -> {\n    System.out.println(\"Running in virtual thread: \" + Thread.currentThread());\n});\nvThread.join();\n\n// 2. 每任务一线程模式（推荐）\ntry (var executor = Executors.newVirtualThreadPerTaskExecutor()) {\n    for (int i = 0; i < 100_000; i++) {\n        int taskId = i;\n        executor.submit(() -> {\n            // 模拟 I/O 操作\n            Thread.sleep(Duration.ofSeconds(1));\n            return \"Result-\" + taskId;\n        });\n    }\n} // 自动关闭并等待所有任务完成\n\n// 3. JDK 21-23 注意 synchronized 中的阻塞操作可能 pin carrier thread\n// JDK 24+（JEP 491）基本消除该问题，但仍应避免长时间持锁执行慢 I/O\nsynchronized (lock) {\n    updateSharedState();\n}\n\n// 需要可中断、超时、公平性等能力时仍选择 ReentrantLock\nReentrantLock reentrantLock = new ReentrantLock();\nif (reentrantLock.tryLock(100, TimeUnit.MILLISECONDS)) {\n    try {\n        updateSharedState();\n    } finally {\n        reentrantLock.unlock();\n    }\n}\n\n// 4. 与传统线程池对比\n// 传统方式：受限于线程池大小\nExecutorService pool = Executors.newFixedThreadPool(200); // 最多200并发\n// 虚拟线程：轻松支持高并发\nExecutorService vPool = Executors.newVirtualThreadPerTaskExecutor(); // 无上限",
+      "title": "可运行代码：检测并演示虚拟线程 per-task 模型",
       "language": "java",
+      "content": "import java.lang.reflect.Method;\nimport java.util.ArrayList;\nimport java.util.List;\nimport java.util.concurrent.Callable;\nimport java.util.concurrent.ExecutorService;\nimport java.util.concurrent.Executors;\nimport java.util.concurrent.Future;\nimport java.util.concurrent.Semaphore;\nimport java.util.concurrent.TimeUnit;\nimport java.util.concurrent.atomic.AtomicInteger;\n\npublic class Main {\n    public static void main(String[] args) throws Exception {\n        Method factory;\n        try {\n            factory = Executors.class.getMethod(\"newVirtualThreadPerTaskExecutor\");\n        } catch (NoSuchMethodException notOnJdk21) {\n            System.out.println(\"virtualThreadsAvailable=false, java=\"\n                    + System.getProperty(\"java.version\"));\n            return;\n        }\n\n        ExecutorService executor = (ExecutorService) factory.invoke(null);\n        Semaphore dbPermits = new Semaphore(2);\n        AtomicInteger maxInDb = new AtomicInteger();\n        AtomicInteger activeInDb = new AtomicInteger();\n        List<Future<String>> futures = new ArrayList<>();\n        try {\n            for (int i = 0; i < 6; i++) {\n                int taskId = i;\n                Callable<String> task = () -> {\n                    boolean virtual = isVirtual(Thread.currentThread());\n                    dbPermits.acquire();\n                    int now = activeInDb.incrementAndGet();\n                    maxInDb.accumulateAndGet(now, Math::max);\n                    try {\n                        Thread.sleep(30);\n                        return \"task-\" + taskId + \":virtual=\" + virtual;\n                    } finally {\n                        activeInDb.decrementAndGet();\n                        dbPermits.release();\n                    }\n                };\n                futures.add(executor.submit(task));\n            }\n            for (Future<String> future : futures) {\n                System.out.println(future.get());\n            }\n            System.out.println(\"maxInDb=\" + maxInDb.get());\n            assert maxInDb.get() <= 2;\n        } finally {\n            executor.shutdown();\n            executor.awaitTermination(1, TimeUnit.SECONDS);\n        }\n    }\n\n    static boolean isVirtual(Thread thread) {\n        try {\n            Method method = Thread.class.getMethod(\"isVirtual\");\n            return (Boolean) method.invoke(thread);\n        } catch (ReflectiveOperationException unavailableBeforeJdk21) {\n            return false;\n        }\n    }\n}",
       "highlights": [
         {
-          "line": 19,
-          "note": "并发控制点：说明它保护的共享状态，以及可见性、原子性或阻塞语义。"
+          "line": 15,
+          "note": "用反射检测 JDK 21 API，代码在 JDK 17 可运行，在 JDK 21+ 会真实使用虚拟线程执行器。"
         },
         {
-          "line": 21,
-          "note": "并发控制点：说明它保护的共享状态，以及可见性、原子性或阻塞语义。"
+          "line": 23,
+          "note": "虚拟线程不再池化，外部资源用 Semaphore 或连接池限制并发。"
         },
         {
-          "line": 25,
-          "note": "并发控制点：说明它保护的共享状态，以及可见性、原子性或阻塞语义。"
+          "line": 33,
+          "note": "每个任务提交后由虚拟线程执行；是否虚拟线程通过 Thread.isVirtual 反射验证。"
+        },
+        {
+          "line": 48,
+          "note": "运行结果验证数据库类资源并发没有超过许可数。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**高频问题1：什么是虚拟线程？它解决了什么问题？**\n\n虚拟线程是 Java 21 引入的轻量级线程，由 JVM 管理而非操作系统。它解决的核心问题是传统平台线程资源开销大、数量有限，无法满足高并发 I/O 密集型场景。虚拟线程创建成本极低（几百字节），可以创建数百万个，当执行阻塞 I/O 时自动从载体线程上卸载，释放操作系统线程资源。这使得 Java 无需引入 async/await 语法就能实现高并发，代码风格保持同步编程的简洁性。\n**高频问题2：虚拟线程的使用有什么注意事项？**\n\n主要注意事项：\n\n1. 不要池化虚拟线程，应采用每任务一个虚拟线程的模式\n2. JDK 21-23 中 synchronized 阻塞可能导致 pinning；JDK 24+（JEP 491）基本消除该问题，但仍要避免长时间持锁执行慢 I/O\n3. 需要可中断、超时、公平性等锁能力时使用 ReentrantLock；虚拟线程适合 I/O 密集型任务，CPU 密集型任务仍应使用平台线程\n4. 监控时注意虚拟线程的 Thread.isVirtual() 状态\n5. ThreadLocal 的使用需谨慎，大量虚拟线程可能导致内存问题。\n**高频问题3：虚拟线程与响应式编程（如 Reactor）相比有什么优劣？**\n\n虚拟线程的优势：代码保持同步风格，学习成本低，调试方便，与现有同步代码兼容。响应式编程的优势：更细粒度的背压控制，与函数式编程结合更紧密。劣势对比：虚拟线程是阻塞模型但资源开销极低，响应式是非阻塞模型但代码复杂度高。趋势上虚拟线程更适合大多数 I/O 场景，而响应式在需要精细流控的场景仍有价值。",
+      "content": "我会先定义：虚拟线程是 JDK 21 正式引入的轻量级 `java.lang.Thread`，由 JVM 调度，运行时挂载到 carrier 平台线程上。它让高并发 I/O 服务可以继续使用同步阻塞代码，每个请求一个虚拟线程，而不是把业务拆成复杂回调链。\n\n底层抓手是 mount/unmount：虚拟线程运行 Java 代码时占用 carrier；遇到适配的阻塞 I/O、sleep、park 等等待点可以卸载，carrier 去跑其他虚拟线程；等待结束后再挂载继续。它降低的是等待期间占用平台线程的成本，不提升 CPU 算力。\n\n边界要讲三类。第一，不要池化虚拟线程，直接每任务创建；真正要限的是数据库连接、下游 QPS、文件句柄和队列。第二，JDK 21-23 中 synchronized 内阻塞可能 pin carrier；JDK 24 的 JEP 491 已改善这类 pinning，但 native/foreign 调用、长时间持锁和下游耗尽仍要排查。第三，ThreadLocal 虽被支持，但大量虚拟线程持有大对象会增加内存压力，只读上下文优先考虑作用域化传递。\n\n与响应式相比，虚拟线程保留同步代码和调试体验，适合大量请求型阻塞 I/O；响应式仍适合复杂流处理和显式背压链路。上线验证看 JFR pinning、线程 dump、carrier CPU、下游连接池等待和端到端延迟。",
       "followUpQuestions": [
         {
-          "question": "能深入说说Virtual Threads（Java 21+）的底层实现原理吗？关键的数据结构或算法是什么？",
-          "answer": "Virtual Threads是Java 21+的协程实现：用户态线程，由JVM调度（不经过OS内核）。创建：Thread.ofVirtual().start(runnable) 或 Executors.newVirtualThreadPerTaskExecutor()。优势：可以轻松创建百万个，适合IO密集型任务。注意：JDK 21-23 中 synchronized 阻塞可能 pin carrier thread；JDK 24+ 已基本改善，但仍要控制锁粒度，需要超时/可中断能力时用 ReentrantLock。"
+          "question": "为什么不要池化虚拟线程？",
+          "answer": "平台线程昂贵，所以需要池化复用；虚拟线程很便宜，设计目标就是每个任务创建一个并在任务结束后丢弃。池化虚拟线程会重新制造稀缺线程，并掩盖真正需要保护的资源。并发控制应放在数据库连接池、HTTP 连接池、Semaphore、限流器或队列上。"
         },
         {
-          "question": "Virtual Threads（Java 21+） 在高并发场景下的性能瓶颈通常在哪里？有哪些优化思路？",
-          "answer": "高并发下 Virtual Threads（Java 21+） 的瓶颈通常在锁竞争和内存可见性。优化 Virtual Threads（Java 21+） 时，我会先确认锁竞争位置，再比较锁粒度、无锁结构、线程池参数和 volatile/CAS 对吞吐与正确性的影响。"
+          "question": "虚拟线程适合 CPU 密集任务吗？",
+          "answer": "不适合用来提升 CPU 密集任务吞吐。虚拟线程只降低等待型任务占用平台线程的成本，CPU 计算仍受核心数限制。CPU 密集任务要限制并行度，用固定大小执行器、ForkJoin 或并行算法，避免创建大量同时争抢 CPU 的任务。"
         },
         {
-          "question": "如果多个线程同时操作 Virtual Threads（Java 21+） 导致数据不一致，你会怎么定位和修复？",
-          "answer": "定位并发问题的思路：先用 jstack 查看线程状态和锁持有情况，再用 Arthas 的 watch/trace 命令追踪方法调用常见原因包括锁竞争激烈、死锁、ABA 问题等，需要根据具体场景选择合适的并发工具"
+          "question": "如何排查虚拟线程上线后效果不达预期？",
+          "answer": "先看瓶颈是否转移到下游：数据库连接池等待、HTTP 连接池、第三方限流、文件句柄。再看 JFR 的 pinning 事件和线程 dump，定位 synchronized、native 或长临界区。还要看 ThreadLocal/MDC 内存占用、carrier CPU、请求延迟分布和超时配置，确认不是把等待从线程池转移到了资源池。"
         }
       ]
     },
@@ -81,19 +94,21 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释虚拟线程的定义、与平台线程的区别及创建方式",
-        "能说明虚拟线程的载体线程卸载/挂载机制",
-        "能列举虚拟线程的适用场景和不适用场景",
-        "能说明 synchronized pinning 的 JDK 21-23 风险、JDK 24+ JEP 491 变化，以及 ReentrantLock 的适用场景",
-        "能解释为什么不应池化虚拟线程",
-        "能对比虚拟线程与传统线程池、响应式编程的优劣"
+        "能解释虚拟线程、平台线程和 carrier 的关系",
+        "能说明 mount/unmount 如何降低阻塞 I/O 对平台线程的占用",
+        "能写出每任务一个虚拟线程的创建方式，并说明不要池化虚拟线程",
+        "能指出 CPU 密集任务、下游资源耗尽、ThreadLocal 大对象不是虚拟线程能自动解决的问题",
+        "能说明 JDK 21-23 synchronized pinning 与 JDK 24+ JEP 491 的版本差异",
+        "能用 JFR、线程 dump、连接池等待和延迟指标排查迁移问题",
+        "能对比虚拟线程、传统平台线程池和响应式模型的适用边界"
       ]
     }
   ],
+  "quiz": null,
   "recallPrompts": [
     {
       "id": "java.concurrency.topic-virtual-threads.recall.1",
-      "prompt": "Virtual Threads（Java 21+） 的实现原理是什么？和同类方案相比有什么优劣？",
+      "prompt": "Virtual Threads（Java 21+） 的实现原理是什么？和平台线程池相比有什么优劣？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
@@ -107,14 +122,14 @@
     },
     {
       "id": "java.concurrency.topic-virtual-threads.recall.3",
-      "prompt": "Virtual Threads（Java 21+） 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "Virtual Threads、传统线程池和响应式编程有什么关键区别？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "java.concurrency.topic-virtual-threads.recall.scenario",
-      "prompt": "生产环境里 Virtual Threads（Java 21+） 出现异常或效果不达预期时，你会如何定位原因、选择修复方案并验证结果？",
+      "prompt": "生产环境里 Virtual Threads 出现效果不达预期时，你会如何定位原因、选择修复方案并验证结果？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
@@ -122,20 +137,22 @@
   ],
   "rubric": {
     "mustHave": [
-      "能准确描述虚拟线程的定义和与平台线程的差异",
-      "能解释载体线程的卸载/挂载调度机制",
-      "能展示虚拟线程的创建和使用代码",
-      "能说明 synchronized pinning 的版本差异和避免方法"
+      "能准确描述虚拟线程、平台线程、carrier 的关系",
+      "能解释阻塞 I/O 时卸载/重新挂载机制",
+      "能展示每任务一个虚拟线程的代码并说明不要池化",
+      "能说明 Java 21-23 pinning 与 Java 24 JEP 491 的版本差异"
     ],
     "goodToHave": [
-      "能对比虚拟线程与 Go goroutine、Kotlin coroutine",
-      "能说明虚拟线程对现有 Java 生态（如 Tomcat、Spring）的影响",
-      "能结合实际场景分析虚拟线程的性能优势"
+      "能指出 DB 连接池、下游限流、ThreadLocal 大对象、监控兼容性等迁移风险",
+      "能比较虚拟线程、传统线程池、响应式模型的取舍",
+      "能用 JFR/线程 dump/pinning 诊断定位问题",
+      "能说明 ScopedValue 对只读上下文的适用边界"
     ],
     "commonMistakes": [
-      "不清楚Virtual Threads和Platform Threads的区别",
-      "忽略 synchronized pinning 的 JDK 版本差异，或误以为所有场景都必须替换成 ReentrantLock",
-      "以为Virtual Threads适合所有场景（CPU密集型不适合）"
+      "以为虚拟线程适合 CPU 密集任务或能提升 CPU 算力",
+      "继续用固定虚拟线程池控制并发，忽略外部资源限流",
+      "忽略 JDK 版本下 synchronized/native pinning 差异",
+      "把虚拟线程和响应式简单说成谁完全替代谁"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -144,11 +161,12 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-19",
   "status": "production",
   "prerequisites": [
-    "java.concurrency.topic-013-cc70cb0e"
+    "java.concurrency.topic-021-d2222a23",
+    "java.concurrency.topic-025-a8370d9d"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「Virtual Threads（Java 21+）」说清能准确描述虚拟线程的定义和与平台线程的差异、能解释载体线程的卸载/挂载调度机制，并放到Java 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察能否基于 JDK 21/24 版本事实解释虚拟线程调度、pinning、每任务模型、资源限流和生产迁移排查。"
 }

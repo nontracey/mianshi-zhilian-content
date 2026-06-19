@@ -37,10 +37,20 @@
     {
       "type": "diagram",
       "format": "mermaid",
-      "title": "分布式事务按一致性强度选型",
-      "content": "flowchart TD\nA[\"业务动作跨服务或跨库\"] --> B{\"能否调整边界到单库事务\"}\nB -->|能| C[\"领域收敛：本地事务保证强一致\"]\nB -->|不能| D{\"是否要求提交前不可见且立即一致\"}\nD -->|是，参与方少且低吞吐| E[\"XA/2PC：prepare 持锁，关注 in-doubt 恢复\"]\nD -->|是，但高并发资源可冻结| F[\"TCC：冻结资源 + 状态机防空回滚/悬挂\"]\nD -->|否，流程长且步骤可补偿| G[\"Saga：状态机 + 语义锁 + 逆序补偿\"]\nD -->|否，派生动作可异步| H[\"本地消息表/事务消息：至少一次投递 + 消费幂等\"]\nF --> I{\"是否有迟到 Try 或重复 Cancel\"}\nI -->|有| J[\"分支事务表记录 CANCELLED/CONFIRMED，拒绝非法状态迁移\"]\nG --> K{\"中间状态是否会被外部读取\"}\nK -->|会| L[\"PENDING 状态过滤、资源预留过期、补偿幂等\"]\nH --> M{\"消息投递或消费失败\"}\nM -->|失败| N[\"重试、死信、补偿任务、人工修复\"]",
-      "caption": "选型先判断能否回到本地事务，再按一致性强度、资源是否可冻结、流程是否可补偿、是否异步派生来选择方案；TCC、Saga、消息方案都必须设计异常状态收敛。",
-      "fallback": "分布式事务选型先尝试收敛到本地事务；不能收敛时，低吞吐强一致用 XA/2PC，高并发资源冻结用 TCC，长流程用 Saga，异步派生用本地消息表或事务消息，并为异常状态设计补偿。"
+      "title": "分布式事务选型：XA、TCC、Saga、Outbox 与事务消息",
+      "content": "flowchart TD\nA[\"跨服务写一致性需求\"] --> B{\"能否收敛到单服务事务\"}\nB -->|能| C[\"单服务事务 + 事件通知\"]\nB -->|不能| D{\"资源是否支持 XA\"}\nD -->|支持且强一致| E[\"2PC/XA\n阻塞和性能成本\"]\nD -->|业务可预留/确认/取消| F[\"TCC\n空回滚/悬挂/幂等\"]\nD -->|长流程可补偿| G[\"Saga\n本地事务 + 补偿\"]\nD -->|最终一致即可| H[\"Outbox/事务消息\n可靠投递 + 幂等消费\"]\nE --> I[\"监控超时/补偿/对账\"]\nF --> I\nG --> I\nH --> I",
+      "caption": "分布式事务选型：XA、TCC、Saga、Outbox 与事务消息",
+      "fallback": "图展示分布式事务先缩小强一致边界，再按 XA、TCC、Saga、Outbox/事务消息取舍。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[\"跨服务写一致性需求\"] --> B{\"能否收敛到单服务事务\"}\nB -->|能| C[\"单服务事务 + 事件通知\"]\nB -->|不能| D{\"资源是否支持 XA\"}\nD -->|支持且强一致| E[\"2PC/XA\n阻塞和性能成本\"]\nD -->|业务可预留/确认/取消| F[\"TCC\n空回滚/悬挂/幂等\"]\nD -->|长流程可补偿| G[\"Saga\n本地事务 + 补偿\"]\nD -->|最终一致即可| H[\"Outbox/事务消息\n可靠投递 + 幂等消费\"]\nE --> I[\"监控超时/补偿/对账\"]\nF --> I\nG --> I\nH --> I"
+        },
+        {
+          "kind": "text",
+          "content": "图展示分布式事务先缩小强一致边界，再按 XA、TCC、Saga、Outbox/事务消息取舍。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -51,7 +61,25 @@
       "type": "code",
       "title": "代码示例",
       "content": "// 1. TCC示例：库存预占，重点处理幂等、空回滚和悬挂\n@Service\npublic class InventoryTccService {\n    @Transactional\n    public boolean tryDeduct(String xid, String branchId, String skuId, int quantity) {\n        TccBranch branch = branchRepo.find(xid, branchId);\n        if (branch != null && branch.isCancelled()) return false;\n        if (branch != null && branch.isTried()) return true;\n\n        Inventory inv = inventoryRepo.selectForUpdate(skuId);\n        if (inv.getAvailable() < quantity) return false;\n        inv.setAvailable(inv.getAvailable() - quantity);\n        inv.setFrozen(inv.getFrozen() + quantity);\n        inventoryRepo.update(inv);\n        branchRepo.insertTried(xid, branchId, skuId, quantity);\n        return true;\n    }\n\n    @Transactional\n    public void confirmDeduct(String xid, String branchId) {\n        TccBranch branch = branchRepo.findForUpdate(xid, branchId);\n        if (branch == null || branch.isConfirmed()) return;\n        if (branch.isCancelled()) return;\n\n        Inventory inv = inventoryRepo.selectForUpdate(branch.getSkuId());\n        inv.setFrozen(inv.getFrozen() - branch.getQuantity());\n        inventoryRepo.update(inv);\n        branchRepo.markConfirmed(xid, branchId);\n    }\n\n    @Transactional\n    public void cancelDeduct(String xid, String branchId, String skuId, int quantity) {\n        TccBranch branch = branchRepo.findForUpdate(xid, branchId);\n        if (branch == null) {\n            branchRepo.insertCancelled(xid, branchId, skuId, quantity);\n            return;\n        }\n        if (branch.isCancelled() || branch.isConfirmed()) return;\n\n        Inventory inv = inventoryRepo.selectForUpdate(branch.getSkuId());\n        inv.setFrozen(inv.getFrozen() - branch.getQuantity());\n        inv.setAvailable(inv.getAvailable() + branch.getQuantity());\n        inventoryRepo.update(inv);\n        branchRepo.markCancelled(xid, branchId);\n    }\n}\n\n// 2. 本地消息表：业务写入和待投递消息在同一个本地事务\n@Service\npublic class OrderService {\n    @Transactional\n    public OrderId createOrder(CreateOrderCmd cmd) {\n        Order order = Order.create(cmd);\n        orderRepo.save(order);\n\n        LocalMessage msg = new LocalMessage();\n        msg.setMessageId(UUID.randomUUID().toString());\n        msg.setTopic(\"order-created\");\n        msg.setBizKey(order.getId().toString());\n        msg.setPayload(JSON.toJSONString(order));\n        msg.setStatus(MessageStatus.PENDING);\n        localMessageRepo.save(msg);\n        return order.getId();\n    }\n}\n\n@Scheduled(fixedDelay = 1000)\npublic void pollAndSend() {\n    List<LocalMessage> messages = localMessageRepo.lockPending(MessageStatus.PENDING, 100);\n    for (LocalMessage msg : messages) {\n        try {\n            kafkaTemplate.send(msg.getTopic(), msg.getBizKey(), msg.getPayload()).get();\n            msg.markSent();\n            localMessageRepo.update(msg);\n        } catch (Exception e) {\n            msg.increaseRetryCount();\n            if (msg.getRetryCount() >= 10) msg.markFailed();\n            localMessageRepo.update(msg);\n        }\n    }\n}\n\n// 3. Seata AT模式：短事务可快速接入，但要关注全局锁冲突和undo_log\n@GlobalTransactional(timeoutMills = 60000, name = \"create-order\")\npublic OrderId createOrder(CreateOrderCmd cmd) {\n    Order order = Order.create(cmd);\n    orderRepo.save(order);\n    inventoryClient.deduct(cmd.getItems());\n    return order.getId();\n}",
-      "language": "java"
+      "language": "java",
+      "highlights": [
+        {
+          "line": 3,
+          "note": "`public class InventoryTccService {` 定义了 分布式事务方案选型 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+        },
+        {
+          "line": 70,
+          "note": "`for (LocalMessage msg : messages) {` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+        },
+        {
+          "line": 7,
+          "note": "`if (branch != null && branch.isCancelled()) return false;` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+        },
+        {
+          "line": 12,
+          "note": "`inv.setAvailable(inv.getAvailable() - quantity);` 更新核心数据结构，是解释状态如何推进的抓手。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
@@ -155,5 +183,5 @@
   ],
   "interviewFrequency": "high",
   "interviewerFocus": "重点看候选人是否能从业务一致性边界出发做取舍，并能讲透 TCC 空回滚/悬挂、Saga 隔离性、Seata AT 全局锁与脏写、本地消息表和事务消息的工程治理，而不是只背方案名称。",
-  "updatedAt": "2026-06-17"
+  "updatedAt": "2026-06-18"
 }

@@ -19,17 +19,17 @@
     {
       "type": "explain",
       "title": "io_uring 是什么",
-      "content": "## 背景\n传统 Linux 高性能 IO 主要有两个痛点：\n- **epoll** 是就绪通知模型：`epoll_wait` 告诉你 fd 可读/可写后，应用仍要再发 `read`、`write`、`accept`、`send` 等系统调用完成操作；对普通磁盘文件，epoll 基本无法提供有意义的异步就绪能力，因为页缓存命中、缺页、回写都不等价于 socket 的 readiness。\n- **Linux AIO（libaio / `io_submit`）** 历史上更偏直接 IO，接口窄、组合能力弱，对 buffered IO 和网络操作覆盖不足，很多服务仍要维护网络一套 epoll、磁盘一套 AIO 或线程池。\n\n## io_uring 的核心机制\nio_uring 从 Linux 5.1 引入，用户态通过 `io_uring_setup` 创建一个 ring，再把内核分配的 ring 元数据用 `mmap` 映射到用户态。它的关键不是“更快的 epoll”，而是把**要执行的操作本身**放进提交队列，让内核完成后再回填结果：\n- **SQ（Submission Queue）**：应用填写 SQE（Submission Queue Entry），描述 opcode、fd、buffer、offset、flags、user_data 等。常见 opcode 包括 `IORING_OP_READV`、`IORING_OP_WRITEV`、`IORING_OP_ACCEPT`、`IORING_OP_RECV`、`IORING_OP_SEND`、`IORING_OP_FSYNC`。\n- **CQ（Completion Queue）**：内核把 CQE（Completion Queue Entry）写回完成结果，`res` 字段通常是返回字节数或负 errno，`user_data` 用来关联业务请求。\n- **提交与收割**：应用批量准备多个 SQE 后，通过 `io_uring_enter` 提交；也可以同一次 enter 指定等待完成数，把提交和等待合并。完成后应用从 CQ 批量读取 CQE 并推进业务状态机。\n\n## 触发性能收益的条件\nio_uring 的收益来自三类开销下降：\n- **系统调用聚合**：多个 IO 可以一次 `io_uring_enter` 提交和等待，降低用户态/内核态切换次数。\n- **共享内存队列**：SQ/CQ 的 head/tail 在共享映射中推进，减少传统系统调用参数反复拷贝和内核数据结构查找。\n- **可选内核轮询**：启用 `IORING_SETUP_SQPOLL` 后，内核 SQ poll 线程轮询 SQ，应用写入 SQE 后在满足条件时无需每次 enter 唤醒内核；代价是占用 CPU，并且要关注内核参数、权限和 idle 超时。\n\n## 失败路径和边界\n- CQE 的 `res` 小于 0 时表示负 errno，例如 `-EAGAIN`、`-ECANCELED`、`-EINVAL`，不能只按“完成即成功”处理。\n- CQ 空间不足会出现完成队列溢出风险，内核可能把溢出完成挂到 overflow 列表，应用若长期不收割 CQ，会看到吞吐下降、延迟尖刺，严重时提交侧也会被反压。\n- buffered IO 是否真正异步受内核版本、文件系统、页缓存状态影响；缺页、元数据锁、回写拥塞仍可能让 worker 线程参与，不能承诺所有文件 IO 都无阻塞。\n- io_uring 安全和能力边界随内核版本变化较大，生产选型需要确认发行版内核补丁、容器 seccomp、`kernel.io_uring_disabled` 等限制。"
+      "content": "## 背景\n传统 Linux 高性能 IO 主要有两个痛点：\n- **epoll** 是就绪通知模型：`epoll_wait` 告诉你 fd 可读/可写后，应用仍要再发 `read`、`write`、`accept`、`send` 等系统调用完成操作；对普通磁盘文件，epoll 基本无法提供有意义的异步就绪能力，因为页缓存命中、缺页、回写都不等价于 socket 的 readiness。\n- **Linux AIO（libaio / `io_submit`）** 历史上更偏直接 IO，接口窄、组合能力弱，对 buffered IO 和网络操作覆盖不足，很多服务仍要维护网络一套 epoll、磁盘一套 AIO 或线程池。\n\n## io_uring 的核心机制\nio_uring 从 Linux 5.1 引入，用户态通过 `io_uring_setup` 创建一个 ring，再把内核分配的 ring 元数据用 `mmap` 映射到用户态。它的关键不是“更快的 epoll”，而是把**要执行的操作本身**放进提交队列，让内核完成后再回填结果：\n- **SQ（Submission Queue）**：应用填写 SQE（Submission Queue Entry），描述 opcode、fd、buffer、offset、flags、user_data 等。常见 opcode 包括 `IORING_OP_READV`、`IORING_OP_WRITEV`、`IORING_OP_ACCEPT`、`IORING_OP_RECV`、`IORING_OP_SEND`、`IORING_OP_FSYNC`。\n- **CQ（Completion Queue）**：内核把 CQE（Completion Queue Entry）写回完成结果，`res` 字段通常是返回字节数或负 errno，`user_data` 用来关联业务请求。\n- **提交与收割**：应用批量准备多个 SQE 后，通过 `io_uring_enter` 提交；也可以同一次 enter 指定等待完成数，把提交和等待合并。完成后应用从 CQ 批量读取 CQE 并推进业务状态机。\n\n## 触发性能收益的条件\nio_uring 的收益来自三类开销下降：\n- **系统调用聚合**：多个 IO 可以一次 `io_uring_enter` 提交和等待，降低用户态/内核态切换次数。\n- **共享内存队列**：SQ/CQ 的 head/tail 在共享映射中推进，减少传统系统调用参数反复拷贝和内核数据结构查找。\n- **可选内核轮询**：启用 `IORING_SETUP_SQPOLL` 后，内核 SQ poll 线程轮询 SQ，应用写入 SQE 后在满足条件时可减少提交通知系统调用；代价是占用 CPU、影响功耗，并且 SQPOLL 对固定文件、权限和特性的要求随内核版本、稳定版回补和发行版策略变化，需要以运行内核的 feature flags 和 man-pages 为准。\n\n## 失败路径和边界\n- CQE 的 `res` 小于 0 时表示负 errno，例如 `-EAGAIN`、`-ECANCELED`、`-EINVAL`，不能只按“完成即成功”处理。\n- CQ 空间不足会出现完成队列溢出风险，内核可能把溢出完成挂到 overflow 列表，应用若长期不收割 CQ，会看到吞吐下降、延迟尖刺，严重时提交侧也会被反压。\n- buffered IO 是否真正异步受内核版本、文件系统、页缓存状态影响；缺页、元数据锁、回写拥塞仍可能让 worker 线程参与，不能承诺所有文件 IO 都无阻塞。\n- 安全边界必须显式检查：`kernel.io_uring_disabled=0` 表示正常允许创建；`=1` 时非特权进程通常需要 `CAP_SYS_ADMIN` 或属于 `kernel.io_uring_group` 指定组；`=2` 时创建会被系统级禁用。容器 seccomp、LSM、发行版补丁也可能让 `io_uring_setup` 返回 `EPERM`。"
     },
     {
       "type": "explain",
       "title": "相对 epoll/AIO 的优势与适用",
-      "content": "## 相对 epoll：从 Reactor 到 Proactor\n- epoll 的核心事件是“fd 已经就绪”，业务线程仍要调用读写系统调用；io_uring 的核心事件是“这次读写请求已经完成”，业务线程消费 CQE 即可知道结果。\n- epoll 在高并发网络服务中很成熟，兼容性和调试工具链好；io_uring 在小包高频、磁盘与网络混合、批量化明显的场景更容易摊薄 syscall 成本。\n- 如果业务瓶颈在协议解析、锁竞争、下游服务或数据库，而不是 syscall/IO 提交路径，迁移 io_uring 可能只增加复杂度，不会显著提升吞吐。\n\n## 相对 Linux AIO：覆盖面和组合能力\nLinux AIO 常见使用姿势依赖 direct IO，且与网络事件模型割裂。io_uring 把网络、文件、超时、取消、连接、fsync 等操作统一成 SQE/CQE，可用 `user_data` 把多个阶段串成状态机，也支持 linked SQE、timeout、cancel 等组合能力。\n\n## 固定文件和固定缓冲区\nio_uring 的注册资源是难度 4 面试常追问点：\n- **固定文件**：通过注册文件表把 fd 固定到 ring 内部索引，SQE 使用 fixed file 索引，减少每次 IO 的 fd 查找和引用计数开销；适合连接池、热文件、存储引擎数据文件，不适合 fd 高频变化且生命周期很短的请求。\n- **固定缓冲区**：注册用户态 buffer 后，内核可避免每次 IO pin/unpin 用户页的成本；适合重复使用的大块 buffer 池。缺点是内存长期 pinned，过量注册会压缩页回收空间，NUMA 放置不当还会制造远端内存访问。\n- **选择标准**：固定资源不是默认越多越好，只有在 perf 或 eBPF 证明 fdget、页 pin、copy iovec 等开销占比明显时才值得引入；否则资源管理复杂度和内存压力会抵消收益。\n\n## 多线程使用注意事项\n- 一个 ring 可以被多个线程提交，但 SQ tail、SQE 分配、`user_data` 唯一性、CQ 收割需要明确所有权；最常见工程方案是每个 IO 线程一个 ring，业务线程通过 MPSC 队列投递，避免多个线程同时抢 SQE。\n- 多线程共享 ring 时要使用 liburing 提供的线程安全约束或外部锁，不能把“mmap 共享内存”误解成“任意并发写都安全”。\n- CQ 通常应由固定线程批量收割，避免多个消费者重复推进 CQ head 或破坏业务请求归属；若必须多消费者，要在业务层做请求分片和完成归属设计。\n\n## 生产适用范围\n更适合高吞吐网络代理、数据库/存储引擎、对象存储、日志系统、需要把网络与文件 IO 放进同一异步状态机的运行时。不适合内核版本不可控、容器策略严格、团队缺少内核问题定位能力，或 IO 路径并非主要瓶颈的系统。"
+      "content": "## 相对 epoll：从 Reactor 到 Completion\n- epoll 的核心事件是“fd 已经就绪”，业务线程仍要调用读写系统调用；io_uring 的核心事件是“这次请求已经完成”，业务线程消费 CQE 才知道结果。\n- epoll 在高并发网络服务中很成熟，兼容性和调试工具链好；io_uring 在小包高频、磁盘与网络混合、批量化明显的场景更容易摊薄 syscall 成本。\n- 如果业务瓶颈在协议解析、锁竞争、下游服务或数据库，而不是 syscall/IO 提交路径，迁移 io_uring 可能只增加复杂度，不会显著提升吞吐。\n\n## 相对 Linux AIO：覆盖面和组合能力\nLinux AIO 常见使用姿势依赖 direct IO，且与网络事件模型割裂。io_uring 把网络、文件、超时、取消、连接、fsync 等操作统一成 SQE/CQE，可用 `user_data` 把多个阶段串成状态机，也支持 linked SQE、timeout、cancel 等组合能力。\n\n## 固定文件和固定缓冲区\nio_uring 的注册资源是难度 4 面试常追问点：\n- **固定文件**：通过注册文件表把 fd 固定到 ring 内部索引，SQE 使用 fixed file 索引，减少每次 IO 的 fd 查找和引用计数开销；适合连接池、热文件、存储引擎数据文件，不适合 fd 高频变化且生命周期很短的请求。\n- **固定缓冲区**：注册用户态 buffer 后，内核可减少每次 IO pin/unpin 用户页的成本；适合重复使用的大块 buffer 池。缺点是内存长期 pinned，过量注册会压缩页回收空间，NUMA 放置不当还会制造远端内存访问。\n- **选择标准**：固定资源不是默认越多越好，只有在 perf 或 eBPF 证明 fdget、页 pin、copy iovec 等开销占比明显时才值得引入；否则资源管理复杂度和内存压力会抵消收益。\n\n## 多线程使用注意事项\n- 一个 ring 可以被多个线程提交，但 SQ tail、SQE 分配、`user_data` 唯一性、CQ 收割需要明确所有权；最常见工程方案是每个 IO 线程一个 ring，业务线程通过 MPSC 队列投递，避免多个线程同时抢 SQE。\n- 多线程共享 ring 时要使用 liburing 提供的线程安全约束或外部锁，不能把“mmap 共享内存”误解成“任意并发写都安全”。\n- CQ 通常应由固定线程批量收割，避免多个消费者重复推进 CQ head 或破坏业务请求归属；若必须多消费者，要在业务层做请求分片和完成归属设计。\n\n## 生产适用范围\n更适合高吞吐网络代理、数据库/存储引擎、对象存储、日志系统、需要把网络与文件 IO 放进同一完成队列状态机的运行时。不适合内核版本不可控、容器策略严格、团队缺少内核问题定位能力，或 IO 路径并非主要瓶颈的系统。"
     },
     {
       "type": "diagram",
-      "title": "SQ/CQ 双环提交、完成与溢出反压路径",
-      "content": "flowchart LR\nApp[应用线程准备多个 SQE] -->|写入 mmap SQE 数组并推进 SQ tail| SQ[SQ 提交环]\nSQ -->|io_uring_enter 提交通知| Kernel[内核消费 SQE]\nSQ -->|IORING_SETUP_SQPOLL 时由内核线程轮询| SQPoll[SQ poll 内核线程]\nSQPoll -->|发现新 tail 后取走请求| Kernel\nKernel -->|执行 readv/writev/accept/fsync 等 opcode| Exec[文件系统或网络协议栈]\nExec -->|成功或负 errno 写入 CQE.res| CQ[CQ 完成环]\nCQ -->|应用批量读取 CQE 并推进 CQ head| App\nCQ -->|应用收割过慢导致 CQ 空间不足| Overflow[CQ overflow 列表或反压]\nOverflow -->|延迟尖刺并阻塞后续完成暴露| App",
+      "title": "io_uring SQ/CQ 提交完成路径",
+      "content": "assets/diagrams/os-io-uring-sq-cq.svg",
       "items": [
         "应用批量填写 SQE，通过 SQ tail 发布给内核",
         "普通模式用 io_uring_enter 提交，SQPOLL 模式由内核轮询线程主动消费 SQ",
@@ -38,23 +38,33 @@
         "user_data 贯穿 SQE/CQE，用于把完成事件映射回业务请求",
         "固定 fd 和固定 buffer 优化的是 fd 引用、页 pin 与 iovec 处理成本，不改变 CQ 收割责任"
       ],
-      "format": "mermaid",
-      "fallback": "应用批量写 SQE，普通模式由 io_uring_enter 提交，SQPOLL 模式由内核线程轮询；内核执行后写 CQE，应用收割过慢会导致 CQ 溢出和反压。",
-      "caption": "图中同时展示了普通提交、SQPOLL 分支、完成收割和 CQ overflow 失败路径，是面试中解释 io_uring 机制与线上延迟尖刺的核心链路。"
+      "format": "svg",
+      "fallback": "io_uring 先 setup 并 mmap 共享 SQ/CQ；应用填写 SQE 后推进 SQ tail，通过 io_uring_enter 或 SQPOLL 让内核消费；内核执行 opcode 后写 CQE，应用按 user_data 找回请求并检查 res。CQ 收割慢会 overflow/反压；fixed files/buffers 只在 fd 查找或页 pin 成本显著时值得用；生产还要核验内核版本、seccomp、io_uring_disabled 与 io_uring_group。",
+      "caption": "图中强调 io_uring 是完成通知：业务提交的是操作本身，消费的是 CQE 结果；完成不等于成功，res 可能是负 errno，CQ 也必须及时收割。",
+      "sources": [
+        {
+          "kind": "svg",
+          "path": "assets/diagrams/os-io-uring-sq-cq.svg"
+        },
+        {
+          "kind": "text",
+          "content": "io_uring 先 setup 并 mmap 共享 SQ/CQ；应用填写 SQE 后推进 SQ tail，通过 io_uring_enter 或 SQPOLL 让内核消费；内核执行 opcode 后写 CQE，应用按 user_data 找回请求并检查 res。CQ 收割慢会 overflow/反压；fixed files/buffers 只在 fd 查找或页 pin 成本显著时值得用；生产还要核验内核版本、seccomp、io_uring_disabled 与 io_uring_group。"
+        }
+      ]
     },
     {
       "type": "compareTable",
       "title": "epoll vs io_uring",
-      "content": "| 维度 | epoll | io_uring |\n| --- | --- | --- |\n| IO 模型 | Reactor，就绪后应用再执行 read/write | Proactor，应用提交操作，内核完成后返回 CQE |\n| 系统调用形态 | `epoll_wait` 后通常还要多次读写调用 | 一次 `io_uring_enter` 可批量提交和等待，SQPOLL 可减少提交通知 |\n| 文件 IO | 普通磁盘文件 readiness 语义弱，通常要线程池兜底 | 可提交 read/write/fsync 等文件操作，但 buffered IO 仍受内核和文件系统路径影响 |\n| 完成结果 | 事件只说明 fd 状态，读写结果来自后续系统调用 | CQE.res 直接携带字节数或负 errno，user_data 关联请求 |\n| 性能收益来源 | 复用 fd readiness，避免每连接一线程 | 批量化、共享内存环、注册 fd/buffer、可选 SQPOLL |\n| 复杂度和风险 | 生态成熟，调试路径清晰，跨内核表现稳定 | 版本差异、安全策略、CQ 溢出、多线程 ring 所有权和固定资源管理更复杂 |"
+      "content": "| 维度 | epoll | io_uring |\n| --- | --- | --- |\n| IO 模型 | Reactor，就绪后应用再执行 read/write | 完成通知语义，应用提交操作，内核完成后返回 CQE |\n| 系统调用形态 | `epoll_wait` 后通常还要多次读写调用 | 一次 `io_uring_enter` 可批量提交和等待，SQPOLL 可减少提交通知 |\n| 文件 IO | 普通磁盘文件 readiness 语义弱，通常要线程池兜底 | 可提交 read/write/fsync 等文件操作，但 buffered IO 仍受内核和文件系统路径影响 |\n| 完成结果 | 事件只说明 fd 状态，读写结果来自后续系统调用 | CQE.res 直接携带字节数或负 errno，user_data 关联请求 |\n| 性能收益来源 | 复用 fd readiness，避免每连接一线程 | 批量化、共享内存环、注册 fd/buffer、可选 SQPOLL |\n| 复杂度和风险 | 生态成熟，调试路径清晰，跨内核表现稳定 | 版本差异、安全策略、CQ 溢出、多线程 ring 所有权和固定资源管理更复杂 |"
     },
     {
       "type": "interviewAnswer",
       "title": "标准面试回答",
-      "content": "30 秒结论：io_uring 是 Linux 的异步 IO 提交/完成接口。应用把读写、accept、fsync 等操作写成 SQE 放入共享 SQ，内核执行后把 CQE 写入共享 CQ；它通过批量 `io_uring_enter`、共享内存 ring、可选 SQPOLL 和注册资源降低系统调用、fd 查找、页 pin 等开销。它不是 epoll 的简单替代品，而是把“等待就绪”改成“提交操作并消费完成”。\n\n机制要点：\n- SQE 描述一次具体操作，CQE 的 `res` 返回字节数或负 errno，`user_data` 用来把完成事件映射回业务请求。\n- 普通模式下应用通过 `io_uring_enter` 批量提交并可同时等待完成；SQPOLL 模式下内核线程轮询 SQ，减少每次提交的系统调用，但会消耗 CPU 并受权限、内核参数和 idle 策略影响。\n- 相比 epoll，io_uring 对文件 IO、网络 IO、超时、取消、fsync 等提供更统一的 Proactor 风格接口；相比老 Linux AIO，覆盖面和组合能力更强。\n- 固定文件和固定缓冲区能减少 fd 引用、用户页 pin/unpin、iovec 处理等成本，但会带来资源生命周期、内存 pinned、NUMA 和容量规划问题。\n\n边界和追问应对：\n- 不能把 CQE 完成等同于成功，`res < 0` 是负 errno；短读短写也要按业务协议继续提交。\n- CQ 必须及时收割，完成队列满会导致 overflow、延迟尖刺和反压，压测时要同时看提交速率、CQ backlog、overflow 指标和尾延迟。\n- 多线程共享 ring 需要明确 SQE 分配和 CQ 消费所有权；高性能服务常用每 IO 线程一个 ring，跨线程投递请求，避免多个线程同时改 ring head/tail。\n- 选型时先确认内核版本、发行版补丁、容器 seccomp、`kernel.io_uring_disabled` 和团队定位能力；如果瓶颈不在 IO 提交路径，epoll 加线程池可能更稳。",
+      "content": "30 秒结论：io_uring 是 Linux 的异步 IO 提交/完成接口。应用把读写、accept、fsync 等操作写成 SQE 放入共享 SQ，内核执行后把 CQE 写入共享 CQ；它通过批量 `io_uring_enter`、共享内存 ring、可选 SQPOLL 和注册资源降低系统调用、fd 查找、页 pin 等开销。它不是 epoll 的简单替代品，而是把“等待就绪”改成“提交操作并消费完成”。\n\n机制要点：\n- SQE 描述一次具体操作，CQE 的 `res` 返回字节数或负 errno，`user_data` 用来把完成事件映射回业务请求。\n- 普通模式下应用通过 `io_uring_enter` 批量提交并可同时等待完成；SQPOLL 模式下内核线程轮询 SQ，减少提交通知系统调用，但会消耗 CPU，并且特性、权限和固定文件要求要按运行内核核验。\n- 相比 epoll，io_uring 对文件 IO、网络 IO、超时、取消、fsync 等提供更统一的完成队列接口；相比老 Linux AIO，覆盖面和组合能力更强。\n- 固定文件和固定缓冲区能减少 fd 引用、用户页 pin/unpin、iovec 处理等成本，但会带来资源生命周期、内存 pinned、NUMA 和容量规划问题。\n\n边界和追问应对：\n- 不能把 CQE 完成等同于成功，`res < 0` 是负 errno；短读短写也要按业务协议继续提交。\n- CQ 必须及时收割，完成队列满会导致 overflow、延迟尖刺和反压，压测时要同时看提交速率、CQ backlog、overflow 指标和尾延迟。\n- 多线程共享 ring 需要明确 SQE 分配和 CQ 消费所有权；高性能服务常用每 IO 线程一个 ring，跨线程投递请求，避免多个线程同时改 ring head/tail。\n- 选型时先确认内核版本、发行版补丁、容器 seccomp、LSM、`kernel.io_uring_disabled`、`kernel.io_uring_group` 和团队定位能力；如果瓶颈不在 IO 提交路径，epoll 加线程池可能更稳。",
       "followUpQuestions": [
         {
           "question": "io_uring 和 epoll 最本质的区别？",
-          "answer": "epoll 返回的是 readiness，业务线程拿到事件后还要自己调用 read/write，并处理 EAGAIN、短读短写；io_uring 提交的是 operation，内核完成后 CQE.res 已经给出这次操作的结果。前者是 Reactor，后者更接近 Proactor。这个区别决定了 io_uring 可以把文件 IO、网络 IO、timeout、cancel、fsync 等统一进一个完成队列，而 epoll 主要围绕 fd 就绪状态工作。"
+          "answer": "epoll 返回的是 readiness，业务线程拿到事件后还要自己调用 read/write，并处理 EAGAIN、短读短写；io_uring 提交的是 operation，内核完成后 CQE.res 给出这次操作的结果。前者是 Reactor，后者是完成通知语义。这个区别决定了 io_uring 可以把文件 IO、网络 IO、timeout、cancel、fsync 等统一进一个完成队列，而 epoll 主要围绕 fd 就绪状态工作。"
         },
         {
           "question": "SQPOLL 模式为什么能降低系统调用？它的代价是什么？",
@@ -65,7 +75,7 @@
           "answer": "先区分是提交侧堵还是完成侧堵：看 SQ 是否经常无可用 SQE、CQ backlog 是否增长、是否出现 CQ overflow、CQE.res 里是否集中出现 -EAGAIN、-ECANCELED、-ENOMEM 或短读短写。再看是否启用了 SQPOLL 且 poll 线程被抢占或跑在远端 NUMA；固定 buffer 是否注册过多导致内存回收压力；多线程是否共享 ring 造成锁竞争。最后用 perf、bpftrace 或 liburing 暴露指标把延迟拆到提交、内核执行、CQ 收割三个阶段。"
         },
         {
-          "question": "固定文件和固定缓冲区为什么不应该无脑开启？",
+          "question": "固定文件和固定缓冲区为什么不应该默认大量开启？",
           "answer": "固定文件减少 fd 查找和引用计数，固定缓冲区减少用户页 pin/unpin 与 iovec 处理，但它们都把资源生命周期前置到注册阶段。fd 高频变化时固定文件表维护成本高；buffer 长期 pinned 会影响内存回收，容量过大还可能造成 NUMA 远端访问。只有在压测或 profiling 证明这些开销占比明显，并且业务能管理连接、文件和 buffer 池生命周期时才值得使用。"
         }
       ]
@@ -76,12 +86,12 @@
       "items": [
         "说清 SQE、SQ、CQE、CQ、user_data 和 CQE.res 在一次请求生命周期中的作用",
         "解释 `io_uring_enter` 如何批量提交和等待，以及 SQPOLL 如何把提交通知从 syscall 变成内核线程轮询",
-        "区分 epoll readiness/Reactor 与 io_uring completion/Proactor 的语义差异",
+        "区分 epoll readiness/Reactor 与 io_uring completion 的语义差异",
         "说明 io_uring 处理文件 IO 的优势与 buffered IO、文件系统、内核版本相关的边界",
         "描述 CQ 收割过慢导致 CQ overflow、反压和尾延迟升高的链路",
         "说明多线程共享 ring 时 SQE 分配、CQ 消费和请求归属的所有权问题",
         "解释固定文件、固定缓冲区优化的具体成本，以及 pinned memory、NUMA、资源生命周期代价",
-        "能给出生产选型检查项：内核版本、发行版补丁、seccomp、`kernel.io_uring_disabled`、团队排障能力"
+        "能给出生产选型检查项：内核版本、发行版补丁、seccomp、`kernel.io_uring_disabled`、`kernel.io_uring_group`、团队排障能力"
       ]
     }
   ],
@@ -95,7 +105,7 @@
     },
     {
       "id": "os.io-model.topic-io-uring.recall.2",
-      "prompt": "io_uring 相比 epoll 的本质区别是什么？为什么说它是真异步而不是更快的就绪通知？",
+      "prompt": "io_uring 相比 epoll 的本质区别是什么？为什么说它是完成通知语义，而不是更快的就绪通知？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
@@ -113,7 +123,7 @@
       "SQE/SQ/CQE/CQ 双环共享内存请求生命周期",
       "io_uring_enter 批量提交与等待完成",
       "CQE.res 负 errno 和 user_data 请求关联",
-      "Proactor 完成语义对比 epoll readiness",
+      "完成通知语义对比 epoll readiness",
       "文件 IO 与网络 IO 统一提交能力"
     ],
     "goodToHave": [
@@ -121,14 +131,14 @@
       "CQ overflow、完成收割滞后和尾延迟反压",
       "固定文件表和固定缓冲区注册机制",
       "多线程共享 ring 的 SQE 分配与 CQ 消费所有权",
-      "内核版本、seccomp、kernel.io_uring_disabled 选型检查"
+      "内核版本、seccomp、kernel.io_uring_disabled、kernel.io_uring_group 选型检查"
     ],
     "commonMistakes": [
       "把 io_uring 说成更快的 epoll，而没有区分就绪事件和完成事件",
       "认为 CQE 出现就代表业务成功，忽略负 errno 和短读短写",
       "只讲 SQPOLL 省系统调用，不讲轮询 CPU、权限和亲和性代价",
       "忽略 CQ 收割过慢导致 overflow、反压和尾延迟尖刺",
-      "无脑注册固定 buffer，忽略 pinned memory、NUMA 和资源生命周期",
+      "默认大量注册固定 buffer，忽略 pinned memory、NUMA 和资源生命周期",
       "认为 mmap 共享 ring 后多线程可以无同步地同时写 SQ 和收割 CQ"
     ],
     "scoreWeights": {
@@ -138,7 +148,7 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-17",
+  "updatedAt": "2026-06-19",
   "status": "production",
   "interviewFrequency": "medium",
   "interviewerFocus": "重点看候选人能否把 SQE 提交、内核执行、CQE 收割和失败反压串成完整链路，并能在 epoll 对比之外讲清 SQPOLL、CQ overflow、固定资源注册与多线程 ring 所有权这些生产级取舍。"

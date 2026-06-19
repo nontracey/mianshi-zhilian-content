@@ -37,10 +37,20 @@
     {
       "type": "diagram",
       "format": "mermaid",
-      "title": "高可用三件套：限流/熔断/降级",
-      "content": "flowchart TD\nA[\"高并发或依赖故障\"] --> B[\"限流：令牌桶/漏桶/滑动窗口控制入口\"]\nA --> C[\"熔断：Closed→Open→Half-Open 状态机切断故障依赖\"]\nA --> D[\"降级：返回默认值/切备用/关非核心功能保核心\"]",
-      "caption": "高可用三件套：限流用令牌桶/漏桶/滑动窗口控制入口流量，熔断用 Closed/Open/Half-Open 状态机切断故障依赖，降级牺牲非核心功能保住核心。",
-      "fallback": "过载或依赖故障时：限流（令牌桶、漏桶、滑动窗口）控制入口流量；熔断（Closed→Open→Half-Open 状态机）切断对故障依赖的调用；降级（返回默认值、切备用、关非核心功能）保住核心。"
+      "title": "限流熔断降级：入口预算、状态机与降级结果",
+      "content": "flowchart LR\nA[\"请求进入\"] --> B[\"识别维度\n用户/IP/租户/API\"]\nB --> C{\"限流算法\"}\nC -->|令牌桶| D[\"允许突发但受平均速率约束\"]\nC -->|漏桶| E[\"平滑出流\"]\nC -->|滑动窗口| F[\"统计近窗口请求量\"]\nD --> G{\"是否通过\"}\nE --> G\nF --> G\nG -->|拒绝| H[\"快速失败/排队/降级响应\"]\nG -->|通过| I[\"调用下游\"]\nI --> J[\"熔断器\nClosed/Open/Half-Open\"]\nJ --> K[\" fallback / 限制重试风暴\"]",
+      "caption": "限流熔断降级：入口预算、状态机与降级结果",
+      "fallback": "图展示请求先按维度限流，再通过熔断器控制下游故障扩散，并返回可解释降级结果。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart LR\nA[\"请求进入\"] --> B[\"识别维度\n用户/IP/租户/API\"]\nB --> C{\"限流算法\"}\nC -->|令牌桶| D[\"允许突发但受平均速率约束\"]\nC -->|漏桶| E[\"平滑出流\"]\nC -->|滑动窗口| F[\"统计近窗口请求量\"]\nD --> G{\"是否通过\"}\nE --> G\nF --> G\nG -->|拒绝| H[\"快速失败/排队/降级响应\"]\nG -->|通过| I[\"调用下游\"]\nI --> J[\"熔断器\nClosed/Open/Half-Open\"]\nJ --> K[\" fallback / 限制重试风暴\"]"
+        },
+        {
+          "kind": "text",
+          "content": "图展示请求先按维度限流，再通过熔断器控制下游故障扩散，并返回可解释降级结果。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -50,13 +60,31 @@
     {
       "type": "compareTable",
       "title": "维度对比",
-      "content": "| 维度 | Sentinel | Hystrix | Resilience4j |\n| --- | --- | --- | --- |\n| 维护状态 | 活跃 | 停止 | 活跃 |\n| 集群限流 | 支持 | 不支持 | 不支持 |\n| 熔断策略 | 多种 | 线程池/信号量 | 多种 |\n| 流控规则 | 动态推送 | 配置文件 | 配置文件 |\n| 语言 | Java | Java | Java |"
+      "content": "| 维度 | Sentinel | Hystrix | Resilience4j |\n| --- | --- | --- | --- |\n| 维护状态 | 活跃 | 停止 | 活跃 |\n| 集群限流 | 支持 | 不支持 | 不支持 |\n| 熔断策略 | 多种 | 线程池/信号量 | 多种 |\n| 流控规则 | 动态推送 | 配置文件 | 配置文件 |\n| 语言 | Java（Sentinel） | Java（Hystrix） | Java（Resilience4j） |"
     },
     {
       "type": "code",
       "title": "代码示例",
       "content": "// 1. Guava RateLimiter - 令牌桶\n@Service\npublic class RateLimitService {\n    private final RateLimiter limiter = RateLimiter.create(100); // 100 QPS\n\n    public String process(String request) {\n        if (!limiter.tryAcquire(100, TimeUnit.MILLISECONDS)) {\n            throw new RateLimitException(\"请求过于频繁\");\n        }\n        return doProcess(request);\n    }\n}\n\n// 2. Redis集群限流 - 滑动窗口\n@Service\npublic class RedisRateLimiter {\n    private final StringRedisTemplate redis;\n\n    public boolean isAllowed(String key, int limit, int windowSeconds) {\n        long now = System.currentTimeMillis();\n        long windowStart = now - windowSeconds * 1000L;\n\n        String luaScript = \"redis.call('zremrangebyscore', KEYS[1], 0, ARGV[1]) \" +\n            \"local count = redis.call('zcard', KEYS[1]) \" +\n            \"if count < tonumber(ARGV[3]) then \" +\n            \"redis.call('zadd', KEYS[1], ARGV[2], ARGV[2]) \" +\n            \"redis.call('expire', KEYS[1], ARGV[4]) \" +\n            \"return 1 else return 0 end\";\n\n        Long result = redis.execute(\n            new DefaultRedisScript<>(luaScript, Long.class),\n            Collections.singletonList(\"rate:\" + key),\n            String.valueOf(windowStart),\n            String.valueOf(now),\n            String.valueOf(limit),\n            String.valueOf(windowSeconds)\n        );\n        return Long.valueOf(1L).equals(result);\n    }\n}\n\n// 3. Sentinel限流配置\n// @SentinelResource注解\n@SentinelResource(\n    value = \"createOrder\",\n    blockHandler = \"createOrderBlock\",\n    fallback = \"createOrderFallback\"\n)\npublic OrderId createOrder(CreateOrderCmd cmd) {\n    return orderService.create(cmd);\n}\n\n// 限流降级方法\npublic OrderId createOrderBlock(CreateOrderCmd cmd, BlockException ex) {\n    throw new RateLimitException(\"系统繁忙，请稍后重试\");\n}\n\n// 熔断降级方法\npublic OrderId createOrderFallback(CreateOrderCmd cmd, Throwable t) {\n    return OrderId.pending(); // 返回待处理状态\n}\n\n// 4. Resilience4j熔断器\n@Service\npublic class CircuitBreakerService {\n    private final CircuitBreaker circuitBreaker = CircuitBreaker.ofDefaults(\"orderService\");\n    private final Supplier<OrderDTO> decoratedSupplier = CircuitBreaker\n        .decorateSupplier(circuitBreaker, () -> orderClient.getOrder(\"123\"));\n\n    public OrderDTO getOrderWithFallback() {\n        Try<OrderDTO> result = Try.ofSupplier(decoratedSupplier)\n            .recover(CallNotPermittedException.class, e -> OrderDTO.degraded())\n            .recover(Exception.class, e -> OrderDTO.error());\n        return result.get();\n    }\n}\n\n// 5. 降级策略 - 返回缓存数据\n@Service\npublic class DegradeService {\n    public UserProfile getUserProfile(String userId) {\n        try {\n            return userClient.getProfile(userId); // 远程调用\n        } catch (Exception e) {\n            // 降级：返回缓存数据\n            UserProfile cached = cacheManager.get(\"user:\" + userId);\n            if (cached != null) return cached;\n            // 降级：返回默认值\n            return UserProfile.defaultProfile(userId);\n        }\n    }\n}",
-      "language": "java"
+      "language": "java",
+      "highlights": [
+        {
+          "line": 3,
+          "note": "`public class RateLimitService {` 定义了 限流降级熔断策略 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+        },
+        {
+          "line": 7,
+          "note": "`if (!limiter.tryAcquire(100, TimeUnit.MILLISECONDS)) {` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+        },
+        {
+          "line": 26,
+          "note": "`\"redis.call('zadd', KEYS[1], ARGV[2], ARGV[2]) \" +` 更新核心数据结构，是解释状态如何推进的抓手。"
+        },
+        {
+          "line": 46,
+          "note": "`blockHandler = \"createOrderBlock\",` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
@@ -145,5 +173,5 @@
   ],
   "interviewFrequency": "high",
   "interviewerFocus": "考察能否区分限流降级熔断三者职责、对比限流算法、讲清熔断状态机，并知道阈值要压测、集群限流要共享配额。",
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-18"
 }

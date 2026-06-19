@@ -36,10 +36,20 @@
     {
       "type": "diagram",
       "format": "mermaid",
-      "title": "多租户隔离方案与租户路由",
-      "content": "flowchart TD\nA[\"请求带租户标识 域名/Header/Token\"] --> B[\"拦截器提取租户，存入 ThreadLocal 上下文\"]\nB --> C[\"租户路由到对应数据源\"]\nC --> D{\"数据隔离方案\"}\nD -->|大客户| E[\"独立数据库：隔离最好、成本高\"]\nD -->|中客户| F[\"独立 Schema：中等\"]\nD -->|小客户| G[\"共享表 tenant_id：成本低、隔离差\"]\nB --> H[\"MyBatis 拦截器自动注入 tenant_id 防越权\"]",
-      "caption": "多租户 SaaS：请求带租户标识、拦截器存入 ThreadLocal 并路由数据源；隔离方案按客户分独立库/独立 Schema/共享表，MyBatis 拦截器自动注入 tenant_id 防越权。",
-      "fallback": "请求带租户标识（域名/Header/Token），拦截器提取并存入 ThreadLocal 上下文、路由到对应数据源；隔离方案按客户分独立数据库（隔离最好）、独立 Schema（中等）、共享表加 tenant_id（成本低、隔离差）；MyBatis 拦截器自动注入 tenant_id 防止越权。"
+      "title": "多租户链路：租户识别、上下文传递、数据路由与越权防护",
+      "content": "flowchart LR\nA[\"请求进入\"] --> B[\"租户识别\n域名/Header/Token\"]\nB --> C[\"Tenant Context\n传递到应用层\"]\nC --> D{\"隔离模式\"}\nD -->|独立库| E[\"DataSource Routing\"]\nD -->|共享库独立表| F[\"表路由/Schema\"]\nD -->|共享表| G[\"自动注入 tenant_id\"]\nG --> H[\"SQL 拦截器/行级权限\"]\nE --> I[\"业务查询\"]\nF --> I\nH --> I\nI --> J[\"配额/计费/审计/数据迁移\"]",
+      "caption": "多租户链路：租户识别、上下文传递、数据路由与越权防护",
+      "fallback": "图展示多租户从请求识别租户，到上下文传递、数据隔离和 tenant_id 防越权的完整链路。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart LR\nA[\"请求进入\"] --> B[\"租户识别\n域名/Header/Token\"]\nB --> C[\"Tenant Context\n传递到应用层\"]\nC --> D{\"隔离模式\"}\nD -->|独立库| E[\"DataSource Routing\"]\nD -->|共享库独立表| F[\"表路由/Schema\"]\nD -->|共享表| G[\"自动注入 tenant_id\"]\nG --> H[\"SQL 拦截器/行级权限\"]\nE --> I[\"业务查询\"]\nF --> I\nH --> I\nI --> J[\"配额/计费/审计/数据迁移\"]"
+        },
+        {
+          "kind": "text",
+          "content": "图展示多租户从请求识别租户，到上下文传递、数据隔离和 tenant_id 防越权的完整链路。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -55,7 +65,25 @@
       "type": "code",
       "title": "代码示例",
       "content": "// 1. 租户上下文\npublic class TenantContext {\n    private static final ThreadLocal<String> TENANT_ID = new ThreadLocal<>();\n\n    public static void setTenantId(String tenantId) {\n        TENANT_ID.set(tenantId);\n    }\n\n    public static String getTenantId() {\n        return TENANT_ID.get();\n\n    public static void clear() {\n        TENANT_ID.remove();\n    }\n}\n\n// 2. 租户拦截器 - 从请求中提取租户\n@Component\npublic class TenantInterceptor implements HandlerInterceptor {\n    @Override\n    public boolean preHandle(HttpServletRequest request,\n            HttpServletResponse response, Object handler) {\n        // 从Header获取\n        String tenantId = request.getHeader(\"X-Tenant-Id\");\n        // 或从域名获取: tenant1.saas.com\n        // 或从JWT Token获取\n        if (tenantId == null) {\n            throw new UnauthorizedException(\"缺少租户标识\");\n        }\n        TenantContext.setTenantId(tenantId);\n        return true;\n    }\n\n    @Override\n    public void afterCompletion(HttpServletRequest request,\n            HttpServletResponse response, Object handler, Exception ex) {\n        TenantContext.clear();\n    }\n}\n\n// 3. MyBatis自动注入tenant_id\n@Intercepts({@Signature(type = Executor.class,\n    method = \"query\", args = {MappedStatement.class, Object.class,\n        RowBounds.class, ResultHandler.class})})\npublic class TenantInterceptor implements Interceptor {\n    @Override\n    public Object intercept(Invocation invocation) throws Throwable {\n        MappedStatement ms = (MappedStatement) invocation.getArgs()[0];\n        // 修改SQL，自动加上 tenant_id = ? 条件\n        String sql = ms.getBoundSql(invocation.getArgs()[1]).getSql();\n        String newSql = addTenantCondition(sql);\n        // 重新构建MappedStatement\n        // ...\n        return invocation.proceed();\n    }\n}\n\n// 4. 多数据源路由\npublic class TenantDataSource extends AbstractRoutingDataSource {\n    @Override\n    protected Object determineCurrentLookupKey() {\n        return TenantContext.getTenantId();\n    }\n}\n\n// 5. 配额管理\n@Service\npublic class QuotaService {\n    @Autowired\n    private TenantConfigMapper configMapper;\n\n    public void checkQuota(String tenantId, QuotaType type) {\n        TenantConfig config = configMapper.findByTenantId(tenantId);\n        switch (type) {\n            case API_CALL:\n                if (config.getApiCallCount() >= config.getApiCallLimit()) {\n                    throw new QuotaExceededException(\"API调用次数超限\");\n                }\n                break;\n            case STORAGE:\n                if (config.getStorageUsed() >= config.getStorageLimit()) {\n                    throw new QuotaExceededException(\"存储空间超限\");\n                }\n                break;\n            case USER_COUNT:\n                if (config.getUserCount() >= config.getUserLimit()) {\n                    throw new QuotaExceededException(\"用户数超限\");\n                }\n                break;\n        }\n    }\n}\n\n// 6. 功能开关\npublic boolean hasFeature(String tenantId, String feature) {\n    TenantConfig config = configMapper.findByTenantId(tenantId);\n    return config.getFeatures().contains(feature);\n}",
-      "language": "java"
+      "language": "java",
+      "highlights": [
+        {
+          "line": 2,
+          "note": "`public class TenantContext {` 定义了 多租户 SaaS 架构设计 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+        },
+        {
+          "line": 27,
+          "note": "`if (tenantId == null) {` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+        },
+        {
+          "line": 5,
+          "note": "`public static void setTenantId(String tenantId) {` 更新核心数据结构，是解释状态如何推进的抓手。"
+        },
+        {
+          "line": 3,
+          "note": "`private static final ThreadLocal<String> TENANT_ID = new ThreadLocal<>();` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
@@ -144,5 +172,5 @@
   "prerequisites": [
     "architecture.system-design.topic-seckill"
   ],
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-18"
 }

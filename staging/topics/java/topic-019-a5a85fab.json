@@ -23,15 +23,25 @@
     {
       "type": "explain",
       "title": "底层机制与边界条件",
-      "content": "CountDownLatch 和 Semaphore 都依赖 AQS 的共享模式：前者的 state 表示剩余计数，countDown 递减到 0 后释放所有等待线程；后者的 state 表示可用许可证，acquire 递减、release 递增。CyclicBarrier 主要用 ReentrantLock 和 Condition 维护 parties、count 和 generation，当最后一个线程到达时唤醒本代所有等待者并进入下一代。常见边界是：CountDownLatch 不能重置；CyclicBarrier 任一等待线程中断或超时会打破屏障；Semaphore 必须保证 acquire/release 成对出现，否则会泄漏许可证。\n把 CountDownLatch、CyclicBarrier 与 Semaphore 放到真实场景里看，重点是对象职责、运行时状态、并发或框架边界和排查证据。判断 CountDownLatch、CyclicBarrier 与 Semaphore 是否答到位时，我会先核对 JDK 版本，再观察 线程状态，最后用 堆栈日志 或 性能计数器 证明结论。\n再进一步，CountDownLatch、CyclicBarrier 与 Semaphore 的理解要能落到具体判断：哪些输入或条件会触发变化，哪个环节承担主要成本，失败时能从哪些指标、样例或现象反推原因。CountDownLatch、CyclicBarrier 与 Semaphore 的分析过程要围绕 Java、并发编程 的用户假设、关键动作、结果指标和复盘结论展开。"
+      "content": "CountDownLatch 和 Semaphore 都依赖 AQS 共享模式，但 state 含义不同：CountDownLatch 的 state 是剩余计数，countDown 递减到 0 后释放所有 await 线程；Semaphore 的 state 是剩余许可证，acquire 递减、release 递增。CyclicBarrier 不基于 AQS，主要用 ReentrantLock + Condition 管理 parties、count 和 generation，最后一个到达的线程负责执行 barrierAction、唤醒本代等待者并开启下一代。\n\n边界要讲清：CountDownLatch 一次性，不可重置；CyclicBarrier 可复用，但任一等待线程中断/超时会打破当前 generation，其他等待线程收到 BrokenBarrierException；Semaphore 的 acquire/release 必须成对，异常路径不 release 会让许可证泄漏，误 release 又会把并发度放大。排查时看线程 dump 里的 await/acquire 栈、许可证或计数是否归零、是否存在 BrokenBarrierException 或超时日志。"
     },
     {
       "type": "diagram",
       "format": "mermaid",
-      "title": "三个同步工具的语义与底层",
-      "content": "flowchart TD\nA[\"计数型线程协作\"] --> B[\"CountDownLatch：主线程 await，子任务 countDown 到 0，一次性\"]\nA --> C[\"CyclicBarrier：一组线程互等到齐再走，可复用\"]\nA --> D[\"Semaphore：许可证 acquire/release 限并发数\"]\nB --> E[\"AQS 共享模式：state 为剩余计数\"]\nD --> F[\"AQS 共享模式：state 为可用许可\"]",
-      "caption": "三个同步工具按计数协作但语义不同：CountDownLatch 一次性倒计时门闩、CyclicBarrier 可复用屏障、Semaphore 许可证限流；前两者靠 AQS 共享模式、CyclicBarrier 靠 Lock 加 Condition。",
-      "fallback": "CountDownLatch：主线程 await，子任务 countDown 到 0 才继续，一次性。CyclicBarrier：一组线程互相等待到齐再一起走，可复用。Semaphore：许可证 acquire/release 限制并发数。CountDownLatch 和 Semaphore 基于 AQS 共享模式，CyclicBarrier 基于 ReentrantLock 加 Condition。"
+      "title": "三种计数型同步工具的状态变化对比",
+      "content": "flowchart TD\nStart[选择线程协作工具] --> Latch[CountDownLatch\n一次性倒计时]\nStart --> Barrier[CyclicBarrier\n可复用阶段屏障]\nStart --> Sem[Semaphore\n许可证限流]\nLatch --> L1[state=剩余任务数]\nL1 --> L2[countDown--]\nL2 -->|state==0| L3[释放所有 await 线程]\nBarrier --> B1[count=未到达线程数\ngeneration=当前代]\nB1 --> B2[await 到达屏障]\nB2 -->|最后一个到达| B3[执行 barrierAction\n唤醒本代并进入下一代]\nB2 -->|中断/超时| B4[打破屏障\nBrokenBarrierException]\nSem --> S1[state=剩余许可证]\nS1 --> S2[acquire: state--\n无许可证则等待]\nS2 --> S3[release: state++\n必须放 finally]\nS3 --> Risk[少 release 会泄漏\n多 release 会放大并发]",
+      "caption": "这三者都和“计数”有关，但等待关系完全不同：Latch 是主线程等任务，Barrier 是同一批线程互等，Semaphore 是资源许可证。",
+      "fallback": "CountDownLatch state 归零释放等待者且不可复用；CyclicBarrier 最后一个到达者打开本代屏障并进入下一代，中断/超时会打破屏障；Semaphore acquire/release 改变许可证数，异常路径必须 release。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nStart[选择线程协作工具] --> Latch[CountDownLatch\n一次性倒计时]\nStart --> Barrier[CyclicBarrier\n可复用阶段屏障]\nStart --> Sem[Semaphore\n许可证限流]\nLatch --> L1[state=剩余任务数]\nL1 --> L2[countDown--]\nL2 -->|state==0| L3[释放所有 await 线程]\nBarrier --> B1[count=未到达线程数\ngeneration=当前代]\nB1 --> B2[await 到达屏障]\nB2 -->|最后一个到达| B3[执行 barrierAction\n唤醒本代并进入下一代]\nB2 -->|中断/超时| B4[打破屏障\nBrokenBarrierException]\nSem --> S1[state=剩余许可证]\nS1 --> S2[acquire: state--\n无许可证则等待]\nS2 --> S3[release: state++\n必须放 finally]\nS3 --> Risk[少 release 会泄漏\n多 release 会放大并发]"
+        },
+        {
+          "kind": "text",
+          "content": "CountDownLatch state 归零释放等待者且不可复用；CyclicBarrier 最后一个到达者打开本代屏障并进入下一代，中断/超时会打破屏障；Semaphore acquire/release 改变许可证数，异常路径必须 release。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -46,7 +56,7 @@
       "highlights": [
         {
           "line": 2,
-          "note": "这里体现状态推进或遍历过程，需要说明终止条件、复杂度和异常输入。"
+          "note": "「for (int i = 0; i < 3; i++) {」 是这段示例的主遍历；它决定处理顺序和成本上界，说明「CountDownLatch、CyclicBarrier 与 Semaphore」时要补上每轮维护的状态。"
         }
       ]
     },
@@ -128,7 +138,7 @@
       "depth": 15
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-18",
   "status": "staging",
   "prerequisites": [
     "java.concurrency.topic-017-df4531b1",

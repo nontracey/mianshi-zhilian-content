@@ -23,16 +23,16 @@
     {
       "type": "explain",
       "title": "零值和值语义决定 Go 代码的默认行为",
-      "content": "Go 的很多设计都围绕简单可预测展开：变量声明后总有零值，赋值和传参默认发生值复制。真正需要小心的是 slice、map、channel、func、interface 这类值本身很小,但它们内部指向运行时管理的数据结构。\n\n从零理解时先抓住这几个点：\n- int、bool、struct 等普通值复制后彼此独立,零值分别是 0、false、各字段递归零值\n- 指针复制的是 8 字节地址、\n多个变量会观察到同一块数据,零值是 nil\n- slice 复制的是 24 字节的 header(ptr/len/cap),底层数组仍可能共享,零值是 nil 但 len=cap=0 可直接 append\n- map 和 channel 复制的是指向 runtime.hmap / runtime.hchan 的描述符指针、\n操作仍指向同一份底层对象,零值 nil map 写入会 panic、nil channel 收发会永久阻塞\n\n容易答浅的地方通常在边界:\n- 把所有类型都叫引用类型会掩盖 Go 的值复制规则、\nGo spec 明确只有值传递\n- 用指针不一定更快,逃逸到堆上反而增加 GC 压力,小结构体(<=64 字节)按值传更便宜\n- interface 的内部表示是 (type、\nvalue) 二元组(iface/eface),nil 判断要同时看类型和值都为 nil"
+      "content": "Go 的很多设计都围绕简单可预测展开：变量声明后总有零值，赋值和传参默认发生值复制。真正需要小心的是 slice、map、channel、func、interface 这类值本身很小,但它们内部指向运行时管理的数据结构。\n\n从零理解时先抓住这几个点：\n- int、bool、struct 等普通值复制后彼此独立,零值分别是 0、false、各字段递归零值\n- 指针复制的是一个地址值,多个变量会观察到同一块数据,零值是 nil\n- slice 复制的是 24 字节的 header(ptr/len/cap),底层数组仍可能共享,零值是 nil 但 len=cap=0 可直接 append\n- map 和 channel 复制的是指向 runtime.hmap / runtime.hchan 的描述符指针,操作仍指向同一份底层对象;nil map 读取返回零值、写入会 panic,nil channel 收发会永久阻塞\n\n容易答浅的地方通常在边界:\n- 把所有类型都叫引用类型会掩盖 Go 的值复制规则,Go spec 明确只有值传递\n- 用指针不一定更快,逃逸到堆上反而增加 GC 压力;小且不可变的结构体按值传常常更清晰,是否更快要看逃逸和 benchmark\n- interface 的内部表示是 (type,value) 二元组(iface/eface),nil 判断要同时看类型和值都为 nil"
     },
     {
       "type": "explain",
       "title": "传参、逃逸和 nil 判断是追问重点",
-      "content": "面试深入问题通常不会停在“Go 是值传递”这句话,而会继续问为什么函数里修改 slice 元素会影响外部、\nappend 后为什么又可能不影响。答案是:函数参数确实复制了一份 slice header(ptr/len/cap 三字段共 24 字节),但 header 里的 ptr 仍指向同一个底层数组;当 append 后 len 超过 cap 触发 growslice 扩容时、\nruntime 会按旧 cap<1024 翻倍、\n否则约 1.25 倍策略分配新数组,新 header 指向新数组,后续写入就和旧数组分离。这也是为什么 `s = append(s, x)` 必须把返回值赋回去——局部 header 改了,调用方看不到。\n\n另一个高频深入问题是逃逸分析。局部变量如果被返回指针、被闭包捕获、被装入 interface 后跨调用边界使用、\n或者大小超过栈帧上限(默认 64KB),编译器都会把它放到堆上。面试表达时不要把“栈快、堆慢”讲成绝对规则,应该说编译器按生命周期和可达性决定位置。nil 也要讲清:`var r io.Reader = (*bytes.Buffer)(nil)` 这样的 interface 不等于 nil,因为 iface 的 type 字段已经是 *bytes.Buffer、\n只有 value 字段是 nil;打印 `r == nil` 会得到 false,这是 Go 1.x 长期保持的语义。\n\n验证 Go 值语义要用工具:`go build -gcflags='-m -m'` 输出每个变量的逃逸决策(如 `moved to heap: x`、\n`x escapes to heap`);`go test -race` 检查共享 map/slice 的并发写;`fmt.Printf(\"%p %d %d\n\"、\n &s[0], len(s), cap(s))` 直接打印 slice header 三字段确认是否共享底层数组;`go tool compile -S` 看汇编里函数参数到底是按 24 字节 header 还是 8 字节指针传。常见失败路径是把 slice 传参误认为深拷贝、\n把 interface 里包着 typed nil 当成 nil(尤其是 `func() error { var p *MyErr; return p }` 这种返回方式)、\n为了“少复制”滥用指针反而让对象逃逸到堆上拖慢 GC。"
+      "content": "面试深入问题通常不会停在“Go 是值传递”这句话,而会继续问为什么函数里修改 slice 元素会影响外部、append 后为什么又可能不影响。答案是:函数参数确实复制了一份 slice header(ptr/len/cap 三字段共 24 字节),但 header 里的 ptr 仍指向同一个底层数组;当 append 后 len 超过 cap 触发 growslice 扩容时,runtime 会按当前版本的增长策略分配新数组,新 header 指向新数组,后续写入就和旧数组分离。这也是为什么 `s = append(s, x)` 必须把返回值赋回去——局部 header 改了,调用方看不到。\n\n另一个高频深入问题是逃逸分析。局部变量如果被返回指针、被闭包捕获、被装入 interface 后跨调用边界使用,或者对象过大/生命周期无法在编译期证明只在栈内,编译器就可能把它放到堆上。面试表达时不要把“栈快、堆慢”讲成绝对规则,应该说编译器按生命周期和可达性决定位置。nil 也要讲清:`var r io.Reader = (*bytes.Buffer)(nil)` 这样的 interface 不等于 nil,因为 iface 的 type 字段已经是 *bytes.Buffer,只有 value 字段是 nil;打印 `r == nil` 会得到 false,这是 Go 1.x 长期保持的语义。\n\n验证 Go 值语义要用工具:`go build -gcflags='-m -m'` 输出每个变量的逃逸决策(如 `moved to heap: x`、`x escapes to heap`);`go test -race` 检查共享 map/slice 的并发写;非空切片可用 `fmt.Printf(\"%p %d %d\\n\", &s[0], len(s), cap(s))` 观察底层数组首地址和 cap;`go tool compile -S` 看汇编里函数参数到底是按 24 字节 header 还是 8 字节指针传。常见失败路径是把 slice 传参误认为深拷贝、把 interface 里包着 typed nil 当成 nil(尤其是 `func() error { var p *MyErr; return p }` 这种返回方式)、为了“少复制”滥用指针反而让对象逃逸到堆上拖慢 GC。"
     },
     {
       "type": "compareTable",
-      "title": "Go 值类型 vs 引用类型的零值与传参行为对比",
+      "title": "普通值 vs 带共享底层对象的值",
       "columns": [
         "类型",
         "零值",
@@ -60,7 +60,7 @@
         ],
         [
           "map",
-          "nil（读 panic）",
+          "nil（读零值，写 panic）",
           "复制指针，共享 bucket 数组",
           "可见（共享底层结构）"
         ],
@@ -73,7 +73,7 @@
         [
           "interface",
           "nil（type+value 均 nil）",
-          "复制 eface 指针",
+          "复制 iface/eface 的 type+data 两个字",
           "可见（共享底层对象）"
         ]
       ]
@@ -84,7 +84,17 @@
       "format": "mermaid",
       "content": "flowchart LR\nA[调用方 slice header: ptr/len/cap] --> B[传参复制 24 字节 header]\nB --> C{append 后 len 是否超 cap}\nC -->|否: 写入共享底层数组| D[调用方可见元素修改]\nC -->|是: growslice 分配新底层数组| E[局部 header.ptr 指向新数组]\nE --> F[调用方不可见: 仍指向旧数组]\nD --> G[风险: 并发 append 写冲突]\nF --> H[典型 bug: 数据丢失/不可见]",
       "fallback": "调用方 slice (ptr/len/cap) -> 传参复制 24 字节 header -> 判断 append 后 len 是否超 cap -> 未超则写入共享底层数组,调用方可见 / 超出则 growslice 分配新数组,局部 header 改向新数组,调用方不可见",
-      "caption": "Go slice 传参复制 header 但共享底层数组。append 不超 cap 时写入共享数组（可见但并发不安全），超 cap 时 growslice 分配新数组（调用方不可见）。"
+      "caption": "Go slice 传参复制 header 但共享底层数组。append 不超 cap 时写入共享数组（可见但并发不安全），超 cap 时 growslice 分配新数组（调用方不可见）。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart LR\nA[调用方 slice header: ptr/len/cap] --> B[传参复制 24 字节 header]\nB --> C{append 后 len 是否超 cap}\nC -->|否: 写入共享底层数组| D[调用方可见元素修改]\nC -->|是: growslice 分配新底层数组| E[局部 header.ptr 指向新数组]\nE --> F[调用方不可见: 仍指向旧数组]\nD --> G[风险: 并发 append 写冲突]\nF --> H[典型 bug: 数据丢失/不可见]"
+        },
+        {
+          "kind": "text",
+          "content": "调用方 slice (ptr/len/cap) -> 传参复制 24 字节 header -> 判断 append 后 len 是否超 cap -> 未超则写入共享底层数组,调用方可见 / 超出则 growslice 分配新数组,局部 header 改向新数组,调用方不可见"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -126,11 +136,15 @@
       "type": "code",
       "title": "值复制与 slice 共享示例",
       "language": "go",
-      "content": "package main\n\nimport \"fmt\"\n\nfunc change(s []int) {\n\ts[0] = 99          // 修改共享底层数组\n\ts = append(s, 100) // 可能扩容，只改变局部 header\n}\n\nfunc main() {\n\tnums := []int{1, 2, 3}\n\tchange(nums[:2])\n\tfmt.Println(nums) // [99 2 3]\n}",
+      "content": "package main\n\nimport \"fmt\"\n\nfunc appendInPlace(s []int) {\n\ts[0] = 99          // 修改共享底层数组\n\ts = append(s, 100) // len=2 cap=3，未扩容，写到底层数组下标 2\n}\n\nfunc appendDetached(s []int) {\n\ts = append(s, 200) // len=2 cap=2，扩容后只改变局部 header\n}\n\nfunc main() {\n\tnums := []int{1, 2, 3}\n\tappendInPlace(nums[:2])\n\tfmt.Println(nums) // [99 2 100]\n\n\tother := []int{1, 2, 3}\n\tappendDetached(other[:2:2])\n\tfmt.Println(other) // [1 2 3]\n}",
       "highlights": [
         {
-          "line": 5,
-          "note": "change 收到的 s 是 nums[:2] 的 header 副本(ptr 指向同一底层数组、len=2、cap=3),所以 s[0]=99 直接落到调用方共享的底层数组上;但 s=append(s,100) 后 len 变成 3 没超 cap=3,会就地写到底层数组下标 2,这就是为什么外部输出 [99 2 3] 而不是 [99 2]——值传递与共享底层数据并存的关键点。"
+          "line": 7,
+          "note": "nums[:2] 的 len=2、cap=3，append 未扩容，会把 100 写入共享底层数组下标 2，所以调用方看到 [99 2 100]。"
+        },
+        {
+          "line": 20,
+          "note": "other[:2:2] 使用三下标切片把 cap 限制为 2，append 必须扩容，局部 header 指向新数组，调用方 other 仍是 [1 2 3]。"
         }
       ]
     },
@@ -145,11 +159,11 @@
         },
         {
           "question": "Go 里的 typed nil 为什么容易踩坑?给个真实例子。",
-          "answer": "interface 在运行时是 iface=(itab, data) 二元组,只有 itab 和 data 都为 nil 时接口才 == nil。最经典的例子是 func doSomething() error { var p *MyErr; return p }——p 是 *MyErr 的 nil 指针,return 时被装进 error 接口,itab 已经是 *MyErr 的类型描述符,所以调用方写 if err != nil 永远为 true,但 err.Error() 又会 panic。修复方式是显式 return nil,或者在返回前判断 if p == nil { return nil }。"
+          "answer": "interface 在运行时是 iface=(itab, data) 二元组,只有 itab 和 data 都为 nil 时接口才 == nil。最经典的例子是 func doSomething() error { var p *MyErr; return p }——p 是 *MyErr 的 nil 指针,return 时被装进 error 接口,itab 已经是 *MyErr 的类型描述符,所以调用方写 if err != nil 永远为 true；如果 Error 方法里解引用接收者,还可能继续 panic。修复方式是显式 return nil,或者在返回前判断 if p == nil { return nil }。"
         },
         {
           "question": "什么时候该用指针接收者,什么时候该用值接收者?",
-          "answer": "三条判断:一是结构体大于一两个机器字(经验上 >64 字节)用指针避免栈复制成本;二是方法需要修改接收者字段必须用指针;三是同一个类型的方法集要保持一致,避免一半值一半指针造成 interface 实现混乱(只有指针接收者时,值类型不满足该 interface)。反过来,小结构体(time.Time、image.Point)、不可变值、需要并发安全副本时用值接收者更清晰,也能避开因取指针导致的逃逸到堆。"
+          "answer": "三条判断:一是结构体很大或包含不能廉价复制的字段时,用指针避免复制成本,但要用 benchmark 和逃逸分析确认;二是方法需要修改接收者字段必须用指针;三是同一个类型的方法集要保持一致,避免一半值一半指针造成 interface 实现混乱(只有指针接收者时,值类型不满足该 interface)。反过来,小结构体(time.Time、image.Point)、不可变值、需要并发安全副本时用值接收者更清晰,也能避开因取指针导致的逃逸到堆。"
         },
         {
           "question": "线上服务出现 slice 并发 append 导致数据错乱，你怎么排查和修复？",
@@ -217,5 +231,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-13"
+  "updatedAt": "2026-06-18"
 }

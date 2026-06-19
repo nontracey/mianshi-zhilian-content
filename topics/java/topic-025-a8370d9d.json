@@ -4,73 +4,88 @@
   "category": "concurrency",
   "group": "concurrency",
   "title": "ThreadLocal",
-  "summary": "掌握ThreadLocal中1. 用户会话管理（Web应用）、2. 数据库连接管理、3. SimpleDateFormat线程安全、泄漏过程等核心概念，理解其原理和实际应用。",
+  "summary": "讲清 ThreadLocal 的线程绑定存储、ThreadLocalMap 弱 key/强 value 结构、线程池串数据和泄漏路径、InheritableThreadLocal 边界，以及 JDK 25 ScopedValue 的现代替代场景。",
   "tags": [
     "Java",
     "并发编程",
     "ThreadLocal"
   ],
-  "difficulty": 3,
-  "estimatedMinutes": 25,
+  "difficulty": 4,
+  "estimatedMinutes": 35,
   "order": 90,
-  "recommendWeight": 90,
+  "recommendWeight": 82,
   "learningCards": [
     {
       "type": "explain",
-      "title": "ThreadLocal 的使用场景、ThreadLocal 底层实现（ThreadLocalMap）",
-      "content": "## 一、ThreadLocal的使用场景\nThreadLocal提供了线程级别的变量隔离，每个线程都有自己独立的变量副本，互不干扰。\n### 典型使用场景\n**1. 用户会话管理（Web应用）**\n```java\n// 存储当前请求的用户信息\npublic class UserContext {\n    private static final ThreadLocal<User> CURRENT_USER = new ThreadLocal<>();\n    public static void setUser(User user) {\n        CURRENT_USER.set(user);\n    }\npublic static User getUser() {\n    return CURRENT_USER.get();\n}\npublic static void clear() {\n    CURRENT_USER.remove();\n}\n}\n// 在Filter中设置\npublic class AuthFilter implements Filter {\n    @Override\n    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) {\n        try {\n            User user = extractUser((HttpServletRequest) request);\n            UserContext.setUser(user);\n            chain.doFilter(request, response);\n        } finally {\n            UserContext.clear();  // 必须清除！\n        }\n}\n}\n// 在Service中使用\n@Service\npublic class OrderService {\n    public void createOrder() {\n        User user = UserContext.getUser();  // 直接获取，无需传参\n        // ...\n    }\n}\n```\n**2. 数据库连接管理**\n```java\npublic class ConnectionHolder {\n    private static final ThreadLocal<Connection> connectionHolder =\n    ThreadLocal.withInitial(() -> {\n        try {\n            return DriverManager.getConnection(DB_URL);\n        } catch (SQLException e) {\n            throw new RuntimeException(e);\n        }\n});\npublic static Connection getConnection() {\n    return connectionHolder.get();\n}\n}\n```\n**3. SimpleDateFormat线程安全**\n```java\n// SimpleDateFormat不是线程安全的，用ThreadLocal包装\nprivate static final ThreadLocal<SimpleDateFormat> DATE_FORMAT =\nThreadLocal.withInitial(() -> new SimpleDateFormat(\"yyyy-MM-dd\"));\npublic String formatDate(Date date) {\n    return DATE_FORMAT.get().format(date);  // 每个线程有自己的SimpleDateFormat\n}\n```\n### 要点\n- ThreadLocal的核心价值：在不传递参数的情况下，在整个调用链中共享数据\n- 典型场景：用户上下文、数据库连接、日期格式化、事务管理\n- Spring的RequestContextHolder就是基于ThreadLocal实现的\n\n## 二、ThreadLocal底层实现（ThreadLocalMap）\n### 2.1 核心结构\nThreadLocal的实现依赖于Thread类中的一个关键字段：\n```\nThread\n+-- ThreadLocal.ThreadLocalMap threadLocals  // 每个线程持有一个Map\n+-- ThreadLocal.ThreadLocalMap inheritableThreadLocals\nThreadLocalMap\n+-- Entry[] table  // Entry数组\n+-- Entry: key=ThreadLocal对象（弱引用）, value=用户设置的值\n+-- Entry: key=ThreadLocal对象（弱引用）, value=用户设置的值\n...\n```\n### 2.2 set流程\n```java\n// ThreadLocal.set()\npublic void set(T value) {\n    Thread t = Thread.currentThread();\n    ThreadLocalMap map = t.threadLocals;  // 获取当前线程的Map\n    if (map != null) {\n        map.set(this, value);  // this就是当前ThreadLocal对象\n    } else {\n        createMap(t, value);   // 首次set时创建Map\n    }\n}\n// ThreadLocalMap.set()\nprivate void set(ThreadLocal<?> key, Object value) {\n    Entry[] tab = table;\n    int len = tab.length;\n    int i = key.threadLocalHashCode & (len - 1);  // 计算桶位置\n    // 线性探测法解决hash冲突\n    for (Entry e = tab[i]; e != null; e = tab[i = nextIndex(i, len)]) {\n        ThreadLocal<?> k = e.get();\n        if (k == key) {\n            e.value = value;  // 更新\n            return;\n        }\n    if (k == null) {\n        // key已被GC回收，清理过期Entry\n        replaceStaleEntry(key, value, i);\n        return;\n    }\n}\ntab[i] = new Entry(key, value);  // 新增\nsize++;\n// 如果需要扩容...\n}\n```\n### 2.3 get流程\n```java\n// ThreadLocal.get()\npublic T get() {\n    Thread t = Thread.currentThread();\n    ThreadLocalMap map = t.threadLocals;\n    if (map != null) {\n        ThreadLocalMap.Entry e = map.getEntry(this);\n        if (e != null) {\n            return (T) e.value;\n        }\n}\nreturn setInitialValue();  // 如果没有设置过，返回initialValue()的默认值\n}\n```\n### 要点\n- 每个Thread持有一个ThreadLocalMap，key是ThreadLocal对象，value是值\n- ThreadLocalMap使用开放地址法（线性探测）解决hash冲突，而非链表\n- ThreadLocal本身不存储数据，只是一个访问Map的\"key\"\n- Entry的key是WeakReference，这是内存泄漏问题的根源\n\n## 三、ThreadLocal内存泄漏问题（弱引用）\n### 3.1 Entry的弱引用设计\n```java\n// ThreadLocalMap的Entry继承自WeakReference\nstatic class Entry extends WeakReference<ThreadLocal<?>> {\n    Object value;  // 强引用，指向用户设置的值\n    Entry(ThreadLocal<?> k, Object v) {\n        super(k);    // key（ThreadLocal对象）被弱引用\n        value = v;   // value被强引用\n    }\n}\n```\n### 3.2 内存泄漏的场景\n```\n场景：ThreadLocal引用被置null，但线程还在运行（如线程池）\n栈内存                          堆内存\n+------------------+     +-------------------+\n+------------------+            |\n(GC回收后)\nv\n+------------------+     +-------------------+\n+------------------+     |  + Entry[]         |\n+-------------------+\n```\n**泄漏过程**：\n1. 创建ThreadLocal对象，调用set()存值\n2. ThreadLocalMap的Entry用弱引用指向ThreadLocal对象\n3. 外部不再引用ThreadLocal对象（如局部变量出作用域）\n4. GC回收ThreadLocal对象，Entry的key变为null\n5. 但Entry本身和value还在ThreadLocalMap中，因为线程还活着\n6. 如果不手动remove()，这些Entry永远不会被清理\n### 3.3 为什么用弱引用？\n如果用强引用，当外部不再使用ThreadLocal时，由于ThreadLocalMap的Entry持有强引用，ThreadLocal对象永远无法被GC，泄漏更严重。\n弱引用至少保证了：当外部不再引用ThreadLocal时，key可以被GC，虽然value仍然泄漏，但ThreadLocalMap在后续操作时会清理key为null的Entry（启发式清理）。\n### 3.4 最终结论\n**内存泄漏的根本原因是：线程生命周期比ThreadLocal长（如线程池），且没有手动remove()。**\n弱引用只是让问题不那么严重，但不能完全解决问题。\n### 要点\n- Entry的key是弱引用，value是强引用\n- 线程池场景下，线程复用导致ThreadLocalMap不会被销毁\n- 必须在finally中调用remove()，这是唯一可靠的解决方案\n- ThreadLocalMap有启发式清理机制，但不能依赖它"
+      "title": "ThreadLocal 的值挂在 Thread 上",
+      "content": "ThreadLocal 不是把变量复制给每个线程，也不是锁。它只是一个访问入口：当前线程的 `Thread.threadLocals` 字段里有一个 ThreadLocalMap，ThreadLocal 对象作为 key，业务值作为 value。调用 `set/get/remove` 时，都会先取当前 Thread，再访问这个线程自己的 map。\n\n这个设计适合保存“随当前执行线程走”的上下文，例如 requestId、用户身份、租户标识、事务上下文、日志 MDC。它不适合保存需要跨线程共享和修改的业务对象；如果多个线程要修改同一份数据，仍要使用锁、CAS、线程安全容器或消息化串行处理。\n\n现代代码还要区分“线程上下文”和“调用作用域上下文”。Java 25 已正式引入 ScopedValue（OpenJDK JEP 506），它把不可变上下文绑定在词法作用域内，结束后自动失效，更适合虚拟线程和结构化并发中的只读上下文传递。ThreadLocal 仍适合需要可变、线程私有缓存或旧框架集成的场景，但不能把它当成默认上下文传播方案。"
     },
     {
       "type": "explain",
-      "title": "ThreadLocal：ThreadLocal 最佳实践、InheritableThreadLocal",
-      "content": "## 四、ThreadLocal最佳实践\n### 4.1 使用后必须remove\n```java\n// 正确用法：try-finally保证remove\nThreadLocal<User> userLocal = new ThreadLocal<>();\ntry {\n    userLocal.set(getUser(request));\n    // 业务逻辑\n    doSomething();\n} finally {\n    userLocal.remove();  // 必须清除！\n}\n```\n### 4.2 使用static final修饰\n```java\n// 正确：static final\nprivate static final ThreadLocal<User> USER_CONTEXT = new ThreadLocal<>();\n// 错误：非static，每次创建新实例都会产生新的ThreadLocal对象\nprivate ThreadLocal<User> userContext = new ThreadLocal<>();\n```\n### 4.3 设置初始值\n```java\n// 方式1：重写initialValue()\nprivate static final ThreadLocal<SimpleDateFormat> SDF = new ThreadLocal<SimpleDateFormat>() {\n    @Override\n    protected SimpleDateFormat initialValue() {\n        return new SimpleDateFormat(\"yyyy-MM-dd\");\n    }\n};\n// 方式2：使用withInitial()（推荐，JDK8+）\nprivate static final ThreadLocal<SimpleDateFormat> SDF =\nThreadLocal.withInitial(() -> new SimpleDateFormat(\"yyyy-MM-dd\"));\n```\n### 要点\n- 用static final修饰ThreadLocal，避免重复创建\n- 使用withInitial()设置初始值，避免get()返回null\n- 在finally中remove()，防止内存泄漏和数据污染\n- 线程池中使用ThreadLocal格外小心，因为线程会被复用\n\n## 五、InheritableThreadLocal\nThreadLocal的值不能被子线程继承，如果需要子线程能访问父线程的变量，使用InheritableThreadLocal。\n### 5.1 基本使用\n```java\nThreadLocal<String> parentLocal = new InheritableThreadLocal<>();\nparentLocal.set(\"父线程的值\");\nThread child = new Thread(() -> {\n    System.out.println(parentLocal.get());  // 输出：父线程的值\n});\nchild.start();\n```\n### 5.2 实现原理\n```java\npublic class InheritableThreadLocal<T> extends ThreadLocal<T> {\n    @Override\n    protected T childValue(T parentValue) {\n        return parentValue;  // 子线程直接使用父线程的值\n    }\n@Override\nThreadLocalMap getMap(Thread t) {\n    return t.inheritableThreadLocals;  // 使用Thread的inheritableThreadLocals字段\n}\n}\n// Thread.init()中会复制父线程的inheritableThreadLocals\nif (inheritThreadLocals && parent.inheritableThreadLocals != null)\nthis.inheritableThreadLocals =\nThreadLocal.createInheritedMap(parent.inheritableThreadLocals);\n```\n### 5.3 InheritableThreadLocal的局限\n```java\n// 问题：线程池中不生效\nInheritableThreadLocal<String> local = new InheritableThreadLocal<>();\nlocal.set(\"parent\");\nExecutorService pool = Executors.newFixedThreadPool(1);\npool.submit(() -> {\n    // 第一次提交：能获取到\"parent\"\n    System.out.println(local.get());\n});\npool.submit(() -> {\n    // 第二次提交：仍然获取到\"parent\"（线程复用，值没有更新）\n    // 如果第一次任务修改了值，第二次任务会读到修改后的值\n    System.out.println(local.get());\n});\n```\n**解决**：使用阿里巴巴开源的TransmittableThreadLocal（TTL），支持线程池场景下的值传递。\n```java\n// 使用TransmittableThreadLocal（需引入依赖）\nTransmittableThreadLocal<String> local = new TransmittableThreadLocal<>();\nlocal.set(\"parent\");\n// 使用TTL的线程池包装\nExecutorService ttlPool = TtlExecutors.getTtlExecutorService(pool);\nttlPool.submit(() -> {\n    System.out.println(local.get());  // 每次都能正确获取\n});\n```\n### 要点\n- InheritableThreadLocal在创建子线程时复制值，但线程池中线程不会重新创建\n- 线程池场景下推荐使用TransmittableThreadLocal（TTL）\n- Spring的RequestContextHolder在异步场景下也面临这个问题\n\n## 六、面试高频问题\n### Q1: ThreadLocal的底层实现原理是什么？\n**答**：每个Thread持有一个ThreadLocalMap，key是ThreadLocal对象（弱引用），value是用户设置的值。ThreadLocal本身不存储数据，只是一个访问Map的\"key\"。调用set()时，以当前ThreadLocal为key，值为value存入当前线程的ThreadLocalMap。调用get()时，从当前线程的ThreadLocalMap中以ThreadLocal为key查找value。\n### Q2: ThreadLocal为什么会内存泄漏？如何避免？\n**答**：ThreadLocalMap的Entry的key是弱引用，当外部不再引用ThreadLocal时，key被GC回收变为null，但value仍然被Entry强引用，无法回收。如果线程一直存活（如线程池），这些Entry就永远不会被清理，导致内存泄漏。解决方法：在finally中调用remove()清除数据。\n### Q3: ThreadLocalMap为什么用弱引用而不是强引用？\n**答**：如果用强引用，当外部不再使用ThreadLocal时（如局部变量出作用域），ThreadLocalMap的Entry仍然持有强引用，ThreadLocal对象永远无法被GC，内存泄漏更严重。弱引用至少保证了外部不再引用ThreadLocal时，key可以被GC。虽然value仍然泄漏，但ThreadLocalMap在后续操作时会清理key为null的Entry。\n### Q4: ThreadLocal和synchronized的区别？\n**答**：synchronized是用时间换空间，多个线程排队访问共享变量；ThreadLocal是用空间换时间，每个线程持有变量副本，互不干扰。synchronized适合共享变量的互斥访问，ThreadLocal适合线程隔离的场景（如用户上下文）。\n### Q5: InheritableThreadLocal有什么局限？\n**答**：InheritableThreadLocal在创建子线程时复制父线程的值，但有两个问题：1)线程池中线程被复用，不会重新创建，因此值不会更新；2)子线程修改值不会影响父线程（浅拷贝，引用类型可能有共享问题）。线程池场景下推荐使用阿里巴巴的TransmittableThreadLocal。"
+      "title": "ThreadLocalMap：弱 key 和强 value",
+      "content": "ThreadLocalMap 是开放地址哈希表，冲突时用线性探测。Entry 继承 `WeakReference<ThreadLocal<?>>`，所以 key 是弱引用；value 是普通强引用，指向业务对象。弱 key 的目的，是在外部已经丢掉 ThreadLocal 实例时，让 key 有机会被 GC，而不是被线程长期强引用。\n\n泄漏风险来自 value 的生命周期。假设某个线程池 worker 上存了一个大对象，后来 ThreadLocal 实例外部引用消失，GC 后 Entry 的 key 会变成 null；但 Entry 还在 worker 的 ThreadLocalMap 中，value 仍被强引用。ThreadLocalMap 会在后续 get/set/remove 的部分路径上做启发式清理，但清理时机不是请求边界，也不覆盖所有空闲线程。\n\n因此关键实践不是“key 是弱引用所以安全”，而是为每次逻辑请求定义清晰的生命周期：进入时 set，退出时 remove。Web Filter、拦截器、RPC 调用链、线程池任务包装器都应把 remove 放在 finally 中。"
+    },
+    {
+      "type": "explain",
+      "title": "线程池最怕串数据和长生命周期",
+      "content": "线程池复用的是物理线程，而 ThreadLocal 绑定在 Thread 上。上一个请求 set 了用户 A 的上下文却没有 remove，下一个请求被调度到同一个 worker 时，`get()` 可能读到用户 A 的残留值。这类问题比内存泄漏更危险，因为它会造成权限、租户、traceId 或事务上下文串线。\n\n排查时看三个点：线程 dump 中是否是同一批 worker 处理不同请求；日志 MDC、用户上下文或租户上下文是否在请求结束后仍存在；堆 dump 里 Thread -> threadLocals -> Entry -> value 是否保留了大量请求对象。修复优先级通常是补生命周期清理，其次才是调整对象大小或线程池参数。\n\n使用 `ThreadLocal.withInitial` 可以避免 null 判断，但它不会自动清理。使用 `static final ThreadLocal` 可以减少 key 丢失导致的 stale entry，但如果不 remove，线程池串数据和 value 长期驻留仍然存在。"
+    },
+    {
+      "type": "explain",
+      "title": "InheritableThreadLocal 只在创建线程时复制",
+      "content": "InheritableThreadLocal 使用 Thread 的 `inheritableThreadLocals` 字段。父线程创建子线程时，JVM 会把父线程的 inheritable map 复制到子线程；默认 `childValue` 返回同一个引用，必要时可以覆写做拷贝。\n\n它不适合普通线程池上下文传播。线程池 worker 通常在任务提交前已经创建，后续提交任务不会再次从提交者复制值；如果 worker 上曾继承或修改过旧值，新任务还可能读到旧上下文。异步链路要么显式传参，要么在提交任务时捕获上下文并在 worker 中 try/finally 恢复和清理，要么使用框架提供的上下文传播能力。\n\n在 Java 25 及以后，如果是只读上下文且能用结构化作用域表达，ScopedValue 往往比 InheritableThreadLocal 更容易推理：值只在绑定的作用域内可见，不能被远处代码 set 改写，作用域结束后自然失效。"
     },
     {
       "type": "diagram",
-      "title": "ThreadLocal 学习主线图",
-      "format": "mermaid",
-      "content": "flowchart LR\nA[ThreadLocal] --> B[并发编程]\nB --> C[线程级变量副本]\nC --> D[ThreadLocalMap]\nD --> E[弱引用 key]\nE --> F[value 泄漏原因]",
-      "caption": "从 并发编程 到 value 泄漏原因，这张图帮助区分 ThreadLocal 的核心机制、边界条件和常见误区。",
-      "fallback": "ThreadLocal -> 并发编程 -> 线程级变量副本 -> ThreadLocalMap -> 弱引用 key -> value 泄漏原因",
-      "items": [
-        "ThreadLocal核心：线程隔离存储",
-        "Thread对象：持有ThreadLocalMap",
-        "ThreadLocalMap：key为ThreadLocal(弱引用)，value为用户值",
-        "set操作：获取当前线程的ThreadLocalMap，存入key-value",
-        "get操作：获取当前线程的ThreadLocalMap，根据key获取value",
-        "内存泄漏：key弱引用被回收，value强引用未清理",
-        "应用场景：用户会话、数据库连接、日期格式化、事务管理"
-      ]
+      "format": "svg",
+      "title": "ThreadLocalMap 存储、泄漏和上下文边界",
+      "content": "assets/diagrams/java-threadlocal-map-leak-scope.svg"
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | ThreadLocal | synchronized |\n| --- | --- | --- |\n| 实现原理 | 线程隔离，每个线程独立副本 | 互斥锁，同一时刻只有一个线程访问 |\n| 数据共享 | 不共享，各线程独立 | 共享，需要同步 |\n| 性能 | 无锁，性能好 | 有锁，性能较差 |\n| 内存占用 | 每个线程一份副本 | 共享一份数据 |\n| 适用场景 | 线程隔离(会话、连接) | 数据共享(计数器、缓存) |\n| 内存泄漏 | 可能泄漏(需要remove) | 无泄漏 |\n| 线程安全 | 本身就是线程安全的 | 需要同步保证 |"
+      "title": "用法边界和替代方案",
+      "content": "| 维度 | ThreadLocal | InheritableThreadLocal | ScopedValue（JDK 25） | 显式传参 |\n| --- | --- | --- | --- | --- |\n| 绑定对象 | 当前 Thread | 创建子线程时复制到子 Thread | 词法作用域内的当前执行 | 方法调用关系 |\n| 是否可变 | 可 set/remove | 可 set/remove | 绑定值只读 | 由参数对象决定 |\n| 线程池表现 | worker 复用会残留 | 不按任务重新复制 | 适合结构化并发的作用域传播 | 最清晰但改签名成本高 |\n| 典型场景 | MDC、事务上下文、线程私有缓存 | 手工 new Thread 的少量继承 | 只读请求上下文、虚拟线程、结构化并发 | 核心业务参数、跨服务边界 |\n| 主要风险 | 忘记 remove 导致串数据或泄漏 | 线程池读到旧值，引用浅拷贝 | 需要目标 JDK 和框架支持 | 参数链路显得冗长 |\n\n| 实践规则 | 原因 |\n| --- | --- |\n| set 后用 try/finally remove | 让逻辑请求生命周期和线程复用解耦 |\n| 不把大对象长期放入 ThreadLocal | worker 生命周期可能远长于请求 |\n| 不用 ThreadLocal 传递核心业务参数 | 隐式依赖让测试、异步和重构更难 |\n| 异步任务提交时显式捕获和清理上下文 | ThreadLocal 不会自动跨线程传播 |\n| 只读上下文优先评估 ScopedValue | 作用域清晰、结束后自动失效 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "// 存储当前请求的用户信息\npublic class UserContext {\n    private static final ThreadLocal<User> CURRENT_USER = new ThreadLocal<>();\n\n    public static void setUser(User user) {\n        CURRENT_USER.set(user);\n    }\n\n    public static User getUser() {\n        return CURRENT_USER.get();\n    }\n\n    public static void clear() {\n        CURRENT_USER.remove();\n    }\n}\n\n// 在Filter中设置\npublic class AuthFilter implements Filter {\n    @Override\n    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) {\n        try {\n            User user = extractUser((HttpServletRequest) request);\n            UserContext.setUser(user);\n            chain.doFilter(request, response);\n        } finally {\n            UserContext.clear();  // 必须清除！\n        }\n    }\n}\n\n// 在Service中使用\n@Service\npublic class OrderService {\n    public void createOrder() {\n        User user = UserContext.getUser();  // 直接获取，无需传参\n        // ...\n    }\n}",
+      "title": "可运行代码：线程池串数据与正确清理",
       "language": "java",
+      "content": "import java.util.concurrent.ExecutorService;\nimport java.util.concurrent.Executors;\nimport java.util.concurrent.Future;\n\npublic class Main {\n    private static final ThreadLocal<String> REQUEST_ID = new ThreadLocal<>();\n    private static final InheritableThreadLocal<String> INHERITED = new InheritableThreadLocal<>();\n\n    public static void main(String[] args) throws Exception {\n        demonstrateThreadPoolResidue();\n        demonstrateInheritableThreadLocalBoundary();\n    }\n\n    static void demonstrateThreadPoolResidue() throws Exception {\n        ExecutorService pool = Executors.newSingleThreadExecutor();\n        try {\n            Future<String> first = pool.submit(() -> {\n                REQUEST_ID.set(\"REQ-A\");\n                return REQUEST_ID.get();\n            });\n            System.out.println(\"first request=\" + first.get());\n\n            String leaked = pool.submit(REQUEST_ID::get).get();\n            System.out.println(\"next task sees=\" + leaked);\n            assert \"REQ-A\".equals(leaked);\n\n            String cleaned = pool.submit(() -> {\n                try {\n                    REQUEST_ID.set(\"REQ-B\");\n                    return REQUEST_ID.get();\n                } finally {\n                    REQUEST_ID.remove();\n                }\n            }).get();\n            System.out.println(\"cleaned request=\" + cleaned);\n\n            String afterClean = pool.submit(REQUEST_ID::get).get();\n            System.out.println(\"after clean=\" + afterClean);\n            assert afterClean == null;\n        } finally {\n            pool.shutdownNow();\n        }\n    }\n\n    static void demonstrateInheritableThreadLocalBoundary() throws Exception {\n        ExecutorService pool = Executors.newSingleThreadExecutor();\n        try {\n            INHERITED.set(\"parent-1\");\n            String first = pool.submit(INHERITED::get).get();\n            System.out.println(\"inherited first=\" + first);\n            assert \"parent-1\".equals(first);\n\n            INHERITED.set(\"parent-2\");\n            String second = pool.submit(INHERITED::get).get();\n            System.out.println(\"inherited second=\" + second);\n            assert \"parent-1\".equals(second);\n\n            pool.submit(() -> {\n                INHERITED.remove();\n                return null;\n            }).get();\n        } finally {\n            INHERITED.remove();\n            pool.shutdownNow();\n        }\n    }\n}",
       "highlights": [
         {
-          "line": 10,
-          "note": "这里给出最终结果或提前退出条件，需要补充空值、失败和边界场景。"
+          "line": 17,
+          "note": "第一个任务没有 remove，值留在单线程池的 worker 上。"
+        },
+        {
+          "line": 22,
+          "note": "下一次任务复用同一个 worker，因此能读到上个逻辑请求的残留值。"
+        },
+        {
+          "line": 30,
+          "note": "正确做法是把 remove 放入 finally，让请求结束时清空线程槽位。"
+        },
+        {
+          "line": 50,
+          "note": "InheritableThreadLocal 在线程创建时复制；线程池复用后不会按每次提交重新复制。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
-      "title": "标准面试回答",
-      "content": "结论：ThreadLocal 提供线程级变量副本，解决同一变量在不同线程之间互不干扰的问题。它不是解决共享变量并发修改，而是通过每个线程自己的 ThreadLocalMap 实现隔离。\n\n机制上，底层结构要从 Thread 对象看：\n1. 每个 Thread 内部有一个 ThreadLocalMap。\n2. ThreadLocal 对象作为 key，业务值作为 value 存在当前线程的 map 中。\n3. key 是弱引用，ThreadLocal 外部强引用消失后 key 可能被回收。\n4. value 仍被线程持有，在线程池长生命周期线程中如果不 remove 就可能泄漏。\n\n追问边界：典型场景是用户上下文、traceId、事务上下文等随线程传递的数据。在线程池、异步任务和请求复用场景必须在 finally 中 remove；跨线程传递不能指望普通 ThreadLocal，需显式传参或使用受控的上下文传递工具。",
+      "title": "面试回答思路",
+      "content": "我会先澄清定位：ThreadLocal 解决的是线程内上下文隔离，不是共享变量同步。值实际存在当前 Thread 的 ThreadLocalMap 里，ThreadLocal 对象只是 key；每个线程访问自己的 map，所以不同线程互不干扰。\n\n底层结构要讲到弱 key/强 value：ThreadLocalMap 的 Entry key 是 ThreadLocal 的弱引用，value 是业务对象强引用。弱 key 让 ThreadLocal 实例在外部不用时有机会被 GC，但如果线程仍存活，key 变 null 的 Entry 仍可能强持有 value。线程池 worker 生命周期很长，不 remove 就会造成 value 驻留，也可能让后续请求读到旧上下文。\n\n实践上，ThreadLocal 要有严格生命周期：Filter、Interceptor、线程池包装器中 set 后 try/finally remove；不要存大对象，不要用它隐藏核心业务参数，异步任务要显式捕获和清理上下文。InheritableThreadLocal 只在线程创建时复制，线程池里不可靠。\n\n最后补现代边界：如果是只读请求上下文，且运行在 Java 25 及之后，可以评估 ScopedValue；它把上下文绑定到作用域，结束后自然失效，更适合虚拟线程和结构化并发。ThreadLocal 仍可用于旧框架集成、可变线程私有缓存和需要兼容老 JDK 的场景。",
       "followUpQuestions": [
         {
-          "question": "ThreadLocalMap 的 key 为什么设计成弱引用？",
-          "answer": "弱引用可以避免 ThreadLocal 实例不用后仍被线程长期强持有，但它不能自动清掉 value，所以仍需要 remove。"
+          "question": "ThreadLocal 为什么会在线程池里发生串数据？",
+          "answer": "因为 ThreadLocal 的值绑定在 Thread 上，而线程池复用 worker。上一个任务 set 后没有 remove，worker 的 ThreadLocalMap 还保留旧值；下一个任务如果被同一个 worker 执行，调用 get 就会读到上一个逻辑请求的数据。"
         },
         {
-          "question": "ThreadLocal 能不能解决并发安全问题？",
-          "answer": "它解决的是线程隔离，不是共享数据同步。如果多个线程必须修改同一对象，仍需要锁、CAS 或线程安全容器。"
+          "question": "ThreadLocalMap 的 key 是弱引用，为什么仍会泄漏 value？",
+          "answer": "弱引用只影响 key。外部不再引用 ThreadLocal 后，key 可以被 GC 成 null，但 Entry 本身还在当前线程的 ThreadLocalMap 中，value 仍是强引用。只要线程继续存活且没有触发或完成清理，value 就可能长期保留。"
+        },
+        {
+          "question": "InheritableThreadLocal 在线程池里为什么不可靠？",
+          "answer": "它只在创建子线程时复制父线程的 inheritableThreadLocals。线程池的 worker 通常早已创建，提交新任务时不会重新复制提交者上下文；同一个 worker 还可能保留旧任务修改过的值，所以容易读到过期上下文。"
         }
       ]
     },
@@ -78,16 +93,17 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释ThreadLocal的实现原理",
-        "能说明ThreadLocalMap的结构",
-        "能解释为什么key使用弱引用",
-        "能说明ThreadLocal导致内存泄漏的原因",
-        "能说出避免内存泄漏的方法",
-        "能列举ThreadLocal的应用场景",
-        "能比较ThreadLocal和synchronized的区别"
+        "能说明 ThreadLocal 的值存放在当前 Thread 的 ThreadLocalMap 中",
+        "能解释 ThreadLocalMap 的开放地址、弱 key 和强 value 结构",
+        "能描述线程池串数据和 value 驻留的完整路径",
+        "能写出 set 后 try/finally remove 的安全结构",
+        "能说明 static final ThreadLocal 不能替代 remove",
+        "能解释 InheritableThreadLocal 只在线程创建时复制",
+        "能区分 ThreadLocal、显式传参和 JDK 25 ScopedValue 的适用边界"
       ]
     }
   ],
+  "quiz": null,
   "recallPrompts": [
     {
       "id": "java.concurrency.topic-025-a8370d9d.recall.1",
@@ -119,7 +135,7 @@
     },
     {
       "id": "java.concurrency.topic-025-a8370d9d.recall.5",
-      "prompt": "ThreadLocalMap 的 key 是弱引用，为什么仍可能发生 value 泄漏？",
+      "prompt": "ThreadLocal、InheritableThreadLocal 和 ScopedValue 的上下文传播边界分别是什么？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
@@ -127,20 +143,22 @@
   ],
   "rubric": {
     "mustHave": [
-      "线程级变量副本",
-      "ThreadLocalMap",
-      "弱引用 key",
-      "value 泄漏原因"
+      "能说明 ThreadLocal 的值在线程自己的 ThreadLocalMap 中",
+      "能解释弱引用 key 和强引用 value",
+      "能说清线程池串数据和 value 泄漏原因",
+      "能写出 finally remove 的清理结构"
     ],
     "goodToHave": [
-      "线程池复用风险",
-      "InheritableThreadLocal 边界",
-      "上下文传递方案"
+      "能说明 ThreadLocalMap 的开放地址和启发式清理",
+      "能解释 InheritableThreadLocal 在线程池里的边界",
+      "能区分 ThreadLocal、显式传参和 ScopedValue",
+      "能结合线程 dump 和堆引用链排查线上问题"
     ],
     "commonMistakes": [
       "把 ThreadLocal 当成锁",
-      "只说弱引用不会泄漏",
-      "在线程池中 set 后不 remove"
+      "以为 key 是弱引用就不会泄漏",
+      "在线程池中 set 后不 remove",
+      "把 InheritableThreadLocal 当作线程池任务级上下文传播"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -149,11 +167,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-12",
+  "updatedAt": "2026-06-19",
   "status": "production",
   "prerequisites": [
     "java.concurrency.topic-013-cc70cb0e"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能围绕「ThreadLocal」说清线程级变量副本、ThreadLocalMap，并放到Java 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察能否从 Thread、ThreadLocalMap、弱 key/强 value 和线程池复用解释串数据与泄漏，并能给出现代上下文传播边界。"
 }

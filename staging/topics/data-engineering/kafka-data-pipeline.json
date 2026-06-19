@@ -40,11 +40,21 @@
     },
     {
       "type": "diagram",
-      "title": "Producer acks=all + ISR=2 的写入路径",
+      "title": "Kafka 数据管道：分区顺序、消费位点、重平衡与落库幂等",
       "format": "mermaid",
-      "content": "flowchart LR\nP[Producer acks=all] --> L[Leader 写本地 log]\nL --> F1[Follower1 fetch 并写日志]\nL --> F2[Follower2 fetch 并写日志]\nF1 --> HW[HW 推进 = ISR 最小 LEO]\nF2 --> HW\nHW --> ACK[向 Producer 返回 ack]\nL -->|少于 min.insync.replicas| ERR[NotEnoughReplicasException]",
-      "fallback": "Producer(acks=all) -> Leader 写本地日志 -> Follower1/Follower2 fetch 同步 -> ISR 全部跟上后推进 HW -> 返回 ack；ISR 不足 min.insync.replicas 时抛 NotEnoughReplicasException 让上游重试。",
-      "caption": "HW 推进依赖 ISR 中所有副本的 LEO，min.insync.replicas 不足会主动报错而不是降级写入。"
+      "content": "flowchart LR\nA[\"业务事件/Outbox\"] --> B[\"Producer\nkey 决定分区\"]\nB --> C[\"Broker Topic\nPartition Log\"]\nC --> D[\"Consumer Group\"]\nD --> E[\"处理和转换\"]\nE --> F[\"Sink\n数仓/湖仓/搜索/缓存\"]\nD --> G[\"提交 offset\"]\nH[\"Rebalance/失败重试\"] --> D\nE --> I{\"处理失败\"}\nI -->|可重试| D\nI -->|不可恢复| J[\"DLQ + 告警 + 补偿\"]\nF --> K[\"幂等键/事务/去重表\"]",
+      "fallback": "图展示 Kafka 管道中分区顺序、consumer group、offset 提交、重平衡、失败重试和 sink 幂等必须一起设计。",
+      "caption": "Kafka 数据管道：分区顺序、消费位点、重平衡与落库幂等",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart LR\nA[\"业务事件/Outbox\"] --> B[\"Producer\nkey 决定分区\"]\nB --> C[\"Broker Topic\nPartition Log\"]\nC --> D[\"Consumer Group\"]\nD --> E[\"处理和转换\"]\nE --> F[\"Sink\n数仓/湖仓/搜索/缓存\"]\nD --> G[\"提交 offset\"]\nH[\"Rebalance/失败重试\"] --> D\nE --> I{\"处理失败\"}\nI -->|可重试| D\nI -->|不可恢复| J[\"DLQ + 告警 + 补偿\"]\nF --> K[\"幂等键/事务/去重表\"]"
+        },
+        {
+          "kind": "text",
+          "content": "图展示 Kafka 管道中分区顺序、consumer group、offset 提交、重平衡、失败重试和 sink 幂等必须一起设计。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -91,7 +101,25 @@
       "type": "code",
       "title": "Producer 事务 + Consumer 手动提交的最小骨架",
       "language": "java",
-      "content": "// Producer 端：开启幂等 + 事务\nProperties pp = new Properties();\npp.put(\"acks\", \"all\");\npp.put(\"enable.idempotence\", \"true\");\npp.put(\"transactional.id\", \"order-pipeline-tx-1\"); // 必须稳定且唯一\nKafkaProducer<String, String> producer = new KafkaProducer<>(pp);\nproducer.initTransactions(); // 注册 PID 并 fence 旧实例\n\n// Consumer 端：关闭自动提交，配合事务读\nProperties cp = new Properties();\ncp.put(\"enable.auto.commit\", \"false\");\ncp.put(\"isolation.level\", \"read_committed\"); // 只读已提交事务\nKafkaConsumer<String, String> consumer = new KafkaConsumer<>(cp);\nconsumer.subscribe(List.of(\"orders\"));\n\nwhile (true) {\n  ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));\n  if (records.isEmpty()) continue;\n  producer.beginTransaction();\n  try {\n    for (ConsumerRecord<String, String> r : records) {\n      // 业务处理 + 写下游 topic\n      producer.send(new ProducerRecord<>(\"orders.enriched\", r.key(), enrich(r.value())));\n    }\n    // 把消费位移塞进同一个事务，原子提交\n    Map<TopicPartition, OffsetAndMetadata> offsets = currentOffsets(records);\n    producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());\n    producer.commitTransaction();\n  } catch (KafkaException e) {\n    producer.abortTransaction(); // 下次 poll 会从未提交位移重读\n  }\n}"
+      "content": "// Producer 端：开启幂等 + 事务\nProperties pp = new Properties();\npp.put(\"acks\", \"all\");\npp.put(\"enable.idempotence\", \"true\");\npp.put(\"transactional.id\", \"order-pipeline-tx-1\"); // 必须稳定且唯一\nKafkaProducer<String, String> producer = new KafkaProducer<>(pp);\nproducer.initTransactions(); // 注册 PID 并 fence 旧实例\n\n// Consumer 端：关闭自动提交，配合事务读\nProperties cp = new Properties();\ncp.put(\"enable.auto.commit\", \"false\");\ncp.put(\"isolation.level\", \"read_committed\"); // 只读已提交事务\nKafkaConsumer<String, String> consumer = new KafkaConsumer<>(cp);\nconsumer.subscribe(List.of(\"orders\"));\n\nwhile (true) {\n  ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));\n  if (records.isEmpty()) continue;\n  producer.beginTransaction();\n  try {\n    for (ConsumerRecord<String, String> r : records) {\n      // 业务处理 + 写下游 topic\n      producer.send(new ProducerRecord<>(\"orders.enriched\", r.key(), enrich(r.value())));\n    }\n    // 把消费位移塞进同一个事务，原子提交\n    Map<TopicPartition, OffsetAndMetadata> offsets = currentOffsets(records);\n    producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());\n    producer.commitTransaction();\n  } catch (KafkaException e) {\n    producer.abortTransaction(); // 下次 poll 会从未提交位移重读\n  }\n}",
+      "highlights": [
+        {
+          "line": 16,
+          "note": "`while (true) {` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+        },
+        {
+          "line": 18,
+          "note": "`if (records.isEmpty()) continue;` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+        },
+        {
+          "line": 3,
+          "note": "`pp.put(\"acks\", \"all\");` 更新核心数据结构，是解释状态如何推进的抓手。"
+        },
+        {
+          "line": 12,
+          "note": "`cp.put(\"isolation.level\", \"read_committed\"); // 只读已提交事务` 更新核心数据结构，是解释状态如何推进的抓手。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
@@ -189,5 +217,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-13"
+  "updatedAt": "2026-06-18"
 }

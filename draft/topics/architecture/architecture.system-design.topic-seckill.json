@@ -20,8 +20,8 @@
   "learningCards": [
     {
       "type": "explain",
-      "title": "核心挑战与分层限流",
-      "content": "## 一、核心挑战\n- **瞬时高并发**：100万人抢100个商品\n- **超卖问题**：库存扣减的原子性\n- **高可用**：系统不能挂\n\n## 二、分层限流\n\n### 2.1 前端限流\n- 按钮置灰/倒计时\n- 验证码（削峰）\n- 前端JS限制重复提交\n\n### 2.2 网关限流\n- Nginx限流（漏桶）\n- 网关层限流（Sentinel）\n- 用户级/IP级限流\n\n分层限流的核心思路是「越靠前拦得越多、越靠后越精准」：前端和网关挡住的是无效流量和机器刷单（成本低、量大），真正需要保证正确性的库存扣减放在最里层用原子操作做。这样数据库只承受和库存量级相当的请求，而不是百万级冲击。"
+      "title": "核心挑战：容量峰值、库存正确性与用户体验的取舍",
+      "content": "## 一、先建容量模型，而不是只喊“高并发”\n秒杀系统的真实难点不是总访问量，而是活动开始后很短时间内的**有效请求峰值**、库存规模、支付转化率和后端可承受写入能力之间不匹配。设计前至少要估算：活动库存、预约人数、开抢瞬时请求、单用户限购规则、下单保留时间、支付超时释放策略，以及订单库、Redis、MQ 的压测上限。\n\n一个可靠答案要把目标拆成三类：\n- **正确性**：不能超卖；同一用户不能重复成功；订单、库存、支付状态最终能对账。\n- **稳定性**：无效流量和刷单流量尽量在入口被拒绝，数据库只承接已经通过资格和库存预占的请求。\n- **体验**：卖完要快速失败；排队中要给可解释状态；系统宁可少卖后补偿，也不能放任超卖。\n\n## 二、分层限流的核心是“越靠前越粗，越靠后越准”\n- **前端/CDN 层**：静态化商品页，按钮倒计时和防重复提交只作为体验优化，不能当安全边界。\n- **网关层**：按活动、用户、IP、设备、风险分做限流和风控，保护后端线程池与连接池。\n- **服务层**：用用户限购、资格校验、Redis 原子库存预占、排队令牌控制进入下单链路的请求数。\n\n入口层可以粗暴拒绝，库存层必须精确判断。这样数据库面对的是“已经获得库存预占资格的候选订单”，而不是所有点击流量。"
     },
     {
       "type": "explain",
@@ -30,53 +30,85 @@
     },
     {
       "type": "explain",
-      "title": "分段库存、异步下单与防刷",
-      "content": "### 3.3 分段库存\n- 将100个库存分成10段，每段10个\n- 不同用户请求路由到不同段\n- 减少热点竞争\n\n## 四、异步下单\n- Redis扣减成功后，发送MQ消息\n- 订单服务异步消费消息创建订单\n- 削峰填谷，保护数据库\n\n## 五、防刷策略\n- 用户限购（每人限1件）\n- 设备指纹/IP限制\n- 黑名单机制\n\n## 六、整体架构\n```\n用户 → CDN → Nginx → Gateway → 秒杀服务 → Redis预扣 → MQ → 订单服务 → DB\n```\n\n分段库存解决的是「单条库存记录的行锁热点」：所有人抢同一行时行锁让扣减串行化、成为瓶颈；把库存拆成多段分散到多行或多个 Redis key，请求按用户哈希路由到不同段，就把热点打散了。代价是可能出现某段抢光、另一段还有的局部不均，需要段间借调兜底。"
+      "title": "分段库存、异步下单、补偿与防刷",
+      "content": "## 一、分段库存解决热点，不是改变库存总量\n如果所有请求都扣同一个 Redis key 或同一行库存记录，热点会集中在单点。分段库存的做法是把可售库存拆到多个段，用户按稳定哈希路由到某一段，失败时可以按有限次数尝试其他段。它降低热点竞争，但要维护总量不变、段间借调、活动结束后的汇总对账。\n\n## 二、异步下单把“抢到资格”和“创建订单”解耦\nRedis 预扣成功后，不建议让用户请求线程同步完成所有数据库写入和后续通知。更稳的链路是：写入下单消息或 outbox，订单消费者按幂等键创建订单并扣减 DB 库存，前端通过轮询、推送或订单查询接口获取结果。\n\n异步化的代价是中间态更多：\n- MQ 投递失败或消费失败时，需要重试、死信和人工补偿入口。\n- Redis 预扣成功但 DB 落单失败时，需要回补库存或释放预占。\n- 用户支付超时时，需要关闭订单并释放库存，避免长期少卖。\n\n## 三、防刷要和业务规则绑定\n防刷不只是黑名单。更关键的是把用户资格、限购次数、设备风险、支付账户、收货地址异常、活动令牌有效期放进统一风控判断；同时所有成功路径都必须有唯一约束兜底，例如 (activity_id, user_id) 唯一索引防重复订单。"
     },
     {
       "type": "diagram",
       "format": "mermaid",
-      "title": "秒杀分层削峰与防超卖",
-      "content": "flowchart TD\nA[\"百万请求\"] --> B[\"前端：置灰/验证码/防重复\"]\nB --> C[\"网关 Nginx：限流 + 按用户IP 限流\"]\nC --> D[\"服务层：Redis Lua 原子预扣库存\"]\nD -->|扣成功| E[\"发 MQ 异步下单\"]\nE --> F[\"DB 行锁 stock>0 兜底防超卖\"]\nD -->|库存空| G[\"快速返回已抢完\"]",
-      "caption": "秒杀分层削峰：前端、网关、服务层逐层拦截，Redis Lua 原子预扣库存挡住绝大多数请求，扣成功才发 MQ 异步下单、DB 行锁兜底防超卖。",
-      "fallback": "百万请求经前端（置灰、验证码、防重复）、网关（限流、按用户和 IP 限流）、服务层（Redis Lua 原子预扣库存）逐层削峰；扣成功发 MQ 异步下单、DB 用 stock>0 行锁兜底防超卖，库存空则快速返回已抢完。"
+      "title": "秒杀削峰链路：入口限流、Redis 预扣、异步下单与防超卖",
+      "content": "flowchart TD\nA[\"用户请求\"] --> B[\"CDN/静态化/验证码/风控\"]\nB --> C[\"网关限流\n用户/IP/活动维度\"]\nC --> D[\"Redis 原子预扣库存\"]\nD -->|库存不足| E[\"快速失败\"]\nD -->|预扣成功| F[\"写入下单 MQ\"]\nF --> G[\"订单消费者\"]\nG --> H[\"DB 行锁/乐观锁落单\"]\nH --> I{\"落单成功\"}\nI -->|成功| J[\"支付倒计时\"]\nI -->|失败| K[\"补偿 Redis 库存/关闭订单\"]",
+      "caption": "秒杀削峰链路：入口限流、Redis 预扣、异步下单与防超卖",
+      "fallback": "图展示秒杀用入口限流和 Redis 原子预扣削峰，再通过 MQ 异步落单和 DB 约束防超卖。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[\"用户请求\"] --> B[\"CDN/静态化/验证码/风控\"]\nB --> C[\"网关限流\n用户/IP/活动维度\"]\nC --> D[\"Redis 原子预扣库存\"]\nD -->|库存不足| E[\"快速失败\"]\nD -->|预扣成功| F[\"写入下单 MQ\"]\nF --> G[\"订单消费者\"]\nG --> H[\"DB 行锁/乐观锁落单\"]\nH --> I{\"落单成功\"}\nI -->|成功| J[\"支付倒计时\"]\nI -->|失败| K[\"补偿 Redis 库存/关闭订单\"]"
+        },
+        {
+          "kind": "text",
+          "content": "图展示秒杀用入口限流和 Redis 原子预扣削峰，再通过 MQ 异步落单和 DB 约束防超卖。"
+        }
+      ]
     },
     {
       "type": "compareTable",
       "title": "对比与边界",
-      "content": "| 维度 | Redis预扣 | 数据库直接扣 | 分段库存 |\n| --- | --- | --- | --- |\n| 性能 | 极高 | 低 | 高 |\n| 超卖风险 | 极低(Lua原子) | 低(行锁) | 极低 |\n| 复杂度 | 中 | 低 | 中 |\n| 适用 | 高并发秒杀 | 低并发 | 超高并发 |"
+      "content": "| 维度 | Redis 预扣 | DB 条件扣减 | 分段库存 |\n| --- | --- | --- | --- |\n| 主要作用 | 在数据库前过滤无库存请求 | 最终防超卖兜底 | 打散热点 key 或热点行 |\n| 正确性依赖 | Lua 原子判断、限购集合、过期释放 | 条件更新、唯一约束、事务边界 | 段内原子扣减、段间汇总对账 |\n| 主要风险 | 预扣成功后消息/落单失败导致少卖 | 高峰期行锁竞争和连接池耗尽 | 局部段售罄、借调逻辑复杂 |\n| 适用边界 | 峰值明显高于 DB 写入能力 | 库存规模小或作为最终校验 | 单 key/单行成为热点时 |"
     },
     {
       "type": "compareTable",
       "title": "维度对比",
-      "content": "| 维度 | 同步下单 | 异步下单 |\n| --- | --- | --- |\n| 实时性 | 高 | 低（毫秒级延迟） |\n| 数据库压力 | 大 | 小 |\n| 用户体验 | 立即知道结果 | 需轮询 |\n| 适用 | 低并发 | 高并发秒杀 |"
+      "content": "| 维度 | 同步下单 | 异步下单 |\n| --- | --- | --- |\n| 用户反馈 | 立即知道落单结果 | 先返回排队/受理状态，再查询结果 |\n| 后端压力 | 请求线程占用更久，峰值更难削 | MQ 缓冲峰值，消费者按能力处理 |\n| 一致性处理 | 逻辑直接但容易拖垮主链路 | 需要幂等、重试、死信、补偿和对账 |\n| 适用场景 | 低峰值或库存/订单链路很短 | 峰值远高于订单库稳定写入能力 |"
     },
     {
       "type": "code",
       "title": "代码示例",
-      "content": "// 1. Redis预扣库存 - Lua脚本\npublic class SeckillService {\n    private final StringRedisTemplate redis;\n    private final KafkaTemplate<String, String> kafka;\n\n    // Lua脚本：检查库存 + 扣减 + 检查限购\n    private static final String SECKILL_SCRIPT =\n        \"local stock = tonumber(redis.call('get', KEYS[1])) \" +\n        \"if stock == nil or stock <= 0 then return -1 end \" +  // 库存不足\n        \"local bought = redis.call('sismember', KEYS[2], ARGV[1]) \" +\n        \"if bought == 1 then return -2 end \" +                 // 已购买\n        \"redis.call('decr', KEYS[1]) \" +                       // 扣减库存\n        \"redis.call('sadd', KEYS[2], ARGV[1]) \" +              // 记录购买\n        \"return 1\";                                             // 成功\n\n    public SeckillResult doSeckill(String userId, String skuId) {\n        String stockKey = \"seckill:stock:\" + skuId;\n        String boughtKey = \"seckill:bought:\" + skuId;\n\n        Long result = redis.execute(\n            new DefaultRedisScript<>(SECKILL_SCRIPT, Long.class),\n            Arrays.asList(stockKey, boughtKey),\n            userId\n        );\n\n        if (result == -1) return SeckillResult.SOLD_OUT;\n        if (result == -2) return SeckillResult.ALREADY_BOUGHT;\n\n        // 发送MQ异步下单\n        kafka.send(\"seckill-order\",\n            JSON.toJSONString(new SeckillMessage(userId, skuId)));\n        return SeckillResult.SUCCESS;\n    }\n}\n\n// 2. 异步下单消费者\n@KafkaListener(topics = \"seckill-order\")\npublic void handleSeckillOrder(String message) {\n    SeckillMessage msg = JSON.parseObject(message, SeckillMessage.class);\n    try {\n        // 数据库扣减库存（最终一致性）\n        boolean success = inventoryMapper.deductStock(\n            msg.getSkuId(), 1);\n        if (success) {\n            // 创建订单\n            orderService.createSeckillOrder(msg.getUserId(), msg.getSkuId());\n        } else {\n            // 库存不足，补偿Redis\n            redisTemplate.opsForValue().increment(\n                \"seckill:stock:\" + msg.getSkuId());\n        }\n    } catch (Exception e) {\n        // 重试或人工处理\n        log.error(\"秒杀下单失败: {}\", msg, e);\n    }\n}\n\n// 3. 数据库扣减SQL\n// UPDATE inventory SET quantity = quantity - 1\n// WHERE sku_id = #{skuId} AND quantity > 0\n\n// 4. 分段库存\npublic class SegmentStockService {\n    private static final int SEGMENT_COUNT = 10;\n\n    public boolean deduct(String skuId, String userId) {\n        // 根据用户ID哈希到不同段\n        int segment = Math.abs(userId.hashCode()) % SEGMENT_COUNT;\n        String stockKey = \"seckill:stock:\" + skuId + \":\" + segment;\n        Long result = redis.opsForValue().decrement(stockKey);\n        if (result != null && result >= 0) {\n            return true;\n        }\n        // 当前段没有库存，尝试其他段\n        if (result != null) {\n            redis.opsForValue().increment(stockKey); // 回补\n        }\n        return false;\n    }\n}",
-      "language": "java"
+      "content": "// 1. Redis 预扣库存：Lua 脚本把库存判断、限购判断和扣减放在同一个原子执行单元\npublic class SeckillService {\n    private final StringRedisTemplate redis;\n    private final KafkaTemplate<String, String> kafka;\n\n    private static final String SECKILL_SCRIPT =\n        \"local stock = tonumber(redis.call('get', KEYS[1])) \" +\n        \"if stock == nil or stock <= 0 then return -1 end \" +\n        \"local bought = redis.call('sismember', KEYS[2], ARGV[1]) \" +\n        \"if bought == 1 then return -2 end \" +\n        \"redis.call('decr', KEYS[1]) \" +\n        \"redis.call('sadd', KEYS[2], ARGV[1]) \" +\n        \"return 1\";\n\n    public SeckillResult doSeckill(String activityId, String userId, String skuId) {\n        String stockKey = \"seckill:stock:\" + activityId + \":\" + skuId;\n        String boughtKey = \"seckill:bought:\" + activityId + \":\" + skuId;\n\n        Long result = redis.execute(\n            new DefaultRedisScript<>(SECKILL_SCRIPT, Long.class),\n            Arrays.asList(stockKey, boughtKey),\n            userId\n        );\n\n        if (result == -1) return SeckillResult.SOLD_OUT;\n        if (result == -2) return SeckillResult.ALREADY_BOUGHT;\n\n        SeckillMessage msg = new SeckillMessage(activityId, userId, skuId);\n        try {\n            kafka.send(\"seckill-order\", activityId + \":\" + userId, JSON.toJSONString(msg)).get();\n            return SeckillResult.ACCEPTED;\n        } catch (Exception sendFailure) {\n            // 发送失败时要释放预占；生产上通常会配合本地 outbox、可靠投递或补偿任务兜底\n            redis.opsForValue().increment(stockKey);\n            redis.opsForSet().remove(boughtKey, userId);\n            return SeckillResult.RETRY_LATER;\n        }\n    }\n}\n\n// 2. 异步下单消费者：DB 侧仍用唯一约束和条件扣减兜底，消费必须幂等\n@KafkaListener(topics = \"seckill-order\")\n@Transactional\npublic void handleSeckillOrder(String message) {\n    SeckillMessage msg = JSON.parseObject(message, SeckillMessage.class);\n    if (orderRepository.existsByActivityIdAndUserId(msg.getActivityId(), msg.getUserId())) {\n        return;\n    }\n\n    boolean deducted = inventoryMapper.deductStock(msg.getActivityId(), msg.getSkuId(), 1);\n    if (!deducted) {\n        compensateRedisStock(msg);\n        return;\n    }\n\n    orderService.createSeckillOrder(msg.getActivityId(), msg.getUserId(), msg.getSkuId());\n}\n\n// UPDATE inventory\n// SET quantity = quantity - 1\n// WHERE activity_id = #{activityId} AND sku_id = #{skuId} AND quantity >= #{count}\n// 另加唯一索引：uk_activity_user(activity_id, user_id)\n\n// 3. 分段库存：先命中稳定哈希段，失败后有限尝试其他段，避免单段剩余导致少卖\npublic class SegmentStockService {\n    private static final int SEGMENT_COUNT = 16;\n\n    public boolean deduct(String activityId, String skuId, String userId) {\n        int base = Math.abs(userId.hashCode()) % SEGMENT_COUNT;\n        for (int offset = 0; offset < SEGMENT_COUNT; offset++) {\n            int segment = (base + offset) % SEGMENT_COUNT;\n            String key = \"seckill:stock:\" + activityId + \":\" + skuId + \":\" + segment;\n            Long left = redis.opsForValue().decrement(key);\n            if (left != null && left >= 0) {\n                return true;\n            }\n            if (left != null) {\n                redis.opsForValue().increment(key);\n            }\n        }\n        return false;\n    }\n}",
+      "language": "java",
+      "highlights": [
+        {
+          "line": 7,
+          "note": "Lua 脚本把库存判断、限购判断和扣减放在同一个 Redis 原子执行单元，避免并发读写窗口。"
+        },
+        {
+          "line": 29,
+          "note": "发送下单消息失败时释放 Redis 预占，否则会出现少卖，需要 outbox 或补偿任务兜底。"
+        },
+        {
+          "line": 45,
+          "note": "消费者先用业务唯一键做幂等，避免 MQ 重投导致重复订单。"
+        },
+        {
+          "line": 50,
+          "note": "DB 条件扣减是最终防超卖兜底，不能只依赖缓存库存。"
+        },
+        {
+          "line": 66,
+          "note": "分段库存要支持有限段间尝试，否则会出现某段售罄但整体仍有库存的少卖。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：秒杀的核心矛盾是「瞬时百万请求」对「极少库存」，三大挑战是高并发、超卖、高可用。设计主线就一句话：层层削峰、把流量挡在数据库之前，最终只让和库存量级相当的请求落到下单。\n\n分层削峰（从外到内）：\n\n1. 前端：按钮置灰、倒计时、验证码、防重复提交，先削掉一部分。\n2. 网关或 Nginx：限流（漏桶）、按用户和 IP 限流，挡住机器刷单。\n3. 服务层：Redis 限流计数、信号量控并发。\n\n库存扣减（防超卖关键）：\n\n1. Redis 预扣：秒杀前把库存加载到 Redis，用 Lua 脚本原子扣减，扣成功才进下单，把绝大多数请求挡在 DB 外。\n2. DB 兜底：最终落库用 update set stock=stock-1 where stock>0 的行锁加条件防超卖。\n3. 分段库存：把库存分成多段、请求路由到不同段，减少单行热点竞争。\n\n异步下单：Redis 扣减成功后发 MQ，订单服务异步消费建单，削峰填谷保护数据库。防刷：用户限购、设备指纹、IP 限制、黑名单。\n\n边界和取舍。① 超卖与少卖的权衡：Redis 扣了但 MQ 或下单失败要回补库存，否则会少卖，用对账或预占超时释放兜底。② 一致性：Redis 和 DB 最终一致，要处理「Redis 扣成功、DB 失败」的补偿。③ 高可用：Redis 要集群、热点 key 要分散，限流阈值靠压测定，宁可拒绝也不能雪崩。",
+      "content": "结论：秒杀系统不是单纯“扛高并发”，而是在活动峰值、库存正确性、用户体验和后端写入能力之间做取舍。主线是层层削峰、库存原子预占、异步落单、DB 兜底、防重复和可补偿。\n\n我会先建容量模型：库存多少、预约/在线人数多少、开抢窗口多短、单用户限购规则是什么、订单库稳定写入能力是多少、支付超时多久释放库存。然后按链路分层处理：CDN/静态化减少商品页压力，网关按活动、用户、IP 和风险分限流，服务层做资格校验和 Redis Lua 预扣，预扣成功后进入 MQ 或 outbox，订单消费者幂等建单，数据库用条件扣减和唯一索引做最终兜底。\n\n防超卖靠两层：Redis Lua 保证“判断库存、判断限购、扣库存”原子执行；DB 落库时仍用 where stock >= count 条件更新、唯一索引和事务边界防止缓存异常或消息重复。防少卖靠补偿：Redis 预扣成功但消息投递失败、消费失败、DB 扣减失败、支付超时，都要释放预占或进入对账任务。\n\n高阶追问要主动讲边界：限流阈值来自压测和错误预算，不是拍脑袋；热点 key 可以用分段库存打散，但要处理段间借调和总量对账；异步下单提升稳定性，但引入中间态、重试、死信、幂等和用户查询体验。",
       "followUpQuestions": [
         {
           "question": "在你的项目中，秒杀系统设计是怎么落地的？遇到了什么权衡取舍？",
-          "answer": "秒杀系统核心：\n1. 前端：静态化+CDN+验证码\n2. 网关：限流+风控\n3. 服务：Redis预减库存+Lua原子操作+异步下单\n4. 数据库：乐观锁+唯一索引。关键：把请求拦截在最前面，真正到数据库的请求很少。"
+          "answer": "我会按活动容量先定入口限流和后端写入预算：商品页静态化，网关做用户/IP/设备/活动维度限流，服务层用资格校验和 Redis Lua 预扣库存，预扣成功后写 MQ/outbox，订单消费者幂等建单，DB 用条件扣减和唯一约束兜底。主要取舍是“快速拒绝 vs 排队体验”“超卖风险 vs 少卖补偿”“单 key 简单 vs 分段库存复杂度”。"
         },
         {
-          "question": "秒杀系统 在高并发（万级 QPS）和数据一致性要求高的场景下，有哪些关键设计决策？",
-          "answer": "秒杀系统设计 在高并发场景下要先识别核心约束，再拆成容量、延迟、一致性、故障隔离和可观测性几个维度设计。回答 秒杀系统设计 时，要说明 架构设计、系统设计 的关键瓶颈、可异步或降级的链路、必须一致的数据以及积压或超时时的恢复方式。"
+          "question": "Redis 预扣成功后 MQ 发送失败怎么办？",
+          "answer": "不能只记录日志。轻量方案是在发送失败时立即回补库存并移除限购标记；更稳的方案是把预扣成功事件写入可靠 outbox 或待投递表，由后台任务重试投递。无论哪种，都要有超时释放和库存对账，避免长期少卖。"
         },
         {
-          "question": "如果现有系统需要引入 秒杀系统，你会怎么评估改造风险和制定迁移计划？",
-          "answer": "引入 秒杀系统 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。引入 秒杀系统设计 时建议分阶段推进：先选择 架构设计、系统设计、秒杀 中风险较低的链路试点，验证 降级策略 后再推广。秒杀系统设计 迁移时要先灰度小流量，再绑定回滚条件、监控指标和业务验收口径。"
+          "question": "为什么 DB 还要做条件扣减和唯一索引？Redis Lua 不是已经原子了吗？",
+          "answer": "Redis 解决的是缓存侧并发预占，不能覆盖消息重复、缓存与 DB 不一致、人工修复、消费重试等异常。DB 是最终事实源，需要 stock >= count 的条件更新防超卖，并用 (activity_id,user_id) 唯一索引防同一用户重复成功。"
         },
         {
-          "question": "秒杀系统设计 在真实项目里怎么做取舍和验证？",
-          "answer": "我会先明确 架构设计、系统设计、秒杀 的业务约束，再比较收益、成本和失败边界。落地后用 容量峰值、一致性边界、降级策略和压测指标 做闭环：既看正常路径是否达标，也看异常路径能否告警、回滚和复盘"
+          "question": "分段库存有什么风险？",
+          "answer": "分段能打散热点，但会带来局部段售罄、段间借调、活动结束汇总和库存对账复杂度。实现上要让总库存只初始化一次，段内扣减原子，失败后有限尝试其他段，并在 DB 侧仍保留总量兜底。"
         }
       ]
     },
@@ -84,11 +116,11 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "秒杀系统的三层限流：前端/网关/服务层",
-        "Redis预扣库存的Lua脚本实现原理",
-        "异步下单的削峰作用和实现方式",
-        "数据库扣减的SQL写法和防超卖机制",
-        "分段库存减少热点竞争的原理"
+        "能先建立活动容量模型：库存、峰值请求、限购、支付超时和订单库写入预算",
+        "能解释入口限流、服务资格校验、Redis Lua 预扣、MQ/outbox、DB 落单的完整链路",
+        "能说明 Redis 原子预扣与 DB 条件扣减/唯一索引各自防什么问题",
+        "能讲清预扣成功但消息失败、消费失败、支付超时等少卖路径的补偿",
+        "能说出分段库存打散热点的收益、段间借调风险和对账要求"
       ]
     }
   ],
@@ -117,20 +149,21 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说出秒杀的三大挑战（高并发、超卖、高可用）和分层削峰主线",
-      "能讲清 Redis Lua 预扣库存加 DB 行锁兜底防超卖",
-      "能说明异步下单（MQ）削峰",
-      "能指出超卖与少卖的取舍和补偿"
+      "能从容量模型出发说明秒杀峰值、库存规模、限购规则和写入预算",
+      "能讲清 Redis Lua 预扣库存加 DB 条件扣减/唯一索引兜底防超卖",
+      "能说明 MQ/outbox 异步下单的削峰作用和幂等要求",
+      "能指出超卖与少卖的取舍、补偿、超时释放和对账"
     ],
     "goodToHave": [
-      "能用分段库存打散行锁热点",
-      "能说明限流阈值靠压测、宁拒绝不雪崩",
-      "能说出防刷（限购、设备指纹、黑名单）"
+      "能用分段库存打散热点并说明段间借调和汇总对账",
+      "能说明限流阈值来自压测、错误预算和业务拒绝策略",
+      "能把防刷与用户资格、设备风险、支付账户、唯一约束结合起来"
     ],
     "commonMistakes": [
-      "只靠 DB 行锁扛百万并发、不做削峰",
-      "Redis 扣成功后下单失败不回补库存导致少卖",
-      "限流阈值拍脑袋、热点 key 不分散"
+      "只靠 DB 行锁承接峰值点击流量，不做入口削峰和资格过滤",
+      "Redis 扣成功后消息或落单失败不回补库存，导致长期少卖",
+      "把前端按钮置灰当成安全边界，忽略接口重放和刷单流量",
+      "分段库存只拆 key 不做总量对账，导致库存漂移"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -140,9 +173,9 @@
     }
   },
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否讲清分层削峰、Redis 原子预扣加 DB 兜底防超卖、异步下单，并意识到超卖/少卖补偿、限流压测和热点分散。",
+  "interviewerFocus": "考察能否从容量模型出发讲清分层削峰、Redis 原子预扣、MQ/outbox 异步落单、DB 兜底防超卖，以及少卖补偿、限流压测、热点分散和对账。",
   "prerequisites": [
     "architecture.microservice.topic-split-principles"
   ],
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-18"
 }

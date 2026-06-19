@@ -26,16 +26,26 @@
     },
     {
       "type": "explain",
-      "title": "Web API 设计：响应格式、最佳实践",
-      "content": "## 响应格式\n\n**统一响应格式**：\n```csharp\npublic class ApiResponse<T>\n{\n    public int Code { get; set; }\n    public string Message { get; set; }\n    public T Data { get; set; }\n    public object Errors { get; set; }\n}\n\n// 成功响应\nreturn Ok(new ApiResponse<UserDto>\n{\n    Code = 200,\n    Message = \"成功\",\n    Data = userDto\n});\n\n// 错误响应\nreturn BadRequest(new ApiResponse<object>\n{\n    Code = 400,\n    Message = \"验证失败\",\n    Errors = ModelState.ToDictionary(\n        kvp => kvp.Key,\n        kvp => kvp.Value.Errors.Select(e => e.ErrorMessage))\n});\n```\n\n## 最佳实践\n\n1. **版本控制**：使用 URL 或 Header 进行版本控制\n2. **分页**：大数据集使用分页\n3. **过滤排序**：支持查询参数过滤和排序\n4. **HATEOAS**：在响应中包含相关链接\n5. **限流**：防止 API 被滥用"
+      "title": "Web API 设计：响应契约、错误模型与演进策略",
+      "content": "## 响应契约先尊重 HTTP 语义\n\nAPI 不建议所有结果都包成 HTTP 200 + 自定义 Code。成功、客户端错误和服务端错误应使用清晰状态码：201 Created 搭配 Location 表达资源创建，400/422 表达校验失败，401 表示未认证，403 表示无权限，404 表示资源不存在，409 表示并发冲突或唯一约束冲突，429 表示限流，5xx 表示服务端故障。\n\n## 错误模型要稳定可机器处理\n\n错误响应可以采用 ProblemDetails 风格：type、title、status、detail、instance、traceId，再按业务需要扩展 errorCode 和 fieldErrors。traceId 帮排查，errorCode 帮前端和调用方做稳定分支，detail 不要泄露 SQL、堆栈和内部服务名。\n\n## 演进策略比“统一格式”更重要\n\n分页要明确 cursor/offset 语义和排序稳定性；过滤和排序要白名单化；版本策略可以用 URL、Header 或媒体类型，但必须说明兼容窗口；限流要返回 Retry-After 或明确的错误码；缓存要用 ETag、Last-Modified、Cache-Control 表达可重用边界。\n\n## 什么时候还需要响应壳\n\n内部 BFF 或强前端约定场景可以保留响应壳，但不要吞掉 HTTP 状态码。更稳的做法是 HTTP 状态表达协议级结果，body 中的业务码表达领域级失败。"
     },
     {
       "type": "diagram",
       "format": "mermaid",
-      "title": "Web API 请求处理流程",
-      "content": "flowchart LR\nA[\"请求 + HTTP 方法\"] --> B[\"路由匹配 Controller/Action\"]\nB --> C[\"模型绑定 FromRoute/FromQuery/FromBody\"]\nC --> D[\"模型验证 ModelState\"]\nD --> E[\"业务处理\"]\nE --> F[\"按语义返回状态码 + 响应体\"]",
-      "caption": "Web API 请求流程：按 HTTP 方法路由到 Action，模型绑定（FromRoute/Query/Body）和验证后处理业务，最后按语义返回状态码和响应体。",
-      "fallback": "请求带 HTTP 方法进来，路由匹配到 Controller/Action，模型绑定（FromRoute/FromQuery/FromBody）后做 ModelState 验证，处理业务，最后按语义返回状态码加响应体。"
+      "title": "Web API 设计链路：资源建模、状态码、错误模型、版本与兼容演进",
+      "content": "flowchart TD\nA[\"业务能力\"] --> B[\"资源和操作建模\"]\nB --> C[\"HTTP 方法和路由\"]\nC --> D[\"请求校验\nDTO/绑定/验证\"]\nD --> E[\"业务处理\"]\nE --> F{\"结果类型\"}\nF -->|成功| G[\"2xx + 资源表示/Location\"]\nF -->|客户端错误| H[\"4xx + ProblemDetails\"]\nF -->|服务错误| I[\"5xx + traceId\"]\nG --> J[\"版本、分页、过滤、缓存和限流\"]\nH --> J\nI --> J",
+      "caption": "Web API 设计链路：资源建模、状态码、错误模型、版本与兼容演进",
+      "fallback": "图展示 Web API 设计要从资源建模到状态码、错误模型、版本兼容、分页缓存和限流，而不是只套统一响应壳。",
+      "sources": [
+        {
+          "kind": "mermaid",
+          "content": "flowchart TD\nA[\"业务能力\"] --> B[\"资源和操作建模\"]\nB --> C[\"HTTP 方法和路由\"]\nC --> D[\"请求校验\nDTO/绑定/验证\"]\nD --> E[\"业务处理\"]\nE --> F{\"结果类型\"}\nF -->|成功| G[\"2xx + 资源表示/Location\"]\nF -->|客户端错误| H[\"4xx + ProblemDetails\"]\nF -->|服务错误| I[\"5xx + traceId\"]\nG --> J[\"版本、分页、过滤、缓存和限流\"]\nH --> J\nI --> J"
+        },
+        {
+          "kind": "text",
+          "content": "图展示 Web API 设计要从资源建模到状态码、错误模型、版本兼容、分页缓存和限流，而不是只套统一响应壳。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -51,7 +61,25 @@
       "type": "code",
       "title": "代码示例",
       "content": "using System;\nusing System.Collections.Generic;\nusing System.ComponentModel.DataAnnotations;\nusing System.Linq;\nusing Microsoft.AspNetCore.Mvc;\n\nnamespace WebApiDesignDemo\n{\n    // 请求模型\n    public class CreateProductRequest\n    {\n        [Required(ErrorMessage = \"产品名称不能为空\")]\n        [StringLength(100, MinimumLength = 2)]\n        public string Name { get; set; }\n\n        [StringLength(500)]\n        public string Description { get; set; }\n\n        [Required]\n        [Range(0.01, 100000)]\n        public decimal Price { get; set; }\n\n        [Required]\n        [Range(0, 10000)]\n        public int Stock { get; set; }\n\n        [Required]\n        [StringLength(50)]\n        public string Category { get; set; }\n    }\n\n    public class UpdateProductRequest\n    {\n        [StringLength(100, MinimumLength = 2)]\n        public string Name { get; set; }\n\n        [StringLength(500)]\n        public string Description { get; set; }\n\n        [Range(0.01, 100000)]\n        public decimal? Price { get; set; }\n\n        [Range(0, 10000)]\n        public int? Stock { get; set; }\n    }\n\n    // 响应模型\n    public class ProductResponse\n    {\n        public int Id { get; set; }\n        public string Name { get; set; }\n        public string Description { get; set; }\n        public decimal Price { get; set; }\n        public int Stock { get; set; }\n        public string Category { get; set; }\n        public DateTime CreatedAt { get; set; }\n        public DateTime? UpdatedAt { get; set; }\n    }\n\n    public class ApiResponse<T>\n    {\n        public int Code { get; set; }\n        public string Message { get; set; }\n        public T Data { get; set; }\n        public object Errors { get; set; }\n\n        public static ApiResponse<T> Success(T data, string message = \"成功\")\n        {\n            return new ApiResponse<T>\n            {\n                Code = 200,\n                Message = message,\n                Data = data\n            };\n        }\n\n        public static ApiResponse<T> Error(int code, string message, object errors = null)\n        {\n            return new ApiResponse<T>\n            {\n                Code = code,\n                Message = message,\n                Errors = errors\n            };\n        }\n    }\n\n    // 查询参数\n    public class ProductQueryParameters\n    {\n        public string Category { get; set; }\n        public decimal? MinPrice { get; set; }\n        public decimal? MaxPrice { get; set; }\n        public string Search { get; set; }\n        public string SortBy { get; set; } = \"Name\";\n        public bool Descending { get; set; }\n        public int Page { get; set; } = 1;\n        public int PageSize { get; set; } = 10;\n    }\n\n    // 控制器\n    [ApiController]\n    [Route(\"api/[controller]\")]\n    [Produces(\"application/json\")]\n    public class ProductsController : ControllerBase\n    {\n        private static readonly List<ProductResponse> Products = new();\n        private static int _nextId = 1;\n\n        /// <summary>\n        /// 获取产品列表\n        /// </summary>\n        [HttpGet]\n        [ProducesResponseType(typeof(ApiResponse<IEnumerable<ProductResponse>>), 200)]\n        public IActionResult GetAll([FromQuery] ProductQueryParameters query)\n        {\n            var filtered = Products.AsQueryable();\n\n            // 过滤\n            if (!string.IsNullOrEmpty(query.Category))\n                filtered = filtered.Where(p => p.Category == query.Category);\n\n            if (query.MinPrice.HasValue)\n                filtered = filtered.Where(p => p.Price >= query.MinPrice.Value);\n\n            if (query.MaxPrice.HasValue)\n                filtered = filtered.Where(p => p.Price <= query.MaxPrice.Value);\n\n            if (!string.IsNullOrEmpty(query.Search))\n                filtered = filtered.Where(p => p.Name.Contains(query.Search) ||\n                                               p.Description.Contains(query.Search));\n\n            // 排序\n            filtered = query.SortBy?.ToLower() switch\n            {\n                \"price\" => query.Descending\n                    ? filtered.OrderByDescending(p => p.Price)\n                    : filtered.OrderBy(p => p.Price),\n                \"name\" => query.Descending\n                    ? filtered.OrderByDescending(p => p.Name)\n                    : filtered.OrderBy(p => p.Name),\n                _ => filtered.OrderBy(p => p.Name)\n            };\n\n            // 分页\n            var paged = filtered\n                .Skip((query.Page - 1) * query.PageSize)\n                .Take(query.PageSize)\n                .ToList();\n\n            return Ok(ApiResponse<IEnumerable<ProductResponse>>.Success(paged));\n        }\n\n        /// <summary>\n        /// 获取特定产品\n        /// </summary>\n        [HttpGet(\"{id:int:min(1)}\")]\n        [ProducesResponseType(typeof(ApiResponse<ProductResponse>), 200)]\n        [ProducesResponseType(404)]\n        public IActionResult GetById([FromRoute] int id)\n        {\n            var product = Products.FirstOrDefault(p => p.Id == id);\n            if (product == null)\n            {\n                return NotFound(ApiResponse<ProductResponse>.Error(404, \"产品不存在\"));\n            }\n            return Ok(ApiResponse<ProductResponse>.Success(product));\n        }\n\n        /// <summary>\n        /// 创建产品\n        /// </summary>\n        [HttpPost]\n        [ProducesResponseType(typeof(ApiResponse<ProductResponse>), 201)]\n        [ProducesResponseType(400)]\n        public IActionResult Create([FromBody] CreateProductRequest request)\n        {\n            if (!ModelState.IsValid)\n            {\n                return BadRequest(ApiResponse<ProductResponse>.Error(400, \"验证失败\",\n                    ModelState.ToDictionary(\n                        kvp => kvp.Key,\n                        kvp => kvp.Value.Errors.Select(e => e.ErrorMessage))));\n            }\n\n            var product = new ProductResponse\n            {\n                Id = _nextId++,\n                Name = request.Name,\n                Description = request.Description,\n                Price = request.Price,\n                Stock = request.Stock,\n                Category = request.Category,\n                CreatedAt = DateTime.UtcNow\n            };\n\n            Products.Add(product);\n\n            return CreatedAtAction(\n                nameof(GetById),\n                new { id = product.Id },\n                ApiResponse<ProductResponse>.Success(product, \"创建成功\"));\n        }\n\n        /// <summary>\n        /// 更新产品\n        /// </summary>\n        [HttpPut(\"{id}\")]\n        [ProducesResponseType(typeof(ApiResponse<ProductResponse>), 200)]\n        [ProducesResponseType(404)]\n        public IActionResult Update([FromRoute] int id, [FromBody] UpdateProductRequest request)\n        {\n            var product = Products.FirstOrDefault(p => p.Id == id);\n            if (product == null)\n            {\n                return NotFound(ApiResponse<ProductResponse>.Error(404, \"产品不存在\"));\n            }\n\n            if (request.Name != null) product.Name = request.Name;\n            if (request.Description != null) product.Description = request.Description;\n            if (request.Price.HasValue) product.Price = request.Price.Value;\n            if (request.Stock.HasValue) product.Stock = request.Stock.Value;\n            product.UpdatedAt = DateTime.UtcNow;\n\n            return Ok(ApiResponse<ProductResponse>.Success(product, \"更新成功\"));\n        }\n\n        /// <summary>\n        /// 删除产品\n        /// </summary>\n        [HttpDelete(\"{id}\")]\n        [ProducesResponseType(204)]\n        [ProducesResponseType(404)]\n        public IActionResult Delete([FromRoute] int id)\n        {\n            var product = Products.FirstOrDefault(p => p.Id == id);\n            if (product == null)\n            {\n                return NotFound(ApiResponse<object>.Error(404, \"产品不存在\"));\n            }\n\n            Products.Remove(product);\n            return NoContent();\n        }\n    }\n\n    // 全局异常处理\n    public class GlobalExceptionHandler\n    {\n        public static IActionResult HandleException(Exception ex)\n        {\n            return new ObjectResult(ApiResponse<object>.Error(500, \"服务器内部错误\"))\n            {\n                StatusCode = 500\n            };\n        }\n    }\n}",
-      "language": "csharp"
+      "language": "csharp",
+      "highlights": [
+        {
+          "line": 10,
+          "note": "`public class CreateProductRequest` 定义了 Web API 设计 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+        },
+        {
+          "line": 41,
+          "note": "`public decimal? Price { get; set; }` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+        },
+        {
+          "line": 14,
+          "note": "`public string Name { get; set; }` 更新核心数据结构，是解释状态如何推进的抓手。"
+        },
+        {
+          "line": 107,
+          "note": "`private static readonly List<ProductResponse> Products = new();` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
@@ -72,7 +100,7 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "RESTful 设计原则和最佳实践",
+        "REST 资源建模、HTTP 状态码、ProblemDetails 和版本演进",
         "属性路由的配置和使用",
         "模型绑定的各种来源",
         "数据注解验证和 FluentValidation",
@@ -130,5 +158,5 @@
   },
   "interviewFrequency": "high",
   "interviewerFocus": "考察能否解释 REST 的资源与方法语义、幂等性及其重要性、状态码使用，并区分 PUT 与 PATCH、说清模型绑定验证。",
-  "updatedAt": "2026-06-12"
+  "updatedAt": "2026-06-18"
 }
