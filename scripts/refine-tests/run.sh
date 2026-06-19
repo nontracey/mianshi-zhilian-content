@@ -59,6 +59,17 @@ assert_contains_out() { # 输出含某日志
 echo "########## 0) 判官纯函数单测 ##########"
 if node scripts/refine-tests/judge_unit.mjs; then PASS=$((PASS+1)); echo "  ✓ PASS [judge-unit]"; else FAIL=$((FAIL+1)); echo "  ✗ FAIL [judge-unit]"; fi
 
+if grep -q "API 模式" scripts/quality_refine.mjs && grep -q "不再 spawn CLI" scripts/quality_refine.mjs; then
+  echo
+  echo "########## E2E 跳过 ##########"
+  echo "当前 quality_refine.mjs 是 API 模式，--cli mock_cli 已不再接管精修/判官调用；旧 e2e 会误连真实 API，已跳过。"
+  echo "后续需要补 OpenAI-compatible mock server 后再恢复 Phase 0/1/2/3 端到端测试。"
+  echo
+  echo "########## 结果：PASS=$PASS  FAIL=$FAIL  SKIP=e2e-api-mode ##########"
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+
 echo "########## 1) Phase 0/1：静态 keep-best + 锁字段（--no-judge）##########"
 echo "[1.1] inject（改烂）→ 保留旧版"
 ensure_clean; out="$(run_static inject)"; assert_contains_out "$out" "保留旧版"; assert_no_diff "inject→keep"

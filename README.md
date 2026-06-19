@@ -43,9 +43,9 @@ npm run hooks:install  # 每个本地 clone 需要安装一次 Git hooks
 npm run quality:refine:interactive
 ```
 
-交互器支持选择同步阶段、运行模式、领域、topic、CLI agent 和模型降级链。测试预览模式只精修单篇并在终端渲染结果；正式模式会把选中的 topic 逐篇发给外部 CLI/LLM 精修，成功后按阶段同步到 `staging/`、`draft/`。
+交互器支持选择同步阶段、运行模式、领域、topic、API 模型链和判官模型链。测试预览模式只精修单篇并在终端渲染结果；正式模式会把选中的 topic 逐篇发给 LLM 精修，成功后按阶段同步到 `staging/`、`draft/`。
 
-注意：一个 CLI 调用只处理一个 topic。选择领域或多个 topic 只是建立队列，不会把整个领域塞进同一个 prompt。静态 `90` 分只是验收兜底，不会阻止已达标 topic 进入第一轮 LLM 精修。
+注意：一次精修请求只处理一个 topic。选择领域或多个 topic 只是建立队列，不会把整个领域塞进同一个 prompt。CI 静态 `90` 分只是最低门禁；正式精修按 production-strict 目标看齐静态/动态 `95+`，并通过判官和 keep-best 防止内容或图解退化。
 
 详细说明见 [docs/quality-refine.md](docs/quality-refine.md)。
 

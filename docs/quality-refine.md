@@ -3,6 +3,8 @@
 精修器用于替代过去的 CI LLM 评分报告流程。CI 现在只跑确定性校验：`npm run validate`、`npm run quality:scan`、`npm run quality:audit`。LLM 质量检查和内容重写由维护者在本机按需运行精修器完成。
 
 > **v3 重大变更**（2026-06-17）：CLI 调度路径全部删除，统一走 OpenAI 兼容 API；流式 SSE + token 实时显示；额度耗尽全局暂停闸（手动 / 自动探活 / 跳过三种策略）；模型清单 `scripts/llm/env-config.mjs` 硬编码 13 个 spec；所有默认值都在 `.env`，交互向导一路回车即可开跑。9 维度评分、反刷分、keep-best、块合并、空转看门狗、确定性门禁全部保留。
+>
+> **v3.1 标准同步**（2026-06-19）：统一标准版本为 `knowledge-content-standard-v1.1`。判官新增 `diagramModalityFinding`，专门评估 SVG / Mermaid / compareTable / code/text / none 哪种图解形态更适合 topic；不是每篇都必须配图，已有承载真实机制的 SVG 不得被弱化成 Mermaid，新增 SVG 必须有 mermaid/text 兜底且资源真实存在。正式发布精修目标按 production-strict 口径看齐静态/动态 `95+`，仓库 CI 的 `90` 仍只是最低门禁。
 
 ## 推荐入口
 
@@ -59,8 +61,10 @@ node scripts/llm/seed-env.mjs --upgrade-defaults  # 把 .env 里的旧默认值�
 - 启用判官时，第一轮先对 scope 内 topic 做判前评审，按 `contentHash` 缓存。
 - 静态分数是地板，判官分数是语义天花板。两者都达标且所有维度均不低于 4 才直接跳过改写。
 - 内容深度对标真实职级：技术域写到 **P7/P7+（资深/专家）** 的纵深。判官的 `seniorityDiscrimination`（区分度天花板）维度专门把关：difficulty≥3 缺"为什么这样设计 / 如何排查 / 取舍 / 极端场景"会被压分；rubric 内嵌代码、纯线性关键词链假图直接判 fail。
+- 图解形态是独立门禁：不是每个 topic 都必须有 SVG、Mermaid 或其他 diagram；SVG 不是天然高级，Mermaid 不是天然降级。算法/空间状态/多步骤机制确实需要图解时优先 SVG；协议交互优先 sequenceDiagram；状态机优先 stateDiagram；架构边界优先 flowchart/graph+subgraph；概念对比优先 compareTable。判官必须输出 `diagramModalityFinding`，落盘前也会阻断 SVG-only 无兜底、新增 SVG 资源不存在、已有机制型 SVG 被删除且信息量退化等问题。
+- 文本模型不能假装看见图片。判官只能评估图源码和图文语义；重叠、裁切、显示不全、文字过密等视觉问题需要渲染 QA 或视觉模型。没有视觉报告时，判官应把 `visualFit` 标为 `not_checked`。
 - 候选会先跑 invariant、静态审计和判后评审，再用回归向量决定整篇接受、保留旧版，或只合并变好的块。
-- **CI 静态门禁不变**：`scripts/content_quality_audit.mjs` / `quality_scan.mjs` / `quality_gate_staged.mjs` 全部不动。精修器以确定性审计为唯一验收线。
+- **CI 仍只跑确定性门禁**：阈值仍是 `90`，不会调用 LLM 判官；但 `scripts/content_quality_audit.mjs` 已纳入图解兜底、SVG 资源和空间/状态型假图的部分静态检查。精修器以确定性审计为最低验收线，以动态判官补足事实、深度和图解形态判断。
 - 按 `Ctrl-C` 中断当前精修；再次按强制退出。
 
 ## 子 agent 行（固定栏，summary + TTY 模式）
@@ -99,7 +103,7 @@ DEFAULT_SCOPE=failing
 DEFAULT_LIMIT=20
 DEFAULT_MAX_ROUNDS=3
 DEFAULT_CONCURRENCY=4
-DEFAULT_MIN_SCORE=90
+DEFAULT_MIN_SCORE=95
 DEFAULT_USE_JUDGE=true
 DEFAULT_JUDGE_COUNT=1
 DEFAULT_TEST_RUN=false
@@ -110,7 +114,7 @@ DEFAULT_TEST_RUN=false
 仅审计：
 
 ```bash
-npm run quality:refine -- --audit-only --scope domain:go --min-score 90
+npm run quality:refine -- --audit-only --scope domain:go --min-score 95
 ```
 
 正式精修一个领域，模型链全 .env 默认：
@@ -123,10 +127,10 @@ npm run quality:refine -- \
   --retries 1 \
   --timeout-ms 600000 \
   --judge-count 1 \
-  --dynamic-skip-min 85 \
+  --dynamic-skip-min 95 \
   --judge-batch-size 5 \
   --judge-warm-concurrency 3 \
-  --min-score 90
+  --min-score 95
 ```
 
 正式精修多个指定 topic：
@@ -137,7 +141,7 @@ npm run quality:refine -- \
   --topics topics/go/context.json,topics/go/interface.json \
   --concurrency 1 \
   --max-rounds 3 \
-  --min-score 90
+  --min-score 95
 ```
 
 直接使用 `quality:refine` 只负责改 `topics/`。需要同步测试或草稿环境时，手动运行：
@@ -189,4 +193,3 @@ npm run quality:audit
 ```
 
 本地 pre-commit hook 也是快速确定性门禁。真正的语义质量、事实正确性、专家口吻和面试可用性，改由维护者人工触发精修器来把关。
-

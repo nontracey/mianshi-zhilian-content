@@ -1,9 +1,20 @@
 // 内容精修"动态判官"的共享纯函数：9 维评审 prompt、输出解析、多判官聚合、通过/接受判据。
 // 与确定性静态审计互补——静态当地板 + 抓跨 topic 套话，判官当语义/事实/可教会的真天花板。
 // 这里只放纯逻辑（无 IO、无 CLI spawn），便于单测与复用；CLI 调度复用 quality_refine.mjs 的 runProcess。
+import {
+  CONTENT_STANDARD_VERSION,
+  DIMENSION_FLOOR,
+  DIAGRAM_FORMATS,
+  DIAGRAM_MODALITY_FINDING_EXAMPLE,
+  DIAGRAM_VISUAL_FITS,
+  JUDGE_DIMENSIONS,
+  diagramPolicyPrompt,
+} from "./quality_standard.mjs";
 
-export const JUDGE_RUBRIC_VERSION = "judge-9dim-v1";
-export const BLOCK_JUDGE_RUBRIC_VERSION = "block-judge-v1";
+export { DIMENSION_FLOOR, JUDGE_DIMENSIONS } from "./quality_standard.mjs";
+
+export const JUDGE_RUBRIC_VERSION = `judge-9dim-v2-diagram-modality-${CONTENT_STANDARD_VERSION}`;
+export const BLOCK_JUDGE_RUBRIC_VERSION = `block-judge-v2-diagram-modality-${CONTENT_STANDARD_VERSION}`;
 
 // 字符串值内禁止未转义 ASCII 双引号——国产模型在 evidence/reason 字段里直接写
 // `"goodToHave"` 之类引号会让 JSON 提前闭合，整批判官输出全废。
@@ -18,20 +29,6 @@ export const JSON_STRING_RULES = `
 3. 如果你不确定某个字符是否需要转义，宁可改写措辞，也不要让 JSON.parse 失败。
 4. 整体输出必须能被 JSON.parse 成功解析，不要包 Markdown 代码围栏，不要在 JSON 外加任何解释。`;
 
-// 9 维（原 6 维对应标准 §8.4 + learnerClarity/coverage 两个正交补洞 + seniorityDiscrimination 区分度天花板）。1-5 整数，<4 视为该维不达标。
-export const JUDGE_DIMENSIONS = [
-  "accuracy", // 事实/版本/复杂度/协议行为/框架机制正确；图、表、代码也按事实核验
-  "cognitiveOrder", // 动机->定义->机制->例子->边界/失败->对比/取舍->面试表达
-  "expertVoice", // 有机制/条件/指标/失败模式/工程边界与取舍，不是模板腔/百科腔
-  "selfContained", // 正文足以回答自己的 recallPrompts 和 rubric.mustHave
-  "interviewUsability", // 可形成 30 秒结论 + 机制主线 + 追问边界
-  "difficultyFit", // 内容深度与 difficulty 标注一致
-  "learnerClarity", // 零基础读者能否真看懂：句子清晰、术语先解释、认知负荷不过载
-  "coverage", // 面试关键面是否讲全（按知识点该考什么评，不许拿本篇 rubric 当标尺）
-  "seniorityDiscrimination", // 区分度天花板：技术类对标 P7/P7+——difficulty≥3 须能区分资深、4-5 须到专家深度；非技术类对应专家纵深；difficulty 1-2 基础题诚实标注即可
-];
-
-export const DIMENSION_FLOOR = 4; // 任一维 <4 视为不达标
 const FACT_PROBLEM_VERDICTS = new Set(["wrong", "outdated"]);
 
 // 构造单篇判官 prompt：只输出一个 review JSON 对象。
@@ -52,6 +49,7 @@ export function buildJudgePrompt(topic, ref) {
     coverageFindings: [{ missingPoint: "面试会考但本篇没讲到的关键面", why: "为什么面试需要它" }],
     followUpFindings: [{ question: "原追问文案", isSpecific: true, answerAdequate: true, fix: "若不够，应如何尖锐化/补全答案" }],
     blockingFindings: [{ reason: "导致 fail 的硬问题（事实错/outdated 等）" }],
+    diagramModalityFinding: DIAGRAM_MODALITY_FINDING_EXAMPLE,
     notes: "",
   };
   return `你是独立的内容质量评审 agent，面向“零基础用户靠这一篇就能学会并拿去面试”的目标做审查。不要复用写作立场，只按事实和真实学习体验打分。
@@ -77,7 +75,10 @@ export function buildJudgePrompt(topic, ref) {
 - rubric.mustHave/goodToHave/commonMistakes 内嵌代码片段（throw new ...()、function、=>、带分号语句、缩进代码块）→ 判 fail 并进 blockingFindings；代码只该在 code 卡。
 - diagram 是纯线性关键词链（无分支/汇合/状态转移）或终点为“面试结论/答题要点/总结”类汇聚节点 → 判为假图，压低 expertVoice 并在 voiceFindings 标记要求重画。
 - diagram 使用 sources 时，要检查降级链是否合理（svg 资源 → mermaid 结构图 → text 兜底）；必须至少有一层 mermaid 或 text 兜底，不能只有 svg path 而无后续层。
+- 必须填写 diagramModalityFinding，但这不是要求每篇必须有图：判断当前 topic 应使用 svg / mermaid / compareTable / code / text / none 中哪一种；如果不需要图，recommendedFormat 填 none 或 text/code/compareTable 并说明理由。如果已有图型不适配、SVG 只是装饰、Mermaid 弱化了真实结构、或视觉未核验，请写清 reason/requiredFix。没有视觉报告时 visualFit 填 not_checked，不要假装看见图片。
 - 不要臆造；无法核验的事实标 suspicious 并在 evidence 说明原因。
+
+${diagramPolicyPrompt()}
 
 输出 JSON schema（仅示意字段，值要按真实评审填）：
 ${JSON.stringify(schema, null, 2)}
@@ -106,6 +107,7 @@ export function buildJudgeBatchPrompt(items) {
       coverageFindings: [],
       followUpFindings: [],
       blockingFindings: [],
+      diagramModalityFinding: DIAGRAM_MODALITY_FINDING_EXAMPLE,
       notes: "",
     })),
   };
@@ -124,6 +126,9 @@ ${JUDGE_DIMENSIONS.map((d, index) => `${index + 1}. ${d}`).join("\n")}
 - coverage 必须按“这个 title / difficulty 的知识点，资深面试官真正会考什么”判断，严禁拿本篇自己的 rubric/recallPrompts 当唯一标尺。
 - seniorityDiscrimination 区分度天花板：技术类 difficulty≥3 必须能区分资深（对标 P7）、4-5 须到专家深度（P7+），非技术类按对应专家纵深；只考“是什么/列举”、缺“为什么这样设计/如何排查/取舍/极端场景”深问的给 ≤3；difficulty 1-2 基础题诚实标注即给 4。
 - rubric.mustHave/goodToHave/commonMistakes 内嵌代码片段 → fail；diagram 是纯线性关键词链或终点为”面试结论/答题要点”类汇聚节点 → 判假图、压低 expertVoice；sources 降级链（svg→mermaid→text）缺兜底或层级不合理也要指出。
+- 每篇都必须填写 diagramModalityFinding，但这不是要求每篇必须有图；可推荐 none / text / code / compareTable。SVG 不是天然更好，Mermaid 也不是天然降级。没有视觉报告时 visualFit 填 not_checked。
+
+${diagramPolicyPrompt()}
 
 输出 JSON schema（仅示意字段，值要按真实评审填）：
 ${JSON.stringify(schema, null, 2)}
@@ -158,6 +163,9 @@ export function buildBlockJudgePrompt({ ref, title, blocks }) {
 - 每个输入 block 都必须返回一个同 key 的 blockReview。
 - 如果发现事实错或候选追问答案不充分，优先判 blocking 或 regressed。
 - 不要因为候选更长就判 improved；必须看有效信息和面试可用性。
+- diagram / animation 块要额外比较图解形态：候选把承载真实机制的 SVG 换成更弱的 Mermaid、删除 SVG 且丢失空间/状态/数据结构信息、删除 mermaid/text 兜底、或把真实数据结构/空间关系弱化成流程节点链时，判 regressed 或 blocking；装饰性/错误 SVG 可以移除，但候选必须用更清楚的文字、表格、Mermaid 或重画图替代。候选新增 SVG 但只是装饰、没有比 Mermaid/compareTable 多表达信息，也不能判 improved。
+
+${diagramPolicyPrompt()}
 
 输出 JSON schema：
 ${JSON.stringify(schema, null, 2)}
@@ -173,6 +181,29 @@ ${JSON_STRING_RULES}
 function toInt(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : 0;
+}
+
+function normalizeDiagramFormat(value) {
+  const format = String(value ?? "").trim();
+  return DIAGRAM_FORMATS.includes(format) ? format : "none";
+}
+
+function normalizeVisualFit(value) {
+  const fit = String(value ?? "").trim();
+  return DIAGRAM_VISUAL_FITS.includes(fit) ? fit : "not_checked";
+}
+
+function normalizeDiagramModalityFinding(raw) {
+  const item = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  return {
+    currentBestFormat: normalizeDiagramFormat(item.currentBestFormat),
+    recommendedFormat: normalizeDiagramFormat(item.recommendedFormat),
+    isCurrentFormatFit: item.isCurrentFormatFit === false ? false : true,
+    isCandidateDowngrade: item.isCandidateDowngrade === true,
+    visualFit: normalizeVisualFit(item.visualFit),
+    reason: typeof item.reason === "string" ? item.reason : "",
+    requiredFix: typeof item.requiredFix === "string" ? item.requiredFix : "",
+  };
 }
 
 // 把单个判官原始输出规整成统一结构。verdict 只有显式 "pass" 才算 pass。
@@ -191,6 +222,7 @@ export function normalizeJudgeReview(parsed) {
     coverageFindings: arr(parsed?.coverageFindings),
     followUpFindings: arr(parsed?.followUpFindings),
     blockingFindings: arr(parsed?.blockingFindings),
+    diagramModalityFinding: normalizeDiagramModalityFinding(parsed?.diagramModalityFinding),
     notes: typeof parsed?.notes === "string" ? parsed.notes : "",
   };
 }
@@ -229,6 +261,23 @@ function median(values) {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+export function diagramModalityProblemCount(review) {
+  const finding = review?.diagramModalityFinding;
+  if (!finding) return 0;
+  let count = 0;
+  if (finding.isCurrentFormatFit === false) count += 1;
+  if (finding.isCandidateDowngrade === true) count += 1;
+  if (finding.visualFit === "fail") count += 1;
+  return count;
+}
+
+function pickDiagramModalityFinding(reviews) {
+  const findings = reviews.map((review) => review.diagramModalityFinding).filter(Boolean);
+  if (!findings.length) return normalizeDiagramModalityFinding(null);
+  const blocking = findings.find((finding) => diagramModalityProblemCount({ diagramModalityFinding: finding }) > 0);
+  return blocking ?? findings[0];
+}
+
 // 多判官聚合：分数/维度取中位数（抗单个判官抽风）；事实问题取并集（任一判官报错就保留）。
 export function aggregateReviews(reviews) {
   if (!reviews.length) return null;
@@ -252,6 +301,7 @@ export function aggregateReviews(reviews) {
     coverageFindings: reviews.flatMap((r) => r.coverageFindings),
     followUpFindings: reviews.flatMap((r) => r.followUpFindings),
     blockingFindings,
+    diagramModalityFinding: pickDiagramModalityFinding(reviews),
     notes: reviews.map((r) => r.notes).filter(Boolean).join(" | "),
     judgeCount: reviews.length,
   };
@@ -270,6 +320,7 @@ export function judgePasses(review, dynamicSkipMin) {
   if (!review) return false;
   if (review.score < dynamicSkipMin) return false;
   if (factProblemCount(review) > 0) return false;
+  if (diagramModalityProblemCount(review) > 0) return false;
   return JUDGE_DIMENSIONS.every((d) => toInt(review.dimensions?.[d]) >= DIMENSION_FLOOR);
 }
 
@@ -284,6 +335,9 @@ export function acceptByJudge({ before, after, staticBefore, staticAfter, minSta
   if (factProblemCount(after) > factProblemCount(before)) {
     return { accept: false, reason: `引入了新的事实问题（${factProblemCount(before)} -> ${factProblemCount(after)}）` };
   }
+  if (diagramModalityProblemCount(after) > diagramModalityProblemCount(before)) {
+    return { accept: false, reason: `引入了新的图解形态/视觉问题（${diagramModalityProblemCount(before)} -> ${diagramModalityProblemCount(after)}）` };
+  }
   for (const d of JUDGE_DIMENSIONS) {
     const b = toInt(before?.dimensions?.[d]);
     const a = toInt(after?.dimensions?.[d]);
@@ -292,12 +346,14 @@ export function acceptByJudge({ before, after, staticBefore, staticAfter, minSta
   const dimUp = JUDGE_DIMENSIONS.some((d) => toInt(after?.dimensions?.[d]) > toInt(before?.dimensions?.[d]));
   const scoreUp = toInt(after?.score) > toInt(before?.score);
   const factDown = factProblemCount(after) < factProblemCount(before);
+  const diagramDown = diagramModalityProblemCount(after) < diagramModalityProblemCount(before);
   const staticUp = staticAfter > staticBefore;
   if (dimUp) reasons.push("维度↑");
   if (scoreUp) reasons.push("动态分↑");
   if (factDown) reasons.push("事实问题↓");
+  if (diagramDown) reasons.push("图解问题↓");
   if (staticUp) reasons.push("静态分↑");
-  if (!(dimUp || scoreUp || factDown || staticUp)) {
+  if (!(dimUp || scoreUp || factDown || diagramDown || staticUp)) {
     return { accept: false, reason: "无任何改善（维度/动态分/事实/静态分都没变好）" };
   }
   return { accept: true, reason: reasons.join("+") };
@@ -323,6 +379,14 @@ export function findingsToPromptLines(review) {
   for (const f of review.selfContainedFindings ?? []) lines.push(`【自包含】${f.where ?? ""}：${f.issue ?? ""}${f.fix ? `（${f.fix}）` : ""}`);
   for (const f of review.clarityFindings ?? []) lines.push(`【可读性】${f.where ?? ""}：${f.issue ?? ""}${f.fix ? `（${f.fix}）` : ""}`);
   for (const f of review.coverageFindings ?? []) lines.push(`【覆盖缺口】${f.missingPoint ?? ""}${f.why ? `（${f.why}）` : ""}`);
+  const diagramFinding = review.diagramModalityFinding;
+  if (diagramModalityProblemCount(review) > 0 || diagramFinding?.requiredFix) {
+    lines.push(
+      `【图解形态】当前=${diagramFinding?.currentBestFormat ?? "none"}，建议=${diagramFinding?.recommendedFormat ?? "none"}，` +
+        `适配=${diagramFinding?.isCurrentFormatFit !== false ? "是" : "否"}，视觉=${diagramFinding?.visualFit ?? "not_checked"}；` +
+        `${diagramFinding?.reason ?? ""}${diagramFinding?.requiredFix ? ` 修法：${diagramFinding.requiredFix}` : ""}`,
+    );
+  }
   return lines;
 }
 
@@ -372,6 +436,31 @@ function _jDimensionsSchema() {
   };
 }
 
+function _jDiagramModalitySchema() {
+  return {
+    type: "object",
+    properties: {
+      currentBestFormat: { type: "string", enum: DIAGRAM_FORMATS },
+      recommendedFormat: { type: "string", enum: DIAGRAM_FORMATS },
+      isCurrentFormatFit: { type: "boolean" },
+      isCandidateDowngrade: { type: "boolean" },
+      visualFit: { type: "string", enum: DIAGRAM_VISUAL_FITS },
+      reason: _jProp("string", "图解形态是否适合 topic 的理由"),
+      requiredFix: _jProp("string", "如果不适合，应如何修"),
+    },
+    required: [
+      "currentBestFormat",
+      "recommendedFormat",
+      "isCurrentFormatFit",
+      "isCandidateDowngrade",
+      "visualFit",
+      "reason",
+      "requiredFix",
+    ],
+    additionalProperties: false,
+  };
+}
+
 // 单篇评审 schema。顶层钉全键 + additionalProperties:false。
 // 这是新版本（API 模式）替换旧的 QWEN_JUDGE_SCHEMA。
 export const JUDGE_REVIEW_SCHEMA = (() => {
@@ -400,6 +489,7 @@ export const JUDGE_REVIEW_SCHEMA = (() => {
       coverageFindings: _jHeterogeneousArr([coverageEx]),
       followUpFindings: _jHeterogeneousArr([followUpEx]),
       blockingFindings: _jHeterogeneousArr([blockingEx]),
+      diagramModalityFinding: _jDiagramModalitySchema(),
       notes: _jProp("string", "评审附加说明"),
     },
     required: [
@@ -416,6 +506,7 @@ export const JUDGE_REVIEW_SCHEMA = (() => {
       "coverageFindings",
       "followUpFindings",
       "blockingFindings",
+      "diagramModalityFinding",
       "notes",
     ],
     additionalProperties: false,
@@ -445,6 +536,7 @@ export const QWEN_JUDGE_BATCH_SCHEMA = (() => {
             coverageFindings: _jHeterogeneousArr([{ missingPoint: "缺失面", why: "原因" }]),
             followUpFindings: _jHeterogeneousArr([{ question: "追问", isSpecific: true, answerAdequate: true, fix: "修法" }]),
             blockingFindings: _jHeterogeneousArr([{ reason: "阻断原因" }]),
+            diagramModalityFinding: _jDiagramModalitySchema(),
             notes: _jProp("string", "评审说明"),
           },
           required: [
@@ -461,6 +553,7 @@ export const QWEN_JUDGE_BATCH_SCHEMA = (() => {
             "coverageFindings",
             "followUpFindings",
             "blockingFindings",
+            "diagramModalityFinding",
             "notes",
           ],
           additionalProperties: false,

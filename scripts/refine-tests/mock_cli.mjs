@@ -29,6 +29,15 @@ const prompt = argv.find((arg) => typeof arg === "string" && (arg.includes("【�
 
 function reviewForText(text) {
   const allFive = { accuracy: 5, cognitiveOrder: 5, expertVoice: 5, selfContained: 5, interviewUsability: 5, difficultyFit: 5, learnerClarity: 5, coverage: 5, seniorityDiscrimination: 5 };
+  const diagramModalityFinding = {
+    currentBestFormat: "mermaid",
+    recommendedFormat: "mermaid",
+    isCurrentFormatFit: true,
+    isCandidateDowngrade: false,
+    visualFit: "not_checked",
+    reason: "mock judge uses a neutral diagram finding",
+    requiredFix: "",
+  };
   if (text.includes(FACTBUG_SENTENCE)) {
     return {
       verdict: "fail",
@@ -36,6 +45,7 @@ function reviewForText(text) {
       dimensions: { ...allFive, accuracy: 2 },
       factFindings: [{ claim: FACTBUG_SENTENCE, verdict: "wrong", evidence: "与实际机制相反" }],
       blockingFindings: [{ reason: "存在与事实相反的断言" }],
+      diagramModalityFinding,
       notes: "mock judge: factbug",
     };
   }
@@ -47,6 +57,7 @@ function reviewForText(text) {
       factFindings: [{ claim: "示例机制", verdict: "correct", evidence: "ok" }],
       blockingFindings: [],
       followUpFindings: [{ question: "示例追问", isSpecific: false, answerAdequate: true, fix: "改成本题专属" }],
+      diagramModalityFinding,
       notes: "mock judge: degraded",
     };
   }
@@ -60,6 +71,7 @@ function reviewForText(text) {
       { claim: "边界", verdict: "correct", evidence: "ok" },
     ],
     blockingFindings: [],
+    diagramModalityFinding,
     notes: "mock judge: clean",
   };
 }

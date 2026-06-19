@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -410,6 +411,18 @@ function diagramHumanSignals(card, topic) {
   };
 }
 
+function isStrongDiagramCard(card, topic) {
+  if (diagramHumanSignals(card, topic).isStrong) return true;
+  if (!cardHasSvg(card) || !cardHasMermaidOrTextFallback(card)) return false;
+  const fallbackText = `${card.fallback ?? ""} ${card.caption ?? ""} ${(Array.isArray(card.sources) ? card.sources : [])
+    .filter((source) => source?.kind === "text")
+    .map((source) => source.content ?? "")
+    .join(" ")}`;
+  const tokens = primaryRelevanceTokens(topic);
+  const matched = matchedTokens(fallbackText, tokens);
+  return textLength(fallbackText) >= 24 && matched.length >= Math.min(2, Math.max(1, tokens.length));
+}
+
 function isGoodCompareCard(card) {
   if (Array.isArray(card.columns) && card.columns.length >= 3 && Array.isArray(card.rows) && card.rows.length >= 3) {
     return true;
@@ -581,6 +594,57 @@ function cardMermaidContent(card) {
     .find((item) => item?.kind === "mermaid" && typeof item.content === "string" && item.content.trim());
   if (source) return source.content;
   return card.content ?? "";
+}
+
+function isSvgAssetPath(value) {
+  return typeof value === "string" && /\.svg(?:[?#].*)?$/i.test(value.trim());
+}
+
+function cardSvgPaths(card) {
+  const paths = [];
+  for (const value of [card.svgPath, card.asset]) {
+    if (isSvgAssetPath(value)) paths.push(value.trim());
+  }
+  for (const source of Array.isArray(card.sources) ? card.sources : []) {
+    if (source?.kind === "svg" && isSvgAssetPath(source.path)) paths.push(source.path.trim());
+  }
+  return paths;
+}
+
+function cardHasSvg(card) {
+  if (card.format === "svg" || typeof card.svg === "string") return true;
+  return cardSvgPaths(card).length > 0 || (Array.isArray(card.sources) && card.sources.some((source) => source?.kind === "svg"));
+}
+
+function cardHasMermaidOrTextFallback(card) {
+  if (typeof card.fallback === "string" && textLength(card.fallback) >= 12) return true;
+  if (typeof card.caption === "string" && textLength(card.caption) >= 12) return true;
+  return (Array.isArray(card.sources) ? card.sources : []).some(
+    (source) =>
+      (source?.kind === "mermaid" || source?.kind === "text") &&
+      typeof source.content === "string" &&
+      textLength(source.content) >= 12,
+  );
+}
+
+function cardHasTextualFallback(card) {
+  if (typeof card.fallback === "string" && textLength(card.fallback) >= 12) return true;
+  if (typeof card.caption === "string" && textLength(card.caption) >= 12) return true;
+  return (Array.isArray(card.sources) ? card.sources : []).some(
+    (source) => source?.kind === "text" && typeof source.content === "string" && textLength(source.content) >= 12,
+  );
+}
+
+function validAssetPath(value) {
+  return typeof value === "string" && value.startsWith("assets/") && !value.includes("..") && !path.isAbsolute(value);
+}
+
+function spatialDiagramExpected(topic) {
+  const text = `${topic.domain} ${topic.category} ${topic.title} ${(topic.tags ?? []).join(" ")} ${topic.summary ?? ""}`;
+  return (
+    topic.domain === "algorithm" ||
+    /动态规划|DP|数组|矩阵|网格|双指针|滑动窗口|链表|指针|二叉树|树|图遍历|BFS|DFS|堆|队列|栈|回溯|递归|前缀和|拓扑|并查集|窗口|状态表|状态转移/i.test(text)
+  );
 }
 
 function topicProseFields(topic, { includeMeta = true } = {}) {
@@ -1111,7 +1175,26 @@ function scoreTopic(topic, ref, corpus) {
   }
 
   for (const card of diagramCards) {
-    if (!card.fallback && !card.caption) deduct(3, `图示缺少 fallback/caption：${card.title}`);
+    if (!cardHasTextualFallback(card)) deduct(3, `图示缺少 fallback/caption/text 兜底：${card.title}`);
+    const hasSvg = cardHasSvg(card);
+    const sources = Array.isArray(card.sources) ? card.sources : [];
+    if (sources.some((source) => source?.kind === "svg") && !sources.some((source) => source?.kind === "mermaid" || source?.kind === "text")) {
+      deduct(5, `SVG sources 缺少 mermaid/text 降级兜底：${card.title}`);
+      capScore(94, "SVG 图解没有结构/文本兜底，渲染失败后用户无法理解");
+    }
+    if (hasSvg && !cardHasMermaidOrTextFallback(card)) {
+      deduct(4, `SVG 图解缺少可读 fallback/caption/mermaid/text 兜底：${card.title}`);
+      capScore(94, "SVG 图解缺少可读兜底，不能稳定达到 95+");
+    }
+    for (const svgPath of cardSvgPaths(card)) {
+      if (!validAssetPath(svgPath)) {
+        deduct(6, `SVG 路径越界或不在 assets/：${card.title}`);
+        capScore(89, "SVG 资源路径非法");
+      } else if (!existsSync(path.join(root, svgPath))) {
+        deduct(6, `SVG 资源不存在：${svgPath}`);
+        capScore(89, "SVG 资源引用不存在，发布态图解不可用");
+      }
+    }
     if ((card.title ?? "").endsWith("流程图") && /的关键环节/.test(card.caption ?? "")) {
       deduct(4, `图示标题或图注模板化：${card.title}`);
     }
@@ -1185,6 +1268,18 @@ function scoreTopic(topic, ref, corpus) {
         !/\|[^|]+\|/.test(card.content ?? "")
       ) {
         deduct(3, `高阶题图是无分支、无边标签的线性链，疑似关键词直链，建议补失败路径/分支或在连线上标注机制：${card.title}`);
+      }
+      if (
+        mermaid &&
+        spatialDiagramExpected(topic) &&
+        !hasSvg &&
+        (mermaid.type === "flowchart" || mermaid.type === "graph") &&
+        mermaid.nodeCount >= 4 &&
+        !hasMermaidBranch(mermaidContent) &&
+        !/\|[^|]+\|/.test(card.content ?? "")
+      ) {
+        deduct(5, `空间/状态型 topic 仅用普通 Mermaid 流程链，难以表达真实数据结构或状态变化：${card.title}`);
+        capScore(94, "空间/状态型图解缺少 SVG 或状态/数据结构表达，不能稳定达到 95+");
       }
       if (
         generatedDiagramTitlePattern.test(card.title ?? "") &&
@@ -1375,7 +1470,7 @@ function scoreTopic(topic, ref, corpus) {
   if (highWeight) deduct(3, "高频 topic 权重低于 85");
   if (lowWeight) deduct(3, "低频 topic 权重高于 75");
 
-  const strongDiagramCount = diagramCards.filter((card) => card.type === "diagram" && diagramHumanSignals(card, topic).isStrong).length;
+  const strongDiagramCount = diagramCards.filter((card) => card.type === "diagram" && isStrongDiagramCard(card, topic)).length;
   const goodCompareCount = compareCards.filter(isGoodCompareCard).length;
   const rubricItems = ["mustHave", "goodToHave", "commonMistakes"].flatMap((key) => rubric[key] ?? []);
   const specificRubricItems = rubricItems.filter((item) => {
@@ -1496,7 +1591,7 @@ function scoreTopic(topic, ref, corpus) {
   const hasSpecificChecklist = checklistCards.some((card) => (card.items ?? []).filter((item) => textLength(item) >= 10).length >= 3);
   const hasStrongDiagram = strongDiagramCount > 0;
   const hasGoodCompare = goodCompareCount > 0;
-  const allDiagramsReadable = diagramCards.every((card) => card.fallback || card.caption);
+  const allDiagramsReadable = diagramCards.every((card) => cardHasTextualFallback(card));
   const interviewHasStructure = interviewCards.some((card) => /结论|先|核心|最后|边界|补充/.test(card.content ?? ""));
   const interviewHasDepth = interviewChars >= (topic.difficulty >= 4 ? 320 : topic.difficulty >= 3 ? 250 : 180);
   const followUpDepthCount = interviewCards.reduce(

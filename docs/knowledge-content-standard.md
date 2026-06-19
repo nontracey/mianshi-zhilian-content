@@ -1,7 +1,7 @@
 # 面试知识内容判断标准
 
-> 版本：v1.0  
-> 日期：2026-05-29  
+> 版本：v1.1
+> 日期：2026-06-19
 > 用途：作为以后新增、修改、审查面试智练内容的持续性判断标准。任何通过 AI 生成的内容改动点，在执行前都必须先仔细阅读并遵守本标准。
 
 ## 1. 强制前置要求
@@ -297,6 +297,19 @@ AI 或人工审查内容时，不能只看单个 topic 是否写得完整，还�
 | 概念/对比/分类（设计模式对比、数据结构选型） | `compareTable` | 对比表足够，不要强行画图 |
 | 基础题（difficulty 1-2） | 保持简洁 | 已有简单 flowchart 或对比表保留即可 |
 
+**图解形态适配标准**：
+
+1. SVG、Mermaid、compareTable 都不是天然高级或低级，判断依据只有一个：它是否比其他形态更低成本地讲清当前 topic 的真实机制。
+2. 不是每个 topic 都必须有 SVG、Mermaid 或其他 diagram。文字、代码卡、compareTable 已经更清楚时，不要为了“有图”新增图解；判官的推荐形态可以是 `code`、`compareTable`、`text` 或 `none`。
+3. SVG 更适合表现空间结构和状态变化：算法数组窗口、双指针移动、DP 表、矩阵、链表指针、树/图遍历 frontier、堆、回溯搜索树、多面板步骤、JVM/缓存/索引/内存引用链、网络包结构等。
+4. Mermaid 更适合表达抽象关系：`sequenceDiagram` 表达协议交互，`stateDiagram` 表达状态机，`flowchart/graph + subgraph` 表达架构边界、调用链和数据流。
+5. compareTable 更适合概念边界、方案选型和分类对比；不要为了“有图”把对比题硬画成流程图。
+6. 不得一味生成 SVG。如果 SVG 只是 Mermaid 节点换皮、没有表达更多信息、文字过密、移动端看不清、维护成本高，应改用 Mermaid、compareTable、text，或在不需要图时移除图解。
+7. 不得一味弱化为 Mermaid。已有 SVG 如果表达了空间结构、步骤状态或数据结构细节，精修候选不能删除 SVG、不能替换成更弱的 Mermaid 线性链，除非能证明 Mermaid 在语义、可读性和维护性上不差于原 SVG。
+8. 算法图解一旦存在，就必须体现题目真实数据结构和推演过程，禁止复用“四个节点换名字”的模板图。DP 题要能看出状态表或状态转移，双指针/滑动窗口题要能看出窗口移动，树/图题要能看出节点关系和遍历 frontier，回溯题要能看出选择树或剪枝。
+9. 只要使用 `diagram` 或 `animation`，就必须提供可读的 `fallback`、`caption` 或 text source 兜底；使用 SVG 的 `sources` 还必须保留 mermaid 或 text 降级链。只有 svg path、没有可读兜底的图解不能作为发布态高质量内容。
+10. 文本模型不能假装看见图片。图的语义适配可由文本判官评估；重叠、裁切、空白、显示不全、文字过密、字号过小、边线压字等视觉问题必须由渲染 QA 或视觉模型评估。没有视觉报告时，视觉结论只能标记为未核验。
+
 不合格图示包括：
 
 1. 所有 topic 都复用 `输入 -> 状态维护 -> 边界处理 -> 输出答案`。
@@ -346,8 +359,9 @@ AI 或人工审查内容时，不能只看单个 topic 是否写得完整，还�
 15. **rubric 不得内嵌代码**：rubric.mustHave / goodToHave / commonMistakes 命中代码特征（`throw new ...()`、`function`、`=>`、带分号的语句、缩进代码块）即判 P0——rubric 只能是知识点名词短语或自然语句，代码只放 code 卡。
 16. **假图检测（线性关键词链）**：mermaid 图若构成单链（每节点入度≤1、出度≤1，无分支/汇合/状态转移）、或终点节点文本命中“结论/要点/总结/面试”，即使节点专属也判为假图扣分。判真假图看边是否承载机制，而非节点是否专属。
 17. **区分度天花板**：difficulty≥3 的技术题，若 recallPrompts/followUpQuestions 全是“是什么/列举”、缺“为什么这样设计 / 如何排查 / 取舍 / 极端场景”深问，按区分度不足封顶（只能区分中级，达不到 P7）；difficulty 4-5 必须具备专家（P7+）区分度。基础题（difficulty 1-2）豁免，但不得为凑深度注水或虚标难度。
+18. **图解形态非退化**：已有承载真实空间/状态/数据结构信息的 SVG 被删除或替换后信息量变弱、SVG sources 缺少 mermaid/text 兜底、新增 SVG 路径不存在、空间/状态型 topic 被普通 Mermaid 流程链替代，都会扣分或封顶。SVG 不是加分捷径，Mermaid 也不是降级同义词，必须按 topic 机制选择；装饰性或错误 SVG 可以移除，但要用更清晰的文字、表格、Mermaid 或重画图替代。
 
-> 第 15-17 条目前由本地精修器（`quality:refine` 的判官维度 `seniorityDiscrimination` 及阻断规则）强制把关；确定性脚本 `quality:audit` 会分批纳入这三项检测——一次性开启会回溯性判挂存量中的线性串联图与 rubric 代码，需配合存量整改逐步收紧，不要在未清理存量前直接加成硬门禁。
+> 第 15-18 条目前由本地精修器（`quality:refine` 的判官维度 `seniorityDiscrimination`、`diagramModalityFinding` 及阻断规则）强制把关；确定性脚本 `quality:audit` 会分批纳入这些检测——一次性开启会回溯性判挂存量中的线性串联图、rubric 代码和图解兜底问题，需配合存量整改逐步收紧，不要在未清理存量前直接加成硬门禁。
 
 评分重点覆盖：
 
@@ -376,6 +390,8 @@ AI 或人工审查内容时，不能只看单个 topic 是否写得完整，还�
 7. 正式精修成功后再同步 staging/draft；交互脚本会按所选阶段自动同步，直接运行核心脚本时需要手动执行 `node scripts/sync_environment_content.mjs <all|staging|draft>`。
 8. 每个本地 clone 必须运行一次 `npm run hooks:install` 才会启用 `.githooks/pre-commit`；当前 hook 只做暂存 topic 的 JSON 和静态质量分门禁。
 
+精修器的动态判官必须使用统一 9 维：`accuracy`、`cognitiveOrder`、`expertVoice`、`selfContained`、`interviewUsability`、`difficultyFit`、`learnerClarity`、`coverage`、`seniorityDiscrimination`。任一维低于 4、出现 wrong/outdated 事实、图解形态明显不适配或视觉 QA fail，都不能判为动态通过。
+
 精修器必须重点处理：
 
 1. 事实正确性：关键事实、版本、复杂度、协议行为、框架机制不能错；图的流程方向、对比表结论、代码正确性同样按事实核验。
@@ -386,8 +402,9 @@ AI 或人工审查内容时，不能只看单个 topic 是否写得完整，还�
 6. 难度匹配：内容深度与 `difficulty` 标注一致，difficulty 1-2 不注水、difficulty 4-5 必须讲透机制和权衡。
 7. 区分度天花板：技术域对标 P7/P7+ 的知识纵深，difficulty≥3 必须深到能区分资深、4-5 到专家深度；非技术域对标对应职业的资深纵深。判据是 recallPrompts/followUpQuestions 是否含“为什么这样设计 / 如何排查 / 取舍 / 极端场景”的深问，且正文能支撑其答案；只考“是什么/列举”的封顶为仅区分中级。
 8. rubric 与图示卫生：rubric 三项不得内嵌代码（代码进 code 卡）；diagram 不得是纯线性关键词链或终点为“面试结论”类汇聚节点的假图，边必须承载真实机制。
+9. 图解形态适配与非退化：每篇都要判断当前 topic 应使用 SVG、Mermaid、compareTable、code/text 还是不需要图；已有好 SVG 不能被弱化成 Mermaid，Mermaid 已足够清晰时也不能为了“升级”强行 SVG。判官输出应包含 `diagramModalityFinding`，说明当前/推荐图型、是否适配、是否候选退化、视觉是否已核验和修复建议。
 
-精修后的内容仍必须通过确定性校验。静态 `90` 分不是内容真的达标的证明，只是提交和同步前的最低门槛。
+精修后的内容仍必须通过确定性校验。静态 `90` 分不是内容真的达标的证明，只是提交和同步前的最低门槛；正式发布精修的目标是静态与动态都尽量达到 `95+`，且没有 9 维短板、事实问题、图解退化或格式问题。候选内容只有在不变量、静态审计、动态判官和图解形态评审均不退化，且至少一块实质变好时，才允许写回。
 
 ## 9. 面试可用性标准
 

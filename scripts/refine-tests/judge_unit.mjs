@@ -5,6 +5,7 @@ import {
   judgePasses,
   acceptByJudge,
   factProblemCount,
+  diagramModalityProblemCount,
   JUDGE_DIMENSIONS,
 } from "../quality_llm_judge.mjs";
 
@@ -61,6 +62,14 @@ check("全 5 分 + 无事实问题 + 分≥线 => pass", judgePasses(review({ sc
 check("分数低于动态线 => 不 pass", judgePasses(review({ score: 80 }), 85) === false);
 check("某维 <4 => 不 pass", judgePasses(review({ dimensions: { ...allFive, learnerClarity: 3 } }), 85) === false);
 check("有 wrong 事实 => 不 pass", judgePasses(review({ factFindings: [{ verdict: "wrong" }] }), 85) === false);
+check(
+  "图解形态不适配 => 不 pass",
+  judgePasses(review({ diagramModalityFinding: { isCurrentFormatFit: false, visualFit: "not_checked" } }), 85) === false,
+);
+check(
+  "图解问题计数能识别候选退化",
+  diagramModalityProblemCount(review({ diagramModalityFinding: { isCandidateDowngrade: true, visualFit: "pass" } })) === 1,
+);
 
 console.log("=== acceptByJudge：回归向量 ===");
 // 真改善：维度 4->5、静态 90->95，无新事实问题 => accept
@@ -77,6 +86,15 @@ check(
 check(
   "引入新 wrong 事实 => reject",
   acceptByJudge({ before: review(), after: review({ factFindings: [{ verdict: "wrong" }], blockingFindings: [{ reason: "x" }] }), staticBefore: 95, staticAfter: 96 }).accept === false,
+);
+check(
+  "引入图解形态退化 => reject",
+  acceptByJudge({
+    before: review(),
+    after: review({ diagramModalityFinding: { isCandidateDowngrade: true, visualFit: "pass" } }),
+    staticBefore: 95,
+    staticAfter: 96,
+  }).accept === false,
 );
 // 静态跌破 90 地板 => reject（即使动态更好）
 check(

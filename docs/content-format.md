@@ -478,7 +478,8 @@ content-repo/
 1. 每个 source 必须有 `kind`（`svg`/`mermaid`/`text`），并且 `path` 与 `content` 二选一。
 2. `svg` 使用 `path`，必须位于 `assets/` 下，禁止绝对路径、`..` 和隐藏目录。
 3. `mermaid`/`text` 使用 `content`；渲染端按数组顺序尝试，全部失败才显示 `fallback`。
-4. 旧 `asset`、`svgPath`、`svg`、`content+format=mermaid` 字段继续兼容，不要求一次性迁移。
+4. 正式发布内容中，只要使用 `diagram` 或 `animation`，必须提供可读的 `fallback`、`caption` 或 text source 兜底；如果 `sources` 含 `svg`，还必须同时提供至少一层 `mermaid` 或 `text` 降级链。精修器不得生成只有 SVG path 的图解。
+5. 旧 `asset`、`svgPath`、`svg`、`content+format=mermaid` 字段继续兼容，不要求一次性迁移；但新增 SVG 资源必须真实存在于 `assets/` 下。
 
 Mermaid 约束：
 
@@ -489,6 +490,8 @@ Mermaid 约束：
 5. 图示节点必须使用当前 topic 的专属概念、对象、状态或链路名，不得大量使用 `输入`、`处理`、`输出`、`关键流程`、`边界处理` 这类万能节点。
 6. 图示必须表达真实关系，例如调用顺序、数据流、状态转移、依赖关系、隔离边界或失败路径；不能只是把正文关键词横向摆放。
 7. `caption` 或 `fallback` 应说明图在解释哪个机制，不能写成“展示本知识点关键环节”这类模板句。
+
+图解形态选择属于知识质量标准而不是 JSON 契约：不是每个 topic 都必须有 SVG、Mermaid 或其他 diagram；SVG、Mermaid、compareTable、code/text/none 都可能是正确选择。算法、二维状态、内存/索引/链表/树图结构等确实需要空间表达时优先考虑 SVG；协议交互、状态机、架构边界优先考虑对应 Mermaid 图型；纯对比题优先 compareTable。精修器不得把已有表达空间/状态细节的 SVG 弱化成 Mermaid 线性链，也不得为了“高级”把 Mermaid 能讲清的关系强行改成装饰性 SVG。
 
 5 色板固定值：
 

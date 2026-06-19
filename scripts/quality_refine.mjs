@@ -36,6 +36,11 @@ import { pauseBus } from "./llm/pause-bus.mjs";
 import { QuotaSkipped } from "./llm/router.mjs";
 import { envConfig } from "./llm/env-config.mjs";
 import { createRouter } from "./llm/router.mjs";
+import {
+  CONTENT_STANDARD_VERSION,
+  PRODUCTION_STRICT_MIN_SCORE,
+  diagramPolicyPrompt,
+} from "./quality_standard.mjs";
 
 const root = process.cwd();
 // .quality-refine 产物根目录（runDir / judge-cache / preview 全在这下面）。
@@ -76,19 +81,24 @@ const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任�
 - 禁止 JSON 注释（不要 //、不要 /* */），禁止 trailing comma（最后一个属性、最后一个数组元素后面禁止逗号）。
 （字符串的转义/换行规则随输出协议不同，见文末"字符串排版规则"那一节，按那里的要求执行。）
 
-【8 个评估维度——每一项都要做到位，不能为了一项牺牲另一项】
+【9 个评估维度——每一项都要做到位，不能为了一项牺牲另一项】
 1. 结构完整性：必须含 explain + interviewAnswer + checklist；至少一张 compareTable / diagram / code；rubric 四维权重之和=100。
 2. 内容深度：每张 explain 要讲清机制/触发条件/关键指标/失败路径/工程取舍，不是清单堆砌、不是大白话复述定义。
 3. 专家证据：给出具体抓手——真实函数名/类名/参数、版本边界、命令与配置项、数值量级、生产现象与定位线索。禁止"通常、一般、很重要"这类空话。
 4. 讲解清晰度：遵循认知顺序——先动机/痛点 → 机制 → 具体例子 → 边界/反例 → 面试如何表达；逻辑连贯不跳跃。
 5. 图示/对比：diagram 节点必须是本题专属概念（不是"输入→处理→输出"这种万能图），且边必须表达真实机制（调用顺序/数据流/状态转移/分支/失败路径）——纯线性关键词链（A→B→C→D→…，无分支/汇合/状态转移）、或终点是"面试结论/答题要点/总结"这类汇聚节点的，即使节点专属也算假图，必须重画；compareTable 行列对齐，且每一行都含真正的结论而非同义复述。
-【何时用什么图——按 topic 类型评估，不是所有 topic 都需要 diagram，也不是所有图都适合做成 Mermaid】
+【何时用什么图——按 topic 类型评估，不是所有 topic 都需要 SVG、Mermaid 或其他 diagram】
+- 先判断是否需要图解：如果文字、代码卡或 compareTable 已经更清楚，就不要为了凑图新增 diagram；recommendedFormat 可以是 code、compareTable、text 或 none。
 - 协议/状态机/分布式类（TCP 握手/挥手、拥塞控制、Paxos/Raft、OAuth2 流程、事务状态机）：首选 mermaid stateDiagram 或 sequenceDiagram 展示"参与者交互/状态转移/分支条件"；sources: [{kind: "mermaid", content: ...}, {kind: "text", content: ...}]。
 - 架构/跨系统边界类（微服务拓扑、数据血缘、CI/CD 流水线、消息流转）：首选 mermaid flowchart/graph + subgraph 展示"模块分组/调用链路/隔离边界"；sources: [{kind: "mermaid", content: ...}, {kind: "text", content: ...}]。
 - 纯概念/对比/分类类（设计模式对比、数据结构选型、安全攻击分类）：不需要 diagram 卡，用 compareTable 就够了。不要为了凑"有图"给纯概念对比画流程图。
+- 算法/数据结构/空间状态类（数组窗口、双指针、DP 表、树/图遍历 frontier、堆、链表指针、回溯搜索树）：若需要图解，优先使用 SVG 表达真实布局、状态变化或多步骤面板；Mermaid 只能用于控制流/状态机，不能把真实数据结构弱化成四个流程节点。
 - difficulty 1-2 基础题：不主动加复杂图，保持简洁；已有的简单 flowchart 或对比表保留即可。
 - 如有 svg 静态资源（assets/diagrams/*.svg），可放在 sources[0] 作为第一展示层，sources[1]=mermaid、sources[2]=text 作为降级兜底。
 - 降级链最少要有一层 mermaid 或 text 兜底。
+- SVG 不是天然更好：如果 SVG 只是 Mermaid 换皮、文字过密、移动端看不清、没有表达更多机制，应改用 Mermaid/compareTable/text。
+- Mermaid 不是天然低级：如果 sequenceDiagram/stateDiagram/flowchart+subgraph 已经清楚表达交互、状态或架构边界，不要为了"高级"强行生成 SVG。
+- 严禁图解退化：原 topic 已有 SVG 且表达了真实空间结构、步骤状态或数据结构细节时，候选必须保留同等或更强的信息量；可以移除装饰性/错误 SVG，但必须证明文字、表格、Mermaid 或重画后的图更清楚。
 6. 面试可用性：interviewAnswer 用三层结构——30 秒结论 → 机制要点列表 → 边界/追问应对；followUpQuestions ≥2 条，且答案是本题专属、不复述题面。
 7. rubric 评估质量：mustHave 是具体知识点名词（如"本地队列+全局队列+work stealing 三层调度"），不是"能说明「X」在「Y」里的作用和判断标准"这类套娃句；commonMistakes 是真实的坑，不是泛化。mustHave / goodToHave / commonMistakes 只能是知识点名词短语或自然语句，禁止内嵌代码片段（如 throw new ...()、function、=>、带分号的语句、缩进代码块）——代码只放 code 卡。
 8. 模板与语言卫生：逐字消除下列 P0 模板句式（命中必改写成本题专属的具体表达）：
@@ -115,7 +125,7 @@ const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任�
 - checklist：合法字段有 type / title / items。items 必须是字符串数组，每项是一条可核验的能力点。
 - code：合法字段有 type / title / content / language / highlights。language 必填，取值仅限 java / python / javascript / typescript / bash / sql / json / yaml / c / cpp / go / rust 之一。highlights 为 \`[{line, note}]\` 数组，line 是从 1 开始的行号，note 是该行的具体语义说明（禁止"关键行"/"核心入口"等泛化占位，必须是本题专属的具体解释）；禁止在 code 卡片里使用 box-drawing 字符画（┌─┐│└┘ 等），需要画图就用 diagram 卡片。
 - compareTable：合法字段有 type / title / content / columns / rows。两种合法形态——（A）Markdown 表格字符串放在 content（以 \`|\` 开头）；（B）结构化表格，columns 为表头字符串数组、rows 为二维字符串数组。**保留原 topic 用的那种形态，不要互换。** 若原 topic 用 columns+rows 形态，则每行 rows 的列数必须与 columns 对齐；若原 topic 用 content 形态，则精修后仍用 content 形态。
-- diagram：合法字段有 type / title / content / format / items / fallback / caption / svgPath / asset / svg / sources。format 取值 mermaid / svg / image / text 之一；当 format=mermaid 时，content 必须以 \`flowchart\` 或 \`graph\` 开头并紧跟 TB|TD|BT|LR|RL 方向（例如 \`flowchart LR\`）；若 REFINE_ALLOW_COMPLEX_MERMAID=true，可使用 subgraph(≤2层)、stateDiagram(-v2)、sequenceDiagram、classDef 5 色板。items 为字符串数组，是图示要点列表，**原 topic 有 items 字段就必须保留**。必须提供 fallback（一句话纯文本概括）。caption 为图注。节点文案必须紧扣本 topic 主题，禁止使用"输入→处理→输出"这类万能节点。sources 可选，格式 [{kind:"svg"|"mermaid"|"text", path?:"...", content?:"..."}]，按数组顺序降级（svg 资源 → mermaid 结构图 → text 兜底）。
+- diagram：合法字段有 type / title / content / format / items / fallback / caption / svgPath / asset / svg / sources。format 取值 mermaid / svg / image / text 之一；当 format=mermaid 时，content 必须是合法 Mermaid 头：\`flowchart|graph + TB/TD/BT/LR/RL\`，若 REFINE_ALLOW_COMPLEX_MERMAID=true 也可使用 stateDiagram(-v2)、sequenceDiagram、subgraph(≤2层)、classDef 5 色板。items 为字符串数组，是图示要点列表，**原 topic 有 items 字段就必须保留**。必须提供 fallback（一句话纯文本概括）。caption 为图注。节点文案必须紧扣本 topic 主题，禁止使用"输入→处理→输出"这类万能节点。sources 可选，格式 [{kind:"svg"|"mermaid"|"text", path?:"...", content?:"..."}]，按数组顺序降级（svg 资源 → mermaid 结构图 → text 兜底）；只要 sources 含 svg，就必须同时含 mermaid 或 text 兜底。
 - animation：合法字段有 type / title / asset / sources / fallback / caption。asset 为资源路径，fallback 必填。sources 规则同 diagram。
 
 - recallPrompts：至少 1 条；第一条必须是该 topic 最核心、面试官最常开口问的那个问题（首轮练习兼容旧版 App 用）；每条对象结构必须是 \`{id, prompt, mode}\`，id 形如 \`<topic.id>.recall.<n>\`，mode 取值仅限 text / code / voice；可选附加 expectedMinutes（数字，分钟）、difficulty（1-5）。
@@ -1149,6 +1159,11 @@ function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministi
     : "REFINE_ALLOW_COMPLEX_MERMAID=false: diagram only simple flowchart/graph + direction header, sources only svg/mermaid/text.";
   return `${spec}
 ${retryBlock}
+【统一知识精修标准】
+标准版本：${CONTENT_STANDARD_VERSION}。production-strict 目标静态/动态均 ≥${PRODUCTION_STRICT_MIN_SCORE}；当前命令行 minScore 只是本次运行门槛，不代表内容已经达到人工精品。
+
+${diagramPolicyPrompt()}
+
 【本次精修功能开关】
 ${dynamicRules}
 
@@ -1179,6 +1194,89 @@ WROTE:${cachePath}
 【当前 topic JSON】
 ${JSON.stringify(topic, null, 2)}
 `;
+}
+
+function isSvgAssetPath(value) {
+  return typeof value === "string" && /\.svg(?:[?#].*)?$/i.test(value.trim());
+}
+
+function topicDiagramCards(topic) {
+  return (topic.learningCards ?? []).filter((card) => card?.type === "diagram" || card?.type === "animation");
+}
+
+function cardHasSvg(card) {
+  if (!card || typeof card !== "object") return false;
+  if (card.format === "svg" || typeof card.svg === "string") return true;
+  if (isSvgAssetPath(card.svgPath) || isSvgAssetPath(card.asset)) return true;
+  return (Array.isArray(card.sources) ? card.sources : []).some((source) => source?.kind === "svg" || isSvgAssetPath(source?.path));
+}
+
+function cardHasMermaidOrTextFallback(card) {
+  if (!card || typeof card !== "object") return false;
+  if (typeof card.fallback === "string" && card.fallback.trim().length >= 12) return true;
+  if (typeof card.caption === "string" && card.caption.trim().length >= 12) return true;
+  return (Array.isArray(card.sources) ? card.sources : []).some(
+    (source) =>
+      (source?.kind === "mermaid" || source?.kind === "text") &&
+      typeof source.content === "string" &&
+      source.content.trim().length >= 12,
+  );
+}
+
+function cardHasTextualFallback(card) {
+  if (!card || typeof card !== "object") return false;
+  if (typeof card.fallback === "string" && card.fallback.trim().length >= 12) return true;
+  if (typeof card.caption === "string" && card.caption.trim().length >= 12) return true;
+  return (Array.isArray(card.sources) ? card.sources : []).some(
+    (source) => source?.kind === "text" && typeof source.content === "string" && source.content.trim().length >= 12,
+  );
+}
+
+function collectSvgPaths(topic) {
+  const paths = new Set();
+  for (const card of topicDiagramCards(topic)) {
+    for (const value of [card.svgPath, card.asset]) {
+      if (isSvgAssetPath(value)) paths.add(value.trim());
+    }
+    for (const source of Array.isArray(card.sources) ? card.sources : []) {
+      if (source?.kind === "svg" && isSvgAssetPath(source.path)) paths.add(source.path.trim());
+    }
+  }
+  return paths;
+}
+
+function assetExists(relPath) {
+  if (typeof relPath !== "string" || !relPath.startsWith("assets/") || relPath.includes("..") || path.isAbsolute(relPath)) {
+    return false;
+  }
+  try {
+    return statSync(path.join(root, relPath)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function checkDiagramModalityInvariants(original, parsed) {
+  const originalSvgPaths = collectSvgPaths(original);
+  const candidateSvgPaths = collectSvgPaths(parsed);
+  for (const svgPath of candidateSvgPaths) {
+    if (!originalSvgPaths.has(svgPath) && !assetExists(svgPath)) {
+      return `候选新增 SVG 路径但资源不存在：${svgPath}`;
+    }
+  }
+  for (const card of topicDiagramCards(parsed)) {
+    if (!cardHasTextualFallback(card)) {
+      return `图解缺少可读 fallback/caption/text 兜底：${card.title ?? ""}`;
+    }
+    const sources = Array.isArray(card.sources) ? card.sources : [];
+    if (sources.some((source) => source?.kind === "svg") && !sources.some((source) => source?.kind === "mermaid" || source?.kind === "text")) {
+      return `diagram/animation sources 含 SVG 但缺少 mermaid/text 降级兜底：${card.title ?? ""}`;
+    }
+    if (cardHasSvg(card) && !cardHasMermaidOrTextFallback(card)) {
+      return `SVG 图解缺少可读 fallback/caption/mermaid/text 兜底：${card.title ?? ""}`;
+    }
+  }
+  return null;
 }
 
 // 落盘前的 schema 不变量：只防"身份被改 / 内容被掏空 / 结构损坏"，质量好坏交给审计判。
@@ -1234,6 +1332,8 @@ function checkInvariants(original, parsed) {
   const originalLen = JSON.stringify(original).length;
   const newLen = JSON.stringify(parsed).length;
   if (newLen < originalLen * 0.6) return `内容疑似被截断/掏空（${newLen} < 原文 ${originalLen} 的 60%）`;
+  const diagramModalityBad = checkDiagramModalityInvariants(original, parsed);
+  if (diagramModalityBad) return diagramModalityBad;
 
   const mermaidHeadRe = allowComplexMermaid
     ? /^\s*(?:(?:flowchart|graph)\s+(?:TB|TD|BT|LR|RL)|stateDiagram(?:-v2)?|sequenceDiagram)\b/
@@ -2906,7 +3006,7 @@ async function main() {
     console.warn("[deprecated] --qwen-routes 在 API 模式下已无意义,忽略。");
   }
   const scope = String(args.scope ?? "all").trim();
-  const minScore = Number(args["min-score"] ?? 90);
+  const minScore = Number(args["min-score"] ?? PRODUCTION_STRICT_MIN_SCORE);
   const concurrency = Number(args.concurrency ?? 2);
   const autoConcurrencyMin = Number(args["auto-concurrency-min"] ?? (concurrency > 3 ? 3 : concurrency));
   const maxRounds = Number(args["max-rounds"] ?? 3);
@@ -3032,7 +3132,7 @@ async function main() {
     ? String(args["judge-models"]).split(",").map((entry) => entry.trim()).filter(Boolean)
     : [modelChain[0]]; // 默认 = 精修主模型（modelChain[0]，可能是 undefined=CLI 默认）
   const judgeCount = Number(args["judge-count"] ?? 1);
-  const dynamicSkipMin = Number(args["dynamic-skip-min"] ?? args["dynamic-pass-min"] ?? args["dynamic-min"] ?? 85);
+  const dynamicSkipMin = Number(args["dynamic-skip-min"] ?? args["dynamic-pass-min"] ?? args["dynamic-min"] ?? PRODUCTION_STRICT_MIN_SCORE);
   const judgeBatchSize = Number(args["judge-batch-size"] ?? 1);
   const judgeJsonRetries = Number(args["judge-json-retries"] ?? 2);
   const judgeWarmConcurrency = Number(args["judge-warm-concurrency"] ?? concurrency);
