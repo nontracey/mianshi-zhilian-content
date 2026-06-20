@@ -285,7 +285,7 @@ AI 或人工审查内容时，不能只看单个 topic 是否写得完整，还�
 4. **兜底可读**：复杂 Mermaid 或动画必须提供 `fallback` 或 `caption`，即使图渲染失败，用户也能读懂图在讲什么。
 5. **不替代解释**：图示只帮助理解结构或流程，不能用一张图替代 explain 对机制、边界和误区的解释。
 6. **孤立节点先诊断再处理**：Mermaid 中出现没有连线的节点时，不能直接批量删除。先判断它是否是重复定义、是否应该与上一/下一节点补边、是否引用了错误节点、是否已有更清晰的新图替代；只有确认节点无语义价值或已有更好图承接时，才可以删除。
-7. **降级链可用**：卡片可使用 `sources`，按 svg 资源 → mermaid 结构图 → text 兜底的顺序降级；资源路径允许先作为 backlog 存在，但必须保留可读的 mermaid/text/fallback。
+7. **降级链可用**：卡片可使用 `sources`，按 svg 资源或内联 SVG → mermaid 结构图 → text 兜底的顺序降级；`svg.path` 必须位于 `assets/` 且真实存在，`svg.content` 必须是真正的 `<svg...>` 源码，不能把资源路径塞进 content；必须保留可读的 mermaid/text/fallback。
 8. **复杂 Mermaid 有边界**：允许 `subgraph`、`stateDiagram`、`sequenceDiagram` 和 5 色板 `classDef`，但禁止 `classDiagram/gantt/pie/journey/erDiagram/mindmap` 与裸 `style` 行。
 
 **按 topic 类型选择图示**：
@@ -382,7 +382,7 @@ AI 或人工审查内容时，不能只看单个 topic 是否写得完整，还�
 默认规则：
 
 1. CI 不配置 LLM key、模型或 provider，也不再要求提交 `.quality-review/reports/`。
-2. CI 只运行 `npm run validate`、`npm run quality:scan`、`npm run quality:audit`。
+2. CI 只运行 `npm run ci:static`，即脚本语法检查、精修器静态/单元契约测试、`validate`、`quality:scan`、`quality:audit`。
 3. 维护者用 `npm run quality:refine:interactive` 启动本地精修器，按需选择领域、topic、CLI agent 和模型链。
 4. 一个 CLI 调用只能处理一个 topic。选择领域或多个 topic 只是建立队列，不得把整个领域合成一次 prompt。
 5. 静态分数只作为验收兜底；即使 topic 已经达到 90 分，第一轮正式精修仍可以送 LLM 重新审读和改写。
@@ -403,6 +403,12 @@ AI 或人工审查内容时，不能只看单个 topic 是否写得完整，还�
 7. 区分度天花板：技术域对标 P7/P7+ 的知识纵深，difficulty≥3 必须深到能区分资深、4-5 到专家深度；非技术域对标对应职业的资深纵深。判据是 recallPrompts/followUpQuestions 是否含“为什么这样设计 / 如何排查 / 取舍 / 极端场景”的深问，且正文能支撑其答案；只考“是什么/列举”的封顶为仅区分中级。
 8. rubric 与图示卫生：rubric 三项不得内嵌代码（代码进 code 卡）；diagram 不得是纯线性关键词链或终点为“面试结论”类汇聚节点的假图，边必须承载真实机制。
 9. 图解形态适配与非退化：每篇都要判断当前 topic 应使用 SVG、Mermaid、compareTable、code/text 还是不需要图；已有好 SVG 不能被弱化成 Mermaid，Mermaid 已足够清晰时也不能为了“升级”强行 SVG。判官输出应包含 `diagramModalityFinding`，说明当前/推荐图型、是否适配、是否候选退化、视觉是否已核验和修复建议。
+
+外部证据规则：
+
+1. 视觉质量可由静态 SVG QA、MCP 渲染/视觉工具或支持图像的模型判官提供；文本模型不得假装看见图片。没有视觉后端或渲染报告时，`visualFit` 必须是 `not_checked`，不能写 `pass`。
+2. 时效性、版本、默认值、协议/API 行为等容易过时的事实，允许通过 MCP 联网事实工具查询官方文档、标准规范、源码文档、论文或 release notes。外部证据返回 wrong/outdated 时，必须进入 `factFindings` 和 `blockingFindings`。
+3. 弱模型、本地模型、免费模型可以参与精修和判官，但必须声明能力边界：是否支持 `json`、是否支持 `image`、是否本地/免费、并发和额度限制。模型池只能降低成本和扩展吞吐，不能降低 9 维验收标准。
 
 精修后的内容仍必须通过确定性校验。静态 `90` 分不是内容真的达标的证明，只是提交和同步前的最低门槛；正式发布精修的目标是静态与动态都尽量达到 `95+`，且没有 9 维短板、事实问题、图解退化或格式问题。候选内容只有在不变量、静态审计、动态判官和图解形态评审均不退化，且至少一块实质变好时，才允许写回。
 
@@ -726,7 +732,7 @@ NODE
 
 每次改动后必须检查：
 
-1. `npm run validate` 通过。
+1. `npm run ci:static` 通过；快速局部检查时至少运行 `npm run validate`。
 2. manifest 的 topicCount 与实际文件数一致。
 3. domain 分类引用的 topic 文件存在。
 4. topic 的 `id`、`domain`、`category` 一致。

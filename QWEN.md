@@ -110,10 +110,10 @@ manifest.json
 | checklist       | `items[]`                                                                               |
 | compareTable    | `content` 或 `columns` + `rows`                                                         |
 | code            | `content` + `language`，可选 `highlights[].line/note`                                   |
-| diagram         | `format` (mermaid/svg/image/text) + `content` 或 `svgPath`/`asset`/`svg`，可有 `fallback`/`caption` |
-| animation       | `asset`                                                                                 |
+| diagram         | `format` (mermaid/svg/image/text) + `content` 或 `sources[]`，`sources` 支持 `svg.path`/`svg.content`、`mermaid.content`、`text.content`，可有 `fallback`/`caption` |
+| animation       | `asset` 或 `sources[]` 降级链                                                           |
 
-mermaid 卡只能使用 App 轻量解析器支持的子集（`flowchart`/`graph` + 基础边），禁止 `subgraph`/`classDef`/`style`/`linkStyle`/`click`/`direction`/带标签虚线边。
+mermaid 卡只能使用 App 轻量解析器支持的子集：`flowchart`/`graph` + 方向、`subgraph`、`stateDiagram`、`sequenceDiagram` 和 5 色板 `classDef`。禁止 `classDiagram`/`gantt`/`pie`/`journey`/`erDiagram`/`mindmap`、裸 `style`、`linkStyle`、`click` 和带标签虚线边。
 
 ### 三个环境入口
 
@@ -144,7 +144,7 @@ npm run generate                        # 从 Markdown 源生成 JSON（需 CONT
 npm run sync:env                        # 从正式内容同步 staging/draft 隔离副本
 npm run hooks:install                   # 安装 .githooks（每个 clone 一次）
 
-# 内容精修（LLM 辅助，需要本地有 qwen / codex / claude / gemini / opencode 等 CLI）
+# 内容精修（API 模式；模型链/视觉/联网后端全部读 .env，可自定义模型并声明有效期/QPS）
 npm run quality:refine:interactive      # 交互式启动（推荐入口）
 npm run quality:refine -- --help        # 直接运行
 npm run quality:refine:test             # 精修脚本测试套件
@@ -165,7 +165,7 @@ npm run quality:gate                    # 等价于 quality:llm:verify --env=pro
 7. `rubric.scoreWeights` 4 维总和 = 100
 8. 孤儿文件检查：每个 topic 文件必须被 domain category 引用
 9. 顺序/权重合理性（order 重复/降序、低频高权重等告警）
-10. `diagram` 卡 `svgPath` / `asset` 资源必须存在；`fallback` / `content` 禁止"建议用…"占位文字
+10. `diagram` 卡 `svgPath` / `asset` / `sources[].path` 资源必须存在；`svg.content` 必须是内联 `<svg...>`，不能写资源路径；`fallback` / `content` 禁止"建议用…"占位文字
 11. mermaid 语法限制：仅 App 解析器支持的子集
 
 ### 三环境同步规则
@@ -238,7 +238,7 @@ npm run quality:gate                    # 等价于 quality:llm:verify --env=pro
 
 ## 内容精修器（LLM 流水线）
 
-`scripts/quality_refine.mjs` 是本地维护者使用的 LLM 精修主程序，CI 不参与 LLM 评分。详见 `docs/quality-refine.md`：
+`scripts/quality_refine.mjs` 是本地维护者使用的 LLM 精修主程序，CI 不参与 LLM 评分。CI 入口是 `npm run ci:static`，只跑语法、契约单测、`validate`、`quality:scan`、`quality:audit`。详见 `docs/quality-refine.md`：
 
 - 一个 CLI 调用只处理一个 topic；并发只是同时启动多个单 topic 子进程
 - 并发 > 3 时启用自适应降级（限流 / 超时 / 非零退出会把并发降到 3）

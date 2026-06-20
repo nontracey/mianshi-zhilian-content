@@ -19,6 +19,7 @@ const mermaidUnsupportedKeyword =
 const mermaidLabeledEdge = /(.+?)\s*--\s*([^>-]+?)\s*--?>\s*(.+)/;
 const mermaidPlainEdge = /(.+?)\s*(-\.->|==>|-->|---)\s*(.+)/;
 const allowedSourceKinds = new Set(["svg", "mermaid", "text"]);
+const inlineSvgStart = /^\s*<svg(?:\s|>)/i;
 
 function isMermaidCard(card) {
   if ((card.format || "").toLowerCase() === "mermaid") return true;
@@ -88,12 +89,22 @@ function assertSources(file, card) {
     if (hasPath === hasContent) {
       throw new Error(`${file} ${card.type} 卡 "${card.title}" sources[${index}] 必须且只能提供 path 或 content`);
     }
-    if (hasPath) {
-      if (path.isAbsolute(source.path) || source.path.includes("..") || /(^|\/)\.[^/]/.test(source.path)) {
-        throw new Error(`${file} ${card.type} 卡 "${card.title}" sources[${index}].path 越界：${source.path}`);
+    if ((source.kind === "mermaid" || source.kind === "text") && !hasContent) {
+      throw new Error(`${file} ${card.type} 卡 "${card.title}" sources[${index}].kind=${source.kind} 必须使用 content，不能使用 path`);
+    }
+    if (source.kind === "svg" && hasContent && !inlineSvgStart.test(source.content)) {
+      throw new Error(`${file} ${card.type} 卡 "${card.title}" sources[${index}].content 必须是真正的内联 SVG（以 <svg 开头）；资源文件请使用 path`);
+    }
+    if (hasPath || source.kind === "svg") {
+      const sourcePath = hasPath ? source.path : null;
+      if (sourcePath && (path.isAbsolute(sourcePath) || sourcePath.includes("..") || /(^|\/)\.[^/]/.test(sourcePath))) {
+        throw new Error(`${file} ${card.type} 卡 "${card.title}" sources[${index}].path 越界：${sourcePath}`);
       }
-      if (!source.path.startsWith("assets/")) {
-        throw new Error(`${file} ${card.type} 卡 "${card.title}" sources[${index}].path 必须位于 assets/：${source.path}`);
+      if (sourcePath && !sourcePath.startsWith("assets/")) {
+        throw new Error(`${file} ${card.type} 卡 "${card.title}" sources[${index}].path 必须位于 assets/：${sourcePath}`);
+      }
+      if (sourcePath && !existsSync(path.join(root, sourcePath))) {
+        throw new Error(`${file} ${card.type} 卡 "${card.title}" sources[${index}].path 资源不存在：${sourcePath}`);
       }
     }
   }
@@ -106,7 +117,7 @@ function assertDiagramCard(file, card) {
   const mermaidSource = sources.find((source) => source.kind === "mermaid" && typeof source.content === "string");
   const mermaid = Boolean(mermaidSource) || isMermaidCard(card);
 
-  // 1) 旧字段引用的图片资源必须存在；sources 中的图片允许作为 backlog 路径，由渲染端降级到后续 source。
+  // 1) 旧字段引用的图片资源必须存在。
   const asset = card.svgPath || card.asset;
   if (asset && !mermaid && !card.svg) {
     if (!existsSync(path.join(root, asset))) {

@@ -20,15 +20,14 @@ const ENV_EXAMPLE = path.join(REPO_ROOT, ".env.example");
 const QWEN_SETTINGS = path.join(os.homedir(), ".qwen", "settings.json");
 
 const SECRET_KEYS = new Set([
-  "HUOSHAN_API_KEY",
-  "DEEPSEEK_API_KEY",
-  "BAIDU_API_KEY",
-  "LONGCHAT_API_KEY",
-  "MIMO_API_KEY",
-  "OPENCODE_API_KEY",
-  "OPENAI_API_KEY",
-  "ANTHROPIC_API_KEY",
-  "GOOGLE_API_KEY",
+  "ZHIPU_API_KEY",
+  "LONGCAT_API_KEY",
+  "AGNES_API_KEY",
+  // v3.3 内置联网 + 长上下文模型
+  "FACT_CHECK_API_KEY",
+  "BING_API_KEY",
+  "DASHSCOPE_API_KEY",
+  "GOOGLE_CSE_API_KEY",
 ]);
 
 function parseEnv(text) {
@@ -123,9 +122,9 @@ function mergeMissingDefaults({ dryRun }) {
 
 // v3 默认值变更（仅在 --upgrade-defaults 下执行；会覆盖旧值）
 const V3_DEFAULTS = {
-  REFINE_MODEL_CHAIN: "volcengine:glm-5.1,volcengine:deepseek-v4-flash",
-  JUDGE_MODEL_CHAIN: "volcengine:deepseek-v4-pro,volcengine:deepseek-v4-flash",
-  BLOCK_JUDGE_MODEL_CHAIN: "volcengine:glm-5.1,volcengine:deepseek-v4-flash",
+  REFINE_MODEL_CHAIN: "zhipu:glm-4.7-flash,longcat:LongCat-2.0-Preview",
+  JUDGE_MODEL_CHAIN: "longcat:LongCat-2.0-Preview,zhipu:glm-4.7-flash",
+  BLOCK_JUDGE_MODEL_CHAIN: "zhipu:glm-4.7-flash,longcat:LongCat-2.0-Preview",
 };
 
 function upgradeDefaults({ dryRun }) {

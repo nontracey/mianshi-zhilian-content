@@ -13,6 +13,7 @@ import { envConfig } from "./env-config.mjs";
 import { pauseBus } from "./pause-bus.mjs";
 import { QuotaError, probeSpec } from "./quota.mjs";
 import { liveEvents } from "./live-events.mjs";
+import { modelPool } from "./model-pool.mjs";
 
 const AVAILABILITY_WINDOW_MS = 10 * 60 * 1000;
 const DEGRADE_AFTER_DEFAULT = 3;
@@ -27,7 +28,7 @@ function parseChain(spec) {
 }
 
 function defaultChain() {
-  return ["volcengine:glm-5.1", "volcengine:deepseek-v4-flash"];
+  return ["zhipu:glm-4.7-flash", "longcat:LongCat-2.0-Preview"];
 }
 
 function parseBackoffs() {
@@ -86,9 +87,29 @@ export function createRouter(opts = {}) {
     return arr.length;
   }
 
-  function shouldDegrade(currentIdx) {
-    if (currentIdx >= chain.length - 1) return false;
-    const spec = chain[currentIdx];
+  function orderedChainForRun() {
+    // 过期模型直接从活动链里剔除（到期即自动"移除"，无需手动改链）。
+    // 若整条链都过期则保留原链，让 resolveSpec 抛清晰的"已过期"错，而不是误报"链为空"。
+    const live = chain.filter((spec) => {
+      const m = envConfig.findModel(spec);
+      return !(m && envConfig.isModelExpired(m));
+    });
+    const base = live.length ? live : chain;
+    return [...base].sort((a, b) => {
+      const ma = envConfig.findModel(a);
+      const mb = envConfig.findModel(b);
+      if (ma?.local && mb?.local) {
+        const la = envConfig.getLocalLatency(a) ?? Infinity;
+        const lb = envConfig.getLocalLatency(b) ?? Infinity;
+        if (la !== lb) return la - lb;
+      }
+      return 0;
+    });
+  }
+
+  function shouldDegrade(currentIdx, activeChain) {
+    if (currentIdx >= activeChain.length - 1) return false;
+    const spec = activeChain[currentIdx];
     return pruneWindow(spec) >= degradeAfter;
   }
 
@@ -126,13 +147,14 @@ export function createRouter(opts = {}) {
     let lastErr = null;
     let currentIdx = 0;
 
-    while (currentIdx < chain.length) {
+    const activeChain = orderedChainForRun();
+    while (currentIdx < activeChain.length) {
       await pauseBus.awaitResume();
 
-      const spec = chain[currentIdx];
-      if (currentIdx === 0 && shouldDegrade(currentIdx)) {
+      const spec = activeChain[currentIdx];
+      if (currentIdx === 0 && shouldDegrade(currentIdx, activeChain)) {
         failureTimestamps.set(spec, []);
-        const next = chain[currentIdx + 1];
+        const next = activeChain[currentIdx + 1];
         onDegrade?.(spec, next);
         liveEvents.emitEvent("llm.degrade", { from: spec, to: next, reason: "window-exceeded" });
         currentIdx += 1;
@@ -140,7 +162,7 @@ export function createRouter(opts = {}) {
       }
 
       try {
-        return await openaiRunner.run({ ...req, spec });
+        return await modelPool.run({ spec, kind: req.kind || label }, () => openaiRunner.run({ ...req, spec }));
       } catch (err) {
         if (err instanceof QuotaError || err.quotaFailure) {
           await handleQuotaPause(err);
@@ -152,11 +174,11 @@ export function createRouter(opts = {}) {
           if (err.availabilityFailure) {
             noteFailure(spec);
           }
-          if (currentIdx >= chain.length - 1) {
+          if (currentIdx >= activeChain.length - 1) {
             onExhaust?.(err);
             throw new ChainExhaustedError(`[router] 模型链全部不可用 last=${spec} ${err.message}`, err);
           }
-          const next = chain[currentIdx + 1];
+          const next = activeChain[currentIdx + 1];
           liveEvents.emitEvent("llm.degrade", { from: spec, to: next, reason: err.availabilityFailure ? "availability" : "truncated" });
           currentIdx += 1;
           continue;

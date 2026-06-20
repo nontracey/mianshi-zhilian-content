@@ -27,6 +27,7 @@ npm install
 npm run generate  # 需要设置 CONTENT_SOURCE_ROOT 环境变量指向原始 Markdown 目录
 npm run sync:env  # 从正式内容同步生成 staging/draft 隔离副本
 npm run validate
+npm run ci:static  # CI 同款静态检查：语法、契约单测、validate、scan、audit
 npm run quality:scan
 npm run quality:audit
 npm run quality:refine:interactive  # 交互式启动内容精修器
@@ -111,12 +112,12 @@ topics/{domain}/{filename}.json
 
 1. **修改内容**（知识点、分类、领域等），或在 [内容工作台](https://github.com/nontracey/mianshi-zhilian-studio) 编辑
 2. **验证内容**：`npm run validate`
-3. **运行确定性质量检查**：`npm run quality:scan && npm run quality:audit`
+3. **运行确定性质量检查**：`npm run ci:static`
 4. **按需人工精修**：`npm run quality:refine:interactive`
 5. **提交 Pull Request**（fork PR 仅限 `draft/` 目录）
 6. **合并到 `main`** 后自动部署并更新版本号
 
-CI 不再运行 LLM 评分，也不要求提交 `.quality-review/reports/`。语义质量由维护者本地运行精修器把关；CI 只运行 `validate`、`quality:scan` 和 `quality:audit`。
+CI 不再运行 LLM 评分，也不要求提交 `.quality-review/reports/`。语义质量由维护者本地运行精修器把关；CI 只运行 `npm run ci:static`，它包含脚本语法检查、精修器纯静态/单元契约测试、`validate`、`quality:scan` 和 `quality:audit`，不会启动真实精修、判官、联网或视觉后端。
 
 ### 本地 Git hook
 
@@ -155,7 +156,7 @@ npm run hooks:install
 - [ ] 内容平台：同步内容文件、更新 topics 目录结构
 - [ ] App 平台：更新内容解析逻辑、缓存机制
 - [ ] 文档：更新 README.md、content-format.md、schema 文件
-- [ ] 验证：运行 `npm run validate` 确保内容格式正确
+- [ ] 验证：运行 `npm run ci:static` 确保内容格式、契约和确定性质量检查正确
 - [ ] 测试：在各端测试内容加载和显示
 
 #### 常见同步场景

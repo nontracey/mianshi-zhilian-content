@@ -449,7 +449,7 @@ content-repo/
 
 ### 6.6 diagram
 
-静态流程图或结构图。`format` 当前允许 `mermaid`、`svg`、`image`、`text`。
+静态流程图或结构图。`format` 当前允许 `mermaid`、`svg`、`image`、`text`。这部分是 App / Studio 共享解析契约，新增字段必须先确认三端都能忽略或渲染。
 
 ```json
 {
@@ -476,10 +476,12 @@ content-repo/
 `sources` 规则：
 
 1. 每个 source 必须有 `kind`（`svg`/`mermaid`/`text`），并且 `path` 与 `content` 二选一。
-2. `svg` 使用 `path`，必须位于 `assets/` 下，禁止绝对路径、`..` 和隐藏目录。
-3. `mermaid`/`text` 使用 `content`；渲染端按数组顺序尝试，全部失败才显示 `fallback`。
-4. 正式发布内容中，只要使用 `diagram` 或 `animation`，必须提供可读的 `fallback`、`caption` 或 text source 兜底；如果 `sources` 含 `svg`，还必须同时提供至少一层 `mermaid` 或 `text` 降级链。精修器不得生成只有 SVG path 的图解。
-5. 旧 `asset`、`svgPath`、`svg`、`content+format=mermaid` 字段继续兼容，不要求一次性迁移；但新增 SVG 资源必须真实存在于 `assets/` 下。
+2. `svg.path` 表示仓库资源，必须位于 `assets/` 下，禁止绝对路径、`..` 和隐藏目录，资源必须真实存在。
+3. `svg.content` 表示内联 SVG，必须是以 `<svg` 开头的完整 SVG 字符串；不要把 `assets/...svg` 路径塞进 `content`。
+4. `mermaid`/`text` 只能使用 `content`；渲染端按数组顺序尝试，全部失败才显示 `fallback`。
+5. 正式发布内容中，只要使用 `diagram` 或 `animation`，必须提供可读的 `fallback`、`caption` 或 text source 兜底；如果 `sources` 含 `svg`，还必须同时提供至少一层 `mermaid` 或 `text` 降级链。精修器不得生成只有 SVG path 的图解。
+6. 旧 `asset`、`svgPath`、`svg`、`content+format=mermaid` 字段继续兼容，不要求一次性迁移；但新增 SVG 资源必须真实存在于 `assets/` 下，新增内联 SVG 必须同时提供 text 或 mermaid 兜底。
+7. `compareTable` 是独立 `learningCard.type="compareTable"`，不能塞进 `diagram.sources` 作为一种 source。
 
 Mermaid 约束：
 

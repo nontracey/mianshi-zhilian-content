@@ -46,8 +46,30 @@ export const BLOCK_JUDGE_DEFAULTS = {
   retry: num("BLOCK_JUDGE_RETRY", 2),
 };
 
+export const VISION_JUDGE_DEFAULTS = {
+  temperature: num("VISION_JUDGE_TEMPERATURE", 0.1),
+  top_p: num("VISION_JUDGE_TOP_P", 0.9),
+  max_tokens: num("VISION_JUDGE_MAX_TOKENS", 4096),
+  timeoutMs: num("VISION_JUDGE_TIMEOUT_MS", 120000),
+  retry: num("VISION_JUDGE_RETRY", 2),
+  modelChain: str("VISION_JUDGE_MODEL_CHAIN", ""),
+};
+
+// 图候选生成：用于视觉判官 fail 后重生 N 候选图。
+// 优先用 free tier 模型（DIAGRAM_CANDIDATE_ALLOW_PAID=false 时强制 free）。
+export const DIAGRAM_GENERATE_DEFAULTS = {
+  temperature: num("DIAGRAM_GENERATE_TEMPERATURE", 0.4),
+  top_p: num("DIAGRAM_GENERATE_TOP_P", 0.9),
+  max_tokens: num("DIAGRAM_GENERATE_MAX_TOKENS", 8192),
+  timeoutMs: num("DIAGRAM_GENERATE_TIMEOUT_MS", 120000),
+  retry: num("DIAGRAM_GENERATE_RETRY", 2),
+  modelChain: str("DIAGRAM_CANDIDATE_MODEL_CHAIN", ""),
+};
+
 export const DEFAULTS = {
   refine: REFINE_DEFAULTS,
   judge: JUDGE_DEFAULTS,
   block_judge: BLOCK_JUDGE_DEFAULTS,
+  vision_judge: VISION_JUDGE_DEFAULTS,
+  diagram_generate: DIAGRAM_GENERATE_DEFAULTS,
 };

@@ -5,7 +5,7 @@
 
 import { openaiRunner } from "./openai-runner.mjs";
 import { createRouter } from "./router.mjs";
-import { REFINE_DEFAULTS, JUDGE_DEFAULTS, BLOCK_JUDGE_DEFAULTS } from "./defaults.mjs";
+import { REFINE_DEFAULTS, JUDGE_DEFAULTS, BLOCK_JUDGE_DEFAULTS, VISION_JUDGE_DEFAULTS, DIAGRAM_GENERATE_DEFAULTS } from "./defaults.mjs";
 
 /**
  * @typedef {Object} RunRequest
@@ -27,7 +27,7 @@ function buildRouter(defaults, envKey, overrideChain) {
   if (defaults.modelChain) {
     return createRouter({ specs: defaults.modelChain });
   }
-  return createRouter({ envKey, fallback: ["volcengine:deepseek-v4-pro", "volcengine:deepseek-v4-flash"] });
+  return createRouter({ envKey, fallback: ["zhipu:glm-4.7-flash", "longcat:LongCat-2.0-Preview"] });
 }
 
 function mergeSampling(defaults, override) {
@@ -45,6 +45,7 @@ export async function runRefine(req) {
   const router = buildRouter(REFINE_DEFAULTS, "REFINE_MODEL_CHAIN", req.modelChain);
   return router.run({
     ...req,
+    kind: "refine",
     timeoutMs: req.timeoutMs ?? REFINE_DEFAULTS.timeoutMs,
     retry: req.retry ?? REFINE_DEFAULTS.retry,
     sampling: mergeSampling(REFINE_DEFAULTS, req.sampling),
@@ -56,6 +57,7 @@ export async function runJudge(req) {
   const router = buildRouter(JUDGE_DEFAULTS, "JUDGE_MODEL_CHAIN", req.modelChain);
   return router.run({
     ...req,
+    kind: "judge",
     timeoutMs: req.timeoutMs ?? JUDGE_DEFAULTS.timeoutMs,
     retry: req.retry ?? JUDGE_DEFAULTS.retry,
     sampling: mergeSampling(JUDGE_DEFAULTS, req.sampling),
@@ -67,9 +69,34 @@ export async function runBlockJudge(req) {
   const router = buildRouter(BLOCK_JUDGE_DEFAULTS, "BLOCK_JUDGE_MODEL_CHAIN", req.modelChain);
   return router.run({
     ...req,
+    kind: "block_judge",
     timeoutMs: req.timeoutMs ?? BLOCK_JUDGE_DEFAULTS.timeoutMs,
     retry: req.retry ?? BLOCK_JUDGE_DEFAULTS.retry,
     sampling: mergeSampling(BLOCK_JUDGE_DEFAULTS, req.sampling),
+  });
+}
+
+/** 视觉评审：需要模型声明 image capability，或通过 MCP 后端走外部视觉工具。 */
+export async function runVisionJudge(req) {
+  const router = buildRouter(VISION_JUDGE_DEFAULTS, "VISION_JUDGE_MODEL_CHAIN", req.modelChain);
+  return router.run({
+    ...req,
+    kind: "vision_judge",
+    timeoutMs: req.timeoutMs ?? VISION_JUDGE_DEFAULTS.timeoutMs,
+    retry: req.retry ?? VISION_JUDGE_DEFAULTS.retry,
+    sampling: mergeSampling(VISION_JUDGE_DEFAULTS, req.sampling),
+  });
+}
+
+/** 图候选生成：视觉判官 fail 后重生 N 候选。优先 free tier，付费需 allowPaid 显式开启。 */
+export async function runDiagramGenerate(req) {
+  const router = buildRouter(DIAGRAM_GENERATE_DEFAULTS, "DIAGRAM_CANDIDATE_MODEL_CHAIN", req.modelChain);
+  return router.run({
+    ...req,
+    kind: "diagram_generate",
+    timeoutMs: req.timeoutMs ?? DIAGRAM_GENERATE_DEFAULTS.timeoutMs,
+    retry: req.retry ?? DIAGRAM_GENERATE_DEFAULTS.retry,
+    sampling: mergeSampling(DIAGRAM_GENERATE_DEFAULTS, req.sampling),
   });
 }
 
@@ -78,4 +105,4 @@ export async function runOnce(req) {
   return openaiRunner.run(req);
 }
 
-export const llmRunner = { runRefine, runJudge, runBlockJudge, runOnce };
+export const llmRunner = { runRefine, runJudge, runBlockJudge, runVisionJudge, runDiagramGenerate, runOnce };

@@ -59,6 +59,14 @@ assert_contains_out() { # 输出含某日志
 echo "########## 0) 判官纯函数单测 ##########"
 if node scripts/refine-tests/judge_unit.mjs; then PASS=$((PASS+1)); echo "  ✓ PASS [judge-unit]"; else FAIL=$((FAIL+1)); echo "  ✗ FAIL [judge-unit]"; fi
 
+echo
+echo "########## 0.1) 池化与视觉 QA 单测 ##########"
+if node scripts/refine-tests/pool_visual_unit.mjs; then PASS=$((PASS+1)); echo "  ✓ PASS [pool-visual-unit]"; else FAIL=$((FAIL+1)); echo "  ✗ FAIL [pool-visual-unit]"; fi
+
+echo
+echo "########## 0.2) 图候选选优单测 ##########"
+if node scripts/refine-tests/diagram_candidates_unit.mjs; then PASS=$((PASS+1)); echo "  ✓ PASS [diagram-candidates-unit]"; else FAIL=$((FAIL+1)); echo "  ✗ FAIL [diagram-candidates-unit]"; fi
+
 if grep -q "API 模式" scripts/quality_refine.mjs && grep -q "不再 spawn CLI" scripts/quality_refine.mjs; then
   echo
   echo "########## E2E 跳过 ##########"

@@ -5,10 +5,11 @@
 //   ② 非流式回退:provider 不支持 stream / 流式半路坏掉 → 自动切 stream:false 兜底
 //   ③ 失败分类:走 quota.classifyHttpError → quota / availability / fatal
 //   ④ schema strict（json_schema）+ 截断重试（max_tokens 翻倍上限 32k）
-//   ⑤ reasoning 模型自动加 prefix + low effort,GLM-5.1 等不失控
+//   ⑤ reasoning 模型自动加 prefix + low effort，避免把预算耗在长思考上
 
 import { envConfig } from "./env-config.mjs";
 import { classifyHttpError, looksLikeQuotaText, QuotaError, AvailabilityError } from "./quota.mjs";
+import { costTracker, estimateImageTokens } from "./cost-tracker.mjs";
 
 const DEFAULT_TIMEOUT_MS = 120000;
 const REASONING_PROMPT_PREFIX =
@@ -17,11 +18,22 @@ const REASONING_PROMPT_PREFIX =
 // 同一 spec 已知 schemaMode 缓存:首次试 json_schema 失败后记下来,后续直接用 prompt。
 const SCHEMA_MODE_CACHE = new Map(); // spec -> "json_schema" | "json_object" | "prompt"
 
-// 已知不支持 response_format 的 provider/host 提前钉成 prompt 模式,免去 2 次失败探测。
-// 火山方舟 ark coding v3 端点(volcengine)整族都不支持 response_format → 直接 prompt。
-function initialSchemaModeFor(spec) {
+// 弱/本地模型默认不用 strict json_schema 起步：这是“输出协议容错”，不是放宽验收；
+// 返回内容仍会被本地不变量、静态审计、判官和 keep-best 严格卡住。
+function initialSchemaModeFor(spec, model) {
   if (!spec) return "json_schema";
-  if (spec.startsWith("volcengine:")) return "prompt";
+  if (model?.tier === "weak") {
+    return envConfig.getEnv("LLM_WEAK_SCHEMA_MODE", "json_object");
+  }
+  if (model?.local) {
+    return envConfig.getEnv("LLM_LOCAL_SCHEMA_MODE", "prompt");
+  }
+  // 免费在线模型（glm/longcat 等）对 strict json_schema 的支持参差不齐。默认仍先试 json_schema
+  // （当前它能产出可解析、结构正确的 JSON），但允许用 LLM_FREE_SCHEMA_MODE=json_object 一键降协议。
+  // 即便起步是 json_schema，下面 runOnce 里"解析不出 JSON 就自动降协议"也会兜底，不会卡死在坏协议上。
+  if (model?.tier === "free") {
+    return envConfig.getEnv("LLM_FREE_SCHEMA_MODE", "json_schema");
+  }
   return "json_schema";
 }
 
@@ -48,18 +60,66 @@ function safeParseJson(text) {
 }
 
 function mergeSampling(modelMeta, override) {
-  const base = modelMeta.reasoning
-    ? { temperature: 0.2, top_p: 0.8, max_tokens: 16384, reasoning_effort: modelMeta.reasoningEffort || "low" }
-    : { temperature: 0.3, top_p: 0.8, max_tokens: 16384 };
+  // max_tokens 优先级：override > model.maxOutputTokens > 默认 16384
+  const defaultMaxTokens = modelMeta?.maxOutputTokens ?? (Number(envConfig.getEnv("LLM_DEFAULT_MAX_TOKENS", "16384")) || 16384);
+  const base = modelMeta?.reasoning
+    ? { temperature: 0.2, top_p: 0.8, max_tokens: defaultMaxTokens, reasoning_effort: modelMeta.reasoningEffort || "low" }
+    : { temperature: 0.3, top_p: 0.8, max_tokens: defaultMaxTokens };
   return { ...base, ...(override || {}) };
 }
 
-function buildBody({ model, systemPrompt, userPrompt, schema, sampling, stream, schemaMode = "json_schema" }) {
+function normalizeImagePart(image) {
+  if (!image) return null;
+  const url = image.url || image.dataUrl || image.image_url;
+  if (!url) return null;
+  return {
+    type: "image_url",
+    image_url: {
+      url,
+      ...(image.detail ? { detail: image.detail } : {}),
+    },
+  };
+}
+
+function normalizeAudioPart(audio) {
+  if (!audio) return null;
+  const data = audio.dataUrl || audio.data || audio.input_audio?.data;
+  if (!data) return null;
+  const format = audio.format || "mp3";
+  return {
+    type: "input_audio",
+    input_audio: { data, format },
+  };
+}
+
+// 粗估 prompt token 数（中文 1 字 ≈ 1 token，英文 4 字符 ≈ 1 token，混合按 2.5 字符/token）
+function estimatePromptTokens(systemPrompt, userPrompt) {
+  const total = String(systemPrompt ?? "").length + String(userPrompt ?? "").length;
+  return Math.ceil(total / 2.5);
+}
+
+function buildBody({ model, systemPrompt, userPrompt, schema, sampling, stream, schemaMode = "json_schema", images = [], audios = [], extraParams = {} }) {
+  const mediaParts = [];
+  for (const img of images) {
+    const part = normalizeImagePart(img);
+    if (part) mediaParts.push(part);
+  }
+  for (const au of audios) {
+    const part = normalizeAudioPart(au);
+    if (part) mediaParts.push(part);
+  }
+  const userContent = mediaParts.length
+    ? [{ type: "text", text: userPrompt }, ...mediaParts]
+    : userPrompt;
   const messages = [
     { role: "system", content: model.reasoning ? REASONING_PROMPT_PREFIX + systemPrompt : systemPrompt },
-    { role: "user", content: userPrompt },
+    { role: "user", content: userContent },
   ];
   const body = { model: model.id, messages, ...sampling };
+  // 模型级任意参数透传（如 enable_search、thinking.type）
+  if (extraParams && typeof extraParams === "object") {
+    Object.assign(body, extraParams);
+  }
   if (stream) {
     body.stream = true;
     body.stream_options = { include_usage: true };
@@ -73,7 +133,6 @@ function buildBody({ model, systemPrompt, userPrompt, schema, sampling, stream, 
     } else if (schemaMode === "json_object") {
       body.response_format = { type: "json_object" };
     } else if (schemaMode === "prompt") {
-      // 不在 body 上加 response_format,改为往 prompt 头部塞 schema 描述。
       const schemaHint = "你必须返回严格符合下面 JSON Schema 的 JSON 对象。不要任何额外解释、不要 markdown 围栏,只返回纯 JSON。\n```\n" + JSON.stringify(schema) + "\n```";
       messages[0] = { role: "system", content: schemaHint + "\n\n" + messages[0].content };
     }
@@ -216,6 +275,9 @@ async function runOnce(req) {
     retry = 3,
     onProgress,
     signal,
+    images = [],
+    audios = [],
+    extraParams,
     stream = (envConfig.getEnv("LLM_STREAM", "true") === "true"),
     lastLineMax = Number(envConfig.getEnv("SUBAGENT_LAST_LINE_MAX", "80")) || 80,
   } = req;
@@ -225,7 +287,27 @@ async function runOnce(req) {
   }
 
   const model = envConfig.resolveSpec(spec);
+  const caps = model.modality ?? model.capabilities ?? [];
+  if (images.length && !caps.includes("image")) {
+    const err = new Error(`[openai-runner] 模型不支持图像输入 spec=${spec}`);
+    err.availabilityFailure = true;
+    err.spec = spec;
+    throw err;
+  }
+  if (audios.length && !caps.includes("audio")) {
+    const err = new Error(`[openai-runner] 模型不支持音频输入 spec=${spec}`);
+    err.availabilityFailure = true;
+    err.spec = spec;
+    throw err;
+  }
+  // 长上下文 warn
+  const estTokens = estimatePromptTokens(systemPrompt, userPrompt) + images.reduce((sum, img) => sum + estimateImageTokens(img.dataUrl || img.url || ""), 0);
+  if (model.maxContext && estTokens > model.maxContext * 0.8) {
+    onProgress?.({ type: "context-warn", spec, estTokens, maxContext: model.maxContext });
+  }
   const finalSampling = mergeSampling(model, sampling);
+  // 合并模型级 extraParams + 请求级 extraParams
+  const mergedExtraParams = { ...(model.extraParams ?? {}), ...(extraParams ?? {}) };
   const url = `${model.baseUrl.replace(/\/$/, "")}/chat/completions`;
   const headers = {
     "Content-Type": "application/json",
@@ -235,11 +317,12 @@ async function runOnce(req) {
   };
 
   let useStream = !!stream;
-  let schemaMode = schema ? (SCHEMA_MODE_CACHE.get(spec) || initialSchemaModeFor(spec)) : "none";
+  let schemaMode = schema ? (SCHEMA_MODE_CACHE.get(spec) || initialSchemaModeFor(spec, model)) : "none";
   let lastErr = null;
+  const callStart = Date.now();
 
   for (let attempt = 1; attempt <= retry; attempt++) {
-    const body = buildBody({ model, systemPrompt, userPrompt, schema, sampling: finalSampling, stream: useStream, schemaMode });
+    const body = buildBody({ model, systemPrompt, userPrompt, schema, sampling: finalSampling, stream: useStream, schemaMode, images, audios, extraParams: mergedExtraParams });
 
     try {
       let result;
@@ -297,6 +380,30 @@ async function runOnce(req) {
         throw err;
       }
 
+      // 协议容错：拿到了文本但解析不出 JSON（弱/免费模型 strict json_schema 没真生效、或裹了围栏/解释）。
+      // 不抛错重试同协议，而是把该 spec 的 schemaMode 降一级（json_schema→json_object→prompt）后重试，
+      // 直到能解析出 JSON。这样弱模型也能稳定产出，不会在坏协议上空转浪费整轮生成。
+      if (schema && result && !result.parsed && (result.text || "").trim() && schemaMode !== "prompt" && attempt < retry) {
+        schemaMode = schemaMode === "json_schema" ? "json_object" : "prompt";
+        SCHEMA_MODE_CACHE.set(spec, schemaMode);
+        onProgress?.({ type: "schema-fallback", spec, mode: schemaMode, reason: "unparsable" });
+        continue;
+      }
+
+      // 成功返回 → 喂给 costTracker
+      try {
+        const imageTokens = images.reduce((sum, img) => sum + estimateImageTokens(img.dataUrl || img.url || ""), 0);
+        costTracker.record({
+          spec,
+          accountId: model.accountId,
+          kind: req.kind || "unknown",
+          inputTokens: result.usage?.inputTokens ?? estTokens,
+          outputTokens: result.usage?.outputTokens ?? 0,
+          imageTokens,
+          durationMs: result.durationMs ?? (Date.now() - callStart),
+          tier: model.tier,
+        });
+      } catch {}
       return result;
     } catch (err) {
       // 配额错误:不重试不降级,抛给 router 走暂停

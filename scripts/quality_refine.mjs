@@ -36,11 +36,21 @@ import { pauseBus } from "./llm/pause-bus.mjs";
 import { QuotaSkipped } from "./llm/router.mjs";
 import { envConfig } from "./llm/env-config.mjs";
 import { createRouter } from "./llm/router.mjs";
+import { buildVisualReview, applyVisualReviewToJudgeReview } from "./quality_visual_judge.mjs";
+import { buildFactEvidence, applyFactEvidenceToJudgeReview } from "./quality_fact_evidence.mjs";
 import {
   CONTENT_STANDARD_VERSION,
   PRODUCTION_STRICT_MIN_SCORE,
   diagramPolicyPrompt,
 } from "./quality_standard.mjs";
+import { costTracker } from "./llm/cost-tracker.mjs";
+import { probeAndDowngrade } from "./llm/capability-probe.mjs";
+import { discoverLocalModels, probeLocalModels } from "./llm/discover-local.mjs";
+import { startHealthServer } from "./llm/health-server.mjs";
+import { modelPool } from "./llm/model-pool.mjs";
+import { mcpHealthSnapshot, stopMcpClients } from "./mcp/registry.mjs";
+import { generateDiagramCandidates, scoreDiagramCandidates, selectBestCandidate, NoFreeDiagramModel } from "./diagram_candidates.mjs";
+import { probeBackends } from "./web/probe.mjs";
 
 const root = process.cwd();
 // .quality-refine 产物根目录（runDir / judge-cache / preview 全在这下面）。
@@ -55,6 +65,8 @@ const maxConcurrency = 8;
 const activeChildren = new Map(); // noop 占位,后续 edit 会从 runProcess 里移走
 let shutdownRequested = false; // 保留:Ctrl-C 时设 true,所有循环检查后退出
 let activeRunDir = null;
+let allowPaidDiagramRuntime = false;
+const diagramTopicStates = new Map(); // ref -> { diagramRetryCount: Map, previousFailures: Map }
 
 // 处理顺序：先小后大，便于早期发现问题、降低单次回滚成本（与 manual-refine 一致）。
 const DOMAIN_ORDER = [
@@ -94,8 +106,12 @@ const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任�
 - 纯概念/对比/分类类（设计模式对比、数据结构选型、安全攻击分类）：不需要 diagram 卡，用 compareTable 就够了。不要为了凑"有图"给纯概念对比画流程图。
 - 算法/数据结构/空间状态类（数组窗口、双指针、DP 表、树/图遍历 frontier、堆、链表指针、回溯搜索树）：若需要图解，优先使用 SVG 表达真实布局、状态变化或多步骤面板；Mermaid 只能用于控制流/状态机，不能把真实数据结构弱化成四个流程节点。
 - difficulty 1-2 基础题：不主动加复杂图，保持简洁；已有的简单 flowchart 或对比表保留即可。
-- 如有 svg 静态资源（assets/diagrams/*.svg），可放在 sources[0] 作为第一展示层，sources[1]=mermaid、sources[2]=text 作为降级兜底。
-- 降级链最少要有一层 mermaid 或 text 兜底。
+- App 实际渲染优先级固定为 SVG > Mermaid > Text：sources 必须按这个顺序排（svg 在前、mermaid 次之、text 最后），App 优先渲染 SVG，渲染失败才退到 mermaid，再退到 text。
+- 因此判断"这张图该用什么"时只在 SVG 与 Mermaid 之间选主表达层；text 不是可选的展示形态，而是 App 两层都渲染挂掉时的纯文字兜底——你不要用 text 当主图，但必须把 text 兜底写成"脱离图也能独立看懂、且贴合本 topic 真实机制"的说明（≥30 字），不能是"见上图""如图所示"这类离了图就无意义的话。
+- 主表达层选择：本 topic 需要表达真实空间/状态/数据结构形态（数组窗口、指针移动、DP 表、树/图遍历、内存引用链、包结构等）→ 优先 SVG 主图；只是结构关系/协议交互/状态机/架构边界 → Mermaid 主图就够，不必为"高级"硬造 SVG。
+- 已有 SVG 的处理：SVG 质量好（承载真实机制、移动端可读、不是 mermaid 换皮）就保留/微调；SVG 很差（文字过密、重叠、无额外信息）优先把 SVG 改好，而不是删成 mermaid；确实只需 mermaid 时才可降级，但要保证信息不丢。
+- 原先没有 SVG 但本 topic 明显适合 SVG（属于上面的空间/状态/数据结构类）→ 应新增一张承载真实结构的 SVG 作为主图。
+- 降级链最少要有一层 mermaid 或 text 兜底；含 svg 时必须同时有 mermaid 或 text 兜底，三层内容都要贴合 topic、各自能独立看懂。
 - SVG 不是天然更好：如果 SVG 只是 Mermaid 换皮、文字过密、移动端看不清、没有表达更多机制，应改用 Mermaid/compareTable/text。
 - Mermaid 不是天然低级：如果 sequenceDiagram/stateDiagram/flowchart+subgraph 已经清楚表达交互、状态或架构边界，不要为了"高级"强行生成 SVG。
 - 严禁图解退化：原 topic 已有 SVG 且表达了真实空间结构、步骤状态或数据结构细节时，候选必须保留同等或更强的信息量；可以移除装饰性/错误 SVG，但必须证明文字、表格、Mermaid 或重画后的图更清楚。
@@ -137,13 +153,14 @@ const REFINE_SPEC = `你是资深技术面试内容主笔 + 领域专家。任�
 // ===== API 模式（v3）=====
 // 不再 spawn CLI：所有 LLM 调用走 scripts/llm/runner.mjs。
 // response_format=json_schema + 截断自动重试 + 模型链降级，全在 runner.mjs 里处理。
-// 旧版 qwen headless / computer-use / MCP 不变量已不适用，全部弃用。
+// 旧版 qwen headless / computer-use 文件协议已不适用；MCP 现在只作为可选外部质量工具接口
+// （视觉 QA / 联网事实依据），不再参与旧 CLI 路由。
 
 // qwen 显式路由 + 结构化输出 schema 旧实现已删除 ——
 // ① 路由（--bare + OPENAI_BASE_URL 直连）由 env-config.mjs 的 baseUrl 字段直接管，runner.mjs 透传；
 // ② 结构化 schema 由 quality_llm_judge.mjs 的 JUDGE_REVIEW_SCHEMA / QWEN_JUDGE_BATCH_SCHEMA / QWEN_BLOCK_JUDGE_SCHEMA 提供（顶层 additionalProperties:false + required 钉键），在 quality_refine.mjs 顶部已 import。
 // 精修结构化 schema：递归镜像当前 topic 的结构，给每一层 array/object/标量都显式标 type。
-// 关键修复（2026-06-14）：原实现只把每个顶层 key 列成空 schema {}（无 type）。火山 minimax-m3 在
+// 关键修复（2026-06-14）：原实现只把每个顶层 key 列成空 schema {}（无 type）。部分 OpenAI-compatible provider 在
 // structured_output 下遇到"无 type 的属性 + 数组值"会把数组包成 {"item":[...]} 对象——learningCards /
 // recallPrompts / tags / rubric.mustHave / interviewAnswer.followUpQuestions / checklist.items 全中招，
 // 于是 looksLikeTopicContract 的 Array.isArray(learningCards) 必失败 → 凡是真调了模型的篇统统报
@@ -680,7 +697,7 @@ function strictParseJudgeJson(text, label) {
 }
 
 // 单次判官调用：API 模式 —— 调 llmRunner.runJudge（自动应用 JUDGE_MODEL_CHAIN + 默认采样 + 降级 + 截断重试）。
-async function runJudgeProcessJson(prompt, judge, model, ref, index, schema) {
+async function runJudgeProcessJson(prompt, judge, model, ref, index, schema, images = []) {
   void judge; // API 模式不需要 judge.cliPath / judge.cfg
   const finalSchema = schema ?? JUDGE_REVIEW_SCHEMA;
   const attempts = judge?.jsonRetries ? judge.jsonRetries + 1 : 1;
@@ -697,6 +714,7 @@ async function runJudgeProcessJson(prompt, judge, model, ref, index, schema) {
         userPrompt: prompt,
         schema: finalSchema,
         modelChain: model ? [model] : undefined,
+        images,
         onProgress: (e) => {
           if (e.type === "token") {
             liveEvents.emitEvent("llm.token", {
@@ -720,23 +738,64 @@ async function runJudgeProcessJson(prompt, judge, model, ref, index, schema) {
   throw lastError ?? new Error(`判官失败：${ref}`);
 }
 
-function judgeCacheFile(topic, judge) {
-  const contentHash = sha256(JSON.stringify(topic));
-  return path.join(judge.cacheDir, `${contentHash.slice(0, 16)}-${JUDGE_RUBRIC_VERSION}-${judge.setHash}.json`);
+async function buildExternalJudgeContext(topic, ref) {
+  const [visualReview, factEvidence] = await Promise.all([
+    buildVisualReview(topic, ref),
+    buildFactEvidence(topic, ref),
+  ]);
+  const hasExternalSignal =
+    (visualReview?.visualFit === "fail") ||
+    ((visualReview?.findings ?? []).length > 0) ||
+    ((visualReview?.candidateRanking ?? []).length > 0) ||
+    (factEvidence?.status && factEvidence.status !== "not_checked") ||
+    ((factEvidence?.findings ?? []).length > 0) ||
+    ((factEvidence?.sources ?? []).length > 0);
+  return {
+    visualReview,
+    factEvidence,
+    cacheKey: hasExternalSignal ? sha256(JSON.stringify({
+      visual: {
+        backend: visualReview?.backend,
+        visualFit: visualReview?.visualFit,
+        summary: visualReview?.summary,
+        findings: visualReview?.findings,
+        ranking: visualReview?.candidateRanking,
+      },
+      fact: {
+        status: factEvidence?.status,
+        summary: factEvidence?.summary,
+        findings: factEvidence?.findings,
+        sources: factEvidence?.sources,
+      },
+    })).slice(0, 12) : "",
+  };
 }
 
-function readJudgeCache(topic, judge) {
+function applyExternalJudgeContext(review, context) {
+  let out = review;
+  out = applyVisualReviewToJudgeReview(out, context?.visualReview);
+  out = applyFactEvidenceToJudgeReview(out, context?.factEvidence);
+  return out;
+}
+
+function judgeCacheFile(topic, judge, context = {}) {
+  const contentHash = sha256(JSON.stringify(topic));
+  const contextHash = context.cacheKey ? `-${context.cacheKey}` : "";
+  return path.join(judge.cacheDir, `${contentHash.slice(0, 16)}-${JUDGE_RUBRIC_VERSION}-${judge.setHash}${contextHash}.json`);
+}
+
+function readJudgeCache(topic, judge, context) {
   try {
-    return JSON.parse(readFileSync(judgeCacheFile(topic, judge), "utf8"));
+    return JSON.parse(readFileSync(judgeCacheFile(topic, judge, context), "utf8"));
   } catch {
     return null;
   }
 }
 
-async function writeJudgeCache(topic, judge, review) {
+async function writeJudgeCache(topic, judge, review, context) {
   try {
     await mkdir(judge.cacheDir, { recursive: true });
-    await writeFile(judgeCacheFile(topic, judge), `${JSON.stringify(review, null, 2)}\n`);
+    await writeFile(judgeCacheFile(topic, judge, context), `${JSON.stringify(review, null, 2)}\n`);
   } catch {
     // 缓存写失败不影响主流程
   }
@@ -745,20 +804,41 @@ async function writeJudgeCache(topic, judge, review) {
 // 对一篇内容跑全部判官（模型 × 数量），按 contentHash 缓存聚合结果。判官全失败时返回 null（退回静态护栏）。
 async function runJudges(topic, ref, judge) {
   if (!judge?.enabled) return null;
-  const cached = readJudgeCache(topic, judge);
-  if (cached) return cached;
-  const prompt = buildJudgePrompt(topic, ref);
+  const externalContext = await buildExternalJudgeContext(topic, ref);
+  const cached = readJudgeCache(topic, judge, externalContext);
+  if (cached) return applyExternalJudgeContext(cached, externalContext);
+  // v3.3 判官看图：根据判官 chain 第一个模型的 imageUnderstanding 模式准备 visualUnderstanding
+  const judgeModel = judge.models.find(Boolean);
+  const judgeModelMeta = judgeModel ? envConfig.findModel(judgeModel) : null;
+  const understandingMode = judgeModelMeta?.imageUnderstanding ?? "none";
+  if (understandingMode !== "none" && externalContext.visualReview) {
+    const vu = { mode: understandingMode, staticFindings: externalContext.visualReview.findings ?? [] };
+    if (understandingMode === "native" && externalContext.visualReview.artifacts) {
+      vu.images = externalContext.visualReview.artifacts.slice(0, 4).map((a) => ({ dataUrl: a.dataUrl, detail: "high" }));
+    } else if (understandingMode === "mcp" && /mcp/i.test(externalContext.visualReview.backend ?? "")) {
+      vu.mcpDescription = {
+        backend: externalContext.visualReview.backend,
+        summary: externalContext.visualReview.summary,
+        candidateRanking: externalContext.visualReview.candidateRanking,
+      };
+    }
+    externalContext.visualUnderstanding = vu;
+  }
+  const built = buildJudgePrompt(topic, ref, externalContext);
+  const prompt = typeof built === "string" ? built : built.prompt;
+  const judgeImages = typeof built === "object" && built ? (built.images ?? []) : [];
   const reviews = [];
   for (const model of judge.models) {
     for (let index = 0; index < judge.count; index += 1) {
       if (shutdownRequested) break;
       try {
-        const parsed = await runJudgeProcessJson(prompt, judge, model, ref, index);
+        // 只给 image-capable 模型传 images（避免不支持图的模型 400）
+        const modelMeta = envConfig.findModel(model);
+        const imagesForThisModel = (modelMeta && (modelMeta.modality ?? []).includes("image")) ? judgeImages : [];
+        const parsed = await runJudgeProcessJson(prompt, judge, model, ref, index, undefined, imagesForThisModel);
         reviews.push(normalizeJudgeReview(parsed));
       } catch (error) {
         if (error.interrupted) throw error;
-        // 判官协议失败（多次重试仍写坏 JSON）也只降级、绝不上抛——否则判前 runJudges 会一路抛穿
-        // worker(无 catch) 把整轮 run 崩掉。这里当"该判官此次不可用"，reviews 为空时返回 null → 退回静态护栏。
         const tag = error.judgeProtocolFailure ? "JSON协议失败(降级静态)" : "评审失败";
         console.log(`[JUDGE] ${tag} ${ref} m=${model ?? "默认"} #${index + 1}: ${error.message}`);
       }
@@ -766,8 +846,8 @@ async function runJudges(topic, ref, judge) {
   }
   if (!reviews.length) return null;
   const agg = aggregateReviews(reviews);
-  await writeJudgeCache(topic, judge, agg);
-  return agg;
+  await writeJudgeCache(topic, judge, agg, externalContext);
+  return applyExternalJudgeContext(agg, externalContext);
 }
 
 async function runJudgeBatch(items, judge) {
@@ -863,6 +943,31 @@ async function warmJudgeCacheForTargets(refs, judge, cfg = {}) {
   const cachedTopics = refs.length - missing.length;
   if (!missing.length) {
     if (cfg.progressStyle !== "quiet") console.log(`[判官] 判前缓存命中 ${refs.length}/${refs.length}，无需预热`);
+    return;
+  }
+  const externalSignalsEnabled =
+    /^(1|true|yes|on)$/i.test(envConfig.getEnv("VISION_JUDGE_ENABLED", "false")) ||
+    /^(1|true|yes|on)$/i.test(envConfig.getEnv("FACT_CHECK_ENABLED", "false"));
+  if (externalSignalsEnabled) {
+    const requestedWarm = Math.max(1, Number(judge.warmConcurrency ?? cfg.concurrency ?? 1));
+    const warmConcurrency = Math.min(requestedWarm, missing.length);
+    if (cfg.progressStyle !== "quiet") {
+      console.log(`[判官] 外部视觉/联网上下文已启用，改用单篇上下文预热 missing=${missing.length} 并发=${warmConcurrency}（避免 batch 缓存失配白跑）`);
+    }
+    let cursor = 0;
+    async function singleWarmWorker() {
+      while (cursor < missing.length) {
+        if (shutdownRequested || costTracker.exceeded) return;
+        const item = missing[cursor++];
+        try {
+          await runJudges(item.topic, item.ref, judge);
+        } catch (error) {
+          if (error.interrupted) throw error;
+          console.log(`[判官] 单篇上下文预热失败 ${item.ref}: ${error.message}`);
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: warmConcurrency }, () => singleWarmWorker()));
     return;
   }
   const batches = [];
@@ -1175,6 +1280,11 @@ ${issueBlock}
 ${templateBlock}${judgeBlock}
 【降低格式出错的关键做法（务必照做）】下面【当前 topic JSON】本身就是一份格式完全正确的模板。请把它当基底：保持所有字段名、括号层级、引号转义方式与它一致，只改写需要提升的"文字内容"，不要重排结构、不要新造字段名、不要改动你没必要改的部分的标点与转义。这样能把 JSON 格式出错概率降到最低——记住：我们要的失败是"内容不够好"，绝不接受"少括号/少逗号/裸引号/中英文标点"这类格式失败。
 
+【弱模型执行顺序（按顺序做，降低漏改）】
+1. 先只读【本篇被扣分的具体缺口】和【动态判官缺口】，列出本篇必须修的 3-6 个具体点（内部完成，不要输出）。
+2. 再按卡片逐块改：explain 补机制/边界/取舍，interviewAnswer 补 30 秒结论与追问答案，rubric 去模板化，diagram/compareTable 只在确实更清楚时调整。
+3. 最后自检：id/domain/category/status/metadata 不变，updatedAt=${todayYmd}，learningCards/recallPrompts/rubric 结构不变，图解有 fallback/caption/text 兜底，输出仍是单个完整 JSON 对象。
+
 ${cachePath ? `【输出要求】不要在 stdout 输出 JSON 内容、不要解释、不要 markdown 代码围栏。把改写后的完整 topic JSON 对象（从 { 开始到 } 结束、单一对象、合法 JSON）写入下面这个绝对路径的文件：
 ${cachePath}
 
@@ -1277,6 +1387,178 @@ function checkDiagramModalityInvariants(original, parsed) {
     }
   }
   return null;
+}
+
+// ===== 落盘前确定性修复（弱模型友好）=====
+// 目标：模型只负责"改文字"，凡是它无权改 / 易写错的机械格式，由驱动确定性恢复或归一，
+// 不让一个 mermaid 头或一个元数据漂移把整篇昂贵的生成丢掉重来。
+// 顺序：恢复身份/元数据/难度/日期 → 补回被删字段 → 归一 mermaid → 坏图恢复原有效图(绝不降级 text) → 归一 rubric 权重。
+const LOCKED_META_KEYS = ["tags", "group", "order", "interviewFrequency", "recommendWeight", "prerequisites", "leetcodeUrl", "sourceRef"];
+
+// 归一 mermaid 头：剥 ``` 围栏、去头部 %% 指令/注释/空行、bare flowchart/graph 补方向。
+function normalizeMermaidHead(content) {
+  let text = typeof content === "string" ? content : "";
+  text = text.replace(/^\s*```(?:mermaid)?\s*/i, "").replace(/```\s*$/i, "");
+  const lines = text.split(/\r?\n/);
+  while (lines.length && /^\s*(?:%%.*)?$/.test(lines[0])) lines.shift();
+  text = lines.join("\n").trim();
+  text = text.replace(/^(\s*(?:flowchart|graph))\s*(?=\r?\n|$)/i, "$1 TD");
+  return text;
+}
+
+// 与 checkInvariants 里 mermaid 规则一一对应：判断归一后是否仍非法（→ 触发降级）。
+function mermaidContentBad(content, allowComplex) {
+  const s = typeof content === "string" ? content : "";
+  const headRe = allowComplex
+    ? /^\s*(?:(?:flowchart|graph)\s+(?:TB|TD|BT|LR|RL)|stateDiagram(?:-v2)?|sequenceDiagram)\b/
+    : /^\s*(?:flowchart|graph)\s+(?:TB|TD|BT|LR|RL)\b/;
+  const blacklist = allowComplex
+    ? /\b(?:classDiagram|gantt|pie|journey|erDiagram|mindmap)\b/
+    : /\b(?:subgraph|classDef|style|sequenceDiagram|classDiagram|stateDiagram|mindmap|gantt|pie|journey|erDiagram)\b/;
+  if (!headRe.test(s)) return true;
+  if (blacklist.test(s)) return true;
+  if (allowComplex) {
+    if (/^\s*style\s+/m.test(s)) return true;
+    for (const line of s.split(/\r?\n/).map((e) => e.trim()).filter((e) => e.startsWith("classDef "))) {
+      if (!/^classDef\s+(ok|warn|fail|async|highlight)\s+fill:#[0-9a-fA-F]{6}(?:,stroke:#[0-9a-fA-F]{6})?(?:,color:#[0-9a-fA-F]{6})?$/.test(line)) return true;
+    }
+  }
+  return false;
+}
+
+// 找原 topic 里和这张坏图最匹配的有效 diagram 卡（按标题归一匹配，再退到同序位）。
+function findOriginalDiagramFor(card, original, candidatePos) {
+  const origDiagrams = (original?.learningCards ?? [])
+    .filter((c) => c?.type === "diagram" || c?.type === "animation");
+  if (!origDiagrams.length) return null;
+  const titleNorm = normalizeForMatch(card?.title ?? "");
+  if (titleNorm) {
+    const byTitle = origDiagrams.find((c) => normalizeForMatch(c.title ?? "") === titleNorm);
+    if (byTitle) return byTitle;
+  }
+  // 退而求其次：按 diagram 卡在各自序列里的相对顺序对齐——仅当原 topic 真的有同序位图时才恢复，
+  // 否则（如模型凭空新增第 N 张图而原 topic 只有 < N 张）返回 null，交给上层重生，避免把原图复制成重复图。
+  return origDiagrams[candidatePos] ?? null;
+}
+
+// 从一张（原始）diagram 卡里取出一段合法的 mermaid 源码：优先 mermaid source，其次 format=mermaid 的 content。无则 null。
+function extractValidMermaid(card, allowComplex) {
+  if (!card || typeof card !== "object") return null;
+  const candidates = [];
+  if (Array.isArray(card.sources)) for (const s of card.sources) if (s?.kind === "mermaid" && typeof s.content === "string") candidates.push(s.content);
+  if (card.format === "mermaid" && typeof card.content === "string") candidates.push(card.content);
+  for (const c of candidates) {
+    const normalized = normalizeMermaidHead(c);
+    if (!mermaidContentBad(normalized, allowComplex)) return normalized;
+  }
+  return null;
+}
+
+// mermaid 无法挽救时，用原 topic 已上线的有效图覆盖回去（原地保留数组序位）。绝不降级成纯文字。
+// 返回 true=成功恢复成一张有效图；false=原 topic 没有可恢复的图（交给上层 focused 重生）。
+function restoreOriginalDiagramCard(card, original, candidatePos) {
+  const orig = findOriginalDiagramFor(card, original, candidatePos);
+  if (!orig) return false;
+  for (const k of Object.keys(card)) delete card[k];
+  Object.assign(card, cloneJson(orig));
+  return true;
+}
+
+// 主修复入口：原地修 parsed。返回 { parsed, notes, needsDiagramRegen }。
+// needsDiagramRegen = 归一后 mermaid 仍非法、且原 topic 也没有可恢复图的卡片下标（交给 focused 重生）。
+function repairTopic(original, parsed, todayYmd, allowComplex) {
+  const notes = [];
+  const needsDiagramRegen = [];
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { parsed, notes, needsDiagramRegen };
+  for (const key of ["id", "domain", "category"]) {
+    if (parsed[key] !== original[key]) { parsed[key] = original[key]; notes.push(`恢复 ${key}`); }
+  }
+  if (parsed.status !== "production") { parsed.status = "production"; notes.push("status→production"); }
+  if (typeof original.difficulty === "number" && (typeof parsed.difficulty !== "number" || parsed.difficulty < original.difficulty)) {
+    parsed.difficulty = original.difficulty; notes.push("恢复 difficulty");
+  }
+  for (const key of LOCKED_META_KEYS) {
+    if (key in original && JSON.stringify(parsed[key]) !== JSON.stringify(original[key])) {
+      parsed[key] = cloneJson(original[key]); notes.push(`恢复元数据 ${key}`);
+    }
+  }
+  for (const key of Object.keys(original)) {
+    if (!(key in parsed)) { parsed[key] = cloneJson(original[key]); notes.push(`补回字段 ${key}`); }
+  }
+  if (parsed.updatedAt !== todayYmd) parsed.updatedAt = todayYmd;
+  const cards = Array.isArray(parsed.learningCards) ? parsed.learningCards : [];
+  const dropIdx = [];
+  let diagramPos = -1;
+  for (let ci = 0; ci < cards.length; ci += 1) {
+    const card = cards[ci];
+    if (!card || typeof card !== "object") continue;
+    const isDiagram = card.type === "diagram" || card.type === "animation";
+    if (isDiagram) diagramPos += 1;
+    if (card.type === "diagram" && card.format === "mermaid" && typeof card.content === "string") {
+      card.content = normalizeMermaidHead(card.content);
+    }
+    if (Array.isArray(card.sources)) {
+      for (const src of card.sources) {
+        if (src?.kind === "mermaid" && typeof src.content === "string") src.content = normalizeMermaidHead(src.content);
+      }
+    }
+    const mermaidContents = [];
+    if (card.type === "diagram" && card.format === "mermaid") mermaidContents.push(card.content);
+    if (Array.isArray(card.sources)) for (const src of card.sources) if (src?.kind === "mermaid") mermaidContents.push(src.content);
+    if (mermaidContents.some((c) => mermaidContentBad(c, allowComplex))) {
+      // App 渲染优先级 SVG > mermaid > text。坏的只是 mermaid 兜底层时，绝不能因此丢掉（可能已优化的）SVG 主图。
+      if (cardHasSvg(card)) {
+        // 该卡仍有 SVG 主图：只修 mermaid 兜底层——能从原卡恢复有效 mermaid 就恢复，否则丢掉坏 mermaid，保留 SVG+text。
+        const origCard = findOriginalDiagramFor(card, original, diagramPos);
+        const origMermaid = extractValidMermaid(origCard, allowComplex);
+        if (Array.isArray(card.sources)) {
+          card.sources = card.sources.filter((src) => {
+            if (src?.kind !== "mermaid") return true;
+            if (!mermaidContentBad(src.content, allowComplex)) return true;
+            if (origMermaid) { src.content = origMermaid; return true; }
+            return false; // 丢掉无法挽救的 mermaid 兜底，SVG 主图与 text 兜底仍在
+          });
+        }
+        if (card.format === "mermaid" && mermaidContentBad(card.content, allowComplex)) {
+          // format 标成 mermaid 但其实有 SVG：纠正为 svg 主图；content 用有效 mermaid 或清空
+          card.format = "svg";
+          if (origMermaid) card.content = origMermaid; else delete card.content;
+        }
+        notes.push(`图「${card.title ?? ""}」mermaid 兜底非法→保留 SVG 主图，仅修复降级链`);
+      } else if (restoreOriginalDiagramCard(card, original, diagramPos)) {
+        // 无 SVG，mermaid 即主图：用原 topic 已上线的有效图恢复（不低于上线质量），绝不降级成纯文字。
+        notes.push(`图「${card.title ?? ""}」mermaid 主图非法→恢复原有效图`);
+      } else {
+        // 模型凭空新增、mermaid 又坏、原 topic 也无图可恢复：标记待 focused 重生；
+        // 若删掉它后整篇仍满足"≥1 compareTable/diagram/code"，先删占位避免污染；否则留着走重试（绝不降级）。
+        needsDiagramRegen.push({ index: ci, title: card.title ?? "", card: cloneJson(card) });
+        const othersCoverReq = cards.some((c, j) => j !== ci && ["compareTable", "diagram", "code"].includes(c?.type));
+        if (othersCoverReq) { dropIdx.push(ci); notes.push(`图「${card.title ?? ""}」mermaid 非法且无原图→暂移除待重生`); }
+        else notes.push(`图「${card.title ?? ""}」mermaid 非法且无原图→保留待重试/重生`);
+      }
+    }
+  }
+  if (dropIdx.length) parsed.learningCards = cards.filter((_, j) => !dropIdx.includes(j));
+  const w = parsed.rubric?.scoreWeights;
+  if (w && typeof w === "object") {
+    const keys = ["coverage", "accuracy", "interviewExpression", "depth"];
+    const allNum = keys.every((k) => Number.isFinite(Number(w[k])));
+    if (allNum) {
+      const vals = keys.map((k) => Number(w[k]));
+      const sum = vals.reduce((a, b) => a + b, 0);
+      if (sum > 0 && sum !== 100) {
+        const scaled = vals.map((v) => Math.round((v / sum) * 100));
+        const diff = 100 - scaled.reduce((a, b) => a + b, 0);
+        scaled[scaled.indexOf(Math.max(...scaled))] += diff;
+        keys.forEach((k, i) => { w[k] = scaled[i]; });
+        notes.push(`rubric 权重归一 ${sum}→100`);
+      }
+    } else if (original.rubric?.scoreWeights) {
+      parsed.rubric.scoreWeights = cloneJson(original.rubric.scoreWeights);
+      notes.push("rubric 权重缺键→恢复原值");
+    }
+  }
+  return { parsed, notes, needsDiagramRegen };
 }
 
 // 落盘前的 schema 不变量：只防"身份被改 / 内容被掏空 / 结构损坏"，质量好坏交给审计判。
@@ -2048,8 +2330,51 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
         // {item:[...]} 对象"这种 schema 坑误导成"只剩 8 个键/丢内容"，排查走了弯路。
         throw new Error(`CLI 输出 JSON 不是当前 topic 契约（${describeContractMiss(parsed, original)}）`);
       }
+      // 确定性修复：先把模型无权改 / 易写错的机械格式恢复或归一，避免一个 mermaid 头/权重和把整篇丢弃重来。
+      // 坏图绝不降级成纯文字：优先恢复原有效图；新增坏图无原图可恢复时交给下面的图候选选优重生。
+      const { notes: repairNotes, needsDiagramRegen } = repairTopic(original, parsed, new Date().toISOString().slice(0, 10), allowComplexMermaid);
+      if (needsDiagramRegen?.length) {
+        console.log(`[REPAIR] ${ref} ${needsDiagramRegen.length} 张新增图 mermaid 非法且无原图可恢复，交给图候选选优重生：${needsDiagramRegen.map((d) => d.title).join("、")}`);
+      }
+      if (repairNotes.length) {
+        console.log(`[REPAIR] ${ref} 确定性修复 ${repairNotes.length} 处：${repairNotes.slice(0, 6).join("；")}${repairNotes.length > 6 ? " …" : ""}`);
+      }
       const bad = checkInvariants(original, parsed);
       if (bad) throw new Error(`schema 不变量失败：${bad}`);
+
+      // v3.3 图候选选优 phase：判前 visualFit=fail 或 diagramModalityFinding.visualFit=fail 时触发
+      // 对每张坏图产 N 候选 → 视觉判官打分 → 选最优替换；全 fail 兜底保留旧版
+      if (!writeTo && diagramCandidateEnabled()) {
+        const trigger = shouldTriggerDiagramCandidate(original, parsed, beforeReview);
+        if (trigger) {
+          phase("diagramCandidate");
+          try {
+            const result = await runDiagramCandidatePass(original, parsed, ref, trigger, ensureDiagramTopicState(ref));
+            if (result.replaced) {
+              parsed = result.topic;
+              console.log(`[DIAGRAM] ${ref} 替换 ${result.replacedCount}/${trigger.badCards.length} 张图（${result.summary}）`);
+              // 替换后重新过 invariants
+              const reBad = checkInvariants(original, parsed);
+              if (reBad) {
+                console.log(`[DIAGRAM] ${ref} 替换后 invariants 失败（${reBad}），回滚到候选原版`);
+                parsed = result.originalParsed;
+              }
+            } else if (result.stuck) {
+              console.log(`[DIAGRAM] ${ref} 图候选选优 stuck（连续失败），保留旧版图`);
+            }
+          } catch (e) {
+            if (e instanceof NoFreeDiagramModel) {
+              // preflight 应该已经拦截，这里兜底
+              console.warn(`[DIAGRAM] ${ref} 跳过：${e.message}`);
+            } else if (!e.interrupted) {
+              console.warn(`[DIAGRAM] ${ref} 候选选优失败（忽略，继续原流程）：${e.message}`);
+            } else {
+              throw e;
+            }
+          }
+        }
+      }
+
       if (writeTo) {
         // 预览模式：直接写候选产物，不做 keep-best（预览本就是看"这次会改成什么样"）。
         await mkdir(path.dirname(writeTo), { recursive: true });
@@ -2353,6 +2678,7 @@ class LiveDashboard {
     this.repaintTimer = null;
     this.originalWrite = null;
     this.originalErrWrite = null;
+    this.liveEventHandler = null;
     this.painting = false; // 防止 paint 内部 write 触发递归
     this.dirty = false;
   }
@@ -2388,6 +2714,14 @@ class LiveDashboard {
       this.paint();
     }, 1000);
     this.repaintTimer.unref?.();
+    this.liveEventHandler = (evt) => {
+      const line = formatDashboardEvent(evt);
+      if (!line) return;
+      this.state.lastEvents = [line, ...(this.state.lastEvents ?? [])].slice(0, 5);
+      this.dirty = true;
+      this.paint();
+    };
+    liveEvents.on("event", this.liveEventHandler);
   }
 
   disable() {
@@ -2396,9 +2730,11 @@ class LiveDashboard {
     if (this.originalWrite) this.stream.write = this.originalWrite;
     if (this.originalErrWrite) process.stderr.write = this.originalErrWrite;
     if (this.repaintTimer) clearInterval(this.repaintTimer);
+    if (this.liveEventHandler) liveEvents.off("event", this.liveEventHandler);
     this.repaintTimer = null;
     this.originalWrite = null;
     this.originalErrWrite = null;
+    this.liveEventHandler = null;
     this.enabled = false;
   }
 
@@ -2574,6 +2910,11 @@ class LiveDashboard {
       }
     }
 
+    if (this.state.lastEvents?.length) {
+      lines.push(`├─ 运行信号 ${"─".repeat(Math.max(0, width - 12))}`);
+      for (const line of this.state.lastEvents) lines.push(` · ${truncate(line, width - 4)}`);
+    }
+
     lines.push(`╰${sep.slice(1)}`);
     return lines;
   }
@@ -2586,20 +2927,21 @@ function phaseLabel(phase) {
     starting: "启动",
     judgeBefore: "判前",
     refineCall: "生成",
+    diagramCandidate: "图候选",
     blockJudge: "块判",
     judgeAfter: "判后",
     merging: "写回",
   }[phase] ?? phase ?? "?";
 }
 
-// 子 agent 行展示用的 spec 缩写: "volcengine:glm-5.1" → "glm-5.1@vol"
+// 子 agent 行展示用的 spec 缩写: "zhipu:glm-4.7-flash" → "glm-4.7-flash@zhi"
 function shortSpec(spec) {
   if (!spec) return "";
   const idx = spec.indexOf(":");
   if (idx < 0) return spec;
   const provider = spec.slice(0, idx);
   const model = spec.slice(idx + 1);
-  const provShort = provider === "volcengine" ? "vol" : provider === "deepseek" ? "ds" : provider === "opencode" ? "oc" : provider === "longcat" ? "lc" : provider === "baidu" ? "bd" : provider === "mimo" ? "mi" : provider.slice(0, 3);
+  const provShort = provider === "zhipu" ? "zhi" : provider === "longcat" ? "lon" : provider.slice(0, 3);
   return `${model}@${provShort}`;
 }
 
@@ -2607,6 +2949,31 @@ function formatTok(n) {
   if (n == null) return "?";
   if (n < 1000) return String(n);
   return `${(n / 1000).toFixed(1)}k`;
+}
+
+function formatDashboardEvent(evt) {
+  if (!evt?.type) return "";
+  if (evt.type === "cost.tick") {
+    const total = evt.tokens?.total ?? evt.tokens ?? 0;
+    const budget = evt.budgetPct != null ? ` / 预算 ${evt.budgetPct.toFixed(1)}%` : "";
+    return `成本 $${Number(evt.totalUsd ?? 0).toFixed(4)} · token ${formatTok(total)}${budget}`;
+  }
+  if (evt.type === "mcp.unhealthy") {
+    return `MCP ${evt.server} unhealthy ${Math.ceil(Math.max(0, (evt.until ?? Date.now()) - Date.now()) / 1000)}s`;
+  }
+  if (evt.type === "llm.pool.unhealthy") {
+    return `模型隔离 ${shortSpec(evt.spec)} ${Math.ceil(Math.max(0, (evt.until ?? Date.now()) - Date.now()) / 1000)}s`;
+  }
+  if (evt.type === "diagram.candidates") {
+    return `图候选 ${compactRef(evt.ref, 28)} · ${evt.cardTitle ?? ""} · N=${evt.count}${evt.previousFailureCount ? ` · 带反馈 ${evt.previousFailureCount}` : ""}`;
+  }
+  if (evt.type === "diagram.selected") {
+    return `图选择 ${compactRef(evt.ref, 28)} · ${evt.cardTitle ?? ""} · ${evt.format}${evt.keptOld ? " 保留旧版" : ` score=${evt.score}`}${evt.stuck ? " stuck" : ""}`;
+  }
+  if (evt.type === "factcheck.done") {
+    return `事实核验 ${compactRef(evt.ref, 28)} · ${evt.backend} · sources=${evt.sources ?? 0}`;
+  }
+  return "";
 }
 
 function truncate(s, max) {
@@ -2620,6 +2987,7 @@ function phaseBucket(phase) {
   // 用于心跳行的 "判官=A 生成=B" 概览。
   if (phase === "judgeBefore" || phase === "blockJudge" || phase === "judgeAfter") return "judge";
   if (phase === "refineCall") return "gen";
+  if (phase === "diagramCandidate") return "gen";
   return "other";
 }
 
@@ -2666,6 +3034,7 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
   async function worker() {
     while (index < targets.length) {
       if (shutdownRequested) throw makeInterruptedError();
+      if (costTracker.exceeded) return;
       const ref = targets[index++];
       const model = currentModel(modelState);
       const itemStartedAt = Date.now();
@@ -2746,6 +3115,9 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
       else if (outcome === "merged") counters.merged += 1;
       else if (outcome === "kept") counters.kept += 1;
       else counters.failed += 1;
+      if (costTracker.exceeded) {
+        console.log(`[BUDGET] 已达到预算上限，停止领取新 topic：${costTracker.exceededReason}`);
+      }
       const snapshot = {
         processed: counters.processed,
         total: counters.total,
@@ -2998,6 +3370,480 @@ async function writeRunState(runDir, patch) {
   await writeFile(file, `${JSON.stringify(next, null, 2)}\n`).catch(() => {});
 }
 
+function strictStartupEnabled(profile) {
+  if (profile === "quick" || profile === "offline") return false;
+  const raw = envConfig.getEnv("QUALITY_REFINE_STRICT_STARTUP", "true");
+  return /^(1|true|yes|on)$/i.test(raw);
+}
+
+function hardPreflight(message, hints = []) {
+  console.error(`\x1b[31m[preflight] ${message}\x1b[0m`);
+  for (const hint of hints) console.error(`  - ${hint}`);
+  process.exit(1);
+}
+
+function parseModelChainEnv(key) {
+  return String(envConfig.getEnv(key) ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+function usableFreeModels(chain) {
+  return envConfig.pickUsableFreeModels(chain);
+}
+
+function firstModelTier(spec) {
+  return spec ? envConfig.findModel(spec)?.tier ?? "unknown" : "unknown";
+}
+
+// v3.3 启动 preflight：检查基础链路，输出彩色能力表。
+// 严格质量能力（事实/视觉/判官独立性）在拿到 targetRefs 后由 topicAwarePreflight 再按目标集判断。
+function preflightChecks({ judge, allowPaidDiagram, profile, refineChainOverride = [] }) {
+  const lines = [];
+  const enabled = [];
+  const downgraded = [];
+  const missing = [];
+  const strictStartup = strictStartupEnabled(profile);
+
+  // 1. 精修模型链
+  const refineChainFromEnv = parseModelChainEnv("REFINE_MODEL_CHAIN");
+  const refineChain = refineChainOverride.filter(Boolean).length ? refineChainOverride.filter(Boolean) : refineChainFromEnv;
+  if (!refineChain.length) {
+    hardPreflight("REFINE_MODEL_CHAIN 为空。", ["请在 .env 配置精修模型链。"]);
+  }
+  enabled.push(`精修链：${refineChain.join(", ")}`);
+
+  // 2. 判官模型链
+  if (judge?.enabled) {
+    const judgeChain = judge.models.filter(Boolean).length
+      ? judge.models.filter(Boolean)
+      : parseModelChainEnv("JUDGE_MODEL_CHAIN");
+    if (!judgeChain.length) {
+      hardPreflight("判官已启用但模型链为空。", ["配置 JUDGE_MODEL_CHAIN，或显式加 --no-judge（严格启动会拒绝无判官精修）。"]);
+    }
+    enabled.push(`判官链：${judgeChain.join(", ")} ×${judge.count}`);
+    const sameAsRefine = judgeChain.length === 1 && refineChain.length && judgeChain[0] === refineChain[0];
+    if (strictStartup && sameAsRefine && ["weak", "local"].includes(firstModelTier(judgeChain[0]))) {
+      hardPreflight(
+        `严格启动要求判官独立于弱/本地精修模型，当前 judge=${judgeChain[0]} 与 refine 首模型相同。`,
+        ["配置更强或至少独立的 JUDGE_MODEL_CHAIN；弱模型适合“改”，不适合单独当最终裁判。"],
+      );
+    }
+  } else {
+    if (strictStartup) {
+      hardPreflight("严格启动不允许关闭判官。", ["去掉 --no-judge，或设置 QUALITY_REFINE_STRICT_STARTUP=false 进入非严格试跑。"]);
+    }
+    downgraded.push("判官：关闭（仅静态 keep-best）");
+  }
+
+  // 3. 视觉判官
+  const visionEnabled = /^(1|true|yes|on)$/i.test(envConfig.getEnv("VISION_JUDGE_ENABLED", "false"));
+  const visionMcp = envConfig.getEnv("VISION_JUDGE_MCP_TOOLS") || envConfig.getEnv("VISION_JUDGE_MCP_TOOL");
+  const visionChain = parseModelChainEnv("VISION_JUDGE_MODEL_CHAIN");
+  const visionImageModels = visionChain.filter((spec) => envConfig.modelSupports(spec, "image"));
+  if (visionEnabled) {
+    if (visionMcp) {
+      enabled.push(`视觉判官：MCP(${visionMcp})` + (visionImageModels.length ? ` + LLM(${visionImageModels.join(",")})` : ""));
+    } else if (visionImageModels.length) {
+      enabled.push(`视觉判官：LLM image-capable(${visionImageModels.join(",")})`);
+    } else {
+      downgraded.push("视觉判官：VISION_JUDGE_ENABLED=true 但无 MCP 也无 image-capable 模型 → 降级为静态 SVG QA");
+    }
+  } else if (profile !== "offline") {
+    missing.push("视觉判官（VISION_JUDGE_ENABLED=false）");
+  }
+
+  // 4. 联网事实核验
+  const factEnabled = /^(1|true|yes|on)$/i.test(envConfig.getEnv("FACT_CHECK_ENABLED", "false"));
+  if (factEnabled) {
+    const factMcp = envConfig.getEnv("FACT_CHECK_MCP_TOOLS") || envConfig.getEnv("FACT_CHECK_MCP_TOOL");
+    const factBackend = envConfig.getEnv("FACT_CHECK_BACKEND", "auto");
+    if (factMcp) {
+      enabled.push(`联网事实核验：MCP(${factMcp})`);
+    } else if (factBackend !== "none") {
+      enabled.push(`联网事实核验：内置 backend=${factBackend}`);
+    } else {
+      downgraded.push("联网事实核验：FACT_CHECK_ENABLED=true 但无 MCP 且 backend=none → 降级为 not_checked");
+    }
+  } else if (profile !== "offline") {
+    missing.push("联网事实核验（FACT_CHECK_ENABLED=false）");
+  }
+
+  // 5. 图候选生成
+  const diagramEnabled = /^(1|true|yes|on)$/i.test(envConfig.getEnv("DIAGRAM_CANDIDATE_ENABLED", "true"));
+  if (diagramEnabled && profile !== "quick") {
+    const diagramChain = parseModelChainEnv("DIAGRAM_CANDIDATE_MODEL_CHAIN");
+    const sourceChain = diagramChain.length ? diagramChain : refineChain;
+    const freeModels = usableFreeModels(sourceChain);
+    if (freeModels.length) {
+      enabled.push(`图候选生成：free 模型 ${freeModels.join(", ")}`);
+    } else if (allowPaidDiagram) {
+      enabled.push(`图候选生成：付费授权（${sourceChain.join(", ")}）`);
+    } else {
+      downgraded.push("图候选生成：当前没有可用 free 模型且未授权付费；若目标集含 diagram/animation，目标集 preflight 会阻断启动");
+    }
+  } else if (diagramEnabled && profile === "quick") {
+    downgraded.push("图候选生成：quick profile 下跳过");
+  } else {
+    missing.push("图候选生成（DIAGRAM_CANDIDATE_ENABLED=false）");
+  }
+
+  // 输出彩色能力表
+  console.log("\n\x1b[36m===== Preflight 能力表 =====\x1b[0m");
+  for (const line of enabled) console.log(`\x1b[32m[已启用]\x1b[0m ${line}`);
+  for (const line of downgraded) console.log(`\x1b[33m[已降级]\x1b[0m ${line}`);
+  for (const line of missing) console.log(`\x1b[90m[未配置]\x1b[0m ${line}`);
+  const { expired, soon } = expiringModelsNotice();
+  for (const line of expired) console.log(`\x1b[31m[已过期]\x1b[0m ${line}（已自动停用并从模型链跳过；可删 .env 里对应 LLM_MODEL_<别名>_* 块或从 LLM_CUSTOM_MODELS 去掉别名）`);
+  for (const line of soon) console.log(`\x1b[33m[即将过期]\x1b[0m ${line}`);
+  console.log(`\x1b[36mprofile=${profile} strictStartup=${strictStartup} allowPaidDiagram=${allowPaidDiagram}\x1b[0m\n`);
+}
+
+// 扫描所有已配置模型的有效期：返回已过期 / N 天内即将过期的清单（供 preflight 提醒）。
+function expiringModelsNotice() {
+  const now = Date.now();
+  const warnDays = Number(envConfig.getEnv("MODEL_EXPIRY_WARN_DAYS", "7")) || 7;
+  const soonMs = warnDays * 86400000;
+  const expired = [];
+  const soon = [];
+  for (const m of envConfig.listModels({ includeExpired: true })) {
+    if (m.expiresAt == null) continue;
+    const spec = `${m.provider}:${m.id}`;
+    const day = new Date(m.expiresAt).toISOString().slice(0, 10);
+    if (now > m.expiresAt) expired.push(`${spec}（有效期至 ${day}）`);
+    else if (m.expiresAt - now <= soonMs) soon.push(`${spec}（有效期至 ${day}，约 ${Math.ceil((m.expiresAt - now) / 86400000)} 天后到期）`);
+  }
+  return { expired, soon };
+}
+
+function factBackendReady() {
+  const enabled = /^(1|true|yes|on)$/i.test(envConfig.getEnv("FACT_CHECK_ENABLED", "false"));
+  if (!enabled) return { ok: false, reason: "FACT_CHECK_ENABLED=false" };
+  const backend = String(envConfig.getEnv("FACT_CHECK_BACKEND", "auto")).toLowerCase();
+  const mcpTools = envConfig.getEnv("FACT_CHECK_MCP_TOOLS") || envConfig.getEnv("FACT_CHECK_MCP_TOOL");
+  if (backend === "none") return { ok: false, reason: "FACT_CHECK_BACKEND=none" };
+  if (backend === "mcp" && !mcpTools) return { ok: false, reason: "FACT_CHECK_BACKEND=mcp 但未配置 FACT_CHECK_MCP_TOOLS" };
+  if (backend === "google-cse" && (!envConfig.getEnv("FACT_CHECK_API_KEY") || !envConfig.getEnv("FACT_CHECK_CX"))) {
+    return { ok: false, reason: "google-cse 需要 FACT_CHECK_API_KEY + FACT_CHECK_CX" };
+  }
+  if (backend === "bing" && !(envConfig.getEnv("FACT_CHECK_API_KEY") || envConfig.getEnv("BING_API_KEY"))) {
+    return { ok: false, reason: "bing 需要 FACT_CHECK_API_KEY 或 BING_API_KEY" };
+  }
+  return { ok: true, backend, mcpTools };
+}
+
+function visionBackendReady() {
+  const enabled = /^(1|true|yes|on)$/i.test(envConfig.getEnv("VISION_JUDGE_ENABLED", "false"));
+  if (!enabled) return { ok: false, reason: "VISION_JUDGE_ENABLED=false" };
+  const mcpTools = envConfig.getEnv("VISION_JUDGE_MCP_TOOLS") || envConfig.getEnv("VISION_JUDGE_MCP_TOOL");
+  if (mcpTools) return { ok: true, backend: `mcp:${mcpTools}` };
+  const imageModels = parseModelChainEnv("VISION_JUDGE_MODEL_CHAIN")
+    .filter((spec) => envConfig.modelSupports(spec, "image") && envConfig.modelHasKey(spec));
+  if (imageModels.length) return { ok: true, backend: `llm:${imageModels.join(",")}` };
+  return { ok: false, reason: "未配置视觉 MCP，且 VISION_JUDGE_MODEL_CHAIN 没有可用 image-capable 模型" };
+}
+
+function topicCapabilityProfile(targetRefs) {
+  const profile = {
+    total: targetRefs.length,
+    diagramTopics: 0,
+    svgTopics: 0,
+    animationTopics: 0,
+    diagramCards: 0,
+    svgCards: 0,
+    samples: [],
+  };
+  for (const ref of targetRefs) {
+    try {
+      const topic = JSON.parse(readFileSync(path.join(root, ref), "utf8"));
+      const cards = topicDiagramCards(topic);
+      const svgCards = cards.filter(cardHasSvg);
+      if (cards.length) {
+        profile.diagramTopics += 1;
+        profile.diagramCards += cards.length;
+      }
+      if (svgCards.length) {
+        profile.svgTopics += 1;
+        profile.svgCards += svgCards.length;
+      }
+      if (cards.some((card) => card.type === "animation")) profile.animationTopics += 1;
+      if ((cards.length || svgCards.length) && profile.samples.length < 5) profile.samples.push(ref);
+    } catch {}
+  }
+  return profile;
+}
+
+async function topicAwarePreflight(targetRefs, { judge, profile, allowPaidDiagram, refineChainOverride = [] } = {}) {
+  const strictStartup = strictStartupEnabled(profile);
+  if (!strictStartup) return;
+  const caps = topicCapabilityProfile(targetRefs);
+  if (!judge?.enabled) {
+    hardPreflight("严格目标集启动要求动态判官开启。", ["不要使用 --no-judge；9 维动态评估是防止多轮降级的主闸。"]);
+  }
+  const fact = factBackendReady();
+  if (!fact.ok && targetRefs.length) {
+    hardPreflight(
+      `严格目标集启动要求联网事实核验可用，当前不可用：${fact.reason}`,
+      ["设置 FACT_CHECK_ENABLED=true 且 FACT_CHECK_BACKEND=auto（零配置优先 Baidu/Sogou/DuckDuckGo），或配置 FACT_CHECK_MCP_TOOLS。"],
+    );
+  }
+  if (fact.ok && fact.backend === "auto" && !fact.mcpTools) {
+    const probe = await probeBackends();
+    const usable = probe.filter((entry) => entry.ok);
+    if (!usable.length) {
+      hardPreflight(
+        "严格启动要求内置联网事实核验至少有一个可达后端，但 auto 探测全部失败。",
+        [`探测结果：${probe.map((entry) => `${entry.backend}=${entry.ok ? "ok" : entry.reason}`).join("; ")}`],
+      );
+    }
+    fact.backend = usable[0].backend;
+  }
+  if (caps.svgTopics > 0) {
+    const vision = visionBackendReady();
+    if (!vision.ok) {
+      hardPreflight(
+        `目标集含 SVG 图解（${caps.svgCards} 张 / ${caps.svgTopics} 篇），但视觉判官不可用：${vision.reason}`,
+        [
+          "配置 VISION_JUDGE_ENABLED=true + VISION_JUDGE_MCP_TOOLS，或配置 image-capable VISION_JUDGE_MODEL_CHAIN。",
+          `样例：${caps.samples.join(", ")}`,
+        ],
+      );
+    }
+  }
+  if (caps.diagramTopics > 0 && diagramCandidateEnabled()) {
+    const diagramChain = parseModelChainEnv("DIAGRAM_CANDIDATE_MODEL_CHAIN");
+    const refineChain = refineChainOverride.filter(Boolean).length ? refineChainOverride.filter(Boolean) : parseModelChainEnv("REFINE_MODEL_CHAIN");
+    const sourceChain = diagramChain.length ? diagramChain : refineChain;
+    const freeModels = usableFreeModels(sourceChain);
+    if (!freeModels.length && !allowPaidDiagram) {
+      hardPreflight(
+        `目标集含 diagram/animation（${caps.diagramCards} 张 / ${caps.diagramTopics} 篇），但图候选生成没有可用 free 模型且未授权付费。`,
+        ["配置可用 tier=free 模型，或加 --allow-paid-diagram。坏图需要候选选优链才能稳定修复。"],
+      );
+    }
+  }
+  console.log(
+    `[preflight] 目标集能力检查通过：topics=${caps.total} diagramTopics=${caps.diagramTopics} svgTopics=${caps.svgTopics} fact=${fact.backend} strict=true`,
+  );
+}
+
+// v3.3 profile 预设：quick / deep / offline
+function applyProfile(args) {
+  const profile = String(args.profile ?? "deep").toLowerCase();
+  if (!["quick", "deep", "offline"].includes(profile)) {
+    throw new Error(`--profile 必须是 quick | deep | offline，实际 ${profile}`);
+  }
+  // quick：单轮、关联网、关图重生
+  if (profile === "quick") {
+    process.env.DIAGRAM_CANDIDATE_ENABLED = "false";
+    process.env.FACT_CHECK_ENABLED = "false";
+  }
+  // offline：禁联网、禁 MCP、仅本地模型 + 静态 QA
+  if (profile === "offline") {
+    process.env.FACT_CHECK_ENABLED = "false";
+    process.env.VISION_JUDGE_ENABLED = "false";
+    process.env.FACT_CHECK_BACKEND = "none";
+  }
+  // deep：默认全开（用户可在 .env 进一步调）
+  return profile;
+}
+
+// v3.3 state.json：持久化 costTracker + autoscale + diagramStuck
+async function writeV33State(runDir, data) {
+  const file = path.join(runDir, "v33-state.json");
+  await writeFile(file, `${JSON.stringify(data, null, 2)}\n`).catch(() => {});
+}
+
+async function readV33State(runDir) {
+  try {
+    const file = path.join(runDir, "v33-state.json");
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch { return null; }
+}
+
+function ensureDiagramTopicState(ref) {
+  if (!diagramTopicStates.has(ref)) {
+    diagramTopicStates.set(ref, { diagramRetryCount: new Map(), previousFailures: new Map() });
+  }
+  const state = diagramTopicStates.get(ref);
+  if (!(state.diagramRetryCount instanceof Map)) state.diagramRetryCount = new Map(Object.entries(state.diagramRetryCount ?? {}));
+  if (!(state.previousFailures instanceof Map)) state.previousFailures = new Map(Object.entries(state.previousFailures ?? {}));
+  return state;
+}
+
+function serializeDiagramTopicStates() {
+  return Object.fromEntries([...diagramTopicStates.entries()].map(([ref, state]) => [
+    ref,
+    {
+      diagramRetryCount: Object.fromEntries(state.diagramRetryCount ?? []),
+      previousFailures: Object.fromEntries(state.previousFailures ?? []),
+    },
+  ]));
+}
+
+function restoreDiagramTopicStates(raw) {
+  if (!raw || typeof raw !== "object") return 0;
+  let restored = 0;
+  for (const [ref, state] of Object.entries(raw)) {
+    diagramTopicStates.set(ref, {
+      diagramRetryCount: new Map(Object.entries(state?.diagramRetryCount ?? {})),
+      previousFailures: new Map(Object.entries(state?.previousFailures ?? {})),
+    });
+    restored += 1;
+  }
+  return restored;
+}
+
+function v33StateSnapshot() {
+  return {
+    costTracker: costTracker.serialize(),
+    poolSnapshot: modelPool?.snapshot?.() ?? [],
+    diagramStates: serializeDiagramTopicStates(),
+    localLatencies: envConfig.localLatencySnapshot(),
+  };
+}
+
+async function persistV33State(runDir) {
+  await writeV33State(runDir, v33StateSnapshot());
+}
+
+// v3.3 图候选选优 helper
+function diagramCandidateEnabled() {
+  return /^(1|true|yes|on)$/i.test(envConfig.getEnv("DIAGRAM_CANDIDATE_ENABLED", "true"));
+}
+
+// 判断是否该触发图候选重生：visualFit=fail / SVG 被删 / 判官建议该加 SVG 但当前没有
+function shouldTriggerDiagramCandidate(original, parsed, beforeReview) {
+  const badCards = [];
+  // 1. 判前 visualFit=fail
+  if (beforeReview?.diagramModalityFinding?.visualFit === "fail") {
+    const cards = (parsed.learningCards ?? []).filter((c) => c?.type === "diagram" || c?.type === "animation");
+    badCards.push(...cards);
+  }
+  // 2. SVG 被删且信息量退化（原版有 SVG，候选没有 + 没有 mermaid/text 替代）
+  const originalCards = (original.learningCards ?? []).filter((c) => c?.type === "diagram" || c?.type === "animation");
+  const parsedCards = (parsed.learningCards ?? []).filter((c) => c?.type === "diagram" || c?.type === "animation");
+  for (const oldCard of originalCards) {
+    const oldTitle = oldCard.title ?? "";
+    const newCard = parsedCards.find((c) => (c.title ?? "") === oldTitle);
+    if (newCard && cardHasSvg(oldCard) && !cardHasSvg(newCard) && !cardHasMermaidOrTextFallback(newCard)) {
+      if (!badCards.includes(newCard)) badCards.push(newCard);
+    }
+  }
+  // 3. 判官建议该用 SVG 但当前不适配（"该加/该换 svg"）——即使 visualFit 没 fail 也走专用图生成器择优。
+  //    仅当模型精修后 parsed 仍没有 SVG 时才触发（模型自己已经加好 SVG 就交给后面的 keep-best 评估，不重复生成）。
+  const finding = beforeReview?.diagramModalityFinding;
+  if (finding && finding.isCurrentFormatFit === false && finding.recommendedFormat === "svg") {
+    const alreadyHasSvg = parsedCards.some((c) => cardHasSvg(c));
+    if (!alreadyHasSvg) {
+      if (parsedCards.length) {
+        // 已有 diagram 卡（如 mermaid）→ 升级它：生成 svg/mermaid/compareTable 候选，视觉择优；低于现有形态会被 keep-best 挡。
+        for (const c of parsedCards) if (!badCards.includes(c)) badCards.push(c);
+      } else {
+        // 完全没有 diagram 卡 → 造一张占位卡，候选选优成功后插入（绝不无脑插，质量差由 selectBestCandidate + keep-best 挡）。
+        badCards.push({ __insert: true, type: "diagram", title: `${parsed.title ?? original.title ?? "核心机制"}图解`, recommendedFormat: "svg", reason: finding.reason ?? "" });
+      }
+    }
+  }
+  return badCards.length ? { badCards } : null;
+}
+
+// 图候选重生主流程：对每张坏图调 generateDiagramCandidates → scoreDiagramCandidates → selectBestCandidate
+// topicState：per-topic 跨 attempt 状态 { diagramRetryCount: Map<cardTitle, count>, previousFailures: Map<cardTitle, string[]> }
+async function runDiagramCandidatePass(original, parsed, ref, trigger, topicState = {}) {
+  const allowPaid = allowPaidDiagramRuntime || /^(1|true|yes|on)$/i.test(envConfig.getEnv("DIAGRAM_CANDIDATE_ALLOW_PAID", "false"));
+  const maxRetries = Number(envConfig.getEnv("DIAGRAM_CANDIDATE_MAX_RETRIES", "2")) || 2;
+  if (!topicState.diagramRetryCount) topicState.diagramRetryCount = new Map();
+  if (!topicState.previousFailures) topicState.previousFailures = new Map();
+  const originalParsed = JSON.parse(JSON.stringify(parsed));
+  const replaced = [];
+  const stuck = [];
+  const failedThisPass = [];
+  const skippedStuck = [];
+  for (const badCard of trigger.badCards) {
+    const cardKey = badCard.title ?? `(idx:${(parsed.learningCards ?? []).indexOf(badCard)})`;
+    // K3 stuck 检测：该图已达 max retries → 跳过
+    if ((topicState.diagramRetryCount.get(cardKey) ?? 0) >= maxRetries) {
+      skippedStuck.push(cardKey);
+      continue;
+    }
+    try {
+      // K2 反馈循环：喂回上一版 fail findings
+      const previousFailures = topicState.previousFailures.get(cardKey) ?? null;
+      liveEvents.emitEvent("diagram.candidates", {
+        ref, cardTitle: cardKey, count: Number(envConfig.getEnv("DIAGRAM_CANDIDATE_COUNT", "3")) || 3, previousFailureCount: previousFailures?.length ?? 0,
+      });
+      const generated = await generateDiagramCandidates(parsed, badCard, ref, { allowPaid, previousFailures });
+      if (!generated.candidates.length) {
+        const nextCount = (topicState.diagramRetryCount.get(cardKey) ?? 0) + 1;
+        topicState.diagramRetryCount.set(cardKey, nextCount);
+        failedThisPass.push(cardKey);
+        if (nextCount >= maxRetries) stuck.push(cardKey);
+        continue;
+      }
+      const scored = await scoreDiagramCandidates(generated.candidates, parsed, ref);
+      const selection = selectBestCandidate(scored, badCard);
+      if (selection.best) {
+        const idx = (parsed.learningCards ?? []).findIndex((c) => (c.title ?? "") === (badCard.title ?? ""));
+        if (idx >= 0) {
+          parsed.learningCards[idx] = selection.best.card;
+          replaced.push({ title: cardKey, format: selection.best.format, score: selection.best.score });
+          // 成功 → 清掉该图的失败计数 + previousFailures
+          topicState.diagramRetryCount.delete(cardKey);
+          topicState.previousFailures.delete(cardKey);
+          liveEvents.emitEvent("diagram.selected", {
+            ref, cardTitle: cardKey, format: selection.best.format, score: selection.best.score, keptOld: false,
+          });
+        } else if (badCard.__insert) {
+          // "该加 svg"：topic 原本没有 diagram 卡，候选选优通过（视觉 score≥50 且非 fail）才插入。
+          // 插在最后一张 explain 之后（紧贴讲解），否则追加末尾；最终是否留下由后续整篇 keep-best/acceptByJudge 决定。
+          if (!Array.isArray(parsed.learningCards)) parsed.learningCards = [];
+          let insertAt = parsed.learningCards.length;
+          for (let i = 0; i < parsed.learningCards.length; i += 1) if (parsed.learningCards[i]?.type === "explain") insertAt = i + 1;
+          parsed.learningCards.splice(insertAt, 0, selection.best.card);
+          replaced.push({ title: cardKey, format: selection.best.format, score: selection.best.score, inserted: true });
+          topicState.diagramRetryCount.delete(cardKey);
+          topicState.previousFailures.delete(cardKey);
+          liveEvents.emitEvent("diagram.selected", {
+            ref, cardTitle: cardKey, format: selection.best.format, score: selection.best.score, keptOld: false, inserted: true,
+          });
+        }
+      } else {
+        // K2/K3：失败 → 累计 retry + 把这版的 fail findings 喂回下次
+        const nextCount = (topicState.diagramRetryCount.get(cardKey) ?? 0) + 1;
+        topicState.diagramRetryCount.set(cardKey, nextCount);
+        const failFindings = scored
+          .filter((s) => s.review?.visualFit === "fail")
+          .flatMap((s) => (s.review?.findings ?? []).map((f) => ({ issue: f.issue, requiredFix: f.requiredFix })))
+          .slice(0, 5);
+        if (failFindings.length) topicState.previousFailures.set(cardKey, failFindings);
+        failedThisPass.push(cardKey);
+        if (nextCount >= maxRetries) stuck.push(cardKey);
+        liveEvents.emitEvent("diagram.selected", {
+          ref, cardTitle: cardKey, format: "kept-old", score: 0, keptOld: true, retryCount: nextCount, stuck: nextCount >= maxRetries,
+        });
+      }
+    } catch (e) {
+      if (e instanceof NoFreeDiagramModel) throw e;
+      const nextCount = (topicState.diagramRetryCount.get(cardKey) ?? 0) + 1;
+      topicState.diagramRetryCount.set(cardKey, nextCount);
+      failedThisPass.push(cardKey);
+      if (nextCount >= maxRetries) stuck.push(cardKey);
+    }
+  }
+  return {
+    replaced: replaced.length > 0,
+    replacedCount: replaced.length,
+    stuck: stuck.length > 0,
+    stuckCount: stuck.length,
+    failedThisPassCount: failedThisPass.length,
+    skippedStuck,
+    summary: replaced.length
+      ? `成功 ${replaced.map((r) => `${r.format}(${r.score})`).join(", ")}`
+      : `本次未选中（失败 ${failedThisPass.length} 张，真正 stuck ${stuck.length} 张，已达 maxRetries=${maxRetries} 的 ${skippedStuck.length} 张已跳过）`,
+    topic: parsed,
+    originalParsed,
+  };
+}
+
 async function main() {
   const runStartedAt = Date.now(); // 全程墙钟起点：汇总里报"本次执行多久"
   const args = parseArgs();
@@ -3122,15 +3968,34 @@ async function main() {
   const completedFromProgress = resumeRequested ? readCompletedRefsFromProgress(progressPath) : new Map();
   if (resumeRequested) {
     console.log(`[RESUME] runDir=${path.relative(root, runDir)} 已有完成记录 ${completedFromProgress.size} 条`);
+    // v3.3 K1：恢复 costTracker + autoscale 状态
+    const v33State = await readV33State(runDir);
+    if (v33State?.costTracker) {
+      costTracker.restore(v33State.costTracker);
+      console.log(`[RESUME] 恢复 costTracker：${costTracker.summary().calls} 次调用累计 $${costTracker.summary().cost.totalUsd.toFixed(4)}`);
+    }
+    if (v33State?.poolSnapshot && Array.isArray(v33State.poolSnapshot)) {
+      const restored = modelPool.restoreSnapshot(v33State.poolSnapshot);
+      console.log(`[RESUME] 恢复 autoscale：${restored} 个队列 limit`);
+    }
+    const diagramRestored = restoreDiagramTopicStates(v33State?.diagramStates);
+    if (diagramRestored) console.log(`[RESUME] 恢复图候选状态：${diagramRestored} 篇`);
+    for (const item of v33State?.localLatencies ?? []) {
+      if (item?.spec && item?.latencyMs) envConfig.setLocalLatency(item.spec, item.latencyMs);
+    }
   }
   const modelState = makeModelState(modelChain, degradeAfter, degradeWindowSeconds * 1000);
 
-  // ===== 动态判官配置（默认开；模型默认跟精修主模型一致；支持多模型 × 每模型多实例）=====
+  // ===== 动态判官配置（默认开；优先用 JUDGE_MODEL_CHAIN；支持多模型 × 每模型多实例）=====
   const judgeDisabled = Boolean(args["no-judge"]);
   const judgeCli = args["judge-cli"] ?? cli;
+  const judgeModelsFromEnv = String(envConfig.getEnv("JUDGE_MODEL_CHAIN") ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
   const judgeModels = args["judge-models"]
     ? String(args["judge-models"]).split(",").map((entry) => entry.trim()).filter(Boolean)
-    : [modelChain[0]]; // 默认 = 精修主模型（modelChain[0]，可能是 undefined=CLI 默认）
+    : (judgeModelsFromEnv.length ? judgeModelsFromEnv : [modelChain[0]]);
   const judgeCount = Number(args["judge-count"] ?? 1);
   const dynamicSkipMin = Number(args["dynamic-skip-min"] ?? args["dynamic-pass-min"] ?? args["dynamic-min"] ?? PRODUCTION_STRICT_MIN_SCORE);
   const judgeBatchSize = Number(args["judge-batch-size"] ?? 1);
@@ -3172,6 +4037,80 @@ async function main() {
     console.log("判官：已关闭（--no-judge），仅静态 keep-best。");
   }
 
+  // ===== v3.3 新参数：profile / preflight / costTracker / capability-probe / healthServer =====
+  const profile = applyProfile(args);
+  envConfig.reload(); // applyProfile 写 process.env 后刷新 env-config 缓存
+  const allowPaidDiagram = Boolean(args["allow-paid-diagram"]) || /^(1|true|yes|on)$/i.test(envConfig.getEnv("DIAGRAM_CANDIDATE_ALLOW_PAID", "false"));
+  allowPaidDiagramRuntime = allowPaidDiagram;
+  const healthPort = args["health-port"] ? Number(args["health-port"]) : null;
+  const maxTokensPerRun = args["max-tokens-per-run"] ? Number(args["max-tokens-per-run"]) : null;
+  const maxCostPerRun = args["max-cost-per-run"] ? Number(args["max-cost-per-run"]) : null;
+  const maxLocalGpuSeconds = args["max-local-gpu-seconds"] ? Number(args["max-local-gpu-seconds"]) : null;
+
+  // costTracker 预算
+  costTracker.setBudget({ maxTokensPerRun, maxCostPerRun, maxLocalGpuSeconds });
+
+  // 本地模型自动发现（可选）
+  if (/^(1|true|yes|on)$/i.test(envConfig.getEnv("LLM_AUTODISCOVER_LOCAL", "false"))) {
+    try {
+      const { models: localModels, sources } = await discoverLocalModels();
+      if (localModels.length) {
+        console.log(`[discover-local] 从 ${sources.join(", ")} 发现 ${localModels.length} 个本地模型`);
+        // 通过 LLM_MODELS_JSON 注入：env-config reload 后才能生效
+        const existing = envConfig.getEnv("LLM_MODELS_JSON");
+        const merged = existing ? JSON.parse(existing).concat(localModels) : localModels;
+        process.env.LLM_MODELS_JSON = JSON.stringify(merged);
+        envConfig.reload();
+      }
+    } catch (e) {
+      console.warn(`[discover-local] 失败（忽略）：${e.message}`);
+    }
+  }
+
+  try {
+    const localProbe = await probeLocalModels();
+    const ok = localProbe.filter((item) => item.ok);
+    if (ok.length) {
+      console.log(`[local-probe] 本地模型可达 ${ok.length}/${localProbe.length}：${ok.map((item) => `${item.spec}=${item.latencyMs}ms`).join(", ")}`);
+    }
+  } catch (e) {
+    console.warn(`[local-probe] 失败（忽略）：${e.message}`);
+  }
+
+  // 模型能力启动探测要在 preflight 前跑，这样 preflight 看到的是降级后的真实能力。
+  if (profile !== "offline") {
+    try {
+      const { downgraded: dg } = await probeAndDowngrade({
+        onDowngrade: (spec, error) => console.warn(`[capability-probe] ${spec} 不支持图像（${error}）→ 降级 imageUnderstanding`),
+      });
+      if (dg.length) console.warn(`[capability-probe] ${dg.length} 个模型降级：${dg.join(", ")}`);
+    } catch (e) {
+      console.warn(`[capability-probe] 探测失败（忽略）：${e.message}`);
+    }
+  }
+
+  // preflight 检查（不在 auditOnly/preview 模式跑）
+  if (!auditOnly && !previewMode) {
+    preflightChecks({ judge, allowPaidDiagram, profile, refineChainOverride: modelChain.filter(Boolean) });
+  }
+
+  // 健康检查 HTTP 端点
+  let healthServer = null;
+  if (healthPort) {
+    healthServer = startHealthServer({
+      port: healthPort,
+      getState: () => ({
+        profile,
+        cost: costTracker.summary(),
+        poolHealth: modelPool?.healthSnapshot?.() ?? null,
+        activeRunDir: activeRunDir ? path.relative(root, activeRunDir) : null,
+      }),
+      pause: () => pauseBus.pause({ source: "health-http" }),
+      resume: () => pauseBus.resume({ source: "health-http" }),
+    });
+    console.log(`[health] http://127.0.0.1:${healthPort}/ 监听中（GET / 状态 / POST /pause /resume）`);
+  }
+
   // 测试/预览模式：精修单篇，结果写到 .quality-refine/preview/（不动仓库），打印路径供 sh 渲染。
   if (previewMode) {
     const audit = await runAudit(minScore, cfg);
@@ -3204,6 +4143,7 @@ async function main() {
   const initialAudit = await runAudit(minScore, cfg);
   const targetRefs = resolveTargetRefs(initialAudit, scope, options, topicFilters);
   if (!targetRefs.length) throw new Error(`scope=${scope} 内没有可精修 topic。`);
+  await topicAwarePreflight(targetRefs, { judge, profile, allowPaidDiagram, refineChainOverride: modelChain.filter(Boolean) });
   const targetSet = new Set(targetRefs);
   const initialFailing = new Set(initialAudit.failingTopics.map((topic) => topic.ref).filter((ref) => targetSet.has(ref)));
   console.log(
@@ -3278,6 +4218,10 @@ async function main() {
 
   for (let round = 1; round <= maxRounds; round += 1) {
     if (shutdownRequested) throw makeInterruptedError();
+    if (costTracker.exceeded) {
+      console.log(`[BUDGET] 预算已超限，停止进入下一轮：${costTracker.exceededReason}`);
+      break;
+    }
     await writeRunState(runDir, { status: "running", round, stage: "audit" });
     dashboard.setStage("① 全量审计", { round, maxRounds });
     const audit = await runAudit(minScore, cfg);
@@ -3318,6 +4262,11 @@ async function main() {
     await writeRunState(runDir, { status: "running", round, stage: "judge-warm", roundTargets: ordered });
     dashboard.setStage("② 判官预热", { round, maxRounds });
     await warmJudgeCacheForTargets(ordered, judge, cfg);
+    if (costTracker.exceeded) {
+      console.log(`[BUDGET] 判官预热后预算超限，跳过本轮精修：${costTracker.exceededReason}`);
+      await persistV33State(runDir);
+      break;
+    }
 
     await writeRunState(runDir, { status: "running", round, stage: "refine", roundTargets: ordered });
     dashboard.setStage("③ 精修", { round, maxRounds });
@@ -3339,6 +4288,11 @@ async function main() {
     console.log(
       `[round ${round}] 完成：已达标(免改) ${counters.good}，整篇写回 ${counters.written}，块级合并 ${counters.merged}，保留旧版(未改善) ${counters.kept}，失败 ${counters.failed}`,
     );
+    await persistV33State(runDir);
+    if (costTracker.exceeded) {
+      console.log(`[BUDGET] 本轮结束后预算超限，优雅停止：${costTracker.exceededReason}`);
+      break;
+    }
   }
 
   // 最终审计 + 汇总
@@ -3440,16 +4394,50 @@ async function main() {
     stillFailingDetail: stillFailing
       .map((ref) => ({ ref, score: finalAudit.failingMap.get(ref).score, issues: finalAudit.failingMap.get(ref).issues }))
       .sort((a, b) => a.score - b.score),
+    // v3.3 新增：成本 / 池健康 / profile / budget
+    cost: costTracker.summary(),
+    poolHealth: modelPool?.healthSnapshot?.() ?? null,
+    mcpHealth: (() => { try { return mcpHealthSnapshot(); } catch { return []; } })(),
+    profile,
+    budgetExceeded: costTracker.exceeded,
+    budgetExceededReason: costTracker.exceededReason,
+    diagramStates: serializeDiagramTopicStates(),
+    diagramStuckCount: [...diagramTopicStates.values()].reduce((sum, state) => {
+      const maxRetries = Number(envConfig.getEnv("DIAGRAM_CANDIDATE_MAX_RETRIES", "2")) || 2;
+      let count = 0;
+      for (const value of state.diagramRetryCount?.values?.() ?? []) {
+        if (Number(value) >= maxRetries) count += 1;
+      }
+      return sum + count;
+    }, 0),
   };
   await writeFile(path.join(runDir, "summary.json"), `${JSON.stringify(summary, null, 2)}\n`);
   await writeRunState(runDir, { status: "completed", stage: "done", summary: "summary.json" });
+  // v3.3 持久化 v33-state.json（costTracker + autoscale 等）
+  await persistV33State(runDir);
 
   // 精修结束：关掉 dashboard，让最终汇总用普通滚屏输出。
   dashboard.disable();
+  if (healthServer) { try { healthServer.close(); } catch {} }
+  try { stopMcpClients(); } catch {}
 
   console.log(`\n==== 精修完成 ====`);
   console.log(`本次耗时：${formatDuration(durationMs)}    最终模型：${currentModel(modelState) ?? "CLI默认"}    全量 overall：${initialAudit.overallScore} -> ${finalAudit.overallScore}`);
   console.log(`处理：${processed.length}/${targetRefs.length}    已达标(免改)：${goodRefs.length}    整篇写回：${writtenRefs.length}    块级合并：${mergedRefs.length}    保留旧版(未改善)：${keptOldRefs.length}    执行失败：${failedExecutions.length}    修好原静态未达标：${fixed.length}/${initialFailing.size}    仍 <${minScore}：${stillFailing.length}    放弃(stuck)：${stuck.size}`);
+  if (summary.diagramStuckCount) console.log(`图候选 stuck：${summary.diagramStuckCount} 张（详见 summary.json 的 diagramStates）`);
+  // v3.3 成本报告
+  const costSum = costTracker.summary();
+  console.log(`\n===== 本轮成本（profile=${profile}）=====`);
+  console.log(`总 token：input ${costSum.tokens.input} / output ${costSum.tokens.output} / total ${costSum.tokens.total}`);
+  console.log(`总成本：$${costSum.cost.totalUsd.toFixed(4)}${costSum.cost.localGpuSeconds ? ` + 本地 GPU ${costSum.cost.localGpuSeconds}s` : ""}`);
+  for (const entry of costSum.cost.bySpec) {
+    const costLabel = entry.isLocal ? "(local)" : `$${entry.cost.toFixed(4)}`;
+    const kinds = Object.entries(entry.byKind).map(([k, v]) => `${k}×${v}`).join(" ");
+    console.log(`  ${entry.spec.padEnd(36)} ${kinds.padEnd(20)} in=${entry.inputTokens} out=${entry.outputTokens} ${costLabel}`);
+  }
+  if (costTracker.exceeded) {
+    console.log(`\x1b[33m预算超限：${costTracker.exceededReason}\x1b[0m`);
+  }
   if (retrySummary.triggered) {
     console.log(`重试：${retrySummary.triggered} 篇触发重试（多次 attempt 或跨轮再处理）→ 重试后达标 ${retrySummary.recovered}，保留旧版 ${retrySummary.retained}，仍失败 ${retrySummary.stillFailed}`);
   } else {
@@ -3497,12 +4485,16 @@ if (__isMain) {
       if (error?.interrupted) {
         if (activeRunDir) {
           await writeRunState(activeRunDir, { status: "interrupted", stage: "stopped", resumeCommand: `node scripts/quality_refine.mjs --resume-run ${path.relative(root, activeRunDir)}` });
+          await persistV33State(activeRunDir);
         }
         console.error(`[INTERRUPT] 精修已中断。可用 --resume 或 --resume-run ${activeRunDir ? path.relative(root, activeRunDir) : "<runDir>"} 续跑。`);
         process.exitCode = 130;
         return;
       }
-      if (activeRunDir) await writeRunState(activeRunDir, { status: "failed", stage: "error", error: error.message });
+      if (activeRunDir) {
+        await writeRunState(activeRunDir, { status: "failed", stage: "error", error: error.message });
+        await persistV33State(activeRunDir);
+      }
       console.error(error);
       process.exitCode = 1;
     })
@@ -3513,4 +4505,4 @@ if (__isMain) {
     });
 }
 
-export { refineOneTopic, runAudit, callRefineApi };
+export { refineOneTopic, runAudit, callRefineApi, repairTopic, checkInvariants, normalizeMermaidHead, mermaidContentBad, shouldTriggerDiagramCandidate };

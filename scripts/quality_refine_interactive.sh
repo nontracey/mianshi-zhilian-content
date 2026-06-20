@@ -48,6 +48,13 @@ JUDGE_JSON_RETRIES=2
 JUDGE_WARM_CONCURRENCY=""   # 空 = 跟随 CONCURRENCY
 PROGRESS_STYLE="summary"
 HEARTBEAT_SECONDS=60
+
+# v3.3 新参数（向导步骤会询问；留空=用 .env 默认）
+REFINE_PROFILE=""       # quick | deep | offline
+ALLOW_PAID_DIAGRAM=0
+HEALTH_PORT=""
+MAX_COST_PER_RUN=""
+MAX_TOKENS_PER_RUN=""
 STALL_TIMEOUT_SECONDS=150
 RESUME_LAST=1
 QUOTA_PAUSE_POLICY=""  # 空 = 用 .env QUOTA_PAUSE_DEFAULT
@@ -64,7 +71,7 @@ LAST_CONFIG_FILE=".quality-refine/last-config.env"
 # v4：API 模式重构。SELECTED_CLI 退化为 "api" 标签；模型 spec 改成 "provider:modelId"，
 # baseUrl/envKey 由 mjs 端 env-config.mjs 在运行时按 spec 反查，不再持久化到 last-config。
 # 旧 v3 last-config 不兼容（带 CHAIN_BASE_URLS/CHAIN_ENV_KEYS 等已废弃字段），自动丢弃退手选。
-LAST_CONFIG_VERSION=4
+LAST_CONFIG_VERSION=5
 
 # 模型 chain 单平行数组：仅存 spec（"provider:modelId"），不再保留路由元数据。
 MODEL_CHAIN_ITEMS=()
@@ -362,7 +369,7 @@ choose_cli() {
 }
 
 discover_models() {
-  # API 模式:直接从 scripts/llm/env-config.mjs 读硬编码的 13 个 OpenAI 兼容 spec。
+  # API 模式:直接从 scripts/llm/env-config.mjs 读当前配置可用的 OpenAI 兼容 spec。
   # 输出 4 列 TSV: spec \t label \t baseUrl \t envKey  (spec = "<provider>:<modelId>")
   # 只列 .env 里有 apiKey 的 spec(没 key 的 provider 跑不了,藏起来免误选)。
   node -e '
@@ -397,7 +404,7 @@ choose_model_chain() {
   # 读 .env 的默认精修链作为"回车=接受"
   local env_default
   env_default="$(grep -E '^REFINE_MODEL_CHAIN=' .env 2>/dev/null | tail -1 | cut -d= -f2-)"
-  env_default="${env_default:-volcengine:glm-5.1,volcengine:deepseek-v4-flash}"
+  env_default="${env_default:-zhipu:glm-4.7-flash,longcat:LongCat-2.0-Preview}"
 
   local index choice custom selections selected idx rc
   if (( ${#MODEL_VALUES[@]} )); then
@@ -416,7 +423,7 @@ choose_model_chain() {
         MODEL_CHAIN=""  # 空 = 让 mjs 端读 .env 默认
         return 0
       elif [[ "$choice" == "c" || "$choice" == "C" ]]; then
-        if read_required "模型链（如 volcengine:glm-5.1,volcengine:deepseek-v4-flash）$(prompt_suffix): "; then
+        if read_required "模型链（如 zhipu:glm-4.7-flash,longcat:LongCat-2.0-Preview）$(prompt_suffix): "; then
           :
         else
           rc=$?; return "$rc"
@@ -454,7 +461,7 @@ choose_model_chain() {
 
 choose_judge_models() {
   title "选择判官模型（默认走 .env JUDGE_MODEL_CHAIN）"
-  info "判官评\"静态分查不出的\"事实正确性、认知顺序、零基础可读性、面试覆盖。回车=用 .env JUDGE_MODEL_CHAIN（默认 火山 deepseek-v4-pro）；0=不启用判官（纯静态、最快）。"
+  info "判官评\"静态分查不出的\"事实正确性、认知顺序、零基础可读性、面试覆盖。回车=用 .env JUDGE_MODEL_CHAIN（默认 LongCat + GLM-4.7-Flash）；0=不启用判官（纯静态、最快，deep 严格启动会拒绝）。"
   JUDGE_MODEL_VALUES=()
   JUDGE_MODEL_LABELS=()
   JUDGE_MODEL_BASE_URLS=()
@@ -474,7 +481,7 @@ choose_judge_models() {
   # 读 .env 默认判官链
   local env_default
   env_default="$(grep -E '^JUDGE_MODEL_CHAIN=' .env 2>/dev/null | tail -1 | cut -d= -f2-)"
-  env_default="${env_default:-volcengine:deepseek-v4-pro,volcengine:deepseek-v4-flash}"
+  env_default="${env_default:-longcat:LongCat-2.0-Preview,zhipu:glm-4.7-flash}"
 
   local index choice selections selected idx items
   printf ' 0. 不启用判官（纯静态 keep-best，最快）\n'
@@ -947,6 +954,22 @@ run_refine() {
     if [[ -n "$topics_csv" ]]; then
       cmd+=(--topics "$topics_csv")
     fi
+    # v3.3 新参数（默认值已在 .env，向导变量留空则不覆盖）
+    if [[ -n "$REFINE_PROFILE" ]]; then
+      cmd+=(--profile "$REFINE_PROFILE")
+    fi
+    if [[ "$ALLOW_PAID_DIAGRAM" == "1" ]]; then
+      cmd+=(--allow-paid-diagram)
+    fi
+    if [[ -n "$HEALTH_PORT" ]]; then
+      cmd+=(--health-port "$HEALTH_PORT")
+    fi
+    if [[ -n "$MAX_COST_PER_RUN" ]]; then
+      cmd+=(--max-cost-per-run "$MAX_COST_PER_RUN")
+    fi
+    if [[ -n "$MAX_TOKENS_PER_RUN" ]]; then
+      cmd+=(--max-tokens-per-run "$MAX_TOKENS_PER_RUN")
+    fi
     # 把交互选的额度策略覆盖到 .env 默认(env var > .env 值)
     if [[ -n "$QUOTA_PAUSE_POLICY" ]]; then
       export QUOTA_PAUSE_DEFAULT="$QUOTA_PAUSE_POLICY"
@@ -1019,7 +1042,7 @@ summary() {
 
 print_qwen_route_summary() {
   # 把已绑定的 (model → host · envKey) 一行行打出来；列表空就一行 “未绑定”。
-  # 让用户当场识破“忘选/选错 provider”——尤其是火山/通义同名 id 的场景。
+  # 让用户当场识破“忘选/选错 provider”——尤其是不同 OpenAI-compatible 端点里同名 id 的场景。
   local cli_base
   cli_base="${SELECTED_CLI##*/}"
   case "$cli_base" in

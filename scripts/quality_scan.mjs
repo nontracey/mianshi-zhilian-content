@@ -85,6 +85,10 @@ function normalizeCodeContent(text) {
   return (text ?? "").replace(/\\n/g, "\n").trim();
 }
 
+function stripShellHeredocs(text) {
+  return (text ?? "").replace(/<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?\s*\n[\s\S]*?\n\s*\1\b/g, "");
+}
+
 function firstNonEmptyLine(text) {
   return normalizeCodeContent(text)
     .split("\n")
@@ -128,7 +132,7 @@ function detectCodeLanguageIssue(card) {
     return "CODE_LANGUAGE_CSS_WRONG";
   }
 
-  if (language === "bash" && /\b(LocalDate|public\s+class|import\s+java\.|#include\s*<)/.test(head)) {
+  if (language === "bash" && /\b(LocalDate|public\s+class|import\s+java\.|#include\s*<)/.test(stripShellHeredocs(content).slice(0, 1200))) {
     return "CODE_LANGUAGE_BASH_WRONG";
   }
 

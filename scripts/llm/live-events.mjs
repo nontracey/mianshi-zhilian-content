@@ -16,6 +16,19 @@
 //   audit.summary  { round, total, failing, avgScore }
 //   user.input     { kind, payload }   // 用户手动操作:resume/skip/policy
 //
+// v3.3 新增事件类型:
+//   llm.pool.wait      { spec, kind, waitedMs, limits, accountId }    — 队列等待超 250ms
+//   llm.pool.start     { spec, kind, limits, accountId }              — 拿到 slot 开始调用
+//   llm.pool.done      { spec, kind, durationMs, accountId, ok, error }
+//   llm.pool.unhealthy { spec, kind, until }                          — 模型连续失败被隔离
+//   mcp.unhealthy      { server, until }                              — MCP server 故障隔离
+//   diagram.candidates { ref, cardTitle, count, ok, stuck }           — 图候选选优进度
+//   diagram.selected   { ref, cardTitle, format, score, keptOld }     — 图候选落盘
+//   factcheck.start    { ref, backend }                               — 联网搜索开始
+//   factcheck.done     { ref, backend, ok, findings, sources }        — 联网搜索完成
+//   cost.tick          { totalUsd, tokens, budgetPct }                — 成本快照
+//   judge.disagreement { ref, dims }                                  — 判官分歧度告警
+//
 // 任何模块都可以 emit;TUI 是消费者。
 
 import { EventEmitter } from "node:events";
