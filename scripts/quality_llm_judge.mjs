@@ -115,7 +115,7 @@ export function buildJudgePrompt(topic, ref, context = {}) {
     score: 88,
     dimensions: Object.fromEntries(JUDGE_DIMENSIONS.map((d) => [d, 4])),
     factFindings: [
-      { claim: "被核验的事实断言", verdict: "correct | wrong | suspicious | outdated", evidence: "核验依据或无法核验的原因" },
+      { cardTitle: "该断言所属卡片的 title（尽量填，便于逐卡定向精修）", claim: "被核验的事实断言", verdict: "correct | wrong | suspicious | outdated", evidence: "核验依据或无法核验的原因" },
     ],
     orderFindings: [{ where: "卡片标题或位置", issue: "认知顺序问题", fix: "应如何调整" }],
     voiceFindings: [{ where: "卡片标题", issue: "模板腔/百科腔/空泛", fix: "改成本题专属的具体表达" }],
@@ -130,7 +130,7 @@ export function buildJudgePrompt(topic, ref, context = {}) {
   const topicSafe = sanitizeTopicForPrompt(topic);
   const vu = visualUnderstandingPrompt(context);
   return {
-    prompt: `你是独立的内容质量评审 agent，面向“零基础用户靠这一篇就能学会并拿去面试”的目标做审查。不要复用写作立场，只按事实和真实学习体验打分。
+    prompt: `你是独立的内容质量评审 agent，面向"零基础用户靠这一篇就能学会并拿去面试"的目标做审查。不要复用写作立场，只按事实和真实学习体验打分。
 
 只返回一个 JSON 对象，第一个非空白字符是 {，最后一个是 }。不要解释、不要 Markdown 代码围栏。
 
@@ -142,17 +142,18 @@ export function buildJudgePrompt(topic, ref, context = {}) {
 5. interviewUsability 面试可用性：能否形成可复述的 30 秒结论、机制主线和追问边界；追问是否本题专属、答案是否到位。
 6. difficultyFit 难度匹配：内容深度与 difficulty 标注是否一致（低难不注水、高难讲透机制与权衡）。
 7. learnerClarity 可教会零基础：一个不懂的人能否真看懂——句子是否清晰、术语是否先解释、认知负荷是否过载。
-8. coverage 面试覆盖完整性：按“这个 title / difficulty 的知识点，资深面试官真正会考什么”来判断关键面是否讲全。**严禁拿本篇自己的 rubric/recallPrompts 当标尺**（那是循环论证）；要按你对该知识点的专家认知判断有没有漏掉该讲的点。
-9. seniorityDiscrimination 区分度天花板：判断这篇“能筛到哪个职级”。技术类 difficulty≥3 必须深到能区分资深（对标 P7），difficulty 4-5 必须到专家深度（P7+：源码级机制、架构权衡、极端规模、疑难定位）；非技术类按对应职业的资深纵深。只考“是什么/列举”、recallPrompts/followUpQuestions 缺“为什么这样设计而非另一种 / 线上如何排查 / 取舍 / 极端场景”深问的，本维给 ≤3。difficulty 1-2 的基础题只要诚实标注、紧凑不注水即给 4，不要求其区分资深。
+8. coverage 面试覆盖完整性：按"这个 title / difficulty 的知识点，资深面试官真正会考什么"来判断关键面是否讲全。**严禁拿本篇自己的 rubric/recallPrompts 当标尺**（那是循环论证）；要按你对该知识点的专家认知判断有没有漏掉该讲的点。
+9. seniorityDiscrimination 区分度天花板：判断这篇"能筛到哪个职级"。技术类 difficulty≥3 必须深到能区分资深（对标 P7），difficulty 4-5 必须到专家深度（P7+：源码级机制、架构权衡、极端规模、疑难定位）；非技术类按对应职业的资深纵深。只考"是什么/列举"、recallPrompts/followUpQuestions 缺"为什么这样设计而非另一种 / 线上如何排查 / 取舍 / 极端场景"深问的，本维给 ≤3。difficulty 1-2 的基础题只要诚实标注、紧凑不注水即给 4，不要求其区分资深。
 
 硬性要求：
 - score 用 0-100；任一维 <4，或存在 wrong/outdated 事实，verdict 必须为 fail。
-- factFindings 至少 3 条，覆盖定义、机制、边界/失败路径等关键事实；wrong/outdated 的事实必须同时进 blockingFindings。
+- factFindings 至少 3 条，覆盖定义、机制、边界/失败路径等关键事实；wrong/outdated 的事实必须同时进 blockingFindings。每条尽量填 cardTitle（断言出自哪张卡的 title），供逐卡定向精修。
+- 各类 findings 的 where/cardTitle 请尽量写**卡片的确切 title 原文**（不要写"某段/正文"这类模糊位置），否则无法定位到具体卡。
 - 事实核验可信度规则（防止误杀正确内容）：① 来自官方文档（authoritative=true）的外部证据才能触发 wrong/outdated；② 非权威来源（博客/教程/社区问答）的冲突只标 suspicious；③ 无外部证据时，只有高度确信的错误才标 wrong，不确定的标 suspicious + 注明原因；④ 如果你的知识来源不确定或涉及版本差异，优先标 suspicious 而非 wrong。
 - followUpFindings 必须逐条评每个 interviewAnswer 的 followUpQuestion：isSpecific（是否本题专属、不泛化）、answerAdequate（答案是否到位），不达标给出 fix。
 - clarityFindings / coverageFindings 指出零基础读者会卡住的地方、以及面试该讲却没讲的关键面。
 - rubric.mustHave/goodToHave/commonMistakes 内嵌代码片段（throw new ...()、function、=>、带分号语句、缩进代码块）→ 判 fail 并进 blockingFindings；代码只该在 code 卡。
-- diagram 是纯线性关键词链（无分支/汇合/状态转移）或终点为“面试结论/答题要点/总结”类汇聚节点 → 判为假图，压低 expertVoice 并在 voiceFindings 标记要求重画。
+- diagram 是纯线性关键词链（无分支/汇合/状态转移）或终点为"面试结论/答题要点/总结"类汇聚节点 → 判为假图，压低 expertVoice 并在 voiceFindings 标记要求重画。
 - diagram 使用 sources 时，要检查降级链是否合理（svg 资源 → mermaid 结构图 → text 兜底）；必须至少有一层 mermaid 或 text 兜底，不能只有 svg path 而无后续层。
 - 必须填写 diagramModalityFinding，但这不是要求每篇必须有图：判断当前 topic 应使用 svg / mermaid / compareTable / code / text / none 中哪一种；如果不需要图，recommendedFormat 填 none 或 text/code/compareTable 并说明理由。如果已有图型不适配、SVG 只是装饰、Mermaid 弱化了真实结构、或视觉未核验，请写清 reason/requiredFix。没有视觉报告时 visualFit 填 not_checked，不要假装看见图片。
 - 不要臆造；无法核验的事实标 suspicious 并在 evidence 说明原因。
@@ -186,7 +187,7 @@ export function buildJudgeBatchPrompt(items) {
       score: 88,
       dimensions: Object.fromEntries(JUDGE_DIMENSIONS.map((d) => [d, 4])),
       factFindings: [
-        { claim: "被核验的事实断言", verdict: "correct | wrong | suspicious | outdated", evidence: "核验依据或无法核验的原因" },
+        { cardTitle: "该断言所属卡片的 title（尽量填，便于逐卡定向精修）", claim: "被核验的事实断言", verdict: "correct | wrong | suspicious | outdated", evidence: "核验依据或无法核验的原因" },
       ],
       orderFindings: [],
       voiceFindings: [],
@@ -199,7 +200,7 @@ export function buildJudgeBatchPrompt(items) {
       notes: "",
     })),
   };
-  return `你是独立的内容质量评审 agent，面向“零基础用户靠这一篇就能学会并拿去面试”的目标做审查。不要复用写作立场，只按事实和真实学习体验打分。
+  return `你是独立的内容质量评审 agent，面向"零基础用户靠这一篇就能学会并拿去面试"的目标做审查。不要复用写作立场，只按事实和真实学习体验打分。
 
 只返回一个 JSON 对象，第一个非空白字符是 {，最后一个是 }。不要解释、不要 Markdown 代码围栏。
 
@@ -212,9 +213,9 @@ ${JUDGE_DIMENSIONS.map((d, index) => `${index + 1}. ${d}`).join("\n")}
 - score 用 0-100；任一维 <4，或存在 wrong/outdated 事实，verdict 必须为 fail。
 - factFindings 每篇至少 3 条，覆盖定义、机制、边界/失败路径等关键事实；wrong/outdated 的事实必须同时进 blockingFindings。
 - 事实核验可信度规则（防止误杀正确内容）：① 只有你高度确信的错误才标 wrong；② 知识来源不确定或涉及版本差异时，标 suspicious 并在 evidence 说明具体疑虑；③ 若内容在你的知识截止日期后可能已变化，标 suspicious（outdated?） 而非 wrong；④ 宁可漏一个 wrong 也不要误杀一个 correct。
-- coverage 必须按”这个 title / difficulty 的知识点，资深面试官真正会考什么”判断，严禁拿本篇自己的 rubric/recallPrompts 当唯一标尺。
-- seniorityDiscrimination 区分度天花板：技术类 difficulty≥3 必须能区分资深（对标 P7）、4-5 须到专家深度（P7+），非技术类按对应专家纵深；只考”是什么/列举”、缺”为什么这样设计/如何排查/取舍/极端场景”深问的给 ≤3；difficulty 1-2 基础题诚实标注即给 4。
-- rubric.mustHave/goodToHave/commonMistakes 内嵌代码片段 → fail；diagram 是纯线性关键词链或终点为”面试结论/答题要点”类汇聚节点 → 判假图、压低 expertVoice；sources 降级链（svg→mermaid→text）缺兜底或层级不合理也要指出。
+- coverage 必须按"这个 title / difficulty 的知识点，资深面试官真正会考什么"判断，严禁拿本篇自己的 rubric/recallPrompts 当唯一标尺。
+- seniorityDiscrimination 区分度天花板：技术类 difficulty≥3 必须能区分资深（对标 P7）、4-5 须到专家深度（P7+），非技术类按对应专家纵深；只考"是什么/列举"、缺"为什么这样设计/如何排查/取舍/极端场景"深问的给 ≤3；difficulty 1-2 基础题诚实标注即给 4。
+- rubric.mustHave/goodToHave/commonMistakes 内嵌代码片段 → fail；diagram 是纯线性关键词链或终点为"面试结论/答题要点"类汇聚节点 → 判假图、压低 expertVoice；sources 降级链（svg→mermaid→text）缺兜底或层级不合理也要指出。
 - 每篇都必须填写 diagramModalityFinding，但这不是要求每篇必须有图；可推荐 none / text / code / compareTable。SVG 不是天然更好，Mermaid 也不是天然降级。没有视觉报告时 visualFit 填 not_checked。
 
 评审顺序（内部执行，不要输出过程）：先核事实和图解硬伤，再逐维打分；seniorityDiscrimination 必须单独看追问/正文是否足以区分资深，任一短板不能被总分补偿。
@@ -240,7 +241,7 @@ export function buildBlockJudgePrompt({ ref, title, blocks }) {
       fix: "如果 regressed/blocking，应如何修",
     })),
   };
-  return `你是内容精修 keep-best 的块级判官。任务是比较“旧块”和“候选块”，判断候选块是否真的变好。
+  return `你是内容精修 keep-best 的块级判官。任务是比较"旧块"和"候选块"，判断候选块是否真的变好。
 
 只返回一个 JSON 对象，第一个非空白字符是 {，最后一个是 }。不要解释、不要 Markdown 代码围栏。
 
@@ -249,6 +250,10 @@ export function buildBlockJudgePrompt({ ref, title, blocks }) {
 - same：候选块只是改写措辞、移动格式，质量没有实质提升。
 - regressed：候选块比旧块更泛、更绕、漏掉关键点、追问变弱，或破坏 explain 与 interviewAnswer 的衔接。
 - blocking：候选块引入 wrong/outdated 事实、明显误导、结构损坏或与 topic 主题不一致。
+
+删除块判定（kind="remove"，after 为 null 表示「提议删除此块」）：
+- 只有当该块**确属重复 / 占位空壳 / 已被更优块取代**，且删除后整篇**面试覆盖面不下降**时，才判 improved（=同意删）。
+- 删除会丢任何独有知识点、机制、追问深度或覆盖面 → 判 regressed 或 blocking（=保留）。默认倾向保留，举证不足即不删。
 
 要求：
 - 每个输入 block 都必须返回一个同 key 的 blockReview。
@@ -413,7 +418,7 @@ export function aggregateReviews(reviews) {
   }
   const factFindings = reviews.flatMap((r) => r.factFindings);
   const blockingFindings = reviews.flatMap((r) => r.blockingFindings);
-  // 任一判官 fail 则聚合 fail（保守，符合“宁可不退步”）。
+  // 任一判官 fail 则聚合 fail（保守，符合"宁可不退步"）。
   const verdict = reviews.every((r) => r.verdict === "pass") ? "pass" : "fail";
   // K6 visualFit 多数决
   const visualFits = reviews.map((r) => r.diagramModalityFinding?.visualFit).filter(Boolean);
@@ -447,7 +452,7 @@ export function factProblemCount(review) {
   return Math.max(factWrong, blocking);
 }
 
-// 判官判定“已经够好”：分数达线 + 每维 ≥ 地板 + 无事实问题。用于“已达标则不浪费改写”。
+// 判官判定"已经够好"：分数达线 + 每维 ≥ 地板 + 无事实问题。用于"已达标则不浪费改写"。
 export function judgePasses(review, dynamicSkipMin) {
   if (!review) return false;
   if (review.score < dynamicSkipMin) return false;
@@ -456,13 +461,14 @@ export function judgePasses(review, dynamicSkipMin) {
   return JUDGE_DIMENSIONS.every((d) => toInt(review.dimensions?.[d]) >= DIMENSION_FLOOR);
 }
 
-// 接受候选的“回归向量”判据（不拿总分当唯一开关，避免误杀“部分更好但总分波动”的候选）：
-//   - 静态分 ≥ 90（⟹ 静态各维不跌破地板，硬规则未破）
-//   - 没有引入新的事实问题（after 的 wrong/outdated 计数 ≤ before）
-//   - 动态每一维都不低于 before（不许“修一块、坏一块”）
-//   - 且至少一处改善（某维↑ / 动态总分↑ / 事实问题↓ / 静态分↑）
-export function acceptByJudge({ before, after, staticBefore, staticAfter, minStatic = 90 }) {
+// 接受候选的"回归向量"判据（L1–L4 证据互证；不拿总分当唯一开关，避免误杀"部分更好但总分波动"的候选）：
+//   - L1 静态硬门：静态分 ≥ minStatic（90）且不新增事实/视觉问题
+//   - L2/L3 9 维全程在场：逐维不退（互证后的 regressedDims 才算数），至少一维确有改善
+//   - corroborated（可选）：来自多判官互证的 { regressedDims, improvedDims }，有则优先用；
+//     无则退回单判官原始维度比较（向后兼容）。退步"一经互证确认即否"，不放宽容差。
+export function acceptByJudge({ before, after, staticBefore, staticAfter, minStatic = 90, corroborated = null }) {
   const reasons = [];
+  // L1：确定性硬门（双向检查）
   if (staticAfter < minStatic) return { accept: false, reason: `静态分 ${staticAfter} < ${minStatic} 地板` };
   if (factProblemCount(after) > factProblemCount(before)) {
     return { accept: false, reason: `引入了新的事实问题（${factProblemCount(before)} -> ${factProblemCount(after)}）` };
@@ -470,17 +476,30 @@ export function acceptByJudge({ before, after, staticBefore, staticAfter, minSta
   if (diagramModalityProblemCount(after) > diagramModalityProblemCount(before)) {
     return { accept: false, reason: `引入了新的图解形态/视觉问题（${diagramModalityProblemCount(before)} -> ${diagramModalityProblemCount(after)}）` };
   }
-  for (const d of JUDGE_DIMENSIONS) {
-    const b = toInt(before?.dimensions?.[d]);
-    const a = toInt(after?.dimensions?.[d]);
-    if (a < b) return { accept: false, reason: `维度 ${d} 退步（${b} -> ${a}）` };
+  // L3 互证：有 corroborated 时用互证结论，无则用原始单判官维度比较（向后兼容）
+  let regressedDims, improvedDims;
+  if (corroborated) {
+    regressedDims = corroborated.regressedDims ?? [];
+    improvedDims = corroborated.improvedDims ?? [];
+  } else {
+    // 单判官路径（原始实现）
+    regressedDims = JUDGE_DIMENSIONS.filter((d) => toInt(after?.dimensions?.[d]) < toInt(before?.dimensions?.[d]));
+    improvedDims = JUDGE_DIMENSIONS.filter((d) => toInt(after?.dimensions?.[d]) > toInt(before?.dimensions?.[d]));
   }
-  const dimUp = JUDGE_DIMENSIONS.some((d) => toInt(after?.dimensions?.[d]) > toInt(before?.dimensions?.[d]));
+  if (regressedDims.length > 0) {
+    const detail = regressedDims.map((d) => {
+      const b = toInt(before?.dimensions?.[d]);
+      const a = toInt(after?.dimensions?.[d]);
+      return `${d}(${b}->${a})`;
+    }).join(", ");
+    return { accept: false, reason: `维度退步（${corroborated ? "互证确认" : ""}）：${detail}` };
+  }
+  const dimUp = improvedDims.length > 0;
   const scoreUp = toInt(after?.score) > toInt(before?.score);
   const factDown = factProblemCount(after) < factProblemCount(before);
   const diagramDown = diagramModalityProblemCount(after) < diagramModalityProblemCount(before);
   const staticUp = staticAfter > staticBefore;
-  if (dimUp) reasons.push("维度↑");
+  if (dimUp) reasons.push(`维度↑(${improvedDims.join(",")})`);
   if (scoreUp) reasons.push("动态分↑");
   if (factDown) reasons.push("事实问题↓");
   if (diagramDown) reasons.push("图解问题↓");
@@ -491,30 +510,54 @@ export function acceptByJudge({ before, after, staticBefore, staticAfter, minSta
   return { accept: true, reason: reasons.join("+") };
 }
 
-// 把判官 findings 压成喂给改写 prompt 的“块级缺口清单”，驱动“每一块更精准”。
+// 把判官 findings 压成喂给改写 prompt 的"块级缺口清单"，驱动"每一块更精准"。
+// P2.3：增「headroom severity 标注」：[blocking] / [高] / [中] 前缀帮模型区分优先级。
+// where 字段存在时优先按卡分组，便于块级精修定向。
 export function findingsToPromptLines(review) {
   if (!review) return [];
   const lines = [];
+  // 事实问题：blocking 级别，最优先
   for (const f of review.factFindings ?? []) {
     const v = String(f?.verdict ?? "").toLowerCase();
     if (v === "wrong" || v === "outdated" || v === "suspicious") {
-      lines.push(`【事实(${v})】${f.claim ?? ""}${f.evidence ? `（依据：${f.evidence}）` : ""}`);
+      const sev = v === "wrong" ? "[blocking]" : v === "outdated" ? "[高]" : "[中]";
+      const card = f.cardTitle ? `@${f.cardTitle}：` : "";
+      lines.push(`${sev}【事实(${v})】${card}${f.claim ?? ""}${f.evidence ? `（依据：${f.evidence}）` : ""}`);
     }
   }
+  // 追问
   for (const f of review.followUpFindings ?? []) {
     if (f && (f.isSpecific === false || f.answerAdequate === false)) {
-      lines.push(`【追问】「${f.question ?? ""}」${f.isSpecific === false ? "不够本题专属；" : ""}${f.answerAdequate === false ? "答案不到位；" : ""}${f.fix ? `建议：${f.fix}` : ""}`);
+      const card = f.cardTitle ? `@${f.cardTitle}：` : "";
+      lines.push(`[高]【追问】${card}「${f.question ?? ""}」${f.isSpecific === false ? "不够本题专属；" : ""}${f.answerAdequate === false ? "答案不到位；" : ""}${f.fix ? `建议：${f.fix}` : ""}`);
     }
   }
-  for (const f of review.orderFindings ?? []) lines.push(`【认知顺序】${f.where ?? ""}：${f.issue ?? ""}${f.fix ? `（${f.fix}）` : ""}`);
-  for (const f of review.voiceFindings ?? []) lines.push(`【专家口吻】${f.where ?? ""}：${f.issue ?? ""}${f.fix ? `（${f.fix}）` : ""}`);
-  for (const f of review.selfContainedFindings ?? []) lines.push(`【自包含】${f.where ?? ""}：${f.issue ?? ""}${f.fix ? `（${f.fix}）` : ""}`);
-  for (const f of review.clarityFindings ?? []) lines.push(`【可读性】${f.where ?? ""}：${f.issue ?? ""}${f.fix ? `（${f.fix}）` : ""}`);
-  for (const f of review.coverageFindings ?? []) lines.push(`【覆盖缺口】${f.missingPoint ?? ""}${f.why ? `（${f.why}）` : ""}`);
+  // 认知顺序、专家口吻、自包含、可读性
+  for (const f of review.orderFindings ?? []) {
+    const card = f.where ? `@${f.where}：` : "";
+    lines.push(`[中]【认知顺序】${card}${f.issue ?? ""}${f.fix ? `（${f.fix}）` : ""}`);
+  }
+  for (const f of review.voiceFindings ?? []) {
+    const card = f.where ? `@${f.where}：` : "";
+    lines.push(`[中]【专家口吻】${card}${f.issue ?? ""}${f.fix ? `（${f.fix}）` : ""}`);
+  }
+  for (const f of review.selfContainedFindings ?? []) {
+    const card = f.where ? `@${f.where}：` : "";
+    lines.push(`[中]【自包含】${card}${f.issue ?? ""}${f.fix ? `（${f.fix}）` : ""}`);
+  }
+  for (const f of review.clarityFindings ?? []) {
+    const card = f.where ? `@${f.where}：` : "";
+    lines.push(`[中]【可读性】${card}${f.issue ?? ""}${f.fix ? `（${f.fix}）` : ""}`);
+  }
+  // 覆盖缺口
+  for (const f of review.coverageFindings ?? []) {
+    lines.push(`[高]【覆盖缺口】${f.missingPoint ?? ""}${f.why ? `（${f.why}）` : ""}`);
+  }
+  // 图解形态
   const diagramFinding = review.diagramModalityFinding;
   if (diagramModalityProblemCount(review) > 0 || diagramFinding?.requiredFix) {
     lines.push(
-      `【图解形态】当前=${diagramFinding?.currentBestFormat ?? "none"}，建议=${diagramFinding?.recommendedFormat ?? "none"}，` +
+      `[blocking]【图解形态】当前=${diagramFinding?.currentBestFormat ?? "none"}，建议=${diagramFinding?.recommendedFormat ?? "none"}，` +
         `适配=${diagramFinding?.isCurrentFormatFit !== false ? "是" : "否"}，视觉=${diagramFinding?.visualFit ?? "not_checked"}；` +
         `${diagramFinding?.reason ?? ""}${diagramFinding?.requiredFix ? ` 修法：${diagramFinding.requiredFix}` : ""}`,
     );

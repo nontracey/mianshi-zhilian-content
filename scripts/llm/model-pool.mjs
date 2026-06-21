@@ -34,7 +34,7 @@ function queueLimitFor({ spec, model, kind }) {
   const accountKey = sanitize(model.accountId || "default");
   const kindKey = sanitize(kind || "default");
   return {
-    global: num("LLM_POOL_GLOBAL_CONCURRENCY", 8),
+    global: num("LLM_POOL_GLOBAL_CONCURRENCY", 28),
     kind: num(`LLM_POOL_KIND_${kindKey}`, model.kindConcurrency?.[kind] ?? 8),
     provider: num(`LLM_POOL_PROVIDER_${providerKey}`, model.providerConcurrency ?? model.maxProviderConcurrency ?? 8),
     account: num(`LLM_POOL_ACCOUNT_${accountKey}`, model.accountConcurrency ?? model.maxAccountConcurrency ?? 8),

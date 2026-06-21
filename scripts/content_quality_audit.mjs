@@ -800,8 +800,14 @@ function tokenJaccard(left, right) {
 function buildCorpus(allTopics) {
   const sentenceTopics = new Map();
   const domainLexicon = new Map();
-  for (const { topic, ref } of allTopics) {
-    for (const sentence of fingerprintSentences(topic)) {
+  // P1.7：refSentences 反向索引（ref -> 该篇的指纹句集合），支撑轮内增量刷新 refreshRef，
+  // 避免每轮 buildRefineCorpus() 整库重读。
+  const refSentences = new Map();
+
+  function addTopic(topic, ref) {
+    const sentences = fingerprintSentences(topic);
+    refSentences.set(ref, new Set(sentences));
+    for (const sentence of sentences) {
       const refs = sentenceTopics.get(sentence) ?? new Set();
       refs.add(ref);
       sentenceTopics.set(sentence, refs);
@@ -815,7 +821,29 @@ function buildCorpus(allTopics) {
     }
     domainLexicon.set(topic.domain, lexicon);
   }
-  return { sentenceTopics, domainLexicon };
+
+  function removeRef(ref) {
+    const old = refSentences.get(ref);
+    if (!old) return;
+    for (const sentence of old) {
+      const refs = sentenceTopics.get(sentence);
+      if (!refs) continue;
+      refs.delete(ref);
+      if (!refs.size) sentenceTopics.delete(sentence);
+    }
+    refSentences.delete(ref);
+    // domainLexicon 故意不回收：tag 精修期间不变、词库是累加型的粗筛信号，删了反而可能漏判跨域术语。
+  }
+
+  // P1.7：某篇写回后，用新内容增量替换它在语料库中的指纹句（先删旧、再加新），
+  // 让后续轮的跨篇重复句检测看到的是最新文本，且只触碰这一篇而非整库。
+  function refreshRef(ref, topic) {
+    removeRef(ref);
+    if (topic) addTopic(topic, ref);
+  }
+
+  for (const { topic, ref } of allTopics) addTopic(topic, ref);
+  return { sentenceTopics, domainLexicon, refreshRef };
 }
 
 function expectedMinutesRange(difficulty) {

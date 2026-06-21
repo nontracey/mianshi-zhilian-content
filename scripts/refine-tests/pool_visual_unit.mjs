@@ -159,7 +159,9 @@ console.log("\n=== 内置 web 工具：stripTags / extractMainText ===");
 
 console.log("\n=== 内置搜索：Baidu HTML 解析 ===");
 {
-  const baiduHtml = '<html><body><div class="result"><h3><a href="http://example.com/1">Result One</a></h3><div class="c-abstract">First snippet here</div></div><div class="result"><h3><a href="http://example.com/2">Result Two</a></h3><div class="c-abstract">Second snippet</div></div></body></html>';
+  // 注意：searchBaidu 有「页面 <5000 字符即判 CAPTCHA」的启发式守卫，fixture 必须够长才不被误判。
+  const baiduFiller = `<!-- ${"x".repeat(5200)} -->`;
+  const baiduHtml = `<html><body>${baiduFiller}<div class="result"><h3><a href="http://example.com/1">Result One</a></h3><div class="c-abstract">First snippet here</div></div><div class="result"><h3><a href="http://example.com/2">Result Two</a></h3><div class="c-abstract">Second snippet</div></div></body></html>`;
   const origFetch = globalThis.fetch;
   globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => baiduHtml, headers: new Map() });
   const { searchBaidu } = await import("../web/search.mjs");

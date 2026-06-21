@@ -307,6 +307,7 @@ function parseScalarCustomModels() {
     const priceInput = maybeNum(key("PRICE_INPUT_PER_MTOK"));
     const priceOutput = maybeNum(key("PRICE_OUTPUT_PER_MTOK"));
     const extraParams = parseJsonObject(key("EXTRA_PARAMS_JSON"), `LLM_MODEL_${suffix}_EXTRA_PARAMS_JSON`);
+    const roleRaw = splitList(key("ROLE"));
     const model = compactObject({
       provider: key("PROVIDER") || alias,
       id: key("ID") || key("MODEL") || key("MODEL_ID"),
@@ -318,6 +319,9 @@ function parseScalarCustomModels() {
       local: maybeBool(key("LOCAL")),
       tier: key("TIER"),
       modality,
+      // P9（计划第九节）：角色/资历——让精修阵容按 role+seniority 运行时解析，绝不写死模型名。
+      role: roleRaw.length ? roleRaw : undefined,       // writer | reviewer | fact | vision（可多值）
+      seniority: maybeNum(key("SENIORITY")),              // 1=初级写手 2=中级 3=资深兜底
       maxContext: maybeNum(key("MAX_CONTEXT")),
       maxOutputTokens: maybeNum(key("MAX_OUTPUT_TOKENS")),
       maxConcurrency: maybeNum(key("MAX_CONCURRENCY")),
@@ -392,6 +396,18 @@ function listModelsByCapability(capability) {
 
 function listModelsByTier(tier) {
   return models().filter((m) => m.tier === tier);
+}
+
+// P9：按角色筛模型（role 为 undefined 时表示未声明角色；默认可用于任何角色）。
+function listModelsByRole(role) {
+  return models().filter((m) => !m.role || (m.role ?? []).includes(role));
+}
+
+// P9：按资历筛模型（seniority 未声明视为 1=初级）；返回按资历排序（低→高）。
+function listModelsBySeniority(minSeniority = 1) {
+  return models()
+    .filter((m) => (m.seniority ?? 1) >= minSeniority)
+    .sort((a, b) => (a.seniority ?? 1) - (b.seniority ?? 1));
 }
 
 // 从一个模型链 specs 里挑出 tier=free 的（图生成优先用免费模型）
@@ -579,6 +595,8 @@ export const envConfig = {
   listModels,
   listModelsByCapability,
   listModelsByTier,
+  listModelsByRole,
+  listModelsBySeniority,
   pickFreeModels,
   pickUsableFreeModels,
   modelHasKey,

@@ -112,5 +112,36 @@ check(
   acceptByJudge({ before: review({ dimensions: { ...allFive, coverage: 4 } }), after: review({ dimensions: { ...allFive } }), staticBefore: 98, staticAfter: 95 }).accept === true,
 );
 
+// ===== P2.1/P2.2 互证（corroborated）落盘门 =====
+console.log("=== acceptByJudge：互证（corroborated）路径 ===");
+{
+  // 单判官裸维度看到某维退步，但互证结论 regressedDims 为空 → 不据此否（互证去噪），且 improvedDims 非空 → accept。
+  const before = review({ dimensions: { ...allFive } });
+  const after = review({ dimensions: { ...allFive, coverage: 4 } });
+  check(
+    "互证 regressedDims 为空 + improvedDims 非空 => accept（裸维度退步被互证去噪）",
+    acceptByJudge({
+      before, after, staticBefore: 95, staticAfter: 96,
+      corroborated: { regressedDims: [], improvedDims: ["expertVoice"] },
+    }).accept === true,
+  );
+}
+{
+  // 互证确认某维退步 → 必须 reject（退步一经互证确认即否，不放宽容差）。
+  const decision = acceptByJudge({
+    before: review(), after: review(), staticBefore: 95, staticAfter: 96,
+    corroborated: { regressedDims: ["accuracy"], improvedDims: [] },
+  });
+  check("互证确认退步 => reject", decision.accept === false);
+  check("互证退步 reason 含『互证确认』", /互证确认/.test(decision.reason));
+}
+check(
+  "互证无退步但毫无改善 => reject",
+  acceptByJudge({
+    before: review(), after: review(), staticBefore: 95, staticAfter: 95,
+    corroborated: { regressedDims: [], improvedDims: [] },
+  }).accept === false,
+);
+
 console.log(`\n=== judge unit: PASS=${pass} FAIL=${fail} ===`);
 process.exit(fail === 0 ? 0 : 1);

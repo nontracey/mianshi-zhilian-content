@@ -37,7 +37,6 @@ RETRIES=2
 TIMEOUT_SECONDS=600
 DEGRADE_AFTER=3
 LIMIT=""
-SELECTED_CLI=""
 MODEL_CHAIN=""
 JUDGE_ENABLED=1
 JUDGE_MODELS=""   # 空 = 跟精修主模型一致
@@ -68,10 +67,10 @@ ASK_VALUE=""
 # --last 短路：命令行加 --last 后跳过中间所有题，仅保留 SCOPE/LIMIT/MAX_ROUNDS 让用户回车确认。
 REPLAY_FLAG=0
 LAST_CONFIG_FILE=".quality-refine/last-config.env"
-# v4：API 模式重构。SELECTED_CLI 退化为 "api" 标签；模型 spec 改成 "provider:modelId"，
-# baseUrl/envKey 由 mjs 端 env-config.mjs 在运行时按 spec 反查，不再持久化到 last-config。
-# 旧 v3 last-config 不兼容（带 CHAIN_BASE_URLS/CHAIN_ENV_KEYS 等已废弃字段），自动丢弃退手选。
-LAST_CONFIG_VERSION=5
+# API 模式：CLI 模式已移除；模型 spec 为 "provider:modelId"，baseUrl/envKey 由 mjs 端
+# env-config.mjs 在运行时按 spec 反查，不再持久化到 last-config。
+# 旧版 last-config 不兼容（带 SELECTED_CLI / CHAIN_BASE_URLS 等已废弃字段），自动丢弃退手选。
+LAST_CONFIG_VERSION=6
 
 # 模型 chain 单平行数组：仅存 spec（"provider:modelId"），不再保留路由元数据。
 MODEL_CHAIN_ITEMS=()
@@ -355,16 +354,8 @@ choose_domains() {
   done
 }
 
-discover_clis() {
-  # API 模式占位：精修器已不 spawn CLI，统一以 "api" 作为日志标签。
-  CLI_NAMES=(api)
-  CLI_PATHS=(api)
-}
-
 choose_cli() {
-  # API 模式：直接钉成 "api" 标签，跳过任何 CLI 选择。保留函数是因为向导步骤号
-  # 还在 5（main 的 next_step/previous_step 与复用提示都引用 step 5），返回 0 让流程继续。
-  SELECTED_CLI="api"
+  # CLI 模式已移除（精修器只走 API）。保留空函数仅因向导步骤号还占着 5；直接放行。
   return 0
 }
 
@@ -807,45 +798,9 @@ choose_topics() {
   done
 }
 
-build_qwen_routes_json() {
-  # 把 (model, baseUrl, envKey) 三元组合并成一份 inline JSON，给 mjs --qwen-routes 用。
-  # 仅当 SELECTED_CLI 是 qwen/qwen-code 且至少一项带 baseUrl 时才返回非空字符串。
-  # 实现走 node：bash 拼 JSON 容易踩 \"、$、`、引号嵌套；node 端调 JSON.stringify 一劳永逸，
-  # 同时把 ~/.qwen/settings.json 字段名 envKey 重命名成 mjs 期望的 apiKeyEnv。
-  local cli_base
-  cli_base="${SELECTED_CLI##*/}"
-  case "$cli_base" in
-    qwen|qwen-code) ;;
-    *) printf ''; return 0 ;;
-  esac
-  local -a models=("$@")
-  local count=$(( ${#models[@]} / 3 ))
-  (( count > 0 )) || { printf ''; return 0; }
-  local has_route=0 i base_url
-  for (( i = 0; i < count; i += 1 )); do
-    base_url="${models[$((i * 3 + 1))]}"
-    [[ -n "$base_url" ]] && { has_route=1; break; }
-  done
-  (( has_route == 1 )) || { printf ''; return 0; }
-  node - "$@" <<'NODE'
-const out = {};
-const argv = process.argv.slice(2);
-for (let i = 0; i < argv.length; i += 3) {
-  const model = argv[i];
-  const baseUrl = argv[i + 1] || "";
-  const envKey = argv[i + 2] || "";
-  if (!model || !baseUrl) continue;
-  // 同一 model 多次出现（精修主链 + 判官选了同一条）按后写入覆盖即可，三元组本身一致。
-  out[model] = { baseUrl, apiKeyEnv: envKey || undefined };
-  if (!envKey) delete out[model].apiKeyEnv;
-}
-process.stdout.write(JSON.stringify(out));
-NODE
-}
-
 build_common_refine_args() {
+  # 精修器只走 OpenAI 兼容 API（CLI 模式已移除）。模型路由全由 .env / env-config.mjs 决定。
   COMMON_ARGS=(
-    --cli "$SELECTED_CLI"
     --min-score "$MIN_SCORE"
     --retries "$RETRIES"
     --timeout-ms "$((TIMEOUT_SECONDS * 1000))"
@@ -858,44 +813,12 @@ build_common_refine_args() {
     COMMON_ARGS+=(--model-chain "$MODEL_CHAIN")
   fi
   if [[ "$JUDGE_ENABLED" == "1" ]]; then
-    # 判官 CLI 默认 = 精修 CLI；判官模型空时由 .mjs 默认取精修主模型。
+    # 判官模型空时由 .mjs 默认取 JUDGE_MODEL_CHAIN / 精修主模型。
     [[ -n "$JUDGE_MODELS" ]] && COMMON_ARGS+=(--judge-models "$JUDGE_MODELS")
     COMMON_ARGS+=(--judge-count "$JUDGE_COUNT" --dynamic-skip-min "$DYNAMIC_SKIP_MIN" --judge-batch-size "$JUDGE_BATCH_SIZE" --judge-json-retries "$JUDGE_JSON_RETRIES")
     [[ -n "$JUDGE_WARM_CONCURRENCY" ]] && COMMON_ARGS+=(--judge-warm-concurrency "$JUDGE_WARM_CONCURRENCY")
   else
     COMMON_ARGS+=(--no-judge)
-  fi
-
-  # qwen/qwen-code 显式路由：把精修链 + 判官多选模型的 (model, baseUrl, envKey) 全收齐写成 inline JSON
-  # 交给 mjs。这是解决 “同 modelId 不同 provider 被 qwen 静默回落到第一条 openai entry → 402” 的关键。
-  # apiKey 不进命令行（防 ps 泄露），mjs 端读 envKey 指向的环境变量或 ~/.qwen/settings.json 的 env 段。
-  local -a route_triples=()
-  local i n
-  n=${#MODEL_CHAIN_ITEMS[@]:-0}
-  if (( n > 0 )); then
-    for (( i = 0; i < n; i += 1 )); do
-      route_triples+=("${MODEL_CHAIN_ITEMS[$i]}" "${CHAIN_BASE_URLS[$i]:-}" "${CHAIN_ENV_KEYS[$i]:-}")
-    done
-  fi
-  if [[ "$JUDGE_ENABLED" == "1" && -n "$JUDGE_MODELS" ]]; then
-    local judge_count=${#JUDGE_CHAIN_BASE_URLS[@]:-0}
-    if (( judge_count > 0 )); then
-      local -a judge_items=()
-      IFS=',' read -r -a judge_items <<< "$JUDGE_MODELS"
-      local jn=${#judge_items[@]}
-      (( jn < judge_count )) && judge_count=$jn
-      for (( i = 0; i < judge_count; i += 1 )); do
-        route_triples+=("${judge_items[$i]}" "${JUDGE_CHAIN_BASE_URLS[$i]:-}" "${JUDGE_CHAIN_ENV_KEYS[$i]:-}")
-      done
-    fi
-  fi
-  if (( ${#route_triples[@]} > 0 )); then
-    local routes_json
-    routes_json="$(build_qwen_routes_json "${route_triples[@]}")"
-    # 当返回空串（CLI 不是 qwen 系，或全部模型都没有 baseUrl）时跳过追加。
-    if [[ -n "$routes_json" && "$routes_json" != "{}" ]]; then
-      COMMON_ARGS+=(--qwen-routes "$routes_json")
-    fi
   fi
 }
 
@@ -1013,9 +936,7 @@ summary() {
   printf '合格分：%s\n' "$MIN_SCORE"
   if [[ "$RUN_MODE" != "audit" ]]; then
     printf 'Topic：%s\n' "$TOPIC_SELECTION_LABEL"
-    printf 'CLI：%s\n' "$SELECTED_CLI"
-    printf '模型链：%s\n' "${MODEL_CHAIN:-CLI默认}"
-    print_qwen_route_summary
+    printf '模型链：%s\n' "${MODEL_CHAIN:-默认(.env)}"
     printf '重试：%s 次，超时：%s 秒，空转看门狗：%s 秒，降级阈值：%s\n' "$RETRIES" "$TIMEOUT_SECONDS" "$STALL_TIMEOUT_SECONDS" "$DEGRADE_AFTER"
     printf '进度：%s，心跳：%s 秒（每完成一篇立即刷一行）\n' "$PROGRESS_STYLE" "$HEARTBEAT_SECONDS"
   fi
@@ -1040,37 +961,7 @@ summary() {
   fi
 }
 
-print_qwen_route_summary() {
-  # 把已绑定的 (model → host · envKey) 一行行打出来；列表空就一行 “未绑定”。
-  # 让用户当场识破“忘选/选错 provider”——尤其是不同 OpenAI-compatible 端点里同名 id 的场景。
-  local cli_base
-  cli_base="${SELECTED_CLI##*/}"
-  case "$cli_base" in
-    qwen|qwen-code) ;;
-    *) return 0 ;;
-  esac
-  local n=${#MODEL_CHAIN_ITEMS[@]:-0}
-  if (( n == 0 )); then
-    printf 'qwen 路由：未绑定（用 CLI 默认/手动模型链）\n'
-    return 0
-  fi
-  local i model base_url env_key host any=0
-  for (( i = 0; i < n; i += 1 )); do
-    model="${MODEL_CHAIN_ITEMS[$i]}"
-    base_url="${CHAIN_BASE_URLS[$i]:-}"
-    env_key="${CHAIN_ENV_KEYS[$i]:-}"
-    [[ -z "$base_url" ]] && continue
-    any=1
-    host="${base_url#*://}"; host="${host%%/*}"
-    if (( i == 0 )); then
-      printf 'qwen 路由：\n'
-    fi
-    printf '  - %s → %s · %s\n' "$model" "$host" "${env_key:-（无 envKey）}"
-  done
-  (( any == 0 )) && printf 'qwen 路由：选中模型未携带 baseUrl（不会传 --qwen-routes）\n'
-}
-
-# 把当前内存里的「技术参数」（CLI/模型/判官/并发/qwen 路由）落盘成 KV 文件，下次跑可一键复用。
+# 把当前内存里的「技术参数」（模型/判官/并发）落盘成 KV 文件，下次跑可一键复用。
 # 不存 SCOPE/LIMIT/MAX_ROUNDS——这些是「本次任务范围」，每次重新问；只把当前值当 default。
 # 不存任何 API key 本身，仅存 envKey 变量名。
 save_last_config() {
@@ -1096,7 +987,6 @@ save_last_config() {
     printf 'DEGRADE_AFTER=%q\n' "$DEGRADE_AFTER"
     printf 'PROGRESS_STYLE=%q\n' "$PROGRESS_STYLE"
     printf 'HEARTBEAT_SECONDS=%q\n' "$HEARTBEAT_SECONDS"
-    printf 'SELECTED_CLI=%q\n' "$SELECTED_CLI"
     printf 'MODEL_CHAIN=%q\n' "$MODEL_CHAIN"
     printf 'JUDGE_ENABLED=%q\n' "$JUDGE_ENABLED"
     printf 'JUDGE_MODELS=%q\n' "$JUDGE_MODELS"
@@ -1159,18 +1049,16 @@ load_last_config() {
   return 0
 }
 
-# 用 discover_models 跑一次当前 CLI 的 model 列表，校验上次记下的 model id 是否还在。
+# 用 discover_models 跑一次 .env 里可用的 model 列表，校验上次记下的 model id 是否还在。
 # 缺一个就返回 1 + 在 stderr 上点名缺失的 id。让上层退回到手选 step。
 verify_replayed_models() {
-  local cli="$SELECTED_CLI"
-  [[ -z "$cli" ]] && return 1
   local available=()
   local value label base_url env_key
   while IFS=$'\t' read -r value label base_url env_key; do
     [[ -z "$value" ]] && continue
     available+=("$value")
-  done < <(discover_models "$cli")
-  # discover_models 对非 qwen CLI 可能返回空——空列表视为「未知列表，跳过校验」。
+  done < <(discover_models)
+  # 空列表视为「未知列表，跳过校验」（如 .env 未配 key）。
   (( ${#available[@]} == 0 )) && return 0
   local id missing=()
   for id in "${MODEL_CHAIN_ITEMS[@]}"; do
@@ -1210,10 +1098,9 @@ last_config_summary_line() {
     source "$LAST_CONFIG_FILE" 2>/dev/null || exit 1
     local saved_at=""
     saved_at=$(grep -m1 '^# saved at ' "$LAST_CONFIG_FILE" 2>/dev/null | sed 's/^# saved at //')
-    printf '%s · cli=%s · model=%s · judge=%s · batch=%s · warm=%s · concurrency=%s' \
+    printf '%s · model=%s · judge=%s · batch=%s · warm=%s · concurrency=%s' \
       "${saved_at:-未知时间}" \
-      "${SELECTED_CLI:-?}" \
-      "${MODEL_CHAIN:-CLI默认}" \
+      "${MODEL_CHAIN:-默认}" \
       "${JUDGE_MODELS:-同精修}" \
       "${JUDGE_BATCH_SIZE:-?}" \
       "${JUDGE_WARM_CONCURRENCY:-跟随并发}" \
@@ -1247,7 +1134,7 @@ confirm_execution() {
   done
 }
 
-# 步骤：0 阶段 1 模式 2 领域 3 (audit?参数:topic) 4 参数 5 CLI 6 模型链 7 判官模型 8 判官参数 9 确认
+# 步骤：0 阶段 1 模式 2 领域 3 (audit?参数:topic) 4 参数 5 (空,CLI 已废弃) 6 模型链 7 判官模型 8 判官参数 9 确认
 # audit 跳到 9；refine（含测试跑）走 7、(启用判官?8)、9——测试跑只是 topic 步钉成单篇，其余完全一致。
 next_step() {
   case "$1" in
@@ -1296,8 +1183,8 @@ previous_step() {
 run_wizard_step() {
   if (( REPLAY_FLAG == 1 )); then
     case "$1" in
-      5|6|7|8)
-        printf '%s\n' "${DIM}（复用上次配置：跳过 $(case "$1" in 5) echo CLI ;; 6) echo 模型链 ;; 7) echo 判官模型 ;; 8) echo 判官参数 ;; esac)）${RESET}" >&2
+      6|7|8)
+        printf '%s\n' "${DIM}（复用上次配置：跳过 $(case "$1" in 6) echo 模型链 ;; 7) echo 判官模型 ;; 8) echo 判官参数 ;; esac)）${RESET}" >&2
         return 0
         ;;
     esac
@@ -1333,16 +1220,25 @@ execute_selected_mode() {
 
 main() {
   local force_last=0
+  # P0.4：REFINE_NONINTERACTIVE=true 或 --yes 时，.env 已有值的步骤直接采用（只打印「用 .env: X」），
+  # 向导精简为：选范围 → （可选）覆盖哪几项 → 确认。
+  local noninteractive=0
+  [[ "${REFINE_NONINTERACTIVE:-}" =~ ^(1|true|yes|on)$ ]] && noninteractive=1
   while (( $# > 0 )); do
     case "$1" in
       --last|-l)
         force_last=1
         shift
         ;;
+      --yes|-y)
+        noninteractive=1
+        shift
+        ;;
       --help|-h)
         cat <<'USAGE'
 用法: quality_refine_interactive.sh [选项]
-  --last, -l   直接复用上次配置（跳过 CLI/模型链/判官 询问，仍会问 stage/mode/domains/topics/参数）
+  --last, -l   直接复用上次配置（跳过 模型链/判官 询问，仍会问 stage/mode/domains/topics/参数）
+  --yes, -y    非交互模式：.env 已有值的步骤直接采用，向导精简为选范围→确认（也可通过 REFINE_NONINTERACTIVE=true 启用）
   --help, -h   显示帮助
 USAGE
         return 0
@@ -1358,6 +1254,58 @@ USAGE
   info "正式精修始终改 production topics/；选择阶段只决定成功后同步到哪些环境。"
   load_domains
 
+  # P0.4：非交互模式——读取 .env 值直接采用，省去逐项询问，仅让用户选范围后确认。
+  if (( noninteractive == 1 )); then
+    info "非交互模式（REFINE_NONINTERACTIVE/--yes）：从 .env 读取默认配置，跳过逐项询问。"
+    MODEL_CHAIN=""    # 空=读 .env REFINE_MODEL_CHAIN
+    JUDGE_ENABLED=1
+    JUDGE_MODELS=""   # 空=读 .env JUDGE_MODEL_CHAIN
+    local env_min env_conc env_rounds env_batch env_skip
+    env_min="$(grep -E '^MIN_SCORE=' .env 2>/dev/null | tail -1 | cut -d= -f2-)"
+    env_conc="$(grep -E '^CONCURRENCY=' .env 2>/dev/null | tail -1 | cut -d= -f2-)"
+    env_rounds="$(grep -E '^MAX_ROUNDS=' .env 2>/dev/null | tail -1 | cut -d= -f2-)"
+    env_batch="$(grep -E '^JUDGE_BATCH_SIZE=' .env 2>/dev/null | tail -1 | cut -d= -f2-)"
+    env_skip="$(grep -E '^DYNAMIC_SKIP_MIN=' .env 2>/dev/null | tail -1 | cut -d= -f2-)"
+    [[ -n "$env_min" ]]    && { MIN_SCORE="$env_min";        printf '%s\n' "  用 .env: MIN_SCORE=${MIN_SCORE}" >&2; }
+    [[ -n "$env_conc" ]]   && { CONCURRENCY="$env_conc";     printf '%s\n' "  用 .env: CONCURRENCY=${CONCURRENCY}" >&2; }
+    [[ -n "$env_rounds" ]] && { MAX_ROUNDS="$env_rounds";    printf '%s\n' "  用 .env: MAX_ROUNDS=${MAX_ROUNDS}" >&2; }
+    [[ -n "$env_batch" ]]  && { JUDGE_BATCH_SIZE="$env_batch"; printf '%s\n' "  用 .env: JUDGE_BATCH_SIZE=${JUDGE_BATCH_SIZE}" >&2; }
+    [[ -n "$env_skip" ]]   && { DYNAMIC_SKIP_MIN="$env_skip"; printf '%s\n' "  用 .env: DYNAMIC_SKIP_MIN=${DYNAMIC_SKIP_MIN}" >&2; }
+    # 非交互模式：只走 阶段→模式→领域→Topic→确认，跳过 模型/判官 步骤
+    local step=0 rc
+    while true; do
+      case "$step" in
+        0) choose_stage || { rc=$?; [[ "$rc" == 130 ]] && { printf '%s\n' "${DIM}已退出。${RESET}"; return 0; }; }
+           step=1 ;;
+        1) choose_run_mode || { rc=$?; [[ "$rc" == 130 ]] && { printf '%s\n' "${DIM}已退出。${RESET}"; return 0; }; [[ "$rc" == 2 ]] && { step=0; continue; } }
+           step=2 ;;
+        2) choose_domains || { rc=$?; [[ "$rc" == 130 ]] && { printf '%s\n' "${DIM}已退出。${RESET}"; return 0; }; [[ "$rc" == 2 ]] && { step=1; continue; } }
+           step=3 ;;
+        3)
+          if [[ "$RUN_MODE" == "audit" ]]; then
+            choose_quality_options || { rc=$?; [[ "$rc" == 130 ]] && { printf '%s\n' "${DIM}已退出。${RESET}"; return 0; }; [[ "$rc" == 2 ]] && { step=2; continue; } }
+          else
+            choose_topics || { rc=$?; [[ "$rc" == 130 ]] && { printf '%s\n' "${DIM}已退出。${RESET}"; return 0; }; [[ "$rc" == 2 ]] && { step=2; continue; } }
+          fi
+          step=4 ;;
+        4)
+          if confirm_execution; then
+            set +e
+            execute_selected_mode
+            rc=$?
+            set -e
+            return "$rc"
+          else
+            rc=$?
+            [[ "$rc" == 130 ]] && { printf '%s\n' "${DIM}已退出。${RESET}"; return 0; }
+            [[ "$rc" == 2 ]] && { step=3; continue; }
+          fi
+          ;;
+      esac
+    done
+    return 0
+  fi
+
   if [[ -f "$LAST_CONFIG_FILE" ]]; then
     local summary
     summary="$(last_config_summary_line || true)"
@@ -1366,7 +1314,7 @@ USAGE
       if load_last_config; then
         if verify_replayed_models; then
           REPLAY_FLAG=1
-          info "✓ 上次配置已复用，将跳过 CLI/模型链/判官 步骤。"
+          info "✓ 上次配置已复用，将跳过 模型链/判官 步骤。"
         else
           printf '%s\n' "${YELLOW}警告：上次配置中的模型已不可用（详见上方提示），退回手选模式。${RESET}" >&2
           REPLAY_FLAG=0
@@ -1386,7 +1334,7 @@ USAGE
           if load_last_config; then
             if verify_replayed_models; then
               REPLAY_FLAG=1
-              info "✓ 已复用上次配置，将跳过 CLI/模型链/判官 步骤（仍会问阶段/模式/领域/topic/参数）。"
+              info "✓ 已复用上次配置，将跳过 模型链/判官 步骤（仍会问阶段/模式/领域/topic/参数）。"
             else
               printf '%s\n' "${YELLOW}警告：上次配置中的模型已不可用（详见上方提示），退回手选模式。${RESET}" >&2
               REPLAY_FLAG=0

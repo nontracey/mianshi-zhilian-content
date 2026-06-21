@@ -9,6 +9,8 @@
 // - 优先级链：显式 backend > MCP > auto 内置 > not_checked
 
 import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { envConfig } from "./llm/env-config.mjs";
 import { liveEvents } from "./llm/live-events.mjs";
 import { callConfiguredTools } from "./mcp/registry.mjs";
@@ -16,6 +18,55 @@ import { builtinFactCheck } from "./web/builtin-fact-check.mjs";
 
 const cache = new Map(); // queryHash -> {result, fetchedAt}
 const FACT_CHECK_CACHE_TTL_MS = Number(envConfig.getEnv("FACT_CHECK_CACHE_TTL_MS", "3600000")) || 3600000;
+
+// P1.2：按 claim/query 哈希落盘到 .quality-refine/fact-cache/，跨轮跨 run 复用。
+// 事实核验只跟「检索查询」相关（title/domain/category/tags/difficulty）——而非整篇内容，
+// 所以用查询指纹当 key：精修改了正文但没动 title/tags 时，证据可直接复用、不再联网。
+const qualityRoot = process.env.QUALITY_REFINE_DIR
+  ? path.resolve(process.env.QUALITY_REFINE_DIR)
+  : path.join(process.cwd(), ".quality-refine");
+const FACT_CACHE_DIR = path.join(qualityRoot, "fact-cache");
+
+function diskCachePath(cacheKey) {
+  return path.join(FACT_CACHE_DIR, `${cacheKey}.json`);
+}
+
+function readDiskCache(cacheKey) {
+  try {
+    const file = diskCachePath(cacheKey);
+    if (!existsSync(file)) return null;
+    const entry = JSON.parse(readFileSync(file, "utf8"));
+    if (!entry || typeof entry.fetchedAt !== "number") return null;
+    if (Date.now() - entry.fetchedAt >= FACT_CHECK_CACHE_TTL_MS) return null;
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+function writeDiskCache(cacheKey, entry) {
+  try {
+    mkdirSync(FACT_CACHE_DIR, { recursive: true });
+    const file = diskCachePath(cacheKey);
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(entry));
+    renameSync(tmp, file);
+  } catch {
+    // 缓存落盘失败不阻塞精修（只损失一次复用）。
+  }
+}
+
+// 检索查询指纹：只取决定 web 查询的稳定字段，精修正文不会让它变化。
+function factQueryFingerprint(topic) {
+  const tags = Array.isArray(topic?.tags) ? [...topic.tags].map((t) => String(t)).sort() : [];
+  return hash(JSON.stringify({
+    title: topic?.title ?? "",
+    domain: topic?.domain ?? "",
+    category: topic?.category ?? "",
+    difficulty: topic?.difficulty ?? null,
+    tags,
+  }));
+}
 
 function boolEnv(key, fallback = false) {
   const raw = envConfig.getEnv(key);
@@ -130,9 +181,9 @@ export async function buildFactEvidence(topic, ref) {
   }
 
   const backend = String(envConfig.getEnv("FACT_CHECK_BACKEND", "auto")).toLowerCase();
+  // P1.2：key 改用「检索查询指纹」而非整篇 topicHash——精修改正文不再让证据失效，可跨轮跨 run 复用。
   const cacheKey = hash(JSON.stringify({
-    ref,
-    topicHash: hash(JSON.stringify(topic)),
+    queryFingerprint: factQueryFingerprint(topic),
     backend,
     mcp: envConfig.getEnv("FACT_CHECK_MCP_TOOLS") ?? envConfig.getEnv("FACT_CHECK_MCP_TOOL") ?? "",
     recency: envConfig.getEnv("FACT_CHECK_RECENCY_DAYS"),
@@ -140,6 +191,12 @@ export async function buildFactEvidence(topic, ref) {
   const cached = cache.get(cacheKey);
   if (cached && Date.now() - cached.fetchedAt < FACT_CHECK_CACHE_TTL_MS) {
     return cached.result;
+  }
+  // 内存未命中 → 查落盘缓存（跨 run 复用）。
+  const disk = readDiskCache(cacheKey);
+  if (disk) {
+    cache.set(cacheKey, { result: disk.result, fetchedAt: disk.fetchedAt });
+    return disk.result;
   }
 
   let evidence;
@@ -180,7 +237,10 @@ export async function buildFactEvidence(topic, ref) {
     };
   }
 
-  cache.set(cacheKey, { result: evidence, fetchedAt: Date.now() });
+  const fetchedAt = Date.now();
+  cache.set(cacheKey, { result: evidence, fetchedAt });
+  // 不缓存暂时性失败（unreachable），避免把一次断网/限流固化成长期命中。
+  if (evidence?.status !== "unreachable") writeDiskCache(cacheKey, { result: evidence, fetchedAt });
   liveEvents.emitEvent("factcheck.done", {
     ref,
     backend: evidence?.backend ?? backend,

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { envConfig } from "./llm/env-config.mjs";
@@ -6,6 +6,40 @@ import { llmRunner } from "./llm/runner.mjs";
 import { callConfiguredTools } from "./mcp/registry.mjs";
 
 const root = process.cwd();
+
+// P1.3：按 diagram 卡内容（SVG/mermaid/fallback）哈希缓存视觉判定 + 落盘，跨轮跨 run 复用。
+// 视觉判定只取决于「图本身」，与正文其它卡无关——所以用 diagram 卡的内容指纹当 key，
+// 精修改了正文但没动图时，渲染 + 视觉判定可直接复用、不再跑后端。
+const qualityRoot = process.env.QUALITY_REFINE_DIR
+  ? path.resolve(process.env.QUALITY_REFINE_DIR)
+  : path.join(root, ".quality-refine");
+const VISUAL_CACHE_DIR = path.join(qualityRoot, "visual-cache");
+
+function visualDiskPath(cacheKey) {
+  return path.join(VISUAL_CACHE_DIR, `${cacheKey}.json`);
+}
+
+function readVisualDisk(cacheKey) {
+  try {
+    const file = visualDiskPath(cacheKey);
+    if (!existsSync(file)) return null;
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeVisualDisk(cacheKey, review) {
+  try {
+    mkdirSync(VISUAL_CACHE_DIR, { recursive: true });
+    const file = visualDiskPath(cacheKey);
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(review));
+    renameSync(tmp, file);
+  } catch {
+    // 缓存落盘失败不阻塞精修。
+  }
+}
 const VISUAL_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -375,14 +409,20 @@ ${JSON.stringify({ checkedCards: staticReview.checkedCards, findings: staticRevi
 export async function buildVisualReview(topic, ref) {
   const staticReview = staticVisualReview(topic, ref);
   const enabled = boolEnv("VISION_JUDGE_ENABLED", false);
+  // P1.3：key 改用 diagram 卡内容指纹（而非整篇 topicHash）——改正文不让视觉缓存失效。
   const cacheKey = hash(JSON.stringify({
     ref,
-    topicHash: hash(JSON.stringify(topic)),
+    diagramHash: hash(JSON.stringify(diagramCards(topic))),
     enabled,
     mcp: envConfig.getEnv("VISION_JUDGE_MCP_TOOLS") ?? envConfig.getEnv("VISION_JUDGE_MCP_TOOL") ?? "",
     models: envConfig.getEnv("VISION_JUDGE_MODEL_CHAIN") ?? "",
   }));
   if (cache.has(cacheKey)) return cache.get(cacheKey);
+  const disk = readVisualDisk(cacheKey);
+  if (disk) {
+    cache.set(cacheKey, disk);
+    return disk;
+  }
   let review = staticReview;
   if (enabled && diagramCards(topic).length) {
     try {
@@ -399,6 +439,8 @@ export async function buildVisualReview(topic, ref) {
     }
   }
   cache.set(cacheKey, review);
+  // 只缓存真正跑过后端（或纯静态）的结果；后端报错（visual-backend-error）不落盘，留待下次重试。
+  if (review?.backend !== "visual-backend-error") writeVisualDisk(cacheKey, review);
   return review;
 }
 

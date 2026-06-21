@@ -16,6 +16,7 @@ import {
   BLOCK_JUDGE_RUBRIC_VERSION,
   JSON_STRING_RULES,
   JUDGE_RUBRIC_VERSION,
+  JUDGE_DIMENSIONS,
   buildBlockJudgePrompt,
   buildJudgeBatchPrompt,
   buildJudgePrompt,
@@ -60,6 +61,22 @@ const qualityRoot = process.env.QUALITY_REFINE_DIR
   ? path.resolve(process.env.QUALITY_REFINE_DIR)
   : path.join(root, ".quality-refine");
 const allowComplexMermaid = /^(1|true|yes)$/i.test(envConfig.getEnv("REFINE_ALLOW_COMPLEX_MERMAID", "false"));
+// P1.1：块级删卡总开关——默认关（绝不静默删）。需删冗余/占位/被取代卡时显式 REFINE_ALLOW_BLOCK_REMOVE=true，
+// 且仍受 remove 专属门把关（结构硬门 + 静态不退 + 判官互证）。
+const allowBlockRemove = /^(1|true|yes|on)$/i.test(envConfig.getEnv("REFINE_ALLOW_BLOCK_REMOVE", "false"));
+// P1.4/§二原则2：逐卡写手契约摘要——块级 prompt 太薄会窄化 9 维契约。这里给一份精炼的硬约束，
+// 既不像整篇 REFINE_SPEC 那样按卡重复堆 token，又保住「不可窄化」的底线。
+const CARD_REFINE_CONTRACT = [
+  "硬约束（务必遵守，违反会被判官/不变量直接退回）：",
+  "1. 只改本卡文字内容，结构（type/title/字段名/层级）严格不变，不新增/删除字段。",
+  "2. 专家口吻、面试可直接用：补机制主线/边界/取舍/失败路径，杜绝模板腔、百科腔、空泛套话。",
+  "3. 禁止跨篇模板句、禁止把多篇通用的句子照抄进来；表达要本题专属、具体可验证。",
+  "4. rubric.mustHave/goodToHave/commonMistakes 内不得内嵌代码片段；代码只放在 code 卡。",
+  "5. diagram 不得是纯线性关键词链或'结论/总结'汇聚点；要有真实分支/状态/取舍，且保留 fallback/caption 兜底。",
+  "6. 不臆造事实；版本/默认值/复杂度/协议行为等时间敏感点要稳妥，拿不准就别写死。",
+].join("\n");
+// P1.4：同领域最高分篇的同类型卡，作为逐卡精修的 few-shot 范例（main() 在初审后填充）。
+let domainExemplars = new Map(); // domain -> Map(type -> exemplarCard)
 const maxConcurrency = 8;
 // activeChildren 已弃用 —— CLI 子进程路径已删除,API 模式无 spawn。但 installSignalHandlers / runProcess 仍引用 → 改写为 noop
 const activeChildren = new Map(); // noop 占位,后续 edit 会从 runProcess 里移走
@@ -679,11 +696,7 @@ function noteModelResult(_modelState, _result) { /* noop,降级由 router.mjs �
 
 // ===== 动态判官（LLM 9 维评审；只读/plan 预设，零写/工具权限）=====
 // 判官输入全内嵌 prompt、输出一个小 review JSON 到 stdout，不需要任何写或工具执行权限。
-// applyJudgePreset / buildJudgeFilePrompt / judgeProtocolError / extractJsonErrorLocation 已弃用
-// —— CLI 文件协议路径已删除(API 模式用 response_format=json_schema strict,工具自动序列化,无需"文件协议+重试")。
-// 保留为 stub 防旧引用炸。
-function applyJudgePreset(_cli, timeoutMs) { return { baseArgs: [], modelArg: "--model", promptArg: null, promptMode: "positional", extraArgs: [], usePty: false, timeoutMs }; }
-function buildJudgeFilePrompt(prompt, _cachePath, _previousError = "") { return prompt; }
+// judgeProtocolError / extractJsonErrorLocation：判官 JSON 解析的协议错误标记 + 定位（API 模式 schema strict 下基本不触发，保留）。
 function judgeProtocolError(message, extras = {}) { const err = new Error(message); err.judgeProtocolFailure = true; Object.assign(err, extras); return err; }
 function extractJsonErrorLocation(_text, _error) { return null; /* API 模式 schema strict 校验,不需 line/col 定位 */ }
 
@@ -698,7 +711,6 @@ function strictParseJudgeJson(text, label) {
 
 // 单次判官调用：API 模式 —— 调 llmRunner.runJudge（自动应用 JUDGE_MODEL_CHAIN + 默认采样 + 降级 + 截断重试）。
 async function runJudgeProcessJson(prompt, judge, model, ref, index, schema, images = []) {
-  void judge; // API 模式不需要 judge.cliPath / judge.cfg
   const finalSchema = schema ?? JUDGE_REVIEW_SCHEMA;
   const attempts = judge?.jsonRetries ? judge.jsonRetries + 1 : 1;
   let lastError = null;
@@ -740,11 +752,23 @@ async function runJudgeProcessJson(prompt, judge, model, ref, index, schema, ima
 
 // skipExternal=true 时跳过联网事实核验 + 视觉 QA（用于预热和判前基线：跑原文，不需要外部信号）。
 // 只有判后（judgeAfter，精修完成后）才需要完整外部 context。
-async function buildExternalJudgeContext(topic, ref, { skipExternal = false } = {}) {
+// P1.2/P1.3：changedBlocks/hadSvg/needSvg 用于按需触发——只有改动块命中事实/视觉相关时才查。
+async function buildExternalJudgeContext(topic, ref, { skipExternal = false, changedBlocks = null, hadSvg = null, needSvg = null } = {}) {
   if (skipExternal) return { visualReview: null, factEvidence: null, cacheKey: "" };
+  // P1.2：联网按需——仅当：changedBlocks 为 null（全量判，不知道改了什么）或包含事实/技术类卡片时才查。
+  // changedBlocks 为空数组时说明本次未改内容块，跳过联网。
+  const needFact = changedBlocks === null || changedBlocks.length > 0;
+  // P1.3：视觉按需——仅当已有 SVG 主图或判定该生成 SVG 时进视觉后端；纯 mermaid/compareTable 不查。
+  // hadSvg 未传时从 topic 自动检测（向后兼容）。
+  const topicHasSvg = hadSvg !== null ? hadSvg : (
+    topic && Array.isArray(topic.learningCards)
+      ? topic.learningCards.some(cardHasSvg)
+      : false
+  );
+  const needVisual = topicHasSvg || needSvg || false;
   const [visualReview, factEvidence] = await Promise.all([
-    buildVisualReview(topic, ref),
-    buildFactEvidence(topic, ref),
+    needVisual ? buildVisualReview(topic, ref) : Promise.resolve(null),
+    needFact ? buildFactEvidence(topic, ref) : Promise.resolve({ status: "not_checked", summary: "本次未改内容块，跳过联网核验", findings: [], sources: [] }),
   ]);
   const hasExternalSignal =
     (visualReview?.visualFit === "fail") ||
@@ -816,9 +840,11 @@ async function writeJudgeCache(topic, judge, review, context) {
 
 // 对一篇内容跑全部判官（模型 × 数量），按 contentHash 缓存聚合结果。判官全失败时返回 null（退回静态护栏）。
 // skipExternal=true：跳过事实核验和视觉 QA（用于预热 / judgeBefore 基线，只评原文内容，不做联网）。
-async function runJudges(topic, ref, judge, { skipExternal = false } = {}) {
+// external：P1.2/P1.3 按需外部信号开关——{ changedBlocks, hadSvg, needSvg } 透传给 buildExternalJudgeContext，
+//           让「只改了带事实断言的块才联网、有图才看图」真正生效（不传则保持全量行为）。
+async function runJudges(topic, ref, judge, { skipExternal = false, returnRaw = false, external = null } = {}) {
   if (!judge?.enabled) return null;
-  const externalContext = await buildExternalJudgeContext(topic, ref, { skipExternal });
+  const externalContext = await buildExternalJudgeContext(topic, ref, { skipExternal, ...(external ?? {}) });
   const cached = readJudgeCache(topic, judge, externalContext);
   if (cached) return applyExternalJudgeContext(cached, externalContext);
   // v3.3 判官看图：根据判官 chain 第一个模型的 imageUnderstanding 模式准备 visualUnderstanding
@@ -842,7 +868,9 @@ async function runJudges(topic, ref, judge, { skipExternal = false } = {}) {
   const prompt = typeof built === "string" ? built : built.prompt;
   const judgeImages = typeof built === "object" && built ? (built.images ?? []) : [];
   const reviews = [];
-  for (const model of judge.models) {
+  // fallback 语义：非 ensemble 模式下首个成功模型即停，不全跑；ensemble 模式跑所有 judge.models。
+  for (const model of [...judge.models, ...(judge.fallbackChain ?? [])]) {
+    const modelReviews = [];
     for (let index = 0; index < judge.count; index += 1) {
       if (shutdownRequested) break;
       try {
@@ -850,18 +878,24 @@ async function runJudges(topic, ref, judge, { skipExternal = false } = {}) {
         const modelMeta = envConfig.findModel(model);
         const imagesForThisModel = (modelMeta && (modelMeta.modality ?? []).includes("image")) ? judgeImages : [];
         const parsed = await runJudgeProcessJson(prompt, judge, model, ref, index, undefined, imagesForThisModel);
-        reviews.push(normalizeJudgeReview(parsed));
+        modelReviews.push(normalizeJudgeReview(parsed));
       } catch (error) {
         if (error.interrupted) throw error;
         const tag = error.judgeProtocolFailure ? "JSON协议失败(降级静态)" : "评审失败";
         console.log(`[JUDGE] ${tag} ${ref} m=${model ?? "默认"} #${index + 1}: ${error.message}`);
       }
     }
+    if (modelReviews.length) {
+      reviews.push(...modelReviews);
+      if (!judge.ensemble) break; // fallback 模式：首个成功即停
+    }
   }
   if (!reviews.length) return null;
   const agg = aggregateReviews(reviews);
   await writeJudgeCache(topic, judge, agg, externalContext);
-  return applyExternalJudgeContext(agg, externalContext);
+  const result = applyExternalJudgeContext(agg, externalContext);
+  // P2.2: returnRaw=true 时额外返回逐模型原始评审数组，供 ensemble 互证计算 corroborated
+  return returnRaw ? { agg: result, reviews } : result;
 }
 
 async function runJudgeBatch(items, judge, { skipExternal = false } = {}) {
@@ -870,13 +904,18 @@ async function runJudgeBatch(items, judge, { skipExternal = false } = {}) {
   const prompt = buildJudgeBatchPrompt(items);
   let batchFatal = null; // 批量协议失败时记下，后面降级单篇兜底
   const errorSamples = [];
-  for (const model of judge.models) {
+  // fallback 语义：非 ensemble 模式下首个成功批量模型即停
+  let batchGotResults = false;
+  for (const model of [...judge.models, ...(judge.fallbackChain ?? [])]) {
+    if (batchGotResults && !judge.ensemble) break;
+    let modelGot = false;
     for (let index = 0; index < judge.count; index += 1) {
       if (shutdownRequested) break;
       try {
         const parsed = await runJudgeProcessJson(prompt, judge, model, `batch:${items.length}`, index, QWEN_JUDGE_BATCH_SCHEMA);
         const normalized = normalizeJudgeBatchReviews(parsed, items);
         for (const { ref, review } of normalized) byRef.get(ref).push(review);
+        modelGot = true;
       } catch (error) {
         if (error.interrupted) throw error;
         // 批量 prompt 一旦坏掉（JSON 非法 / 模型遗漏 ref / 进程失败），整批 16 篇都拿不到结果。
@@ -891,6 +930,7 @@ async function runJudgeBatch(items, judge, { skipExternal = false } = {}) {
         );
       }
     }
+    if (modelGot) batchGotResults = true;
   }
   const out = new Map();
   const fallbackQueue = [];
@@ -1005,15 +1045,13 @@ async function warmJudgeCacheForTargets(refs, judge, cfg = {}) {
   function buildAbortError(out, batchIdx) {
     const samples = (out.errorSamples || []).slice(0, 3);
     const judgeModels = (judge.models || []).map((m) => m ?? "默认").join(", ") || "(默认)";
-    const cliPath = judge.cfg?.cliPath || judge.cfg?.cli || "(未知)";
     const stem = batchIdx === 0
       ? "判官预热第一批整批失败"
       : `判官预热连续 ${consecutiveAllFailed} 批整批失败`;
-    const hint = "请检查：① 模型名是否正确（modelChain）② 对应的 envKey/API Key 是否已设置 ③ baseURL 是否可达 ④ CLI 是否能独立运行";
+    const hint = "请检查：① 模型名是否正确（modelChain）② 对应的 envKey/API Key 是否已设置 ③ baseURL 是否可达";
     const err = new Error(
       `${stem}（model × count × 单篇兜底全部失败），中止预热以避免空跑。\n` +
         `  judge models: ${judgeModels}\n` +
-        `  judge CLI:    ${cliPath}\n` +
         (samples.length ? `  错误样例:\n    - ${samples.join("\n    - ")}\n` : "") +
         `  ${hint}`,
     );
@@ -1110,13 +1148,18 @@ async function runBlockJudges({ ref, title, blocks }, judge) {
   }
   const byKey = new Map(blocks.map((block) => [block.key, []]));
   const prompt = buildBlockJudgePrompt({ ref, title, blocks });
-  for (const model of judge.models) {
+  // fallback 语义：非 ensemble 模式下首个成功块级判官即停
+  let blockGotResults = false;
+  for (const model of [...judge.models, ...(judge.fallbackChain ?? [])]) {
+    if (blockGotResults && !judge.ensemble) break;
+    let modelGot = false;
     for (let index = 0; index < judge.count; index += 1) {
       if (shutdownRequested) break;
       try {
         const parsed = await runJudgeProcessJson(prompt, judge, model, `block:${ref}`, index, QWEN_BLOCK_JUDGE_SCHEMA);
         const reviews = normalizeBlockJudgeReview(parsed, blocks);
         for (const review of reviews) byKey.get(review.key)?.push(review);
+        modelGot = true;
       } catch (error) {
         if (error.interrupted) throw error;
         // 同 runJudges：块级判官协议失败也只降级（返回 null → 块级 keep-best 退回静态/整篇判定），不上抛崩溃。
@@ -1124,6 +1167,7 @@ async function runBlockJudges({ ref, title, blocks }, judge) {
         console.log(`[JUDGE] ${tag} ${ref} m=${model ?? "默认"} #${index + 1}: ${error.message}`);
       }
     }
+    if (modelGot) blockGotResults = true;
   }
   if (![...byKey.values()].some((reviews) => reviews.length)) return null;
   const verdictRank = { blocking: 4, regressed: 3, same: 2, improved: 1 };
@@ -1202,6 +1246,33 @@ function buildRefineCorpus() {
   return buildCorpus(all);
 }
 
+// P1.4：每个领域取最高分篇，按卡片 type 提一份范例卡，供逐卡精修做 few-shot。
+// 只读"每域一篇"（约十几个文件），开销可忽略。
+function buildDomainExemplars(audit) {
+  const bestByDomain = new Map(); // domain -> { ref, score }
+  for (const topicInfo of audit?.allTopics ?? []) {
+    if (!topicInfo?.domain || !topicInfo?.ref) continue;
+    const current = bestByDomain.get(topicInfo.domain);
+    if (!current || (topicInfo.score ?? 0) > current.score) {
+      bestByDomain.set(topicInfo.domain, { ref: topicInfo.ref, score: topicInfo.score ?? 0 });
+    }
+  }
+  const map = new Map();
+  for (const [domain, { ref }] of bestByDomain) {
+    try {
+      const topic = JSON.parse(readFileSync(path.join(root, ref), "utf8"));
+      const byType = new Map();
+      for (const card of topic.learningCards ?? []) {
+        if (card?.type && !byType.has(card.type)) byType.set(card.type, card);
+      }
+      if (byType.size) map.set(domain, byType);
+    } catch {
+      // 跳过读不出的范例篇——few-shot 缺失只是少一个提示，不影响正确性。
+    }
+  }
+  return map;
+}
+
 // 把 duplicateLanguageIssues（形如 "5x <句子> :: ref1 | ref2 | ..."）反向索引到每个 ref。
 function templatesByRef(audit) {
   const map = new Map();
@@ -1223,11 +1294,15 @@ function templatesByRef(audit) {
   return map;
 }
 
-function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministicScore, cachePath, findingLines = [], previousError = null) {
+function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministicScore, cachePath, findingLines = [], previousError = null, previousKeptOldReason = null) {
   const todayYmd = new Date().toISOString().slice(0, 10);
   const spec = REFINE_SPEC.split("${todayYmd}").join(todayYmd);
   const issues = failingInfo?.issues ?? [];
   const tmpl = templates ?? [];
+  // P1.4：上轮 keptOld 的拒绝原因——喂回让模型知道"上次改了但被退回、原因是什么"。
+  const keptOldBlock = previousKeptOldReason
+    ? `\n【上轮精修被拒——原因如下，本次必须针对性修正（不改这点会再被拒）】\n${previousKeptOldReason}\n`
+    : "";
   // 上一次输出解析失败 → 把"具体哪坏了 + 位置上下文"喂回去，让模型精准修格式，而不是同 prompt 再撞一次。
   // 关键诉求：失败要因为内容不够好，而不是少括号/少逗号/裸引号/中英文标点这种格式问题。
   let retryBlock = "";
@@ -1256,7 +1331,7 @@ function buildRefinePrompt(topic, failingInfo, templates, minScore, deterministi
     ? "REFINE_ALLOW_COMPLEX_MERMAID=true: diagram uses subgraph(<=2 levels), stateDiagram(-v2), sequenceDiagram, classDef 5-color palette; banned: classDiagram/gantt/pie/journey/erDiagram/mindmap and bare style. sources: svg -> mermaid -> text."
     : "REFINE_ALLOW_COMPLEX_MERMAID=false: diagram only simple flowchart/graph + direction header, sources only svg/mermaid/text.";
   return `${spec}
-${retryBlock}
+${retryBlock}${keptOldBlock}
 【统一知识精修标准】
 标准版本：${CONTENT_STANDARD_VERSION}。production-strict 目标静态/动态均 ≥${PRODUCTION_STRICT_MIN_SCORE}；当前命令行 minScore 只是本次运行门槛，不代表内容已经达到人工精品。
 
@@ -1882,6 +1957,10 @@ function blockLabel(descriptor) {
   }
   if (descriptor.kind === "followUp") return `followUp:${descriptor.cardTitle || descriptor.cardKey}#${descriptor.index + 1}`;
   if (descriptor.kind === "recall") return `recallPrompt#${descriptor.index + 1}`;
+  if (descriptor.kind === "remove") {
+    const removed = descriptor.original;
+    return `remove:${removed?.type ?? "card"}${removed?.title ? `:${removed.title}` : ""}`;
+  }
   return descriptor.kind;
 }
 
@@ -1938,6 +2017,23 @@ function buildBlockDescriptors(original, candidate) {
           candidate: candidateFollowUps[index],
         });
       }
+    }
+  }
+
+  // P1.1 remove：原卡在候选中消失（未被任何候选卡匹配）→ 生成 remove 描述符。
+  // 仅在 REFINE_ALLOW_BLOCK_REMOVE=true 时生成；后续仍需过结构硬门 + 静态不退 + 块级判官互证才会被选中。
+  if (allowBlockRemove) {
+    for (const entry of originalCards.filter((cardEntry) => !cardEntry.matched)) {
+      descriptors.push({
+        kind: "remove",
+        key: `remove:${entry.key}`,
+        cardKey: entry.key,
+        original: entry.item,
+        originalCard: entry.item,
+        originalIndex: entry.index,
+        candidate: null,
+        candidateIndex: -1,
+      });
     }
   }
 
@@ -2024,6 +2120,16 @@ function applyBlockDescriptors(original, candidate, selectedDescriptors, blockIn
       }
     }
     keyOrder.splice(insertAt, 0, descriptor.cardKey);
+  }
+
+  // P1.1 remove：被选中的 remove 描述符才删卡（按原卡内容定位，再同步 keyOrder）。
+  // 未选中的 remove 默认不删——维持「从 original 起步、绝不静默删」语义。
+  for (const descriptor of selected.filter((item) => item.kind === "remove")) {
+    const idx = merged.learningCards.findIndex((card) => sameJson(card, descriptor.original));
+    if (idx < 0) continue;
+    merged.learningCards.splice(idx, 1);
+    const keyIdx = keyOrder.indexOf(descriptor.cardKey);
+    if (keyIdx >= 0) keyOrder.splice(keyIdx, 1);
   }
 
   for (const descriptor of selected.filter((item) => item.kind === "followUp")) {
@@ -2120,6 +2226,15 @@ function staticRegressionVectorAccepts(beforeReport, afterReport) {
     && staticImproved(beforeReport, afterReport);
 }
 
+// P1.1 remove 的静态门：删块不要求"静态更好"（删冗余卡可能小幅降分仍是对的），
+// 只要求"静态安全"——分不破地板、问题数不增、各维不退；正当性由判官互证另行把关。
+function staticRemoveSafe(beforeReport, afterReport) {
+  const floor = beforeReport.score >= 90 ? 90 : beforeReport.score;
+  return afterReport.score >= floor
+    && afterReport.issueCount <= beforeReport.issueCount
+    && dimensionDropFree(beforeReport, afterReport);
+}
+
 function blockJudgePayload(descriptor) {
   return {
     key: descriptor.key,
@@ -2128,6 +2243,24 @@ function blockJudgePayload(descriptor) {
     before: descriptor.original ?? null,
     after: descriptor.candidate ?? null,
   };
+}
+
+// P1.2/P1.3：算出本次判后需要的外部信号——changedBlocks（动了哪些内容块，空=不联网）、
+// hadSvg（原文是否有 SVG 主图）、needSvg（是否需要看图：有图或判官建议生成 SVG）。
+function computeExternalSignals(original, candidate, beforeReview) {
+  let changedBlocks = null;
+  try {
+    const blockIndex = buildBlockDescriptors(original, candidate);
+    changedBlocks = blockIndex.descriptors
+      .filter((descriptor) => !sameJson(descriptor.original, descriptor.candidate))
+      .map((descriptor) => blockLabel(descriptor));
+  } catch {
+    changedBlocks = null; // 计算失败 → 退回全量联网（保守，不放过新事实错）
+  }
+  const hadSvg = Array.isArray(original?.learningCards) && original.learningCards.some(cardHasSvg);
+  const recommended = beforeReview?.diagramModalityFinding?.recommendedFormat;
+  const needSvg = hadSvg || recommended === "svg";
+  return { changedBlocks, hadSvg, needSvg };
 }
 
 async function tryBlockKeepBest({ original, candidate, ref, corpus, beforeStaticReport, beforeReview, judge }) {
@@ -2149,6 +2282,30 @@ async function tryBlockKeepBest({ original, candidate, ref, corpus, beforeStatic
       rejected.push({ key: descriptor.key, label: blockLabel(descriptor), reason: `重复块守卫：${duplicate}` });
       continue;
     }
+    // P1.1 remove：删块走专属门——必须有判官在场（绝不静态独自删卡），静态只需"安全不退"，
+    // 正当性由下面块级判官互证（verdict=improved 才删）最终把关。
+    if (descriptor.kind === "remove") {
+      if (!(judge?.enabled && beforeReview)) {
+        rejected.push({ key: descriptor.key, label: blockLabel(descriptor), reason: "remove 需判官在场互证，纯静态模式默认保留" });
+        continue;
+      }
+      // 计划「remove 专属门」：删除需 ≥2 异构判官互证（JUDGE_ENSEMBLE_CHAIN）。无 ensemble → 默认保留。
+      if (!(judge.ensembleModels?.length >= 2)) {
+        rejected.push({ key: descriptor.key, label: blockLabel(descriptor), reason: "remove 需 ≥2 异构判官互证（设置 JUDGE_ENSEMBLE_CHAIN），默认保留" });
+        continue;
+      }
+      const report = scoreTopic(variant, ref, corpus);
+      if (staticRemoveSafe(beforeStaticReport, report)) {
+        selected.push({ descriptor, staticAfter: report.score, issueCount: report.issueCount });
+      } else {
+        rejected.push({
+          key: descriptor.key,
+          label: blockLabel(descriptor),
+          reason: `删块静态不安全（${beforeStaticReport.score}/${beforeStaticReport.issueCount} -> ${report.score}/${report.issueCount}）`,
+        });
+      }
+      continue;
+    }
     const report = scoreTopic(variant, ref, corpus);
     if (staticRegressionVectorAccepts(beforeStaticReport, report)) {
       selected.push({ descriptor, staticAfter: report.score, issueCount: report.issueCount });
@@ -2162,11 +2319,16 @@ async function tryBlockKeepBest({ original, candidate, ref, corpus, beforeStatic
   }
 
   if (judge?.enabled && beforeReview && selected.length) {
+    // 含 remove 时用 ensemble 跑块级判官，让"同意删除"必须 ≥2 异构判官一致（互证）。
+    const hasRemove = selected.some((entry) => entry.descriptor.kind === "remove");
+    const blockJudge = hasRemove && judge.ensembleModels?.length >= 2
+      ? { ...judge, models: judge.ensembleModels, ensemble: true, fallbackChain: [] }
+      : judge;
     const blockReviews = await runBlockJudges({
       ref,
       title: original.title,
       blocks: selected.map((entry) => blockJudgePayload(entry.descriptor)),
-    }, judge);
+    }, blockJudge);
     if (blockReviews) {
       const byKey = new Map(blockReviews.map((review) => [review.key, review]));
       const accepted = [];
@@ -2213,11 +2375,21 @@ async function tryBlockKeepBest({ original, candidate, ref, corpus, beforeStatic
   let mergedReview = null;
   let decision;
   if (judge?.enabled && beforeReview) {
-    mergedReview = await runJudges(merged, ref, judge);
+    // P2.2：落盘决策走 ensemble（≥2 异构）+ 互证 corroborated——块级/逐卡主路径也享同一道互证落盘门。
+    const judgeForMerged = judge.ensembleModels?.length >= 2
+      ? { ...judge, models: judge.ensembleModels, ensemble: true, fallbackChain: [] }
+      : judge;
+    // P1.2/P1.3：合并稿判后联网/看图按需。
+    const external = computeExternalSignals(original, merged, beforeReview);
+    const rawMerged = await runJudges(merged, ref, judgeForMerged, { returnRaw: true, external });
+    mergedReview = rawMerged?.agg ?? rawMerged;
+    const corroborated = rawMerged?.reviews?.length >= 2
+      ? computeCorroborated(rawMerged.reviews, beforeReview)
+      : null;
     decision = mergedReview
       // 地板用棘轮口径（与纯静态 staticRegressionVectorAccepts 一致）：现版 ≥90 才要求候选 ≥90；
       // 现版本来 <90 时只要求"候选不低于现版"，让 80->85 这类真实改善也能逐格上挪，而不是被 90 硬地板退回更差旧版。
-      ? acceptByJudge({ before: beforeReview, after: mergedReview, staticBefore: beforeStaticReport.score, staticAfter: mergedStaticReport.score, minStatic: Math.min(90, beforeStaticReport.score) })
+      ? acceptByJudge({ before: beforeReview, after: mergedReview, staticBefore: beforeStaticReport.score, staticAfter: mergedStaticReport.score, minStatic: Math.min(90, beforeStaticReport.score), corroborated })
       : { accept: false, reason: "块级合并后判官失败，降级整篇接受/拒绝" };
   } else {
     decision = staticRegressionVectorAccepts(beforeStaticReport, mergedStaticReport)
@@ -2248,10 +2420,164 @@ async function tryBlockKeepBest({ original, candidate, ref, corpus, beforeStatic
 
 // writeTo 不为空时写到该路径（预览模式，不动仓库）；否则原子写回仓库 ref。
 // corpus 用于落盘前的静态 keep-best：候选静态分不严格高于现版就保留旧版（"越跑越高、不许改烂"）。
+// P1.1: 从判前评审中提取有 headroom 的卡片列表
+function extractHeadroomCards(review, topic) {
+  const cards = topic?.learningCards ?? [];
+  if (!cards.length || !review) return [];
+  const titleSet = new Set(cards.map((c) => c.title).filter(Boolean));
+  const headroomTitles = new Set();
+  for (const f of review.factFindings ?? []) {
+    if (f?.cardTitle && titleSet.has(f.cardTitle)) headroomTitles.add(f.cardTitle);
+  }
+  for (const arr of [review.voiceFindings ?? [], review.orderFindings ?? [], review.selfContainedFindings ?? [], review.clarityFindings ?? []]) {
+    for (const f of arr ?? []) {
+      if (f?.where && titleSet.has(f.where)) headroomTitles.add(f.where);
+    }
+  }
+  if ((review.followUpFindings ?? []).length > 0) {
+    for (const c of cards) { if (c.type === "interviewAnswer") headroomTitles.add(c.title); }
+  }
+  if ((review.coverageFindings ?? []).length > 0) {
+    for (const c of cards) headroomTitles.add(c.title);
+  }
+  if (!headroomTitles.size && (review.score ?? 100) < 90) return cards;
+  return cards.filter((c) => c.title && headroomTitles.has(c.title));
+}
+
+// 按 "@cardTitle：" 前缀将 findingLines 归组到卡片
+function groupFindingsByCard(findingLines) {
+  const map = new Map();
+  for (const line of findingLines ?? []) {
+    const match = line.match(/@([^：:]+)[：:]/);
+    if (match) {
+      const title = match[1].trim();
+      const arr = map.get(title) ?? [];
+      arr.push(line);
+      map.set(title, arr);
+    }
+  }
+  return map;
+}
+
+// P1.4：取同领域最高分篇的同类型卡作 few-shot 范例（不取本卡自身）。
+function pickExemplarCard(topic, card) {
+  const byType = domainExemplars.get(topic?.domain);
+  const exemplar = byType?.get(card?.type);
+  if (!exemplar) return null;
+  if (exemplar.title && card?.title && normalizeForMatch(exemplar.title) === normalizeForMatch(card.title)) return null;
+  // 控 token：范例 JSON 截到 1800 字符，够示范"好写法"而不喧宾夺主。
+  const text = JSON.stringify(exemplar, null, 2);
+  return text.length > 1800 ? `${text.slice(0, 1800)}\n…（已截断）` : text;
+}
+
+// 单张卡片改写 prompt
+function buildCardRefinePrompt(card, cardFindings, topic, todayYmd) {
+  const findingsBlock = cardFindings.length
+    ? `\n【此卡具体缺口（逐条消除）】\n${cardFindings.map((l, i) => `${i + 1}. ${l}`).join("\n")}\n`
+    : "";
+  const exemplar = pickExemplarCard(topic, card);
+  const exemplarBlock = exemplar
+    ? `\n【同领域高分范例（只学其专家口吻/机制纵深/具体度，不要照抄内容、不要套用其题目细节）】\n${exemplar}\n`
+    : "";
+  return `你是内容精修助手，只改写下方单张卡片的文字内容，结构（type/title/字段名）严格不变。
+今日 ${todayYmd}，不要改动任何日期字段。
+
+${CARD_REFINE_CONTRACT}
+${findingsBlock}${exemplarBlock}
+【当前卡片】
+${JSON.stringify(card, null, 2)}
+
+【本题背景（只读，不要改）】
+title: ${topic.title ?? ""}
+domain: ${topic.domain ?? ""}
+difficulty: ${topic.difficulty ?? ""}
+
+要求：直接输出单张卡片 JSON 对象，首字符为 {，末字符为 }；保持所有字段名、type、title 不变，只改进文字内容。`;
+}
+
+// P2.2: 多判官互证——两侧均满足才算数（严格取交集）
+function computeCorroborated(reviews, beforeReview) {
+  if (!reviews || reviews.length < 2 || !beforeReview) return null;
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const regressedDims = JUDGE_DIMENSIONS.filter((d) =>
+    reviews.every((r) => n(r?.dimensions?.[d]) < n(beforeReview?.dimensions?.[d])),
+  );
+  const improvedDims = JUDGE_DIMENSIONS.filter((d) =>
+    reviews.every((r) => n(r?.dimensions?.[d]) > n(beforeReview?.dimensions?.[d])),
+  );
+  return { regressedDims, improvedDims };
+}
+
+// P1.1 / P1.5: 逐卡精修主路径——比整篇改写更精准、token 更省
+async function tryPerCardRefine(original, findingLines, beforeReview, ref, corpus, judge, cfg, model, extraCtx = {}) {
+  const headroomCards = extractHeadroomCards(beforeReview, original);
+  if (!headroomCards.length) return { ok: false, reason: "无 headroom 卡片" };
+  const todayYmd = new Date().toISOString().slice(0, 10);
+  const staticBeforeReport = corpus ? scoreTopic(original, ref, corpus) : null;
+  if (!staticBeforeReport) return { ok: false, reason: "无 corpus" };
+  const cardFindingsMap = groupFindingsByCard(findingLines);
+  // P1.5 质量阶梯：seniority >= 2 时升级到更高级别写手模型
+  let cardModel = model;
+  const seniority = extraCtx.seniority ?? 1;
+  if (seniority >= 2) {
+    const seniorModels = envConfig.listModelsBySeniority(seniority);
+    if (seniorModels.length) {
+      const sm = seniorModels[seniorModels.length - 1];
+      const candidate = `${sm.provider}:${sm.id}`;
+      if (candidate !== model) {
+        cardModel = candidate;
+        console.log(`[CARD] ${ref} P1.5 质量阶梯：seniority=${seniority} → ${cardModel}`);
+      }
+    }
+  }
+  // 逐卡 API 调用
+  const candidateTopic = JSON.parse(JSON.stringify(original));
+  let improvedCount = 0;
+  for (const card of headroomCards) {
+    const cardFindings = cardFindingsMap.has(card.title)
+      ? cardFindingsMap.get(card.title)
+      : findingLines.slice(0, 6);
+    const prompt = buildCardRefinePrompt(card, cardFindings, original, todayYmd);
+    const schema = { type: "object", properties: { type: { type: "string" }, title: { type: "string" } }, required: ["type", "title"], additionalProperties: true };
+    try {
+      const apiResult = await callRefineApi(prompt, schema, { model: cardModel, timeoutMs: cfg.timeoutMs });
+      const improved = apiResult.parsed;
+      if (improved?.type === card.type && improved?.title === card.title && !sameJson(improved, card)) {
+        const idx = candidateTopic.learningCards.findIndex((c) => c.title === card.title && c.type === card.type);
+        if (idx >= 0) { candidateTopic.learningCards[idx] = improved; improvedCount++; }
+      }
+    } catch (e) {
+      if (e.interrupted) throw e;
+      console.log(`[CARD] ${ref} @${card.title} per-card skipped: ${e.message}`);
+    }
+  }
+  if (!improvedCount) return { ok: false, reason: "逐卡改写无产出" };
+  const { notes } = repairTopic(original, candidateTopic, todayYmd, allowComplexMermaid);
+  if (notes.length) console.log(`[CARD] ${ref} repair: ${notes.slice(0, 4).join("；")}`);
+  const bad = checkInvariants(original, candidateTopic);
+  if (bad) { console.log(`[CARD] ${ref} invariant fail: ${bad}`); return { ok: false, reason: `invariant: ${bad}` }; }
+  const blockResult = await tryBlockKeepBest({ original, candidate: candidateTopic, ref, corpus, beforeStaticReport: staticBeforeReport, beforeReview, judge });
+  if (blockResult.accept) {
+    await writeTopicAtomic(ref, blockResult.topic, original);
+    console.log(`[CARD] ${ref} per-card 块级合并已写回（${blockResult.reason}）`);
+    return {
+      ok: true, action: "merged", attempts: 1, availabilityFailure: false,
+      staticBefore: staticBeforeReport.score, staticAfter: blockResult.staticAfter,
+      dynamicBefore: beforeReview?.score, dynamicAfter: blockResult.dynamicAfter,
+      merged: true, mergedBlocks: blockResult.mergedBlocks,
+      decisionReason: `per-card(${improvedCount}张): ${blockResult.reason}`,
+    };
+  }
+  console.log(`[CARD] ${ref} per-card 块级被拒（${blockResult.reason}），降级整篇改写`);
+  return { ok: false, reason: blockResult.reason };
+}
+
 // setPhase(phase): 可选回调，用于把当前阶段标签写回 pool 的 active map，
 // 让 summary 心跳能区分子 agent 当前是 judgeBefore/refineCall/blockJudge/judgeAfter/merging 哪个阶段。
-async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, model, writeTo, corpus, judge, setPhase) {
+// extraCtx: P1.4 跨轮反馈上下文（previousKeptOldReason=上轮 keptOld 时的拒绝原因）。
+async function refineOneTopic(ref, audit, templates, cfg, runDir, minScore, model, writeTo, corpus, judge, setPhase, extraCtx = {}) {
   const phase = typeof setPhase === "function" ? setPhase : () => {};
+  const { previousKeptOldReason = null } = extraCtx;
   const original = JSON.parse(readFileSync(path.join(root, ref), "utf8"));
   const attempts = cfg.retries + 1;
   const mode = writeTo ? "PREVIEW" : "REFINE";
@@ -2281,7 +2607,11 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
   let findingLines = [];
   if (!writeTo && judge?.enabled) {
     phase("judgeBefore");
-    beforeReview = await runJudges(original, ref, judge, { skipExternal: true });
+    // P2.2 判官分工：判前用轻量探查判官（cheap scout），只找 headroom、不做落盘决策
+    const judgeForBefore = judge.scoutModel
+      ? { ...judge, models: [judge.scoutModel], count: 1, ensemble: false, fallbackChain: [] }
+      : judge;
+    beforeReview = await runJudges(original, ref, judgeForBefore, { skipExternal: true });
     if (!beforeReview) {
       // 判官启用 = 判官必需。判前（已含 judge 内部 jsonRetries）仍拿不到动态评审 → 绝不退回"双静态"（那不是精修），
       // 直接判该篇失败、计入最终报告的"判官评审失败"。本轮该篇静态若仍 <minScore，下一轮会重新进队列再试（跨轮重试）。
@@ -2300,8 +2630,12 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
       };
     }
     findingLines = findingsToPromptLines(beforeReview);
-    if (staticBefore >= minScore && judgePasses(beforeReview, judge.dynamicSkipMin)) {
-      console.log(`[TOPIC] 已达标，跳过改写 ${ref}（static ${staticBefore} + 动态 ${beforeReview.score}，9 维全过、无事实问题）`);
+    // P1.1 跳过判定：以「9 维评审有没有可执行的 headroom」为主依据（而非单看分数线）。
+    // 静态分仅作**地板**保留（绝不跳过静态未达标的篇——那是漏改而非已达标），不再当"跳过"的充分条件。
+    // → 只有「静态达地板 + 动态 9 维全过 + 评审在每张卡都找不到 headroom」三者皆满足才跳，其余一律进精修。
+    const noHeadroom = extractHeadroomCards(beforeReview, original).length === 0 && findingLines.length === 0;
+    if (staticBefore >= minScore && judgePasses(beforeReview, judge.dynamicSkipMin) && noHeadroom) {
+      console.log(`[TOPIC] 已达标，跳过改写 ${ref}（static ${staticBefore} + 动态 ${beforeReview.score}，9 维全过、无事实问题、无可执行 headroom）`);
       return {
         ok: true,
         attempts: 0,
@@ -2314,6 +2648,11 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
         dynamicBefore: beforeReview.score,
         dynamicAfter: beforeReview.score,
       };
+    }
+    // P1.1 逐卡精修主路径：先尝试只改有 headroom 的卡（比整篇改写更精准、token 更省）
+    if (findingLines.length > 0) {
+      const pcResult = await tryPerCardRefine(original, findingLines, beforeReview, ref, corpus, judge, cfg, model, extraCtx);
+      if (pcResult.ok) return pcResult;
     }
   }
   // 上一次 attempt 若是"格式/解析类失败"（非 keptOld），把结构化错误喂回下一次 prompt 让模型精准修格式。
@@ -2328,7 +2667,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
     let raw = ""; // 结构化路径不产文本；finally 的 raw 落盘诊断保留。
     try {
       // ====== API 模式统一走 callRefineApi（其内部已调 llmRunner.runRefine,自动应用 REFINE_MODEL_CHAIN + 截断重试 + 降级 + 流式 onProgress）======
-      const prompt = buildRefinePrompt(original, audit.failingMap.get(ref), templates.get(ref), minScore, audit.scoreMap.get(ref), null, findingLines, previousFormatError);
+      const prompt = buildRefinePrompt(original, audit.failingMap.get(ref), templates.get(ref), minScore, audit.scoreMap.get(ref), null, findingLines, previousFormatError, previousKeptOldReason);
       console.log(`[TOPIC] 开始 ${attemptLabel} score=${score}/100（API 模式）`);
       const reqId = newReqId();
       liveEvents.emitEvent("llm.request", { reqId, topicRef: ref, kind: "refine", spec: model ?? null, attempt, attempts });
@@ -2491,10 +2830,20 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
         // 判后：对候选判一次。回归向量（不退步任一维 + 不新增事实问题 + 静态≥90 + 至少一处改善）才接受。
         // 不拿"总分"当唯一开关，避免误杀"部分更好但总分波动"的候选（这是块级合并前的整篇近似）。
         phase("judgeAfter");
-        afterReview = await runJudges(parsed, ref, judge);
+        // P2.2 判官分工：落盘决策用 ensemble（≥2 异构），互证后才算数
+        const judgeForAfter = judge.ensembleModels?.length >= 2
+          ? { ...judge, models: judge.ensembleModels, ensemble: true, fallbackChain: [] }
+          : judge;
+        // P1.2/P1.3：判后联网/看图按需——只在动了内容块/有图时查；缓存由内容指纹兜住跨轮复用。
+        const external = computeExternalSignals(original, parsed, beforeReview);
+        const rawAfterResult = await runJudges(parsed, ref, judgeForAfter, { returnRaw: true, external });
+        afterReview = rawAfterResult?.agg ?? rawAfterResult;
         if (afterReview) {
+          const corroborated = rawAfterResult?.reviews?.length >= 2
+            ? computeCorroborated(rawAfterResult.reviews, beforeReview)
+            : null;
           // 棘轮地板：现版 ≥90 守 90；现版 <90 时只要不低于现版即可接受真实改善（避免把更好的 <90 候选退回更差旧版）。
-          decision = acceptByJudge({ before: beforeReview, after: afterReview, staticBefore, staticAfter: after, minStatic: Math.min(90, staticBefore) });
+          decision = acceptByJudge({ before: beforeReview, after: afterReview, staticBefore, staticAfter: after, minStatic: Math.min(90, staticBefore), corroborated });
         } else {
           // 判官启用但判后拿不到评审：绝不退回"双静态"放行（那不是精修）。抛出 → 被 attempt catch 捕获 → 重试；
           // 重试到上限仍失败 → 该篇计入最终报告的"判官评审失败"。磁盘保留旧版（绝不在无动态信号下覆盖）。
@@ -2570,6 +2919,8 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
     staticBefore,
     staticAfter: bestRejectedAfter,
     dynamicBefore: beforeReview?.score,
+    // P1.6：keptOld 时把本轮 findingLines 带出，供跨轮 stuck 检测比较是否与上轮逐字相同。
+    findingLines: keptOld ? findingLines : undefined,
   };
 }
 
@@ -3103,7 +3454,7 @@ function startPoolHeartbeat(counters, active, heartbeatMs, cfg) {
   return () => clearInterval(heartbeat);
 }
 
-async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters, corpus, judge) {
+async function refinePool(targets, audit, templates, cfg, runDir, minScore, progressPath, modelState, counters, corpus, judge, topicCtxMap = null) {
   const results = [];
   let index = 0;
   const active = new Map();
@@ -3173,7 +3524,7 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
       liveEvents.on("llm.resume", onResume);
       let result;
       try {
-        result = await refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, model, undefined, corpus, judge, setPhase);
+        result = await refineOneTopic(ref, audit, templates, cfg, runDir, minScore, model, undefined, corpus, judge, setPhase, topicCtxMap?.get(ref) ?? {});
       } catch (error) {
         // 兜底：中断信号照常上抛（让 shutdown 生效）；其余任何意外错误（如 refineOneTopic 顶部读文件/打分抛错）
         // 都转成"该篇失败"，绝不让单篇的意外把整轮 run 崩掉——这是"跑完不用管"的最后一道防线。
@@ -3258,7 +3609,7 @@ async function refinePool(targets, audit, templates, cfg, cliPath, runDir, minSc
   return results;
 }
 
-async function refinePoolWithConcurrencyFallback(targets, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters, corpus, judge) {
+async function refinePoolWithConcurrencyFallback(targets, audit, templates, cfg, runDir, minScore, progressPath, modelState, counters, corpus, judge, topicCtxMap = null) {
   let pending = [...targets];
   const allResults = [];
   // 池级滑动窗口：仅当短时间内频繁可用性失败才降并发；偶发 429 由该篇内重试自行消化。
@@ -3266,7 +3617,7 @@ async function refinePoolWithConcurrencyFallback(targets, audit, templates, cfg,
   const windowMs = modelState.windowMs;
   const threshold = Math.max(2, modelState.degradeAfter); // 至少 2 次才算"频繁"
   while (pending.length) {
-    const results = await refinePool(pending, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters, corpus, judge);
+    const results = await refinePool(pending, audit, templates, cfg, runDir, minScore, progressPath, modelState, counters, corpus, judge, topicCtxMap);
     allResults.push(...results);
     const availabilityFailures = [...new Set(results
       .filter((result) => !result.ok && result.availabilityFailure)
@@ -3939,10 +4290,6 @@ async function runDiagramCandidatePass(original, parsed, ref, trigger, topicStat
 async function main() {
   const runStartedAt = Date.now(); // 全程墙钟起点：汇总里报"本次执行多久"
   const args = parseArgs();
-  // qwen 显式模型路由已弃用：API 模式由 env-config 的 baseUrl/apiKey 直管,无需 --qwen-routes。
-  if (args["qwen-routes"]) {
-    console.warn("[deprecated] --qwen-routes 在 API 模式下已无意义,忽略。");
-  }
   const scope = String(args.scope ?? "all").trim();
   const minScore = Number(args["min-score"] ?? PRODUCTION_STRICT_MIN_SCORE);
   const concurrency = Number(args.concurrency ?? 2);
@@ -4013,36 +4360,21 @@ async function main() {
     return;
   }
 
-  // API 模式不依赖本地 CLI；--cli 仅作为日志标签保留（缺省 "api"），兼容旧脚本/last-config。
-  // QUALITY_LLM_CLI 仍可通过环境变量传入,但不再有路由意义,只影响日志显示。
-  const cli = args.cli ?? process.env.QUALITY_LLM_CLI ?? "api";
-  // 一组在 CLI 模式下生效、API 模式下已无意义的旗标:接受但打一次 deprecation 提示,避免静默吞参误导用户。
-  for (const deprecated of ["qwen-routes", "use-pty", "no-default-extra-args", "model-arg", "prompt-arg", "prompt-mode", "judge-cli"]) {
+  // 精修器只走 OpenAI 兼容 API（不再 spawn 本地 CLI）。一组旧 CLI 旗标接受但忽略，避免静默吞参误导用户。
+  for (const deprecated of ["cli", "judge-cli", "qwen-routes", "use-pty", "no-default-extra-args", "model-arg", "prompt-arg", "prompt-mode"]) {
     if (args[deprecated] !== undefined) {
-      console.warn(`[deprecated] --${deprecated} 在 API 模式下已无意义,忽略(精修器现直接调 OpenAI 兼容 API,不再 spawn CLI)。`);
+      console.warn(`[deprecated] --${deprecated} 已废弃并忽略：精修器现直接调 API，CLI 模式已移除。`);
     }
   }
   const cfg = {
-    cli,
-    model: args.model ?? process.env.QUALITY_LLM_MODEL,
-    preset: args.preset ?? "auto",
     concurrency,
     retries,
     timeoutMs,
-    baseArgs: [],
-    extraArgs: [],
-    modelArg: args["model-arg"] ?? "--model",
-    promptArg: args["prompt-arg"] ?? "-p",
-    promptMode: args["prompt-mode"] ?? "flag",
-    usePty: Boolean(args["use-pty"]),
-    noDefaultExtraArgs: Boolean(args["no-default-extra-args"]),
     heartbeatMs: heartbeatSeconds * 1000,
     stallTimeoutMs,
     progressStyle,
     autoConcurrencyMin,
   };
-  // API 模式无 CLI 路径,cliPath 仅作展示标签。
-  const cliPath = `__api_mode__/${cfg.cli}`;
 
   const qualityDir = qualityRoot;
   const resumeRequested = Boolean(args.resume || args["resume-run"]);
@@ -4078,19 +4410,38 @@ async function main() {
   }
   const modelState = makeModelState(modelChain, degradeAfter, degradeWindowSeconds * 1000);
 
-  // ===== 动态判官配置（默认开；优先用 JUDGE_MODEL_CHAIN；支持多模型 × 每模型多实例）=====
+  // ===== 动态判官配置（默认开；优先用 JUDGE_MODEL_CHAIN；支持 fallback 降级链 / 显式 ensemble）=====
   const judgeDisabled = Boolean(args["no-judge"]);
-  const judgeCli = args["judge-cli"] ?? cli;
-  const judgeModelsFromEnv = String(envConfig.getEnv("JUDGE_MODEL_CHAIN") ?? "")
+  const judgeChainFromEnv = String(envConfig.getEnv("JUDGE_MODEL_CHAIN") ?? "")
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean);
-  const judgeModels = args["judge-models"]
-    ? String(args["judge-models"]).split(",").map((entry) => entry.trim()).filter(Boolean)
-    : (judgeModelsFromEnv.length ? judgeModelsFromEnv : [modelChain[0]]);
+  // JUDGE_SCOUT_MODEL：P2.2 探查判官（单模型，cheap，判前找 headroom 用）
+  const judgeScoutModelFromEnv = String(envConfig.getEnv("JUDGE_SCOUT_MODEL") ?? "").trim();
+  // JUDGE_ENSEMBLE_CHAIN：显式声明 ensemble 评审模型（≥2 异构）；设置后启用真 ensemble，所有模型同时跑。
+  const judgeEnsembleChainFromEnv = String(envConfig.getEnv("JUDGE_ENSEMBLE_CHAIN") ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
   const judgeCount = Number(args["judge-count"] ?? 1);
+  // 真 ensemble：显式 --judge-count≥2 或设置了 JUDGE_ENSEMBLE_CHAIN 时开启；否则只用链首作主判官，其余作 fallback（坏了才换）。
+  const judgeExplicitEnsemble = judgeEnsembleChainFromEnv.length > 0 || judgeCount >= 2;
+  let judgeModels;
+  let judgeFallbackChain;
+  if (args["judge-models"]) {
+    judgeModels = String(args["judge-models"]).split(",").map((entry) => entry.trim()).filter(Boolean);
+    judgeFallbackChain = [];
+  } else if (judgeExplicitEnsemble && judgeEnsembleChainFromEnv.length) {
+    judgeModels = judgeEnsembleChainFromEnv;
+    judgeFallbackChain = [];
+  } else {
+    // 默认：链首为主判官（1 个），其余作 fallback（坏了才换，不全跑）
+    const chain = judgeChainFromEnv.length ? judgeChainFromEnv : [modelChain[0]];
+    judgeModels = [chain[0]];
+    judgeFallbackChain = chain.slice(1);
+  }
   const dynamicSkipMin = Number(args["dynamic-skip-min"] ?? args["dynamic-pass-min"] ?? args["dynamic-min"] ?? PRODUCTION_STRICT_MIN_SCORE);
-  const judgeBatchSize = Number(args["judge-batch-size"] ?? 1);
+  const judgeBatchSize = Number(args["judge-batch-size"] ?? 6);
   const judgeJsonRetries = Number(args["judge-json-retries"] ?? 2);
   const judgeWarmConcurrency = Number(args["judge-warm-concurrency"] ?? concurrency);
   ensureInt(judgeCount, "judge-count", 1, 8);
@@ -4102,17 +4453,13 @@ async function main() {
   }
   let judge = null;
   if (!judgeDisabled) {
-    // API 模式无判官 CLI 路径,judgeCliPath 仅作展示标签。
-    const judgeCliPath = `__api_mode__/${judgeCli}`;
-    const judgeCfg = applyJudgePreset(judgeCli, timeoutMs);
-    judgeCfg.cli = judgeCli;
-    const setHash = sha256(`${judgeCli}|${judgeModels.map((entry) => entry ?? "default").join(",")}|x${judgeCount}`).slice(0, 8);
+    const setHash = sha256(`${judgeModels.map((entry) => entry ?? "default").join(",")}|x${judgeCount}`).slice(0, 8);
     judge = {
       enabled: true,
-      cli: judgeCli,
-      cliPath: judgeCliPath,
-      cfg: judgeCfg,
+      cfg: { timeoutMs },
       models: judgeModels,
+      fallbackChain: judgeFallbackChain,
+      ensemble: judgeExplicitEnsemble,
       count: judgeCount,
       dynamicSkipMin,
       batchSize: judgeBatchSize,
@@ -4120,9 +4467,13 @@ async function main() {
       warmConcurrency: judgeWarmConcurrency,
       cacheDir: path.join(qualityDir, "judge-cache"),
       setHash,
+      // P2.2: 判官分工字段
+      scoutModel: judgeScoutModelFromEnv || null,
+      ensembleModels: judgeEnsembleChainFromEnv.length >= 2 ? judgeEnsembleChainFromEnv : null,
     };
+    const modeLabel = judgeExplicitEnsemble ? `ensemble×${judgeModels.length}` : `主判官+fallback(${(judgeFallbackChain ?? []).length}备)`;
     console.log(
-      `判官：cli=${judgeCli} 模型=[${judgeModels.map((entry) => entry ?? "CLI默认").join(", ")}] × ${judgeCount} 实例，` +
+      `判官：模型=[${judgeModels.map((entry) => entry ?? "默认").join(", ")}] ${modeLabel} × ${judgeCount} 实例，` +
         `动态免改线 ${dynamicSkipMin}，batch=${judgeBatchSize}，判前预热并发=${judgeWarmConcurrency}，json重试=${judgeJsonRetries}（contentHash 缓存复用）`,
     );
   } else {
@@ -4214,7 +4565,7 @@ async function main() {
     }
     const outPath = path.join(qualityRoot, "preview", `${ref.replace(/[^a-z0-9]+/gi, "-")}.json`);
     console.log(`预览精修单篇：${ref}（当前分 ${audit.scoreMap.get(ref)}/100），model=${currentModel(modelState) ?? "CLI 默认"}`);
-    const result = await refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minScore, currentModel(modelState), outPath, null, null);
+    const result = await refineOneTopic(ref, audit, templates, cfg, runDir, minScore, currentModel(modelState), outPath, null, null);
     if (!result.ok) {
       console.error(`预览失败：${result.error}`);
       process.exitCode = 1;
@@ -4225,7 +4576,7 @@ async function main() {
   }
 
   console.log(
-    `精修启动：cli=${cfg.cli} (${cliPath})，模型链=[${modelChain.map((entry) => entry ?? "CLI默认").join(" → ")}]（${degradeWindowSeconds}s 窗口内可用性失败 ≥ ${degradeAfter} 次才降级），` +
+    `精修启动：模型链=[${modelChain.map((entry) => entry ?? "默认").join(" → ")}]（${degradeWindowSeconds}s 窗口内可用性失败 ≥ ${degradeAfter} 次才降级），` +
       `scope=${scope}${topicFilters.length ? ` topics=${topicFilters.length}` : " topics=scope全部"}，concurrency=${cfg.concurrency}` +
       `${cfg.autoConcurrencyMin > 0 && cfg.autoConcurrencyMin < cfg.concurrency ? `（可用性失败自动降至 ${cfg.autoConcurrencyMin}）` : ""}，` +
       `maxRounds=${maxRounds}，minScore=${minScore}`,
@@ -4248,27 +4599,30 @@ async function main() {
     // title 只放简洁标识，不放完整模型链（防止超宽截断右侧 ─）。
     // 模型链/并发/minScore 放在 cfg 里给 renderLines 的"配置行"用。
     const shortModel = (s) => {
-      if (!s) return "CLI默认";
+      if (!s) return "默认";
       const id = s.includes(":") ? s.split(":")[1] : s;
       return id.length > 20 ? id.slice(0, 18) + "…" : id;
     };
     const modelsLabel = modelChain.map(shortModel).join("→");
     const judgeLabel = judge ? `${judge.models.map(shortModel).join(",")}×${judgeCount}` : "off";
     dashboard.setStatic({
-      title: `quality-refine  ${scope}  ${cfg.cli}`,
+      title: `quality-refine  ${scope}`,
       cfg: { concurrency: cfg.concurrency, judge: judgeLabel, minScore, modelsLabel },
       runStartedAt,
     });
     dashboard.enable(process.stdout);
   }
 
-  // 跨轮状态：bestScore 用于检测"连续无提升 -> 放弃，避免死循环"。
+  // REFINE_STUCK_NOIMPROVE：连续几轮静态分无改善后放弃（默认 2）。
+  const stuckNoImproveThreshold = Number(envConfig.getEnv("REFINE_STUCK_NOIMPROVE", "2")) || 2;
+  // 跨轮状态：bestScore 用于检测"连续无提升 -> 放弃，避免死循环"；lastFindingLines 用于 P1.6 findings 早停。
   const state = new Map(targetRefs.map((ref) => [ref, {
     attempts: 0,
     bestScore: initialAudit.scoreMap.get(ref) ?? 0,
     noImprove: 0,
     lastOk: null,
     lastError: null,
+    lastFindingLines: null, // P1.6：上轮 keptOld 时的 findingLines，用于检测 stuck
   }]));
   for (const [ref, item] of completedFromProgress.entries()) {
     const s = state.get(ref);
@@ -4301,6 +4655,8 @@ async function main() {
     console.log(`[RESUME] scope 内跳过已完成 ${inScopeDone}/${targetRefs.length} 篇，未完成项会继续进入后续轮次。`);
   }
   const stuck = new Set();
+  // P1.4：跨轮 keptOld 拒绝原因反馈，下轮精修时喂回 prompt 让模型知道为何被拒并针对性修正。
+  const topicCtxMap = new Map();
   // 跨轮重试累计：每 ref 处理了几轮（rounds）+ 单轮内最多 attempt 次数（maxAttempts），用于汇总"重试后是否成功"。
   const retryStats = new Map();
   if (!dryRun) {
@@ -4315,6 +4671,12 @@ async function main() {
     });
   }
 
+  // P1.7：语料库在 round 循环外建一次（整库扫一遍），轮内增量替换已写回的篇。
+  // 每轮在写回后通过 corpus.refreshRef(ref, newTopic) 增量更新，避免每轮全量重读。
+  let corpus = buildRefineCorpus();
+  // P1.4：构建同领域高分范例库（逐卡精修 few-shot），失败不阻断。
+  try { domainExemplars = buildDomainExemplars(initialAudit); } catch { domainExemplars = new Map(); }
+
   for (let round = 1; round <= maxRounds; round += 1) {
     if (shutdownRequested) throw makeInterruptedError();
     if (costTracker.exceeded) {
@@ -4325,7 +4687,6 @@ async function main() {
     dashboard.setStage("① 全量审计", { round, maxRounds });
     const audit = await runAudit(minScore, cfg);
     const templates = templatesByRef(audit);
-    const corpus = buildRefineCorpus(); // keep-best：候选与现版用同一套 scoreTopic + 语料库对比
     const firstPass = targetRefs.filter((ref) => !stuck.has(ref) && state.get(ref).attempts === 0);
     const retryCandidates = targetRefs.filter((ref) => !stuck.has(ref) && state.get(ref).attempts > 0 && audit.failingMap.has(ref));
 
@@ -4335,7 +4696,7 @@ async function main() {
       const prior = state.get(ref);
       if (current > prior.bestScore) { prior.bestScore = current; prior.noImprove = 0; }
       else { prior.noImprove += 1; }
-      if (prior.noImprove >= 2) { stuck.add(ref); continue; }
+      if (prior.noImprove >= stuckNoImproveThreshold) { stuck.add(ref); continue; }
       retrying.push(ref);
     }
 
@@ -4370,7 +4731,7 @@ async function main() {
     await writeRunState(runDir, { status: "running", round, stage: "refine", roundTargets: ordered });
     dashboard.setStage("③ 精修", { round, maxRounds });
     const counters = { total: ordered.length, processed: 0, good: 0, written: 0, merged: 0, kept: 0, failed: 0 };
-    const results = await refinePoolWithConcurrencyFallback(ordered, audit, templates, cfg, cliPath, runDir, minScore, progressPath, modelState, counters, corpus, judge);
+    const results = await refinePoolWithConcurrencyFallback(ordered, audit, templates, cfg, runDir, minScore, progressPath, modelState, counters, corpus, judge, topicCtxMap);
     for (const result of results) {
       const item = state.get(result.ref);
       item.attempts += 1;
@@ -4383,6 +4744,39 @@ async function main() {
       rs.rounds += 1;
       rs.maxAttempts = Math.max(rs.maxAttempts, result.attempts ?? 1);
       retryStats.set(result.ref, rs);
+      // P1.4：keptOld 时把拒绝原因存入跨轮 ctx，下轮精修时喂回 prompt 让模型知道为何被拒。
+      // P1.5：keptOld 时同步递增 seniority，下轮逐卡路径升级到更高级别写手模型。
+      if (result.keptOld && result.decisionReason) {
+        const prev = topicCtxMap.get(result.ref) ?? {};
+        topicCtxMap.set(result.ref, {
+          ...prev,
+          previousKeptOldReason: result.decisionReason,
+          seniority: Math.min(3, (prev.seniority ?? 1) + 1),
+        });
+      } else if (!result.keptOld) {
+        topicCtxMap.delete(result.ref); // 写回成功则清空，不让过期原因污染下轮
+      }
+      // P1.6 stuck 早停：keptOld 且本轮 findings 与上轮逐字相同 → 立即标 stuck，不再消耗下轮 warm+refine。
+      if (result.keptOld && Array.isArray(result.findingLines)) {
+        const currentKey = result.findingLines.join("\n");
+        if (item.lastFindingLines !== null && item.lastFindingLines === currentKey) {
+          stuck.add(result.ref);
+          console.log(`[STUCK] ${result.ref} findings 与上轮相同，标记 stuck，跳过后续轮次。`);
+        }
+        item.lastFindingLines = currentKey;
+      } else if (!result.keptOld) {
+        item.lastFindingLines = null; // 写回成功则清空 findings 记录
+      }
+      // P1.7：本篇若真写回了（整篇写回 / 块级合并），用新内容增量刷新语料库，
+      // 让下一轮的跨篇重复句检测看到最新文本——只读这一篇，不整库重建。
+      if (result.ok && !result.alreadyGood && !result.keptOld) {
+        try {
+          const written = JSON.parse(readFileSync(path.join(root, result.ref), "utf8"));
+          corpus.refreshRef?.(result.ref, written);
+        } catch {
+          // 读不回写回稿不阻断；最坏只是该篇在下一轮沿用旧指纹（与历史行为一致）。
+        }
+      }
     }
     console.log(
       `[round ${round}] 完成：已达标(免改) ${counters.good}，整篇写回 ${counters.written}，块级合并 ${counters.merged}，保留旧版(未改善) ${counters.kept}，失败 ${counters.failed}`,
@@ -4463,14 +4857,12 @@ async function main() {
     durationLabel: formatDuration(durationMs),
     retry: { triggered: retrySummary.triggered, recovered: retrySummary.recovered, stillFailed: retrySummary.stillFailed, retained: retrySummary.retained },
     failureBreakdown,
-    cli: cfg.cli,
-    modelChain: modelChain.map((entry) => entry ?? "CLI default"),
+    modelChain: modelChain.map((entry) => entry ?? "default"),
     degradeAfter,
     degradeWindowSeconds,
-    endedOnModel: currentModel(modelState) ?? "CLI default",
+    endedOnModel: currentModel(modelState) ?? "default",
     judge: judge ? {
-      cli: judge.cli,
-      models: judge.models.map((entry) => entry ?? "CLI default"),
+      models: judge.models.map((entry) => entry ?? "default"),
       count: judge.count,
       dynamicSkipMin: judge.dynamicSkipMin,
       batchSize: judge.batchSize,
@@ -4521,7 +4913,7 @@ async function main() {
   try { stopMcpClients(); } catch {}
 
   console.log(`\n==== 精修完成 ====`);
-  console.log(`本次耗时：${formatDuration(durationMs)}    最终模型：${currentModel(modelState) ?? "CLI默认"}    全量 overall：${initialAudit.overallScore} -> ${finalAudit.overallScore}`);
+  console.log(`本次耗时：${formatDuration(durationMs)}    最终模型：${currentModel(modelState) ?? "默认"}    全量 overall：${initialAudit.overallScore} -> ${finalAudit.overallScore}`);
   console.log(`处理：${processed.length}/${targetRefs.length}    已达标(免改)：${goodRefs.length}    整篇写回：${writtenRefs.length}    块级合并：${mergedRefs.length}    保留旧版(未改善)：${keptOldRefs.length}    执行失败：${failedExecutions.length}    修好原静态未达标：${fixed.length}/${initialFailing.size}    仍 <${minScore}：${stillFailing.length}    放弃(stuck)：${stuck.size}`);
   if (summary.diagramStuckCount) console.log(`图候选 stuck：${summary.diagramStuckCount} 张（详见 summary.json 的 diagramStates）`);
   // v3.3 成本报告
@@ -4605,3 +4997,5 @@ if (__isMain) {
 }
 
 export { refineOneTopic, runAudit, callRefineApi, repairTopic, checkInvariants, normalizeMermaidHead, mermaidContentBad, shouldTriggerDiagramCandidate };
+// 供单测：互证交集、块级描述符（含 remove）、headroom 提取、外部信号。
+export { computeCorroborated, buildBlockDescriptors, applyBlockDescriptors, extractHeadroomCards, computeExternalSignals };
