@@ -83,16 +83,28 @@ function externalContextPrompt(context = {}) {
     }, null, 2)}`);
   }
   if (context.factEvidence) {
-    parts.push(`【联网事实依据】\n${JSON.stringify({
-      status: context.factEvidence.status,
-      summary: context.factEvidence.summary,
-      findings: context.factEvidence.findings,
-      sources: context.factEvidence.sources,
-      checkedAt: context.factEvidence.checkedAt,
-    }, null, 2)}`);
+    const fe = context.factEvidence;
+    const isUnchecked = !fe.status || fe.status === "not_checked" || fe.status === "unreachable";
+    if (!isUnchecked || (fe.findings ?? []).length || (fe.sources ?? []).length) {
+      parts.push(`【联网事实依据】\n${JSON.stringify({
+        status: fe.status,
+        summary: fe.summary,
+        findings: fe.findings,
+        sources: fe.sources,
+        checkedAt: fe.checkedAt,
+      }, null, 2)}`);
+    }
+    if (isUnchecked) {
+      parts.push(`【联网事实依据说明】status=${fe.status ?? "not_checked"}：联网核验未成功，不要以外部证据触发 wrong/outdated；只凭自身领域知识核验，不确定的标 suspicious。`);
+    }
   }
   if (!parts.length) return "";
-  return `\n\n${parts.join("\n\n")}\n\n要求：外部视觉 QA 为 fail 时，diagramModalityFinding.visualFit 必须为 fail；联网事实依据指出 wrong/outdated 时，必须进入 factFindings 与 blockingFindings。外部状态为 not_checked 时，不要假装已经核验。`;
+  return `\n\n${parts.join("\n\n")}\n\n要求：
+- 外部视觉 QA 为 fail 时，diagramModalityFinding.visualFit 必须为 fail。
+- 联网事实依据中 findings.authoritative=true（官方文档/权威站点）的证据与 topic 冲突时，可触发 wrong/outdated 并进入 blockingFindings。
+- findings.authoritative=false 的非权威来源（博客/论坛/第三方教程）即使与 topic 不一致，最多标 suspicious，不得触发 wrong/outdated。
+- 外部状态为 not_checked 或 unreachable 时，不要以外部证据触发 wrong/outdated；此时只凭自身领域知识核验，不确定的标 suspicious。
+- 凡是用自身知识核验时，只有你高度确信的错误才标 wrong；有疑虑的标 suspicious 并在 evidence 说明理由。`;
 }
 
 export function buildJudgePrompt(topic, ref, context = {}) {
@@ -136,6 +148,7 @@ export function buildJudgePrompt(topic, ref, context = {}) {
 硬性要求：
 - score 用 0-100；任一维 <4，或存在 wrong/outdated 事实，verdict 必须为 fail。
 - factFindings 至少 3 条，覆盖定义、机制、边界/失败路径等关键事实；wrong/outdated 的事实必须同时进 blockingFindings。
+- 事实核验可信度规则（防止误杀正确内容）：① 来自官方文档（authoritative=true）的外部证据才能触发 wrong/outdated；② 非权威来源（博客/教程/社区问答）的冲突只标 suspicious；③ 无外部证据时，只有高度确信的错误才标 wrong，不确定的标 suspicious + 注明原因；④ 如果你的知识来源不确定或涉及版本差异，优先标 suspicious 而非 wrong。
 - followUpFindings 必须逐条评每个 interviewAnswer 的 followUpQuestion：isSpecific（是否本题专属、不泛化）、answerAdequate（答案是否到位），不达标给出 fix。
 - clarityFindings / coverageFindings 指出零基础读者会卡住的地方、以及面试该讲却没讲的关键面。
 - rubric.mustHave/goodToHave/commonMistakes 内嵌代码片段（throw new ...()、function、=>、带分号语句、缩进代码块）→ 判 fail 并进 blockingFindings；代码只该在 code 卡。
@@ -198,8 +211,9 @@ ${JUDGE_DIMENSIONS.map((d, index) => `${index + 1}. ${d}`).join("\n")}
 硬性要求：
 - score 用 0-100；任一维 <4，或存在 wrong/outdated 事实，verdict 必须为 fail。
 - factFindings 每篇至少 3 条，覆盖定义、机制、边界/失败路径等关键事实；wrong/outdated 的事实必须同时进 blockingFindings。
-- coverage 必须按“这个 title / difficulty 的知识点，资深面试官真正会考什么”判断，严禁拿本篇自己的 rubric/recallPrompts 当唯一标尺。
-- seniorityDiscrimination 区分度天花板：技术类 difficulty≥3 必须能区分资深（对标 P7）、4-5 须到专家深度（P7+），非技术类按对应专家纵深；只考“是什么/列举”、缺“为什么这样设计/如何排查/取舍/极端场景”深问的给 ≤3；difficulty 1-2 基础题诚实标注即给 4。
+- 事实核验可信度规则（防止误杀正确内容）：① 只有你高度确信的错误才标 wrong；② 知识来源不确定或涉及版本差异时，标 suspicious 并在 evidence 说明具体疑虑；③ 若内容在你的知识截止日期后可能已变化，标 suspicious（outdated?） 而非 wrong；④ 宁可漏一个 wrong 也不要误杀一个 correct。
+- coverage 必须按”这个 title / difficulty 的知识点，资深面试官真正会考什么”判断，严禁拿本篇自己的 rubric/recallPrompts 当唯一标尺。
+- seniorityDiscrimination 区分度天花板：技术类 difficulty≥3 必须能区分资深（对标 P7）、4-5 须到专家深度（P7+），非技术类按对应专家纵深；只考”是什么/列举”、缺”为什么这样设计/如何排查/取舍/极端场景”深问的给 ≤3；difficulty 1-2 基础题诚实标注即给 4。
 - rubric.mustHave/goodToHave/commonMistakes 内嵌代码片段 → fail；diagram 是纯线性关键词链或终点为”面试结论/答题要点”类汇聚节点 → 判假图、压低 expertVoice；sources 降级链（svg→mermaid→text）缺兜底或层级不合理也要指出。
 - 每篇都必须填写 diagramModalityFinding，但这不是要求每篇必须有图；可推荐 none / text / code / compareTable。SVG 不是天然更好，Mermaid 也不是天然降级。没有视觉报告时 visualFit 填 not_checked。
 

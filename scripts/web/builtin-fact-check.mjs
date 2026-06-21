@@ -75,14 +75,17 @@ async function fetchTopResults(results, max = 3) {
 function buildFindings(topic, query, searchResults, fetchedDocs) {
   // 内置版本不调 LLM 判断对错（避免额外开销），只把搜索摘要 + 抓取正文打包给判官用。
   // 判官 prompt 拿到 factEvidence 后自己对比 topic 内容 vs sources 判断 wrong/outdated。
+  // authoritative=true 的来源（官方文档）才能触发 wrong/outdated；非权威源最多触发 suspicious。
   const findings = [];
   for (const doc of fetchedDocs) {
     if (!doc.text) continue;
+    const auth = doc.authoritative ?? isAuthoritative(doc.url, topic);
     findings.push({
       claim: doc.title || doc.url,
       evidence: doc.text.slice(0, 1500),
       source: doc.url,
-      verdict: "needs_judge", // 待判官判定
+      authoritative: auth,
+      verdict: "needs_judge",
     });
   }
   return findings;

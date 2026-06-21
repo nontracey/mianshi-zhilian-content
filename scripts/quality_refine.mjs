@@ -738,7 +738,10 @@ async function runJudgeProcessJson(prompt, judge, model, ref, index, schema, ima
   throw lastError ?? new Error(`判官失败：${ref}`);
 }
 
-async function buildExternalJudgeContext(topic, ref) {
+// skipExternal=true 时跳过联网事实核验 + 视觉 QA（用于预热和判前基线：跑原文，不需要外部信号）。
+// 只有判后（judgeAfter，精修完成后）才需要完整外部 context。
+async function buildExternalJudgeContext(topic, ref, { skipExternal = false } = {}) {
+  if (skipExternal) return { visualReview: null, factEvidence: null, cacheKey: "" };
   const [visualReview, factEvidence] = await Promise.all([
     buildVisualReview(topic, ref),
     buildFactEvidence(topic, ref),
@@ -802,9 +805,10 @@ async function writeJudgeCache(topic, judge, review, context) {
 }
 
 // 对一篇内容跑全部判官（模型 × 数量），按 contentHash 缓存聚合结果。判官全失败时返回 null（退回静态护栏）。
-async function runJudges(topic, ref, judge) {
+// skipExternal=true：跳过事实核验和视觉 QA（用于预热 / judgeBefore 基线，只评原文内容，不做联网）。
+async function runJudges(topic, ref, judge, { skipExternal = false } = {}) {
   if (!judge?.enabled) return null;
-  const externalContext = await buildExternalJudgeContext(topic, ref);
+  const externalContext = await buildExternalJudgeContext(topic, ref, { skipExternal });
   const cached = readJudgeCache(topic, judge, externalContext);
   if (cached) return applyExternalJudgeContext(cached, externalContext);
   // v3.3 判官看图：根据判官 chain 第一个模型的 imageUnderstanding 模式准备 visualUnderstanding
@@ -850,7 +854,7 @@ async function runJudges(topic, ref, judge) {
   return applyExternalJudgeContext(agg, externalContext);
 }
 
-async function runJudgeBatch(items, judge) {
+async function runJudgeBatch(items, judge, { skipExternal = false } = {}) {
   if (!items.length) return new Map();
   const byRef = new Map(items.map((item) => [item.ref, []]));
   const prompt = buildJudgeBatchPrompt(items);
@@ -899,7 +903,7 @@ async function runJudgeBatch(items, judge) {
     for (const item of fallbackQueue) {
       if (shutdownRequested) break;
       try {
-        const agg = await runJudges(item.topic, item.ref, judge);
+        const agg = await runJudges(item.topic, item.ref, judge, { skipExternal });
         if (agg) out.set(item.ref, agg); // writeJudgeCache 已在 runJudges 内部完成
       } catch (error) {
         if (errorSamples.length < 5) errorSamples.push(`single ${item.ref}: ${error.message}`);
@@ -945,31 +949,10 @@ async function warmJudgeCacheForTargets(refs, judge, cfg = {}) {
     if (cfg.progressStyle !== "quiet") console.log(`[判官] 判前缓存命中 ${refs.length}/${refs.length}，无需预热`);
     return;
   }
-  const externalSignalsEnabled =
-    /^(1|true|yes|on)$/i.test(envConfig.getEnv("VISION_JUDGE_ENABLED", "false")) ||
-    /^(1|true|yes|on)$/i.test(envConfig.getEnv("FACT_CHECK_ENABLED", "false"));
-  if (externalSignalsEnabled) {
-    const requestedWarm = Math.max(1, Number(judge.warmConcurrency ?? cfg.concurrency ?? 1));
-    const warmConcurrency = Math.min(requestedWarm, missing.length);
-    if (cfg.progressStyle !== "quiet") {
-      console.log(`[判官] 外部视觉/联网上下文已启用，改用单篇上下文预热 missing=${missing.length} 并发=${warmConcurrency}（避免 batch 缓存失配白跑）`);
-    }
-    let cursor = 0;
-    async function singleWarmWorker() {
-      while (cursor < missing.length) {
-        if (shutdownRequested || costTracker.exceeded) return;
-        const item = missing[cursor++];
-        try {
-          await runJudges(item.topic, item.ref, judge);
-        } catch (error) {
-          if (error.interrupted) throw error;
-          console.log(`[判官] 单篇上下文预热失败 ${item.ref}: ${error.message}`);
-        }
-      }
-    }
-    await Promise.all(Array.from({ length: warmConcurrency }, () => singleWarmWorker()));
-    return;
-  }
+  // 预热统一走 batch 模式（skipExternal=true，判后才带外部信号）。
+  // 旧代码在 externalSignalsEnabled 时切换到单篇模式，是因为旧预热生成了带外部 context hash 的缓存，
+  // 批量版本生成的是无 context hash 缓存，与 judgeBefore 不匹配。
+  // 现在 judgeBefore 也 skipExternal=true，两者 hash 完全一致，batch 永远可用。
   const batches = [];
   const batchSize = Math.max(1, judge.batchSize);
   for (let i = 0; i < missing.length; i += batchSize) {
@@ -1042,7 +1025,7 @@ async function warmJudgeCacheForTargets(refs, judge, cfg = {}) {
         } else if (cfg.progressStyle !== "quiet") {
           console.log(`[判官] start batch ${idx + 1}/${state.totalBatches} refs=${batch.map((item) => item.ref).join(",")}`);
         }
-        result = await runJudgeBatch(batch, judge);
+        result = await runJudgeBatch(batch, judge, { skipExternal: true });
       } catch (error) {
         if (cfg.progressStyle !== "quiet") console.log(`[判官] fail batch ${idx + 1}/${state.totalBatches} refs=${batch.map((item) => item.ref).join(",")} error=${error.message}`);
         aborted = error;
@@ -1505,6 +1488,46 @@ function repairTopic(original, parsed, todayYmd, allowComplex) {
     const mermaidContents = [];
     if (card.type === "diagram" && card.format === "mermaid") mermaidContents.push(card.content);
     if (Array.isArray(card.sources)) for (const src of card.sources) if (src?.kind === "mermaid") mermaidContents.push(src.content);
+    // ── 卡片级确定性修复 ──────────────────────────────────────────
+    // Bug A: interviewAnswer.followUpQuestions 里 answer 开头被嵌入了 question 文字。
+    // LLM 在重排字段顺序时把 question 拼到 answer 前面（"问题文字\n答案..."），导致渲染重复。
+    if (card.type === "interviewAnswer" && Array.isArray(card.followUpQuestions)) {
+      for (const fq of card.followUpQuestions) {
+        const q = typeof fq.question === "string" ? fq.question : "";
+        let a = typeof fq.answer === "string" ? fq.answer : "";
+        if (q && a.startsWith(q)) {
+          a = a.slice(q.length).replace(/^\s+/, "");
+          fq.answer = a;
+          notes.push(`followUp「${q.slice(0, 20)}…」answer 前缀已去除`);
+        }
+      }
+    }
+    // Bug B: diagram/animation 丢失 caption 或 sources（LLM 选择性遗漏"次要"字段）。
+    // 按标题匹配原卡（findOriginalDiagramFor 已有逻辑），缺啥补啥。
+    if (isDiagram) {
+      const origCard = findOriginalDiagramFor(card, original, diagramPos);
+      if (origCard) {
+        if (typeof origCard.caption === "string" && origCard.caption.trim() && !card.caption) {
+          card.caption = origCard.caption;
+          notes.push(`图「${card.title ?? ""}」恢复 caption`);
+        }
+        if (Array.isArray(origCard.sources) && origCard.sources.length && !Array.isArray(card.sources)) {
+          card.sources = cloneJson(origCard.sources);
+          notes.push(`图「${card.title ?? ""}」恢复 sources（${origCard.sources.length} 项）`);
+        }
+      }
+    }
+    // Bug C: code 卡片丢失 language（字段重排时遗漏；checkInvariants 会拦但触发重试，不如直接修）。
+    if (card.type === "code" && !card.language) {
+      const origCodeCards = (original?.learningCards ?? []).filter((c) => c?.type === "code");
+      const codePos = cards.slice(0, ci + 1).filter((c) => c?.type === "code").length - 1;
+      const origCode = origCodeCards.find((c) => c.title === card.title) ?? origCodeCards[codePos];
+      if (origCode?.language) {
+        card.language = origCode.language;
+        notes.push(`code「${card.title ?? ""}」恢复 language: ${origCode.language}`);
+      }
+    }
+    // ──────────────────────────────────────────────────────────────
     if (mermaidContents.some((c) => mermaidContentBad(c, allowComplex))) {
       // App 渲染优先级 SVG > mermaid > text。坏的只是 mermaid 兜底层时，绝不能因此丢掉（可能已优化的）SVG 主图。
       if (cardHasSvg(card)) {
@@ -1679,10 +1702,38 @@ function checkInvariants(original, parsed) {
   return null;
 }
 
-async function writeTopicAtomic(ref, parsed) {
+// 按 original 的 key 顺序重排 value 的字段，original 没有的 key 追加到末尾。
+// 对 learningCards 数组按 index 对齐：同位置的卡按原卡的字段顺序；新增卡不重排。
+function reorderKeysLike(original, value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  if (!original || typeof original !== "object" || Array.isArray(original)) return value;
+  const result = {};
+  for (const k of Object.keys(original)) {
+    if (!(k in value)) continue;
+    if (k === "learningCards" && Array.isArray(original[k]) && Array.isArray(value[k])) {
+      result[k] = value[k].map((card, i) =>
+        original[k][i] && typeof original[k][i] === "object"
+          ? reorderKeysLike(original[k][i], card)
+          : card,
+      );
+    } else if (value[k] && typeof value[k] === "object" && !Array.isArray(value[k]) &&
+               original[k] && typeof original[k] === "object" && !Array.isArray(original[k])) {
+      result[k] = reorderKeysLike(original[k], value[k]);
+    } else {
+      result[k] = value[k];
+    }
+  }
+  for (const k of Object.keys(value)) {
+    if (!(k in result)) result[k] = value[k];
+  }
+  return result;
+}
+
+async function writeTopicAtomic(ref, parsed, original) {
   const abs = path.join(root, ref);
   const tmp = `${abs}.refine.tmp`;
-  await writeFile(tmp, `${JSON.stringify(parsed, null, 2)}\n`);
+  const ordered = original ? reorderKeysLike(original, parsed) : parsed;
+  await writeFile(tmp, `${JSON.stringify(ordered, null, 2)}\n`);
   await rename(tmp, abs);
 }
 
@@ -2215,12 +2266,12 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
     ? scoreTopic(original, ref, corpus)
     : { score: audit.scoreMap.get(ref) ?? 0, issueCount: audit.failingMap.get(ref)?.issues?.length ?? 0, issues: audit.failingMap.get(ref)?.issues ?? [], metrics: { dimensions: {} } };
   const staticBefore = staticBeforeReport.score;
-  // 判前：对现版判一次（按 contentHash 缓存）。用于 ①"已达标则不浪费改写" ②keep-best 基线 ③findings 喂改写。
+  // 判前：对现版判一次（按 contentHash 缓存，不做联网/视觉 → 命中预热缓存）。用于 ①"已达标则不浪费改写" ②keep-best 基线 ③findings 喂改写。
   let beforeReview = null;
   let findingLines = [];
   if (!writeTo && judge?.enabled) {
     phase("judgeBefore");
-    beforeReview = await runJudges(original, ref, judge);
+    beforeReview = await runJudges(original, ref, judge, { skipExternal: true });
     if (!beforeReview) {
       // 判官启用 = 判官必需。判前（已含 judge 内部 jsonRetries）仍拿不到动态评审 → 绝不退回"双静态"（那不是精修），
       // 直接判该篇失败、计入最终报告的"判官评审失败"。本轮该篇静态若仍 <minScore，下一轮会重新进队列再试（跨轮重试）。
@@ -2397,7 +2448,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
         blockResult = await tryBlockKeepBest({ original, candidate: parsed, ref, corpus, beforeStaticReport: staticBeforeReport, beforeReview, judge });
         if (blockResult.accept) {
           phase("merging");
-          await writeTopicAtomic(ref, blockResult.topic);
+          await writeTopicAtomic(ref, blockResult.topic, original);
           console.log(
             `[TOPIC] 块级合并已写回 ${ref}（${blockResult.reason}，吸收 ${blockResult.mergedBlocks.length}/${blockResult.changedBlocks} 块` +
               `${blockResult.review ? `，动态 ${beforeReview.score}->${blockResult.review.score}` : ""}）`,
@@ -2452,7 +2503,7 @@ async function refineOneTopic(ref, audit, templates, cfg, cliPath, runDir, minSc
       }
       if (decision.accept) {
         phase("merging");
-        await writeTopicAtomic(ref, parsed);
+        await writeTopicAtomic(ref, parsed, original);
         console.log(`[TOPIC] 已写回 ${ref}（${decision.reason}${afterReview ? `，动态 ${beforeReview.score}->${afterReview.score}` : ""}）`);
         console.log(`[TOPIC] 完成 ${attemptLabel}`);
         return {
@@ -2830,8 +2881,20 @@ class LiveDashboard {
     const cfg = this.state.cfg ?? {};
     const judge = this.state.judge;
 
-    lines.push(`╭─ ${this.state.title} ${"─".repeat(Math.max(0, width - this.state.title.length - 4))}`);
-    // 顶栏：当前阶段 + 轮次 + 全程已用，让"总进度/已执行多久"一眼可见（不随单轮重置）。
+    // 顶栏：简洁标题 + 右侧封闭线（title 已缩短，不会超宽）
+    const title = this.state.title ?? "quality-refine";
+    lines.push(`╭─ ${title} ${"─".repeat(Math.max(0, width - title.length - 4))}`);
+    // 第二行：配置摘要（精修链/并发/minScore），让标题行保持简洁
+    if (cfg.modelsLabel || cfg.concurrency || cfg.minScore != null) {
+      const cfgParts = [];
+      if (cfg.modelsLabel) cfgParts.push(`精修 ${cfg.modelsLabel}`);
+      if (cfg.judge && cfg.judge !== "off") cfgParts.push(`判官 ${cfg.judge}`);
+      if (cfg.concurrency) cfgParts.push(`并发 ${cfg.concurrency}`);
+      if (cfg.minScore != null) cfgParts.push(`minScore ${cfg.minScore}`);
+      const cfgLine = cfgParts.join("  ");
+      lines.push(` 配置  ${truncate(cfgLine, width - 8)}`);
+    }
+    // 阶段行：当前阶段 + 轮次 + 全程已用，让"总进度/已执行多久"一眼可见（不随单轮重置）。
     const runElapsed = this.state.runStartedAt ? Date.now() - this.state.runStartedAt : 0;
     const roundLabel = this.state.maxRounds ? ` · 轮次 ${this.state.round}/${this.state.maxRounds}` : "";
     const stageLabel = this.state.stage ? this.state.stage : "运行中";
@@ -2866,7 +2929,7 @@ class LiveDashboard {
 
     const active = this.state.poolActive ?? [];
     if (active.length) {
-      lines.push(`├─ active workers (${active.length}) ${"─".repeat(Math.max(0, width - 24 - String(active.length).length))}`);
+      lines.push(`├─ 子 agent (${active.length}) ${"─".repeat(Math.max(0, width - 18 - String(active.length).length))}`);
       const now = Date.now();
       // 全展示，按 phaseStartedAt 升序（最久的排前），让长尾子 agent 一眼看见。
       const sorted = [...active].sort((a, b) => (a.phaseStartedAt ?? 0) - (b.phaseStartedAt ?? 0));
@@ -2911,8 +2974,18 @@ class LiveDashboard {
     }
 
     if (this.state.lastEvents?.length) {
-      lines.push(`├─ 运行信号 ${"─".repeat(Math.max(0, width - 12))}`);
+      lines.push(`├─ 信号 ${"─".repeat(Math.max(0, width - 6))}`);
       for (const line of this.state.lastEvents) lines.push(` · ${truncate(line, width - 4)}`);
+    }
+
+    // 固定底栏：暂停中时显示恢复提示，正常运行时显示快捷键
+    if (pauseBus.isPaused()) {
+      const reason = truncate(pauseBus.reason ?? "", Math.max(10, width - 44));
+      lines.push(`├─ ⏸ 暂停中: ${reason}${"─".repeat(Math.max(0, width - 14 - reason.length))}`);
+      lines.push(` [Enter] 继续  [a] 自动探活  [s] 跳过当前  [p] 手动模式`);
+    } else {
+      lines.push(`╰─ 按键: [p] 暂停  [Ctrl-C] 停止 ${"─".repeat(Math.max(0, width - 36))}`);
+      return lines;
     }
 
     lines.push(`╰${sep.slice(1)}`);
@@ -2971,7 +3044,10 @@ function formatDashboardEvent(evt) {
     return `图选择 ${compactRef(evt.ref, 28)} · ${evt.cardTitle ?? ""} · ${evt.format}${evt.keptOld ? " 保留旧版" : ` score=${evt.score}`}${evt.stuck ? " stuck" : ""}`;
   }
   if (evt.type === "factcheck.done") {
-    return `事实核验 ${compactRef(evt.ref, 28)} · ${evt.backend} · sources=${evt.sources ?? 0}`;
+    // 普通 checked 结果太频繁，只在有权威来源或异常时才进信号栏（避免刷屏）
+    if (!evt.ok) return `事实核验 ${compactRef(evt.ref, 28)} · ${evt.backend} unreachable`;
+    if ((evt.findings ?? 0) > 0) return `事实核验 ${compactRef(evt.ref, 28)} · ${evt.backend} · findings=${evt.findings}`;
+    return ""; // ok 且无 findings → 不打扰
   }
   return "";
 }
@@ -3589,12 +3665,18 @@ async function topicAwarePreflight(targetRefs, { judge, profile, allowPaidDiagra
     const probe = await probeBackends();
     const usable = probe.filter((entry) => entry.ok);
     if (!usable.length) {
-      hardPreflight(
-        "严格启动要求内置联网事实核验至少有一个可达后端，但 auto 探测全部失败。",
-        [`探测结果：${probe.map((entry) => `${entry.backend}=${entry.ok ? "ok" : entry.reason}`).join("; ")}`],
+      // 全部后端都探测失败（网络问题/被墙）：降级为警告而非 abort。
+      // 判官在 unreachable 状态下会仅凭内部知识核验，并按 suspicious 而非 wrong 处理不确定事实。
+      console.warn(
+        `\x1b[33m[preflight] 警告：联网事实核验所有后端探测失败，将以 unreachable 模式运行。\x1b[0m`
       );
+      console.warn(
+        `  探测结果：${probe.map((entry) => `${entry.backend}=${entry.ok ? "ok" : entry.reason}`).join("; ")}`
+      );
+      console.warn(`  判官将仅凭内部知识核验，不确定项标 suspicious。如需联网核验，请检查网络或配置 FACT_CHECK_MCP_TOOLS。`);
+    } else {
+      fact.backend = usable[0].backend;
     }
-    fact.backend = usable[0].backend;
   }
   if (caps.svgTopics > 0) {
     const vision = visionBackendReady();
@@ -4081,7 +4163,7 @@ async function main() {
   if (profile !== "offline") {
     try {
       const { downgraded: dg } = await probeAndDowngrade({
-        onDowngrade: (spec, error) => console.warn(`[capability-probe] ${spec} 不支持图像（${error}）→ 降级 imageUnderstanding`),
+        onDowngrade: (spec, error) => console.warn(`[capability-probe] ${spec} 图像探测失败（不支持/被审核拒答/4xx-5xx）→ 转纯文本，视觉改走 MCP/Agnes（${String(error).slice(0, 100)}）`),
       });
       if (dg.length) console.warn(`[capability-probe] ${dg.length} 个模型降级：${dg.join(", ")}`);
     } catch (e) {
@@ -4153,11 +4235,18 @@ async function main() {
 
   // dashboard 仅在 summary 模式 + TTY 输出时启用；非 TTY / 重定向到日志文件 / topic|quiet 模式自动降级为原滚屏。
   if (cfg.progressStyle === "summary") {
-    const modelsLabel = modelChain.map((entry) => entry ?? "CLI默认").join(" → ");
-    const judgeLabel = judge ? `${judge.models.map((entry) => entry ?? "CLI默认").join(",")}×${judgeCount}` : "off";
+    // title 只放简洁标识，不放完整模型链（防止超宽截断右侧 ─）。
+    // 模型链/并发/minScore 放在 cfg 里给 renderLines 的"配置行"用。
+    const shortModel = (s) => {
+      if (!s) return "CLI默认";
+      const id = s.includes(":") ? s.split(":")[1] : s;
+      return id.length > 20 ? id.slice(0, 18) + "…" : id;
+    };
+    const modelsLabel = modelChain.map(shortModel).join("→");
+    const judgeLabel = judge ? `${judge.models.map(shortModel).join(",")}×${judgeCount}` : "off";
     dashboard.setStatic({
-      title: `quality_refine  scope=${scope}  cli=${cfg.cli}  精修=${modelsLabel}  判官=${judgeLabel}`,
-      cfg: { concurrency: cfg.concurrency, judge: judgeLabel, minScore },
+      title: `quality-refine  ${scope}  ${cfg.cli}`,
+      cfg: { concurrency: cfg.concurrency, judge: judgeLabel, minScore, modelsLabel },
       runStartedAt,
     });
     dashboard.enable(process.stdout);

@@ -34,8 +34,8 @@ function backendsToProbe() {
   const candidates = [];
   if (apiKey && cx) candidates.push("google-cse");
   if (apiKey || bingKey) candidates.push("bing");
-  // 国内零配置首选
-  candidates.push("baidu", "sogou", "duckduckgo");
+  // 国内零配置首选：bing-html (cn.bing.com) 结构稳定、无需 key
+  candidates.push("bing-html", "baidu", "sogou", "duckduckgo");
   return candidates;
 }
 

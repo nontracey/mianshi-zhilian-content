@@ -1,12 +1,13 @@
 // scripts/web/search.mjs
-// 内置搜索后端：Google CSE / Bing / Baidu / Sogou / DuckDuckGo。
+// 内置搜索后端：Google CSE / Bing API / Bing HTML / Baidu / Sogou / DuckDuckGo。
 // 全部用 Node 原生 fetch，不引第三方依赖。
 //
-// 国内可达性：
+// 国内可达性（优先级）：
 // - Google CSE: 需翻墙 + API key + CX
 // - Bing API: 国内可达 + API key
-// - Baidu HTML: 国内零配置首选（无 key，带浏览器 UA 绕基础反爬）
-// - Sogou HTML: 国内备选（无 key）
+// - Bing HTML (cn.bing.com): 国内零配置首选（无 key，结构稳定，英中文均可）
+// - Baidu HTML: 常被安全验证拦截（CAPTCHA），已降为备选
+// - Sogou HTML: 国内备选（无 key，偶发 403）
 // - DuckDuckGo HTML: 国外备选（无 key，国内通常被墙）
 
 import { envConfig } from "../llm/env-config.mjs";
@@ -87,26 +88,59 @@ export async function searchBing(query, opts = {}) {
   }));
 }
 
-// ===== Baidu HTML（无 key）=====
+// ===== Bing HTML (cn.bing.com, 无 key，国内零配置首选) =====
+export async function searchBingHtml(query, opts = {}) {
+  const num = opts.num || numResults();
+  const url = `https://cn.bing.com/search?q=${encodeURIComponent(query)}&setlang=zh-CN&count=${num * 2}`;
+  const { ok, text, status } = await fetchText(url, {
+    headers: {
+      "Accept": "text/html,application/xhtml+xml",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    },
+  });
+  if (!ok || !text) throw new Error(`BingHtml HTTP ${status}`);
+  const results = [];
+  // Bing 结果在 <li class="b_algo"> 内
+  const re = /<li[^>]+class="[^"]*b_algo[^"]*"[^>]*>([\s\S]*?)<\/li>/gi;
+  let m;
+  while ((m = re.exec(text)) !== null && results.length < num) {
+    const block = m[1];
+    const linkM = block.match(/<h2[^>]*>[\s\S]*?<a[^>]+href="([^"#][^"]*)"[^>]*>([\s\S]*?)<\/a>/i);
+    if (!linkM) continue;
+    const itemUrl = linkM[1];
+    if (!itemUrl.startsWith("http")) continue;
+    const title = stripTags(linkM[2]).trim();
+    if (!title) continue;
+    const snippetM = block.match(/<p[^>]*>([\s\S]*?)<\/p>/i)
+      || block.match(/<div[^>]*class="[^"]*b_caption[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+    const snippet = snippetM ? stripTags(snippetM[1]).trim().slice(0, 300) : "";
+    results.push({ title, url: itemUrl, snippet, source: "bing-html" });
+  }
+  return results;
+}
+
+// ===== Baidu HTML（无 key，常被安全验证拦截，降为备选）=====
 export async function searchBaidu(query, opts = {}) {
   const num = opts.num || numResults();
   const url = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}&rn=${num}&ie=utf-8`;
   const { ok, text, status } = await fetchText(url);
   if (!ok || !text) throw new Error(`Baidu HTTP ${status}`);
-  // 百度搜索结果解析：每个结果在 <div class="result" ...> 或 <div class="c-container" ...> 里
+  // 检测安全验证页面（CAPTCHA）：百度被触发时返回极短页面或含"安全验证"关键词
+  if (text.length < 5000 || /百度安全验证|安全验证|mkdjump/i.test(text)) {
+    throw new Error(`Baidu 安全验证拦截（CAPTCHA）`);
+  }
   const results = [];
-  // 先抓所有 h3 + 紧跟的 a 链接
-  const re = /<h3[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  // 多重 fallback 策略：h3>a、c-title、result 容器
+  const re = /<h3[^>]*>[\s\S]*?<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
   let match;
   while ((match = re.exec(text)) && results.length < num) {
     const url = match[1];
     const title = stripTags(match[2]).trim();
-    if (!url || !title) continue;
-    // 抓 snippet：找该 h3 之后到下一个 h3 之间的文本
+    if (!url || !title || url.startsWith("https://www.baidu.com")) continue;
     const after = text.slice(match.index, match.index + 2000);
     const snippetMatch = after.match(/<span[^>]*class="content-right_[^"]*"[^>]*>([\s\S]*?)<\/span>/i)
       || after.match(/<div[^>]*class="c-abstract[^"]*"[^>]*>([\s\S]*?)<\/div>/i)
-      || after.match(/<div[^>]*class="c-span-last"[^>]*>([\s\S]*?)<\/div>/i);
+      || after.match(/<p[^>]*class="[^"]*c-color-text[^"]*"[^>]*>([\s\S]*?)<\/p>/i);
     const snippet = snippetMatch ? stripTags(snippetMatch[1]).trim() : "";
     results.push({ title, url, snippet, source: "baidu" });
   }
@@ -161,10 +195,11 @@ export async function searchDuckDuckGo(query, opts = {}) {
 
 // ===== 统一入口 =====
 export async function search(query, opts = {}) {
-  const backend = opts.backend || "baidu";
+  const backend = opts.backend || "bing-html";
   const map = {
     "google-cse": searchGoogleCSE,
     "bing": searchBing,
+    "bing-html": searchBingHtml,
     "baidu": searchBaidu,
     "sogou": searchSogou,
     "duckduckgo": searchDuckDuckGo,
@@ -174,4 +209,4 @@ export async function search(query, opts = {}) {
   return await fn(query, opts);
 }
 
-export const SEARCH_BACKENDS = ["google-cse", "bing", "baidu", "sogou", "duckduckgo"];
+export const SEARCH_BACKENDS = ["google-cse", "bing", "bing-html", "baidu", "sogou", "duckduckgo"];

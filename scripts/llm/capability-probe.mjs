@@ -46,9 +46,18 @@ async function probeImageCapability(spec) {
     return { spec, ok: true, response: String(result.text ?? "").slice(0, 50) };
   } catch (error) {
     const msg = String(error.message ?? "");
-    // 不支持的典型错误：400 + "image" / "vision" / "multimodal"
+    const status = Number(error.status) || 0;
+    // “这个模型在这里用不了图像”的判据（比单纯英文 unsupported 更宽）：
+    // ① 明确不支持：image/vision/multimodal/not support；
+    // ② 内容审核/拒答：moderation/policy/safety/违规，及中文“图像/无法提供/法律法规/内容审核/拒绝”；
+    // ③ 带 HTTP 状态码的 4xx/5xx（非纯网络抖动）——说明请求本身被服务端拒绝，而不是网络瞬断。
     const unsupported = /image|vision|multimodal|not\s+support/i.test(msg);
-    return { spec, ok: false, unsupported, error: msg.slice(0, 200) };
+    const moderation = /moderation|policy|safety|content\s*filter|违规|无法提供|法律法规|内容审核|图像|拒绝/i.test(msg);
+    const httpRejected = status >= 400 && status < 600;
+    // 纯网络抖动（无状态码 + timeout/econnreset/eai_again 等）视为瞬时，不据此判定图像不可用。
+    const transient = status === 0 && /timeout|abort|econnreset|etimedout|eai_again|enotfound|socket hang up/i.test(msg);
+    const imageUnusable = !transient && (unsupported || moderation || httpRejected);
+    return { spec, ok: false, unsupported, imageUnusable, status, error: msg.slice(0, 200) };
   }
 }
 
@@ -91,7 +100,9 @@ export async function probeAndDowngrade({ onDowngrade } = {}) {
   for (const model of envConfig.listModelsByCapability("image")) {
     const spec = `${model.provider}:${model.id}`;
     const r = getProbeResult(spec);
-    if (r && !r.ok && r.unsupported) {
+    // 探测失败且判定“图像在这里用不了”（不支持/被审核拒答/4xx-5xx，排除纯网络抖动）→ 降级图像能力。
+    // 兼容旧缓存：老条目没有 imageUnusable 字段时回退到 unsupported。
+    if (r && !r.ok && (r.imageUnusable ?? r.unsupported)) {
       const nextModality = (model.modality ?? []).filter((cap) => cap !== "image");
       envConfig.patchModel(spec, {
         modality: nextModality.length ? nextModality : ["text", "json"],

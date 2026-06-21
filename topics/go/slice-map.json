@@ -20,12 +20,12 @@
     "go.basics.types"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "重点是看候选人能不能画出 slice header(ptr/len/cap)、说清 append 在 cap 不足时分配新数组的行为，以及解释普通 map 并发写为何会触发 runtime fatal。",
+  "interviewerFocus": "考察 slice header(ptr/len/cap) 语义、append 扩容的 cap 判定与内存分配策略、map 的 hmap/bmap 结构及并发写 fatal 机制、sync.Map 的 read/dirty 双 map 与 miss 提升原理。",
   "learningCards": [
     {
       "type": "explain",
       "title": "Slice 是数组窗口，Map 是运行时哈希表",
-      "content": "slice 不是数组本身，而是 runtime 里的三元组：一个指向底层数组的指针、长度 len、容量 cap，共 24 字节（64 位机）。map 是 runtime.hmap 结构：B 表示桶数量的 log2，因此桶数是 2^B；每个 bmap 最多 8 个槽位，键和值分别紧凑存放，溢出时挂 overflow 桶，hash 高 8 位作为 tophash 加速比较。\n\n从零理解时先抓住这几个点：\n- 切片截取 `s[2:5]` 复制了 header 但 ptr 还指向同一底层数组，写入 s[2] 会被原 slice 看见\n- append 容量足够时直接写老数组并返回 len+1 的新 header，容量不足时按规则分配新数组并复制（Go 1.18 起小切片仍约 2 倍，超过 256 后增长系数渐降到 1.25 左右）\n- map 必须 `make(map[K]V)` 或 `make(map[K]V, hint)` 初始化，nil map 读取返回零值，写入会 panic：`assignment to entry in nil map`\n- 普通 map 没有内部锁，并发读写/写写本质上都是数据竞争；runtime 在写路径还会检查 hashWriting 标志位，发现并发写就直接 `fatal error: concurrent map writes`\n\n容易答浅的地方通常在边界：\n- 用 `s := big[:16]` 截一个小切片再长期持有，会让整个 big 底层数组无法 GC——这是常见的内存保留 bug，必须 `copy` 出来才能断开\n- map 的 range 顺序由 runtime 在每次遍历时随机选起始桶，刻意不可重现，写测试断言顺序必挂\n- sync.Map 用 read/dirty 双 map 与 miss 提升机制，只在读多写少且 key 集合相对稳定时才比 RWMutex+map 更合适"
+      "content": "面试中，面试官最常问的第一个问题通常是：“slice 截取后，修改原数组，新 slice 会受影响吗？” 要回答这个问题，必须先建立正确的底层认知：slice 不是数组本身，而是一个 runtime 里的三元组结构（header），包含指向底层数组的指针（ptr）、当前长度（len）和容量（cap），在 64 位机器上共占 24 字节。map 则是 runtime 维护的哈希表，由 hmap 结构体管理，内部包含 B 字段（表示桶数量的 log2，即桶数为 2^B）、buckets 数组以及溢出桶（overflow）链表。每个 bmap 最多存放 8 个键值对，并使用 tophash（哈希值的高 8 位）存储在桶头部，用于快速跳过不匹配的键，避免昂贵的哈希计算。\n\n理解 slice 的核心在于“共享”与“边界”：\n- 截取 `s[2:5]` 只是复制了一个新的 header，ptr 依然指向原数组的第二个元素。因此，对新 slice 的写入会直接反映在原数组上，原 slice 也能看到变化。\n- 扩容（append）是 slice 最易出错的场景。当 len < cap 时，append 直接在原数组上写入并返回新的 header；当 len == cap 时，runtime 会分配新数组，复制旧数据，并返回指向新数组的 header。此时，原 slice 与新 slice 彻底分家。\n- 零值（nil slice）与空切片（empty slice）的区别：`var s []int` 是 nil slice，ptr 为 nil，len 和 cap 为 0，序列化 JSON 为 `null`；`s := []int{}` 是空切片，ptr 非 nil，序列化 JSON 为 `[]`。这在内存占用和序列化结果上有显著差异。\n\n理解 map 的核心在于“并发安全”与“扩容”：\n- map 必须通过 `make(map[K]V)` 初始化，nil map 读取返回零值，但写入会 panic（`assignment to entry in nil map`）。\n- 普通 map 不是并发安全的。runtime 在写入时会设置 `hashWriting` 标志，并发写会直接触发 `fatal error: concurrent map writes`，导致进程崩溃，无法 recover。\n- map 的 range 顺序是随机的，由 runtime 在遍历时随机选择起始桶，刻意不可重现，依赖遍历顺序的业务逻辑或测试断言必挂。\n\n容易答浅的地方通常在边界：\n- 小切片钉住大数组：用 `s := big[:16]` 截取一个小切片并长期持有，会导致整个 big 底层数组无法被 GC 回收，这是常见的内存保留 bug。必须使用 `copy` 将数据复制到独立切片才能断开引用。\n- sync.Map 的选型：sync.Map 使用 read/dirty 双 map 与 miss 提升机制，只在读多写少且 key 集合相对稳定时才比 RWMutex+map 更合适。写多场景下，sync.Map 的性能反而更差。\n- map 的哈希冲突解决：采用链地址法，当桶满时，通过 overflow 桶链表解决冲突。当溢出桶过多时，会触发扩容。"
     },
     {
       "type": "explain",
@@ -35,9 +35,8 @@
     {
       "type": "diagram",
       "title": "Slice header / append 扩容 / map 桶结构",
-      "format": "mermaid",
       "content": "flowchart LR\nA[slice header ptr len cap] --> B[底层数组 arr]\nC[s2 := s1 5: 10] --> A\nB --> D{append 时 len 小于 cap}\nD -->|是| E[原数组就地写入, 共享者可见]\nD -->|否| F[分配新数组并 copy, 与原 slice 分家]\nG[map hmap B 个桶] --> H[bmap 8 槽位 tophash]\nH --> I[overflow 桶链]\nG --> J[写入置 hashWriting 标志]\nJ --> K[并发写触发 runtime fatal]",
-      "fallback": "slice header(ptr/len/cap) 指向底层数组；s2:=s1[5:10] 复制 header 共享数组；append 时 len<cap 走原数组（共享者可见），cap 不足则分配新数组 copy（与原 slice 分家）；map hmap 含 2^B 个 bmap 桶，每桶 8 槽位 + tophash + overflow 链；写入置 hashWriting 标志，并发写触发 fatal。",
+      "format": "mermaid",
       "caption": "判断 slice 副作用看 cap 是否足够；判断 map 并发安全看是否多 goroutine 进写路径。",
       "sources": [
         {
@@ -48,7 +47,8 @@
           "kind": "text",
           "content": "slice header(ptr/len/cap) 指向底层数组；s2:=s1[5:10] 复制 header 共享数组；append 时 len<cap 走原数组（共享者可见），cap 不足则分配新数组 copy（与原 slice 分家）；map hmap 含 2^B 个 bmap 桶，每桶 8 槽位 + tophash + overflow 链；写入置 hashWriting 标志，并发写触发 fatal。"
         }
-      ]
+      ],
+      "fallback": "slice header(ptr/len/cap) 指向底层数组；s2:=s1[5:10] 复制 header 共享数组；append 时 len<cap 走原数组（共享者可见），cap 不足则分配新数组 copy（与原 slice 分家）；map hmap 含 2^B 个 bmap 桶，每桶 8 槽位 + tophash + overflow 链；写入置 hashWriting 标志，并发写触发 fatal。"
     },
     {
       "type": "compareTable",
@@ -69,7 +69,7 @@
         [
           "append 扩容",
           "len<cap 原地写；否则按 ~2x（>256 后渐降到 1.25x）分配新数组",
-          "原 slice 是否能看到新元素",
+          "原 slice 是否能看到新元素 → 看 cap 是否够用",
           "误以为 append 永远返回新数组或永远原地"
         ],
         [
@@ -95,8 +95,8 @@
     {
       "type": "code",
       "title": "copy 断开子切片对大数组的引用",
-      "language": "go",
       "content": "package main\n\nfunc keepSmall(buf []byte) []byte {\n\tif len(buf) > 16 {\n\t\tbuf = buf[:16]\n\t}\n\tout := make([]byte, len(buf))\n\tcopy(out, buf) // 断开对大 buf 底层数组的引用\n\treturn out\n}",
+      "language": "go",
       "highlights": [
         {
           "line": 5,
@@ -115,7 +115,7 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "30 秒结论：slice 是 ptr/len/cap 三元组的数组窗口，map 是 runtime.hmap 维护的桶+tophash 哈希表，理解它们必须从底层结构而不是语法容器入手，否则共享、扩容、并发三个边界都会答错。\n\n机制层面我会按这条线展开：\n1. slice header 是 24 字节三元组，截取和传参都复制 header 但共享底层数组，所以元素写入是别名可见的\n2. append 看 cap：足够就原地写并返回新 len 的 header，不够就按约 2x（大切片渐降到 1.25x）分配新数组并 copy，原 slice 看不到新元素\n3. map 用 2^B 个桶+8 槽 tophash 加速查找；并发读写/写写是数据竞争，写路径还会用 hashWriting 做 fatal 检测，命中后进程直接退出，不能 recover\n4. 选型上：读多写少 key 稳定用 sync.Map，写多或需要复合操作用 RWMutex+map\n\n边界追问我会主动补：小切片钉住大数组要 copy 出来释放、map range 顺序刻意随机不能依赖、nil map 可读不可写、map 增量扩容期间 oldbuckets 与 buckets 同时存在、`go test -race` 是验证并发 map 误用的第一招。",
+      "content": "30 秒结论：slice 是 ptr/len/cap 三元组的数组窗口，map 是 runtime.hmap 维护的桶+tophash 哈希表，理解它们必须从底层结构入手，否则共享、扩容、并发三个边界都会答错。\n\n机制层面我会按这条线展开：\n1. slice header 是 24 字节三元组，截取和传参都复制 header 但共享底层数组，所以元素写入是别名可见的\n2. append 看 cap：足够就原地写并返回新 len 的 header，不够就按约 2x（大切片渐降到 1.25x）分配新数组并 copy，原 slice 看不到新元素\n3. map 用 2^B 个桶+8 槽 tophash 加速查找；并发读写/写写是数据竞争，写路径还会用 hashWriting 做 fatal 检测，命中后进程直接退出，不能 recover\n4. 选型上：读多写少 key 稳定用 sync.Map，写多或需要复合操作用 RWMutex+map\n\n边界追问我会主动补：小切片钉住大数组要 copy 出来释放、map range 顺序刻意随机不能依赖、nil map 可读不可写、map 增量扩容期间 oldbuckets 与 buckets 同时存在、`go test -race` 是验证并发 map 误用的第一招。",
       "followUpQuestions": [
         {
           "question": "append 后原 slice 一定会变化吗？",
@@ -123,7 +123,7 @@
         },
         {
           "question": "sync.Map 适合所有并发 map 场景吗？",
-          "answer": "不适合。sync.Map 用 read+dirty 双 map 结构优化读多写少、key 集合稳定的场景（典型如全局配置、连接缓存）；当写入频繁、需要遍历一致快照、或需要 GetOrCompute 这类复合操作时，dirty 提升和拷贝成本反而比 RWMutex+map 高，而且 sync.Map 没有 len 也没有强类型约束。生产里我会优先 RWMutex+map，只有 benchmark 证明读冲突明显才换 sync.Map。"
+          "answer": "不适合。sync.Map 用 read+dirty 双 map 结构优化读多写少、key 集合稳定的场景（典型如全局配置、连接缓存）；当写入频繁、需要遍历一致快照、或需要 GetOrCompute 这类复合操作时，dirty 提升和拷贝成本反而比 RWMutex+map 高，而且 sync.Map 的 Range 不保证一致性快照（因为 dirty 可能随时被提升，遍历过程中数据可能发生变化）。生产里我会优先 RWMutex+map，只有 benchmark 证明读冲突明显才换 sync.Map。"
         },
         {
           "question": "为什么并发写普通 map 是 fatal 而不是 panic？",
@@ -146,40 +146,28 @@
   ],
   "recallPrompts": [
     {
+      "difficulty": 3,
+      "expectedMinutes": 3,
       "id": "go.basics.slice-map.recall.1",
-      "prompt": "请解释 slice header 的三个字段、append 扩容的判定条件，以及底层数组共享带来的别名风险。",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "prompt": "请解释 slice header 的三个字段、append 扩容的判定条件，以及底层数组共享带来的别名风险。"
     },
     {
+      "difficulty": 3,
+      "expectedMinutes": 3,
       "id": "go.basics.slice-map.recall.2",
-      "prompt": "Go 普通 map 并发写为什么既是 data race，又可能触发 runtime fatal？sync.Map 适合哪些场景，不适合哪些？",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "prompt": "Go 普通 map 并发写为什么既是 data race，又可能触发 runtime fatal？sync.Map 适合哪些场景，不适合哪些？"
     },
     {
-      "id": "go.basics.slice-map.recall.3",
-      "prompt": "一个 16 字节的小切片为什么可能让几十 MB 的大数组无法释放？给出最小修复代码。",
-      "mode": "text",
+      "difficulty": 3,
       "expectedMinutes": 3,
-      "difficulty": 3
+      "id": "go.basics.slice-map.recall.3",
+      "mode": "text",
+      "prompt": "一个 16 字节的小切片为什么可能让几十 MB 的大数组无法释放？给出最小修复代码。"
     }
   ],
   "rubric": {
-    "mustHave": [
-      "能画出 slice header(ptr/len/cap) 三元组并解释截取共享底层数组",
-      "能说清 append 在 len<cap 时原地写、否则分配新数组（约 2x，大切片渐降到 1.25x）",
-      "能描述 map 的 hmap+bmap+tophash 桶结构与 nil map 写入 panic",
-      "能解释普通 map 并发写为何触发 runtime fatal 而非可 recover 的 panic"
-    ],
-    "goodToHave": [
-      "能用 make+copy 断开子切片对大数组的引用，避免内存保留",
-      "能区分 sync.Map（读多写少 key 稳定）与 RWMutex+map（写多或复合操作）的选型",
-      "能指出 map range 顺序由 runtime 随机化，不可依赖",
-      "能描述 map 增量扩容期间 oldbuckets/buckets 双查的过程"
-    ],
     "commonMistakes": [
       "认为 append 总是原地修改或总是返回新数组，没有以 cap 判定",
       "依赖 map 遍历顺序写测试或业务逻辑",
@@ -187,12 +175,24 @@
       "用 recover 想兜住并发写 map 的 fatal error",
       "结构体里声明 map 字段后忘记 make 直接写入"
     ],
+    "goodToHave": [
+      "能用 make+copy 断开子切片对大数组的引用，避免内存保留",
+      "能区分 sync.Map（读多写少 key 稳定）与 RWMutex+map（写多或复合操作）的选型",
+      "能指出 map range 顺序由 runtime 随机化，不可依赖",
+      "能描述 map 增量扩容期间 oldbuckets/buckets 双查的过程"
+    ],
+    "mustHave": [
+      "slice header(ptr/len/cap) 三元组与截取共享底层数组",
+      "append 在 len<cap 时原地写、否则分配新数组（约 2x，大切片渐降到 1.25x）",
+      "map 的 hmap+bmap+tophash 桶结构与 nil map 写入 panic",
+      "普通 map 并发写触发 runtime fatal 的原因（hashWriting 标志 + 扩容期间桶迁移）"
+    ],
     "scoreWeights": {
-      "coverage": 30,
       "accuracy": 25,
-      "interviewExpression": 20,
-      "depth": 25
+      "coverage": 30,
+      "depth": 25,
+      "interviewExpression": 20
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-20"
 }

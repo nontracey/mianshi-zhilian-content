@@ -12,6 +12,8 @@ const GENERIC_AUTHORITATIVE = [
   "github.com", "gitlab.com", "stackoverflow.com",
   "developer.mozilla.org", "datatracker.ietf.org", "rfc-editor.org",
   "w3.org", "ietf.org", "apache.org", "cncf.io", "openjdk.org",
+  // 中国镜像/官方中文站
+  "golang.google.cn", "docs.pythontab.com",
 ];
 
 // 领域/关键词 → 官方文档站点。键既匹配 topic.domain，也匹配 title/tags 里出现的关键词（小写包含）。
@@ -19,8 +21,8 @@ const DOC_SITES = {
   java: ["docs.oracle.com", "openjdk.org", "docs.spring.io", "jakarta.ee"],
   spring: ["docs.spring.io", "spring.io"],
   python: ["docs.python.org", "peps.python.org", "packaging.python.org"],
-  go: ["go.dev", "pkg.go.dev"],
-  golang: ["go.dev", "pkg.go.dev"],
+  go: ["go.dev", "pkg.go.dev", "golang.google.cn"],
+  golang: ["go.dev", "pkg.go.dev", "golang.google.cn"],
   rust: ["doc.rust-lang.org", "docs.rs"],
   dotnet: ["learn.microsoft.com", "docs.microsoft.com"],
   "design-pattern": ["refactoring.guru", "learn.microsoft.com"],
