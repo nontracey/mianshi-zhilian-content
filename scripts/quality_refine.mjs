@@ -781,8 +781,18 @@ function applyExternalJudgeContext(review, context) {
   return out;
 }
 
+// JSON 序列化时对所有对象的 key 按字母序排列，消除字段顺序对 hash 的影响。
+// 精修器落盘时用 reorderKeysLike 写 canonical 顺序，但 LLM 输出是字母序，
+// 两者 JSON.stringify 不同 → 没有此函数时缓存永远错位。
+function stableJsonString(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJsonString).join(",")}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableJsonString(value[k])}`).join(",")}}`;
+}
+
 function judgeCacheFile(topic, judge, context = {}) {
-  const contentHash = sha256(JSON.stringify(topic));
+  const contentHash = sha256(stableJsonString(topic));
   const contextHash = context.cacheKey ? `-${context.cacheKey}` : "";
   return path.join(judge.cacheDir, `${contentHash.slice(0, 16)}-${JUDGE_RUBRIC_VERSION}-${judge.setHash}${contextHash}.json`);
 }
@@ -1086,7 +1096,7 @@ async function warmJudgeCacheForTargets(refs, judge, cfg = {}) {
 }
 
 function blockJudgeCacheFile(blocks, ref, judge) {
-  const hash = sha256(JSON.stringify({ ref, blocks, setHash: judge.setHash }));
+  const hash = sha256(stableJsonString({ ref, blocks, setHash: judge.setHash }));
   return path.join(judge.cacheDir, `${hash.slice(0, 16)}-${BLOCK_JUDGE_RUBRIC_VERSION}-${judge.setHash}.json`);
 }
 
