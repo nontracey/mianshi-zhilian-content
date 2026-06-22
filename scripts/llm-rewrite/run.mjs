@@ -7,6 +7,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { REPO_ROOT, REWRITE_DIR, DEFAULTS, resolveModel } from "./config.mjs";
 import { buildMessages, mockResponse } from "./prompt.mjs";
 import { callChat, extractJson } from "./client.mjs";
@@ -76,14 +77,27 @@ function atomicWrite(absPath, obj) {
 async function processOne(ref, { model, mock, previewDir }) {
   const abs = path.join(REPO_ROOT, ref);
   const topic = JSON.parse(fs.readFileSync(abs, "utf8"));
-  let text, usage = null;
-  if (mock) {
-    text = mockResponse(topic);
-  } else {
-    const r = await callChat({ model, messages: buildMessages(topic) });
-    text = r.text; usage = r.usage;
+  // JSON 解析或校验失败就 re-roll 重调（MiMo 出 JSON 是随机的，重试多半能拿到合法输出）。
+  const attempts = mock ? 1 : 3;
+  let merged, diagramRequests, usage = null, lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      let text;
+      if (mock) {
+        text = mockResponse(topic);
+      } else {
+        const r = await callChat({ model, messages: buildMessages(topic) });
+        text = r.text; usage = r.usage;
+      }
+      ({ topic: merged, diagramRequests } = mergeRewrite(topic, extractJson(text)));
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      if (mock) break;
+    }
   }
-  const { topic: merged, diagramRequests } = mergeRewrite(topic, extractJson(text));
+  if (lastErr) throw lastErr;
   const outAbs = previewDir ? path.join(previewDir, ref) : abs;
   atomicWrite(outAbs, merged);
   return { usage, diagramRequests, outAbs };
@@ -155,4 +169,7 @@ async function main() {
     (failures.length ? ` | 失败清单 → scripts/llm-rewrite/failures.json` : ""));
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+// 仅作为 CLI 直接运行时才执行；被 import 时不自动开跑（防误触发全量）。
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => { console.error(e); process.exit(1); });
+}

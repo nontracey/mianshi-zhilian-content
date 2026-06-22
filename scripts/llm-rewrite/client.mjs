@@ -50,7 +50,7 @@ export async function callChat({ model, messages }) {
   throw lastErr;
 }
 
-// 从模型回复里提取 JSON 对象（容忍 ```json 围栏 / 前后多余文字）。
+// 从模型回复里提取 JSON 对象（容忍 ```json 围栏 / 前后多余文字 / 常见坏转义）。
 export function extractJson(text) {
   let s = String(text).trim();
   const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -58,5 +58,22 @@ export function extractJson(text) {
   const start = s.indexOf("{");
   const end = s.lastIndexOf("}");
   if (start >= 0 && end > start) s = s.slice(start, end + 1);
-  return JSON.parse(s);
+  try {
+    return JSON.parse(s);
+  } catch (e1) {
+    try {
+      return JSON.parse(repairJson(s));
+    } catch {
+      const err = new Error(`JSON 解析失败：${e1.message}`);
+      err.jsonParse = true; // 标记为可 re-roll 重试的失败
+      throw err;
+    }
+  }
+}
+
+// 修常见的 LLM 坏 JSON：非法反斜杠转义、对象/数组尾随逗号。其余结构性错误交给上层 re-roll 重试。
+function repairJson(s) {
+  return s
+    .replace(/\\(?!["\\/bfnrtu])/g, "\\\\") // \ 后面不是合法转义字符 → 补成 \\
+    .replace(/,\s*([}\]])/g, "$1"); // 去掉 } ] 前的多余逗号
 }

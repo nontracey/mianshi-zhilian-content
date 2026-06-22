@@ -44,7 +44,7 @@ export function buildMessages(topic) {
     "```json\n" + JSON.stringify(context, null, 0) + "\n```",
     "待改写的内容字段（现有全部卡）：",
     "```json\n" + JSON.stringify(content, null, 0) + "\n```",
-    "按规范输出一个 JSON 对象，key 恰好是上面内容字段的 key（summary、learningCards、recallPrompts、rubric、interviewerFocus），外加可选 _diagramRequests。learningCards 必须是完整数组（含你保留未改的卡）。不要解释、不要代码围栏。",
+    "按规范输出一个 JSON 对象，key 恰好是上面内容字段的 key（summary、learningCards、recallPrompts、rubric、interviewerFocus），外加可选 _diagramRequests。learningCards 必须是完整数组（含你保留未改的卡）。不要解释、不要代码围栏。\n严格 JSON：字符串里的反斜杠写 `\\\\`、双引号写 `\\\"`、换行写 `\\n`，整体必须能被 JSON.parse 直接解析。",
   ].join("\n\n");
 
   return [
