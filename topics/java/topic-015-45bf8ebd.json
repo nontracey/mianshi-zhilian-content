@@ -13,7 +13,7 @@
   "difficulty": 4,
   "estimatedMinutes": 35,
   "order": 100,
-  "recommendWeight": 84,
+  "recommendWeight": 86,
   "learningCards": [
     {
       "type": "explain",
@@ -36,10 +36,27 @@
       "content": "Double-Checked Locking 的目标是：第一次创建对象时加锁，之后读取实例时走无锁快路径。问题在于 `new Singleton()` 不是单步操作，至少包含分配内存、执行构造初始化、把引用赋给 instance。没有 volatile 时，引用赋值可能被观察到早于初始化完成，另一个线程在外层 null 检查通过后可能拿到半初始化对象。\n\n把 `instance` 声明为 volatile 后，构造函数里对对象字段的写发生在 volatile 写 instance 之前；其他线程 volatile 读到非 null instance 后，就能看到初始化完成后的字段状态。这里 volatile 保护的是“引用发布顺序和可见性”，不是让构造过程变成互斥；第一次创建仍依赖 synchronized 保证只创建一个实例。\n\n更简单的单例可以用静态内部类或枚举；DCL 的价值主要在需要懒加载、又想避免后续每次加锁的场景。"
     },
     {
+      "type": "explain",
+      "title": "JMM 语义定义、硬件实现与验证排查",
+      "content": "volatile 的 JMM 语义在 JLS §17.4.4（synchronizes-with）和 §17.4.5（happens-before）定义：对同一个 volatile 变量，写操作 synchronizes-with 后续读到该写或更新值的读操作，从而建立 happens-before 链。JDK 9 引入的 VarHandle 把访问语义拆成四级：`getOpaque`（单向可见、无屏障）、`getAcquire`（acquire 语义）、`getRelease`（release 语义）、`getVolatile`（完整 volatile 语义），可以按需选择更轻的内存顺序。\n\n不同硬件上 JVM 用不同指令实现这套语义。x86 是强内存模型（TSO），volatile 写通常编译成 `lock addl $0,0(%rsp)`（lock 前缀的空操作，等价于 StoreLoad 屏障，约 10-20 纳秒开销），volatile 读就是普通 `mov`；ARM 是弱内存模型，需要 `dmb ish` 显式屏障。所以 volatile 在 x86 上开销远小于 ARM，但 JMM 是跨平台契约，不能因为 x86 强模型就漏写 volatile。\n\n验证 volatile 语义不能用普通单元测试——并发 bug 是概率性的，单线程测试永远过。正确工具是 JCStress（OpenJDK Code Tools 项目），通过成千上万次反复执行 + 硬件级对齐来暴露 JMM 违规。例如把 DCL 单例包成 `@JCStressTest`，加 volatile 前会观察到「半初始化」状态，加 volatile 后只能看到 null 或完整对象。\n\n线上排查 worker 线程不响应 `running=false` 停止标志，按顺序查：`running` 漏加 volatile（最常见）；JIT 把 volatile 读 hoist 出循环（用 `-XX:+UnlockDiagnosticVMOptions -XX:+PrintAssembly` 看机器码，确认有 `lock` 前缀或屏障）；读的是寄存器缓存副本（`jstack <pid>` 看 worker 线程状态，RUNNABLE 卡循环说明读不到更新）。DCL 在 Java 5 之前是不可修复的（旧 JMM 没明确定义 volatile 语义），JSR-133 重写 JMM 后 volatile DCL 才真正安全，这也是老资料说「DCL 反模式」的历史原因。"
+    },
+    {
       "type": "diagram",
       "format": "svg",
       "title": "volatile happens-before、屏障与原子性边界",
-      "content": "assets/diagrams/java-volatile-happens-before.svg"
+      "content": "assets/diagrams/java-volatile-happens-before.svg",
+      "caption": "图中把 A 线程普通写 → volatile 写（release）→ B 线程 volatile 读（acquire）→ 普通读的 happens-before 链、StoreStore/StoreLoad/LoadLoad/LoadStore 屏障位置、count++ 三步非原子、DCL 中 volatile 发布 instance 引用与 synchronized 互斥首次创建的分工放在同一张图里。",
+      "fallback": "volatile 写是 release（写前 StoreStore、写后 StoreLoad），volatile 读是 acquire（读后 LoadLoad + LoadStore），围绕同一变量建立 happens-before：A 线程 volatile 写之前的普通写，对 B 线程 volatile 读之后的普通读可见。x86 上 volatile 写编译成 lock addl（StoreLoad），ARM 用 dmb ish 屏障。volatile 不保护 count++ 这类读-改-写三步原子性，要改用 AtomicInteger/LongAdder/synchronized；volatile 数组只保护引用不保护元素；DCL 中 instance 加 volatile 防止引用发布早于构造完成，synchronized 仍负责首次创建互斥。",
+      "sources": [
+        {
+          "kind": "svg",
+          "path": "assets/diagrams/java-volatile-happens-before.svg"
+        },
+        {
+          "kind": "text",
+          "content": "volatile 链路：A 线程(普通写 data → volatile 写 ready=true, release) synchronizes-with B 线程(volatile 读 ready=true, acquire → 普通读 data)。屏障位置：volatile 写前 StoreStore、写后 StoreLoad；volatile 读后 LoadLoad + LoadStore。边界：count++ 三步非原子、volatile 数组只保引用、多 volatile 字段不自动一致、DCL 需 volatile+synchronized。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -73,7 +90,7 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "我会先给结论：volatile 保证单个变量的可见性和有序性，不保证复合操作原子性。JMM 规定，对同一个 volatile 变量的写，happens-before 后续读到该写或更新值的 volatile 读；因此写前的普通写，对读后的普通读可见。\n\n底层可以用 release/acquire 解释：volatile 写是 release，写之前的操作不能被重排到写之后；volatile 读是 acquire，读之后的操作不能被重排到读之前。JVM 会通过内存屏障或硬件指令实现这个约束，不同 CPU 指令细节不同，但语义一致。\n\n边界要主动说明：`count++` 是读、加、写三步，volatile 只保证读和写的可见性，不把三步变成原子事务；计数用 AtomicInteger 或 LongAdder，多个字段一致性用锁。volatile 数组只保护引用，不保护元素。\n\nDCL 是经典应用：instance 要用 volatile，因为 new 对象包含分配、初始化、引用赋值。volatile 禁止引用发布早于初始化被其他线程观察到；synchronized 仍负责首次创建的互斥。最后给场景：停止标志、配置快照引用、安全发布不可变对象适合 volatile；复合修改和条件等待不适合。",
+      "content": "volatile 保证单个变量的可见性和有序性，不保证复合操作原子性。回答按「语义 → 屏障 → 边界 → 应用 → 排查」五条主线展开。\n\n**JMM 语义（JLS §17.4.4 / §17.4.5）**\n- 对同一 volatile 变量，写 synchronizes-with 后续读到该写的读，建立 happens-before\n- A 线程 volatile 写之前的普通写，对 B 线程 volatile 读之后的普通读可见\n- JDK 9 VarHandle 提供更细粒度：`getOpaque`/`getAcquire`/`getRelease`/`getVolatile`\n\n**底层屏障（release/acquire）**\n- volatile 写是 release：写前 StoreStore，写后 StoreLoad；写前的操作不能重排到写后\n- volatile 读是 acquire：读后 LoadLoad + LoadStore；读后的操作不能重排到读前\n- x86 强内存模型（TSO）：volatile 写编译成 `lock addl $0,0(%rsp)`，volatile 读是普通 `mov`\n- ARM 弱内存模型：用 `dmb ish` 显式屏障\n\n**原子性边界**\n- `count++` 是读、加、写三步，volatile 只保证每步可见，不合成原子事务\n- 计数：低竞争用 `AtomicInteger`，高并发用 `LongAdder`（分段累加，热点分散）\n- 多字段一致性：`synchronized`/`Lock` 或 `AtomicReference` 整体替换\n- `volatile int[] arr` 只保护数组引用，不保护 `arr[0]` 元素；元素级并发用 `AtomicIntegerArray`\n\n**DCL 安全发布**\n- `new Singleton()` 含分配、初始化、引用赋值三步，无 volatile 时引用发布可能早于初始化\n- instance 加 volatile：构造中的字段写不能重排到 volatile 写之后，读到非 null 即看到完整对象\n- synchronized 仍负责首次创建的互斥，volatile 只负责引用发布的可见性\n- Java 5 JSR-133 重写 JMM 后 volatile DCL 才真正安全；更简单用静态内部类或枚举单例\n\n**适合与不适合**\n- 适合：停止标志、配置快照引用整体替换、DCL instance、读多写少只读快照\n- 不适合：count++ 复合修改、多字段不变式、条件等待\n\n**线上排查**\n- worker 不响应 `running=false`：先查漏加 volatile，再 `-XX:+PrintAssembly` 确认 `lock` 前缀，`jstack` 看线程状态\n- 用 JCStress 写 `@JCStressTest` 复现 JMM 违规，比单元测试可靠",
       "followUpQuestions": [
         {
           "question": "volatile 为什么不能保证 count++ 的原子性？",

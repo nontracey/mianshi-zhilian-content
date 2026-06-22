@@ -11,7 +11,7 @@
     "GC Roots 与引用类型"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 26,
+  "estimatedMinutes": 32,
   "order": 40,
   "recommendWeight": 88,
   "learningCards": [
@@ -22,13 +22,13 @@
     },
     {
       "type": "explain",
-      "title": "四种引用怎么选",
-      "content": "强引用就是普通对象引用，例如局部变量、字段、集合元素。强引用可达时对象保活，真实泄漏也常来自静态集合、长生命周期缓存、线程对象或 ClassLoader 还持有业务对象。\n\nSoftReference 描述“可以丢，但丢了能重建”的对象。它通常在内存压力下被清理，但具体策略由 JVM 和收集器决定，不适合承诺命中率或过期时间。工程上做缓存更常用 Caffeine、Redis 或带容量/TTL 的缓存；软引用更像 JVM 兜底策略，而不是完整缓存方案。\n\nWeakReference 描述“不影响目标对象生命周期”的关联关系。只剩弱引用可达时，目标会在后续 GC 的引用处理阶段被清理，WeakHashMap 的 key 就是典型例子。它适合做对象元数据、监听器弱关联等，但 value 或回调里如果反向强引用 key，仍然会把对象保活。\n\nPhantomReference 不能通过 get() 取回对象，主要和 ReferenceQueue 配合，用来在对象进入可清理状态后收到通知。它适合堆外资源、native handle、DirectByteBuffer/Cleaner 这类“Java 对象死亡后还要释放非堆资源”的场景。不要依赖 finalize；现代 Java 已经把 finalization 视为高风险机制。"
+      "title": "四种引用的清理时机与工程选型",
+      "content": "强引用就是普通对象引用，例如局部变量、字段、集合元素。强引用可达时对象保活，真实泄漏也常来自静态集合、长生命周期缓存、线程对象或 ClassLoader 还持有业务对象。\n\nSoftReference 描述「可以丢，但丢了能重建」的对象。HotSpot 的清理策略由 `-XX:SoftRefLRUPolicyMSPerMB`（默认 1000ms/MB）控制：堆剩余空间越小，软引用存活时间越短。它不适合承诺命中率或过期时间。工程上做缓存更常用 Caffeine（W-TinyLFU 算法）、Redis 或带容量/TTL 的缓存；软引用更像 JVM 兜底策略，而不是完整缓存方案。\n\nWeakReference 描述「不影响目标对象生命周期」的关联关系。只剩弱引用可达时，目标会在后续 GC 的引用处理阶段被清理，WeakHashMap 的 key 就是典型例子——它的 `expungeStaleEntries` 在每次访问 map 时触发清理。弱引用适合做对象元数据、监听器弱关联等，但 value 或回调里如果反向强引用 key，仍然会把对象保活。\n\nPhantomReference 不能通过 `get()` 取回对象（始终返回 null），主要和 ReferenceQueue 配合，用来在对象进入可清理状态后收到通知。它适合堆外资源、native handle、DirectByteBuffer/Cleaner 这类「Java 对象死亡后还要释放非堆资源」的场景。Java 9 引入 `java.lang.ref.Cleaner`，是 PhantomReference 的官方封装，替代了被标记为 deprecated 的 `finalize()`。\n\n引用处理发生在 GC 末尾，是 STW 的一部分；ReferenceQueue 的入队时机不是确定时刻，依赖 GC 触发。生产中不要用 `System.gc()` 试图强制清理软/弱引用——它只是建议，G1/ZGC 可能直接忽略，且会触发 Full GC 停顿。"
     },
     {
       "type": "explain",
       "title": "ThreadLocal 泄漏与排查口径",
-      "content": "ThreadLocalMap 的 Entry key 是 ThreadLocal 的弱引用，value 是强引用。弱 key 能避免 ThreadLocal 对象自身被永久挂住，但不能自动释放 value：当外部不再强引用 ThreadLocal 时，key 可能被清理成 null；如果线程还活着，Entry 和 value 仍挂在 Thread 的 ThreadLocalMap 上，直到后续访问触发清理或线程结束。线程池线程生命周期很长，所以 ThreadLocal 使用规范是 try-finally 里 remove。\n\n排查“对象看似没用却回收不了”时，不要只猜引用类型，直接看 heap dump：先用 dominator tree 找 retained size 最大的保留者，再看 Path to GC Roots。常见根链包括 static Map、ThreadLocalMap、线程栈局部变量、ClassLoader、连接池/缓存队列、定时任务和监听器列表。能把引用链说清，才算真正理解 GC Roots。"
+      "content": "ThreadLocalMap 的 Entry key 是 ThreadLocal 的弱引用，value 是强引用。弱 key 能避免 ThreadLocal 对象自身被永久挂住，但不能自动释放 value：当外部不再强引用 ThreadLocal 时，key 可能被清理成 null；如果线程还活着，Entry 和 value 仍挂在 Thread 的 ThreadLocalMap 上，直到后续访问触发清理或线程结束。线程池线程生命周期很长，所以 ThreadLocal 使用规范是 try-finally 里 remove。\n\n排查“对象看似没用却回收不了”时，不要只猜引用类型，直接看 heap dump：先用 dominator tree 找 retained size 最大的保留者，再看 Path to GC Roots。常见根链包括 static Map、ThreadLocalMap、线程栈局部变量、ClassLoader、连接池/缓存队列、定时任务和监听器列表。能把引用链说清，才算真正理解 GC Roots。\n\n取舍上，引用类型不是「越弱越好」。强引用最安全但保活；软引用看似省内存但清理时机不可控，OOM 风险仍在；弱引用适合元数据但不适合业务数据；虚引用只用于资源清理，不能当引用用。生产监控要关注：SoftReference 在高负载下是否频繁清理（命中率下降）、WeakHashMap 是否在访问时才清理（批量过期延迟）、PhantomReference/Cleaner 是否及时释放堆外内存（DirectByteBuffer 泄漏排查）。堆外内存泄漏用 `-XX:MaxDirectMemorySize` 设上限 + `Native Memory Tracking`（`jcmd <pid> VM.native_memory`）追踪。"
     },
     {
       "type": "diagram",
@@ -129,6 +129,13 @@
       "prompt": "如果一个对象看似无用却一直不能回收，你会如何从 GC Roots 引用链定位原因？",
       "mode": "text",
       "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "java.jvm.topic-006-e97a07bb.recall.4",
+      "prompt": "线上服务 heap dump 发现 retained size 最大的是 ThreadLocalMap，但代码里都有 remove。你会怎么排查？最终换什么方案？",
+      "mode": "text",
+      "expectedMinutes": 6,
       "difficulty": 4
     }
   ],

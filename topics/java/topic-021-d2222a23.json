@@ -44,7 +44,19 @@
       "type": "diagram",
       "format": "svg",
       "title": "ThreadPoolExecutor 接纳路径与反压边界",
-      "content": "assets/diagrams/java-threadpool-executor-admission.svg"
+      "content": "assets/diagrams/java-threadpool-executor-admission.svg",
+      "caption": "图中把 execute 的接纳路径（核心线程 → 有界队列 → 非核心线程 → 拒绝策略）、无界/有界/SynchronousQueue 对 maximumPoolSize 的影响、四类拒绝策略的反压语义、execute/submit 异常传播差异和 Java 21 虚拟线程边界放在同一张图里。",
+      "fallback": "ThreadPoolExecutor 的 execute 路径：RUNNING 状态接收任务 → worker 数 < corePoolSize 创建核心线程 → 核心满后入 workQueue → 队列满后再建非核心线程到 maximumPoolSize → 仍满触发 RejectedExecutionHandler。无界 LinkedBlockingQueue 让 maximumPoolSize 基本失效（队列永不满）；有界 ArrayBlockingQueue 让扩容和拒绝可控；SynchronousQueue 直接交接，无空闲 worker 就建新线程。拒绝策略：Abort 抛异常、CallerRuns 提交线程自己执行形成反压、Discard/DiscardOldest 丢任务。execute 异常走 UncaughtExceptionHandler，submit 异常封装在 Future。Java 21 虚拟线程适合大量阻塞 IO，不替代限流和连接池。",
+      "sources": [
+        {
+          "kind": "svg",
+          "path": "assets/diagrams/java-threadpool-executor-admission.svg"
+        },
+        {
+          "kind": "text",
+          "content": "execute 接纳路径：RUNNING → worker<core 创建核心 → 核心满入队 → 队列满建非核心到 max → 仍满拒绝。队列类型：无界(队列永不满, max 失效, OOM 风险) / 有界(扩容拒绝可控) / Synchronous(直接交接, 无空闲则新建)。拒绝：Abort(抛异常) / CallerRuns(提交线程执行, 反压) / Discard(丢新) / DiscardOldest(丢旧)。异常：execute→UncaughtExceptionHandler, submit→Future.get 抛 ExecutionException。Java 21 虚拟线程：大量阻塞 IO, 不替代限流。"
+        }
+      ]
     },
     {
       "type": "compareTable",
@@ -78,7 +90,7 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "我会先说线程池不是单纯复用线程，而是一个任务接纳、排队、扩容和反压系统。核心参数要成组理解：corePoolSize 是基础执行能力，maximumPoolSize 是队列满后的突发上限，workQueue 是排队预算，threadFactory 负责可观测性，handler 决定满载后的失败或降速方式。\n\n执行流程按 `execute` 讲：RUNNING 才接收任务；worker 数小于核心数就建核心线程；核心满后入队；队列满后再建非核心线程；线程数到最大且队列仍满就拒绝。这里要强调队列类型：无界 LinkedBlockingQueue 会让 maximumPoolSize 基本失效，有界队列才会让扩容和拒绝变得可控，SynchronousQueue 则是直接交接。\n\n拒绝策略要落到工程语义：Abort 让调用方知道失败；CallerRuns 用提交线程执行形成反压；Discard 系列会丢任务，只适合可丢弃场景；生产更常见的是自定义策略，打指标、日志和补偿。execute 和 submit 的异常传播也要区分，submit 不 get 可能吞掉任务异常。\n\n最后补现代边界：Java 21 的虚拟线程适合大量阻塞 IO 的 per-task 模型，但不替代 CPU 并行度控制、连接池、限流、超时和下游保护。线程池调优最终要看指标和压测，不是只套线程数公式。",
+      "content": "线程池不是单纯复用线程，而是一个任务接纳、排队、扩容和反压系统。\n\n**核心参数（成组理解）**\n- `corePoolSize`：基础执行能力\n- `maximumPoolSize`：队列满后的突发上限\n- `workQueue`：排队预算\n- `threadFactory`：命名、daemon、异常处理（可观测性）\n- `RejectedExecutionHandler`：满载后的失败或降速方式\n- `keepAliveTime`：非核心线程空闲回收\n\n**execute 接纳路径**\n- RUNNING 状态才接收任务\n- worker 数 < corePoolSize：创建核心线程\n- 核心满后：入 workQueue\n- 队列满后：再建非核心线程到 maximumPoolSize\n- 线程数到最大且队列仍满：触发拒绝策略\n- 入队后二次检查线程池状态，避免 shutdown 与入队竞争\n\n**队列类型决定扩容行为**\n- 无界 `LinkedBlockingQueue`：队列永不满，maximumPoolSize 基本失效，OOM 风险\n- 有界 `ArrayBlockingQueue`：扩容和拒绝可控，适合大多数业务线程池\n- `SynchronousQueue`：不存任务，直接交接，无空闲 worker 就建新线程\n\n**拒绝策略（容量保护）**\n- `AbortPolicy`：抛 RejectedExecutionException，调用方明确失败\n- `CallerRunsPolicy`：提交线程自己执行，形成反压（注意别用在事件循环/IO 线程）\n- `DiscardPolicy`/`DiscardOldestPolicy`：丢任务，只适合可丢弃场景\n- 生产常见：自定义策略，打指标、日志、补偿（写消息队列/失败表）\n\n**异常传播**\n- `execute(Runnable)`：未捕获异常走 UncaughtExceptionHandler，worker 结束后补新 worker\n- `submit(Callable/Runnable)`：异常封装在 Future，`get()` 才以 ExecutionException 暴露；不 get 可能静默\n\n**关闭状态（ctl 编码 runState + workerCount）**\n- RUNNING：接收新任务 + 处理队列\n- SHUTDOWN：不接收新任务 + 处理已有队列\n- STOP：不接收新任务 + 中断正在执行的任务\n- TIDYING/TERMINATED：收尾\n- `shutdown()` 温和关闭，`shutdownNow()` 返回未开始任务并中断\n\n**Java 21+ 虚拟线程（JEP 444）**\n- `Executors.newVirtualThreadPerTaskExecutor()`：每任务一虚拟线程\n- 适合大量阻塞 IO，载体线程可让出\n- 不替代 CPU 并行度控制、连接池、限流、超时、下游保护\n- ThreadLocal 可用但大量虚拟线程持有大 ThreadLocal 有内存压力\n\n**观测指标**\n- 线程池名、core/max、activeCount、poolSize、queueSize、remainingCapacity\n- completedTaskCount、task latency、reject count、shutdown 状态\n- 没这些指标，线程池问题常被误判为「系统慢」",
       "followUpQuestions": [
         {
           "question": "为什么无界队列会让 maximumPoolSize 基本失效？",
@@ -144,6 +156,13 @@
       "prompt": "ThreadPoolExecutor 队列满时是先扩线程还是先拒绝？这个顺序和队列类型有什么关系？",
       "mode": "text",
       "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "java.concurrency.topic-021-d2222a23.recall.6",
+      "prompt": "线上线程池 queueSize 持续接近 remainingCapacity、reject count 上升、task latency 飙高。你会怎么排查？最终调什么参数或换什么方案？",
+      "mode": "text",
+      "expectedMinutes": 6,
       "difficulty": 4
     }
   ],

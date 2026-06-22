@@ -61,7 +61,7 @@
     {
       "type": "compareTable",
       "title": "synchronized 与 ReentrantLock 的边界",
-      "content": "| 对比项 | synchronized | ReentrantLock |\n| --- | --- | --- |\n| 释放方式 | 退出同步块自动释放，异常路径也释放 | 必须 `try/finally unlock` |\n| 可见性 | unlock happens-before 后续同锁 lock | unlock happens-before 后续同锁 lock |\n| 可重入 | 支持 | 支持 |\n| 公平性 | 不提供公平策略 | 可选择公平/非公平 |\n| 可中断/超时 | 获取锁过程不支持中断/超时 API | `lockInterruptibly`、`tryLock(timeout)` |\n| 条件队列 | 每个对象一个 WaitSet，配合 `wait/notify` | 一个锁可创建多个 `Condition` |\n| 实现入口 | JVM monitor、Mark Word、ObjectMonitor | AQS 队列和显式 API |\n| 适合场景 | 普通互斥、简单条件等待、语法简洁优先 | 复杂等待条件、可取消等待、公平或超时需求 |"
+      "content": "| 对比项 | synchronized | ReentrantLock |\n| --- | --- | --- |\n| 释放方式 | 退出同步块自动释放，异常路径也释放 | 必须 `try/finally unlock` |\n| 可见性 | unlock happens-before 后续同锁 lock，由 JVM monitor 保证 | unlock happens-before 后续同锁 lock，由 AQS state + volatile 保证 |\n| 可重入 | JVM 记录 owner 和重入计数 | AQS state 记录重入层数，exclusiveOwnerThread 记录持有者 |\n| 公平性 | 不提供公平策略 | 可选择公平/非公平 |\n| 可中断/超时 | 获取锁过程不支持中断/超时 API | `lockInterruptibly`、`tryLock(timeout)` |\n| 条件队列 | 每个对象一个 WaitSet，配合 `wait/notify` | 一个锁可创建多个 `Condition` |\n| 实现入口 | JVM monitor、Mark Word、ObjectMonitor | AQS 队列和显式 API |\n| 适合场景 | 普通互斥、简单条件等待、语法简洁优先 | 复杂等待条件、可取消等待、公平或超时需求 |"
     },
     {
       "type": "code",
@@ -90,7 +90,7 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "我会先从锁对象说起：实例方法锁 `this`，静态方法锁 `Class` 对象，代码块锁指定对象。`synchronized` 是可重入互斥锁，释放锁 happens-before 后续对同一把锁的获取，所以它同时提供互斥和可见性。\n\n底层分三层讲。字节码层，同步代码块是 `monitorenter/monitorexit`，同步方法是 `ACC_SYNCHRONIZED`。HotSpot 快路径会利用对象头 Mark Word 和线程栈锁记录尝试轻量级加锁；竞争持续、需要阻塞唤醒或 `wait` 时，会膨胀为 `ObjectMonitor`，由 owner、EntryList、WaitSet、recursions 等结构管理持有者、竞争线程和等待线程。`wait()` 会释放 monitor，`notify/notifyAll` 只是让等待线程重新具备竞争锁的资格，条件判断必须放在 while 里。\n\n版本边界要补上：偏向锁是 JDK 8 语境常讲的历史优化，JDK 15 起默认禁用并废弃相关选项，新版本不应把偏向锁作为主路径。JDK 21-23 的虚拟线程里 synchronized 阻塞可能 pin carrier，JDK 24 的 JEP 491 已改善这一点。\n\n选型上，普通互斥优先 synchronized；需要公平、可中断、超时获取或多个条件队列时选 ReentrantLock。性能问题不要停留在“锁重不重”，要看锁粒度、持锁时间、是否持锁做 I/O、竞争线程数和监控里的 blocked/monitor 热点。",
+      "content": "synchronized 从锁对象说起：实例方法锁 `this`，静态方法锁 `Class` 对象，代码块锁指定对象。它是可重入互斥锁，释放锁 happens-before 后续对同一把锁的获取，所以同时提供互斥和可见性。\n\n**锁对象（第一层问题）**\n- 实例同步方法：锁当前实例 `this`，两个不同实例不互斥\n- 静态同步方法：锁 `Class` 对象，所有实例共享\n- 同步代码块：锁括号里的对象，可缩小临界区\n- 常见错误：请求级 `new Object()` 当锁、实例方法保护静态变量、读路径没走同一把锁\n\n**字节码层面**\n- 同步代码块：`monitorenter` / `monitorexit`（正常退出 + 异常退出两条路径）\n- 同步方法：方法访问标志 `ACC_SYNCHRONIZED`，JVM 自动获取/释放 receiver 或 Class monitor\n- 进入同步块 = acquire，退出 = release\n\n**HotSpot 实现（轻量级 → 膨胀）**\n- 无竞争：Mark Word + 线程栈 Lock Record 走轻量级路径\n- 竞争出现：短暂自旋\n- 竞争持续/wait/阻塞唤醒：膨胀为 `ObjectMonitor`\n- ObjectMonitor 结构：owner、EntryList（竞争线程）、WaitSet（wait 线程）、recursions\n- JIT 优化：锁消除（逃逸分析）、锁粗化（合并连续同对象加锁）\n\n**版本边界**\n- 偏向锁：JDK 8 语境常见，JDK 15 JEP 374 默认禁用并废弃\n- 新版本主线：轻量级锁、锁膨胀、ObjectMonitor、JIT 优化\n- 虚拟线程：JDK 21-23 synchronized 阻塞可能 pin carrier；JDK 24 JEP 491 改善\n\n**wait/notify**\n- 绑定同一对象监视器，调用前必须持有锁\n- `wait()` 释放锁进入 WaitSet，被唤醒后重新竞争 monitor\n- 条件检查必须 `while`（虚假唤醒、条件可能被其他线程改掉）\n\n**选型**\n- 普通互斥优先 synchronized（语法简单、异常自动释放）\n- 需要公平、可中断、超时、多 Condition → ReentrantLock\n- 性能问题看锁粒度、持锁时间、是否持锁做 I/O、竞争线程数、blocked/monitor 热点",
       "followUpQuestions": [
         {
           "question": "同步代码块和同步方法在字节码上有什么不同？",
@@ -159,6 +159,13 @@
       "prompt": "synchronized 和 ReentrantLock 如何按公平、可中断、超时、多条件队列和虚拟线程版本边界选型？",
       "mode": "text",
       "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "java.concurrency.topic-014-880c2a03.recall.6",
+      "prompt": "线上多个线程用 synchronized 保护共享变量，但数据仍然不一致。你会怎么排查？常见原因有哪些？",
+      "mode": "text",
+      "expectedMinutes": 6,
       "difficulty": 4
     }
   ],

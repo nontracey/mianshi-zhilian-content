@@ -24,7 +24,7 @@
     {
       "type": "explain",
       "title": "JDK 8+ 主线不是 Segment",
-      "content": "面试里应先讲 JDK 8+ 的实现，再把 JDK 7 Segment 当历史对比。JDK 7 的 `ConcurrentHashMap` 用 `Segment extends ReentrantLock` 分段保护多个小表，`concurrencyLevel` 主要影响 Segment 数量；JDK 8 以后主结构变成 `Node<K,V>[] table`，桶内是链表或 `TreeBin`，写路径用 CAS 和桶头 `synchronized` 组合，锁粒度细到单个桶。\n\nJDK 8+ 的读写核心是：`table`、`Node.val`、`Node.next` 等关键读路径具备 volatile 可见性；空桶插入用 CAS，不需要加锁；桶非空时锁住桶头节点 `f`，并在锁内再次检查 `tabAt(tab, i) == f`，避免锁住旧桶头后在错误结构上修改；链表过长时先看数组容量，不足 64 优先扩容，容量足够且链表长度达到阈值才树化。\n\nJDK 7 Segment 仍值得了解，因为很多老资料和迁移面试会追问差异。但如果把当前版本仍回答成“默认 16 个 Segment、最多 16 个线程并发写”，就没有达到现代口径。JDK 8+ 的并发能力取决于桶分布、冲突程度、扩容状态和计数竞争，不是固定 Segment 数。"
+      "content": "JDK 7 的 `ConcurrentHashMap` 用 `Segment extends ReentrantLock` 分段保护多个小表，`concurrencyLevel` 主要影响 Segment 数量（默认 16）。JDK 8 以后主结构改成 `Node<K,V>[] table`，桶内是链表或 `TreeBin`，写路径用 CAS 和桶头 `synchronized` 组合，锁粒度细到单个桶，并发度不再受固定 Segment 数限制。\n\nJDK 8+ 的读写核心：`table`、`Node.val`、`Node.next` 等关键读路径具备 volatile 可见性。空桶插入用 CAS 不加锁。桶非空时锁住桶头节点 `f`，并在锁内再次检查 `tabAt(tab, i) == f`，避免锁住旧桶头后在错误结构上修改。链表过长时先看数组容量，不足 64 优先扩容，容量足够且链表长度达到 8 才树化（树化阈值 8，退化为链表阈值 6）。\n\nJDK 8+ 的并发能力取决于桶分布、冲突程度、扩容状态和计数竞争，而不是固定 Segment 数。JDK 7 Segment 仍有了解价值：迁移老代码、读老资料、回答版本对比题时需要区分两代实现。"
     },
     {
       "type": "explain",
@@ -39,7 +39,12 @@
     {
       "type": "explain",
       "title": "线程安全方法不等于复合逻辑安全",
-      "content": "`ConcurrentHashMap` 保证单次 `put/get/remove/compute/merge` 等方法内部的线程安全，但不能自动保证外部组合逻辑。例如 `if (!map.containsKey(k)) map.put(k, v)` 是 check-then-act 竞态，两个线程都可能通过检查并覆盖。应使用 `putIfAbsent`、`computeIfAbsent`、`compute`、`merge`、`replace(k, old, new)` 等原子复合 API。\n\n高频计数不要写成 `map.put(k, map.get(k) + 1)`。单 key 计数可以用 `merge(k, 1, Integer::sum)`；极高并发统计常用 `ConcurrentHashMap<K, LongAdder>`，通过 `computeIfAbsent(k, key -> new LongAdder()).increment()` 降低 CAS 热点。跨多个 key 的不变量，例如“两个账户同时转账保持总额不变”，不是单个 `ConcurrentHashMap` 方法能保证的，需要外部锁、事务或重新建模。\n\n选型上，读多写少且 key 分布较好时它非常合适；热点 key 更新、全表精确 size、需要有序遍历、需要跨 key 原子性时，要评估 LongAdder、ConcurrentSkipListMap、分片锁、队列化或数据库事务等方案。"
+      "content": "`ConcurrentHashMap` 保证单次 `put/get/remove/compute/merge` 等方法内部的线程安全，但不能自动保证外部组合逻辑。例如 `if (!map.containsKey(k)) map.put(k, v)` 是 check-then-act 竞态，两个线程都可能通过检查并覆盖。应使用 `putIfAbsent`、`computeIfAbsent`、`compute`、`merge`、`replace(k, old, new)` 等原子复合 API。\n\n高频计数不要写成 `map.put(k, map.get(k) + 1)`。单 key 计数可以用 `merge(k, 1, Integer::sum)`；极高并发统计常用 `ConcurrentHashMap<K, LongAdder>`，通过 `computeIfAbsent(k, key -> new LongAdder()).increment()` 降低 CAS 热点。跨多个 key 的不变量，例如「两个账户同时转账保持总额不变」，不是单个 `ConcurrentHashMap` 方法能保证的，需要外部锁、事务或重新建模。\n\n选型上，读多写少且 key 分布较好时它非常合适；热点 key 更新、全表精确 size、需要有序遍历、需要跨 key 原子性时，要评估 LongAdder、ConcurrentSkipListMap、分片锁、队列化或数据库事务等方案。"
+    },
+    {
+      "type": "explain",
+      "title": "取舍：什么场景不该用 ConcurrentHashMap",
+      "content": "ConcurrentHashMap 不是万能并发容器，主动说边界能体现资深深度。以下场景应换方案。\n\n第一，热点 key 写入。所有写都竞争同一个桶头 synchronized，CAS 失败率高，吞吐被单桶锁限制。这种场景应该用 `ConcurrentHashMap<K, LongAdder>` 把「读-改-写」拆成原子计数，或用 striped lock 分片，或用队列缓冲异步写入。\n\n第二，需要精确 size 做业务决策。CHM 的 `size()` 是 `baseCount + ΣCounterCell` 的近似值，并发更新时可能与实际不一致。如果业务要求「库存小于 N 才下单」这种强不变量，CHM 不合适，应该用数据库行锁、Redis 原子操作、信号量或重新建模。\n\n第三，有序遍历。CHM 的迭代顺序是无序的，且弱一致。需要按 key 排序遍历用 `ConcurrentSkipListMap`（基于跳表，O(log n) 操作，有序迭代）。\n\n第四，跨 key 事务。「两个账户同时转账保持总额不变」这类多 key 不变量，CHM 单方法不保证。要么用外部锁，要么用数据库事务，要么把相关 key 聚合到一个不可变对象整体替换（`AtomicReference<Snapshot>`）。\n\n第五，极高写并发下的 GC 压力。每次 put 创建 Node 对象，TreeBin 树化/退化产生额外对象；百万 QPS 场景要注意 GC。替代方案：原生数组 + 离线处理、堆外内存（如 Chronicle Map）、Caffeine 缓存（W-TinyLFU 算法，命中率更高）。\n\n成本上：CHM 的内存占用比 HashMap 略高（CounterCell、ForwardingNode、TreeBin 额外结构）；读路径无锁但写路径仍有 synchronized 开销；扩容期间吞吐会下降（虽然多线程协助迁移，但迁移本身是重活）。生产监控要关注：桶链长度分布（过长说明 hash 分布差或容量不足）、size 与实际 size 的偏差、扩容频率、CounterCell 竞争程度。"
     },
     {
       "type": "diagram",
@@ -91,7 +96,7 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "我会先声明版本口径：JDK 7 是 Segment 分段锁，JDK 8+ 已经改成 `Node[] table` 加链表/红黑树，写路径是 CAS 和桶头 `synchronized` 组合。现在回答主线应放在 JDK 8+。\n\nput 流程是：先拒绝 null，spread hash 定位桶；table 未初始化用 `sizeCtl` 控制初始化；桶为空时 CAS 插入；桶头是 `ForwardingNode` 说明正在扩容，当前线程参与 transfer；普通桶则锁住桶头，在锁内更新链表或 `TreeBin`。结构修改后通过 `addCount` 更新 `baseCount/CounterCell`，并可能触发扩容。扩容时多个线程按 `transferIndex` 分段迁移桶，迁移完成放 `ForwardingNode`。\n\nget 通常不加锁，依赖 volatile 读和节点安全发布，遇到树或迁移节点走对应查找逻辑。它的迭代器和 size 是弱一致语义，不是全局快照。CHM 不允许 null，是为了让 `get(key) == null` 能明确代表 absent。\n\n最后补边界：单个方法线程安全不代表外部复合逻辑安全。`containsKey + put`、`get + put` 仍有竞态；应该使用 `putIfAbsent`、`compute`、`merge`、`replace`，热点计数用 `ConcurrentHashMap<K, LongAdder>`。跨 key 事务要外部同步或改模型。",
+      "content": "JDK 8+ ConcurrentHashMap 用 `Node[] table` + 链表/TreeBin 结构，写路径 CAS + 桶头 synchronized 组合，锁粒度细到单桶。JDK 7 的 Segment 分段锁只作历史对比。\n\n**版本与结构**\n- JDK 7：`Segment extends ReentrantLock` 分段锁，默认 16 段，`concurrencyLevel` 控制 Segment 数\n- JDK 8+：`Node[] table`，桶内链表或 `TreeBin`；空桶 CAS、桶非空 synchronized 锁桶头；树化阈值 8，退化阈值 6，容量不足 64 优先扩容\n\n**put 主路径**\n- 拒绝 null key/value，spread hash 定位桶\n- table 未初始化：`sizeCtl` CAS 抢初始化权\n- 空桶：CAS 插入新 Node\n- 桶头 hash == MOVED：遇 `ForwardingNode`，调 `helpTransfer` 参与扩容\n- 普通桶：synchronized 锁桶头 `f`，锁内再检查 `tabAt(tab,i)==f`，更新链表或 TreeBin\n- 结构修改后 `addCount` 更新 `baseCount/CounterCell`，可能触发 resize\n- 扩容：多线程按 `transferIndex` 分段迁移，迁移完成的桶放 `ForwardingNode`\n\n**get 与弱一致**\n- 通常不加锁，依赖 volatile 读和节点安全发布\n- 桶头 hash < 0 走 TreeBin 或 ForwardingNode 查找逻辑\n- 迭代器和 size 是弱一致，不是全局快照；并发修改不抛 `ConcurrentModificationException`\n- `size()` 是 `baseCount + ΣCounterCell` 近似值，并发下可能偏差\n\n**null 禁止原因**\n- `get(key) == null` 必须能可靠表示 absent\n- 并发下 `containsKey` + `get` 两步观察不原子，无法区分 absent 和 null value\n- HashMap 单线程可以配合 containsKey，并发容器不行\n\n**复合操作边界**\n- 单方法线程安全 ≠ 外部复合逻辑安全\n- `containsKey+put`、`get+put` 是 check-then-act 竞态\n- 用 `putIfAbsent`/`compute`/`merge`/`replace(k,old,new)` 原子 API\n- 热点计数用 `ConcurrentHashMap<K, LongAdder>`，`computeIfAbsent(k, k->new LongAdder()).increment()`\n- 跨 key 不变量要外部锁、事务或重新建模\n\n**取舍**\n- 热点 key：LongAdder 或 striped lock\n- 精确 size：数据库行锁/Redis 原子/信号量\n- 有序遍历：`ConcurrentSkipListMap`\n- 极高写并发：注意 GC，考虑 Caffeine 或堆外内存",
       "followUpQuestions": [
         {
           "question": "JDK 8+ 为什么用 synchronized 锁桶头，而不是继续用 Segment？",
@@ -149,6 +154,13 @@
       "prompt": "请写一个 get+put 计数丢失的例子，并用 compute/merge 或 LongAdder 修复。",
       "mode": "code",
       "expectedMinutes": 8,
+      "difficulty": 4
+    },
+    {
+      "id": "java.concurrency.topic-024-052a3c12.recall.5",
+      "prompt": "线上服务用 ConcurrentHashMap 做热点计数，发现 CPU 飙高、size 与监控对不上、扩容频繁。你会怎么排查？最终要换成什么方案？",
+      "mode": "text",
+      "expectedMinutes": 6,
       "difficulty": 4
     }
   ],

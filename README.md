@@ -18,7 +18,6 @@
 - `schemas/`：内容 schema。
 - `scripts/`：内容生成与校验脚本。
 - `.githooks/`：本地 Git hooks，需要执行 `npm run hooks:install` 后才会生效。
-- `.quality-refine/`：本地精修器运行产物和测试预览输出，已被 `.gitignore` 忽略。
 
 ## 本地命令
 
@@ -27,28 +26,19 @@ npm install
 npm run generate  # 需要设置 CONTENT_SOURCE_ROOT 环境变量指向原始 Markdown 目录
 npm run sync:env  # 从正式内容同步生成 staging/draft 隔离副本
 npm run validate
-npm run ci:static  # CI 同款静态检查：语法、契约单测、validate、scan、audit
+npm run ci:static  # CI 同款静态检查：语法、validate、scan、audit
 npm run quality:scan
 npm run quality:audit
-npm run quality:refine:interactive  # 交互式启动内容精修器
 npm run hooks:install  # 每个本地 clone 需要安装一次 Git hooks
 ```
 
 内容规范来自《面试智练内容格式规范》。用户侧知识结构只保留"领域 -> 分类 -> 知识点"，不使用阶段、天数或排期概念。
 
-## 内容精修器
+## 9 维评分与静态门禁
 
-维护者需要做语义质量、事实正确性、专家口吻和面试可用性检查时，使用本地精修器：
+CI 通过 `npm run ci:static` 跑确定性静态门禁：脚本语法检查、`validate`、`quality:scan`、`quality:audit --min-score=90`。`content_quality_audit.mjs` 按 9 维（结构完整性、内容深度、专家证据、讲解清晰度、图示/对比、面试可用性、rubric 评估、模板与语言卫生、区分度天花板）打分，单篇 <90 视为不通过。
 
-```bash
-npm run quality:refine:interactive
-```
-
-交互器支持选择同步阶段、运行模式、领域、topic、API 模型链和判官模型链。测试预览模式只精修单篇并在终端渲染结果；正式模式会把选中的 topic 逐篇发给 LLM 精修，成功后按阶段同步到 `staging/`、`draft/`。
-
-注意：一次精修请求只处理一个 topic。选择领域或多个 topic 只是建立队列，不会把整个领域塞进同一个 prompt。CI 静态 `90` 分只是最低门禁；正式精修按 production-strict 目标看齐静态/动态 `95+`，并通过判官和 keep-best 防止内容或图解退化。
-
-详细说明见 [docs/quality-refine.md](docs/quality-refine.md)。
+评分口径、反刷分规则与 agent 审查使用方式见 [docs/nine-dimension-scoring.md](docs/nine-dimension-scoring.md)。
 
 ## ⚠️ 创建新领域指南（必读）
 
@@ -113,11 +103,10 @@ topics/{domain}/{filename}.json
 1. **修改内容**（知识点、分类、领域等），或在 [内容工作台](https://github.com/nontracey/mianshi-zhilian-studio) 编辑
 2. **验证内容**：`npm run validate`
 3. **运行确定性质量检查**：`npm run ci:static`
-4. **按需人工精修**：`npm run quality:refine:interactive`
-5. **提交 Pull Request**（fork PR 仅限 `draft/` 目录）
-6. **合并到 `main`** 后自动部署并更新版本号
+4. **提交 Pull Request**（fork PR 仅限 `draft/` 目录）
+5. **合并到 `main`** 后自动部署并更新版本号
 
-CI 不再运行 LLM 评分，也不要求提交 `.quality-review/reports/`。语义质量由维护者本地运行精修器把关；CI 只运行 `npm run ci:static`，它包含脚本语法检查、精修器纯静态/单元契约测试、`validate`、`quality:scan` 和 `quality:audit`，不会启动真实精修、判官、联网或视觉后端。
+CI 只运行 `npm run ci:static`，它包含脚本语法检查、`validate`、`quality:scan` 和 `quality:audit`，不调用任何 LLM。语义质量由维护者或 agent 按 [docs/nine-dimension-scoring.md](docs/nine-dimension-scoring.md) 复查。
 
 ### 本地 Git hook
 
@@ -156,7 +145,7 @@ npm run hooks:install
 - [ ] 内容平台：同步内容文件、更新 topics 目录结构
 - [ ] App 平台：更新内容解析逻辑、缓存机制
 - [ ] 文档：更新 README.md、content-format.md、schema 文件
-- [ ] 验证：运行 `npm run ci:static` 确保内容格式、契约和确定性质量检查正确
+- [ ] 验证：运行 `npm run ci:static` 确保内容格式、契约和 9 维静态质量检查正确
 - [ ] 测试：在各端测试内容加载和显示
 
 #### 常见同步场景

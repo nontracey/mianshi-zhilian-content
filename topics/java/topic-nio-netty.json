@@ -12,7 +12,7 @@
     "Reactor"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 35,
   "order": 120,
   "recommendWeight": 86,
   "learningCards": [
@@ -92,14 +92,9 @@
       ]
     },
     {
-      "type": "explain",
-      "title": "面试回答抓手",
-      "content": "回答这题按 BIO → NIO → Reactor → Netty 讲最清楚。BIO 同步阻塞，连接多时线程和上下文切换先顶不住；NIO 用 Channel、Buffer、Selector 做同步非阻塞多路复用，但就绪后的读写仍由应用线程执行；Reactor 把 Selector 事件循环和 Handler 分发组织起来；Netty 则把主从 Reactor、Pipeline、ByteBuf、编解码和内存管理工程化。\n\nNetty 核心要落到请求路径：boss EventLoop accept 新连接，worker EventLoop 处理读写，入站 Pipeline 先做 FrameDecoder，再解码、鉴权、业务处理；慢任务不能卡 EventLoop，应交给业务线程池；出站再编码写回。线上排查看 EventLoop lag、连接队列、写缓冲水位、ByteBuf leak、Handler 顺序和协议拆包。"
-    },
-    {
       "type": "interviewAnswer",
-      "title": "追问拆解",
-      "content": "如果被问 EventLoop 为什么不能阻塞，回答要强调一个 EventLoop 管多个 Channel，阻塞一个慢任务会拖慢这批连接；如果被问粘包拆包，先说 TCP 是字节流，再说固定长度、分隔符、长度字段和协议编解码器；如果被问 ByteBuf，抓住读写指针分离、池化、直接内存、引用计数、slice/composite 和 leak detector。",
+      "title": "面试回答与追问",
+      "content": "NIO/Netty 这题按 BIO → NIO → Reactor → Netty 演进讲，再落到请求路径、阻塞边界、粘包和线上排查。\n\n**演进与阻塞语义**\n- BIO：同步阻塞，一连接一线程；连接多时线程数、栈内存、上下文切换先顶不住\n- NIO：同步非阻塞 + 多路复用，`Channel` 非阻塞 + `Selector` 等就绪 + `Buffer` 承载；Linux 底层常用 epoll，Selector 只通知就绪，真正的 `read/write` 仍由应用线程执行，所以 NIO 不是异步 IO\n- AIO：异步完成通知，但 Java 网络生态主流仍是 NIO/Reactor，不要简单说成 NIO 升级版\n- Netty：把主从 Reactor、Pipeline、ByteBuf、编解码、内存管理工程化\n\n**Netty 请求路径**\n- boss EventLoop 负责 `OP_ACCEPT`，接入新连接\n- 新连接分配到 worker EventLoop，注册 `OP_READ`；同一个 Channel 的所有 IO 事件在同一 EventLoop 线程内串行处理，无锁\n- 入站：`FrameDecoder` 切完整帧 → 协议解码器把 ByteBuf 转业务对象 → 鉴权/限流 → 业务 Handler\n- 出站：业务返回 → 编码器写回字节 → 通过 Channel 写出\n- 慢任务（DB、RPC、文件 IO、CPU 密集）必须交给业务线程池或 `DefaultEventExecutorGroup`，结果再写回 Channel\n\n**EventLoop 不能阻塞**\n- 一个 EventLoop 管多个 Channel，一个慢任务会拖慢这批所有连接\n- 现象：同一 EventLoop 上一批 Channel 延迟同时升高、心跳超时、读写积压、写缓冲高水位\n- 排查：EventLoop lag、线程栈（看是否停在慢 SQL/RPC/锁/文件 IO）、任务队列、GC、业务日志时间线\n\n**粘包半包**\n- TCP 是字节流，没有消息边界，自定义协议必须处理\n- 方案：`FixedLengthFrameDecoder`（固定长度）、`DelimiterBasedFrameDecoder`（分隔符）、`LineBasedFrameDecoder`（换行）、`LengthFieldBasedFrameDecoder`（长度字段，生产二进制协议最常用）\n- 长度字段解码器要累计半包，不够长时回滚 `mark`/`reset`，等下一次读再切\n\n**ByteBuf**\n- 读写指针分离（不用 `flip`）、堆内/直接内存可选、池化减少分配、`slice`/`composite` 减少拷贝\n- 引用计数：`retain`/`release` 错误会泄漏直接内存，线上开 `-Dio.netty.leakDetection.level=PARANOID`，关注 `ResourceLeakDetector` 报告\n\n**背压与线上排查**\n- 写速度超过对端接收能力时 outbound buffer 膨胀；Netty 通过高/低水位和 `channelWritabilityChanged` 暴露可写状态，业务层应暂停读、限速、丢弃低优先级消息或降级\n- 线上排查沿着事件路径：accept 队列、文件描述符、EventLoop lag、Pipeline 顺序（业务 Handler 放在解码前会出错）、FrameDecoder 缺失、ByteBuf leak、写缓冲水位\n\n**取舍**\n- BIO 适合连接少、逻辑简单的内部工具，不要为了「先进」上 NIO\n- Netty 适合 RPC、网关、长连接、协议服务器；业务简单时 Servlet 容器更省心\n- 直接内存快但追踪难，堆内内存好排查但有拷贝成本——按吞吐和可观测性权衡",
       "followUpQuestions": [
         {
           "question": "NIO 为什么不是异步 IO？",
@@ -112,6 +107,10 @@
         {
           "question": "EventLoop 被阻塞时线上会看到什么现象？",
           "answer": "同一个 EventLoop 负责的一批 Channel 延迟同时升高，心跳超时、读写积压、写缓冲水位升高，线程栈可能停在慢 SQL、RPC、锁等待或文件 IO。排查看 EventLoop lag、线程栈、任务队列、GC 和业务日志时间线。"
+        },
+        {
+          "question": "为什么 Netty 要分 boss 和 worker 两组 EventLoop？单 Reactor 不行吗？",
+          "answer": "单 Reactor 把 accept、read/write、业务处理都压在少量线程上，连接数大时 accept 会成为瓶颈。主从 Reactor 让 boss 专门处理 OP_ACCEPT 快速接入，worker 专注已接入连接的读写，利用多核扩展，避免接入和处理互相阻塞。"
         }
       ]
     },

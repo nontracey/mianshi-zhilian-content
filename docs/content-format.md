@@ -479,7 +479,7 @@ content-repo/
 2. `svg.path` 表示仓库资源，必须位于 `assets/` 下，禁止绝对路径、`..` 和隐藏目录，资源必须真实存在。
 3. `svg.content` 表示内联 SVG，必须是以 `<svg` 开头的完整 SVG 字符串；不要把 `assets/...svg` 路径塞进 `content`。
 4. `mermaid`/`text` 只能使用 `content`；渲染端按数组顺序尝试，全部失败才显示 `fallback`。
-5. 正式发布内容中，只要使用 `diagram` 或 `animation`，必须提供可读的 `fallback`、`caption` 或 text source 兜底；如果 `sources` 含 `svg`，还必须同时提供至少一层 `mermaid` 或 `text` 降级链。精修器不得生成只有 SVG path 的图解。
+5. 正式发布内容中，只要使用 `diagram` 或 `animation`，必须提供可读的 `fallback`、`caption` 或 text source 兜底；如果 `sources` 含 `svg`，还必须同时提供至少一层 `mermaid` 或 `text` 降级链。不得生成只有 SVG path 的图解。
 6. 旧 `asset`、`svgPath`、`svg`、`content+format=mermaid` 字段继续兼容，不要求一次性迁移；但新增 SVG 资源必须真实存在于 `assets/` 下，新增内联 SVG 必须同时提供 text 或 mermaid 兜底。
 7. `compareTable` 是独立 `learningCard.type="compareTable"`，不能塞进 `diagram.sources` 作为一种 source。
 
@@ -493,7 +493,7 @@ Mermaid 约束：
 6. 图示必须表达真实关系，例如调用顺序、数据流、状态转移、依赖关系、隔离边界或失败路径；不能只是把正文关键词横向摆放。
 7. `caption` 或 `fallback` 应说明图在解释哪个机制，不能写成“展示本知识点关键环节”这类模板句。
 
-图解形态选择属于知识质量标准而不是 JSON 契约：不是每个 topic 都必须有 SVG、Mermaid 或其他 diagram；SVG、Mermaid、compareTable、code/text/none 都可能是正确选择。算法、二维状态、内存/索引/链表/树图结构等确实需要空间表达时优先考虑 SVG；协议交互、状态机、架构边界优先考虑对应 Mermaid 图型；纯对比题优先 compareTable。精修器不得把已有表达空间/状态细节的 SVG 弱化成 Mermaid 线性链，也不得为了“高级”把 Mermaid 能讲清的关系强行改成装饰性 SVG。
+图解形态选择属于知识质量标准而不是 JSON 契约：不是每个 topic 都必须有 SVG、Mermaid 或其他 diagram；SVG、Mermaid、compareTable、code/text/none 都可能是正确选择。算法、二维状态、内存/索引/链表/树图结构等确实需要空间表达时优先考虑 SVG；协议交互、状态机、架构边界优先考虑对应 Mermaid 图型；纯对比题优先 compareTable。不得把已有表达空间/状态细节的 SVG 弱化成 Mermaid 线性链，也不得为了"高级"把 Mermaid 能讲清的关系强行改成装饰性 SVG。
 
 5 色板固定值：
 
@@ -666,7 +666,7 @@ classDef highlight fill:#ec4899,stroke:#db2777,color:#fff
 - [ ] `scoreWeights` 总和为 100。
 - [ ] JSON 能通过 schema 校验。
 - [ ] `npm run quality:audit` 通过，单 topic、单领域和总体质量分均不低于 90。
-- [ ] 若是新增、大改或语义质量不确定的发布态 topic，已运行 `npm run quality:refine:interactive` 做本地精修或测试预览。
+- [ ] 若是新增、大改或语义质量不确定的发布态 topic，已按 `docs/nine-dimension-scoring.md` 复查 9 维短板、事实问题、图解退化或格式问题。
 
 ## 11. 新增内容示例流程
 
@@ -678,7 +678,7 @@ classDef highlight fill:#ec4899,stroke:#db2777,color:#fff
 4. 更新 `manifest.json` 的 `contentVersion`、`topicCount`、`updatedAt`。
 5. 运行 schema 校验。
 6. 运行 `npm run quality:audit`，确认内容质量、深度、图示、追问、rubric 和正向证据达到 90 分门槛；95+ 需要例子、边界、验证、取舍和图文贴合都比较扎实。
-7. 如需 LLM 语义检查或改写，运行 `npm run quality:refine:interactive`；测试预览先看单篇效果，正式精修成功后同步到 staging/draft。
+7. 如需语义检查或改写，按 `docs/nine-dimension-scoring.md` 复查；改写后重新跑 `quality:audit`，通过后再同步到 staging/draft。
 8. 发布内容仓库。
 9. App 下次同步后自动出现该知识点，不需要发新版 App。
 
@@ -715,7 +715,7 @@ classDef highlight fill:#ec4899,stroke:#db2777,color:#fff
 - [ ] 更新相关 `topicCount`、`updatedAt` 和 domain topic 引用。
 - [ ] 运行 `npm run validate`。
 - [ ] 运行 `npm run quality:audit`。
-- [ ] 若改动发布态 topic 且需要语义精修，运行 `npm run quality:refine:interactive`，确认每次 CLI 调用只处理单篇 topic。
+- [ ] 若改动发布态 topic 且需要语义精修，按 `docs/nine-dimension-scoring.md` 复查后再提交。
 - [ ] 确认字段名、字段类型、枚举值、卡片类型没有变化。
 - [ ] 若只是内容值变化，通常不需要改 App 或 studio。
 - [ ] 若实际发现 App 渲染、缓存、studio 编辑或生成流程不兼容，再同步修对应项目和文档。

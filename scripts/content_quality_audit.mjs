@@ -1946,7 +1946,7 @@ async function main() {
     duplicateTitleIssues,
     duplicateLanguageIssues,
     domains: domainReports,
-    // 跨域优先级地图（最差在前）：替代人工审计的“哪个域最烂、先动哪”。tier 仅按确定性分；门禁过(≥90)≠内容真达标，区分度/假图/模板腔需本地精修器判官把关。
+    // 跨域优先级地图（最差在前）：替代人工审计的"哪个域最烂、先动哪"。tier 仅按确定性分；门禁过(≥90)≠内容真达标，区分度/假图/模板腔需 agent 按 docs/nine-dimension-scoring.md 复查。
     domainPriority: [...domainReports]
       .sort((a, b) => a.score - b.score || b.failingTopics - a.failingTopics)
       .map((d) => ({
@@ -2005,7 +2005,7 @@ async function main() {
         `- [${domain.tier}] ${domain.id}: ${domain.score}/100 (${domain.grade}), 跌破 ${minScore} ${domain.failingTopics} 篇, 最低 ${domain.minTopicScore}`,
       );
     }
-    console.log("注：门禁过(≥90)≠内容真达标——区分度不足、关键词直链假图、模板腔需本地精修器(quality:refine)判官把关。");
+    console.log("注：门禁过(≥90)≠内容真达标——区分度不足、关键词直链假图、模板腔仍需 agent 按 docs/nine-dimension-scoring.md 复查。");
     if (orderIssues.length) {
       console.log("\nOrder issues:");
       for (const issue of orderIssues) console.log(`- ${issue}`);
@@ -2048,7 +2048,7 @@ async function main() {
   }
 }
 
-// 导出供精修器在进程内做单篇/keep-best 评分复用（CLI 行为不变，仅在直接运行时才跑 main）。
+// 导出供其他脚本在进程内做单篇评分复用（CLI 行为不变，仅在直接运行时才跑 main）。
 export { scoreTopic, buildCorpus };
 
 const isCliEntry = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

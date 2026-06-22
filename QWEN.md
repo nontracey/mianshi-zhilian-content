@@ -48,25 +48,20 @@
 ├── staging/                   # 测试环境隔离副本（domains/ + topics/）
 ├── draft/                     # 草稿环境隔离副本（domains/ + topics/）
 ├── assets/diagrams/           # 33 个 SVG 图解 + 5 个 GIF 动画
-├── scripts/                   # 生成、校验、质量、精修脚本
+├── scripts/                   # 生成、校验、质量脚本
 │   ├── generate_content.mjs            # 从 Markdown 源生成内容 JSON
 │   ├── sync_environment_content.mjs    # 同步 staging/draft 副本
 │   ├── validate_content.mjs            # Schema + 语义校验
 │   ├── quality_scan.mjs                # 模板/泛化文本扫描
-│   ├── content_quality_audit.mjs       # 确定性质量打分（0-100）
+│   ├── content_quality_audit.mjs       # 确定性 9 维质量打分（0-100）
 │   ├── quality_gate_staged.mjs         # pre-commit 暂存 topic 门禁
-│   ├── quality_refine.mjs              # LLM 精修主程序
-│   ├── quality_refine_interactive.sh   # 交互式精修启动器
-│   ├── quality_llm_*.mjs               # LLM packet/run/verify/prune 流水线
-│   └── refine-tests/                   # 精修脚本测试
-├── docs/                      # 内容规范、知识目录、精修器文档
+│   └── ci_static_check.mjs             # CI 同款静态门禁
+├── docs/                      # 内容规范、知识目录、9 维评分文档
 │   ├── content-format.md
 │   ├── knowledge-content-standard.md
 │   ├── knowledge-directory.md
 │   ├── content-improvement-plan.md
-│   ├── llm-quality-review.md
-│   ├── quality-refine.md
-│   └── quality-refine-v2-plan.md
+│   └── nine-dimension-scoring.md
 └── .github/workflows/
     ├── validate.yml         # PR/push 校验 + contentVersion 自动管理 + 触发下游
     ├── deploy-content.yml   # main push 自动部署到 Cloudflare Pages + 主备验证
@@ -143,15 +138,7 @@ npm run quality:audit                   # 确定性质量打分（默认 --min-s
 npm run generate                        # 从 Markdown 源生成 JSON（需 CONTENT_SOURCE_ROOT），并自动 sync
 npm run sync:env                        # 从正式内容同步 staging/draft 隔离副本
 npm run hooks:install                   # 安装 .githooks（每个 clone 一次）
-
-# 内容精修（API 模式；模型链/视觉/联网后端全部读 .env，可自定义模型并声明有效期/QPS）
-npm run quality:refine:interactive      # 交互式启动（推荐入口）
-npm run quality:refine -- --help        # 直接运行
-npm run quality:refine:test             # 精修脚本测试套件
-
-# LLM packet 流水线（备用，多用于 CI 联动）
-npm run quality:llm:packet|run|verify|prune
-npm run quality:gate                    # 等价于 quality:llm:verify --env=production --scope=changed
+npm run ci:static                       # CI 同款静态门禁：语法 + validate + scan + audit
 ```
 
 ### 校验检查项（`scripts/validate_content.mjs`）
@@ -236,22 +223,14 @@ npm run quality:gate                    # 等价于 quality:llm:verify --env=pro
 3. `mianshi-zhilian-studio`：内容管理逻辑
 4. `mianshi-zhilian-site`：自定义内容章节渲染
 
-## 内容精修器（LLM 流水线）
+## 9 维评分与静态门禁
 
-`scripts/quality_refine.mjs` 是本地维护者使用的 LLM 精修主程序，CI 不参与 LLM 评分。CI 入口是 `npm run ci:static`，只跑语法、契约单测、`validate`、`quality:scan`、`quality:audit`。详见 `docs/quality-refine.md`：
+CI 通过 `npm run ci:static` 跑确定性静态门禁：脚本语法、`validate`、`quality:scan`、`quality:audit --min-score=90`。`content_quality_audit.mjs` 按 9 维（结构完整性、内容深度、专家证据、讲解清晰度、图示/对比、面试可用性、rubric 评估、模板与语言卫生、区分度天花板）打分，单篇 <90 视为不通过。评分口径与反刷分规则见 `docs/nine-dimension-scoring.md`，agent 审查或改写 topic 时按该文档对照。
 
-- 一个 CLI 调用只处理一个 topic；并发只是同时启动多个单 topic 子进程
-- 并发 > 3 时启用自适应降级（限流 / 超时 / 非零退出会把并发降到 3）
-- 子进程通过文件协议输出（带 `//---END---` 标记），主进程严格 JSON 解析，避免 stdout 截断
-- 支持 LLM judge ensemble + 静态分 + invariant 校验三重验收
-- 候选优于现版才整篇接受；否则尝试块级合并；不达标则保留旧版
-- 进度反馈：`--progress-style summary|topic|quiet`，`--heartbeat-seconds` 控制心跳；`summary` 走对齐紧凑进度表
-- `Ctrl-C` 中断当前精修并尝试 kill 子进程；二次 `Ctrl-C` 强制退出
-- 仅审计：`npm run quality:refine -- --audit-only --scope domain:go --min-score 90`
-- 测试预览写 `.quality-refine/preview/`，正式模式只在全部目标达标后才同步到 `staging/` / `draft/`
+pre-commit hook（`scripts/quality_gate_staged.mjs`）对暂存 topic 跑同款静态门禁，历史存量低分不连坐。
 
 ## 已知问题与注意事项
 
-- 历史 topic 中存在系统性模板污染（`code.highlights[].note`、`explain` 三段式、`commonMistakes`、`interviewerFocus`、`followUpQuestions`），主要影响 `java`、`agent`、`architecture`、`dotnet`、`frontend`，需通过精修器逐域清理
+- 历史 topic 中存在系统性模板污染（`code.highlights[].note`、`explain` 三段式、`commonMistakes`、`interviewerFocus`、`followUpQuestions`），主要影响 `java`、`agent`、`architecture`、`dotnet`、`frontend`，需按 `docs/nine-dimension-scoring.md` 逐域清理
 - 已知少量 P0 JSON/转义错误集中在部分 `dotnet` 和 `java` topic（详见维护者本地审计报告）
 - 修改大量 topic 时优先写一次性 Node.js 脚本批量处理，避免逐文件手编出错（参见项目 skill `batch-content-modification-with-scripts`）

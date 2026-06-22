@@ -305,7 +305,7 @@ AI 或人工审查内容时，不能只看单个 topic 是否写得完整，还�
 4. Mermaid 更适合表达抽象关系：`sequenceDiagram` 表达协议交互，`stateDiagram` 表达状态机，`flowchart/graph + subgraph` 表达架构边界、调用链和数据流。
 5. compareTable 更适合概念边界、方案选型和分类对比；不要为了“有图”把对比题硬画成流程图。
 6. 不得一味生成 SVG。如果 SVG 只是 Mermaid 节点换皮、没有表达更多信息、文字过密、移动端看不清、维护成本高，应改用 Mermaid、compareTable、text，或在不需要图时移除图解。
-7. 不得一味弱化为 Mermaid。已有 SVG 如果表达了空间结构、步骤状态或数据结构细节，精修候选不能删除 SVG、不能替换成更弱的 Mermaid 线性链，除非能证明 Mermaid 在语义、可读性和维护性上不差于原 SVG。
+7. 不得一味弱化为 Mermaid。已有 SVG 如果表达了空间结构、步骤状态或数据结构细节，不能删除 SVG、不能替换成更弱的 Mermaid 线性链，除非能证明 Mermaid 在语义、可读性和维护性上不差于原 SVG。
 8. 算法图解一旦存在，就必须体现题目真实数据结构和推演过程，禁止复用“四个节点换名字”的模板图。DP 题要能看出状态表或状态转移，双指针/滑动窗口题要能看出窗口移动，树/图题要能看出节点关系和遍历 frontier，回溯题要能看出选择树或剪枝。
 9. 只要使用 `diagram` 或 `animation`，就必须提供可读的 `fallback`、`caption` 或 text source 兜底；使用 SVG 的 `sources` 还必须保留 mermaid 或 text 降级链。只有 svg path、没有可读兜底的图解不能作为发布态高质量内容。
 10. 文本模型不能假装看见图片。图的语义适配可由文本判官评估；重叠、裁切、空白、显示不全、文字过密、字号过小、边线压字等视觉问题必须由渲染 QA 或视觉模型评估。没有视觉报告时，视觉结论只能标记为未核验。
@@ -361,7 +361,7 @@ AI 或人工审查内容时，不能只看单个 topic 是否写得完整，还�
 17. **区分度天花板**：difficulty≥3 的技术题，若 recallPrompts/followUpQuestions 全是“是什么/列举”、缺“为什么这样设计 / 如何排查 / 取舍 / 极端场景”深问，按区分度不足封顶（只能区分中级，达不到 P7）；difficulty 4-5 必须具备专家（P7+）区分度。基础题（difficulty 1-2）豁免，但不得为凑深度注水或虚标难度。
 18. **图解形态非退化**：已有承载真实空间/状态/数据结构信息的 SVG 被删除或替换后信息量变弱、SVG sources 缺少 mermaid/text 兜底、新增 SVG 路径不存在、空间/状态型 topic 被普通 Mermaid 流程链替代，都会扣分或封顶。SVG 不是加分捷径，Mermaid 也不是降级同义词，必须按 topic 机制选择；装饰性或错误 SVG 可以移除，但要用更清晰的文字、表格、Mermaid 或重画图替代。
 
-> 第 15-18 条目前由本地精修器（`quality:refine` 的判官维度 `seniorityDiscrimination`、`diagramModalityFinding` 及阻断规则）强制把关；确定性脚本 `quality:audit` 会分批纳入这些检测——一次性开启会回溯性判挂存量中的线性串联图、rubric 代码和图解兜底问题，需配合存量整改逐步收紧，不要在未清理存量前直接加成硬门禁。
+> 第 15-18 条由 `quality:audit` 分批纳入确定性检测——一次性开启会回溯性判挂存量中的线性串联图、rubric 代码和图解兜底问题，需配合存量整改逐步收紧，不要在未清理存量前直接加成硬门禁。agent 按 `docs/nine-dimension-scoring.md` 复查时也应对照这几条。
 
 评分重点覆盖：
 
@@ -375,42 +375,19 @@ AI 或人工审查内容时，不能只看单个 topic 是否写得完整，还�
 8. 跨领域一致性：是否与其他领域重复、边界不清或混入无关内容。
 9. 正向证据密度：是否能看到具体例子、真实场景、失败路径、验证/排查指标、工程取舍、专属术语覆盖和非模板化 rubric。
 
-### 8.4 人工 LLM 精修
+### 8.4 静态门禁与 agent 复查
 
-静态脚本只能拦截结构、模板、重复、覆盖率和正向证据，不能可靠判断事实正确性、讲解顺序是否符合认知规律、专家口吻是否真实。因此发布态 topic 的新增、大改或质量不确定时，应由维护者本地运行精修器。
+静态脚本只能拦截结构、模板、重复、覆盖率和正向证据，不能可靠判断事实正确性、讲解顺序是否符合认知规律、专家口吻是否真实。因此发布态 topic 的新增、大改或质量不确定时，由维护者或 agent 按 `docs/nine-dimension-scoring.md` 复查。
 
 默认规则：
 
-1. CI 不配置 LLM key、模型或 provider，也不再要求提交 `.quality-review/reports/`。
-2. CI 只运行 `npm run ci:static`，即脚本语法检查、精修器静态/单元契约测试、`validate`、`quality:scan`、`quality:audit`。
-3. 维护者用 `npm run quality:refine:interactive` 启动本地精修器，按需选择领域、topic、CLI agent 和模型链。
-4. 一个 CLI 调用只能处理一个 topic。选择领域或多个 topic 只是建立队列，不得把整个领域合成一次 prompt。
-5. 静态分数只作为验收兜底；即使 topic 已经达到 90 分，第一轮正式精修仍可以送 LLM 重新审读和改写。
-6. 测试预览模式只精修单篇，写入 `.quality-refine/preview/` 并在终端渲染文字版；正式精修写回 `topics/`。
-7. 正式精修成功后再同步 staging/draft；交互脚本会按所选阶段自动同步，直接运行核心脚本时需要手动执行 `node scripts/sync_environment_content.mjs <all|staging|draft>`。
-8. 每个本地 clone 必须运行一次 `npm run hooks:install` 才会启用 `.githooks/pre-commit`；当前 hook 只做暂存 topic 的 JSON 和静态质量分门禁。
+1. CI 不配置 LLM key、模型或 provider。
+2. CI 只运行 `npm run ci:static`，即脚本语法检查、`validate`、`quality:scan`、`quality:audit`。
+3. 维护者或 agent 复查时，对照 `docs/nine-dimension-scoring.md` 的 9 维口径与反刷分规则，重点处理：事实正确性、认知顺序、专家口吻、自包含闭环、面试可用性、难度匹配、区分度天花板、rubric 与图示卫生、图解形态适配与非退化。
+4. 静态 `90` 分只是提交和同步前的最低门槛；目标分 `95+`，且没有 9 维短板、事实问题、图解退化或格式问题。
+5. 每个本地 clone 必须运行一次 `npm run hooks:install` 才会启用 `.githooks/pre-commit`；当前 hook 只做暂存 topic 的 JSON 和静态质量分门禁。
 
-精修器的动态判官必须使用统一 9 维：`accuracy`、`cognitiveOrder`、`expertVoice`、`selfContained`、`interviewUsability`、`difficultyFit`、`learnerClarity`、`coverage`、`seniorityDiscrimination`。任一维低于 4、出现 wrong/outdated 事实、图解形态明显不适配或视觉 QA fail，都不能判为动态通过。
-
-精修器必须重点处理：
-
-1. 事实正确性：关键事实、版本、复杂度、协议行为、框架机制不能错；图的流程方向、对比表结论、代码正确性同样按事实核验。
-2. 认知顺序：按“动机 -> 定义 -> 机制 -> 例子 -> 边界/失败路径 -> 对比/取舍 -> 面试表达”推进。
-3. 专家口吻真伪：有机制、条件、指标、失败模式、工程边界和取舍，而不是模板腔或百科腔。
-4. 自包含闭环：正文足以回答自己的 `recallPrompts` 和 `rubric.mustHave`。
-5. 面试可用性：能形成可复述的 30 秒结论、机制主线和追问边界。
-6. 难度匹配：内容深度与 `difficulty` 标注一致，difficulty 1-2 不注水、difficulty 4-5 必须讲透机制和权衡。
-7. 区分度天花板：技术域对标 P7/P7+ 的知识纵深，difficulty≥3 必须深到能区分资深、4-5 到专家深度；非技术域对标对应职业的资深纵深。判据是 recallPrompts/followUpQuestions 是否含“为什么这样设计 / 如何排查 / 取舍 / 极端场景”的深问，且正文能支撑其答案；只考“是什么/列举”的封顶为仅区分中级。
-8. rubric 与图示卫生：rubric 三项不得内嵌代码（代码进 code 卡）；diagram 不得是纯线性关键词链或终点为“面试结论”类汇聚节点的假图，边必须承载真实机制。
-9. 图解形态适配与非退化：每篇都要判断当前 topic 应使用 SVG、Mermaid、compareTable、code/text 还是不需要图；已有好 SVG 不能被弱化成 Mermaid，Mermaid 已足够清晰时也不能为了“升级”强行 SVG。判官输出应包含 `diagramModalityFinding`，说明当前/推荐图型、是否适配、是否候选退化、视觉是否已核验和修复建议。
-
-外部证据规则：
-
-1. 视觉质量可由静态 SVG QA、MCP 渲染/视觉工具或支持图像的模型判官提供；文本模型不得假装看见图片。没有视觉后端或渲染报告时，`visualFit` 必须是 `not_checked`，不能写 `pass`。
-2. 时效性、版本、默认值、协议/API 行为等容易过时的事实，允许通过 MCP 联网事实工具查询官方文档、标准规范、源码文档、论文或 release notes。外部证据返回 wrong/outdated 时，必须进入 `factFindings` 和 `blockingFindings`。
-3. 弱模型、本地模型、免费模型可以参与精修和判官，但必须声明能力边界：是否支持 `json`、是否支持 `image`、是否本地/免费、并发和额度限制。模型池只能降低成本和扩展吞吐，不能降低 9 维验收标准。
-
-精修后的内容仍必须通过确定性校验。静态 `90` 分不是内容真的达标的证明，只是提交和同步前的最低门槛；正式发布精修的目标是静态与动态都尽量达到 `95+`，且没有 9 维短板、事实问题、图解退化或格式问题。候选内容只有在不变量、静态审计、动态判官和图解形态评审均不退化，且至少一块实质变好时，才允许写回。
+事实正确性、版本、复杂度、协议/API 行为等容易过时的事实，由 agent 复查时通过官方文档、标准规范、源码文档、论文或 release notes 核对，发现 wrong/outdated 必须修正。rubric 三项不得内嵌代码（代码进 code 卡）；diagram 不得是纯线性关键词链或终点为"面试结论"类汇聚节点的假图，边必须承载真实机制；已有好 SVG 不能被弱化成 Mermaid，Mermaid 已足够清晰时也不能为了"升级"强行 SVG。
 
 ## 9. 面试可用性标准
 
@@ -689,7 +666,7 @@ AI 执行内容生成时，应先输出或内部形成“topic 是否合格”�
 7. 如果发现是标准缺失导致问题反复出现，必须同时建议更新标准和校验脚本。
 8. 评估类任务除逐篇判定外，必须产出**跨域质量分布与优先级热力图**：列出每个领域的整体水平、问题集中点和先修顺序，并显式区分“自动门禁通过”与“内容真达标”——自动分达 90 不等于达到 P7 区分度，模板污染、假图、区分度不足都可能在 90 分之上仍然存在。优先级要落到“先修哪些域、哪些是 P0 重写、哪些是批量清理”，而不是停在域级评语。
 
-   这张地图不需要手工再审：`npm run quality:audit` 已输出 `Domain priority (worst first)` 段（JSON 模式见 `result.domainPriority`，按域分升序 + P0/P1/P2 tier + 跌破阈值篇数），直接给出“哪个域最烂、先动哪”。它替代了人工审计的跨域排名；逐篇的区分度、假图、事实正确性由本地精修器（`quality:refine`）的判官维度把关。两者合起来，常规质量评估不再需要一次性人工通读全库。
+   这张地图不需要手工再审：`npm run quality:audit` 已输出 `Domain priority (worst first)` 段（JSON 模式见 `result.domainPriority`，按域分升序 + P0/P1/P2 tier + 跌破阈值篇数），直接给出"哪个域最烂、先动哪"。它替代了人工审计的跨域排名；逐篇的区分度、假图、事实正确性由 agent 按 `docs/nine-dimension-scoring.md` 复查把关。两者合起来，常规质量评估不再需要一次性人工通读全库。
 
 可使用的全域审查脚本：
 
@@ -749,7 +726,7 @@ NODE
 15. 高频 topic 的 `interviewAnswer` 能读出“30 秒结论 -> 核心机制 -> 追问边界”的层次。
 16. 运行结构化质量扫描 `npm run quality:scan`，确认没有模板化空话、前端通用追问、占位式追问答案或正文行内编号残留。
 17. 运行内容质量评分 `npm run quality:audit`，确认单 topic、单领域和全库总体均达到 90 分以上。
-18. 若新增、大改或不确定发布态 topic 的语义质量，运行 `npm run quality:refine:interactive` 做测试预览或正式精修。
+18. 若新增、大改或不确定发布态 topic 的语义质量，按 `docs/nine-dimension-scoring.md` 复查 9 维短板、事实问题、图解退化或格式问题。
 19. 图示必须逐张检查：节点是否专属、关系是否清楚、是否和 topic 相关、fallback/caption 是否能解释图意，不能只检查 Mermaid 语法是否通过。
 
 建议附加检查关键词：

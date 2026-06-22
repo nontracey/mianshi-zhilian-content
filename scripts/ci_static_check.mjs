@@ -1,13 +1,12 @@
-import { readdirSync, statSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 
 const root = process.cwd();
 
 function listMjs(dir) {
-  const full = path.join(root, dir);
   const out = [];
-  for (const entry of readdirSync(full, { withFileTypes: true })) {
+  for (const entry of readdirSync(path.join(root, dir), { withFileTypes: true })) {
     const rel = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       out.push(...listMjs(rel));
@@ -21,14 +20,7 @@ function listMjs(dir) {
 function run(label, command, args) {
   console.log(`\n## ${label}`);
   console.log(`$ ${[command, ...args].join(" ")}`);
-  const result = spawnSync(command, args, {
-    cwd: root,
-    stdio: "inherit",
-    env: {
-      ...process.env,
-      QUALITY_REFINE_CI_STATIC: "1",
-    },
-  });
+  const result = spawnSync(command, args, { cwd: root, stdio: "inherit" });
   if (result.status !== 0) {
     process.exit(result.status ?? 1);
   }
@@ -36,16 +28,6 @@ function run(label, command, args) {
 
 for (const file of listMjs("scripts")) {
   run(`syntax ${file}`, process.execPath, ["--check", file]);
-}
-
-for (const unit of [
-  "scripts/refine-tests/judge_unit.mjs",
-  "scripts/refine-tests/pool_visual_unit.mjs",
-  "scripts/refine-tests/diagram_candidates_unit.mjs",
-]) {
-  if (statSync(path.join(root, unit), { throwIfNoEntry: false })?.isFile()) {
-    run(`unit ${unit}`, process.execPath, [unit]);
-  }
 }
 
 run("content schema/contract", process.execPath, ["scripts/validate_content.mjs"]);
