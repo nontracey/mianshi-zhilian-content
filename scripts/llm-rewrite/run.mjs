@@ -103,6 +103,78 @@ async function processOne(ref, { model, mock, previewDir }) {
   return { usage, diagramRequests, outAbs };
 }
 
+// ── 动态终端进度条 ──────────────────────────────────────────────
+const isTTY = process.stdout.isTTY;
+const ESC = "\x1b";
+const clearLine = `${ESC}[2K\r`;
+const cursorUp = (n) => `${ESC}[${n}A`;
+
+function shortRef(ref) { return path.basename(ref, ".json"); }
+function fmtTime(ms) { const s = Math.round(ms / 1000); if (s < 60) return `${s}s`; const m = Math.floor(s / 60); if (m < 60) return `${m}m${s % 60}s`; const h = Math.floor(m / 60); return `${h}h${m % 60}m${s % 60}s`; }
+function fmtTok(n) { return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n); }
+
+const disp = { slots: [], total: 0, done: 0, failed: 0, inTok: 0, outTok: 0, t0: 0 };
+
+function initDisplay(total, concurrency) {
+  disp.total = total; disp.done = 0; disp.failed = 0; disp.inTok = 0; disp.outTok = 0; disp.t0 = Date.now();
+  const n = Math.min(concurrency, total);
+  disp.slots = Array.from({ length: n }, () => null);
+  if (isTTY) {
+    // 打印占位行：slot 行 + 汇总行
+    for (let i = 0; i < n + 1; i++) process.stdout.write("\n");
+  }
+}
+
+function renderSlot(s) {
+  if (!s) return "  · 空闲";
+  if (s.status === "working") return `  ⏳ ${shortRef(s.ref)}  ${fmtTime(Date.now() - s.ts)}`;
+  if (s.status === "done")   return `  ✓ ${shortRef(s.ref)}  ${fmtTime(s.dur)}  入${fmtTok(s.inTok)} 出${fmtTok(s.outTok)}`;
+  return `  ✗ ${shortRef(s.ref)}  ${s.err.slice(0, 60)}`;
+}
+
+function refresh() {
+  if (!isTTY) return;
+  const lines = disp.slots.length + 1; // slots + summary
+  process.stdout.write(cursorUp(lines));
+  for (const s of disp.slots) process.stdout.write(clearLine + renderSlot(s) + "\n");
+  // 汇总行
+  const elapsed = Date.now() - disp.t0;
+  const processed = disp.done + disp.failed;
+  const remaining = disp.total - processed;
+  const avg = elapsed / Math.max(processed, 1);
+  const eta = remaining * avg;
+  const sumLine = `\n  📊 ${processed}/${disp.total}  完成${disp.done} 失败${disp.failed}  耗时${fmtTime(elapsed)}  剩余${fmtTime(eta)}  token入${fmtTok(disp.inTok)} 出${fmtTok(disp.outTok)}`;
+  process.stdout.write(clearLine + sumLine);
+}
+
+// 每秒刷新一次（更新耗时/ETA）
+let refreshTimer = null;
+function startAutoRefresh() { if (isTTY) refreshTimer = setInterval(refresh, 1000); }
+function stopAutoRefresh() { if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; } }
+
+function claimSlot(ref) {
+  const idx = disp.slots.findIndex((s) => s === null || s.status !== "working");
+  disp.slots[idx] = { ref, status: "working", ts: Date.now(), dur: 0, inTok: 0, outTok: 0, err: "" };
+  refresh();
+  return idx;
+}
+
+function finishSlot(idx, { ok, usage, err }) {
+  const s = disp.slots[idx];
+  s.dur = Date.now() - s.ts;
+  if (ok) {
+    s.status = "done";
+    s.inTok = usage?.prompt_tokens || 0; s.outTok = usage?.completion_tokens || 0;
+    disp.done++; disp.inTok += s.inTok; disp.outTok += s.outTok;
+  } else {
+    s.status = "failed"; s.err = String(err?.message || err).slice(0, 120);
+    disp.failed++;
+  }
+  refresh();
+  // 短暂显示结果后释放 slot
+  setTimeout(() => { if (disp.slots[idx] === s) disp.slots[idx] = null; refresh(); }, 1500);
+}
+
 async function pool(items, concurrency, worker) {
   let idx = 0;
   const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
@@ -128,30 +200,43 @@ async function main() {
   }
 
   console.log(`模型=${model.name} 共${refs.length}篇 待处理${todo.length}篇 并发${args.concurrency}${args.mock ? " [MOCK]" : ""}${args.previewDir ? ` 预览→${args.previewDir}` : " 原地写回"}`);
+  if (!todo.length) { console.log("无待处理 topic，退出。"); return; }
+
   const t0 = Date.now();
-  let done = 0, failed = 0, inTok = 0, outTok = 0;
   const diagramQueue = [];
   const failures = [];
 
+  // Ctrl+C 中断时也保存已处理状态
+  const onSigint = () => { stopAutoRefresh(); saveLedger(ledger); console.log("\n中断，已保存进度。"); process.exit(130); };
+  process.on("SIGINT", onSigint);
+
+  initDisplay(todo.length, args.concurrency);
+  startAutoRefresh();
+
   await pool(todo, args.concurrency, async (ref, i) => {
-    const ts = Date.now();
+    const slotIdx = claimSlot(ref);
     try {
       const { usage, diagramRequests, outAbs } = await processOne(ref, { model, mock: args.mock, previewDir: args.previewDir });
-      done++;
-      if (usage) { inTok += usage.prompt_tokens || 0; outTok += usage.completion_tokens || 0; }
       for (const d of diagramRequests) diagramQueue.push({ topicRef: ref, topicTitle: JSON.parse(fs.readFileSync(outAbs, "utf8")).title, ...d });
       ledger[ref] = { status: "done", at: new Date().toISOString(), model: model.name };
-      const eta = ((Date.now() - t0) / Math.max(done + failed, 1)) * (todo.length - done - failed);
-      console.log(`[${done + failed}/${todo.length}] ✓ ${ref} ${Math.round((Date.now() - ts) / 1000)}s | 完成${done} 失败${failed} | ETA ${Math.round(eta / 1000)}s`);
+      finishSlot(slotIdx, { ok: true, usage });
     } catch (err) {
-      failed++;
       failures.push({ ref, error: String(err.message || err).slice(0, 300) });
       ledger[ref] = { status: "failed", at: new Date().toISOString(), error: String(err.message || err).slice(0, 300) };
-      console.log(`[${done + failed}/${todo.length}] ✗ ${ref} — ${String(err.message || err).slice(0, 120)}`);
+      finishSlot(slotIdx, { ok: false, err });
     }
-    if ((done + failed) % 10 === 0) saveLedger(ledger);
+    saveLedger(ledger);
   });
+
+  stopAutoRefresh();
   saveLedger(ledger);
+
+  // 最终汇总
+  const elapsed = Date.now() - t0;
+  console.log(`\n完成 ${disp.done} / 失败 ${disp.failed} | 墙钟 ${fmtTime(elapsed)}` +
+    (args.mock ? "" : ` | 入${fmtTok(disp.inTok)} 出${fmtTok(disp.outTok)}`) +
+    (diagramQueue.length ? ` | 待生成 SVG ${diagramQueue.length}` : "") +
+    (failures.length ? ` | 失败清单 → scripts/llm-rewrite/failures.json` : ""));
 
   // 产物：SVG 待生成清单（机器 + 人读）+ 失败清单
   if (diagramQueue.length) {
@@ -162,11 +247,6 @@ async function main() {
       `# 待生成 SVG（${diagramQueue.length} 处）\n\n| # | topic | 卡片 | 画什么 | 建议文件名 |\n| --- | --- | --- | --- | --- |\n${rows.join("\n")}\n`);
   }
   if (failures.length) fs.writeFileSync(path.join(REWRITE_DIR, "failures.json"), JSON.stringify(failures, null, 2));
-
-  console.log(`\n完成 ${done} / 失败 ${failed} | 墙钟 ${Math.round((Date.now() - t0) / 1000)}s` +
-    (args.mock ? "" : ` | token 入${inTok} 出${outTok}`) +
-    (diagramQueue.length ? ` | 待生成 SVG ${diagramQueue.length} → scripts/llm-rewrite/svg-pending.md` : "") +
-    (failures.length ? ` | 失败清单 → scripts/llm-rewrite/failures.json` : ""));
 }
 
 // 仅作为 CLI 直接运行时才执行；被 import 时不自动开跑（防误触发全量）。

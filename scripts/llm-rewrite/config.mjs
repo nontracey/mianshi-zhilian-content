@@ -69,7 +69,7 @@ export function resolveModel({ provider } = {}) {
 }
 
 export const DEFAULTS = {
-  concurrency: Number(process.env.LLM_REWRITE_CONCURRENCY || 8),
+  concurrency: Number(process.env.LLM_REWRITE_CONCURRENCY || 3),
   maxRetries: 4,
   retryBaseMs: 1500,
   requestTimeoutMs: Number(process.env.LLM_REWRITE_TIMEOUT_MS || 180000),
