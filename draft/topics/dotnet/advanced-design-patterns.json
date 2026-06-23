@@ -4,7 +4,7 @@
   "category": "advanced",
   "group": "advanced",
   "title": "ASP.NET Core 内置设计模式",
-  "summary": "聚焦 .NET 框架内部的模式落地：DI 容器中的工厂/生命周期，中间件管道中的装饰器/责任链，事件与后台服务中的观察者模式。",
+  "summary": "ASP.NET Core 不是「用了设计模式」，而是整个框架的骨架由模式构成：DI 容器是工厂+生命周期管理器，中间件管道是责任链+装饰器的运行时实现，Options 模式把配置绑定变成强类型策略，Filter 管道在 MVC 层复用同一套管道思想，IHostedService 把后台任务的生命周期绑定到 Host。理解这些模式不是为了「知道名词」，而是为了回答「注册错了生命周期会怎样」「中间件顺序为什么不能乱」「Filter 和中间件谁先执行」这些线上真正会遇到的问题。",
   "tags": [
     ".NET",
     "ASP.NET Core",
@@ -13,20 +13,35 @@
     "中间件"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 40,
+  "estimatedMinutes": 48,
   "order": 10,
   "recommendWeight": 72,
   "status": "draft",
   "learningCards": [
     {
       "type": "explain",
-      "title": "ASP.NET Core 内置设计模式：工厂模式与对象创建、工厂模式（Factory Pattern）",
-      "content": "设计模式是解决常见软件设计问题的可复用方案，.NET 框架本身大量使用了设计模式。\n\n## 工厂模式（Factory Pattern）\n\n**简单工厂**：\n```csharp\npublic static class NotificationFactory\n{\n    public static INotification Create(string type)\n    {\n        return type switch\n        {\n            \"email\" => new EmailNotification(),\n            \"sms\" => new SmsNotification(),\n            \"push\" => new PushNotification(),\n            _ => throw new ArgumentException($\"Unknown type: {type}\")\n        };\n    }\n}\n```\n\n**抽象工厂**：\n```csharp\npublic interface INotificationFactory\n{\n    INotification Create();\n    INotificationTemplate CreateTemplate();\n}\npublic class EmailNotificationFactory : INotificationFactory\n{\n    public INotification Create() => new EmailNotification();\n    public INotificationTemplate CreateTemplate() => new EmailTemplate();\n}\n\npublic class SmsNotificationFactory : INotificationFactory\n{\n    public INotification Create() => new SmsNotification();\n    public INotificationTemplate CreateTemplate() => new SmsTemplate();\n}\n```\n\n**工厂方法**：\n```csharp\npublic abstract class NotificationService\n{\n    protected abstract INotification CreateNotification();\n\n    public async Task SendAsync(string message)\n    {\n        var notification = CreateNotification();\n        await notification.SendAsync(message);\n    }\n}\n\npublic class EmailNotificationService : NotificationService\n{\n    protected override INotification CreateNotification() => new EmailNotification();\n}\n```\n\n## 依赖注入（Dependency Injection）\n\nDI 是控制反转的具体实现：\n```csharp\n// 注册\nservices.AddTransient<INotification, EmailNotification>();\nservices.AddScoped<IOrderService, OrderService>();\nservices.AddSingleton<ICacheService, RedisCacheService>();\n\n// 注入\npublic class OrderService : IOrderService\n{\n    private readonly INotification _notification;\n    private readonly ICacheService _cache;\n\n    public OrderService(INotification notification, ICacheService cache)\n    {\n        _notification = notification;\n        _cache = cache;\n    }\n}\n```\n\n**工厂注册**：\n```csharp\nservices.AddTransient<INotification>(provider =>\n{\n    var config = provider.GetRequiredService<IConfiguration>();\n    var type = config[\"Notification:Type\"];\n    return type switch\n    {\n        \"email\" => new EmailNotification(),\n        \"sms\" => new SmsNotification(),\n        _ => throw new ArgumentException()\n    };\n});\n```\n\n## 装饰器模式（Decorator Pattern）\n\n动态添加功能：\n```csharp\npublic interface ICacheService\n{\n    Task<T> GetAsync<T>(string key);\n    Task SetAsync<T>(string key, T value, TimeSpan? expiry = null);\n}\n\npublic class RedisCacheService : ICacheService\n{\n    public async Task<T> GetAsync<T>(string key)\n    {\n        // Redis 实现\n    }\n}\n\npublic class LoggingCacheDecorator : ICacheService\n{\n    private readonly ICacheService _inner;\n    private readonly ILogger _logger;\n\n    public LoggingCacheDecorator(ICacheService inner, ILogger logger)\n    {\n        _inner = inner;\n        _logger = logger;\n    }\n\n    public async Task<T> GetAsync<T>(string key)\n    {\n        _logger.LogInformation($\"Getting cache key: {key}\");\n        var result = await _inner.GetAsync<T>(key);\n        _logger.LogInformation($\"Cache {(result != null ? \"hit\" : \"miss\")}: {key}\");\n        return result;\n    }\n}\n\npublic class CachingDecorator : ICacheService\n{\n    private readonly ICacheService _inner;\n    private readonly IMemoryCache _memoryCache;\n\n    public CachingDecorator(ICacheService inner, IMemoryCache memoryCache)\n    {\n        _inner = inner;\n        _memoryCache = memoryCache;\n    }\n\n    public async Task<T> GetAsync<T>(string key)\n    {\n        if (_memoryCache.TryGetValue(key, out T cached))\n            return cached;\n\n        var result = await _inner.GetAsync<T>(key);\n        if (result != null)\n            _memoryCache.Set(key, result, TimeSpan.FromMinutes(5));\n\n        return result;\n    }\n}\n\n// 注册装饰器链\nservices.AddSingleton<RedisCacheService>();\nservices.AddSingleton<ICacheService>(provider =>\n{\n    var inner = provider.GetRequiredService<RedisCacheService>();\n    var logger = provider.GetRequiredService<ILogger<LoggingCacheDecorator>>();\n    var memoryCache = provider.GetRequiredService<IMemoryCache>();\n    \n    return new CachingDecorator(\n        new LoggingCacheDecorator(inner, logger),\n        memoryCache);\n});\n```"
+      "title": "DI 容器：工厂模式的运行时落地",
+      "content": "ASP.NET Core 的 `IServiceProvider` 本质上就是一个工厂，而且是一个带生命周期管理的工厂。它不做「new」这么简单——它决定对象何时创建、创建几个、作用域结束时谁负责 Dispose。\n\n**三种生命周期就是三种工厂策略**：\n\n- **Transient**：每次 `GetService<T>()` 都 new 一个新实例。相当于工厂每次调用都返回新对象。适合无状态服务。\n- **Scoped**：同一个 `IServiceScope` 内只创建一次，scope dispose 时实例跟着销毁。在 Web 请求中，每个请求一个 scope——所以 scoped 服务是「请求级单例」。适合 DbContext、Unit of Work、请求级缓存。\n- **Singleton**：容器级别只创建一次，应用关闭时才 dispose。适合配置对象、HttpClientFactory 管理的 HttpClient、全局缓存。\n\n**生命周期错误的真实后果**：\n\n把 Scoped 服务注入 Singleton 服务是最常见的陷阱。Singleton 只创建一次，它的构造函数只会被调用一次——所以它「捕获」了第一个请求的 DbContext，后续所有请求共享这个已失效的 DbContext。典型表现：`InvalidOperationException: A second operation was started on this context instance before a previous operation completed`。EF Core 在 .NET 8+ 增加了检测，但其他框架不一定有这个保护。\n\n反过来，把 Singleton 注入 Scoped 不会出错，但会浪费内存——每次请求都创建一个新的 Singleton 实例引用，但 Singleton 本身只创建一次。\n\n**工厂注册模式**：当创建逻辑需要运行时决策时（读配置选实现、按请求头选策略），用 `services.AddTransient<IService>(provider => { ... })` 把工厂 lambda 注册进容器。这个 lambda 接收 `IServiceProvider`，可以在运行时读配置、判断条件、组装依赖。这比写一堆 if-else 工厂类更贴合 ASP.NET Core 的 DI 惯用法。"
     },
     {
       "type": "explain",
-      "title": "ASP.NET Core 内置设计模式：观察者模式（Observer Pattern）、中间件模式（Middleware Pattern）",
-      "content": "## 观察者模式（Observer Pattern）\n\n事件驱动：\n```csharp\n// .NET 事件\npublic class OrderService\n{\n    public event EventHandler<OrderCreatedEventArgs> OrderCreated;\n\n    public void CreateOrder(Order order)\n    {\n        // 创建订单逻辑\n        OrderCreated?.Invoke(this, new OrderCreatedEventArgs(order));\n    }\n}\n\n// 使用\nvar orderService = new OrderService();\norderService.OrderCreated += (sender, args) =>\n{\n    Console.WriteLine($\"订单创建: {args.Order.Id}\");\n};\n```\n\n**IObservable<T>**：\n```csharp\npublic class StockPriceProvider : IObservable<decimal>\n{\n    private readonly List<IObserver<decimal>> _observers = new();\n\n    public IDisposable Subscribe(IObserver<decimal> observer)\n    {\n        _observers.Add(observer);\n        return new Unsubscriber(_observers, observer);\n    }\n\n    public void UpdatePrice(decimal price)\n    {\n        foreach (var observer in _observers)\n        {\n            observer.OnNext(price);\n        }\n    }\n}\n```\n\n## 中间件模式（Middleware Pattern）\n\n请求管道：\n```csharp\npublic class RequestLoggingMiddleware\n{\n    private readonly RequestDelegate _next;\n    private readonly ILogger _logger;\n\n    public RequestLoggingMiddleware(RequestDelegate next, ILogger logger)\n    {\n        _next = next;\n        _logger = logger;\n    }\n\n    public async Task InvokeAsync(HttpContext context)\n    {\n        _logger.LogInformation($\"Request: {context.Request.Path}\");\n        await _next(context);\n        _logger.LogInformation($\"Response: {context.Response.StatusCode}\");\n    }\n}\n\n// 注册\napp.UseMiddleware<RequestLoggingMiddleware>();\n```\n\n## 策略模式（Strategy Pattern）\n\n算法可替换：\n```csharp\npublic interface IPricingStrategy\n{\n    decimal CalculatePrice(Order order);\n}\n\npublic class RegularPricing : IPricingStrategy\n{\n    public decimal CalculatePrice(Order order) => order.TotalAmount;\n}\n\npublic class DiscountPricing : IPricingStrategy\n{\n    public decimal CalculatePrice(Order order) => order.TotalAmount * 0.9m;\n}\n\npublic class OrderService\n{\n    private readonly IPricingStrategy _pricingStrategy;\n\n    public OrderService(IPricingStrategy pricingStrategy)\n    {\n        _pricingStrategy = pricingStrategy;\n    }\n\n    public decimal GetPrice(Order order)\n    {\n        return _pricingStrategy.CalculatePrice(order);\n    }\n}\n```\n\n## 仓储模式（Repository Pattern）\n\n数据访问抽象：\n```csharp\npublic interface IRepository<T> where T : class\n{\n    Task<T> GetByIdAsync(int id);\n    Task<IEnumerable<T>> GetAllAsync();\n    Task AddAsync(T entity);\n    void Update(T entity);\n    void Delete(T entity);\n}\n\npublic class Repository<T> : IRepository<T> where T : class\n{\n    protected readonly DbContext _context;\n    protected readonly DbSet<T> _dbSet;\n\n    public Repository(DbContext context)\n    {\n        _context = context;\n        _dbSet = context.Set<T>();\n    }\n\n    // 实现接口方法\n}\n```\n\n## 单例模式（Singleton Pattern）\n\n```csharp\npublic sealed class Singleton\n{\n    private static readonly Lazy<Singleton> _instance = new(() => new Singleton());\n\n    public static Singleton Instance => _instance.Value;\n\n    private Singleton() { }\n}\n\n// 或使用 DI\nservices.AddSingleton<IMyService, MyService>();\n```\n\n## 命令模式（Command Pattern）\n\n```csharp\npublic interface ICommand\n{\n    Task ExecuteAsync();\n    Task UndoAsync();\n}\n\npublic class CreateOrderCommand : ICommand\n{\n    private readonly Order _order;\n    private readonly IOrderRepository _repository;\n\n    public async Task ExecuteAsync() => await _repository.AddAsync(_order);\n    public async Task UndoAsync() => await _repository.DeleteAsync(_order.Id);\n}\n\npublic class CommandManager\n{\n    private readonly Stack<ICommand> _history = new();\n\n    public async Task ExecuteAsync(ICommand command)\n    {\n        await command.ExecuteAsync();\n        _history.Push(command);\n    }\n\n    public async Task UndoAsync()\n    {\n        if (_history.Count > 0)\n        {\n            var command = _history.Pop();\n            await command.UndoAsync();\n        }\n    }\n}\n```\n\n## 实际应用\n\n**ASP.NET Core 中的模式**：\n- 中间件模式：请求管道\n- 依赖注入：服务注册\n- 工厂模式：IServiceProvider\n- 装饰器模式：HttpClient 中间件\n- 观察者模式：IHostApplicationLifetime"
+      "title": "中间件管道：责任链的请求级实现",
+      "content": "ASP.NET Core 的中间件管道是经典责任链模式的变体——每个中间件持有 `RequestDelegate next`，决定是否调用下一个、在调用前/后插入逻辑、或短路（不调 next）。\n\n**next 的执行顺序决定了「洋葱模型」**：\n\n请求进入时按 `Use` 注册顺序执行（1→2→3），响应返回时按逆序执行（3→2→1）。这意味着每个中间件的 `await _next(context)` 之前的代码在请求阶段执行，之后的代码在响应阶段执行。\n\n```csharp\napp.Use(async (context, next) => {\n    // 请求阶段：1. 认证\n    await next();\n    // 响应阶段：1. 记录耗时\n});\napp.Use(async (context, next) => {\n    // 请求阶段：2. 业务逻辑\n    await next();\n    // 响应阶段：2. 清理资源\n});\n```\n\n**短路（Short-Circuiting）**：认证中间件发现 token 无效，直接 `context.Response.StatusCode = 401; return;`——不调 next，后续中间件（包括 MVC）完全不执行。这就是责任链的「提前退出」。`app.UseWhen` 可以按条件分支管道，只在满足条件时进入子管道。\n\n**中间件顺序不能乱的根本原因**：\n\n1. `UseRouting` 必须在 `UseEndpoints` 之前——前者解析路由元数据，后者执行端点。调换顺序会导致路由未匹配就执行 endpoint，直接 404。\n2. `UseAuthentication` 必须在 `UseAuthorization` 之前——认证建立 HttpContext.User，授权基于 User 做决策。\n3. `UseExceptionHandler` 要放在最前面——它要捕获后续所有中间件的异常。\n4. `UseCors` 要在 `UseAuthorization` 之前且通常在 `UseRouting` 之后——CORS 预检请求（OPTIONS）要在认证授权之前处理。\n\n这些顺序不是「建议」，而是功能依赖——违反就会出现「认证失效」「路由 404」「CORS 不生效」等线上高频问题。"
+    },
+    {
+      "type": "explain",
+      "title": "Options 模式：配置绑定的策略化",
+      "content": "Options 模式是 ASP.NET Core 对配置访问的标准化抽象，背后是策略模式 + 工厂模式的组合。\n\n**三层接口**：\n- `IOptions<T>`：Singleton，应用启动时读一次，运行期间不变。适合不热更新的配置。\n- `IOptionsSnapshot<T>`：Scoped，每个请求读一次最新值。适合需要热更新的配置（appsettings.json 改后下个请求生效）。\n- `IOptionsMonitor<T>`：Singleton 但支持 `OnChange` 回调，配置源变化时立即通知。适合需要实时反应的场景。\n\n**关键陷阱**：`IOptions<T>` 是 Singleton，所以如果把 `IOptions<T>` 注入 Scoped/Transient 服务没问题（Singleton 可以注入任何生命周期）。但如果反过来，把 `IOptionsSnapshot<T>`（Scoped）注入 Singleton 服务，会抛异常——因为 Singleton 无法依赖 Scoped。\n\n**验证与强类型**：\n```csharp\nservices.AddOptions<MyConfig>()\n    .Bind(configuration.GetSection(\"MyConfig\"))\n    .ValidateDataAnnotations()\n    .ValidateOnStart(); // 启动时验证，而不是第一次访问时\n```\n`ValidateOnStart()`（.NET 8+）在应用启动时就验证配置合法性，避免生产环境跑起来才发现配置缺失。"
+    },
+    {
+      "type": "explain",
+      "title": "Filter 管道：MVC 层的中间件复用",
+      "content": "Filter 是 MVC/Razor Pages 层面的管道机制，和中间件管道是两套独立的管道，但设计思想完全相同——责任链 + 有序执行。\n\n**五种 Filter 的执行顺序**：\n\n1. **Authorization Filter**：最先执行，决定用户是否有权访问。短路方式：返回 `ForbidResult`，后续 Filter 和 Action 都不执行。\n2. **Resource Filter**：`IResourceFilter`。在模型绑定前后执行，可以短路整个请求（`ResultExecutingContext.Cancel = true`）。适合实现缓存——命中缓存直接返回结果，跳过 Action 执行。\n3. **Action Filter**：`IActionFilter` / `IAsyncActionFilter`。在 Action 方法前后执行，最常用。可以修改参数、替换返回值、记录耗时。\n4. **Exception Filter**：`IExceptionFilter`。Action 或后续 Filter 抛异常时执行。全局异常处理、统一错误格式。\n5. **Result Filter**：`IResultFilter`。在结果（如 View 渲染、JSON 序列化）前后执行。\n\n**Filter 与中间件的区别**：\n- 中间件工作在 HTTP 管道层面，对所有请求生效，不关心 MVC 概念。\n- Filter 工作在 MVC 层面，知道 Controller、Action、ModelState、ViewData。\n- 执行顺序：中间件在 Filter 外层。请求先经过中间件管道（认证、CORS、路由），再进入 Filter 管道，最后执行 Action。\n- 异常传播：Filter 内的异常被 Exception Filter 捕获；如果 Exception Filter 也没处理，异常会冒泡到中间件管道，由 `UseExceptionHandler` 捕获。"
+    },
+    {
+      "type": "explain",
+      "title": "IHostedService 与 BackgroundService：后台任务的生命周期绑定",
+      "content": "ASP.NET Core 的后台任务不是「开个线程跑」这么简单。`IHostedService` 把后台任务的 Start/Stop 绑定到 Host 生命周期，保证：应用启动后才开始工作，优雅关闭时有序停止。\n\n**BackgroundService 是简化封装**：\n```csharp\npublic class OrderCleanupService : BackgroundService\n{\n    protected override async Task ExecuteAsync(CancellationToken stoppingToken)\n    {\n        while (!stoppingToken.IsCancellationRequested)\n        {\n            await DoWorkAsync();\n            await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);\n        }\n    }\n}\n```\n\n**StartAsync 与 ExecuteAsync 的时序区别**：`StartAsync` 在 Host 启动时被调用，它会 fire-and-forget 调用 `ExecuteAsync`。这意味着 `StartAsync` 不会阻塞 Host 启动——`ExecuteAsync` 在后台运行。多个 HostedService 的 `StartAsync` 按注册顺序依次调用，但它们的 `ExecuteAsync` 是并行运行的。\n\n**优雅关闭的三个阶段**：\n1. Host 触发 `ApplicationStopping`——应用开始关闭流程。\n2. Host 调用每个 HostedService 的 `StopAsync`——`stoppingToken` 被取消，`ExecuteAsync` 应该在 `stoppingToken` 信号后尽快退出。\n3. Host 等待 `ShutdownTimeout`（默认 5 秒）——超时后强制终止。\n\n**常见问题**：\n- 忘记检查 `stoppingToken`：`ExecuteAsync` 是一个无限循环，如果不检查 `stoppingToken.IsCancellationRequested`，`StopAsync` 只能等超时后强制杀掉。EF Core 操作不检查 token 会导致关闭时数据库连接不释放。\n- 在 HostedService 中用 Scoped 服务：HostedService 是 Singleton 生命周期，直接注入 Scoped 服务（如 DbContext）会捕获第一个 scope。正确做法是注入 `IServiceScopeFactory`，每次执行时创建新 scope：`using var scope = _scopeFactory.CreateScope();`"
     },
     {
       "type": "diagram",
@@ -54,55 +69,67 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | 简单工厂 | 抽象工厂 | 工厂方法 |\n| --- | --- | --- | --- |\n| 创建对象 | 单个 | 一系列 | 单个 |\n| 扩展性 | 差（修改工厂） | 好（新增工厂） | 好（新增子类） |\n| 复杂度 | 低 | 高 | 中 |\n| 适用场景 | 简单创建 | 产品族 | 延迟到子类 |"
+      "title": "DI 三种生命周期的创建时机、风险与适用场景",
+      "content": "| 维度 | Transient | Scoped | Singleton |\n| --- | --- | --- | --- |\n| 创建时机 | 每次 GetService 都 new | 每个 IServiceScope 内首次访问 | 容器级别首次访问 |\n| 销毁时机 | scope 结束时（由 scope 管理） | scope 结束时 | 应用关闭时 |\n| 注入 Singleton 的后果 | 无（每次拿新的，符合预期） | 会抛异常（Scoped 不能注入 Singleton） | 无（Singleton 可注入任何生命周期） |\n| 注入 Scoped 的后果 | 每次请求 new 一个新实例（浪费但不报错） | 正常（同 scope 共享） | 第一个请求的实例被永久捕获（DbContext 并发问题） |\n| 典型使用 | 无状态工具类、策略对象 | DbContext、Unit of Work、请求级缓存 | 配置对象、HttpClientFactory、全局缓存 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | 事件 | IObservable | 事件总线 |\n| --- | --- | --- | --- |\n| 耦合度 | 中（发布者知道订阅者） | 中 | 低（完全解耦） |\n| 语法 | event 关键字 | Subscribe 方法 | 自定义 |\n| 适用场景 | 控件事件 | 响应式编程 | 跨组件通信 |\n| 框架支持 | 内置 | Rx.NET | 需要实现 |"
+      "title": "中间件 vs Filter vs 装饰器：三种增强机制对比",
+      "content": "| 维度 | 中间件（Middleware） | Filter（MVC Filter） | 装饰器（Decorator） |\n| --- | --- | --- | --- |\n| 工作层级 | HTTP 管道 | MVC 管道 | 服务方法内部 |\n| 知道 MVC 概念 | 不知道（只看到 HttpContext） | 知道（Controller、Action、ModelState） | 不知道（只知道接口） |\n| 执行时机 | 所有请求 | MVC 请求（路由到 Controller/Action 的请求） | 每次服务方法调用 |\n| 组合方式 | Use 注册顺序决定 | Order 属性决定 | DI 注册时手动组装 |\n| 典型应用 | 认证、CORS、日志、异常处理 | 参数校验、缓存 Action 结果、统一异常格式 | 日志装饰、指标装饰、缓存装饰 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | 装饰器 | 继承 | 中间件 |\n| --- | --- | --- | --- |\n| 动态性 | 运行时 | 编译时 | 运行时 |\n| 组合方式 | 灵活组合 | 固定层次 | 管道顺序 |\n| 适用场景 | 功能增强 | is-a 关系 | 请求处理 |\n| 示例 | 缓存、日志 | 控件继承 | ASP.NET Core |"
+      "title": "IOptions 三兄弟：何时读配置、能否热更新",
+      "content": "| 维度 | IOptions<T> | IOptionsSnapshot<T> | IOptionsMonitor<T> |\n| --- | --- | --- | --- |\n| 生命周期 | Singleton | Scoped | Singleton |\n| 读取时机 | 启动时读一次 | 每个请求读一次 | 启动时读 + OnChange 实时通知 |\n| 热更新 | 不支持 | 支持（下个请求生效） | 支持（立即生效） |\n| 能否注入 Singleton | 可以 | 不可以（Scoped 不能注入 Singleton） | 可以 |\n| 典型场景 | 不变的配置（数据库连接格式） | 需要热更新的业务配置 | 需要实时响应的配置（功能开关） |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Collections.Generic;\nusing System.Threading.Tasks;\nusing Microsoft.Extensions.DependencyInjection;\n\nnamespace DesignPatternsDemo\n{\n    // 工厂模式\n    public interface INotification\n    {\n        Task SendAsync(string to, string message);\n    }\n\n    public class EmailNotification : INotification\n    {\n        public Task SendAsync(string to, string message)\n        {\n            Console.WriteLine($\"Sending email to {to}: {message}\");\n            return Task.CompletedTask;\n        }\n    }\n\n    public class SmsNotification : INotification\n    {\n        public Task SendAsync(string to, string message)\n        {\n            Console.WriteLine($\"Sending SMS to {to}: {message}\");\n            return Task.CompletedTask;\n        }\n    }\n\n    public interface INotificationFactory\n    {\n        INotification Create();\n    }\n\n    public class EmailNotificationFactory : INotificationFactory\n    {\n        public INotification Create() => new EmailNotification();\n    }\n\n    public class SmsNotificationFactory : INotificationFactory\n    {\n        public INotification Create() => new SmsNotification();\n    }\n\n    // 依赖注入 + 工厂\n    public class NotificationService\n    {\n        private readonly INotificationFactory _factory;\n\n        public NotificationService(INotificationFactory factory)\n        {\n            _factory = factory;\n        }\n\n        public async Task NotifyAsync(string to, string message)\n        {\n            var notification = _factory.Create();\n            await notification.SendAsync(to, message);\n        }\n    }\n\n    // 装饰器模式\n    public interface ICacheService\n    {\n        Task<T> GetAsync<T>(string key);\n        Task SetAsync<T>(string key, T value, TimeSpan? expiry = null);\n    }\n\n    public class InMemoryCacheService : ICacheService\n    {\n        private readonly Dictionary<string, (object Value, DateTime Expiry)> _cache = new();\n\n        public Task<T> GetAsync<T>(string key)\n        {\n            if (_cache.TryGetValue(key, out var entry) && entry.Expiry > DateTime.UtcNow)\n            {\n                return Task.FromResult((T)entry.Value);\n            }\n            return Task.FromResult(default(T));\n        }\n\n        public Task SetAsync<T>(string key, T value, TimeSpan? expiry = null)\n        {\n            _cache[key] = (value, DateTime.UtcNow.Add(expiry ?? TimeSpan.FromMinutes(5)));\n            return Task.CompletedTask;\n        }\n    }\n\n    public class LoggingCacheDecorator : ICacheService\n    {\n        private readonly ICacheService _inner;\n\n        public LoggingCacheDecorator(ICacheService inner)\n        {\n            _inner = inner;\n        }\n\n        public async Task<T> GetAsync<T>(string key)\n        {\n            Console.WriteLine($\"[LOG] Getting cache: {key}\");\n            var result = await _inner.GetAsync<T>(key);\n            Console.WriteLine($\"[LOG] Cache {(result != null ? \"hit\" : \"miss\")}: {key}\");\n            return result;\n        }\n\n        public async Task SetAsync<T>(string key, T value, TimeSpan? expiry = null)\n        {\n            Console.WriteLine($\"[LOG] Setting cache: {key}\");\n            await _inner.SetAsync(key, value, expiry);\n        }\n    }\n\n    public class MetricsCacheDecorator : ICacheService\n    {\n        private readonly ICacheService _inner;\n        private int _hits;\n        private int _misses;\n\n        public MetricsCacheDecorator(ICacheService inner)\n        {\n            _inner = inner;\n        }\n\n        public async Task<T> GetAsync<T>(string key)\n        {\n            var result = await _inner.GetAsync<T>(key);\n            if (result != null) _hits++;\n            else _misses++;\n            return result;\n        }\n\n        public Task SetAsync<T>(string key, T value, TimeSpan? expiry = null)\n        {\n            return _inner.SetAsync(key, value, expiry);\n        }\n\n        public double HitRate => _hits + _misses > 0 ? (double)_hits / (_hits + _misses) : 0;\n    }\n\n    // 观察者模式\n    public class EventBus\n    {\n        private readonly Dictionary<Type, List<Delegate>> _handlers = new();\n\n        public void Subscribe<T>(Action<T> handler)\n        {\n            var type = typeof(T);\n            if (!_handlers.ContainsKey(type))\n                _handlers[type] = new List<Delegate>();\n            _handlers[type].Add(handler);\n        }\n\n        public void Publish<T>(T @event)\n        {\n            var type = typeof(T);\n            if (_handlers.TryGetValue(type, out var handlers))\n            {\n                foreach (var handler in handlers)\n                {\n                    handler.DynamicInvoke(@event);\n                }\n            }\n        }\n    }\n\n    // 策略模式\n    public interface IDiscountStrategy\n    {\n        decimal CalculateDiscount(decimal amount);\n    }\n\n    public class NoDiscount : IDiscountStrategy\n    {\n        public decimal CalculateDiscount(decimal amount) => 0;\n    }\n\n    public class PercentageDiscount : IDiscountStrategy\n    {\n        private readonly decimal _percentage;\n\n        public PercentageDiscount(decimal percentage)\n        {\n            _percentage = percentage;\n        }\n\n        public decimal CalculateDiscount(decimal amount) => amount * _percentage / 100;\n    }\n\n    public class FixedDiscount : IDiscountStrategy\n    {\n        private readonly decimal _amount;\n\n        public FixedDiscount(decimal amount)\n        {\n            _amount = amount;\n        }\n\n        public decimal CalculateDiscount(decimal amount) => Math.Min(_amount, amount);\n    }\n\n    public class PricingService\n    {\n        private readonly IDiscountStrategy _discountStrategy;\n\n        public PricingService(IDiscountStrategy discountStrategy)\n        {\n            _discountStrategy = discountStrategy;\n        }\n\n        public decimal CalculateFinalPrice(decimal originalPrice)\n        {\n            var discount = _discountStrategy.CalculateDiscount(originalPrice);\n            return originalPrice - discount;\n        }\n    }\n\n    // 配置服务\n    public static class DesignPatternServiceExtensions\n    {\n        public static IServiceCollection AddDesignPatterns(this IServiceCollection services)\n        {\n            // 工厂模式\n            services.AddSingleton<INotificationFactory, EmailNotificationFactory>();\n            services.AddScoped<NotificationService>();\n\n            // 装饰器模式\n            services.AddSingleton<InMemoryCacheService>();\n            services.AddSingleton<ICacheService>(provider =>\n            {\n                var inner = provider.GetRequiredService<InMemoryCacheService>();\n                return new MetricsCacheDecorator(new LoggingCacheDecorator(inner));\n            });\n\n            // 观察者模式\n            services.AddSingleton<EventBus>();\n\n            // 策略模式\n            services.AddSingleton<IDiscountStrategy>(new PercentageDiscount(10));\n            services.AddScoped<PricingService>();\n\n            return services;\n        }\n    }\n}",
+      "title": "DI 生命周期陷阱、中间件管道与 BackgroundService 完整示例",
       "language": "csharp",
+      "content": "using Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Hosting;\nusing Microsoft.Extensions.Options;\nusing System;\nusing System.Threading;\nusing System.Threading.Tasks;\n\nnamespace AspNetCorePatterns\n{\n    // ===== 1. DI 生命周期陷阱演示 =====\n    public interface IOrderRepository { Task SaveAsync(); }\n    public class EfOrderRepository : IOrderRepository // 模拟 DbContext，Scoped 生命周期\n    {\n        private readonly Guid _id = Guid.NewGuid();\n        public Task SaveAsync()\n        {\n            Console.WriteLine($\"  Repository instance: {_id}\");\n            return Task.CompletedTask;\n        }\n    }\n\n    public class OrderProcessor // Singleton 服务\n    {\n        private readonly IOrderRepository _repo; // 危险：Scoped 注入 Singleton\n        public OrderProcessor(IOrderRepository repo)\n        {\n            _repo = repo; // 构造时捕获第一个 Scoped 实例\n            Console.WriteLine($\"  OrderProcessor created, captured repo: {_repo.GetHashCode()}\");\n        }\n        public Task ProcessAsync() => _repo.SaveAsync();\n    }\n\n    // ===== 2. Options 模式 =====\n    public class SmtpOptions\n    {\n        public string Host { get; set; } = \"\";\n        public int Port { get; set; } = 25;\n    }\n\n    // ===== 3. BackgroundService =====\n    public class QueueProcessorService : BackgroundService\n    {\n        private readonly IServiceScopeFactory _scopeFactory;\n        public QueueProcessorService(IServiceScopeFactory scopeFactory)\n        {\n            _scopeFactory = scopeFactory; // 注入工厂而非 Scoped 服务\n        }\n\n        protected override async Task ExecuteAsync(CancellationToken stoppingToken)\n        {\n            while (!stoppingToken.IsCancellationRequested)\n            {\n                // 正确做法：每次循环创建新 scope\n                using var scope = _scopeFactory.CreateScope();\n                var repo = scope.ServiceProvider.GetRequiredService<IOrderRepository>();\n                await repo.SaveAsync();\n                Console.WriteLine($\"  QueueProcessor: processed via {repo.GetHashCode()}\");\n\n                try\n                {\n                    await Task.Delay(2000, stoppingToken); // 响应取消信号\n                }\n                catch (OperationCanceledException)\n                {\n                    break; // 优雅退出\n                }\n            }\n            Console.WriteLine(\"  QueueProcessor: stopped gracefully\");\n        }\n    }\n\n    public static class Demo\n    {\n        public static async Task RunAsync()\n        {\n            // --- 生命周期陷阱演示 ---\n            Console.WriteLine(\"=== DI Lifecycle Trap ===\");\n            var services = new ServiceCollection();\n            services.AddScoped<IOrderRepository, EfOrderRepository>();\n            services.AddSingleton<OrderProcessor>(); // 危险注册！\n            var provider = services.BuildServiceProvider();\n\n            // 模拟两个请求\n            using (var scope1 = provider.CreateScope())\n            {\n                var processor = scope1.ServiceProvider.GetRequiredService<OrderProcessor>();\n                await processor.ProcessAsync(); // 请求 1\n            }\n            using (var scope2 = provider.CreateScope())\n            {\n                var processor = scope2.ServiceProvider.GetRequiredService<OrderProcessor>();\n                await processor.ProcessAsync(); // 请求 2，用的是同一个 repo！\n            }\n            // 输出会显示两次 SaveAsync 用的是同一个 Repository instance（同一个 _id）\n\n            // --- Options 演示 ---\n            Console.WriteLine(\"\\n=== Options Pattern ===\");\n            var optionsServices = new ServiceCollection();\n            optionsServices.AddOptions<SmtpOptions>()\n                .Configure(o => { o.Host = \"smtp.example.com\"; o.Port = 587; });\n            var optProvider = optionsServices.BuildServiceProvider();\n            var opts = optProvider.GetRequiredService<IOptions<SmtpOptions>>().Value;\n            Console.WriteLine($\"  SMTP: {opts.Host}:{opts.Port}\");\n        }\n    }\n}\n\n// ===== 中间件管道（在 Program.cs 中注册） =====\n// app.UseExceptionHandler(\"/error\");   // 1. 最先：捕获后续异常\n// app.UseHsts();                        // 2. 安全头\n// app.UseHttpsRedirection();            // 3. HTTPS\n// app.UseRouting();                      // 4. 路由解析\n// app.UseCors();                        // 5. CORS（路由后，认证前）\n// app.UseAuthentication();              // 6. 认证（建立 User）\n// app.UseAuthorization();               // 7. 授权（基于 User 决策）\n// app.UseEndpoints(endpoints => ...);   // 8. 最后：执行端点",
       "highlights": [
         {
-          "line": 9,
-          "note": "`public interface INotification` 定义了 ASP.NET Core 内置设计模式 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 18,
+          "note": "Singleton 服务在构造函数注入 Scoped 服务：构造函数只执行一次，捕获了第一个请求的 DbContext，后续请求共享同一个已失效实例。"
         },
         {
-          "line": 68,
-          "note": "`Task SetAsync<T>(string key, T value, TimeSpan? expiry = null);` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 52,
+          "note": "正确做法：注入 IServiceScopeFactory 而非 Scoped 服务本身，每次循环创建新 scope，用完即 dispose。"
         },
         {
-          "line": 3,
-          "note": "`using System.Threading.Tasks;` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+          "line": 57,
+          "note": "Task.Delay(stoppingToken) 让 delay 响应取消信号，catch OperationCanceledException 后优雅退出循环。"
         },
         {
-          "line": 19,
-          "note": "`return Task.CompletedTask;` 对应最终输出，检查这里可以确认边界值是否和题意一致。"
+          "line": 76,
+          "note": "验证陷阱：两次请求的 OrderProcessor.ProcessAsync 会输出相同的 Repository instance，证明 Scoped 被 Singleton 捕获。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "工厂模式在 .NET 中广泛应用，ASP.NET Core 的依赖注入容器本质上就是工厂。简单工厂通过 switch 或 if 创建对象，抽象工厂创建一系列相关对象，工厂方法在子类中决定创建哪种对象。\n\n机制要点：\n- 依赖注入是控制反转的具体实现，.NET Core 内置了 DI 容器。通过构造函数注入依赖，可以轻松替换实现，便于测试。支持三种生命周期：Transient、Scoped、Singleton。\n- 装饰器模式动态添加功能，ASP.NET Core 的 HttpClient 中间件就是装饰器链。装饰器实现与被装饰对象相同的接口，在调用前后添加逻辑。\n- 观察者模式实现事件驱动，.NET 的 event 和 IObservable<T> 都是观察者模式。事件总线（EventBus）可以实现松耦合的事件发布订阅。\n- 中间件模式是 ASP.NET Core 的核心，每个中间件处理请求的一部分，形成管道。可以通过组合中间件实现复杂功能。\n- 策略模式封装算法，使其可以互换。定价策略、折扣策略等都是策略模式的应用。\n- 在实际开发中，我会根据需求选择合适的模式，避免过度设计。",
+      "content": "**一句话结论**\nASP.NET Core 的骨架就是设计模式的运行时实现：DI 容器是带生命周期管理的工厂，中间件管道是责任链，Options 是策略化配置绑定，Filter 是 MVC 层的中间件复用，IHostedService 把后台任务绑定到 Host 生命周期。\n\n**DI 容器 = 工厂 + 生命周期**\n- Transient 每次 new、Scoped 请求级共享、Singleton 应用级共享\n- 最大陷阱：Scoped 服务注入 Singleton → DbContext 并发问题\n- 工厂注册：`services.AddTransient<T>(provider => ...)` 用于运行时决策\n\n**中间件 = 责任链 + 洋葱模型**\n- `await _next(context)` 之前是请求阶段，之后是响应阶段\n- 顺序不能乱的根本原因：功能依赖（路由→认证→授权→端点）\n- 短路：不调 next，后续中间件不执行\n\n**Options = 策略化配置**\n- IOptions（单例读一次）/ IOptionsSnapshot（请求级）/ IOptionsMonitor（实时通知）\n- ValidateOnStart 让配置错误在启动时暴露\n\n**Filter = MVC 层管道**\n- 五种 Filter 执行顺序：Authorization → Resource → Action → Exception → Result\n- Filter 知道 MVC 概念，中间件只知道 HttpContext\n\n**IHostedService = 后台任务生命周期绑定**\n- ExecuteAsync 在后台运行，stoppingToken 控制优雅关闭\n- 正确使用 Scoped 服务：注入 IServiceScopeFactory 创建新 scope\n\n**实际开发中的模式选择**\n- 需要功能增强 → 装饰器（日志、指标、缓存叠加）\n- 需要算法替换 → 策略模式（定价、路由选择）\n- 需要请求级处理 → 中间件（认证、CORS、日志）\n- 需要 Action 级处理 → Filter（参数校验、缓存结果）\n\n**一句话总结**\n面试时不要背模式定义，要讲「框架里怎么落地、注册错了会怎样、顺序为什么不能乱」——这才是 .NET 工程师该有的回答。",
       "followUpQuestions": [
         {
-          "question": "面试官追问「ASP.NET Core 内置设计模式」时，最应该展开哪条机制链？",
-          "answer": "回答「ASP.NET Core 内置设计模式」时先抓住 理解常见的设计模式，再展开 知道工厂模式的变体。ASP.NET Core 内置设计模式 不能停在定义层，要把 .NET 版本、GC 指标、输出结果和 P95 延迟 串起来，才像真实 .NET 工程里的判断。"
+          "question": "把 Scoped 服务注入 Singleton 会怎样？为什么？",
+          "answer": "Singleton 的构造函数只执行一次，它捕获了第一个请求的 DbContext 实例。后续所有请求共享这个实例——EF Core 不支持并发操作，典型报错是 `A second operation was started on this context instance before a previous operation completed`。解决方法：在 Singleton 服务中注入 `IServiceScopeFactory`，每次操作时 `CreateScope()` 获取新的 Scoped 实例。"
         },
         {
-          "question": "如果「ASP.NET Core 内置设计模式」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "可以先确认现象是否落在「知道工厂模式的变体」，再结合日志、指标、输入规模和依赖状态验证。"
+          "question": "中间件的顺序为什么不能乱？举一个违反顺序导致的线上问题。",
+          "answer": "中间件之间存在功能依赖。`UseAuthentication` 必须在 `UseAuthorization` 之前，因为授权依赖认证建立的 `HttpContext.User`。如果调换，User 是空的，授权会直接返回 403。`UseRouting` 必须在 `UseEndpoints` 之前，否则路由未解析就执行 endpoint，直接 404。这些不是建议，是功能依赖。"
+        },
+        {
+          "question": "Filter 和中间件有什么区别？什么时候用哪个？",
+          "answer": "中间件工作在 HTTP 管道层，对所有请求生效，只看到 HttpContext；Filter 工作在 MVC 层，只对路由到 Controller/Action 的请求生效，知道 Action 参数、ModelState 等。选择标准：需要操作 MVC 概念（参数校验、Action 缓存）用 Filter；需要对所有请求生效（认证、CORS、静态文件）用中间件。执行顺序：中间件在外层，先执行。"
+        },
+        {
+          "question": "BackgroundService 的 ExecuteAsync 不检查 stoppingToken 会怎样？",
+          "answer": "`StopAsync` 调用时会取消 stoppingToken，但如果 `ExecuteAsync` 不检查这个 token，它会继续运行直到 `ShutdownTimeout`（默认 5 秒）超时被强制终止。这意味着在优雅关闭时，数据库事务、消息确认等操作可能被中断。正确做法是在 `Task.Delay` 和关键操作处传递 stoppingToken，并 catch `OperationCanceledException`。"
+        },
+        {
+          "question": "IOptions、IOptionsSnapshot、IOptionsMonitor 该选哪个？",
+          "answer": "`IOptions<T>` 是 Singleton，启动时读一次，不能热更新，适合不变的配置。`IOptionsSnapshot<T>` 是 Scoped，每个请求读一次最新值，适合需要热更新的业务配置（改 appsettings.json 后下个请求生效）。`IOptionsMonitor<T>` 是 Singleton 但支持 `OnChange` 回调，配置变化时立即通知，适合需要实时响应的场景（功能开关）。注意 IOptionsSnapshot 不能注入 Singleton 服务。"
         }
       ]
     },
@@ -110,33 +137,43 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "工厂模式的三种变体及适用场景",
-        "依赖注入在 .NET 中的实现方式",
-        "装饰器模式的实现和应用",
-        "观察者模式和事件驱动",
-        "中间件模式的工作原理",
-        "策略模式的使用场景"
+        "能解释 DI 三种生命周期（Transient/Scoped/Singleton）的创建时机和销毁时机",
+        "能说明 Scoped 服务注入 Singleton 的真实后果（DbContext 并发问题）及解决方法",
+        "能描述中间件管道的洋葱模型（next 调用前/后的执行顺序）",
+        "能解释中间件顺序不能乱的三个具体依赖关系",
+        "能区分 IOptions / IOptionsSnapshot / IOptionsMonitor 的读取时机和适用场景",
+        "能说出五种 MVC Filter 的执行顺序和各自职责",
+        "能解释 IHostedService 的 StartAsync / ExecuteAsync 时序差异和优雅关闭机制",
+        "能说明 BackgroundService 中正确使用 Scoped 服务的方式（注入 IServiceScopeFactory）",
+        "能区分中间件和 Filter 的工作层级和适用场景"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "dotnet.advanced.design-patterns.recall.1",
-      "prompt": "ASP.NET Core 的 DI 容器体现了哪些设计模式？生命周期选择错误会带来什么问题？",
+      "prompt": "ASP.NET Core 的 DI 容器如何体现工厂模式？三种生命周期的创建和销毁时机分别是什么？把 Scoped 服务注入 Singleton 会出什么问题？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "dotnet.advanced.design-patterns.recall.2",
-      "prompt": "中间件管道为什么可以看成责任链/装饰器？next 调用顺序如何影响请求和响应？",
+      "prompt": "中间件管道为什么是责任链模式？next 调用顺序如何形成洋葱模型？中间件顺序为什么不能乱——举一个具体依赖关系。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "dotnet.advanced.design-patterns.recall.3",
-      "prompt": "ASP.NET Core 内置设计模式 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "Filter 管道和中间件管道有什么区别？什么时候用 Filter，什么时候用中间件？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.advanced.design-patterns.recall.4",
+      "prompt": "BackgroundService 的 ExecuteAsync 如何优雅停止？在后台任务中使用 Scoped 服务（如 DbContext）的正确方式是什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -144,20 +181,22 @@
   ],
   "rubric": {
     "mustHave": [
-      "理解常见的设计模式",
-      "知道工厂模式的变体",
-      "了解依赖注入的原理",
-      "掌握装饰器模式的实现"
+      "能解释 DI 三种生命周期（Transient/Scoped/Singleton）的创建时机、销毁时机和典型使用场景",
+      "能说明 Scoped 服务注入 Singleton 的后果及 IServiceScopeFactory 的解决方式",
+      "能描述中间件管道的洋葱模型（next 前请求、next 后响应）和顺序不能乱的根本原因",
+      "能区分中间件和 Filter 的工作层级（HTTP 管道 vs MVC 管道）和适用场景"
     ],
     "goodToHave": [
-      "了解策略模式和命令模式",
-      "知道中间件模式的工作原理",
-      "理解设计模式在框架中的应用"
+      "能区分 IOptions / IOptionsSnapshot / IOptionsMonitor 的生命周期、读取时机和热更新支持",
+      "能说出五种 MVC Filter 的执行顺序（Authorization → Resource → Action → Exception → Result）",
+      "能解释 IHostedService 的 StartAsync / ExecuteAsync 时序和 stoppingToken 的优雅关闭机制",
+      "能说明装饰器模式在 DI 容器中的注册方式（工厂 lambda 组装装饰器链）"
     ],
     "commonMistakes": [
-      "只列出 ASP.NET Core、设计模式、依赖注入，但说不出触发条件、状态变化和验证证据",
-      "把「ASP.NET Core 内置设计模式」的适用场景、失效条件和相邻概念混在一起",
-      "遇到.NET 工程里的真实问题时，不能说明「ASP.NET Core 内置设计模式」应该观察哪些状态、日志或指标"
+      "只列举模式名称和定义，说不出框架中具体是怎么落地的",
+      "不知道 Scoped 注入 Singleton 的后果，或者知道后果但说不出 IServiceScopeFactory 的解决方案",
+      "混淆中间件和 Filter 的执行顺序和工作层级",
+      "认为 BackgroundService 的 StartAsync 会阻塞到 ExecuteAsync 完成"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -168,6 +207,6 @@
   },
   "prerequisites": [],
   "interviewFrequency": "low",
-  "interviewerFocus": "考察是否能围绕「ASP.NET Core 内置设计模式」说清理解常见的设计模式、知道工厂模式的变体，并放到.NET 工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察是否能围绕 ASP.NET Core 框架，说清 DI 容器的工厂模式落地（生命周期选择与陷阱）、中间件管道的责任链实现（洋葱模型与顺序依赖）、Options 模式的策略化配置、Filter 管道与中间件的区别、IHostedService 的生命周期绑定与 Scoped 服务正确用法，并放到真实工程场景中解释出错后果和排查思路。",
+  "updatedAt": "2026-06-23"
 }

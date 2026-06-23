@@ -4,7 +4,7 @@
   "category": "web-python",
   "group": "web-python",
   "title": "ORM 与数据库交互",
-  "summary": "讲清 ORM（SQLAlchemy）的对象映射与 Session 事务、N+1 问题与预加载、ORM 与原生 SQL 取舍，以及 Alembic 迁移。",
+  "summary": "讲清 SQLAlchemy 的 ORM 模型映射与 Session 工作单元、事务生命周期与 flush 时机、N+1 问题的根因与 joinedload/selectinload 的 SQL 差异、ORM 与原生 SQL/SQL 表达式的取舍边界、异步 ORM 的 engine 配置与 async context、以及 Alembic 迁移的 autogenerate 局限与生产流程。",
   "tags": [
     "Python",
     "SQLAlchemy",
@@ -13,19 +13,39 @@
     "Alembic"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 40,
   "order": 200,
   "recommendWeight": 75,
   "learningCards": [
     {
       "type": "explain",
-      "title": "ORM 与数据库交互：SQLAlchemy ORM、Session 与事务",
-      "content": "## 一、SQLAlchemy ORM\n\nSQLAlchemy 是 Python 最成熟的 ORM 框架，分为 Core（SQL 表达式）和 ORM（对象关系映射）两层。\n\n### 模型定义\n\n```python\nfrom sqlalchemy import Column, Integer, String, ForeignKey\nfrom sqlalchemy.orm import DeclarativeBase, relationship\n\nclass Base(DeclarativeBase):\n    pass\n\nclass User(Base):\n    __tablename__ = \"users\"\n\n    id = Column(Integer, primary_key=True)\n    name = Column(String(50), nullable=False)\n    email = Column(String(100), unique=True)\n    posts = relationship(\"Post\", back_populates=\"author\")\n\nclass Post(Base):\n    __tablename__ = \"posts\"\n\n    id = Column(Integer, primary_key=True)\n    title = Column(String(200))\n    user_id = Column(Integer, ForeignKey(\"users.id\"))\n    author = relationship(\"User\", back_populates=\"posts\")\n```\n\n## 二、Session 与事务\n\n```python\nfrom sqlalchemy.orm import Session\n\nwith Session(engine) as session:\n    # 自动事务管理\n    user = User(name=\"Alice\", email=\"alice@example.com\")\n    session.add(user)\n    session.commit()  # 提交事务\n    # 退出 with 块时自动 close\n```\n\n## 三、查询\n\n```python\n# 基础查询\nsession.query(User).filter(User.name == \"Alice\").all()\nsession.query(User).filter(User.name.like(\"%li%\")).first()\nsession.query(User).count()\n\n# 关系查询\nuser = session.get(User, 1)  # 主键查找\nposts = session.query(Post).join(User).filter(User.name == \"Alice\").all()\n```"
+      "title": "SQLAlchemy 的架构分层：Core 与 ORM",
+      "content": "SQLAlchemy 不是一个单纯的 ORM，它有两层设计：\n\n**Core 层（SQL 表达式语言）**：用 Python 对象构建 SQL 语句，不涉及对象映射。`select()`、`insert()`、`update()` 等函数直接生成 SQL，结果是 Row 对象（类似 named tuple）。适合需要精细控制 SQL、批量操作、或不想承担 ORM 开销的场景。\n\n**ORM 层**：在 Core 之上加了对象映射——把数据库表映射成 Python 类，把行映射成实例，管理对象状态（transient / pending / persistent / detached）。Session 是 ORM 的核心，负责追踪对象变更并生成对应的 SQL。\n\n2.0 版本统一了两层的查询 API：`session.execute(select(User).where(...))`。这条语句底层走的是 Core 的 select 构造，但 ORM 层会自动把结果 Row 转换成映射实例。所以 2.0 风格不是「抛弃 ORM 用 Core」，而是用统一的 select 构造替代了 1.x 的 `session.query()`。\n\n理解这个分层很重要：当你发现 ORM 生成的 SQL 不够好时，可以随时「下沉」到 Core 层手写 SQL 表达式，不需要完全放弃 ORM 的模型定义和 Session 管理。"
     },
     {
       "type": "explain",
-      "title": "ORM 与数据库交互：N+1 查询问题、异步 ORM（SQLAlchemy 1.4+ / 2.0+）",
-      "content": "## 四、N+1 查询问题\n\n```python\n# ❌ N+1：查询每个用户时额外 N 次 SQL 查文章\nusers = session.query(User).all()\nfor user in users:\n    print(user.posts)  # 触发了 N 次额外查询\n\n# ✅ 使用 joinedload 或 selectinload\nfrom sqlalchemy.orm import selectinload\n\nusers = session.query(User).options(selectinload(User.posts)).all()\n# 只需 2 次 SQL\n```\n\n## 五、异步 ORM（SQLAlchemy 1.4+ / 2.0+）\n\n```python\nfrom sqlalchemy.ext.asyncio import create_async_engine, AsyncSession\n\nengine = create_async_engine(\"sqlite+aiosqlite:///db.sqlite3\")\n\nasync with AsyncSession(engine) as session:\n    result = await session.execute(select(User).where(User.name == \"Alice\"))\n    user = result.scalar_one()\n```\n\n## 六、迁移（Alembic）\n\n```bash\nalembic init alembic          # 初始化\nalembic revision --autogenerate -m \"add user table\"\nalembic upgrade head          # 应用迁移\n```\n\n## 七、ORM vs 原生 SQL\n\n| ORM | 原生 SQL |\n| --- | --- |\n| 开发速度快 | 性能极致 |\n| 防止 SQL 注入 | 需要手动参数化 |\n| 数据库无关 | 特定数据库优化 |\n| 隐藏复杂度 | 完全可控 |\n| 适合 CRUD 多表操作 | 适合复杂查询、报表 |\n| N+1 等性能陷阱 | 可预见的 SQL |"
+      "title": "Session 是工作单元，不是数据库连接",
+      "content": "Session 的核心设计模式是 Unit of Work（工作单元），它不是数据库连接的包装——连接由底层 Engine 的连接池管理。Session 的职责是：\n\n**追踪对象状态**：Session 维护一个 Identity Map（身份映射），用 `(主键, 类型)` 做 key 缓存已加载的实例。同一主键在同一 Session 内只会有同一个 Python 对象——这是 ORM 保证一致性的基础，也是 `session.get(User, 1)` 第二次调用不发 SQL 的原因。\n\n**脏数据检测（flush 时机）**：当你修改了一个已持久化的对象属性（如 `user.name = 'Bob'`），Session 会在下一次 flush 时自动检测变更并生成 UPDATE。flush 通常发生在 `session.commit()` 之前自动触发，也可以手动 `session.flush()` 提前将变更写入数据库（但不提交事务）。commit = flush + commit 事务。\n\n**事务边界**：Session 默认工作在事务模式下。`Session(engine)` 或 `with Session(engine) as session:` 在第一次使用时从连接池获取连接并开启事务。commit 提交并释放连接回池，rollback 回滚，close 释放连接（如果在事务中则 rollback 后释放）。\n\n**常见误用**：在请求级别外持有 Session（如全局 Session）会导致 Identity Map 膨胀、对象状态跨请求污染、事务长期不提交持有连接。正确做法：每个请求/操作一个 Session，用完即关。FastAPI 的惯例是用 Depends 注入，yield Session 保证请求结束时 close。"
+    },
+    {
+      "type": "explain",
+      "title": "N+1 问题的根因与两种预加载的 SQL 差异",
+      "content": "N+1 是 ORM 最常见的性能陷阱。触发条件：\n```python\nusers = session.execute(select(User)).scalars().all()  # 1 条 SQL\nfor user in users:\n    print(user.posts)  # 每次访问触发 1 条延迟加载 SQL\n```\n第 1 步查出 N 个 User，第 2 步遍历时访问 `user.posts`——因为 SQLAlchemy 默认对 relationship 使用 lazy loading（延迟加载），每次访问关联属性时才发一条额外查询。总共 1 + N 条 SQL。\n\n**为什么默认是 lazy？**因为 eager loading（立即加载）会在查 User 时一并加载所有关联，如果 User 有 posts、comments、tags 等多个关联，全部 eager 会导致巨大的 JOIN 或多次查询，很多关联可能根本用不到。lazy 是安全默认值，代价是开发者必须在知道会用到关联时主动声明预加载。\n\n**joinedload**：生成 LEFT OUTER JOIN，一条 SQL 把主表和关联表一起查出来。适合一对一或一对多中关联记录较少的场景。注意：如果关联表有多条记录，JOIN 后主表行会重复（笛卡尔积），SQLAlchemy 会自动去重，但数据量大时结果集膨胀。另一个问题是 joinedload 不能用于查询后进一步 filter 关联表的条件（那是 join 的职责）。\n\n**selectinload**：先查主表拿到所有主键，再用 `WHERE id IN (...)` 查关联表。两条独立 SQL，不走 JOIN。适合一对多场景——避免了 JOIN 的行膨胀问题，且 IN 列表通常比 JOIN 更快（特别是主表行数不多时）。SQLAlchemy 官方推荐一对多优先用 selectinload。\n\n**subqueryload**：先查主表，再用子查询加载关联。实际使用较少，性能通常不如 selectinload。\n\n**验证方法**：`create_engine(..., echo=True)` 或 `logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)` 打印实际 SQL，确认是否真的只发了预期条数的查询。"
+    },
+    {
+      "type": "explain",
+      "title": "ORM vs 原生 SQL vs SQL 表达式：三层取舍",
+      "content": "很多面试只问「ORM vs 原生 SQL」，实际有三层可以选：\n\n**ORM（session + 映射类）**：开发最快，自动处理对象状态、关系加载、变更检测。适合 CRUD 密集的业务代码。代价是抽象层开销——Identity Map 有内存成本，flush 时机不透明（大量 INSERT 时默认一条一条发），复杂查询要绕很多弯。\n\n**SQL 表达式（Core 层）**：`select(User).where(...)` 不经过 ORM 映射，结果是 Row 对象。适合批量查询、聚合统计、只需要部分字段的场景。可以配合 ORM 的模型定义用 `User.__table__` 获取表对象。性能接近原生 SQL，但仍有 Python 层的 SQL 构建开销。\n\n**原生 SQL（text()）**：`session.execute(text('SELECT ...'))` 或直接用底层连接。适合窗口函数、CTE、特定数据库方言的优化语法（如 PostgreSQL 的 JSONB 操作、LATERAL JOIN）。完全可控，但丧失 ORM 的类型安全和数据库无关性。\n\n**实战原则**：\n- 增删改 + 关联操作 → ORM（事务和状态管理省心）\n- 列表页、统计页 → SQL 表达式（select 所需字段，避免加载完整模型）\n- 复杂报表、数据库特定优化 → 原生 SQL\n- 三者可以混用——同一个 Session 内可以同时用 ORM 和原生 SQL，事务是统一的。"
+    },
+    {
+      "type": "explain",
+      "title": "异步 ORM 的机制与常见陷阱",
+      "content": "SQLAlchemy 1.4 起支持异步，2.0 正式稳定。核心变化是用 `AsyncSession` 和 `create_async_engine` 替换同步版本。\n\n**asyncpg vs psycopg2**：同步 SQLAlchemy 默认用 psycopg2 连接 PostgreSQL；异步必须用 asyncpg（或 psycopg 3 的 async 模式）。连接字符串从 `postgresql://` 变成 `postgresql+asyncpg://`。asyncpg 是纯 C 实现的异步驱动，性能高于 psycopg2。\n\n**AsyncSession 的工作方式**：API 和同步 Session 对应，但所有 IO 操作加 `await`。内部通过 greenlet 协程在异步引擎和 ORM 代码之间切换——ORM 的映射逻辑仍是同步代码，只有数据库通信部分是异步的。这意味着你不能在 ORM 的 relationship 延迟加载中自动 await（延迟加载在异步上下文中会报 `MissingGreenlet` 错误）。\n\n**MissingGreenlet 陷阱**：这是异步 ORM 最常见的错误。触发场景：\n```python\nasync with AsyncSession(engine) as session:\n    user = await session.get(User, 1)\n    print(user.posts)  # ❌ MissingGreenlet: 延迟加载不支持在异步中直接用\n```\n解决：必须用预加载（joinedload / selectinload）或显式 `await session.run_sync(lambda s: user.posts)`。\n\n**FastAPI 集成惯例**：\n```python\nasync def get_db():\n    async with AsyncSession(engine) as session:\n        yield session\n```\n用 Depends 注入 AsyncSession，请求结束时自动关闭。注意：如果用了 Alembic 迁移，Alembic 默认是同步的，需要配置 `async_engine` 或单独跑迁移脚本。"
+    },
+    {
+      "type": "explain",
+      "title": "Alembic 迁移的流程、autogenerate 局限与生产实践",
+      "content": "Alembic 是 SQLAlchemy 官方的数据库迁移工具，解决「代码改了模型，数据库 schema 怎么同步更新」的问题。\n\n**基本流程**：\n1. `alembic init alembic` — 生成迁移目录和配置\n2. 配置 `env.py` 中的 target_metadata = Base.metadata\n3. `alembic revision --autogenerate -m \"描述\"` — 对比当前模型和数据库实际 schema，自动生成迁移脚本\n4. 审查生成的脚本（必须）\n5. `alembic upgrade head` — 应用到最新版本\n\n**autogenerate 检测不到的变更**（这是面试高频追问）：\n- **列重命名**：会识别为「删旧列 + 加新列」，数据会丢失。必须手动把 `op.drop_column` + `op.add_column` 改成 `op.alter_column(old_name, new_column_name=new_name)`\n- **表重命名**：同理，需手动改 `op.rename_table`\n- **索引类型变更**：如 B-tree 改 GIN，不会检测\n- **视图、触发器、存储过程**：autogenerate 不管\n- **数据迁移**：schema 变更不包含数据转换，如拆列、合并字段需手动写 `op.execute()`\n- **约束名称变更**：如果没显式命名约束，不同数据库自动生成的名称不同，迁移可能报错\n\n**生产实践**：\n- 每次模型变更后立即生成迁移，不要攒多个大变更\n- 迁移脚本必须进版本控制\n- 生产环境迁移前先在 staging 环境跑一遍，确认 SQL 符合预期\n- 大表变更（加列、加索引）考虑 online DDL 工具（如 pg_repack、gh-ost）或分步迁移\n- 不要手动修改已应用的 migration 文件——用新迁移修正"
     },
     {
       "type": "diagram",
@@ -47,33 +67,66 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | SQLAlchemy 1.x 风格 | SQLAlchemy 2.0 风格 |\n| --- | --- | --- |\n| 查询 | `session.query(User).filter(...)` | `session.execute(select(User).where(...))` |\n| 结果 | `Query` 对象 | `Result`（scalars 获取模型实例） |\n| 延迟加载 | 默认开启 | 默认开启（但推荐显式声明） |\n| 异步 | 需扩展 | 原生 async support |\n| 类型提示 | 弱 | 强（更好的 IDE 支持） |\n| 迁移路径 | — | 新旧兼容（1.x 在 2.0 仍可用） |\n| 推荐 | ❌ 旧项目 | ✅ 新项目（2024+） |"
+      "title": "joinedload vs selectinload vs subqueryload",
+      "content": "| 维度 | joinedload | selectinload | subqueryload |\n| --- | --- | --- | --- |\n| SQL 策略 | LEFT OUTER JOIN 一条 SQL | 先查主表，再 IN 查关联（两条 SQL） | 先查主表，再子查询查关联 |\n| 一对多适用性 | 行膨胀（JOIN 后主表行重复） | ✅ 推荐（无膨胀） | 可用但性能通常不如 selectinload |\n| 一对一适用性 | ✅ 推荐 | 可用 | 可用 |\n| 关联数据量大时 | 结果集巨大 | IN 列表长但可控 | 子查询可能慢 |\n| 能否后续 filter 关联 | 不能（那是 join 的职责） | 不能 | 不能 |\n| 本质区别 | 一条 JOIN 语句 | 两条独立查询 | 一条嵌套子查询 |"
+    },
+    {
+      "type": "compareTable",
+      "title": "SQLAlchemy 1.x vs 2.0 查询风格",
+      "content": "| 维度 | 1.x 风格 (session.query) | 2.0 风格 (select + execute) |\n| --- | --- | --- |\n| 查询构造 | `session.query(User).filter(...)` | `session.execute(select(User).where(...))` |\n| 结果类型 | `Query` 对象（可迭代） | `Result` 对象（需 .scalars() 获取实例） |\n| 链式 filter | `.filter(...).filter(...)` | `.where(...).where(...)` |\n| 聚合 | `session.query(func.count(User.id))` | `select(func.count(User.id))` |\n| 异步支持 | 需扩展库 | 原生 AsyncSession |\n| 类型提示 | 弱 | 强（mapped_column + Mapped[type]）\n| 模型声明 | `Column(Integer)` | `mapped_column(Integer)` 或兼容 Column |\n| 2024+ 推荐 | 旧项目兼容 | ✅ 新项目首选 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "# 1. SQLAlchemy 2.0 新风格\nfrom sqlalchemy import select, create_engine\nfrom sqlalchemy.orm import Session\n\n# 2.0 风格：用 select() 替代 query\nstmt = select(User).where(User.name == \"Alice\")\nwith Session(engine) as session:\n    result = session.execute(stmt)\n    user = result.scalar_one()\n\n# 2. 懒加载和预加载\nfrom sqlalchemy.orm import joinedload\n\n# 一次 SQL join 加载关联\nstmt = select(User).options(joinedload(User.posts))\n\n# 3. bulk 操作\nfrom sqlalchemy import insert\n\nstmt = insert(User).values([\n    {\"name\": \"Alice\", \"email\": \"alice@example.com\"},\n    {\"name\": \"Bob\", \"email\": \"bob@example.com\"},\n])\nwith Session(engine) as session:\n    session.execute(stmt)\n    session.commit()\n\n# 4. 异步 FastAPI + SQLAlchemy\nfrom fastapi import FastAPI, Depends\nfrom sqlalchemy.ext.asyncio import AsyncSession\n\napp = FastAPI()\n\nasync def get_db():\n    async with AsyncSession(engine) as session:\n        yield session\n\n@app.get(\"/users/{user_id}\")\nasync def get_user(user_id: int, db: AsyncSession = Depends(get_db)):\n    result = await db.execute(select(User).where(User.id == user_id))\n    user = result.scalar_one_or_none()\n    return user",
+      "title": "SQLAlchemy 2.0 模型定义、CRUD 与预加载",
       "language": "python",
+      "content": "from sqlalchemy import create_engine, ForeignKey, select, func\nfrom sqlalchemy.orm import (\n    DeclarativeBase, Mapped, mapped_column, relationship,\n    Session, selectinload, joinedload\n)\nfrom typing import Optional\n\n# ---------- 模型定义（2.0 声明式风格）----------\nclass Base(DeclarativeBase):\n    pass\n\nclass User(Base):\n    __tablename__ = \"users\"\n\n    id: Mapped[int] = mapped_column(primary_key=True)\n    name: Mapped[str] = mapped_column(String(50))\n    email: Mapped[Optional[str]] = mapped_column(String(100), unique=True)\n    posts: Mapped[list[\"Post\"]] = relationship(back_populates=\"author\")\n\nclass Post(Base):\n    __tablename__ = \"posts\"\n\n    id: Mapped[int] = mapped_column(primary_key=True)\n    title: Mapped[str] = mapped_column(String(200))\n    user_id: Mapped[int] = mapped_column(ForeignKey(\"users.id\"))\n    author: Mapped[User] = relationship(back_populates=\"posts\")\n\n# ---------- 引擎和会话 ----------\nengine = create_engine(\"sqlite:///demo.db\", echo=True)  # echo 打印 SQL\nBase.metadata.create_all(engine)\n\n# ---------- CRUD ----------\nwith Session(engine) as session:\n    # Create\n    user = User(name=\"Alice\", email=\"alice@example.com\")\n    user.posts.append(Post(title=\"First Post\"))\n    session.add(user)\n    session.commit()  # flush + commit 事务\n\n    # Read with selectinload（避免 N+1）\n    stmt = select(User).options(selectinload(User.posts)).where(User.name == \"Alice\")\n    result = session.execute(stmt).scalars().first()\n    print(f\"{result.name} has {len(result.posts)} posts\")  # 不触发额外 SQL\n\n    # Update\n    result.email = \"new@example.com\"\n    session.commit()  # 自动检测 dirty 并生成 UPDATE\n\n    # Delete\n    session.delete(result)\n    session.commit()\n\n# ---------- 聚合查询（SQL 表达式，不走 ORM 映射）----------\nwith Session(engine) as session:\n    stmt = select(User.name, func.count(Post.id).label(\"post_count\")).join(Post).group_by(User.name)\n    rows = session.execute(stmt).all()  # Row 对象，不是 User 实例\n    for name, count in rows:\n        print(f\"{name}: {count} posts\")",
       "highlights": [
         {
-          "line": 2,
-          "note": "这里通过多路等待处理并发分支，重点说明不同事件到达时的状态变化。"
+          "line": 30,
+          "note": "2.0 声明式风格：Mapped[type] + mapped_column() 替代 Column()，类型提示更完整。"
+        },
+        {
+          "line": 35,
+          "note": "relationship 定义双向关联，back_populates 保持两侧同步。"
+        },
+        {
+          "line": 48,
+          "note": "echo=True 打印实际 SQL——排查 N+1 的必备手段。"
+        },
+        {
+          "line": 54,
+          "note": "selectinload 预加载关联，避免遍历 user.posts 时触发 N 条额外查询。"
+        },
+        {
+          "line": 58,
+          "note": "修改属性后 commit 自动检测 dirty 并生成 UPDATE——工作单元模式。"
+        },
+        {
+          "line": 65,
+          "note": "聚合查询用 SQL 表达式 + func，结果是 Row 而非 ORM 实例。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：ORM 把数据库表映射成对象，让你用面向对象的方式操作数据、不用手写 SQL。Python 最成熟的是 SQLAlchemy（分 Core 表达式层和 ORM 对象层）。核心要理解 Session、事务、N+1 问题和 ORM vs 原生 SQL 的取舍。\n\n要点：\n\n1. 模型与 Session：模型类映射表，Session 是工作单元——管理对象状态和事务，add/commit/rollback，查询用 query 或 2.0 的 select。\n2. 事务：Session 默认在事务里，commit 提交、出错 rollback；用 with 上下文或 try-finally 保证关闭。\n3. N+1 问题（必考）：查 N 条主记录后、遍历访问关联对象又发 N 条查询。解决：用 joinedload 或 selectinload 预加载、或只查需要字段。\n4. 异步 ORM：SQLAlchemy 1.4/2.0 支持 async（AsyncSession 加 asyncpg），配合 FastAPI 等异步框架。\n5. 迁移：用 Alembic 管理 schema 版本（autogenerate 生成迁移脚本）。\n\nORM vs 原生 SQL：ORM 开发快、防注入、数据库无关、适合 CRUD；原生 SQL 性能极致、可控、适合复杂查询和报表。\n\n边界和坑。① N+1 是 ORM 最常见性能坑，要开 SQL echo 或日志确认实际发了多少条。② Alembic autogenerate 检测不到所有变更（如列改名会当成删加、数据类型细节），重要迁移要人工 review 生成的脚本。③ ORM 隐藏了 SQL，复杂查询用 ORM 反而绕、性能差，该用原生 SQL 就用。",
+      "content": "**一句话结论**\nORM 把数据库表映射成 Python 对象，用面向对象的方式操作数据。Python 生态最成熟的是 SQLAlchemy，分 Core（SQL 表达式）和 ORM（对象映射）两层，核心要理解 Session 工作单元、N+1 问题、和何时该绕过 ORM。\n\n**Session 与事务（核心）**\n- Session 不是数据库连接——连接由 Engine 连接池管理，Session 管的是对象状态和事务\n- Session 内有 Identity Map：同一主键同一 Session 只有一个 Python 对象\n- flush 时机：commit 前自动 flush（检测 dirty 对象 → 生成 UPDATE/INSERT/DELETE），也可手动 flush\n- 每个请求/操作一个 Session，用完即关——不要用全局 Session\n\n**N+1 问题（必考）**\n- 原因：默认 lazy loading，遍历关联属性时逐条发 SQL\n- 1 次主查询 + N 次关联查询 = N+1\n- 解决：joinedload（一条 JOIN）适合一对一；selectinload（两条独立查询）适合一对多（推荐）\n- 验证：`echo=True` 打印实际 SQL\n\n**三层取舍**\n- ORM（session + 映射类）：CRUD、事务管理、对象状态\n- SQL 表达式（Core）：批量查询、聚合、部分字段\n- 原生 SQL（text()）：窗口函数、CTE、数据库特定优化\n- 三者可在同一 Session 内混用\n\n**异步 ORM**\n- AsyncSession + asyncpg（PostgreSQL）或 aiosqlite\n- 最大坑：延迟加载在异步中报 MissingGreenlet——必须用预加载或 run_sync\n- FastAPI 用 Depends yield AsyncSession\n\n**Alembic 迁移**\n- autogenerate 对比模型和数据库 schema，自动生成迁移脚本\n- 检测不到：列/表重命名（会当删+新建）、索引类型变更、视图触发器、数据迁移\n- 生成后必须 review，生产前先在 staging 测试\n\n**边界和坑**\n- N+1 是 ORM 最常见性能坑，不开 echo 不容易发现\n- Alembic autogenerate 会把列重命名当删加——不 review 会丢数据\n- 复杂报表硬用 ORM 绕弯路且性能差，该用原生 SQL 就用\n- Identity Map 跨请求污染——不要复用 Session",
       "followUpQuestions": [
         {
-          "question": "事务隔离级别在 SQLAlchemy 中怎么设置？什么场景用 read committed vs repeatable read？",
-          "answer": "SQLAlchemy 中通过 `create_engine(..., isolation_level='READ COMMITTED')` 设置。Read Committed 是默认值，避免脏读，适合大多数场景。Repeatable Read 避免不可重复读，适合同一个事务中多次读取一致数据的场景（如报表统计），但可能增加死锁概率。Serializable 最高隔离级别，适合资金相关操作，但并发性能最差。"
+          "question": "SQLAlchemy 中 flush 和 commit 的区别是什么？什么时候需要手动 flush？",
+          "answer": "flush 把 Session 中的脏数据（新增、修改、删除）发送到数据库执行 SQL，但不提交事务——数据在数据库的当前事务中可见，但其他事务看不到。commit = flush + 提交事务。手动 flush 的场景：需要在同一个事务中拿到数据库生成的值（如自增 ID、默认值），或者需要在 commit 前做数据库层面的校验（如唯一约束冲突会在 flush 时抛异常）。"
         },
         {
-          "question": "Alembic 自动迁移的局限性和最佳实践是什么？",
-          "answer": "Alembic 的 autogenerate 能检测大部分模型变更，但局限包括：不能检测表/列重命名（会识别为删+新建）、不能检测索引类型变更、视图和触发器等需手动编写。最佳实践：autogenerate 生成迁移后必须审查 SQL，特别是检查重命名场景；生产环境迁移前先在 staging 测试；不要手动修改已应用的迁移（用新迁移修复）。"
+          "question": "joinedload 和 selectinload 的 SQL 分别是什么样的？什么时候选哪个？",
+          "answer": "joinedload 生成一条 LEFT OUTER JOIN SQL，把主表和关联表一起查出来。selectinload 先查主表拿到所有主键，再用 WHERE id IN (...) 查关联表——两条独立 SQL。选择原则：一对多用 selectinload（避免 JOIN 行膨胀），一对一用 joinedload（一条 SQL 更简单）。关联数据量大时 selectinload 的 IN 列表会很长，可考虑分批。"
+        },
+        {
+          "question": "异步 SQLAlchemy 中出现 MissingGreenlet 错误怎么解决？",
+          "answer": "MissingGreenlet 是因为 SQLAlchemy 的延迟加载在异步上下文中无法自动 await。解决方法：① 用预加载（joinedload / selectinload）在查询时一并加载关联；② 用 `await session.run_sync(lambda s: user.posts)` 在同步上下文中访问延迟加载；③ 在 relationship 定义中设置 `lazy='raise'` 禁止延迟加载，强制开发者显式声明加载策略——这在异步项目中是推荐做法。"
+        },
+        {
+          "question": "Alembic 生成了一个把 old_name 列删掉又加了 new_name 列的迁移脚本，但实际是重命名，怎么处理？",
+          "answer": "autogenerate 检测不到重命名，只会生成 drop + add。必须手动修改迁移脚本：把 `op.drop_column('table', 'old_name')` 和 `op.add_column('table', Column('new_name', ...))` 替换成 `op.alter_column('table', 'old_name', new_column_name='new_name')`。如果已经部署了错误的迁移，需要用新迁移修正——不能修改已应用的迁移文件。"
         }
       ]
     },
@@ -81,34 +134,56 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能使用 SQLAlchemy 定义模型和关系",
-        "能使用 Session 管理事务",
-        "能识别和解决 N+1 查询问题",
-        "能使用 SQLAlchemy 2.0 风格查询",
-        "能使用 Alembic 进行数据库迁移",
-        "能理解 ORM 和原生 SQL 的取舍",
-        "能配置和使用异步 SQLAlchemy"
+        "能区分 SQLAlchemy Core 层和 ORM 层的职责，以及 2.0 统一 select 查询的设计",
+        "能解释 Session 是工作单元而非数据库连接——Identity Map、flush 时机、事务边界",
+        "能用代码复现 N+1 问题，并用 selectinload/joinedload 解决",
+        "能说清 joinedload（一条 JOIN）和 selectinload（两条查询）的 SQL 差异和适用场景",
+        "能区分三层取舍：ORM（CRUD）、SQL 表达式（聚合）、原生 SQL（复杂查询），并知道三者可混用",
+        "能解释异步 ORM 中 MissingGreenlet 的触发原因和三种解决方式",
+        "能说出 Alembic autogenerate 的至少三个检测不到的变更类型，以及生产迁移的最佳实践",
+        "能解释 ORM 对象的四种状态（Transient/Pending/Persistent/Detached）及状态转换"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "python.web-python.orm-database.recall.1",
-      "prompt": "SQLAlchemy 中的 N+1 查询问题是什么？怎么用 selectinload 和 joinedload 解决？",
+      "prompt": "SQLAlchemy 中的 N+1 查询问题是什么？怎么用 selectinload 和 joinedload 解决？两者的 SQL 有什么区别？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "python.web-python.orm-database.recall.2",
-      "prompt": "用 SQLAlchemy 2.0 风格定义一个 User-Post 一对多关系模型，包括异步 Session 的增删查改。",
+      "prompt": "用 SQLAlchemy 2.0 风格定义一个 User-Post 一对多关系模型，实现查询时预加载关联数据、避免 N+1。",
       "mode": "code",
       "expectedMinutes": 10,
       "difficulty": 3
     },
     {
       "id": "python.web-python.orm-database.recall.3",
-      "prompt": "ORM 与数据库交互 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "Session 和数据库连接是什么关系？flush 和 commit 的区别是什么？什么时候需要手动 flush？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "python.web-python.orm-database.recall.4",
+      "prompt": "异步 SQLAlchemy 中出现 MissingGreenlet 错误是怎么回事？有哪些解决方式？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "python.web-python.orm-database.recall.5",
+      "prompt": "Alembic autogenerate 能检测哪些变更？不能检测哪些变更？生产环境怎么用？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "python.web-python.orm-database.recall.6",
+      "prompt": "什么时候该用 ORM、什么时候该用原生 SQL？在同一项目中可以混用吗？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -116,20 +191,23 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说出 ORM 把表映射成对象、Session 管事务",
-      "能解释 N+1 问题及预加载解决",
-      "能对比 ORM 与原生 SQL 的取舍",
-      "能说明用 Alembic 做迁移"
+      "能解释 Session 是工作单元而非数据库连接——Identity Map 追踪对象状态，flush 检测 dirty 并生成 SQL",
+      "能用代码复现 N+1 问题，区分 joinedload（JOIN）和 selectinload（IN 查询）的适用场景",
+      "能区分三层取舍：ORM（CRUD + 事务管理）、SQL 表达式（聚合/批量）、原生 SQL（复杂查询/数据库特定优化）",
+      "能说出 Alembic autogenerate 的局限（列重命名、索引类型、视图、数据迁移）及生产流程"
     ],
     "goodToHave": [
-      "能说明异步 ORM（AsyncSession）配合异步框架",
-      "能指出 Alembic autogenerate 的局限",
-      "能说明复杂查询用原生 SQL"
+      "能解释异步 ORM 中 MissingGreenlet 的原因和解决方式（预加载 / run_sync / lazy='raise'）",
+      "能解释 flush 和 commit 的区别，以及手动 flush 的场景",
+      "能说出 ORM 对象的四种状态（Transient/Pending/Persistent/Detached）",
+      "能说明 SQLAlchemy 2.0 的 Mapped[type] + mapped_column 声明式风格优势"
     ],
     "commonMistakes": [
-      "遍历关联对象引发 N+1 不自知",
-      "完全依赖 Alembic autogenerate 不 review",
-      "复杂报表硬用 ORM 导致性能差"
+      "用全局 Session 导致 Identity Map 膨胀和跨请求对象状态污染",
+      "遍历关联对象引发 N+1 问题且不开 echo 难以发现",
+      "完全依赖 Alembic autogenerate 不 review，列重命名导致数据丢失",
+      "异步 ORM 中直接访问延迟加载属性触发 MissingGreenlet",
+      "复杂报表硬用 ORM 绕弯路，性能差且代码难维护"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -140,8 +218,8 @@
   },
   "status": "production",
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察能否说清 Session 与事务、N+1 及预加载解决、ORM 与原生 SQL 取舍，并知道 Alembic 迁移的局限。",
-  "updatedAt": "2026-06-18",
+  "interviewerFocus": "考察能否说清 Session 工作单元机制（Identity Map / flush / 事务边界）、N+1 的根因与两种预加载的 SQL 差异、ORM/SQL 表达式/原生 SQL 三层取舍、异步 ORM 的 MissingGreenlet 陷阱、Alembic autogenerate 的局限与生产流程。",
+  "updatedAt": "2026-06-23",
   "prerequisites": [
     "python.web-python.flask-fastapi"
   ]

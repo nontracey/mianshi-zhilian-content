@@ -4,7 +4,7 @@
   "category": "dotnet-core",
   "group": "dotnet-core",
   "title": "中间件管道",
-  "summary": "讲清 ASP.NET Core 中间件管道的洋葱模型、Use/Run/Map 注册方式、注册顺序的重要性，以及与过滤器的区别。",
+  "summary": "讲清 ASP.NET Core 中间件管道的洋葱模型——RequestDelegate 如何将 HttpContext 逐层传递、Use/Run/Map 的注册语义、顺序决定行为的原因、Endpoint Routing 前后变化，以及中间件与过滤器的职责边界。",
   "tags": [
     ".NET",
     "中间件",
@@ -13,20 +13,35 @@
     "RequestDelegate"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 35,
+  "estimatedMinutes": 36,
   "order": 20,
   "recommendWeight": 90,
   "status": "staging",
   "learningCards": [
     {
       "type": "explain",
-      "title": "中间件管道：RequestDelegate、中间件的执行流程",
-      "content": "ASP.NET Core 的中间件管道是处理 HTTP 请求的核心机制，每个请求都会经过一系列中间件的处理。\n\n## RequestDelegate\n\nRequestDelegate 是中间件的核心委托类型：\n```csharp\npublic delegate Task RequestDelegate(HttpContext context);\n```\n\n每个中间件本质上就是一个处理 HttpContext 并返回 Task 的函数。\n\n## 中间件的执行流程\n\n中间件按照注册顺序形成管道，请求从前往后经过每个中间件，响应从后往前经过：\n```\n请求 → 中间件1 → 中间件2 → 中间件3 → 终端\n响应 ← 中间件1 ← 中间件2 ← 中间件3 ← 终端\n```\n\n每个中间件可以选择：\n1. 调用 `next()` 将请求传递给下一个中间件\n2. 短路管道，直接返回响应\n\n## Use/Map/Run 扩展方法\n\n**Use**：注册中间件，可以调用 next()\n```csharp\napp.Use(async (context, next) =>\n{\n    // 请求处理前\n    Console.WriteLine(\"Before\");\n    \n    await next(); // 调用下一个中间件\n    \n    // 响应处理后\n    Console.WriteLine(\"After\");\n});\n```\n\n**Map**：根据路径分支管道\n```csharp\napp.Map(\"/api\", apiApp =>\n{\n    apiApp.Use(async (context, next) =>\n    {\n        // 处理 /api 路径的请求\n        await next();\n    });\n});\n```\n\n**MapWhen**：根据条件分支管道\n```csharp\napp.MapWhen(context => context.Request.Path.StartsWithSegments(\"/admin\"), adminApp =>\n{\n    // 处理管理员路径\n});\n```\n\n**Run**：注册终端中间件，不调用 next()\n```csharp\napp.Run(async context =>\n{\n    // 终端中间件，不调用 next()\n    await context.Response.WriteAsync(\"Hello World!\");\n});\n```\n\n## 内置中间件\n\nASP.NET Core 提供了丰富的内置中间件：\n\n```csharp\napp.UseRouting();          // 路由\napp.UseAuthentication();   // 认证\napp.UseAuthorization();    // 授权\napp.UseCors();             // 跨域\napp.UseResponseCompression(); // 响应压缩\napp.UseStaticFiles();      // 静态文件\napp.UseEndpoints(endpoints =>\n{\n    endpoints.MapControllers();\n});\n```\n\n## 自定义中间件\n\n**内联中间件**：\n```csharp\napp.Use(async (context, next) =>\n{\n    var stopwatch = Stopwatch.StartNew();\n    \n    await next();\n    \n    stopwatch.Stop();\n    Console.WriteLine($\"请求耗时: {stopwatch.ElapsedMilliseconds}ms\");\n});\n```\n\n**基于类的中间件**：\n```csharp\npublic class RequestTimingMiddleware\n{\n    private readonly RequestDelegate _next;\n\n    public RequestTimingMiddleware(RequestDelegate next)\n    {\n        _next = next;\n    }\n\n    public async Task InvokeAsync(HttpContext context)\n    {\n        var stopwatch = Stopwatch.StartNew();\n        \n        await _next(context);\n        \n        stopwatch.Stop();\n        context.Response.Headers.Add(\"X-Request-Duration\", \n            $\"{stopwatch.ElapsedMilliseconds}ms\");\n    }\n}\n\n// 注册\napp.UseMiddleware<RequestTimingMiddleware>();\n```\n\n**扩展方法注册**：\n```csharp\npublic static class RequestTimingMiddlewareExtensions\n{\n    public static IApplicationBuilder UseRequestTiming(this IApplicationBuilder app)\n    {\n        return app.UseMiddleware<RequestTimingMiddleware>();\n    }\n}\n\n// 使用\napp.UseRequestTiming();\n```"
+      "title": "RequestDelegate 与洋葱模型的本质",
+      "content": "ASP.NET Core 的 HTTP 管道本质上是一条委托链。`RequestDelegate` 的签名是 `Task RequestDelegate(HttpContext context)`——它只接收一个 `HttpContext`，返回一个 `Task`。每个中间件拿到这个 `context` 的同时，还拿到一个 `next` 委托（指向链中下一个中间件），在 `await next()` 之前插入的代码是「请求阶段」，之后的是「响应阶段」。这就是洋葱模型。\n\n注意：`next` 不调用就不会往后传，管道短路。调用 `next` 后面的代码在下一个中间件（及其后面所有中间件）全部完成后才执行——因为 `await` 挂起了当前中间件的 Task，直到下游的 Task 完成。这意味着「响应阶段」的执行顺序是注册顺序的逆序：最后注册的中间件最先完成、最先返回给前面的中间件。"
     },
     {
       "type": "explain",
-      "title": "中间件管道：中间件的执行顺序、短路与分支",
-      "content": "## 中间件的执行顺序\n\n中间件的注册顺序非常重要：\n```csharp\n// 正确顺序\napp.UseExceptionHandler(\"/Error\");\napp.UseHsts();\napp.UseHttpsRedirection();\napp.UseStaticFiles();\napp.UseRouting();\napp.UseCors();\napp.UseAuthentication();\napp.UseAuthorization();\napp.UseEndpoints(endpoints => endpoints.MapControllers());\n```\n\n## 短路与分支\n\n**短路**：中间件不调用 next()，直接返回响应\n```csharp\napp.Use(async (context, next) =>\n{\n    if (context.Request.Path == \"/health\")\n    {\n        await context.Response.WriteAsync(\"OK\");\n        return; // 短路\n    }\n    \n    await next();\n});\n```\n\n**分支**：根据条件执行不同的中间件管道\n```csharp\napp.MapWhen(context => context.Request.Method == \"GET\", getApp =>\n{\n    getApp.Run(async context => await context.Response.WriteAsync(\"GET Request\"));\n});\n```"
+      "title": "Use、Run、Map——三种注册语义",
+      "content": "**Use** 是最常见的注册方式：`app.Use(async (context, next) => { ... await next(); })`。它在管道中插入一个「前 + 后」的处理节点，`next` 可调可不调。调 `next` 则继续向后；不调则短路。\n\n**Run** 是终端方法：`app.Run(async context => { ... })`。它不接收 `next` 参数，直接写响应，写在管道末尾。如果放在非末尾位置，后面注册的所有中间件永远不会执行。这一点常被忽略。\n\n**Map** 和 **MapWhen** 是分支方法。`Map(\"/api\", subApp => { ... })` 匹配路径前缀后把请求交给 `subApp` 的独立管道，注意匹配后路径的 `PathBase` 和 `Path` 会重新切分。`MapWhen` 按谓词判断，不做路径切分。分支管道有自己的终端中间件，分支内的中间件和主管道是隔离的。"
+    },
+    {
+      "type": "explain",
+      "title": "顺序为什么是架构决策而非配置细节",
+      "content": "中间件的注册顺序就是执行顺序，这是洋葱模型的直接推论。顺序错误会导致安全漏洞、功能缺失或运行时异常，而不是「性能差异」。\n\n典型案例：\n1. `UseAuthorization` 放在 `UseAuthentication` 前：授权运行时 `HttpContext.User` 还是空的或匿名主体，所有需要认证的端点要么被匿名放过，要么直接 403。\n2. `UseExceptionHandler` 不在最外层：它后面的中间件抛的异常它捕获不到，用户看到原始堆栈。\n3. `UseStaticFiles` 放在 `UseRouting` 后面：静态文件请求被路由拦截，可能匹配到控制器返回错误内容或 404。\n4. `UseCors` 放在 `UseEndpoints` 后面：CORS 头在响应已经开始写入后才加，可能抛 `HeadersAlreadySent` 异常或头根本不生效。\n\n官方推荐顺序是：ExceptionHandler → Hsts → HttpsRedirection → StaticFiles → Routing → Cors → Authentication → Authorization → Endpoints → Fallback（SPA）。"
+    },
+    {
+      "type": "explain",
+      "title": "Endpoint Routing 的分阶段设计",
+      "content": ".NET Core 3.0 引入 Endpoint Routing 把路由匹配和端点执行拆成两个独立中间件：`UseRouting()` 负责匹配路由并把 `Endpoint` 信息写入 `HttpContext.GetEndpoint()`；`UseEndpoints()` 负责执行已匹配的端点。中间的空隙就是 CORS、认证、授权这些中间件插进来的地方。\n\n旧的 `UseMvc()` 是匹配和执行合并的，CORS 和认证的时机控制很粗糙。Endpoint Routing 解决了这个问题，让 CORS 预检请求（OPTIONS）可以在认证之前就被处理，也让路由元数据（如 `[Authorize]`、`[AllowAnonymous]`）能在授权中间件之前被正确读取。"
+    },
+    {
+      "type": "explain",
+      "title": "短路、分支与响应已开始的风险",
+      "content": "短路是指中间件不调 `next` 直接写响应。典型用途：健康检查路径、静态文件命中、限流触发时快速返回。风险在于：如果短路点在异常处理或日志中间件之后，这些横切面逻辑就被绕过了。日志缺失会掩盖线上问题。\n\n分支（Map/MapWhen）创建独立的子管道，子管道的中间件和主管道互不影响，但共享同一个 `IServiceProvider`。分支后的路径信息会被重写：`Map(\"/api\", ...)` 后，子管道里 `context.Request.Path` 是去掉 `/api` 的剩余部分，`PathBase` 变成 `/api`。\n\n另一个常见坑：响应已经开始了（`context.Response.HasStarted == true`）再修改 Header 或状态码会抛 `InvalidOperationException`。判断依据是 Kestrel 是否已把响应头 flush 到网络。所有需要改响应头的中间件（如添加 CORS 头、自定义 Header）必须在响应体写入之前执行，也就是要在终端中间件或 MVC 的结果执行之前。"
     },
     {
       "type": "diagram",
@@ -48,50 +63,58 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | Use | Map | MapWhen | Run |\n| --- | --- | --- | --- | --- |\n| 用途 | 注册中间件 | 路径分支 | 条件分支 | 终端中间件 |\n| 调用 next() | 可以 | 可以 | 可以 | 不可以 |\n| 参数 | (context, next) | path, action | predicate, action | context => |\n| 管道行为 | 继续管道 | 创建新管道 | 创建新管道 | 结束管道 |\n| 典型应用 | 日志、认证、CORS | /api 路径 | 管理员路径 | 最终响应 |"
+      "title": "Use / Run / Map / MapWhen 对比",
+      "content": "| 方法 | 接收参数 | 能否调 next | 管道行为 | 典型场景 |\n| --- | --- | --- | --- | --- |\n| `Use` | `(context, next)` | 可以（也可以不调） | 在主管道中插入一个前/后处理节点 | 日志、计时、自定义 Header、通用鉴权 |\n| `Run` | `context =>` | 不接收 next | 终端中间件，写响应 | 管道最末尾兜底响应 |\n| `Map` | `(path, subApp =>)` | 子管道内可调 | 路径前缀匹配后切分 PathBase/Path，创建独立子管道 | `/api`、`/health` 路径分组 |\n| `MapWhen` | `(predicate, subApp =>)` | 子管道内可调 | 按条件匹配，不重写 Path，创建独立子管道 | 按 Method、Header 或自定义条件分支 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | 内联中间件 | 基于类的中间件 |\n| --- | --- | --- |\n| 定义方式 | lambda 表达式 | 独立类 |\n| 依赖注入 | 不支持 | 支持（构造函数） |\n| 可重用性 | 低（仅当前应用） | 高（可封装为库） |\n| 复杂度 | 适合简单逻辑 | 适合复杂逻辑 |\n| 测试 | 难以单元测试 | 易于单元测试 |"
+      "title": "内联中间件 vs 基于类的中间件 vs 过滤器",
+      "content": "| 维度 | 内联中间件 | 基于类的中间件 | MVC 过滤器 |\n| --- | --- | --- | --- |\n| 定义方式 | lambda / 委托 | 类 + `InvokeAsync` 或 IMiddleware | 实现 IActionFilter 等接口 |\n| 依赖注入 | 不支持（只能捕获外部变量） | 构造函数注入（Singleton 生命周期） | 构造函数注入（Scoped） |\n| 执行位置 | 整个 HTTP 管道 | 整个 HTTP 管道 | MVC 内部（Action 前后、Result 前后） |\n| 能拿到的信息 | HttpContext | HttpContext | ActionDescriptor、ModelState、ActionResult |\n| 可重用性 | 低，仅当前 app | 高，可打包为 NuGet | 中，可在多个 Controller 复用 |\n| 可测试性 | 差（嵌入 app 构建） | 好（可直接实例化 Mock 委托） | 好（框架提供测试基础设施） |\n| 适合场景 | 简单一次性逻辑 | 全局横切面（日志、认证、限流） | MVC 特定逻辑（模型验证、Action 级权限） |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Diagnostics;\nusing System.Threading.Tasks;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\n\nnamespace MiddlewarePipelineDemo\n{\n    // 基于类的中间件\n    public class RequestLoggingMiddleware\n    {\n        private readonly RequestDelegate _next;\n        private readonly ILogger<RequestLoggingMiddleware> _logger;\n\n        public RequestLoggingMiddleware(RequestDelegate next, ILogger<RequestLoggingMiddleware> logger)\n        {\n            _next = next;\n            _logger = logger;\n        }\n\n        public async Task InvokeAsync(HttpContext context)\n        {\n            var requestId = Guid.NewGuid().ToString();\n            context.Items[\"RequestId\"] = requestId;\n\n            _logger.LogInformation($\"[{requestId}] 开始处理 {context.Request.Method} {context.Request.Path}\");\n\n            try\n            {\n                await _next(context);\n                _logger.LogInformation($\"[{requestId}] 请求完成，状态码: {context.Response.StatusCode}\");\n            }\n            catch (Exception ex)\n            {\n                _logger.LogError(ex, $\"[{requestId}] 请求处理失败\");\n                throw;\n            }\n        }\n    }\n\n    public class RequestTimingMiddleware\n    {\n        private readonly RequestDelegate _next;\n\n        public RequestTimingMiddleware(RequestDelegate next)\n        {\n            _next = next;\n        }\n\n        public async Task InvokeAsync(HttpContext context)\n        {\n            var stopwatch = Stopwatch.StartNew();\n\n            await _next(context);\n\n            stopwatch.Stop();\n            var duration = stopwatch.ElapsedMilliseconds;\n\n            context.Response.Headers.Add(\"X-Request-Duration\", $\"{duration}ms\");\n\n            if (duration > 1000)\n            {\n                Console.WriteLine($\"警告: 请求 {context.Request.Path} 耗时 {duration}ms\");\n            }\n        }\n    }\n\n    // 中间件扩展方法\n    public static class MiddlewareExtensions\n    {\n        public static IApplicationBuilder UseRequestLogging(this IApplicationBuilder app)\n        {\n            return app.UseMiddleware<RequestLoggingMiddleware>();\n        }\n\n        public static IApplicationBuilder UseRequestTiming(this IApplicationBuilder app)\n        {\n            return app.UseMiddleware<RequestTimingMiddleware>();\n        }\n    }\n\n    class Program\n    {\n        static void Main(string[] args)\n        {\n            var builder = WebApplication.CreateBuilder(args);\n            var app = builder.Build();\n\n            // 注册中间件\n            app.UseRequestLogging();\n            app.UseRequestTiming();\n\n            // 内联中间件示例\n            app.Use(async (context, next) =>\n            {\n                // 添加自定义头\n                context.Response.Headers.Add(\"X-Custom-Header\", \"MiddlewareDemo\");\n                \n                await next();\n            });\n\n            // 路径分支\n            app.Map(\"/api\", apiApp =>\n            {\n                apiApp.Use(async (context, next) =>\n                {\n                    Console.WriteLine(\"API 中间件\");\n                    await next();\n                });\n\n                apiApp.Run(async context =>\n                {\n                    await context.Response.WriteAsync(\"API Response\");\n                });\n            });\n\n            // 条件分支\n            app.MapWhen(\n                context => context.Request.Path.StartsWithSegments(\"/admin\"),\n                adminApp =>\n                {\n                    adminApp.Use(async (context, next) =>\n                    {\n                        // 管理员认证检查\n                        if (!context.User.Identity.IsAuthenticated)\n                        {\n                            context.Response.StatusCode = 401;\n                            return;\n                        }\n                        await next();\n                    });\n\n                    adminApp.Run(async context =>\n                    {\n                        await context.Response.WriteAsync(\"Admin Area\");\n                    });\n                });\n\n            // 终端中间件\n            app.Run(async context =>\n            {\n                await context.Response.WriteAsync(\"Hello World!\");\n            });\n\n            app.Run();\n        }\n    }\n}",
+      "title": "可运行代码：日志 + 计时中间件、短路演示和 Map 分支",
       "language": "csharp",
+      "content": "using System.Diagnostics;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Logging;\n\nnamespace MiddlewareDemo;\n\n// 基于类的中间件：请求日志\nclass RequestLoggingMiddleware\n{\n    private readonly RequestDelegate _next;\n    private readonly ILogger<RequestLoggingMiddleware> _logger;\n\n    public RequestLoggingMiddleware(RequestDelegate next, ILogger<RequestLoggingMiddleware> logger)\n    {\n        _next = next;\n        _logger = logger;\n    }\n\n    public async Task InvokeAsync(HttpContext context)\n    {\n        var sw = Stopwatch.StartNew();\n        _logger.LogInformation(\"{Method} {Path} started\", context.Request.Method, context.Request.Path);\n\n        await _next(context); // 调用下游\n\n        sw.Stop();\n        _logger.LogInformation(\"{Method} {Path} finished {StatusCode} in {Elapsed}ms\",\n            context.Request.Method, context.Request.Path,\n            context.Response.StatusCode, sw.ElapsedMilliseconds);\n    }\n}\n\n// 基于类的中间件：慢请求告警\nclass SlowRequestWarningMiddleware\n{\n    private readonly RequestDelegate _next;\n    private readonly ILogger<SlowRequestWarningMiddleware> _logger;\n    private readonly int _thresholdMs;\n\n    public SlowRequestWarningMiddleware(RequestDelegate next, ILogger<SlowRequestWarningMiddleware> logger, int thresholdMs = 1000)\n    {\n        _next = next;\n        _logger = logger;\n        _thresholdMs = thresholdMs;\n    }\n\n    public async Task InvokeAsync(HttpContext context)\n    {\n        var sw = Stopwatch.StartNew();\n        await _next(context);\n        sw.Stop();\n        if (sw.ElapsedMilliseconds > _thresholdMs)\n        {\n            _logger.LogWarning(\"Slow request: {Path} took {Elapsed}ms\", context.Request.Path, sw.ElapsedMilliseconds);\n        }\n    }\n}\n\n// 基于类的中间件扩展方法\nstatic class MiddlewareExtensions\n{\n    public static IApplicationBuilder UseRequestLogging(this IApplicationBuilder app)\n        => app.UseMiddleware<RequestLoggingMiddleware>();\n\n    public static IApplicationBuilder UseSlowRequestWarning(this IApplicationBuilder app, int thresholdMs = 1000)\n        => app.UseMiddleware<SlowRequestWarningMiddleware>(thresholdMs);\n}\n\n// 入口\nvar builder = WebApplication.CreateBuilder(args);\nvar app = builder.Build();\n\n// 最外层：异常处理\napp.UseExceptionHandler(\"/error\");\n\n// 日志：捕获所有请求及响应状态\napp.UseRequestLogging();\n\n// 内联中间件：健康检查短路\napp.Use(async (context, next) =>\n{\n    if (context.Request.Path == \"/health\")\n    {\n        context.Response.ContentType = \"text/plain\";\n        await context.Response.WriteAsync(\"OK\");\n        return; // 短路：不调 next，后续中间件不执行\n    }\n    await next();\n});\n\n// 慢请求告警\napp.UseSlowRequestWarning(500);\n\n// Map 分支：/api 子管道\napp.Map(\"/api\", apiApp =>\n{\n    apiApp.Use(async (context, next) =>\n    {\n        context.Response.Headers[\"X-Api-Version\"] = \"1.0\";\n        await next();\n    });\n    apiApp.Run(async context =>\n    {\n        await context.Response.WriteAsync(\"API response from branched pipeline\");\n    });\n});\n\n// 终端中间件\napp.Run(async context =>\n{\n    context.Response.StatusCode = 200;\n    await context.Response.WriteAsync(\"Hello from terminal middleware\");\n});\n\napp.Run();",
       "highlights": [
         {
-          "line": 11,
-          "note": "`public class RequestLoggingMiddleware` 定义了 中间件管道 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 24,
+          "note": "`await _next(context)` 是洋葱模型的核心：此处挂起当前中间件，等待下游全部完成后继续执行后半段。"
         },
         {
-          "line": 62,
-          "note": "`if (duration > 1000)` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 52,
+          "note": "`app.UseMiddleware<SlowRequestWarningMiddleware>(thresholdMs)` 展示基于类的中间件如何接收额外参数。"
         },
         {
-          "line": 60,
-          "note": "`context.Response.Headers.Add(\"X-Request-Duration\", $\"{duration}ms\");` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "line": 70,
+          "note": "`if (context.Request.Path == \"/health\") { ... return; }` 短路演示：不调 next 直接返回，后续中间件（包括慢请求告警和终端）都不执行。"
         },
         {
-          "line": 3,
-          "note": "`using System.Threading.Tasks;` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+          "line": 81,
+          "note": "`app.Map(\"/api\", apiApp => { ... })` 创建独立子管道，子管道内的中间件只处理 /api 前缀的请求。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：ASP.NET Core 的请求处理是一条中间件管道。每个中间件就是一个接收 HttpContext、返回 Task 的函数，请求按注册顺序从前往后流过、响应从后往前流回，像洋葱一样。\n\n要点：\n\n1. 模型：每个中间件拿到 HttpContext 和下一个中间件的委托 next，可以在 next() 前后插逻辑（如计时、日志），也可以不调 next 直接短路返回。\n2. 注册方式：Use（可调 next、最常用）、Run（终端中间件、不调 next）、Map 和 MapWhen（按路径或条件分支出子管道）。\n3. 顺序至关重要：注册顺序就是执行顺序。比如异常处理要在最外层、认证要在授权前、静态文件可以早早短路。顺序错了会导致鉴权被绕过或异常没被捕获。\n\n边界和坑。① 中间件顺序写错是最常见 bug，比如 UseAuthorization 写在 UseAuthentication 前面会拿不到身份。② 响应已经开始发送（header 已写）后再改状态码或 header 会抛异常，所以改响应的中间件要放在写响应之前。③ 短路要谨慎，短路后后面的中间件（含日志、异常处理）都不执行。",
+      "content": "**结论一句话**：ASP.NET Core 的请求处理是一条洋葱模型的中间件管道——每个中间件是一个 `Func<RequestDelegate, RequestDelegate>` 委托，请求按注册顺序从前往后流过，响应从后往前流回，`await next()` 之前是请求阶段、之后是响应阶段。\n\n**核心机制（按主线讲）**\n- **RequestDelegate**：`Task RequestDelegate(HttpContext)`，管道中每个节点都是这个签名的委托。\n- **构建过程**：`app.Use(...)` 实际上是在外层不断包装：每次调用 `Use` 都把当前中间件包装在已有管道外面，最终形成一个嵌套的委托链。第一个注册的中间件在最外层，最后注册的在最内层。\n- **洋葱模型**：请求阶段从外到内，响应阶段从内到外。日志、计时、异常处理放在外层才能完整捕获。\n- **短路**：不调 `next()`，管道到此结束。常用于健康检查、静态文件、限流快速返回。\n\n**注册方式**\n- `Use(context, next)`：插入一个前/后处理节点，最常用。\n- `Run(context =>)`：终端中间件，没有 `next`，放在最末尾。\n- `Map(path, subApp)`：路径前缀匹配后创建独立子管道，PathBase 和 Path 会重写。\n- `MapWhen(predicate, subApp)`：条件匹配创建子管道，不重写路径。\n\n**顺序为什么关键**\n- 顺序就是执行顺序，写错不是性能问题而是功能 bug。\n- 典型错误：`UseAuthorization` 在 `UseAuthentication` 前面 → `HttpContext.User` 还是匿名 → 鉴权失效或全部 403。\n- `UseExceptionHandler` 不在最外层 → 后面的中间件异常捕获不到。\n- `UseCors` 在 `UseEndpoints` 后面 → 预检 OPTIONS 请求在认证阶段就被拦截，CORS 失败。\n- 官方推荐顺序：ExceptionHandler → Hsts → HttpsRedirection → StaticFiles → Routing → Cors → Authentication → Authorization → Endpoints。\n\n**Endpoint Routing 两阶段**\n- .NET Core 3.0+ 把路由匹配（`UseRouting`）和端点执行（`UseEndpoints`）拆开。\n- `UseRouting` 计算出 `Endpoint` 并写入 `HttpContext.GetEndpoint()`，中间件（CORS、认证、授权）可以读取路由元数据。\n- 解决了旧 `UseMvc()` 无法在 CORS 预检前处理请求的问题。\n\n**中间件 vs 过滤器**\n- 中间件作用于整个 HTTP 管道，在 MVC 之前，拿到的是 `HttpContext`，适合全局横切面（日志、认证、压缩）。\n- 过滤器是 MVC 内部的扩展点，能拿到 `ActionDescriptor`、`ModelState`、`ActionResult`，分 Authorization/Resource/Action/Exception/Result 五种，适合和控制器相关的逻辑（模型验证、Action 级权限）。\n- 判断标准：需要知道「调了哪个 Action」的用过滤器；只需要 `HttpContext` 的用中间件。",
       "followUpQuestions": [
         {
-          "question": "中间件的注册顺序为什么重要？举个顺序写错会出问题的例子。",
-          "answer": "因为注册顺序就是执行顺序，洋葱模型下越早注册越在外层。典型错误：把 UseAuthorization 写在 UseAuthentication 之前，授权中间件运行时身份还没建立，会拿不到用户，要么全部 401 要么直接放过；又比如异常处理中间件 UseExceptionHandler 没放最外层，它后面中间件抛的异常就捕获不到。UseRouting、UseCors、UseStaticFiles 都有推荐位置，官方文档专门给了顺序表。"
+          "question": "`app.Use()` 和 `app.Run()` 的本质区别是什么？",
+          "answer": "`Use` 接收 `(context, next)`，可以调用 `next()` 继续管道，也可以不调而短路；它在管道中插入的是一个「前+后」两阶段节点。`Run` 只接收 `context`，没有 `next` 参数，是终端中间件——它后面的任何中间件都不会执行。所以 `Run` 只应该放在管道末尾。"
         },
         {
-          "question": "中间件和过滤器（Filter）有什么区别？什么时候用哪个？",
-          "answer": "中间件作用于整个请求管道、在 MVC 之前，拿到的是原始 HttpContext，适合跨切面的全局处理：日志、异常、认证、限流、压缩。过滤器是 MVC/Web API 内部的扩展点，能拿到 action、模型绑定结果、ActionResult，分 Authorization/Resource/Action/Exception/Result 几种，适合和控制器强相关的逻辑，如模型验证、特定接口的权限。简单说：与 HTTP 管道相关、和 MVC 无关的用中间件；需要 MVC 上下文（知道调了哪个 action）的用过滤器。"
+          "question": "`Map` 和 `MapWhen` 创建的子管道和主管道有什么关系？",
+          "answer": "子管道共享同一个 `IServiceProvider`（DI 容器），但中间件链是独立的。子管道有自己完整的管道，有自己的终端中间件。`Map` 会重写 `PathBase` 和 `Path`（匹配前缀从 `Path` 移到 `PathBase`），`MapWhen` 不做路径重写。子管道里的短路不影响主管道的后续中间件——但已经进入子管道的请求不会再回到主管道。"
+        },
+        {
+          "question": "Endpoint Routing 为什么把 `UseRouting` 和 `UseEndpoints` 分开？",
+          "answer": "`UseRouting` 负责路由匹配，匹配完把 `Endpoint` 写入 `HttpContext.GetEndpoint()`；`UseEndpoints` 负责执行。中间的间隙让 CORS、认证、授权中间件可以读取匹配到的 Endpoint 上的元数据（如 `[Authorize]` 特性）。旧的 `UseMvc()` 是匹配和执行合一的，CORS 预检（OPTIONS）请求在认证中间件运行前还没匹配路由，导致 CORS 头加不上去。拆开后，`UseCors` 可以在 `UseAuthentication` 之前处理预检请求。"
+        },
+        {
+          "question": "响应已经开始写入后再修改 Header 会怎样？怎么避免？",
+          "answer": "如果 `context.Response.HasStarted` 为 `true`（Kestrel 已经把响应头 flush 到网络），再调用 `Response.Headers.Add()` 或修改 `StatusCode` 会抛 `InvalidOperationException`。避免方法：需要修改响应头的中间件必须放在终端中间件或 MVC 执行之前；如果必须在后置逻辑中加 Header，可以用 `Response.OnStarting` 回调注册一个在响应头发送前执行的委托。"
         }
       ]
     },
@@ -99,33 +122,49 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "中间件管道的工作原理和执行流程",
-        "Use、Map、MapWhen、Run 的区别和使用场景",
-        "中间件的注册顺序为什么重要",
-        "如何自定义中间件（基于类和内联）",
-        "短路和分支的概念及实现",
-        "常见内置中间件的作用和顺序"
+        "能画出中间件的洋葱模型：请求从前往后、响应从后往前",
+        "能解释 RequestDelegate 的签名和中间件如何通过 next 委托形成链",
+        "能区分 Use、Run、Map、MapWhen 的语义和使用场景",
+        "能说出 Endpoint Routing 为什么拆成 UseRouting 和 UseEndpoints 两步",
+        "能列出至少三个顺序写错导致的真实 bug（认证授权、异常处理、CORS）",
+        "能说明短路的用途和绕过日志/异常中间件的风险",
+        "能区分中间件和 MVC 过滤器的职责边界",
+        "能解释 HasStarted 为 true 后修改 Header 的风险以及 OnStarting 回调方案"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "dotnet.dotnet-core.middleware-pipeline.recall.1",
-      "prompt": "请说明 中间件管道 的核心机制、典型使用场景和常见坑。",
+      "prompt": "请完整说明 ASP.NET Core 中间件管道的洋葱模型、RequestDelegate 的含义、Use/Run/Map 的区别，以及注册顺序为什么至关重要。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "dotnet.dotnet-core.middleware-pipeline.recall.2",
-      "prompt": "Use、Map、MapWhen 和 Run 这四个扩展方法有什么区别？分别在什么场景下使用？",
+      "prompt": "UseRouting 和 UseEndpoints 为什么要拆成两个中间件？中间的间隙有什么意义？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "dotnet.dotnet-core.middleware-pipeline.recall.3",
-      "prompt": "中间件注册顺序为什么重要？以异常处理和认证授权为例说明顺序错了会怎样。",
+      "prompt": "中间件和 MVC 过滤器（Filter）有什么区别？什么场景用中间件、什么场景用过滤器？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.dotnet-core.middleware-pipeline.recall.4",
+      "prompt": "假设线上出现了 UseAuthorization 在 UseAuthentication 之前、UseExceptionHandler 不在最外层、UseCors 在 UseEndpoints 之后这三个问题，分别会导致什么现象？怎么排查？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.dotnet-core.middleware-pipeline.recall.5",
+      "prompt": "响应已经开始发送（HasStarted == true）后还尝试修改 Header 会怎样？有哪些规避手段？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -133,32 +172,35 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说出中间件是处理 HttpContext 的函数、按注册顺序形成管道",
-      "能解释请求从前往后、响应从后往前的洋葱模型",
-      "能区分 Use/Run/Map 的作用",
-      "能说明中间件注册顺序为何关键（如认证在授权前）"
+      "能解释中间件是接收 HttpContext 的委托函数，通过 next 委托形成执行链",
+      "能说明洋葱模型：请求阶段从前往后、响应阶段从后往前",
+      "能区分 Use（可调 next）、Run（终端不调 next）、Map/MapWhen（分支子管道）的语义",
+      "能说出 Endpoint Routing 把 UseRouting 和 UseEndpoints 拆开的原因和中间间隙的作用"
     ],
     "goodToHave": [
-      "能说明短路（不调 next）的用途和风险",
-      "能指出响应已开始后改 header 会抛异常",
-      "能写自定义中间件"
+      "能举出至少两个顺序错误的真实 bug（如认证授权倒序、异常处理不在外层）",
+      "能说明 Map 重写 PathBase/Path 而 MapWhen 不重写",
+      "能区分中间件和过滤器的职责边界",
+      "能解释 HasStarted 后修改 Header 的风险和 OnStarting 回调方案"
     ],
     "commonMistakes": [
-      "UseAuthorization 写在 UseAuthentication 前导致拿不到身份",
-      "中间件顺序写错导致鉴权被绕过或异常未捕获",
-      "响应已发送后还修改 header"
+      "UseAuthorization 放在 UseAuthentication 前面导致 User 为空、鉴权失效",
+      "UseExceptionHandler 不在最外层导致异常漏捕获",
+      "UseCors 放在 UseEndpoints 后面导致 CORS 预检请求被认证拦截",
+      "Run 放在非末尾位置导致后续中间件全部失效",
+      "在 HasStarted == true 后修改 Header 抛 InvalidOperationException"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
   "prerequisites": [
     "dotnet.dotnet-core.dependency-injection"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否解释中间件管道的洋葱模型和 Use/Run/Map、说清注册顺序为何关键（认证授权顺序），并区分中间件与过滤器。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察能否用洋葱模型解释中间件管道的请求/响应双向流动、说清 Use/Run/Map 语义、Endpoint Routing 两阶段设计的原因、顺序错误的真实后果，以及中间件与过滤器的职责边界。",
+  "updatedAt": "2026-06-22"
 }

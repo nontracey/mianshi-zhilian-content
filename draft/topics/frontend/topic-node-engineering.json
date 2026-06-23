@@ -4,7 +4,7 @@
   "category": "nodejs",
   "group": "nodejs",
   "title": "Node.js 进程管理与线上排查",
-  "summary": "掌握PM2进程管理、Node.js内存排查、日志方案和安全加固的落地守则。",
+  "summary": "讲清 PM2 cluster 模式与进程守护原理、Node.js 内存泄漏的排查路径（heap snapshot + retainer 分析）、事件循环延迟与 CPU 瓶颈定位、优雅退出机制，以及日志方案和安全加固在 Node 服务端的工程落地。",
   "tags": [
     "前端",
     "Node.js",
@@ -13,20 +13,37 @@
     "安全"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 37,
   "order": 40,
   "recommendWeight": 70,
   "status": "draft",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Node.js 进程管理与线上排查：PM2 进程管理、内存排查",
-      "content": "## PM2进程管理\n- 多进程模式（cluster）\n- 自动重启、负载均衡\n- 日志管理、监控\n- ecosystem.config.js配置\n\n## 内存排查\n- V8堆内存限制（~1.5GB）\n- 内存泄漏检测：heapdump、Chrome DevTools\n- 常见泄漏：全局变量、闭包引用、事件监听未清理\n\n## 日志方案\n- 级别：error/warn/info/debug\n- 结构化日志（JSON格式）\n- 日志轮转：winston + winston-daily-rotate-file\n- 链路追踪：requestId串联请求\n\n## 安全加固\n- Helmet设置安全HTTP头\n- 限流：express-rate-limit\n- 输入验证：joi/zod\n- CORS配置\n- SQL注入/XSS防护"
+      "title": "PM2 cluster 模式不是简单开多进程",
+      "content": "Node.js 是单线程运行时，一个进程只能用一个 CPU 核心。PM2 的 cluster 模式在底层调用 `cluster.fork()` 创建多个 worker 进程，主进程（master）负责端口监听和请求分发，worker 共享同一个端口。默认的轮询调度（`schedulingPolicy: 'rr'`）按顺序把连接分配给 worker，实现负载均衡。\n\n关键配置项：`instances: 'max'` 表示 worker 数量等于 CPU 核心数，适合 IO 密集型服务；CPU 密集型服务设少于核心数的实例避免过度竞争。`max_memory_restart` 在单个 worker 的 RSS 超过阈值时自动重启该 worker，其他 worker 不受影响，这是生产环境应对内存泄漏的第一道防线。\n\nPM2 的 `restart` 杀掉单个 worker 并创建新进程；`reload` 依次重启每个 worker（graceful reload），不停服，适合代码更新。`gracefulShutdownTimeout`（默认 1600ms）控制优雅退出等待时间，超时后强制杀进程。启动命令：`pm2 start ecosystem.config.js --env production`。\n\n和 systemd/K8s 的取舍：PM2 适合单机部署、中小规模服务，配置简单、自带监控面板；K8s 适合集群调度、弹性扩缩、金丝雀发布，进程管理由 kubelet + restartPolicy 负责。两者可以配合：PM2 做进程守护 + cluster，K8s 做编排和自愈。"
     },
     {
       "type": "explain",
-      "title": "Node.js 进程管理与线上排查的边界、坑点与答题抓手",
-      "content": "Node.js 线上排查要把事件循环、进程模型和资源指标串起来看。CPU 飙高时关注同步计算、JSON 序列化和正则回溯，内存增长时看堆快照、缓存上限和对象引用链，请求堆积时再结合连接池、下游超时和日志采样判断。工程化上通常用守护进程、健康检查、优雅退出和限流熔断来降低单进程异常对整体服务的影响。"
+      "title": "内存泄漏排查：从 RSS 异常到 retainer path",
+      "content": "Node.js 进程内存由 V8 堆 + 原生内存（Buffer、C++ 对象）组成。`process.memoryUsage()` 返回 rss（驻留集）、heapTotal、heapUsed、external（Buffer 等 C++ 分配）、arrayBuffers。RSS 持续增长超过 200MB 且 GC 后不回落，大概率是内存泄漏。\n\nV8 堆默认上限约 1.5GB（64 位系统），可通过 `--max-old-space-size=4096` 调到 4GB。但调大堆只是延缓崩溃，不解决泄漏根因。\n\n排查三步：\n1. **确认泄漏**：PM2 monit 或 `process.memoryUsage()` 定时采样，观察 heapUsed 和 rss 是否单调递增。给进程发送 `SIGUSR2` 信号可以让 PM2 生成 heapdump。\n2. **抓 heap snapshot**：`--inspect` 启动后，Chrome DevTools → Memory → Heap snapshot，抓两次（间隔 30s-1min），用 Comparison 视图看新增对象、释放数量和大小差异。重点关注 `#Delta` 列的大对象。\n3. **分析 retainer path**：选中可疑对象，看 Retainers 面板找出是谁持有了引用。常见路径：全局对象属性、EventEmitter 的 listener 数组（`getMaxListeners()` 默认 10，超过会告警）、闭包捕获了外层大数组、Timer/Interval 未清理、Map/Set 持续增长。",
+      "_noteForDiagram": "应有一张图展示内存泄漏排查路径：RSS 异常 → heapdump → Comparison → retainer path → 常见泄漏模式"
+    },
+    {
+      "type": "explain",
+      "title": "CPU 飙高和事件循环延迟的定位方法",
+      "content": "CPU 飙高的常见根因：同步计算阻塞（大数组排序、JSON.parse 大对象）、正则回溯灾难（`(a+)+$` 类型，用 `--regexp-opt` 或 [safe-regex](https://github.com/substack/safe-regex) 防御）、加密/压缩操作未流式处理、模板渲染大页面。\n\n事件循环延迟（event loop lag）是衡量 Node 服务健康的核心指标。它反映从 `setTimeout(fn, 0)` 被调度到实际执行之间的延迟。正常 < 10ms，超过 100ms 用户可感知卡顿，超过 1s 服务基本不可用。用 `monitorEventLoopDelay`（Node 11+）可以精确采集百分位延迟。\n\n定位方式：`node --prof` 生成 V8 profiling 日志，`node --prof-process` 解析；或 `--inspect` 连接 Chrome DevTools → Performance → Record → 分析火焰图，找到耗时最长的函数。生产环境用 `0x` 工具生成火焰图更安全（`0x -- node server.js`）。\n\n句柄泄漏（handle leak）也常导致进程无法退出和内存缓慢增长。`process._getActiveHandles()` 和 `process._getActiveRequests()` 列出活跃句柄和请求，排查未关闭的 socket、stream、Timer。"
+    },
+    {
+      "type": "explain",
+      "title": "优雅退出：不只是 kill 进程",
+      "content": "Node 服务收到 `SIGTERM` 时如果直接退出，正在处理的请求会中断、数据库连接未释放、消息队列消费者未 ACK。优雅退出的目标是：停止接收新请求 → 处理完进行中的请求 → 释放资源 → 退出。\n\n实现步骤：\n1. 收到 `SIGTERM`/`SIGINT` 后，调用 `server.close()` 停止接收新连接（HTTP server 不再 accept）。\n2. 等待现有连接处理完成，设置超时（如 10s），超时后强制关闭。\n3. 关闭数据库连接池（`pool.end()`）、Redis 客户端（`client.quit()`）、消息队列连接。\n4. 调用 `process.exit(0)`。\n\nPM2 的 `gracefulShutdownTimeout` 和 K8s 的 `terminationGracePeriodSeconds`（默认 30s）需要配合：应用优雅退出时间 < 平台超时，否则被强杀。K8s 还会在 `preStop` hook 中先发 SIGTERM，等待一段时间后再断开 endpoint，确保流量完全转移。\n\n集群场景：PM2 `reload` 逐个重启 worker，旧 worker 排空连接后退出；K8s 滚动更新逐步替换 Pod。",
+      "_noteForDiagram": "应有一张图展示优雅退出时序：SIGTERM → server.close → drain connections → close resources → exit"
+    },
+    {
+      "type": "explain",
+      "title": "日志方案和安全加固的工程落地",
+      "content": "**日志方案**：Node 服务端日志推荐 Winston 或 Pino（性能更高，JSON-only）。核心要求：\n- 结构化 JSON 格式，方便 ELK/Loki 等日志系统解析。\n- 按级别分类：`error`（系统异常、未捕获错误）、`warn`（可恢复异常、慢查询）、`info`（请求生命周期、业务事件）、`debug`（开发调试，生产关闭）。\n- 日志轮转：`winston-daily-rotate-file` 按天轮转，`maxSize` 限制单文件大小，`maxFiles` 控制保留天数，防止磁盘打满。\n- 链路追踪：每个请求生成 `requestId`（UUID），通过 `AsyncLocalStorage`（Node 12.17+）或中间件传递到所有日志和下游调用。\n\n**安全加固**：\n- `helmet` 中间件设置 CSP、HSTS、X-Content-Type-Options 等安全 HTTP 头。\n- `express-rate-limit` 基于 IP 滑动窗口限流，防暴力破解和 DDoS。注意在反向代理后需设置 `app.set('trust proxy', 1)` 读取 `X-Forwarded-For`。\n- 输入验证：`zod`/`joi` 校验请求体、查询参数和路径参数，拒绝非法输入。对用户输入做 HTML 转义防 XSS，使用参数化查询防 SQL 注入。\n- CORS 配置：明确指定 `origin` 白名单，不使用 `*`（会携带 Cookie 时跨域风险）。"
     },
     {
       "type": "diagram",
@@ -55,49 +72,57 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 工具 | 用途 | 特点 |\n| --- | --- | --- |\n| PM2 | 进程管理 | cluster模式、自动重启、日志管理 |\n| nodemon | 开发热重载 | 文件变化自动重启 |\n| Winston | 日志框架 | 多级别、结构化、轮转 |\n| Helmet | 安全HTTP头 | 一行代码设置安全头 |\n| express-rate-limit | 限流 | 滑动窗口算法 |\n| zod/joi | 输入验证 | 类型安全的Schema验证 |"
+      "title": "进程管理与排查工具对比",
+      "content": "| 工具 | 核心用途 | 适用场景 | 关键限制 |\n| --- | --- | --- | --- |\n| PM2 | cluster 多进程 + 自动重启 + 日志 | 单机部署、中小服务 | 不支持集群调度和弹性扩缩 |\n| systemd | OS 级进程守护 + 重启策略 | Linux 单机、systemd 环境 | 无 cluster 和负载均衡 |\n| K8s | 容器编排 + 弹性扩缩 + 自愈 | 集群部署、微服务 | 运维复杂度高 |\n| node --inspect | V8 调试、CPU profile、heap snapshot | 开发和预发排查 | 生产开 inspector 有性能开销 |\n| 0x | 火焰图生成 | CPU 瓶颈定位 | 仅限 CPU 问题 |\n| monitorEventLoopDelay | 事件循环延迟百分位 | 健康监控指标采集 | Node 11+ 才支持 |\n| process._getActiveHandles | 列出活跃句柄 | 句柄泄漏排查 | 私有 API，版本可能变动 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// PM2配置\n// ecosystem.config.js\nmodule.exports = {\n  apps: [{\n    name: 'app',\n    script: './dist/server.js',\n    instances: 'max', // 使用所有CPU核心\n    exec_mode: 'cluster',\n    max_memory_restart: '1G',\n    env: { NODE_ENV: 'development' },\n    env_production: { NODE_ENV: 'production' },\n    log_date_format: 'YYYY-MM-DD HH:mm:ss',\n    error_file: './logs/error.log',\n    out_file: './logs/out.log'\n  }]\n};\n\n// 内存泄漏排查\n// --inspect 启动，Chrome DevTools连接\n// node --inspect server.js\n\n// 监控内存使用\nconst used = process.memoryUsage();\nconsole.log(`RSS: ${Math.round(used.rss / 1024 / 1024)} MB`);\nconsole.log(`Heap: ${Math.round(used.heapUsed / 1024 / 1024)} MB`);\n\n// 常见内存泄漏示例\n// 1. 全局变量累积\nconst cache = {};\nfunction leak(data) {\n  cache[Date.now()] = data; // 持续增长\n}\n\n// 2. 事件监听未清理\nfunction setup() {\n  const handler = () => {};\n  process.on('message', handler);\n  // 忘记 process.removeListener\n}\n\n// 3. 闭包引用大对象\nfunction createHandler() {\n  const large = new Array(1000000);\n  return () => console.log(large.length); // large被引用\n}\n\n// Winston日志配置\nconst winston = require('winston');\nrequire('winston-daily-rotate-file');\n\nconst logger = winston.createLogger({\n  level: 'info',\n  format: winston.format.combine(\n    winston.format.timestamp(),\n    winston.format.json()\n  ),\n  transports: [\n    new winston.transports.DailyRotateFile({\n      filename: 'logs/app-%DATE%.log',\n      datePattern: 'YYYY-MM-DD',\n      maxSize: '20m',\n      maxFiles: '14d'\n    })\n  ]\n});\n\n// 安全中间件\nconst helmet = require('helmet');\nconst rateLimit = require('express-rate-limit');\n\napp.use(helmet()); // 安全HTTP头\napp.use(rateLimit({\n  windowMs: 15 * 60 * 1000, // 15分钟\n  max: 100 // 每个IP最多100次请求\n}));\n\n// 输入验证\nconst { z } = require('zod');\nconst userSchema = z.object({\n  name: z.string().min(1).max(50),\n  email: z.string().email(),\n  age: z.number().int().min(0).max(150)\n});\n\napp.post('/user', (req, res) => {\n  const result = userSchema.safeParse(req.body);\n  if (!result.success) {\n    return res.status(400).json(result.error);\n  }\n  // 处理验证通过的数据\n});",
+      "title": "可运行代码：PM2 配置、内存泄漏排查、优雅退出与安全中间件",
       "language": "javascript",
+      "content": "// ========== 1. PM2 配置 (ecosystem.config.js) ==========\nmodule.exports = {\n  apps: [{\n    name: 'api-server',\n    script: './dist/server.js',\n    instances: 'max',        // 所有 CPU 核心\n    exec_mode: 'cluster',    // cluster 模式\n    max_memory_restart: '1G', // RSS 超 1G 自动重启该 worker\n    env: { NODE_ENV: 'development' },\n    env_production: { NODE_ENV: 'production' },\n    log_date_format: 'YYYY-MM-DD HH:mm:ss',\n    error_file: './logs/error.log',\n    out_file: './logs/out.log',\n    merge_logs: true          // 多 worker 日志合并\n  }]\n};\n// 启动: pm2 start ecosystem.config.js --env production\n// 监控: pm2 monit\n// 优雅重载: pm2 reload api-server\n// 生成 heapdump: kill -USR2 <pid>（需 pm2-configured）\n\n// ========== 2. 内存监控与泄漏示例 ==========\nconst http = require('http');\n\n// 定时采样内存\nsetInterval(() => {\n  const { rss, heapUsed, heapTotal, external } = process.memoryUsage();\n  console.log(JSON.stringify({\n    rss: `${Math.round(rss / 1024 / 1024)}MB`,\n    heapUsed: `${Math.round(heapUsed / 1024 / 1024)}MB`,\n    heapTotal: `${Math.round(heapTotal / 1024 / 1024)}MB`,\n    external: `${Math.round(external / 1024 / 1024)}MB`\n  }));\n}, 30_000);\n\n// 常见内存泄漏 1: 全局 Map 持续增长\nconst userSessionCache = new Map();\nfunction handleSession(userId, data) {\n  userSessionCache.set(userId, data); // 从不清理 → 持续增长\n  // 修复: userSessionCache.set(userId, { data, expireAt: Date.now() + 3600_000 });\n  // 定时清理过期条目\n}\n\n// 常见内存泄漏 2: EventEmitter listener 累积\nconst emitter = new (require('events').EventEmitter)();\nemitter.setMaxListeners(100); // 提高告警阈值但不解决根因\nfunction onEachRequest() {\n  emitter.on('request', () => {}); // 每次请求注册新 listener\n  // 修复: 用 once() 或在请求结束时 removeListener\n}\n\n// ========== 3. 优雅退出 ==========\nconst server = http.createServer((req, res) => {\n  res.end('ok');\n});\n\nlet shuttingDown = false;\nasync function gracefulShutdown(signal) {\n  if (shuttingDown) return;\n  shuttingDown = true;\n  console.log(`Received ${signal}, starting graceful shutdown...`);\n\n  // 1. 停止接收新连接\n  server.close(() => console.log('HTTP server closed'));\n\n  // 2. 设置强制退出超时\n  const forceExitTimer = setTimeout(() => {\n    console.error('Forced exit after timeout');\n    process.exit(1);\n  }, 10_000);\n  forceExitTimer.unref(); // 不阻止进程退出\n\n  // 3. 释放外部资源\n  try {\n    // await dbPool.end();      // 关闭数据库连接池\n    // await redisClient.quit(); // 关闭 Redis\n    // await mqConnection.close(); // 关闭消息队列\n    console.log('Resources released');\n  } catch (err) {\n    console.error('Error during cleanup:', err);\n  }\n\n  process.exit(0);\n}\n\nprocess.on('SIGTERM', () => gracefulShutdown('SIGTERM'));\nprocess.on('SIGINT', () => gracefulShutdown('SIGINT'));\n\nserver.listen(3000);\n\n// ========== 4. 安全中间件 ==========\n// const express = require('express');\n// const helmet = require('helmet');\n// const rateLimit = require('express-rate-limit');\n// const { z } = require('zod');\n//\n// const app = express();\n// app.set('trust proxy', 1); // 反向代理后必须设置\n//\n// app.use(helmet()); // 安全 HTTP 头\n// app.use(express.json({ limit: '1mb' })); // 限制请求体大小\n//\n// app.use(rateLimit({\n//   windowMs: 15 * 60 * 1000,\n//   max: 100,\n//   standardHeaders: true,\n//   legacyHeaders: false\n// }));\n//\n// const userSchema = z.object({\n//   name: z.string().min(1).max(50),\n//   email: z.string().email(),\n//   age: z.number().int().min(0).max(150)\n// });\n//\n// app.post('/user', (req, res) => {\n//   const result = userSchema.safeParse(req.body);\n//   if (!result.success) {\n//     return res.status(400).json({ error: result.error.flatten() });\n//   }\n//   res.json({ data: result.data });\n// });",
       "highlights": [
         {
-          "line": 30,
-          "note": "`function leak(data) {` 定义了 Node.js 进程管理与线上排查 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 12,
+          "note": "`max_memory_restart: '1G'` 是 PM2 cluster 模式下应对内存泄漏的第一道防线，单个 worker 超限自动重启。"
         },
         {
-          "line": 87,
-          "note": "`if (!result.success) {` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 27,
+          "note": "定时采样 `process.memoryUsage()` 是确认内存泄漏的前提，heapUsed 和 RSS 单调递增才需要抓 heap snapshot。"
         },
         {
-          "line": 35,
-          "note": "`function setup() {` 定义了 Node.js 进程管理与线上排查 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 37,
+          "note": "全局 Map 只 set 不 delete 是最常见的 Node.js 内存泄漏模式。"
         },
         {
-          "line": 44,
-          "note": "`return () => console.log(large.length); // large被引用` 定义了 Node.js 进程管理与线上排查 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 45,
+          "note": "EventEmitter 每次请求注册新 listener 不移除，导致 listener 数组持续增长。"
+        },
+        {
+          "line": 57,
+          "note": "`server.close()` 停止接收新连接是优雅退出的第一步，配合超时强制退出防止无限等待。"
+        },
+        {
+          "line": 53,
+          "note": "`unref()` 让 forceExitTimer 不阻止 Node 进程自然退出，资源释放完成后可提前退出。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "PM2是Node.js的进程管理工具，支持cluster多进程模式和自动重启。配置instances为max可以利用所有CPU核心，max_memory_restart在内存超限时自动重启。配合日志轮转和监控功能，是生产环境的标配。\n\n机制要点：\n- 内存排查是Node.js运维的重要技能。V8堆内存默认限制约1.5GB，可以通过--max-old-space-size调整。常见内存泄漏包括全局变量累积、事件监听未清理、闭包引用大对象。使用--inspect启动后可通过Chrome DevTools的Memory面板抓取heapdump对比分析。\n- 日志方案推荐使用winston，支持多级别、结构化JSON格式、日志轮转。通过requestId串联请求链路，方便排查问题。安全方面，使用Helmet设置安全HTTP头、express-rate-limit限流、zod/joi做输入验证、正确配置CORS。",
+      "content": "**结论**：Node.js 生产环境的进程管理和排查是一个完整闭环——PM2 做进程守护和多核利用，内存/CPU/句柄排查定位问题根因，优雅退出保证不中断服务，日志和安全措施保障可观测和可防御。\n\n**PM2 进程管理**\n- cluster 模式：`cluster.fork()` 创建多个 worker，master 分发连接，`instances: 'max'` 用满 CPU 核心\n- `max_memory_restart`：单 worker RSS 超限自动重启，其他 worker 不受影响\n- `reload` vs `restart`：reload 逐个优雅重启（不停服），restart 直接杀重建\n- 和 K8s 配合：PM2 做 cluster + 守护，K8s 做编排和弹性\n\n**内存泄漏排查路径**\n- 确认：定时采样 `process.memoryUsage()`，观察 heapUsed/rss 单调递增\n- 抓取：`--inspect` 连 Chrome DevTools，Heap snapshot Comparison 视图对比两次快照\n- 定位：Retainer 面板找引用链——常见根因是全局 Map/Set 只增不删、EventEmitter listener 累积、闭包捕获大对象、Timer 未清理\n- V8 堆默认 ~1.5GB，`--max-old-space-size` 可调但不解决泄漏根因\n\n**CPU 和事件循环**\n- event loop lag 是核心健康指标，正常 < 10ms，超 100ms 用户可感知\n- CPU 瓶颈：同步计算、大 JSON 序列化、正则回溯（灾难性回溯用 safe-regex 防御）\n- 定位：`--prof` / `--inspect` CPU profile + 火焰图（生产用 `0x`）\n\n**优雅退出**\n- 收到 SIGTERM → `server.close()` 停新连接 → drain 进行中请求 → 释放 DB/Redis/MQ → `process.exit(0)`\n- 超时强制退出（< K8s `terminationGracePeriodSeconds` 的 30s）\n- PM2 `gracefulShutdownTimeout` 和 K8s `preStop` hook 需配合\n\n**日志与安全**\n- Winston/Pino 结构化 JSON + 按天轮转 + `requestId` 链路追踪\n- helmet 安全头、express-rate-limit 限流、zod 输入验证、CORS 白名单、参数化查询防注入",
       "followUpQuestions": [
         {
-          "question": "在实际前端项目中，Node.js工程实践的落地时怎么取舍？有哪些常见坑？",
-          "answer": "Node.js工程实践的核心是理解浏览器/Node.js的运行机制。建议围绕 Node.js 进程管理与线上排查 在 Chrome DevTools 的 Performance、Sources 和 Network 面板里实际复现一次。"
+          "question": "PM2 的 reload 和 restart 有什么区别？什么场景用哪个？",
+          "answer": "`restart` 直接杀掉 worker 并创建新进程，有短暂停服；`reload` 逐个优雅重启 worker，每个 worker 排空连接后才退出，实现零停服部署。代码更新用 reload，配置变更或 worker 卡死用 restart。"
         },
         {
-          "question": "Node.js 进程管理与线上排查 的核心原理是什么？和其他方案相比有什么优劣？",
-          "answer": "落地时先明确场景、输入输出、性能和兼容性边界，再用最小示例或线上指标验证；常见坑是把概念当成银弹，忽略失败路径、回滚和可观测性。"
+          "question": "线上 Node 服务 RSS 持续增长但没有明显代码问题，怎么排查？",
+          "answer": "先区分是 V8 堆内存还是原生内存（Buffer/C++ 对象）。如果 heapUsed 稳定但 RSS 涨，问题在原生内存——检查大 Buffer、数据库连接池、未关闭的 stream。如果 heapUsed 也涨，用 `--inspect` 抓两次 heap snapshot 对比，看 Comparison 视图新增对象的 retainer path，常见根因是闭包引用、EventEmitter listener 和全局缓存。"
         },
         {
-          "question": "如果 Node.js 进程管理与线上排查 在生产环境出了性能或兼容性问题，你会怎么排查？",
-          "answer": "排查 Node.js 进程管理与线上排查 问题的思路：先看浏览器兼容性数据和用户环境分布，再用 DevTools 的 Network/Performance/Console 面板定位。遇到 Node.js 进程管理与线上排查 的跨平台问题时，要在目标设备、浏览器版本和真实网络条件下复现。Node.js 进程管理与线上排查 的错误日志、性能数据和用户影响范围是优先线索。"
+          "question": "K8s 中 Node.js 应用的优雅退出需要注意什么？",
+          "answer": "三件事：一是 `terminationGracePeriodSeconds` 要大于应用优雅退出时间，否则被强杀；二是 `preStop` hook 可以先 sleep 几秒等 endpoint 更新完成再发 SIGTERM，避免新连接打到正在退出的 Pod；三是 `server.close()` 后要设超时强制退出，防止长连接（WebSocket）拖住进程。"
         }
       ]
     },
@@ -105,32 +130,49 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "PM2的cluster模式和自动重启配置",
-        "Node.js内存泄漏的常见原因和排查方法",
-        "Winston日志框架的配置和日志轮转",
-        "Helmet、限流、输入验证等安全措施",
-        "生产环境的Node.js落地守则"
+        "PM2 cluster 模式的原理（cluster.fork、master 分发、round-robin）和关键配置（instances、max_memory_restart、reload vs restart）",
+        "内存泄漏排查三步法：定时采样 → heap snapshot Comparison → retainer path 定位",
+        "常见内存泄漏模式：全局 Map/Set 只增不删、EventEmitter listener 累积、闭包捕获大对象、Timer 未清理",
+        "事件循环延迟（event loop lag）的含义、正常范围和采集方式（monitorEventLoopDelay）",
+        "CPU 瓶颈的定位方式：--prof / --inspect CPU profile + 火焰图",
+        "优雅退出流程：SIGTERM → server.close → drain → release resources → exit，配合 K8s terminationGracePeriodSeconds",
+        "日志方案：结构化 JSON + 按天轮转 + requestId 链路追踪",
+        "安全措施：helmet 安全头、限流（trust proxy）、输入验证（zod）、CORS 白名单、参数化查询"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "frontend.nodejs.topic-node-engineering.recall.1",
-      "prompt": "如何排查Node.js的内存泄漏？常见原因有哪些？",
+      "prompt": "如何排查 Node.js 的内存泄漏？请从确认泄漏、抓取 heap snapshot 到分析 retainer path 说完整流程。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "frontend.nodejs.topic-node-engineering.recall.2",
-      "prompt": "Node.js生产环境需要哪些安全措施？",
+      "prompt": "PM2 的 cluster 模式是怎么工作的？reload 和 restart 有什么区别？max_memory_restart 的作用是什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "frontend.nodejs.topic-node-engineering.recall.3",
-      "prompt": "Node.js 进程管理与线上排查 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "Node.js 服务收到 SIGTERM 后直接 process.exit(0) 会导致什么问题？请描述完整的优雅退出流程。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "frontend.nodejs.topic-node-engineering.recall.4",
+      "prompt": "线上 Node 服务 CPU 飙高且事件循环延迟超过 500ms，你会怎么定位问题？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "frontend.nodejs.topic-node-engineering.recall.5",
+      "prompt": "Node.js 生产环境需要哪些安全措施？为什么反向代理后要设置 trust proxy？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -138,32 +180,34 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说出PM2的核心功能",
-      "能列举内存泄漏的常见原因",
-      "能说出日志框架的选择和配置",
-      "能说出至少3种安全措施"
+      "能说清 PM2 cluster 模式的工作原理和关键配置（instances、max_memory_restart）",
+      "能描述内存泄漏排查的完整路径：确认 → heap snapshot Comparison → retainer path",
+      "能列举至少 3 种常见内存泄漏模式（全局缓存、listener 累积、闭包引用、Timer 未清理）",
+      "能说出优雅退出的核心步骤：server.close → drain → release resources → exit"
     ],
     "goodToHave": [
-      "能使用Chrome DevTools排查内存泄漏",
-      "能配置Winston日志轮转",
-      "能解释PM2的reload和restart区别"
+      "能区分 reload 和 restart 的语义差异和适用场景",
+      "能解释事件循环延迟的含义、采集方式和正常范围",
+      "能说明 PM2/systemd/K8s 在进程管理上的取舍",
+      "能解释 K8s 优雅退出时 preStop hook 和 terminationGracePeriodSeconds 的配合"
     ],
     "commonMistakes": [
-      "只列出 Node.js、PM2、内存排查，但说不出触发条件、状态变化和验证证据",
-      "把「Node.js 进程管理与线上排查」的适用场景、失效条件和相邻概念混在一起",
-      "遇到前端工程里的真实问题时，不能说明「Node.js 进程管理与线上排查」应该观察哪些状态、日志或指标"
+      "把 PM2 cluster 和 K8s 容器调度混为一谈，说不清各自的职责边界",
+      "只知道用 Chrome DevTools 抓 heap snapshot，但不会用 Comparison 视图和 retainer path 定位根因",
+      "优雅退出只说 process.exit，不提 server.close 停止新连接和资源释放",
+      "安全措施只列工具名，不解释 trust proxy、CORS origin 白名单等配置的必要性"
     ],
     "scoreWeights": {
-      "coverage": 35,
-      "accuracy": 30,
+      "coverage": 30,
+      "accuracy": 25,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 25
     }
   },
   "prerequisites": [
     "frontend.nodejs.topic-koa-express"
   ],
   "interviewFrequency": "low",
-  "interviewerFocus": "考察是否能围绕「Node.js 进程管理与线上排查」说清能说出PM2的核心功能、能列举内存泄漏的常见原因，并放到前端工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察能否完整描述 PM2 cluster 原理、内存泄漏排查路径、优雅退出流程和安全加固措施，重点看是否有实际排查经验和工程边界理解，而不是只列工具名。",
+  "updatedAt": "2026-06-22"
 }

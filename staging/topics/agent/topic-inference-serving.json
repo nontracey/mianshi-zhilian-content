@@ -4,7 +4,7 @@
   "category": "llmops",
   "group": "llmops",
   "title": "推理服务化：vLLM / PagedAttention / Continuous Batching",
-  "summary": "理解 PagedAttention 如何管理 KV cache 显存、Continuous Batching 如何提升吞吐，以及推理框架选型。",
+  "summary": "理解 PagedAttention 如何用 OS 分页思想管理 KV cache 显存、Continuous Batching 如何以 token 粒度动态合批提升 GPU 利用率，以及 vLLM/TGI/SGLang 的选型权衡与线上指标观测。",
   "tags": [
     "Agent",
     "LLMOps",
@@ -12,19 +12,29 @@
     "推理优化"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 25,
   "order": 60,
   "recommendWeight": 78,
   "learningCards": [
     {
       "type": "explain",
-      "title": "PagedAttention：KV cache 的显存管理",
-      "content": "## 痛点\n自回归生成时每个序列要缓存历史 token 的 **KV cache**，占用大量显存。传统做法为每个序列**预留连续最大长度**的显存，导致：\n- **内部碎片**：实际长度远小于预留，浪费严重。\n- **外部碎片**：不同长度序列难紧凑排布。\n显存浪费直接限制了能并发的序列数（batch 大小），吞吐上不去。\n## PagedAttention（vLLM 核心）\n借鉴操作系统**虚拟内存分页**：把 KV cache 切成固定大小的 **block（页）**，逻辑上连续、物理上可不连续，用**块表**映射。按需分配页，几乎消除碎片，显存利用率大幅提升，从而能跑更大 batch。\n- 还支持**前缀共享**（多个请求共享相同 system prompt 的 KV 页，copy-on-write），进一步省显存。"
+      "title": "KV cache 为什么是显存瓶颈",
+      "content": "自回归解码时，每个已生成 token 的 Key 和 Value 向量需要缓存下来供后续 token 做 attention，这就是 KV cache。对于一个序列，第 i 层的 KV cache 大小约为 `2 × seq_len × hidden_dim × dtype_bytes`（2 是 K 和 V 各一份），乘以层数和 batch 就是总显存占用。以 Llama-70B、FP16 为例，单请求 4K 上下文的 KV cache 约 3.6GB，一张 80GB A100 只能同时服务 ~20 个并发请求，还没算模型权重。\n\n传统实现会为每个序列**预留连续的最大长度显存**（按 max_seq_len 分配），但实际 prompt 长度千差万别，平均使用率可能只有 30%-50%。大量显存在「分配了但没用」的状态里，这就是**内部碎片**。同时不同序列的空闲块散落在显存各处、无法拼给新序列用，这是**外部碎片**。两层碎片叠加，GPU 看似还有空间，实际已经放不下新请求，吞吐被显存瓶颈锁死。"
     },
     {
       "type": "explain",
-      "title": "Continuous Batching 与框架选型",
-      "content": "## Continuous Batching（连续批处理）\n静态批处理要**等一批里最慢的序列生成完**才能开始下一批，GPU 大量空闲。Continuous Batching（又称 in-flight batching）**以 token 为粒度动态调度**：某序列生成结束就**立刻**把它移出、把等待中的新请求**填进空位**，GPU 始终满载，吞吐大幅提升。\n## 框架选型\n- **vLLM**：PagedAttention + Continuous Batching，吞吐高、生态好，最常用的开源推理引擎。\n- **TGI（Text Generation Inference）**：HuggingFace 出品，工程完善、易部署。\n- **SGLang**：擅长复杂结构化生成与高效前缀缓存（RadixAttention），多轮/Agent 场景吞吐优。\n- 配套优化：量化（INT8/FP8/AWQ/GPTQ）、张量并行、投机采样（speculative decoding）。\n## 选型要点\n吞吐与显存看 PagedAttention/batching；多轮共享前缀看缓存能力；部署便利看 TGI；都支持 OpenAI 兼容 API 便于接入。"
+      "title": "PagedAttention：用分页消除 KV cache 碎片",
+      "content": "vLLM 的 PagedAttention 借鉴了 OS 虚拟内存分页。把 KV cache 切成固定大小的 **block**（通常 16 个 token 一块），每个 block 有固定显存地址，但**逻辑上连续的 token 不需要物理上连续存放**。维护一张 **block table**（类比页表）记录逻辑块到物理块的映射。\n\n分配时按需逐块分配，序列生成几个 token 就占用几个 block，不需要一次性预留 max 长度——**内部碎片被压到一个 block 以内**。释放时块回到空闲池，新请求可以复用任意空闲块——**外部碎片消失**。实测中，PagedAttention 把 KV cache 显存利用率从 20%-40% 提升到 90% 以上，等效并发 batch 可以增大 2-4 倍。\n\n**前缀共享**（copy-on-write）：多个请求如果共享相同的 system prompt，可以只存一份 KV cache，引用计数管理。只有当某个请求在该前缀后面追加了新 token（修改了 KV）才做写时复制。对 Agent 场景特别有用——大量请求共享同一条系统提示或工具定义，前缀 KV 可以复用，省下大量显存。\n\n注意：PagedAttention 优化的是显存碎片和并发量，**不改变 attention 计算本身**，不影响模型精度。"
+    },
+    {
+      "type": "explain",
+      "title": "Continuous Batching：token 级调度消除空转",
+      "content": "**静态批处理**的问题：一批请求里只要有一个长序列没生成完，整个 batch 就不能开始下一轮，短请求等长请求，GPU 利用率随序列长度方差增大而急剧下降。尤其在 Agent 场景中，短回复（工具调用）和长回复（推理思考）混杂，方差极大。\n\nContinuous Batching（vLLM 论文也叫 iteration-level scheduling）打破了「一批同时开始、一批同时结束」的约束：**每一步 decode iteration 结束后，立刻把已完成的序列从 batch 移除，把等待队列中排到的新请求填入空位**。GPU 始终在跑满载 batch，吞吐提升 2-10 倍不等（取决于请求长度方差和并发量）。\n\n实现细节：调度器每 iteration 会检查——当前 batch 里哪些序列已生成 EOS 或达到 max_tokens，移出并释放 KV cache block；等待队列中哪些新请求可以 prefilled（考虑 prefill 的计算量和 block 预算），选择性填入。这里涉及到 **preempt 策略**：当显存不足以容纳新请求时，可以暂停（swap out）低优先级序列的 KV cache 到 CPU 内存，腾出空间给高优先级请求。"
+    },
+    {
+      "type": "explain",
+      "title": "Prefill 与 Decode 的计算特性差异",
+      "content": "推理过程分两个阶段，瓶颈完全不同：\n\n**Prefill（预填充）**：把整个 prompt 一次性并行处理，计算每个 token 的 KV 并写入 cache。这个阶段是**计算密集型**——矩阵乘法可以高效并行，GPU 算力利用率高。长 prompt 的 prefill 时间与 token 数近似线性，这就是 TTFT（Time To First Token）的主要来源。\n\n**Decode（解码）**：逐 token 自回归生成。每步只生成一个 token，但要对整个 KV cache 做 attention——这个阶段是**访存密集型**，GPU 算力利用率低（大量时间花在从显存读 KV 上）。TPOT（Time Per Output Token）就是 decode 速度的体现。\n\n因为两者特性不同，一些优化是分阶段的：**chunked prefill** 把长 prompt 的 prefill 切成多个 chunk 与 decode 交织执行，避免长 prompt 独占 GPU 导致其他请求的 TPOT 飙高。**prefill-decode 分离架构**则在集群层面把 prefill 节点和 decode 节点分开部署，各自优化。"
     },
     {
       "type": "diagram",
@@ -46,25 +56,49 @@
     },
     {
       "type": "compareTable",
-      "title": "推理框架与关键技术",
-      "content": "| 维度 | 静态批处理 | Continuous Batching | 说明 |\n| --- | --- | --- | --- |\n| 调度粒度 | 整批 | 单 token 动态填充 | 后者 GPU 利用率高 |\n| 显存管理 | 连续预留 | PagedAttention 分页 | 后者消除碎片 |\n| 代表 | 朴素实现 | vLLM/TGI/SGLang | — |\n| 前缀复用 | 无 | KV 前缀共享/RadixAttention | 多轮省显存 |"
+      "title": "静态批处理 vs Continuous Batching vs 框架选型",
+      "content": "| 维度 | 静态批处理 | Continuous Batching |\n| --- | --- | --- |\n| 调度粒度 | 整批同时开始/结束 | 每个 decode iteration 动态增减 |\n| 短请求行为 | 等最慢序列结束 | 完成即退出、新请求立刻填入 |\n| GPU 利用率 | 随序列长度方差增大而下降 | 始终接近满载 |\n| 显存管理 | 连续预留 max 长度 | PagedAttention 按需分页 |\n| 预empt | 通常不支持 | 支持 swap out 到 CPU |\n\n| 框架 | 核心能力 | 擅长场景 | 注意事项 |\n| --- | --- | --- | --- |\n| vLLM | PagedAttention + Continuous Batching + 前缀共享 | 通用高吞吐推理 | 社区活跃，生态最广，OpenAI 兼容 API |\n| TGI | Continuous Batching + 量化支持 + 管线并行 | HuggingFace 模型快速部署 | 工程稳定性好，流式输出支持成熟 |\n| SGLang | RadixAttention（前缀树缓存）+ 结构化生成 | 多轮对话/Agent/工具调用密集场景 | 前缀缓存命中率高，复杂 JSON schema 约束生成快 |\n\n| 配套优化 | 作用 | 典型方案 |\n| --- | --- | --- |\n| 量化 | 降低模型权重显存和 decode 访存带宽 | GPTQ/AWQ/INT8/FP8 |\n| 张量并行 | 单模型分片到多卡，降低单卡显存压力 | TP=2/4/8 |\n| 投机采样 | 小模型猜、大模型验，减少 decode 步数 | Draft model + verify |\n| KV cache 量化 | 降低 KV cache 显存占用 | FP8/INT8 KV cache |"
+    },
+    {
+      "type": "code",
+      "title": "代码示例：vLLM 部署与关键参数",
+      "language": "python",
+      "content": "# 启动 vLLM 服务（OpenAI 兼容 API）\n# pip install vllm\n\n# 基础启动：PagedAttention + Continuous Batching 默认开启\n# python -m vllm.entrypoints.openai.api_server \\\n#     --model meta-llama/Llama-3-8B-Instruct \\\n#     --tensor-parallel-size 2 \\\n#     --max-num-seqs 256 \\\n#     --max-model-len 8192 \\\n#     --gpu-memory-utilization 0.90 \\\n#     --enable-prefix-caching\n\nfrom openai import OpenAI\n\nclient = OpenAI(\n    base_url=\"http://localhost:8000/v1\",\n    api_key=\"unused\",  # vLLM 本地部署不需要真实 key\n)\n\n# 流式请求\nresponse = client.chat.completions.create(\n    model=\"meta-llama/Llama-3-8B-Instruct\",\n    messages=[\n        {\"role\": \"system\", \"content\": \"你是一个 Agent，可以调用工具。\"},\n        {\"role\": \"user\", \"content\": \"查询北京天气\"}\n    ],\n    max_tokens=512,\n    temperature=0.7,\n    stream=True,\n)\nfor chunk in response:\n    if chunk.choices[0].delta.content:\n        print(chunk.choices[0].delta.content, end=\"\")\n\n# 关键启动参数说明：\n# --max-num-seqs       : 最大并发序列数（batch 上限），受 KV cache 显存约束\n# --max-model-len      : 最大上下文长度，影响 KV cache 预算\n# --gpu-memory-utilization : GPU 显存使用比例（留余量给 CUDA overhead）\n# --enable-prefix-caching : 开启前缀 KV cache 共享（Agent 场景强推）\n# --tensor-parallel-size  : 张量并行卡数\n# --quantization       : 量化方案（awq/gptq/fp8）\n# --swap-space         : CPU swap 空间（GB），用于 preempt 时暂存 KV cache",
+      "highlights": [
+        {
+          "line": 6,
+          "note": "max-num-seqs 控制并发 batch 大小，实际能跑多少受 KV cache 显存预算决定"
+        },
+        {
+          "line": 9,
+          "note": "enable-prefix-caching 开启后，共享 system prompt 的请求只存一份 KV，Agent 场景省大量显存"
+        },
+        {
+          "line": 22,
+          "note": "流式输出逐 chunk 返回，前端体验更好，也是 TPOT 指标的实际体现"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
-      "title": "标准面试回答",
-      "content": "30 秒结论：LLM 推理服务化的目标是把 GPU 显存和吞吐用好。PagedAttention 通过分页管理 KV Cache 降低碎片，Continuous Batching 以 token 为粒度动态合批，减少静态 batch 等最慢请求造成的空转。\n\n机制要点：\n- 机制上，Prefill 阶段并行处理输入，Decode 阶段逐 token 生成，瓶颈常在 KV Cache 显存和解码吞吐。vLLM 的 PagedAttention 把 KV Cache 切成块，像操作系统分页一样按需分配；Continuous Batching 让已完成序列退出后立刻加入新请求。配合张量并行、量化、前缀缓存和投机采样，可以在不同场景下优化成本。\n- 边界上，这些技术提升吞吐和成本，不会让模型本身更聪明。超长上下文、大 batch、低延迟和高并发之间互相牵制。验证要看 TTFT、TPOT、tokens/s、QPS、P95/P99、显存占用、OOM 率和队列等待时间。",
+      "title": "面试回答思路",
+      "content": "**30 秒结论**：LLM 推理服务化的核心矛盾是 KV cache 显存碎片和 GPU 时间碎片。PagedAttention 用 OS 分页思想消除 KV cache 碎片，提升并发 batch；Continuous Batching 以 token 粒度动态合批，消除静态 batch 等最慢请求的空转。两者配合让 GPU 显存和算力都用满。\n\n**机制主线**：\n- Prefill 阶段并行处理 prompt，写入 KV cache——计算密集，决定 TTFT\n- Decode 阶段逐 token 生成，每步要读取全部 KV cache——访存密集，决定 TPOT\n- PagedAttention 把 KV cache 切成固定大小 block，逻辑连续物理可不连续，按需分配消除碎片，支持前缀共享（copy-on-write）\n- Continuous Batching 每个 decode iteration 结束后移除完成序列、填入新请求，GPU 始终满载\n- 显存不足时可 preempt（swap out KV 到 CPU），配合优先级调度\n\n**边界与取舍**：\n- 这些技术优化吞吐和成本，不改变模型精度\n- 超长上下文 × 大 batch × 低延迟 × 高并发四者互相牵制\n- 验证要看：TTFT、TPOT、tokens/s、QPS、P95/P99、显存占用、KV cache 命中率、OOM 率、排队等待\n\n**框架选型**：\n- vLLM：通用高吞吐，PagedAttention + Continuous Batching + 前缀缓存，生态最广\n- TGI：HuggingFace 生态，工程稳定，快速部署\n- SGLang：RadixAttention 前缀树缓存，多轮/Agent/结构化生成场景吞吐优\n- 配套：量化（AWQ/GPTQ/FP8）、张量并行、投机采样、KV cache 量化",
       "followUpQuestions": [
         {
-          "question": "PagedAttention 解决什么问题？",
-          "answer": "它主要解决 KV Cache 显存碎片和分配效率问题。把 KV Cache 分成固定大小块后，可以按需映射和复用，让并发 batch 更大，减少因为连续内存不足导致的浪费。"
+          "question": "PagedAttention 的 block table 和 OS 页表有什么对应关系？",
+          "answer": "block table 记录逻辑 KV block 到物理显存 block 的映射，和页表的虚拟页号到物理页号映射逻辑一致。区别在于：OS 页表支持缺页中断和换入换出到磁盘，PagedAttention 的 block 换出目标是 CPU 内存（preempt），没有磁盘层级。"
         },
         {
-          "question": "Continuous Batching 和普通 batching 有什么区别？",
-          "answer": "普通 batching 往往等一批请求一起结束，短请求会等长请求；Continuous Batching 在 token 级调度，序列结束就腾出位置加入新请求，提高 GPU 利用率。"
+          "question": "Continuous Batching 中 preempt 的代价是什么？",
+          "answer": "preempt 需要把被暂停序列的 KV cache 从 GPU 搬到 CPU 内存，恢复时再搬回来。这个过程涉及 PCIe 带宽（~32GB/s），对于长序列的 KV cache 可能是几 GB，搬运延迟在数十到数百毫秒。所以 preempt 策略要选低优先级或已生成较多 token 的序列（搬运成本相对产出更值得）。"
         },
         {
-          "question": "推理服务压测看哪些指标？",
-          "answer": "看 TTFT、TPOT、tokens/s、QPS、P95/P99、显存占用、KV Cache 命中/占用、OOM 率、队列等待和错误率。只看 QPS 容易忽略首 token 体验和尾延迟。"
+          "question": "SGLang 的 RadixAttention 和 vLLM 的前缀缓存有什么区别？",
+          "answer": "vLLM 的前缀缓存是基于 hash 的精确匹配，适合 system prompt 这种完全一致的前缀共享。SGLang 的 RadixAttention 用前缀树管理 KV cache，支持部分前缀匹配——即使两个请求的前缀不完全相同，共享部分也能复用。在多轮对话和 Agent 场景中，前缀树的命中率通常高于精确匹配。"
+        },
+        {
+          "question": "推理服务显存不够用，有哪些优化手段？",
+          "answer": "按优先级：1) 量化模型权重（FP8/AWQ/GPTQ），立刻省 50%+ 模型显存；2) 开启 PagedAttention + 前缀缓存，减少 KV cache 浪费；3) 减小 max_model_len 降低单请求 KV 预算；4) 张量并行分摊到多卡；5) KV cache 量化（FP8）；6) 配置 CPU swap 做 preempt。"
         }
       ]
     },
@@ -72,63 +106,89 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释 KV cache 显存碎片问题",
-        "能说明 PagedAttention 如何用分页消除碎片、提升 batch",
-        "能讲清 Continuous Batching 相对静态批处理的吞吐优势",
-        "能区分 vLLM/TGI/SGLang 的定位",
-        "能说出量化/张量并行/投机采样等配套优化"
+        "能解释 KV cache 显存碎片（内部 + 外部）如何限制并发 batch",
+        "能说明 PagedAttention 的 block、block table 和按需分配如何消除碎片",
+        "能讲清前缀共享（copy-on-write）的机制和 Agent 场景收益",
+        "能对比静态批处理和 Continuous Batching 的 GPU 利用率差异",
+        "能区分 Prefill（计算密集）和 Decode（访存密集）的瓶颈",
+        "能说出 vLLM/TGI/SGLang 的核心差异和选型理由",
+        "能列举推理服务压测的关键指标（TTFT/TPOT/tokens/s/P99/OOM/排队时间）",
+        "能说明 preempt 策略的场景和 PCIe 搬运成本"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "agent.llmops.topic-inference-serving.recall.1",
-      "prompt": "解释 PagedAttention 如何借鉴 OS 分页管理 KV cache，解决了什么显存问题。",
+      "prompt": "解释 PagedAttention 如何借鉴 OS 分页管理 KV cache，解决了什么显存问题，前缀共享又是怎么回事。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "agent.llmops.topic-inference-serving.recall.2",
-      "prompt": "Continuous Batching 相比静态批处理为什么吞吐更高？vLLM/TGI/SGLang 如何选型？",
+      "prompt": "Continuous Batching 相比静态批处理为什么吞吐更高？实现上每一步需要做什么调度决策？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
       "id": "agent.llmops.topic-inference-serving.recall.3",
-      "prompt": "推理服务化：vLLM / PagedAttention / Continuous Batching 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "一个 Agent 推理服务：system prompt 很长、工具调用导致回复长度方差极大、显存经常 OOM。你会怎么优化？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "agent.llmops.topic-inference-serving.recall.4",
+      "prompt": "Prefill 和 Decode 的计算特性有什么不同？chunked prefill 和 prefill-decode 分别解决什么问题？",
       "mode": "text",
       "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "agent.llmops.topic-inference-serving.recall.5",
+      "prompt": "vLLM、TGI、SGLang 的核心能力差异是什么？在什么场景下选哪个？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.llmops.topic-inference-serving.recall.6",
+      "prompt": "推理服务压测发现 TTFT 正常但 TPOT 飙高、显存接近上限、偶尔 OOM。你怎么排查和优化？",
+      "mode": "text",
+      "expectedMinutes": 5,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能区分 Prefill 与 Decode 的瓶颈",
-      "能说明 PagedAttention 如何分页管理 KV Cache 并降低碎片",
-      "能说明 Continuous Batching 如何提升 GPU 利用率",
-      "能用 TTFT、TPOT、tokens/s、QPS、P95/P99、显存占用和 OOM 率验证服务效果"
+      "能区分 Prefill（计算密集/TTFT）与 Decode（访存密集/TPOT）的瓶颈差异",
+      "能说明 PagedAttention 的 block 分页、block table 映射和按需分配如何消除 KV cache 碎片",
+      "能说明 Continuous Batching 的 token 级调度如何消除静态批处理的空转",
+      "能用 TTFT、TPOT、tokens/s、QPS、P95/P99、显存占用、KV cache 命中率和 OOM 率验证服务效果"
     ],
     "goodToHave": [
-      "前缀共享/RadixAttention",
-      "vLLM/TGI/SGLang 定位",
-      "量化/张量并行/投机采样"
+      "能解释前缀共享 copy-on-write 机制和 Agent 场景收益",
+      "能区分 vLLM/TGI/SGLang 的核心能力差异和选型依据",
+      "能说明 preempt 策略的触发条件和 PCIe 搬运成本",
+      "能讲清量化/张量并行/投机采样/KV cache 量化各自的优化目标"
     ],
     "commonMistakes": [
-      "以为推理优化能提升模型质量",
-      "混淆静态与连续批处理",
-      "不知道 KV cache 是显存瓶颈"
+      "以为推理优化（PagedAttention/Continuous Batching）能改变模型精度或输出质量",
+      "混淆 Prefill 和 Decode 的计算特性——Prefill 是计算密集、Decode 是访存密集",
+      "忽略前缀缓存在 Agent 多轮场景的显存收益",
+      "只关注吞吐（tokens/s）忽略 TTFT 和 TPOT 对用户体验的影响"
     ],
     "scoreWeights": {
-      "coverage": 30,
+      "coverage": 25,
       "accuracy": 30,
-      "interviewExpression": 15,
+      "interviewExpression": 20,
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "staging",
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察 PagedAttention 的 KV cache 分页、Continuous Batching 的吞吐优化与主流推理框架选型。"
+  "interviewerFocus": "考察 PagedAttention 的 KV cache 分页机制与碎片消除、Continuous Batching 的 token 级调度与 GPU 利用率提升、Prefill/Decode 计算特性差异、框架选型权衡和线上指标观测。"
 }

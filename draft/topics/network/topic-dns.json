@@ -4,7 +4,7 @@
   "category": "dns-cdn",
   "group": "dns-cdn",
   "title": "DNS 解析流程",
-  "summary": "讲清浏览器/系统/本地 DNS/权威四层缓存与递归+迭代两段查询，覆盖 A/AAAA/CNAME/MX/TXT/SRV 记录、TTL 与 GeoDNS 调度、DNS 轮询负载均衡、DNSSEC 验证、DoH/DoT 加密 DNS 的边界和排查手法。",
+  "summary": "讲清从浏览器输入域名到拿到 IP 的完整路径：近端四层缓存（浏览器/应用、系统解析链、本地递归）如何命中；递归查询（客户端→本地 DNS）与迭代查询（本地 DNS→根→TLD→权威）两段机制；A/AAAA/CNAME/MX/TXT/SRV 等记录类型；TTL 与切流实战、GeoDNS/ECS 调度、DNS 轮询局限、DNSSEC 签名验证、DoH/DoT 加密边界，以及四类失败的排查定位手法。",
   "tags": [
     "网络",
     "DNS",
@@ -16,104 +16,110 @@
     "DoT"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 25,
+  "estimatedMinutes": 37,
   "order": 10,
   "recommendWeight": 90,
   "learningCards": [
     {
       "type": "explain",
       "title": "四层缓存 + 递归一段 + 迭代多段：DNS 解析的真实路径",
-      "content": "## 四层缓存按从近到远命中\n用户访问 www.example.com 时，先按顺序查四层缓存：浏览器内存缓存（Chrome 默认 60s，可在 chrome://net-internals/#dns 查看）→ 操作系统缓存（macOS mDNSResponder、Linux systemd-resolved、Windows DNS Client）→ /etc/hosts 静态映射 → 本地递归 DNS（运营商或 8.8.8.8、1.1.1.1、114.114.114.114）的缓存。任何一层命中且未过 TTL 就直接返回，不会再往下走。这是 DNS 能扛住每秒上亿查询的根本原因，也是变更生效慢的根因——线上切流时改 A 记录后，旧 IP 仍可能被各层缓存到 TTL 过期。\n\n## 一段递归 + 多段迭代\n本地递归 DNS 收到查询后，对客户端是「递归」——必须把最终答案给回来；对上游是「迭代」——自己一步步问。典型路径是：先问 13 组根服务器之一（a.root-servers.net ~ m.root-servers.net，IP 通过 root hints 文件硬编码），根返回 .com TLD 的 NS 列表（例如 a.gtld-servers.net）；本地 DNS 再问 .com TLD，TLD 返回 example.com 的权威 NS；最后问权威 NS 拿到 A/AAAA 记录。`dig +trace www.example.com` 能完整看到这三跳，每跳的 NS 都来自上一跳的 ANSWER/AUTHORITY section。\n\n## 记录类型决定查询结果\nA 返回 IPv4、AAAA 返回 IPv6（双栈环境会同时查 A 和 AAAA，Happy Eyeballs 算法挑先连上的）；CNAME 是别名链——查 www.example.com 拿到 CNAME 指向 example.cdn.com 后，本地 DNS 会再发一轮查询解析 CNAME 目标；MX 给邮件路由用（带 preference 优先级）；TXT 存 SPF/DKIM/域名所有权验证；SRV 给服务发现（_sip._tcp.example.com 这种格式，包含端口和优先级），LDAP 和早期微服务注册中心常用；NS 是分区授权记录。\n\n## DNS 轮询负载均衡\n最简单的 DNS 负载均衡是在权威 DNS 上为同一域名配多条 A 记录（如 www.example.com → 1.1.1.1、2.2.2.2、3.3.3.3），递归 DNS 返回时轮转顺序，客户端拿到不同 IP。优点是零成本、无需额外组件。但局限性明显：DNS 层无法感知后端健康状态，某台机器宕机后 DNS 仍会返回它的 IP，直到人工摘除；客户端和 LDNS 缓存导致流量不均——TTL 未过期时同一批客户端始终打到同一 IP；多数客户端 DNS 解析库只取返回列表第一个 IP，失败后不一定自动重试下一个。因此生产环境通常用 DNS 轮询做粗粒度入口分发，细粒度故障转移交给 L4/L7 健康检查（如 Nginx upstream、云厂商 SLB）。",
-      "format": "explain"
+      "content": "## 先查近端缓存，再走递归链\n用户在浏览器输入 www.example.com 后，解析不是直接跳到根服务器。第一层是浏览器/应用内缓存；第二层是系统解析链——hosts 文件、nsswitch/Name Service Switch 策略、OS resolver cache、企业内网搜索域等共同决定结果，具体顺序取决于操作系统和浏览器实现，不能说所有平台完全一致。近端未命中后，才会问本地递归 DNS（运营商 DNS、企业 DNS，或 8.8.8.8、1.1.1.1、114.114.114.114 这类公共递归）的缓存。任何一层命中且未过 TTL 就直接返回——这是 DNS 高吞吐的核心原因，也是线上变更生效慢的根因：改了 A/AAAA 记录后，旧 IP 仍可能被各层缓存拦截到 TTL 过期。\n\n## 一段递归 + 多段迭代\n本地递归 DNS 收到查询后，对客户端承担「递归」角色——它负责给出最终答案或明确失败（NXDOMAIN/SERVFAIL/超时）；对上游权威则是「迭代」——逐级追问，每次只拿回自己目前需要的委派信息。典型迭代路径：先问根服务器集合（a.root-servers.net ~ m.root-servers.net，递归解析器通常随软件携带 root hints），根返回 .com TLD 的 NS 列表；再问 .com TLD，TLD 返回 example.com 的权威 NS；最后问权威 NS 拿到 A/AAAA。若权威返回 CNAME，则继续解析目标域，相当于插入一段新的递归。`dig +trace www.example.com` 能完整看到根、TLD、权威各级返回了什么委派。\n\n## 记录类型决定查询语义\nA 返回 IPv4、AAAA 返回 IPv6；双栈环境会同时查 A 和 AAAA，Happy Eyeballs 算法（RFC 8305）挑先连通的地址族。CNAME 是别名——查 www.example.com 拿到 CNAME 指向 example.cdn.com 后，递归 DNS 会再发一轮查询解析 CNAME 目标，这也是为什么一次看似简单的域名解析实际可能产生多轮迭代。MX 给邮件路由用，带 preference 优先级数字（数字越小优先级越高）。TXT 存 SPF/DKIM/域名所有权验证。SRV 给服务发现用（格式是 _service._proto.domain，包含 priority/weight/port/target 四个字段）。NS 是分区授权记录，表示某域名把解析权委派给了哪些名字服务器。CAA 限定哪些 CA 可给域名签发证书（RFC 8659）。\n\n## DNS 轮询负载均衡\n最简单的 DNS 负载均衡是在权威 DNS 上为同一域名配多条 A/AAAA 记录，递归 DNS 返回时可能轮转顺序，客户端拿到不同 IP。优点是零成本、无需额外组件。但局限明显：DNS 层无法天然感知后端健康状态，某台宕机后仍可能返回它的 IP 直到权威配置摘除且缓存过期；LDNS 和客户端缓存导致流量不均，TTL 内同批客户端始终打到同一 IP；多数解析库只取首个 IP，失败后不一定自动重试下一个。因此生产环境通常用 DNS 轮询做粗粒度入口分发，细粒度故障转移交给 L4/L7 健康检查（Nginx upstream、云厂商 SLB）。"
     },
     {
       "type": "explain",
       "title": "GeoDNS、TTL 抖动、DNSSEC 与 DoH/DoT 的工程权衡",
-      "content": "## GeoDNS / 智能 DNS 怎么调度\n大型站点几乎都用 CNAME 把业务域名委托给 CDN 调度域（如 www.example.com CNAME 到 example.cdn.cn）。CDN 的权威 DNS 根据 LDNS 的源 IP 判断地理位置和运营商，返回最近的边缘节点 IP。EDNS Client Subnet（ECS, RFC 7871）扩展会把客户端真实子网传给权威，调度更精准；但很多公共 DNS（早期 8.8.8.8）默认不带 ECS，导致海外 LDNS 调度国内用户时返回错节点——这是「用了公共 DNS 反而变慢」的常见原因。\n\n## TTL 取舍与切流实战\nTTL 短（30-60s）切流快，但本地 DNS QPS 上去权威压力大；TTL 长（一天以上）缓存稳，但故障切换慢。生产惯例：日常 TTL 设 5-10 分钟，发布或灾备演练前 24 小时把 TTL 降到 60s（让旧值先散出去），切完观察一两天再调回。注意运营商 LDNS 经常违反 TTL（强制最小 600s 甚至缓存到下一次启动），这是切流前必须演练的不可控因素。\n\n## DNSSEC：防缓存投毒的签名验证\nDNSSEC（DNS Security Extensions, RFC 4033-4035）通过数字签名保证 DNS 响应的真实性和完整性，防止缓存投毒（Kaminsky 攻击）。核心机制：权威 DNS 用私钥对记录签名（RRSIG 记录），递归 DNS 用公钥验证。公钥通过信任链传递——DS 记录存放在上级 zone，指向下级 zone 的 DNSKEY，最终锚定到根的信任锚（root trust anchor）。验证失败的响应返回 SERVFAIL（rcode=2），客户端拿不到 IP，表现为「部分用户解析失败」。代价：签名让响应包膨胀（一条 A 记录从 ~60B 涨到 ~300B+），UDP 截断和 TCP 重试比例上升；运维复杂度增加——密钥轮换（KSK/ZSK）操作失误会导致整域不可解析。Cloudflare、Google Public DNS 默认做 DNSSEC 验证，`dig +dnssec example.com` 能看到 AD 标志位（Authenticated Data）和 RRSIG 记录。\n\n## DoH / DoT 加密 DNS\n传统 DNS 走 UDP/TCP 53 端口明文，容易被中间人嗅探或篡改（运营商劫持、DNS 投毒、热点钓鱼）。DoT（DNS over TLS, RFC 7858）走 TCP 853，DoH（DNS over HTTPS, RFC 8484）走 HTTPS 443，把查询封装在 TLS 里。代价：握手开销 + TCP 队头阻塞、企业侧难以审计、HTTPS 流量混在一起绕过传统出口控制。Firefox 默认开 DoH（Cloudflare），Android 9+ 支持 DoT 私有 DNS，但企业网络常关掉以保留 DLP 能力。\n\n## 失败模式区分\n排查时按 NXDOMAIN（权威说没这条记录）、SERVFAIL（权威或递归出错，常因 DNSSEC 校验失败、上游超时）、超时无响应（UDP 包丢/被墙）、解析到错误 IP（劫持/缓存污染/调度错误）四类区分。`dig +trace` 看是否到根/TLD 就断、`dig @8.8.8.8 vs @114.114.114.114` 对比不同递归是否一致、`dig +short TXT whoami.akamai.net` 看自己实际出口的 LDNS。",
-      "format": "explain"
+      "content": "## GeoDNS / 智能 DNS 调度机制\n大型站点常用 CNAME 把业务域名委托给 CDN 调度域（如 www.example.com CNAME 到 example.cdn.cn）。CDN 的权威 DNS 根据 LDNS 出口源 IP 判断地理位置和运营商，返回更合适的边缘节点 IP。EDNS Client Subnet（ECS, RFC 7871）允许递归 DNS 把客户端子网前缀（如 /24）传给权威 DNS，让调度精确到用户所在区域而非 LDNS 出口。但并非所有公共 DNS 都携带或完整透传 ECS——权威 DNS 可能只能按 LDNS 出口 IP 调度，用户被分到不理想节点。这就是「换了公共 DNS 反而变慢」的常见原因：公共递归 DNS 的出口 IP 和用户实际位置不在同一个城市或运营商。`dig +short TXT whoami.akamai.net` 可以看到你的 LDNS 出口信息，辅助确认调度偏差。\n\n## TTL 取舍与切流实战\nTTL 短（30-60s）：切流快，但递归缓存命中率下降，权威 DNS QPS 压力上升。TTL 长（一天以上）：缓存稳，但故障切换慢，出问题时旧 IP 可能在运营商 LDNS 里被持续返回。生产惯例：日常 TTL 设 5-10 分钟，发布或灾备演练前 24 小时把 TTL 降到 60s，让旧 TTL 值在全网先散出去；切完观察一两天确认稳定后再调回。注意部分运营商 LDNS 会强制设置最小 TTL（比如最少缓存 10 分钟），移动网络环境下 Android/iOS resolver 也可能有自己的缓存策略，导致 DNS 已切走但旧连接仍有长尾流量。HTTP/2 和 HTTP/3 的连接复用进一步加剧了这种「DNS 切了但 socket 没断」的现象。\n\n## DNSSEC：防缓存投毒的签名链\nDNSSEC（RFC 4033-4035）通过数字签名保证 DNS 响应的真实性和完整性，防止 Kaminsky 攻击等缓存投毒。核心机制：权威 DNS 用私钥对记录集签名生成 RRSIG，递归 DNS 从根信任锚出发逐级验证——DS 记录（上级 zone 存储的下级 DNSKEY 哈希）用于验证下级 DNSKEY 的合法性，DNSKEY 用于验证 RRSIG。验证失败时递归 DNS 通常返回 SERVFAIL（rcode=2），客户端拿不到 IP，表现为「部分递归解析失败」。`dig @1.1.1.1 example.com A +dnssec` 可看到 RRSIG 记录和 AD（Authenticated Data）标志位，但 AD 标志位只有在递归解析器声明已完成并信任验证结果时才可信。代价是响应包膨胀（一条 A 记录可能变成几百字节 RRSIG + DNSKEY），UDP 截断和 TCP 重试概率上升；运维复杂度增加——KSK/ZSK 轮换时序出错或 DS 记录未同步到上级 zone 会导致整域不可解析。当前全球 DNSSEC 部署率仍然有限，主要是密钥管理的成本和风险。\n\n## DoH / DoT 加密 DNS\n传统 DNS 走 UDP/TCP 53 端口明文传输，容易被中间人嗅探或篡改（运营商劫持、DNS 投毒、公共 WiFi 钓鱼）。DoT（DNS over TLS, RFC 7858）走 TCP 853，用 TLS 加密；DoH（DNS over HTTPS, RFC 8484）把 DNS 查询映射成标准 HTTPS 请求，走 TCP 443。两者都保护客户端到递归解析器这一段链路，但仍然需要信任所选递归解析器本身。代价是首次 TLS 握手增加延迟（长连接复用后影响减小）；DoT 用独立 853 端口，企业防火墙可识别和管控；DoH 混在普通 HTTPS 流量里，传统网络策略很难只拦截 DNS。企业网络常通过策略禁用 DoH，原因是内部 DNS 承担域名拦截（安全策略）、内网域名解析（split-horizon）和审计（DLP/合规）三个职能，DoH 直连外部递归 DNS 会绕过这些控制。Windows 10+/macOS/Chrome 都支持通过组策略或 MDM 关闭 DoH。\n\n## 四类失败模式与排查\n排查 DNS 问题要按症状分类。NXDOMAIN：权威明确说没这条记录，检查域名拼写或确认记录是否已添加。SERVFAIL：权威或递归出错，常见于 DNSSEC 校验失败、上游超时、权威 zone 配置错误。超时无响应：UDP 包丢失、防火墙拦截或权威不可达。解析到错误 IP：劫持、缓存污染或 GeoDNS 调度错误。`dig +trace` 看是否在根/TLD/权威某一级断掉；对比 8.8.8.8、1.1.1.1、运营商 DNS 判断递归差异；直接 `dig @ns1.权威域 记录` 绕过递归缓存验证权威应答。"
     },
     {
       "type": "diagram",
-      "title": "四层缓存 + 一递归三迭代的解析时序",
-      "format": "mermaid",
-      "content": "flowchart TD\n    A[浏览器内存缓存 60s] -->|未命中| B[OS Stub Resolver]\n    B --> C[/etc/hosts 静态映射]\n    C -->|未命中| D[本地递归 DNS]\n    D -->|缓存命中| Z[返回 A/AAAA 给应用]\n    D -->|缓存未命中| E[根 DNS a-m.root-servers.net]\n    E -->|返回 .com TLD NS| F[TLD DNS gtld-servers]\n    F -->|返回 example.com 权威 NS| G[权威 DNS]\n    G -->|返回 A/AAAA 或 CNAME| H{记录类型判断}\n    H -->|A/AAAA| D\n    H -->|CNAME 指向 cdn| I[CDN 权威 DNS]\n    I -->|按 ECS 子网调度| J[返回边缘节点 IP]\n    J --> D\n    D -->|按 TTL 写入缓存| Z",
-      "caption": "客户端到本地 DNS 是递归（一步给答案），本地 DNS 到根/TLD/权威是迭代（自己一跳跳问）；CNAME 链会触发二次查询，CDN 用 ECS 做地理调度。",
-      "fallback": "缓存层：浏览器 → OS → hosts → 本地递归 DNS。迭代查询：根 → TLD → 权威 → CDN 权威（如有 CNAME），最后按 TTL 回写缓存。",
+      "title": "缓存命中、递归迭代、CNAME 与 CDN 调度全路径",
+      "format": "svg",
+      "content": "assets/diagrams/network-dns-resolution.svg",
+      "caption": "图中区分了客户端近端缓存、本地递归缓存、根/TLD/权威的迭代委派、CNAME 到 CDN 权威的二次解析，以及 NXDOMAIN/SERVFAIL/超时/错 IP 四类排查入口。",
+      "fallback": "解析路径：浏览器/系统解析链先查近端缓存；未命中后问本地递归 DNS；递归 DNS 缓存未命中再迭代询问根、TLD、权威；CNAME 会继续问 CDN 权威；最终答案按 TTL 回写缓存。排查要区分 NXDOMAIN、SERVFAIL、超时、错 IP 四类症状。",
       "items": [
-        "四层缓存：浏览器 → OS → hosts → 本地递归 DNS",
-        "递归段：客户端 → 本地递归 DNS（一步返回最终答案）",
-        "迭代段：本地递归 DNS → 根 → TLD → 权威（自己逐跳问）",
-        "CNAME 链触发二次查询：权威返回 CNAME 后需再解析目标域名",
-        "CDN 权威用 ECS 子网做地理调度返回边缘节点 IP"
+        "近端缓存：浏览器/应用缓存、hosts/系统解析链、本地递归缓存都可能命中",
+        "递归段：客户端 → 本地递归 DNS，由递归解析器负责最终答案或失败",
+        "迭代段：本地递归 DNS → 根 → TLD → 权威，逐级拿到下一跳委派",
+        "CNAME 链会触发目标域的二次解析，CDN 权威再按 LDNS/ECS 调度边缘 IP",
+        "排查要区分 NXDOMAIN、SERVFAIL、超时、错 IP 四类症状"
       ],
       "sources": [
         {
+          "kind": "svg",
+          "path": "assets/diagrams/network-dns-resolution.svg"
+        },
+        {
           "kind": "mermaid",
-          "content": "flowchart TD\n    A[浏览器内存缓存 60s] -->|未命中| B[OS Stub Resolver]\n    B --> C[/etc/hosts 静态映射]\n    C -->|未命中| D[本地递归 DNS]\n    D -->|缓存命中| Z[返回 A/AAAA 给应用]\n    D -->|缓存未命中| E[根 DNS a-m.root-servers.net]\n    E -->|返回 .com TLD NS| F[TLD DNS gtld-servers]\n    F -->|返回 example.com 权威 NS| G[权威 DNS]\n    G -->|返回 A/AAAA 或 CNAME| H{记录类型判断}\n    H -->|A/AAAA| D\n    H -->|CNAME 指向 cdn| I[CDN 权威 DNS]\n    I -->|按 ECS 子网调度| J[返回边缘节点 IP]\n    J --> D\n    D -->|按 TTL 写入缓存| Z"
+          "content": "flowchart TD\n    A[浏览器/应用缓存] -->|未命中| B[系统解析链 hosts/OS cache]\n    B -->|未命中| D[本地递归 DNS]\n    D -->|递归缓存命中| Z[返回 A/AAAA 给应用]\n    D -->|缓存未命中| E[根 DNS]\n    E -->|返回 TLD NS| F[TLD DNS]\n    F -->|返回权威 NS| G[业务权威 DNS]\n    G -->|A/AAAA| Z\n    G -->|CNAME| I[CDN 权威 DNS]\n    I -->|按 LDNS/ECS 调度| J[边缘节点 IP]\n    J -->|按 TTL 写回递归缓存| D\n    D --> Z\n    G -->|NXDOMAIN| X1[域名不存在]\n    D -->|SERVFAIL/超时| X2[递归或权威异常]\n    I -->|调度错误| X3[错 IP]"
         },
         {
           "kind": "text",
-          "content": "缓存层：浏览器 → OS → hosts → 本地递归 DNS。迭代查询：根 → TLD → 权威 → CDN 权威（如有 CNAME），最后按 TTL 回写缓存。"
+          "content": "解析路径：浏览器/系统解析链先查近端缓存；未命中后问本地递归 DNS；递归 DNS 缓存未命中再迭代询问根、TLD、权威；CNAME 会继续问 CDN 权威；最终答案按 TTL 回写缓存。"
         }
       ]
     },
     {
       "type": "compareTable",
-      "title": "递归 vs 迭代、UDP vs TCP、DoH vs DoT 的关键差异",
-      "content": "| 维度 | 递归查询 | 迭代查询 |\n| --- | --- | --- |\n| 发生段 | 客户端 → 本地递归 DNS | 本地递归 DNS → 根/TLD/权威 |\n| 责任 | 解析器必须返回最终答案 | 每跳只返回下一级 NS |\n| 缓存 | 解析器整条结果按 TTL 缓存 | 每级权威只缓存自己负责的部分 |\n| 失败表现 | 客户端拿到 SERVFAIL 或超时 | dig +trace 在某一跳停住 |\n\n| 维度 | UDP 53 | TCP 53 | DoT 853 | DoH 443 |\n| --- | ---（递归查询） | ---（迭代查询） | ---（方案3） | ---（方案4） |\n| 默认场景 | 普通查询，响应 ≤512B | 响应 >512B、AXFR 区域传送、UDP 截断重试 | 客户端到递归 DNS 的加密 | 浏览器到递归 DNS 的加密 |\n| 性能 | 单包一来一回最快 | 三次握手开销 | TLS 握手 + 长连接复用 | TLS+HTTP/2，最重 |\n| 可观测性 | 易抓包、易劫持 | 易抓包、可被防火墙拦 | 流量加密但端口独立 | 混入普通 HTTPS，最难审计 |\n| 适用 | 默认查询 | 大响应 EDNS0 截断兜底 | 移动端私有 DNS、企业可控加密 | 浏览器、绕过运营商劫持 |\n\n| 维度 | DNS 轮询 | GeoDNS / 智能 DNS | DNSSEC |\n| --- | ---（递归查询） | ---（迭代查询） | ---（方案3） |\n| 机制 | 同域名配多条 A 记录，轮转返回 | 按 LDNS 源 IP 或 ECS 子网返回不同 IP | 权威用私钥签名记录，递归用信任链验证 |\n| 健康感知 | 无，宕机仍返回旧 IP | 可对接健康检查做 failover | 不涉及流量调度，只防篡改 |\n| 局限 | 缓存导致不均、客户端只取首个 IP | 公共 DNS 缺 ECS 时调度不准 | 响应膨胀、密钥轮换运维复杂 |\n| 典型场景 | 粗粒度入口分发 | CDN 就近调度、多活容灾 | 防缓存投毒、金融/政务域名安全 |"
+      "title": "递归 vs 迭代、传输协议、调度与安全机制",
+      "content": "| 维度 | 递归查询 | 迭代查询 |\n| --- | --- | --- |\n| 发生段 | 客户端 → 本地递归 DNS | 本地递归 DNS → 根/TLD/权威 |\n| 责任 | 解析器必须返回最终答案或明确失败（NXDOMAIN/SERVFAIL） | 每跳返回自己知道的答案或下一层 NS 委派，不替客户端递归 |\n| 缓存 | 递归解析器按 TTL 缓存最终记录和中间委派 | 权威只发布自己 zone 的记录，不负责缓存其他域 |\n| 失败表现 | 客户端直接拿到 NXDOMAIN、SERVFAIL 或超时 | `dig +trace` 在某一跳停住或看到错误委派 |\n\n| 维度 | UDP 53 | TCP 53 | DoT 853 | DoH 443 |\n| --- | --- | --- | --- | --- |\n| 默认场景 | 普通小响应；现代实现带 EDNS0 协商 UDP payload | AXFR/IXFR 区域传送、UDP TC 截断重试、DNSSEC 大包兜底 | 客户端到递归 DNS 的 TLS 加密通道 | 把 DNS 查询映射成标准 HTTPS 请求 |\n| 性能 | 无连接、单包往返快，受路径 MTU 和丢包影响 | 有连接开销，可避免 UDP 截断问题 | TLS 握手增加首包延迟，长连接复用后影响变小 | 可复用 HTTPS 连接，与普通 Web 流量混合 |\n| 可观测性 | 抓包方便，易被劫持和篡改 | 抓包方便，防火墙可识别 | 流量加密但端口独立，企业可识别和管控 | 混入 443 流量，传统网络策略最难按 DNS 粒度识别 |\n| 适用 | 默认查询、内网解析 | 大响应、区域传送、DNSSEC 签名膨胀兜底 | 移动端私有 DNS、企业可控加密场景 | 浏览器内置解析、降低本地网络篡改风险 |\n\n| 维度 | DNS 轮询 | GeoDNS / 智能 DNS | DNSSEC |\n| --- | --- | --- | --- |\n| 机制 | 同域名配多条 A/AAAA 记录，递归 DNS 可能轮转返回顺序 | 按 LDNS 源 IP 或 ECS 子网返回不同边缘节点 IP | 权威用私钥签名记录集（RRSIG），递归用信任链验证 |\n| 健康感知 | DNS 本身无健康检查，宕机 IP 仍在返回 | 可对接健康检查做自动 failover | 不涉及流量调度，只防篡改和伪造 |\n| 局限 | 缓存导致流量不均，客户端重试策略不一致 | 公共 DNS 缺 ECS 时调度不准；ECS 又有隐私取舍 | 响应膨胀、KSK/ZSK 密钥轮换和 DS 同步复杂，部署率有限 |\n| 典型场景 | 粗粒度入口分发 | CDN 就近调度、多活容灾 | 防缓存投毒、金融/政务域名安全 |"
     },
     {
       "type": "code",
       "title": "DNS 排查命令实操",
       "language": "bash",
-      "content": "# 1. dig +trace 看完整迭代路径（最常用的排查命令）\ndig +trace www.example.com\n# 输出会依次出现 .（根）→ com.（TLD）→ example.com.（权威）三段 NS\n# 如果在某段断掉，说明那一级 NS 不可达或配置错\n\n# 2. 对比不同递归 DNS 看是否被劫持\ndig @8.8.8.8 www.example.com +short\ndig @114.114.114.114 www.example.com +short\ndig @1.1.1.1 www.example.com +short\n# 三家结果不同 → 多半是运营商劫持或 GeoDNS 调度差异\n\n# 3. 看自己出口的 LDNS（判断 GeoDNS 调度参考点）\ndig +short TXT whoami.akamai.net\ndig +short TXT o-o.myaddr.l.google.com @ns1.google.com\n# 返回的是替你查询的递归 DNS 的 IP，不是你自己的 IP\n\n# 4. 查特定记录类型\ndig MX example.com +short          # 邮件\ndig AAAA example.com +short        # IPv6\ndig SRV _sip._tcp.example.com      # 服务发现，含 priority/weight/port\ndig TXT example.com +short         # SPF/DKIM/域名验证\ndig CAA example.com                # CA 颁发授权（HTTPS 证书相关）\n\n# 5. 看权威 DNS 怎么响应（绕过递归缓存）\ndig @ns1.example.com www.example.com\n\n# 6. 清本地缓存（切流后旧 IP 还在用时）\nsudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder   # macOS\nsudo systemd-resolve --flush-caches                                # Linux systemd\nipconfig /flushdns                                                  # Windows\n\n# 7. DoH 测试（curl 直接访问 Cloudflare DoH）\ncurl -H 'accept: application/dns-json' \\\n  'https://1.1.1.1/dns-query?name=example.com&type=A'\n\n# 8. DNSSEC 验证测试\ndig +dnssec example.com\n# 看 flags 里是否有 ad（Authenticated Data），有说明 DNSSEC 验证通过\ndig +dnssec www.dnssec-tools.org\n# 如果返回 SERVFAIL 但关掉 +dnssec 后正常，说明是 DNSSEC 验证失败\n\n# 9. 看 TTL 还剩多少（连查两次 TTL 会递减）\ndig www.example.com | grep -E 'ANSWER SECTION' -A 2",
+      "content": "# 1. dig +trace 看完整迭代路径（排查第一刀）\ndig +trace www.example.com\n# 输出依次出现 .（根）→ com.（TLD）→ example.com.（权威）三段委派\n# 某段断掉说明该级 NS 不可达或配置错误\n\n# 2. 对比不同递归 DNS 判断劫持或 GeoDNS 调度差异\ndig @1.1.1.1 www.example.com A +short\ndig @8.8.8.8 www.example.com A +short\ndig @114.114.114.114 www.example.com A +short\n# 三家结果不同：先区分是 GeoDNS 正常差异、递归缓存污染还是运营商劫持\n\n# 3. 看自己 LDNS 出口（判断 GeoDNS 调度的参考点）\ndig +short TXT whoami.akamai.net\ndig +short TXT o-o.myaddr.l.google.com @ns1.google.com\n# 返回的是替你查询的递归 DNS 出口信息，不是客户端自己的公网 IP\n\n# 4. 查特定记录类型\n# 邮件路由（MX 带 preference 优先级，数字越小越优先）\ndig MX example.com +short\n# IPv6\ndig AAAA example.com +short\n# 服务发现（SRV 格式 _service._proto.domain，含 priority/weight/port/target）\ndig SRV _sip._tcp.example.com\n# SPF/DKIM/域名验证\ndig TXT example.com +short\n# CA 颁发授权（哪些 CA 可以给域名签证书）\ndig CAA example.com\n\n# 5. 绕过递归缓存，直接问权威 DNS 验证应答\ndig @ns1.example.com www.example.com A\n\n# 6. 清本地缓存（切流后旧 IP 仍在使用时）\nsudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder  # macOS\nresolvectl flush-caches                                            # Linux systemd-resolved\nipconfig /flushdns                                                 # Windows\n\n# 7. DoH 测试（curl 访问 Cloudflare JSON API）\ncurl -H 'accept: application/dns-json' \\\n  'https://1.1.1.1/dns-query?name=example.com&type=A'\n\n# 8. DNSSEC 验证测试\ndig @1.1.1.1 example.com A +dnssec\n# 看 RRSIG 记录；flags 里的 ad 表示递归解析器声明验证通过\ndig @1.1.1.1 dnssec-failed.org A\n# 验证型递归通常对签名错误域名返回 SERVFAIL\n\n# 9. 看 TTL 递减（连查两次，TTL 值会变小）\ndig www.example.com A +noall +answer\nsleep 5\ndig www.example.com A +noall +answer",
       "highlights": [
         {
           "line": 2,
           "note": "dig +trace 是 DNS 排查的第一把刀：能看到根/TLD/权威三跳分别返回了什么 NS，断在哪一跳就是哪级有问题。"
         },
         {
-          "line": 8,
-          "note": "对比多家公共 DNS 是判断运营商劫持/GeoDNS 异常的标准动作。结果一致基本排除劫持。"
+          "line": 7,
+          "note": "对比多家递归 DNS 是判断劫持、递归缓存污染和 GeoDNS 调度差异的标准动作；差异不一定都是劫持，要结合 LDNS 出口和 ECS 判断。"
         },
         {
-          "line": 15,
-          "note": "whoami.akamai.net 返回的是 LDNS 出口 IP，用来解释「为什么我用 8.8.8.8 反而被调度到海外节点」。"
+          "line": 12,
+          "note": "whoami.akamai.net 返回的是 LDNS 出口信息，可解释「公共 DNS 出口与用户实际位置不一致导致 CDN 调度偏离」。"
         },
         {
           "line": 33,
-          "note": "dig +dnssec 看 AD 标志位判断 DNSSEC 验证是否通过；SERVFAIL 但关 +dnssec 后正常，说明是签名校验失败而非记录不存在。"
+          "note": "直接问权威 DNS（@ns1.example.com）绕过所有递归缓存，是确认权威是否已更新的标准验证步骤。"
+        },
+        {
+          "line": 42,
+          "note": "RRSIG 签名记录和 AD 标志位是判断 DNSSEC 验证状态的关键字段；SERVFAIL 常指向签名链验证失败。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
-      "title": "30 秒结论 + 机制主线 + 边界追问",
-      "content": "结论：DNS 把域名解析为 IP，是访问链路的第一步，关键是「四层缓存 + 一段递归 + 多段迭代」，TTL 决定缓存生效窗口，CDN 通过 CNAME + GeoDNS 做就近调度，DNSSEC 保证响应不被篡改。\n\n机制主线：\n1. 客户端先查浏览器缓存、OS Stub Resolver、/etc/hosts，未命中再问本地递归 DNS。\n2. 客户端到本地递归是递归查询，递归 DNS 必须返回最终答案。\n3. 本地递归 DNS 对外是迭代：先问根（13 组 a~m.root-servers.net），拿到 .com TLD 的 NS，再问 TLD 拿到权威 NS，最后问权威拿 A/AAAA。\n4. 拿到结果按 TTL 写入各层缓存，期间所有同名查询都直接命中。\n5. 业务域名常 CNAME 到 CDN 调度域，CDN 权威 DNS 根据 LDNS 子网（ECS）返回就近边缘 IP。\n\n追问边界：DNS 默认 UDP 53，响应超过 512 字节会被截断，重试切 TCP 53；DoT 走 TCP 853、DoH 走 HTTPS 443，能防劫持但增加握手开销和审计难度。DNSSEC 通过信任链签名验证防缓存投毒，验证失败返回 SERVFAIL。DNS 轮询（多 A 记录）可做简单负载均衡，但无法感知后端健康、缓存导致不均。失败要分清 NXDOMAIN（权威说没这条）、SERVFAIL（递归或权威出错，含 DNSSEC 校验失败）、超时（UDP 丢包/被墙）、错 IP（劫持或 GeoDNS 调度异常），用 dig +trace 和对比多个递归来定位。",
+      "title": "面试回答思路：30 秒结论 + 机制主线 + 边界追问",
+      "content": "结论：DNS 把域名解析为 IP，是所有网络请求的第一步。核心路径是「近端缓存 → 本地递归 DNS → 根/TLD/权威迭代」，TTL 决定缓存生效窗口，CDN 通过 CNAME + GeoDNS/ECS 做就近调度，DNSSEC 用信任链签名防缓存投毒。\n\n**机制主线（按层次讲）**\n1. 客户端先查浏览器/应用缓存，再走系统解析链（hosts、OS resolver cache、nsswitch 等），未命中才问本地递归 DNS。近端命中直接返回，这是 DNS 高吞吐的关键。\n2. 客户端到本地递归是递归查询——递归 DNS 必须返回最终答案或明确失败（NXDOMAIN/SERVFAIL/超时）。\n3. 本地递归到上游是迭代查询——先问根，拿到 TLD 的 NS；再问 TLD，拿到权威 NS；最后问权威拿 A/AAAA。若权威返回 CNAME，则继续解析目标域，等于插入新轮查询。`dig +trace` 能完整看到三跳委派。\n4. 拿到结果后按 TTL 写回递归和近端缓存，期间同名查询直接命中。DNS 已切换不代表旧连接立即消失。\n5. CDN 场景：业务域名 CNAME 到 CDN 调度域，CDN 权威 DNS 根据 LDNS 出口或 ECS 子网返回边缘 IP。公共 DNS 缺 ECS 时调度可能偏离。\n\n**追问边界**\n- 默认走 UDP 53，带 EDNS0 协商 payload 大小；超过协商值或 TC 截断时用 TCP 53。区域传送（AXFR/IXFR）强制 TCP。DNSSEC 签名膨胀增加 TCP 重试概率。\n- DoT（TCP 853）和 DoH（HTTPS 443）加密客户端到递归这一段，DoH 混入 443 最难识别，企业常禁用以保留内网域名解析和审计能力。\n- DNSSEC 通过 DS→DNSKEY→RRSIG 信任链防投毒，验证失败返回 SERVFAIL。\n- DNS 轮询可做粗粒度负载均衡，但无法感知后端健康、缓存导致流量不均。\n- 失败排查分四类：NXDOMAIN、SERVFAIL、超时、错 IP，用 dig +trace 定位断点、对比多家递归确认差异、直接问权威验证更新。",
       "followUpQuestions": [
         {
           "question": "线上要把域名从机房 A 切到机房 B，怎么用 DNS 做平滑切流？",
-          "answer": "提前 24-48 小时把 TTL 从默认值（如 600s）降到 60s，让旧 TTL 自然散出；到切流时间点改 A 记录指向新 IP，dig +short 在多个公共 DNS 验证更新；保留旧机房至少 1 小时观察长尾流量（运营商 LDNS 可能强制最小 TTL）；流量平稳后再把 TTL 调回。配合健康检查的智能 DNS 可做自动 failover，但要警惕「DNS 切走但客户端 socket 没断」导致旧连接继续存活。"
+          "answer": "提前 24-48 小时把 TTL 从默认值（如 600s）降到 60s，让旧 TTL 在全网缓存中自然散出。到切流时间点改 A 记录指向新 IP，用 dig @1.1.1.1 和 dig @8.8.8.8 +short 验证多家递归已拿到新值。保留旧机房至少 1 小时观察长尾流量（运营商 LDNS 可能强制最小 TTL）。流量平稳后再把 TTL 调回。注意 HTTP/2 和 HTTP/3 连接复用会导致「DNS 切了但 socket 没断」，旧连接继续存活直到超时或主动关闭。"
         },
         {
           "question": "DNS 为什么默认用 UDP？什么时候必须用 TCP？",
-          "answer": "UDP 单包一来一回最快、无连接开销，能扛超大 QPS。但响应超过 512 字节（早期 EDNS0 前的限制）或 EDNS0 协商的 buffer（通常 4096）会触发 TC 截断标志，客户端收到后必须切 TCP 53 重查。区域传送（AXFR/IXFR，从权威到从服务器拷贝整份 zone）必须 TCP；DNSSEC 签名让响应膨胀，TCP 比例升高；DoT 直接走 TCP 853。所以现代 DNS 实际上 UDP+TCP 双栈，只是 UDP 占绝大多数。"
+          "answer": "UDP 无连接、单包往返快，普通小查询默认优先用 UDP。512 字节是无 EDNS0 时的传统上限；现代解析器通常用 EDNS0 协商更大的 UDP payload（常见 4096），但仍受路径 MTU 和丢包影响。响应超过协商大小或设置 TC 截断标志时，客户端必须切 TCP 53 重查。区域传送（AXFR/IXFR）强制走 TCP。DNSSEC 签名让响应膨胀，TCP 重试概率升高。DoT 走 TCP 853、DoH 走 HTTPS 443。所以现代 DNS 实际是 UDP+TCP 双栈，普通查询仍以 UDP 为主。"
         },
         {
           "question": "DNSSEC 是怎么防缓存投毒的？验证失败时客户端看到什么现象？",
-          "answer": "权威 DNS 用私钥对每条记录签名（RRSIG），递归 DNS 通过信任链验证签名：从根信任锚出发，用上级 DS 记录验证下级 DNSKEY，再用 DNSKEY 验证 RRSIG。篡改者没有私钥，伪造的记录签名校验不过。验证失败时递归 DNS 返回 SERVFAIL（rcode=2），客户端拿不到 IP，表现为「部分用户解析失败」。排查时用 dig +dnssec 看 AD 标志位，关掉 +dnssec 后正常则确认是签名问题。常见根因：密钥轮换时 KSK/ZSK 未正确更新、DS 记录未同步到上级 zone。"
+          "answer": "权威 DNS 用私钥对记录集签名（RRSIG），递归 DNS 从根信任锚出发验证整条信任链：DS 记录验证下级 DNSKEY 合法性，DNSKEY 验证 RRSIG。攻击者没有私钥，伪造的记录签名校验不过。验证失败时递归 DNS 返回 SERVFAIL（rcode=2），客户端拿不到 IP，表现为「部分用户解析失败」。排查用 dig +dnssec 看 RRSIG 和 AD 标志位；关掉 +dnssec 后正常则确认是签名问题。常见根因：KSK/ZSK 密钥轮换时序错误、DS 记录未同步到上级 zone。"
         },
         {
           "question": "DNS 轮询（多条 A 记录）能做负载均衡吗？有什么局限？",
-          "answer": "能做最简单的负载均衡——权威 DNS 对同一域名返回多个 A 记录，递归 DNS 轮转顺序，客户端拿到不同 IP。但局限明显：DNS 层无法感知后端健康，某台宕机后仍返回其 IP 直到人工摘除；LDNS 和客户端缓存导致流量不均，TTL 未过期时同一批客户端始终打到同一 IP；多数解析库只取首个 IP，失败后不一定自动重试下一个。生产环境通常用 DNS 轮询做粗粒度入口分发，细粒度故障转移交给 L4/L7 健康检查（如 Nginx upstream、云厂商 SLB）。"
+          "answer": "能做最简单的负载均衡——权威 DNS 对同一域名返回多个 A 记录，递归 DNS 可能轮转顺序，客户端拿到不同 IP。但局限明显：DNS 层无法感知后端健康，某台宕机后仍返回其 IP 直到人工摘除；LDNS 和客户端缓存导致流量不均，TTL 内同批客户端始终打到同一 IP；多数解析库只取首个 IP，失败后不一定自动重试下一个。生产环境通常用 DNS 轮询做粗粒度入口分发，细粒度故障转移交给 L4/L7 健康检查（如 Nginx upstream、云厂商 SLB）。"
         },
         {
-          "question": "用户反馈访问慢，怀疑 DNS，怎么按层排查？",
-          "answer": "第一步 dig +short 比较 8.8.8.8/1.1.1.1/114.114.114.114 三家递归返回的 IP，差异大说明 GeoDNS 调度或运营商劫持。第二步 dig +trace 看是否在根/TLD/权威某跳卡住。第三步 dig +stats 看 Query time，>200ms 说明递归或权威慢。第四步 traceroute 到解析出的 IP 验证网络路径。第五步用 dig @ns1.权威域 直接问权威绕过递归缓存。第六步看客户端是否走了 DoH（浏览器可能默认开），与系统 DNS 解析结果不一致会让排查迷惑。"
+          "question": "DoH 和 DoT 各有什么取舍？为什么企业倾向禁 DoH？",
+          "answer": "DoT 走独立 853 端口，企业防火墙可识别和管控；DoH 走 443 混在普通 HTTPS 里，传统出口策略很难只拦 DNS。两者都降低客户端到递归这一段被嗅探或篡改的风险，但仍需信任递归解析器。代价是首次 TLS 握手增加延迟，长连接复用后影响减小。企业禁 DoH 的核心理由：内部 DNS 承担域名拦截（安全策略）、内网域名解析（split-horizon）和审计（DLP/合规）三个职能，DoH 直连外部递归 DNS 绕过这些控制。Windows 10+/macOS/Chrome 都支持通过组策略或 MDM 关闭 DoH。"
         },
         {
-          "question": "DoH 和 DoT 各有什么取舍？为什么很多企业禁用 DoH？",
-          "answer": "DoT 走独立 853 端口，企业防火墙能识别和审计；DoH 走 443 混在普通 HTTPS 里，看不出来是 DNS。两者都能防中间人篡改（运营商劫持、热点钓鱼）。代价：TLS 握手让首次查询多 1-2 个 RTT，长连接复用后差距变小。企业禁 DoH 的核心理由是 DLP/合规：内部 DNS 通常承担域名拦截、内网域名解析、安全审计三个职能，DoH 直连外部递归 DNS 会绕过这些控制，所以 Windows、macOS、Chrome 都允许通过策略关闭。"
+          "question": "用户反馈访问慢，怀疑 DNS 有问题，怎么按层排查？",
+          "answer": "第一步 dig +short 比较 8.8.8.8/1.1.1.1/114.114.114.114 三家递归返回的 IP，差异大说明 GeoDNS 调度或运营商劫持。第二步 dig +trace 看是否在根/TLD/权威某跳卡住。第三步 dig +stats 看 Query time，>200ms 说明递归或权威慢。第四步 traceroute 到解析出的 IP 验证网络路径。第五步 dig @ns1.权威域 直接问权威绕过递归缓存，确认权威记录是否正确。第六步检查客户端是否走了 DoH（浏览器可能默认开启），与系统 DNS 结果不一致会让排查迷惑。"
         }
       ]
     },
@@ -121,15 +127,15 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能按浏览器→OS→hosts→本地递归→根→TLD→权威的顺序复述完整解析路径",
-        "能用一句话说明递归（客户端→本地 DNS）和迭代（本地 DNS→各级权威）发生在哪一段",
-        "能列出 A/AAAA/CNAME/MX/TXT/SRV/NS/CAA 各自的用途，并解释 CNAME 链会触发二次查询",
-        "能解释 TTL 长短的取舍，并说出切流前 24h 降 TTL 的标准做法",
+        "能按浏览器/应用缓存 → 系统解析链（hosts/OS cache） → 本地递归 DNS 缓存的顺序复述命中路径，并知道实际顺序受平台实现影响",
+        "能用一句话说明递归（客户端→本地 DNS）和迭代（本地 DNS→根→TLD→权威）分别发生在哪一段",
+        "能列出 A/AAAA/CNAME/MX/TXT/SRV/NS/CAA 各自用途，并解释 CNAME 链会触发二次递归查询",
+        "能解释 TTL 长短的取舍，说出「切流前 24h 降 TTL」的标准做法及运营商强制最小 TTL 的长尾效应",
         "能说清 GeoDNS + ECS 怎么用 LDNS 子网做地理调度，以及公共 DNS 缺 ECS 时的副作用",
-        "能区分 NXDOMAIN/SERVFAIL/超时/错 IP 四类失败，并用 dig +trace、对比多家递归定位",
-        "能讲清 UDP 53/TCP 53/DoT 853/DoH 443 的适用场景和企业禁用 DoH 的理由",
-        "能说明 DNS 轮询（多 A 记录）的机制及其无法感知后端健康、缓存导致不均的局限",
-        "能解释 DNSSEC 通过信任链签名验证防缓存投毒，验证失败返回 SERVFAIL 的现象与排查方法"
+        "能区分 NXDOMAIN/SERVFAIL/超时/错 IP 四类失败，并用 dig +trace、对比多家递归、直接问权威定位",
+        "能讲清 UDP 53/TCP 53/DoT 853/DoH 443 的适用场景和企业禁用 DoH 的三个理由（拦截、内网解析、审计）",
+        "能说明 DNS 轮询的机制及其无法感知后端健康、缓存导致不均、客户端重试不一致的三个局限",
+        "能解释 DNSSEC 通过 DS→DNSKEY→RRSIG 信任链防缓存投毒，验证失败返回 SERVFAIL 的现象与排查方法"
       ]
     }
   ],
@@ -150,7 +156,7 @@
     },
     {
       "id": "network.dns-cdn.topic-dns.recall.3",
-      "prompt": "用户反馈访问慢，dig 显示 IP 是海外节点。请按 dig +trace、对比多家公共 DNS、whoami.akamai.net 的思路排查，并解释 ECS 在其中起的作用。",
+      "prompt": "用户反馈访问慢，dig 显示 IP 是海外节点。请用 dig +trace、对比多家公共 DNS、whoami.akamai.net 的思路排查，并解释 ECS 在其中起什么作用。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
@@ -172,25 +178,26 @@
   ],
   "rubric": {
     "mustHave": [
-      "四层缓存按浏览器→OS→hosts→本地递归 DNS 的顺序",
+      "浏览器/应用缓存、系统解析链（hosts/OS cache）与本地递归 DNS 缓存的命中路径",
       "递归（客户端→本地 DNS）+ 迭代（根→TLD→权威）的两段查询模型",
-      "A/AAAA/CNAME/MX/TXT/SRV 至少 5 种记录类型的用途",
+      "A/AAAA/CNAME/MX/TXT/SRV 至少 5 种记录类型的用途及 CNAME 触发二次查询",
       "TTL 控制缓存生效窗口，切流要提前降 TTL",
       "DNS 轮询多 A 记录负载均衡及其无法感知后端健康的局限"
     ],
     "goodToHave": [
-      "GeoDNS + EDNS Client Subnet (ECS) 的调度机制",
-      "DoH/DoT 与 UDP 53/TCP 53 的取舍",
-      "dig +trace 排查根/TLD/权威三跳",
-      "NXDOMAIN/SERVFAIL/超时/错 IP 四类失败的区分",
-      "运营商 LDNS 强制最小 TTL 导致切流长尾",
-      "DNSSEC 信任链签名验证机制与 SERVFAIL 验证失败现象"
+      "GeoDNS + EDNS Client Subnet (ECS) 的调度机制及公共 DNS 缺 ECS 的影响",
+      "DoH/DoT 与 UDP 53/TCP 53/EDNS0 截断重试的取舍",
+      "dig +trace 排查根/TLD/权威三跳的方法",
+      "NXDOMAIN/SERVFAIL/超时/错 IP 四类失败的区分与排查",
+      "运营商 LDNS 强制最小 TTL 和连接复用导致切流长尾",
+      "DNSSEC DS→DNSKEY→RRSIG 信任链验证机制与 SERVFAIL 验证失败现象"
     ],
     "commonMistakes": [
-      "把根 DNS 说成客户端直接问的对象，遗漏本地递归 DNS",
+      "把根 DNS 说成客户端直接问的对象，遗漏本地递归 DNS 这个真正的查询入口",
       "混淆递归与迭代的发生段，认为本地 DNS 到根也是递归",
-      "认为 TTL 一过就全网立即更新，忽略运营商 LDNS 强制缓存",
-      "把 CNAME 当成 IP 而不是别名，忽略 CNAME 链会触发二次查询",
+      "把 hosts、OS cache、浏览器缓存的顺序说成所有平台完全一致",
+      "认为 TTL 一过就全网立即更新，忽略运营商 LDNS 强制缓存和 HTTP 连接复用",
+      "把 CNAME 当成 IP 而不是别名，忽略 CNAME 链会触发二次递归查询",
       "DoH 和 DoT 端口混淆（DoT 853 / DoH 443），或以为 DoH 走独立端口",
       "把 DNSSEC 验证失败返回的 SERVFAIL 误认为记录不存在（NXDOMAIN）"
     ],
@@ -201,8 +208,8 @@
       "depth": 20
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "draft",
   "interviewFrequency": "high",
-  "interviewerFocus": "面试官最关心四件事：能不能把四层缓存和递归+迭代两段查询讲对、知不知道 TTL 与 GeoDNS 在 CDN 切流中的真实作用、能不能说清 DNS 轮询负载均衡的局限和 DNSSEC 防投毒机制、遇到解析失败时能不能用 dig +trace 和对比多家递归定位到根/TLD/权威或运营商劫持。"
+  "interviewerFocus": "面试官最关心四件事：能不能把近端缓存、系统解析链、本地递归缓存和递归+迭代两段查询模型讲对讲清；知不知道 TTL 取舍、GeoDNS/ECS 调度在 CDN 切流中的真实作用和长尾风险；能不能说清 DNS 轮询负载均衡的三个局限和 DNSSEC DS→DNSKEY→RRSIG 信任链防投毒机制；遇到解析失败时能不能用 dig +trace、直接问权威、对比多家递归区分 NXDOMAIN/SERVFAIL/超时/错 IP 并定位根因。"
 }

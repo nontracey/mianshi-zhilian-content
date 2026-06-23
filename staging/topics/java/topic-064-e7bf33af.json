@@ -4,7 +4,7 @@
   "category": "microservice",
   "group": "microservice",
   "title": "本地消息表与事务消息",
-  "summary": "聚焦不用 Seata 时的最终一致性方案：本地消息表、事务消息和最大努力通知，说明业务事务、消息投递、补偿任务和幂等消费如何配合。",
+  "summary": "讲清不用 Seata 时如何用 Outbox（本地消息表）、RocketMQ 事务消息、消费幂等和补偿链路实现异步最终一致，把每个失败窗口、状态机、relay 抢占和运维指标说明白。",
   "tags": [
     "Java",
     "微服务治理",
@@ -13,77 +13,97 @@
     "事务消息"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 33,
   "order": 60,
-  "recommendWeight": 76,
+  "recommendWeight": 82,
   "learningCards": [
     {
       "type": "explain",
-      "title": "本地消息表 + MQ：最常用的最终一致方案",
-      "content": "> **定位**：生产中最常用的方案，面试高频深入问题\n\n## 一、本地消息表 + MQ（生产最常用）\n\n### 1.1 核心思想\n**将\"业务操作\"和\"消息发送\"绑定在同一个本地事务中**，通过定时任务保证消息一定发出去。\n```\n┌──────────────────────────────────────────────────────────┐\n│                    订单服务                                │\n│                                                          │\n│  BEGIN TRANSACTION                                       │\n│    ① INSERT INTO orders (...)                            │\n│    ② INSERT INTO outbox_messages (event_type, payload)   │  ← 同一个事务\n│  COMMIT                                                  │\n│                                                          │\n│  ③ 定时任务扫描 outbox_messages 表                         │\n│     → 发送到 MQ → 发送成功则标记为已发送                     │\n└───────────────────────┬──────────────────────────────────┘\n│ MQ\n┌───────────────────────▼──────────────────────────────────┐\n│                    库存服务                                │\n│  ④ 消费消息 → 扣减库存 → 幂等处理                           │\n└──────────────────────────────────────────────────────────┘\n```\n\n### 1.2 代码实现\n```java\n// 1. 本地消息表\nCREATE TABLE outbox_messages (\nid BIGINT PRIMARY KEY AUTO_INCREMENT,\nevent_type VARCHAR(64) NOT NULL,      -- 事件类型\npayload TEXT NOT NULL,                 -- 消息体（JSON）\nstatus TINYINT DEFAULT 0,             -- 0:待发送 1:已发送 2:发送失败\nretry_count INT DEFAULT 0,            -- 重试次数\ncreated_at DATETIME DEFAULT NOW(),\nsent_at DATETIME\n);\n// 2. 业务操作 + 写消息表（同一个事务）\n@Service\npublic class OrderService {\n    @Transactional\n    public void createOrder(CreateOrderCmd cmd) {\n        // 业务操作\n        Order order = new Order(cmd);\n        orderRepo.save(order);\n        // 写本地消息表（同一个事务）\n        OutboxMessage msg = new OutboxMessage();\n        msg.setEventType(\"ORDER_CREATED\");\n        msg.setPayload(JSON.toJSONString(new OrderCreatedEvent(order.getId())));\n        outboxRepo.save(msg);\n    }\n}\n// 3. 定时任务扫描消息表并发送\n@Component\npublic class OutboxPublisher {\n    @Scheduled(fixedDelay = 5000)\n    public void publishPendingMessages() {\n        List<OutboxMessage> messages = outboxRepo.findByStatus(0);\n        for (OutboxMessage msg : messages) {\n            try {\n                rabbitTemplate.convertAndSend(\"order.exchange\", \"order.created\", msg.getPayload());\n                msg.setStatus(1); // 已发送\n                msg.setSentAt(LocalDateTime.now());\n                outboxRepo.save(msg);\n            } catch (Exception e) {\n                msg.setRetryCount(msg.getRetryCount() + 1);\n                if (msg.getRetryCount() > 3) {\n                    msg.setStatus(2); // 发送失败，人工介入\n                }\n                outboxRepo.save(msg);\n            }\n        }\n    }\n}\n```"
+      "title": "消息方案解决“该发且可补发”，不是强一致",
+      "content": "本地消息表和事务消息不是把多个服务变成一个强一致事务，而是在业务允许异步收敛时，确保本地事务成功后事件不会悄悄丢掉，并让下游能重复消费而不重复生效。它适合订单创建后扣库存、支付成功后改订单、会员变更后同步权益这类最终一致场景。\n\n本地消息表也常被称为 Transactional Outbox。核心做法是：在同一个本地数据库事务里写业务表和 outbox 表。事务提交失败，业务数据和消息记录都不出现；事务提交成功，即使服务随后崩溃，relay 仍能扫描或通过 CDC/binlog tailing 找到待投递事件。\n\n真正困难的地方在事务外：relay 发到 MQ 后如果还没把记录标成 SENT 就宕机，下一轮会再次发送；MQ 或消费者也可能因为网络、ack 丢失、重平衡而重复投递。因此方案默认是 at-least-once，必须由消费端 inbox 表、业务唯一键或状态机吸收重复。这就是为什么“只讲 outbox 不讲幂等”在面试里是明显短板。"
     },
     {
       "type": "explain",
-      "title": "RocketMQ 事务消息的两阶段提交",
-      "content": "## 二、RocketMQ事务消息\n\n### 2.1 核心思想\nRocketMQ 原生支持事务消息，**将本地事务和消息发送绑定**，比本地消息表更优雅。\n\n### 2.2 事务消息流程\n```\n1. 发送半消息（Half Message）到 RocketMQ\n→ 消息暂不投递，消费者看不到\n2. 执行本地事务\n3. 根据本地事务结果：\n成功 → Commit → 消息投递\n失败 → Rollback → 消息丢弃\n4. 如果没有收到确认（网络问题等）：\nRocketMQ 回查本地事务状态\n→ 根据回查结果决定 Commit 或 Rollback\n```\n\n### 2.3 代码实现\n```java\n// 1. 发送事务消息\n@Service\npublic class OrderService {\n    @Autowired\n    private RocketMQTemplate rocketMQTemplate;\n    public void createOrder(CreateOrderCmd cmd) {\n        // 发送半消息（Half Message）\n        rocketMQTemplate.sendMessageInTransaction(\n            \"order-producer\",\n            MessageBuilder.withPayload(new OrderCreatedEvent(order.getId())).build(),\n            cmd  // 传递给本地事务方法\n        );\n    }\n}\n// 2. 本地事务执行器\n@RocketMQTransactionListener\npublic class OrderTransactionListener implements RocketMQLocalTransactionListener {\n    @Override\n    public RocketMQLocalTransactionState executeLocalTransaction(Message msg, Object arg) {\n        try {\n            // 执行本地事务：创建订单\n            CreateOrderCmd cmd = (CreateOrderCmd) arg;\n            orderService.createOrderInTransaction(cmd);\n            return RocketMQLocalTransactionState.COMMIT;  // 提交消息\n        } catch (Exception e) {\n            return RocketMQLocalTransactionState.ROLLBACK; // 回滚消息\n        }\n    }\n    @Override\n    public RocketMQLocalTransactionState checkLocalTransaction(Message msg) {\n        // 回查本地事务状态\n        String orderId = ... // 从消息中解析\n        Order order = orderRepo.findById(orderId);\n        if (order != null) {\n            return RocketMQLocalTransactionState.COMMIT;\n        }\n        return RocketMQLocalTransactionState.ROLLBACK;\n    }\n}\n```"
+      "title": "Outbox 表结构、relay 抢占和补偿窗口",
+      "content": "一张可运维的 outbox 表至少要包含 `event_id`、`aggregate_id`、`event_type`、`payload`、`status`（NEW/SENDING/SENT/FAILED）、`retry_count`、`next_retry_at`、`created_at`、`sent_at`。如果同一个订单、账户或库存单元要求顺序处理，还要按 `aggregate_id + version` 或可靠的递增序号发布，避免并发 relay 把同一聚合的事件打乱。\n\nrelay 不只是定时任务。轻量系统可以轮询 NEW 或到期重试记录；对延迟和吞吐敏感的系统可以用 MySQL binlog、PostgreSQL WAL 或 Debezium 一类 CDC 管道做 transaction log tailing。无论采用哪种方式，都要有抢占策略：把记录从 NEW 原子更新到 SENDING，带上 owner 和 lease_until，只有持有者在租期内发送；超时后其他实例可以接管。这样多个 relay 实例不会同时发送同一条记录。\n\n补偿窗口靠四个信号监控：待发送数量（积压）、最老待发送年龄（卡住多久）、SENDING 超时数（抢占失败）、FAILED/死信数（投递不可恢复）。不要只看 MQ 是否有消息；业务库里积压的 outbox 才是“本地事务已提交但事件未到达下游”的真实信号。失败记录需要有告警和人工修复入口，不能只靠自动重试无限循环。"
     },
     {
       "type": "explain",
-      "title": "最大努力通知与方案选型",
-      "content": "## 三、最大努力通知\n\n### 3.1 核心思想\n适用于**跨系统、非实时**的场景（如支付结果通知）。上游服务完成操作后，通过MQ通知下游，下游处理失败则上游**定期重试通知**，直到达到最大重试次数。\n\n### 3.2 流程\n```\n1. 支付服务完成支付\n2. 发送MQ通知订单服务\n3. 订单服务消费消息，更新订单状态\n4. 如果消费失败，支付服务定期重试通知（如1min/5min/30min/1h/6h）\n5. 达到最大重试次数后，人工介入\n```"
+      "title": "RocketMQ 事务消息的承诺范围要说准",
+      "content": "RocketMQ 事务消息把 outbox 的一部分能力放进 Broker 语义里。生产者先发送 half message，Broker 持久化但暂不投递给消费者；生产者执行本地事务后，再发送 commit 或 rollback。commit 后消息对消费者可见，rollback 后半消息被丢弃。如果第二次确认丢失、超时或生产者重启，Broker 会向生产者回查本地事务状态，再决定提交、回滚或继续等待。\n\n这个能力解决的是生产端本地事务与消息投递之间的最终一致，不是消费端 exactly-once。RocketMQ 官方文档也明确强调事务消息不保证消息消费结果与上游执行结果一致，消费者需要按失败重试机制处理。因此，下游仍要实现幂等、重试、死信和人工修复链路。\n\n选型时可以这样判断：已经深度使用 RocketMQ、事件由单个本地事务决定、回查逻辑能稳定判断本地事务状态，可以优先考虑事务消息；需要 MQ 无关、可审计可重放、希望把事件历史沉淀在业务库里，Outbox 更通用。如果事务状态判断依赖多个外部系统，回查反而会变成新的复杂度。"
+    },
+    {
+      "type": "explain",
+      "title": "消费端幂等、重试、死信和修复链路",
+      "content": "消息方案默认 at-least-once，消费端幂等是硬要求而不是可选项。最通用的做法是 inbox 或消费日志表，以 messageId 或业务唯一键建唯一索引，在同一个本地事务中写 inbox 并执行业务变更。对状态类业务，还可以用合法状态迁移（如 PAID → SHIPPED）避免重复推进。\n\n幂等设计要注意三个边界。第一，唯一键粒度：按消息 id 还是业务键，取决于下游关心的是“这条消息已处理”还是“这个业务动作已执行”。第二，事务原子性：inbox 插入和业务写必须在同一个本地事务里，否则幂等记录写成功但业务变更回滚，会导致消息被标记已处理而实际没生效。第三，重试与超时：消费者处理超时但实际成功时，MQ 会重投，inbox 必须能吸收。\n\n重试失败后进入死信队列或告警流水，需要有人工修复入口：重新投递、补偿脚本、或对账系统发现差异后自动补单。只设计发送端重试、不设计消费端幂等和死信修复，是消息方案最常见的生产事故。"
     },
     {
       "type": "diagram",
-      "title": "RocketMQ 事务消息流程",
-      "content": "flowchart TD\nA[Producer 发送半消息] --> B[Broker 存储半消息]\nB --> C[执行本地事务]\nC --> D{本地事务结果}\nD -->|提交| E[发送 Commit]\nD -->|回滚| F[发送 Rollback]\nD -->|未知| G[Broker 事务回查]\nE --> H[消息对消费者可见]\nF --> I[删除半消息]\nG --> J[Producer 检查本地事务状态]\nJ --> D",
-      "caption": "半消息 + 本地事务 + 提交/回滚 + 事务回查",
-      "fallback": "RocketMQ 事务消息流程",
-      "format": "mermaid",
-      "asset": "assets/diagrams/31-distributed-transaction.svg",
+      "format": "svg",
+      "title": "Outbox、RocketMQ 事务消息和消费幂等",
+      "content": "assets/diagrams/java-outbox-transactional-message-idempotency.svg",
+      "caption": "图中把业务事务写 outbox、relay/CDC 投递（含 SENDING 抢占）、MQ 重复投递、消费端 inbox 幂等，以及 RocketMQ half message、commit/rollback、事务回查放在同一张恢复链路里。",
+      "fallback": "本地消息表方案是在本地事务中同时写业务表和 outbox 表，relay 或 CDC 负责把 NEW 事件投递到 MQ，消费者用 inbox、唯一键或状态机做幂等。RocketMQ 事务消息先写 half message，再执行本地事务，之后 commit 或 rollback；确认丢失时由 Broker 回查生产者本地状态。两种方案都需要重试、告警和人工修复入口。",
       "sources": [
         {
           "kind": "svg",
-          "path": "assets/diagrams/31-distributed-transaction.svg"
-        },
-        {
-          "kind": "mermaid",
-          "content": "flowchart TD\nA[Producer 发送半消息] --> B[Broker 存储半消息]\nB --> C[执行本地事务]\nC --> D{本地事务结果}\nD -->|提交| E[发送 Commit]\nD -->|回滚| F[发送 Rollback]\nD -->|未知| G[Broker 事务回查]\nE --> H[消息对消费者可见]\nF --> I[删除半消息]\nG --> J[Producer 检查本地事务状态]\nJ --> D"
+          "path": "assets/diagrams/java-outbox-transactional-message-idempotency.svg"
         },
         {
           "kind": "text",
-          "content": "RocketMQ 事务消息流程"
+          "content": "Apache RocketMQ transaction message 文档：half message、本地事务、commit/rollback、事务回查；Transactional Outbox pattern：业务表和消息记录同本地事务提交，由 relay 投递。"
         }
       ]
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | 本地消息表+MQ | RocketMQ事务消息 | 最大努力通知 | Seata AT |\n| --- | --- | --- | --- | --- |\n| 一致性 | 最终一致 | 最终一致 | 最终一致（尽力而为） | 最终一致 |\n| 实现复杂度 | 中（需建消息表+定时任务） | 低（MQ原生支持） | 低 | 低（注解即可） |\n| 对MQ依赖 | 任意MQ均可 | 仅RocketMQ | 任意MQ均可 | 无 |\n| 消息可靠性 | 高（本地事务保证） | 高（半消息+回查） | 中（重试兜底） | 高（undo_log） |\n| 适用场景 | 生产最常用，通用方案 | 已用RocketMQ的项目 | 跨系统通知（如支付回调） | 单库简单CRUD |\n| 性能 | 高（异步解耦） | 高 | 中（定期重试） | 中（全局锁） |\n| 人工介入 | 发送失败超限需介入 | 回查异常需介入 | 重试超限需介入 | 无 |"
+      "title": "几种最终一致方案的工程取舍",
+      "content": "| 维度 | 本地消息表 / Outbox | RocketMQ 事务消息 | 最大努力通知 | Seata AT |\n| --- | --- | --- | --- | --- |\n| 解决范围 | 本地事务成功后事件可恢复投递 | 本地事务与 RocketMQ 投递最终一致 | 外部系统通知和重试 | 多分支本地事务协调 |\n| 关键依赖 | 业务库、relay 或 CDC、消费幂等 | RocketMQ half message、回查接口 | 通知记录、重试计划、人工补偿 | TC、RM、undo_log、全局锁 |\n| 发送端重复风险 | 发送后未标 SENT、SENDING 超时后抢占 | 回查重复 commit 或消费者 ack 丢失 | 通知重复、回调重复 | 回滚补偿和旁路写冲突 |\n| 事件可审计性 | 高，事件记录留在业务库可查可重放 | 中，主要依赖 Broker 和本地状态 | 中，取决于通知流水 | 中，依赖事务日志和 TC 记录 |\n| 最适合场景 | 通用异步事件、需要重放追账和 MQ 无关 | 已使用 RocketMQ 且回查逻辑可靠 | 支付回调、三方通知、非实时同步 | 同步调用链内需要事务框架协调 |\n| 主要运维代价 | relay、状态机、积压监控、清理和顺序控制 | MQ 绑定、回查逻辑复杂度、消费幂等 | 重试周期长、体验不稳定、依赖外部确认 | 全局锁、性能、SQL 支持范围、TC 高可用 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "@Service\npublic class OrderService {\n    @Transactional\n    public void createOrder(CreateOrderCmd cmd) {\n        // 业务操作\n        Order order = new Order(cmd);\n        orderRepo.save(order);\n        // 写本地消息表（同一个事务）\n        OutboxMessage msg = new OutboxMessage();\n        msg.setEventType(\"ORDER_CREATED\");\n        msg.setPayload(JSON.toJSONString(new OrderCreatedEvent(order.getId())));\n        outboxRepo.save(msg);\n    }\n}\n// 3. 定时任务扫描消息表并发送\n@Component",
+      "title": "可运行代码：Outbox 重复投递与消费幂等",
       "language": "java",
+      "content": "import java.util.*;\n\npublic class Main {\n    enum OutboxStatus { NEW, SENDING, SENT }\n    enum TxState { COMMIT, ROLLBACK, UNKNOWN }\n\n    static final class Order {\n        final String id;\n        final int quantity;\n        Order(String id, int quantity) { this.id = id; this.quantity = quantity; }\n    }\n\n    static final class OutboxMessage {\n        final String id;\n        final String orderId;\n        final int quantity;\n        OutboxStatus status = OutboxStatus.NEW;\n        int attempts;\n        String owner;\n        OutboxMessage(String id, String orderId, int quantity) {\n            this.id = id; this.orderId = orderId; this.quantity = quantity;\n        }\n        OutboxMessage copy() { return new OutboxMessage(id, orderId, quantity); }\n    }\n\n    static final class Database {\n        final Map<String, Order> orders = new LinkedHashMap<>();\n        final List<OutboxMessage> outbox = new ArrayList<>();\n        final Set<String> inbox = new LinkedHashSet<>();\n        int stock = 10;\n    }\n\n    static final class OrderService {\n        private final Database db;\n        OrderService(Database db) { this.db = db; }\n        void createOrder(String orderId, int quantity) {\n            db.orders.put(orderId, new Order(orderId, quantity));\n            db.outbox.add(new OutboxMessage(\"evt-\" + orderId, orderId, quantity));\n        }\n    }\n\n    static final class Broker {\n        final Queue<OutboxMessage> queue = new ArrayDeque<>();\n        int publishAttempts;\n        void publish(OutboxMessage msg) {\n            publishAttempts++;\n            queue.add(msg.copy());\n        }\n    }\n\n    static final class Relay {\n        private final Database db;\n        private final Broker broker;\n        Relay(Database db, Broker broker) { this.db = db; this.broker = broker; }\n        void publishOne(boolean crashAfterBrokerAck) {\n            OutboxMessage msg = db.outbox.stream()\n                    .filter(m -> m.status == OutboxStatus.NEW)\n                    .findFirst()\n                    .orElseThrow();\n            msg.status = OutboxStatus.SENDING;\n            msg.owner = \"relay-1\";\n            msg.attempts++;\n            broker.publish(msg);\n            if (!crashAfterBrokerAck) {\n                msg.status = OutboxStatus.SENT;\n            } else {\n                msg.status = OutboxStatus.NEW;\n            }\n        }\n    }\n\n    static final class InventoryConsumer {\n        private final Database db;\n        private final Broker broker;\n        int duplicateSkipped;\n        InventoryConsumer(Database db, Broker broker) { this.db = db; this.broker = broker; }\n        void consumeAll() {\n            while (!broker.queue.isEmpty()) {\n                OutboxMessage msg = broker.queue.remove();\n                if (!db.inbox.add(msg.id)) {\n                    duplicateSkipped++;\n                    continue;\n                }\n                db.stock -= msg.quantity;\n            }\n        }\n    }\n\n    static final class TxBroker {\n        final Map<String, String> half = new LinkedHashMap<>();\n        final List<String> visible = new ArrayList<>();\n        void sendHalf(String txId, String payload) { half.put(txId, payload); }\n        void commit(String txId) { visible.add(half.remove(txId)); }\n        void rollback(String txId) { half.remove(txId); }\n        void check(String txId, TxState state) {\n            if (state == TxState.COMMIT) commit(txId);\n            else if (state == TxState.ROLLBACK) rollback(txId);\n        }\n    }\n\n    public static void main(String[] args) {\n        Database db = new Database();\n        Broker broker = new Broker();\n        new OrderService(db).createOrder(\"o1\", 2);\n        Relay relay = new Relay(db, broker);\n        relay.publishOne(true);\n        relay.publishOne(false);\n        InventoryConsumer consumer = new InventoryConsumer(db, broker);\n        consumer.consumeAll();\n\n        OutboxMessage saved = db.outbox.get(0);\n        assert broker.publishAttempts == 2 : \"crash scenario must cause re-publish\";\n        assert saved.status == OutboxStatus.SENT : \"second attempt succeeds\";\n        assert db.stock == 8 : \"only one message consumed\";\n        assert consumer.duplicateSkipped == 1 : \"inbox absorbs duplicate\";\n\n        TxBroker txBroker = new TxBroker();\n        txBroker.sendHalf(\"tx-o2\", \"OrderCreated:o2\");\n        db.orders.put(\"o2\", new Order(\"o2\", 1));\n        TxState checked = db.orders.containsKey(\"o2\") ? TxState.COMMIT : TxState.ROLLBACK;\n        txBroker.check(\"tx-o2\", checked);\n        assert txBroker.visible.equals(List.of(\"OrderCreated:o2\"));\n        assert txBroker.half.isEmpty();\n\n        System.out.println(\"outbox sends=\" + broker.publishAttempts\n                + \", status=\" + saved.status\n                + \", stock=\" + db.stock\n                + \", duplicatesSkipped=\" + consumer.duplicateSkipped);\n        System.out.println(\"txMessage visible=\" + txBroker.visible\n                + \", remainingHalf=\" + txBroker.half.size());\n    }\n}",
       "highlights": [
         {
-          "line": 2,
-          "note": "本地消息表的关键是业务数据和 outbox 记录同事务提交；真正发送 MQ 在事务外补偿执行，因此消费者幂等是硬要求。"
+          "line": 38,
+          "note": "业务数据和 outbox 记录在同一个本地事务语义里提交，事务失败两者都不出现。"
+        },
+        {
+          "line": 69,
+          "note": "relay 发送前先将状态原子更新到 SENDING 并记录 owner，模拟发送后宕机则回退到 NEW，下一轮会重新投递。"
+        },
+        {
+          "line": 87,
+          "note": "消费端 inbox 用消息 id 去重，重复消息只计数不再次扣库存。"
+        },
+        {
+          "line": 99,
+          "note": "RocketMQ 事务消息的核心是 half message 先持久化，再由本地事务状态决定 commit 或 rollback。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**Q1：本地消息表方案是怎么保证消息一定发出去的？**\n\n机制要点：\n- A：核心是将业务操作和消息写入绑定在同一个本地事务中。业务操作和INSERT消息表在同一个数据库事务里，要么都成功要么都失败。然后通过定时任务扫描状态为\"待发送\"的消息，发送到MQ后标记为\"已发送\"。如果发送失败，重试次数加一，超过阈值标记为\"发送失败\"供人工介入。因为消息已经持久化到数据库，即使服务重启也不会丢失。\n- **Q2：RocketMQ事务消息和本地消息表有什么区别？**\n- A：本质思想相同，都是将本地事务和消息发送绑定。区别在于实现方式：本地消息表需要自己建表、写定时任务、处理重试逻辑，但不挑MQ，任意MQ都能用。RocketMQ事务消息是MQ原生支持的，通过半消息+回查机制实现，不需要额外建表和定时任务，但只能用RocketMQ。如果项目已经用了RocketMQ，优先用事务消息；否则用本地消息表更通用。\n- **Q3：消费端怎么做幂等处理？**\n- A：常见方案有三种。第一，用消息唯一ID做去重表，消费前先查去重表，存在则跳过。第二，用业务唯一键做数据库唯一约束，重复插入会报唯一键冲突，catch异常后跳过。第三，用状态机控制，只允许合法的状态转换（如\"待支付→已支付\"），重复消费时状态不满足则跳过。推荐第一种方案，通用性强，与业务逻辑解耦。",
+      "content": "我会先定边界：本地消息表和 RocketMQ 事务消息解决的是异步最终一致，不是分布式强一致。业务本地事务成功后，事件要能恢复投递；消息可能重复到达，所以消费端必须幂等。\n\n**本地消息表三步走**\n- 第一步：业务数据和 outbox 事件在同一个本地事务里提交。事务失败两者都不出现，事务成功即使服务崩溃事件也在业务库里。\n- 第二步：relay 通过轮询或 CDC 读取 NEW/SENDING 超时记录，发送 MQ。发送前先原子更新到 SENDING 并记录 owner，发送成功后标记 SENT；发送失败按 `next_retry_at` 退避重试，超过阈值转 FAILED 并告警。\n- 第三步：消费者用 inbox 去重表或业务唯一键，在同一个本地事务中执行去重插入和业务变更。重试失败转死信，需要人工修复入口。\n\n**失败窗口要能说清**\n- 事务内直接发 MQ：回滚后消息已发出去，脏消息。\n- 发送成功但标 SENT 前宕机：下一轮重复发送，消费端必须幂等。\n- 标 SENT 早于 Broker ack：消息可能丢失但本地已标 SENT，无法补偿。\n- 消费者处理成功但 ack 丢失：MQ 重投，inbox 必须吸收。\n\n**RocketMQ 事务消息**\n- 半消息先到 Broker，消费者不可见；本地事务执行后 commit 或 rollback。\n- 二次确认丢失时 Broker 回查生产者本地事务状态。\n- 它解决生产端一致性，不解决消费端 exactly-once，下游仍要幂等。\n\n**选型一句话**\n- 需要 MQ 无关、可审计可重放：用 Outbox。\n- 已用 RocketMQ、事务状态可回查且链路简单：用事务消息。\n- 外部支付回调：最大努力通知。\n- 同步调用链内需要事务框架协调：Seata。\n\n**运维指标**\n- outbox 积压数、最老待发送年龄、SENDING 超时、FAILED 和死信数、消费者去重命中率。",
       "followUpQuestions": [
         {
-          "question": "什么时候不用 Seata，而选择本地消息表或事务消息？",
-          "answer": "当业务可以接受最终一致、链路以异步通知为主、跨服务写入不需要同步阻塞时，本地消息表或事务消息通常更简单可靠。回答要说清本地事务先落业务数据和消息记录，后台投递失败可补偿，消费者必须幂等。"
+          "question": "本地消息表为什么仍然会重复投递？",
+          "answer": "因为发送 MQ 和标记 SENT 不是同一个原子动作。发送成功后服务如果在更新状态前宕机，下一轮 relay 会再次发送同一事件；消费者处理成功但 ack 丢失时，MQ 也可能重投。所以消费端幂等是硬要求。"
         },
         {
-          "question": "事务消息回查为什么仍然需要幂等消费？",
-          "answer": "事务消息只解决“生产端本地事务与消息投递”的一致性，不能保证消费者只执行一次。Broker 可能重投，消费者也可能处理成功但 ack 失败，所以消费端仍要用业务唯一键、去重表或状态机保证幂等。"
+          "question": "RocketMQ 事务消息的回查依赖什么？",
+          "answer": "依赖生产者能根据消息里的业务键查询本地事务结果，例如订单是否已创建、支付流水是否已落库。回查逻辑不能只看内存状态，否则生产者重启后会无法判断；通常是查数据库确认业务记录是否存在。"
+        },
+        {
+          "question": "消费端幂等用 inbox 表时，唯一键应该按消息 id 还是业务键？",
+          "answer": "取决于下游关心的是“这条消息已处理”还是“这个业务动作已执行”。如果消息可以重复发送但业务动作只应执行一次（如扣款），用业务键；如果同一业务动作可能对应不同消息（如多次通知），用消息 id 并配合业务状态判断。两者都可以在同一个本地事务中实现。"
+        },
+        {
+          "question": "Outbox 的运维指标看哪些？",
+          "answer": "看待发送数量、最老待发送年龄、SENDING 超时数、重试次数分布、FAILED 和死信数量、消费者去重命中率。它们能直接反映事件是否卡在业务库、relay、MQ 或消费端。"
         }
       ]
     },
@@ -91,68 +111,88 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "本地消息表方案的事务绑定原理（业务+消息同一事务）",
-        "定时任务扫描发送+重试+人工介入的完整流程",
-        "消费端幂等处理的三种方案（去重表/唯一约束/状态机）",
-        "RocketMQ半消息和事务回查机制",
-        "本地消息表 vs RocketMQ事务消息的选型依据",
-        "最大努力通知的适用场景和重试策略",
-        "与Seata AT模式的对比和适用场景差异"
+        "能解释本地消息表和 Outbox 如何把业务数据与事件记录放进同一个本地事务",
+        "能讲清 relay 状态机（NEW → SENDING → SENT/FAILED）、抢占策略、重试和告警",
+        "能说明发送成功但标记 SENT 前宕机为什么会导致重复投递",
+        "能解释 RocketMQ half message、本地事务、commit/rollback 和事务回查流程",
+        "能准确说明事务消息不保证消费端 exactly-once，消费者仍要幂等",
+        "能说明消费端 inbox 去重、唯一键选择和事务原子性设计",
+        "能在 Outbox、事务消息、最大努力通知和 Seata 之间做工程取舍",
+        "能指出事务内直接发 MQ、先标 SENT、无幂等、无告警、无清理策略这些生产风险"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "java.microservice.topic-064-e7bf33af.recall.1",
-      "prompt": "本地消息表如何保证业务写入和消息发送的最终一致性？补偿任务要扫描哪些状态？",
+      "prompt": "本地消息表如何把业务提交和事件发布拆成两个可恢复阶段？哪些失败窗口会造成重复投递？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "java.microservice.topic-064-e7bf33af.recall.2",
-      "prompt": "RocketMQ 事务消息的半消息、事务回查和最终提交/回滚流程是什么？",
+      "prompt": "RocketMQ 事务消息的 half message、commit/rollback 和回查分别解决什么问题？它不承诺什么？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "java.microservice.topic-064-e7bf33af.recall.3",
-      "prompt": "最大努力通知适合什么业务？为什么不能承诺强一致？",
+      "prompt": "消费端幂等、重试、死信和告警怎么设计？Outbox、事务消息、Seata 如何选型？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "java.microservice.topic-064-e7bf33af.recall.4",
+      "prompt": "Outbox 表需要哪些字段？relay 多实例并发时如何抢占同一条记录？SENDING 超时后怎么处理？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "java.microservice.topic-064-e7bf33af.recall.5",
+      "prompt": "线上 outbox 积压数持续上升、最老待发送年龄超过 10 分钟、FAILED 数开始增长。你会怎么排查？最终可能改什么？",
+      "mode": "text",
+      "expectedMinutes": 6,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能区分 Seata 与最终一致性消息方案的适用边界",
-      "能说明本地消息表的状态机和补偿任务",
-      "能解释 RocketMQ 事务消息的半消息、回查、提交/回滚流程",
-      "能说明最大努力通知为什么依赖重试和幂等"
+      "能区分强一致事务、异步最终一致和最大努力通知的边界",
+      "能说明本地消息表的本地事务、状态机（NEW/SENDING/SENT/FAILED）、relay 抢占、重试和告警",
+      "能解释 RocketMQ 事务消息的半消息、回查、提交和回滚流程及其承诺范围",
+      "能说明消费端幂等（inbox/唯一键/状态机）是消息方案的必要组成部分"
     ],
     "goodToHave": [
-      "能结合订单/支付/库存说明方案选择",
-      "能说明消息堆积、重复投递和补偿风暴的处理",
-      "能指出强一致诉求下这些方案的局限"
+      "能结合订单、支付、库存说明重复投递、乱序和补偿窗口",
+      "能说明 relay 并发抢占策略、next_retry_at、FAILED、死信和清理策略",
+      "能把 Outbox、事务消息、最大努力通知、Seata AT 做真实取舍",
+      "能指出消费端唯一键粒度选择和事务原子性设计"
     ],
     "commonMistakes": [
-      "把本地消息表说成强一致事务",
-      "只讲发送消息，漏掉投递状态和补偿扫描",
-      "忽略消费者幂等，误以为事务消息等于 exactly-once"
+      "把本地消息表说成分布式强一致事务",
+      "在业务事务内直接发送 MQ，忽略事务回滚后的脏消息",
+      "标记 SENT 早于 Broker ack，导致消息丢失且无法补偿",
+      "误以为 RocketMQ 事务消息等于消费端 exactly-once",
+      "只设计发送端重试，不设计消费者幂等、死信、告警和人工修复",
+      "outbox 表没有 SENDING 抢占和超时机制，多实例并发重复发送"
     ],
     "scoreWeights": {
-      "coverage": 30,
+      "coverage": 25,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 20
+      "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "staging",
   "prerequisites": [
-    "java.microservice.topic-055-e51532ee"
+    "java.microservice.topic-055-e51532ee",
+    "java.microservice.topic-062-ce26874b"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「本地消息表与事务消息」说清能区分 Seata 与最终一致性消息方案的适用边界、能说明本地消息表的状态机和补偿任务，并放到Java 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察是否能围绕本地消息表、Outbox、RocketMQ 事务消息和消费幂等，把每个失败窗口、状态机、relay 抢占、补偿链路和选型边界讲清楚。"
 }

@@ -4,7 +4,7 @@
   "category": "process-thread",
   "group": "process-thread",
   "title": "CPU 调度算法与 CFS",
-  "summary": "理解调度目标与经典算法，重点掌握 Linux CFS 用 vruntime + 红黑树实现完全公平调度。",
+  "summary": "理解 CPU 调度在公平、响应、吞吐和避免饥饿之间的权衡，掌握 Linux fair class 中 CFS 的 vruntime/红黑树/权重模型及其比例公平本质，以及 Linux 6.6 起引入 EEVDF 后 lag、virtual deadline 与 eligibility 如何改善唤醒延迟。",
   "tags": [
     "操作系统",
     "进程调度",
@@ -12,43 +12,58 @@
     "vruntime"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 28,
   "order": 70,
   "recommendWeight": 72,
   "learningCards": [
     {
       "type": "explain",
-      "title": "调度目标与经典算法",
-      "content": "## 调度要平衡的目标\n- **公平**：每个任务都拿到合理 CPU 份额。\n- **响应**：交互任务尽快被调度（低延迟）。\n- **吞吐**：单位时间完成的工作多。\n- **避免饥饿**：低优先级任务也终能运行。\n这些目标常冲突（如吞吐 vs 响应），调度器是折中。\n\n## 经典算法\n- **FCFS（先来先服务）**：简单但长任务阻塞短任务（护航效应）。\n- **SJF/SRTF（短作业优先）**：平均等待最短，但需预知运行时间、可能饿死长任务。\n- **RR（时间片轮转）**：每个任务跑一个时间片，响应好，时间片大小影响切换开销与响应。\n- **优先级调度**：按优先级选，需防低优先级饥饿（老化 aging）。\n- **多级反馈队列（MLFQ）**：多队列 + 动态调整优先级，兼顾响应与吞吐。\n\n线上 CPU 调度排查可以从一个具体现象进入：服务 CPU 使用率不高但响应时间突然升高时，先看 run queue 长度、上下文切换次数、线程状态和负载均衡情况。若 runnable 线程长期排队，说明调度延迟可能比业务代码更关键；若 voluntary context switch 异常增多，要继续检查锁等待、IO 阻塞或线程池配置。验证修复时可以比较调整前后的 P95/P99 延迟、上下文切换次数和 CPU steal time。"
+      "title": "调度目标与经典算法的工程取舍",
+      "content": "CPU 调度需要在四个互相冲突的目标间权衡：**公平**（每个任务获得合理份额）、**响应**（交互任务尽快被调度）、**吞吐**（单位时间完成更多工作）、**避免饥饿**（低优先级任务也能运行）。没有一个算法能同时最优，调度器本质上是一个折中机器。\n\n经典算法各自选择不同权衡：FCFS 最简单，任务按到达顺序执行，没有切换开销，但长任务会阻塞所有后续短任务（convoy effect，护航效应），交互响应极差。SJF/SRTF 平均等待时间理论上最优，但需要预知或估计运行时间，且长任务可能永远等不到运行。RR（Round Robin）用固定时间片保证每个任务都能及时运行，响应性好，但时间片大小是个两难——太大退化成 FCFS，太小则上下文切换吞掉大量 CPU 时间。\n\n优先级调度解决了「重要任务先跑」的需求，但纯粹按优先级选会导致低优先级饥饿，所以引入 aging（老化）机制让等待时间长的任务逐渐提升优先级。MLFQ（多级反馈队列）综合了这些思路：多个队列各设不同优先级和时间片长度，新任务进高优先级队列获得短时间片以保响应，用完时间片降到下一级获得更长时间片以提高吞吐；CPU 密集任务自然下沉到低优先级长片队列。MLFQ 的核心启发式是区分交互型和 CPU 密集型负载，但调度行为依赖具体实现参数，调优困难。\n\n线上排查 CPU 调度问题时，一个典型入口是「CPU 使用率不高但响应延迟突然升高」——这时先看 run queue 长度（`/proc/loadavg` 的 runnable 数或 `vmstat 1` 的 `r` 列）、上下文切换次数（`pidstat -w` 的 voluntary/involuntary cswch/s）。如果 runnable 线程长期排队但 CPU 利用率不高，说明存在调度延迟；voluntary context switch 暴涨多半是锁等待或 IO 阻塞；involuntary cswch 增多可能是时间片被抢。验证修复时对比调整前后的 P95/P99 延迟、上下文切换次数和 CPU steal time。"
     },
     {
       "type": "explain",
-      "title": "Linux CFS：完全公平调度",
-      "content": "## 核心思想\nCFS（Completely Fair Scheduler，自 2.6.23 起为 Linux 默认调度器）放弃固定时间片配额，追求**让每个任务长期获得与权重成比例的 CPU 时间**。\n\n## vruntime + 红黑树\n- 每个可运行任务维护 **vruntime（虚拟运行时间）**：实际运行时间按权重归一化累加——`vruntime += delta_exec * 1024 / weight`，**权重越高，vruntime 增长越慢**。\n- 所有可运行任务按 vruntime 作为 key 放进一棵**红黑树**，CFS **每次选 vruntime 最小的任务运行**（最左节点），红黑树的插入/删除/取最小都是 O(log n)。\n- 任务运行时 vruntime 持续增大，很快不再是最小值，从而让出 CPU——这种「最饥饿的最先跑」机制天然趋于比例公平。\n\n## nice 值与权重表\n`nice` 取值 -20 ~ 19，内核用 `prio_to_weight[40]` 把 nice 映射成调度权重。节选自 `kernel/sched/core.c`：\n\n| nice | -5  |  0   |  +5  | +10  | +19  |\n|------|-----|------|------|------|------|\n| 权重 | 3121| 1024 | 335  | 110  |  15  |\n\n相邻 nice 权重比约 1.25，nice 越小权重越大、vruntime 涨得越慢、长期获得越多 CPU 份额。普通用户只能把 nice 调高（权重变小），要把 nice 调低（权重变大）需要 `CAP_SYS_NICE` 能力。\n\n## 调度粒度旋钮\nCFS 通过 `sysctl` 暴露三个核心参数（默认值随内核版本微调，以 5.x 系列为例）：\n- `kernel.sched_latency_ns`：目标调度周期，约 6 ms；可运行任务数 ≤ `latency / min_granularity` 时尽量在一个周期内把它们都轮一遍。\n- `kernel.sched_min_granularity_ns`：单个任务的最小运行时间，约 0.75 ms，防止切得太碎。\n- `kernel.sched_wakeup_granularity_ns`：唤醒任务要抢占当前任务的 vruntime 差门槛，约 1 ms。\n\n把这三个值调小能压低单次响应延迟，但 `context switch / sec` 会成倍上升，吞吐下降；调大则相反。在 NUMA 机器上还要结合 `kernel.sched_migration_cost_ns` 一起看。\n\n## 6.6 起：EEVDF 默认化\nLinux **6.6 起把默认调度器切换成 EEVDF（Earliest Eligible Virtual Deadline First）**：在 CFS 公平基础上为每个任务计算 `virtual deadline = vruntime + slice`，并用 `lag`（理想获得 CPU 与实际获得 CPU 的差）判断是否需要抢占当前任务，从而让延迟敏感任务在毫秒级被优先照顾。普通场景下行为接近 CFS，但面对突发唤醒（如网络包到达）P99 延迟更稳。"
+      "title": "CFS 用 vruntime 实现按权重比例公平",
+      "content": "Linux 2.6.23 引入 CFS（Completely Fair Scheduler），取代之前的 O(1) 调度器成为 fair class 的核心。CFS 的设计哲学不是给每个任务分配固定时间片，而是让所有可运行任务长期获得与权重成比例的 CPU 时间——这就是「完全公平」的含义。\n\n实现机制是 **vruntime（虚拟运行时间）**。每个任务的 sched_entity 维护一个 vruntime 字段，实际运行时按 `vruntime += delta_exec * NICE_0_LOAD / weight` 累加。delta_exec 是本次实际运行的物理时间，weight 是由 nice 值决定的权重。权重越大（nice 越小），同样的物理运行时间累加的 vruntime 越少。比如 nice 0（weight 1024）运行 10ms，vruntime 约增 10ms；nice -20（weight 88761）运行 10ms，vruntime 只增加约 0.1ms。所以高权重任务的 vruntime 长期更小。\n\n所有可运行任务按 vruntime 作为 key 放进红黑树。调度器选择下一个任务时，取红黑树最左节点（vruntime 最小），这个操作通常通过 `rb_leftmost` 缓存 O(1) 得到。任务被选中后运行一段时间，vruntime 增大；被抢占或时间片用完后重新插入红黑树时，它的 vruntime 已变大，会向右移动，让 vruntime 更小的「欠 CPU」的任务成为下一个最左节点。这个过程自动收敛到权重比例公平。\n\nvruntime 的基准（min_vruntime）在运行时动态维护，保证新唤醒的任务不会因为 vruntime 太小而长期霸占最左位置。新任务的初始 vruntime 设为 `min_vruntime + 一些补偿`，避免新来者抢占已有任务的公平份额。红黑树的插入和删除是 O(log n)，n 是该 CPU 上可运行任务数。"
+    },
+    {
+      "type": "explain",
+      "title": "nice 权重表与比例关系",
+      "content": "nice 值范围 -20 到 19，内核通过 `prio_to_weight[40]` 查表把 nice 映射成调度权重。nice 0 对应权重 1024（`NICE_0_LOAD`），是基准点。相邻 nice 值的权重比约 1.25 倍，每增加一个 nice，CPU 份额大约减少 10%（精确说是 1/1.25 = 80%，所以 nice +1 的任务获得 nice 0 的约 80% CPU 时间）。nice 范围跨度巨大：nice -20 的权重 88761 约是 nice 0 的 87 倍，nice +19 的权重 15 约是 nice 0 的 1/68。\n\n实际意义是：在同一个 CPU 上，一个 nice 0 和一个 nice 5 的任务同时 runnable，它们长期获得的 CPU 时间比约为 1024:335 ≈ 3:1。这不是绝对优先级，而是比例分配——nice -20 的任务不会饿死 nice +19 的任务，只是前者获得的份额大得多。\n\n普通用户只能把 nice 调高（降低自己的权重和优先级），要调低到比默认值更高优先级需要 `CAP_SYS_NICE` 能力。`nice` 命令和 `setpriority()` 系统调用都可以设置，CFS 内部直接修改权重。\n\n工程提醒：nice 影响的是 fair class 内的相对比例，不跨越调度类边界。nice -20 的 SCHED_NORMAL 任务仍然低于任何 SCHED_FIFO 或 SCHED_RR 实时任务——内核调度时按调度类优先级选择，同一类内才用各自的机制（CFS 用 vruntime，实时类用优先级和时间片）。"
+    },
+    {
+      "type": "explain",
+      "title": "CFS 调度粒度：方向而非死记默认值",
+      "content": "CFS 的调度粒度由几个可调参数控制，它们影响「一个任务在被抢占前最少运行多久」以及「多久强制调度一次」。内核版本和发行版配置会影响这些参数的实际默认值和暴露方式，不同内核之间会有差异，所以工程上要理解方向而不是死记具体数值。\n\n方向：粒度越小（min_granularity 越低），交互任务的唤醒延迟越低，但上下文切换更频繁，CPU 在切换上的开销增大，对吞吐有负面影响。粒度越大，吞吐更稳定，但单个任务的等待时间可能变长。唤醒抢占粒度（wakeup_granularity）决定一个被唤醒的任务能否立即抢占当前运行任务：粒度越小越容易抢占，唤醒延迟越低，但切换也更频繁。\n\n上层 cgroup 的 cpu.cfs_quota_us 和 cpu.max 也会间接影响调度行为——它们是节流机制（throttling），当任务组在配额周期内用完配额，整个组被暂停到下一个周期。被 throttling 拖延的任务看起来像是「调度延迟」，但根因是配额不足。排查时先看 cgroup 的 nr_throttled 和 throttled_time，再判断是调度算法问题还是配额问题。"
+    },
+    {
+      "type": "explain",
+      "title": "EEVDF：lag 与 virtual deadline 改善唤醒延迟",
+      "content": "Linux 6.6 起在 fair scheduler 中引入 EEVDF（Earliest Eligible Virtual Deadline First）思路，取代了传统 CFS 中一些启发式的唤醒抢占判断。EEVDF 的核心变化是在 vruntime 公平模型之上叠加了两个概念：**lag** 和 **virtual deadline**。\n\n**lag** 衡量一个任务的理想 CPU 获得量与实际 CPU 获得量的差：lag > 0 表示该任务「欠 CPU」（实际得到的比理想的少），lag < 0 表示「多占了 CPU」。lag 从任务创建或唤醒时的初始值 0 开始，随任务的实际运行和等待动态变化。lag 为正的任务是有资格被调度的（eligible），lag 为负的任务会被推迟，直到它的 lag 回到非负。\n\n**virtual deadline** = 任务的 vruntime + lag 的一个正比调度量。lag 越大的任务 virtual deadline 越早，意味着更急切需要被调度。调度器在 eligible 任务中选 virtual deadline 最小的，从而优先服务那些「欠 CPU 最多、最急迫」的任务。\n\nEEVDF 解决的核心问题：传统 CFS 的唤醒抢占依赖启发式规则（如「被唤醒者的 vruntime 小于当前运行者一定阈值就抢占」），这个阈值不容易调——太激进会增加切换，太保守会让交互任务等太久。EEVDF 通过 lag 自动追踪每个任务的公平性偏差，用 virtual deadline 统一决定谁先运行，减少了启发式参数的敏感性。对短任务、交互任务和突发唤醒的延迟更稳定。\n\n边界：EEVDF 仍然服务于 fair class 的权重比例公平目标，不改变 SCHED_NORMAL 与实时调度类之间的优先级关系。lag 和 virtual deadline 是内核内部实现细节，没有用户态接口直接设置；影响它们的方式仍然是 nice、cgroup 权重和调度粒度参数。"
     },
     {
       "type": "diagram",
-      "title": "CPU 调度算法与 CFS：机制分支与风险路径",
-      "content": "flowchart TD\nNevzn77S[CPU 调度算法与 CFS 触发入口] --> Nevzn77M[核心对象或状态: 操作系统]\nNevzn77M --> Nevzn77C{CPU 调度算法与 CFS 是否走正常路径}\nNevzn77C -->|正常| Nevzn77N[执行 CPU 调度算法与 CFS 主流程]\nNevzn77C -->|异常| Nevzn77F[处理 CPU 调度算法与 CFS 边界风险]\nNevzn77N --> Nevzn77O[输出结果或交给下一组件]\nNevzn77F --> Nevzn77R[按 CPU 调度算法与 CFS 语义降级/重试/报错]\nNevzn77O --> Nevzn77V[验证 CPU 调度算法与 CFS 日志、指标或测试]\nNevzn77R --> Nevzn77V",
+      "title": "经典调度、CFS vruntime 与 EEVDF",
+      "content": "assets/diagrams/os-cpu-scheduler-cfs-eevdf.svg",
       "items": [
         "每个可运行任务维护 vruntime(按权重归一化的运行时间)",
         "权重越高(nice 越小) vruntime 增长越慢",
         "所有任务按 vruntime 放入红黑树",
         "调度: 取 vruntime 最小(最左)的任务运行",
         "运行后 vruntime 增大，让位给更小的，趋于公平",
-        "6.6+ 默认 EEVDF，更好兼顾延迟"
+        "Linux 6.6 起 fair scheduler 引入 EEVDF 思路，更好兼顾延迟"
       ],
-      "format": "mermaid",
-      "fallback": "CPU 调度算法与 CFS 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。",
-      "caption": "CPU 调度算法与 CFS 图中的分支用于区分本题正常机制、异常边界和工程验证路径。",
+      "format": "svg",
+      "fallback": "经典算法体现公平、响应、吞吐和避免饥饿之间的取舍；CFS 用 nice 权重影响 vruntime 增速，把可运行任务按 vruntime 放进红黑树并选择最左节点；EEVDF 在 vruntime 上叠加 lag 与 virtual deadline，以更稳定地处理延迟敏感唤醒；生产排查要看 run queue、上下文切换、steal/throttling 和 perf sched latency。",
+      "caption": "图中把经典算法取舍、CFS 的 vruntime/红黑树选择、EEVDF 的 lag/deadline 以及线上排查指标放在一张图里，避免只背“取最左节点”。",
       "sources": [
         {
-          "kind": "mermaid",
-          "content": "flowchart TD\nNevzn77S[CPU 调度算法与 CFS 触发入口] --> Nevzn77M[核心对象或状态: 操作系统]\nNevzn77M --> Nevzn77C{CPU 调度算法与 CFS 是否走正常路径}\nNevzn77C -->|正常| Nevzn77N[执行 CPU 调度算法与 CFS 主流程]\nNevzn77C -->|异常| Nevzn77F[处理 CPU 调度算法与 CFS 边界风险]\nNevzn77N --> Nevzn77O[输出结果或交给下一组件]\nNevzn77F --> Nevzn77R[按 CPU 调度算法与 CFS 语义降级/重试/报错]\nNevzn77O --> Nevzn77V[验证 CPU 调度算法与 CFS 日志、指标或测试]\nNevzn77R --> Nevzn77V"
+          "kind": "svg",
+          "path": "assets/diagrams/os-cpu-scheduler-cfs-eevdf.svg"
         },
         {
           "kind": "text",
-          "content": "CPU 调度算法与 CFS 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。"
+          "content": "经典算法体现公平、响应、吞吐和避免饥饿之间的取舍；CFS 用 nice 权重影响 vruntime 增速，把可运行任务按 vruntime 放进红黑树并选择最左节点；EEVDF 在 vruntime 上叠加 lag 与 virtual deadline，以更稳定地处理延迟敏感唤醒；生产排查要看 run queue、上下文切换、steal/throttling 和 perf sched latency。"
         }
       ]
     },
@@ -57,112 +72,152 @@
       "title": "经典调度算法横向对比",
       "columns": [
         "算法",
-        "时间片/选任务方式",
+        "选任务方式",
         "响应性",
         "吞吐量",
         "公平性",
+        "饥饿风险",
         "实现复杂度",
         "典型场景"
       ],
       "rows": [
         [
           "FCFS",
-          "一直跑完到达顺序",
-          "差（长任务拖住短任务）",
-          "优（无切换）",
-          "差（护航效应）",
+          "按到达顺序，跑完才换",
+          "差，长任务阻塞短任务",
+          "优，几乎无切换",
+          "差，护航效应",
+          "高，短任务被长任务堵",
           "极低",
-          "批处理、单作业系统"
+          "批处理、单道作业系统"
         ],
         [
           "SJF/SRTF",
-          "按估计/剩余运行时间",
+          "按估计/剩余运行时间最短",
           "中",
-          "优（平均等待最优）",
-          "差（长任务可能饿死）",
-          "中（需估计运行时间）",
+          "优，平均等待理论最优",
+          "差，长任务可能永远排不上",
+          "高",
+          "中，需估计运行时间",
           "已知作业长度的批处理"
         ],
         [
           "RR",
           "固定时间片轮转",
           "优",
-          "中（切换开销与片长强耦合）",
-          "中（按到达时间近似公平）",
+          "中，切换开销与片长耦合",
+          "中，按到达近似公平",
           "低",
-          "分时系统、早期 Unix"
+          "低",
+          "分时系统、交互终端"
         ],
         [
           "MLFQ",
-          "多队列+动态片长+老化",
+          "多队列+动态片长+aging",
           "优",
-          "优",
-          "中（按历史行为近似公平）",
-          "高（多队列+老化机制）",
+          "优，CPU密集下沉长片",
+          "中，按历史行为近似",
+          "低，aging 保障",
+          "高，多队列+启发式",
           "早期 Windows、BSD"
         ],
         [
           "CFS",
-          "动态按 vruntime 选最左",
+          "vruntime 最小（红黑树最左）",
           "优",
           "优",
-          "优（按 nice 权重比例公平）",
-          "中（红黑树 O(log n)）",
-          "Linux 2.6.23 ~ 6.5 默认"
+          "优，按 nice 权重比例公平",
+          "极低",
+          "中，红黑树 O(log n)",
+          "Linux 2.6.23 起 fair class"
         ],
         [
           "EEVDF",
-          "按 virtual deadline 选最早 eligible",
-          "更优（毫秒级稳定）",
+          "eligible 且 virtual deadline 最早",
+          "更优，唤醒延迟更稳",
           "优",
-          "优（按权重+lag 公平）",
-          "较高（deadline/lag 追踪）",
-          "Linux 6.6+ 默认"
+          "优，lag 修正偏差",
+          "极低",
+          "较高，lag/deadline 追踪",
+          "Linux 6.6 起 fair scheduler"
         ]
       ]
     },
     {
-      "type": "diagram",
-      "title": "CPU 调度算法与 CFS：机制分支与风险路径",
-      "content": "flowchart TD\nNevzn77S[CPU 调度算法与 CFS 触发入口] --> Nevzn77M[核心对象或状态: 操作系统]\nNevzn77M --> Nevzn77C{CPU 调度算法与 CFS 是否走正常路径}\nNevzn77C -->|正常| Nevzn77N[执行 CPU 调度算法与 CFS 主流程]\nNevzn77C -->|异常| Nevzn77F[处理 CPU 调度算法与 CFS 边界风险]\nNevzn77N --> Nevzn77O[输出结果或交给下一组件]\nNevzn77F --> Nevzn77R[按 CPU 调度算法与 CFS 语义降级/重试/报错]\nNevzn77O --> Nevzn77V[验证 CPU 调度算法与 CFS 日志、指标或测试]\nNevzn77R --> Nevzn77V",
-      "items": [
-        "每个可运行任务独立累加 vruntime（实际运行时间 × 1024 / 权重）",
-        "权重由 nice 决定，每 ±1 nice 权重近似 × 1.25，vruntime 增速反向变化",
-        "所有可运行任务按 vruntime 排进红黑树，key 即 vruntime",
-        "调度器选 vruntime 最小的最左节点 O(log n) 运行",
-        "任务运行后 vruntime 增大从而退出最左，让位给更饥饿的任务",
-        "6.6+ 默认 EEVDF：在 vruntime 之上叠加 lag 与 virtual deadline 优化延迟敏感任务"
+      "type": "compareTable",
+      "title": "fair class 与实时调度类的分域边界",
+      "columns": [
+        "维度",
+        "SCHED_NORMAL/BATCH（CFS/EEVDF）",
+        "SCHED_FIFO",
+        "SCHED_RR",
+        "SCHED_DEADLINE"
       ],
-      "format": "mermaid",
-      "fallback": "CPU 调度算法与 CFS 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。",
-      "caption": "CPU 调度算法与 CFS 图中的分支用于区分本题正常机制、异常边界和工程验证路径。",
-      "sources": [
-        {
-          "kind": "mermaid",
-          "content": "flowchart TD\nNevzn77S[CPU 调度算法与 CFS 触发入口] --> Nevzn77M[核心对象或状态: 操作系统]\nNevzn77M --> Nevzn77C{CPU 调度算法与 CFS 是否走正常路径}\nNevzn77C -->|正常| Nevzn77N[执行 CPU 调度算法与 CFS 主流程]\nNevzn77C -->|异常| Nevzn77F[处理 CPU 调度算法与 CFS 边界风险]\nNevzn77N --> Nevzn77O[输出结果或交给下一组件]\nNevzn77F --> Nevzn77R[按 CPU 调度算法与 CFS 语义降级/重试/报错]\nNevzn77O --> Nevzn77V[验证 CPU 调度算法与 CFS 日志、指标或测试]\nNevzn77R --> Nevzn77V"
-        },
-        {
-          "kind": "text",
-          "content": "CPU 调度算法与 CFS 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。"
-        }
+      "rows": [
+        [
+          "调度类优先级",
+          "低，低于实时类",
+          "高",
+          "高",
+          "最高（内核中 DL class 优先级最高）"
+        ],
+        [
+          "选任务机制",
+          "vruntime + 红黑树（EEVDF: +lag/deadline）",
+          "按实时优先级，同一优先级 FIFO",
+          "按实时优先级，同一优先级 RR 时间片",
+          "按 absolute deadline 最近"
+        ],
+        [
+          "是否有时间片",
+          "动态按权重分配，无固定配额",
+          "无时间片，一直运行到主动让出或被更高优先级抢占",
+          "有固定时间片，轮转",
+          "每个周期内有 runtime 预算"
+        ],
+        [
+          "典型用途",
+          "普通进程、批处理",
+          "低延迟音频、事件处理",
+          "周期性控制任务",
+          "硬实时截止期限保证"
+        ],
+        [
+          "nice/优先级范围",
+          "nice -20~19",
+          "实时优先级 1~99",
+          "实时优先级 1~99",
+          "不按优先级，按 deadline"
+        ],
+        [
+          "饥饿行为",
+          "不会饥饿，vruntime 自动均衡",
+          "低实时优先级可能被高优先级长期饿死",
+          "同 SCHED_FIFO",
+          "按周期调度，有准入控制"
+        ]
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "标准面试回答",
-      "content": "调度本质是在公平、响应、吞吐、避免饥饿之间做权衡，不同算法反映不同的取舍点。\n\n- FCFS 简单但长任务会拖住短任务（护航效应 convoy effect），平均等待时间最差。\n- SJF 平均等待最优，但要预知作业长度，长任务长期拿不到 CPU 会饿死。\n- RR 用时间片轮转保响应，但切换开销与时间片大小强耦合：过大退化成 FCFS，过小则上下文切换吃光 CPU。\n- MLFQ 用多队列 + 动态优先级，是早期 Unix/Windows 的折中方案。\n- Linux 默认的 CFS 走完全公平路线：每个可运行任务维护 vruntime（实际运行时间按权重归一化累加，权重越高涨得越慢），所有可运行任务按 vruntime 排进红黑树，调度器永远挑 vruntime 最小的最左节点运行，O(log n) 选出，运行后 vruntime 增大很快让位，长期看每个任务按权重比例分到 CPU，这就是「完全公平」的来源。\n- nice 范围 -20 到 19，映射到内核 `prio_to_weight[40]` 表，比如 nice 0 = 1024、nice +5 = 335、nice -5 = 3121、nice +19 = 15、nice -20 = 88761，相邻 nice 约 1.25 倍权重比。普通用户只能把 nice 调高，要降需要 `CAP_SYS_NICE`。\n- Linux 6.6 起默认换成 EEVDF，在 CFS 公平基础上用 `virtual deadline` 和 `lag` 把延迟敏感任务往前推。\n\n边界与追问应对：\n\n- CFS 是「公平」不是「实时」，硬实时要走 `SCHED_FIFO` / `SCHED_RR` / `SCHED_DEADLINE` 这些分域调度，CFS 任务即使 nice -20 也压不过 FIFO。\n- vruntime 只保证长期比例公平，单次响应还受 `kernel.sched_min_granularity_ns`、`wakeup_granularity_ns` 等调度粒度参数影响。\n- nice 不是绝对优先级，是权重比例，nice +19 跟 nice -20 理论权重差 88761/15 ≈ 5917 倍，但都跑不出 `SCHED_FIFO` 的优先级域。\n- 排查「CPU 不忙但 P99 飙高」要盯 `/proc/loadavg` 的 `r` 列、`vmstat 1` 的 `r` 与 `b`、`pidstat -w` 的 voluntary/involuntary cswch；自愿切换暴涨多半是锁等待或 IO 模型问题，非自愿切换暴涨才指向调度域，必要时用 `perf sched latency` 看唤醒到执行的等待时间直方图。",
+      "content": "CPU 调度的核心是在公平、响应、吞吐和避免饥饿之间权衡——FCFS 简单但长任务拖住短任务（护航效应），SJF 平均等待最优但长任务可能饥饿且需要估计运行时间，RR 用时间片保响应但片长两难，MLFQ 用多队列+动态优先级+aging 在交互和吞吐之间折中。\n\nLinux fair class 的 CFS 路线是完全公平：每个可运行任务维护 vruntime（实际运行时间按权重归一化累加，`vruntime += delta_exec * NICE_0_LOAD / weight`），所有可运行任务按 vruntime 排进红黑树，调度器选 vruntime 最小的最左节点。高权重任务 vruntime 涨得慢，长期获得更大 CPU 份额。nice -20 到 19 映射到 `prio_to_weight[40]`，相邻 nice 约 1.25 倍权重比（nice 0 = 1024，nice -20 = 88761，nice +19 = 15）。普通用户只能调高 nice，调低需要 `CAP_SYS_NICE`。\n\nLinux 6.6 起 fair scheduler 引入 EEVDF：在 vruntime 基础上维护 lag（理想 CPU 获得量与实际获得量之差）和 virtual deadline。lag 为正说明该任务欠 CPU，是有资格被调度的（eligible）。调度器在 eligible 任务中选 virtual deadline 最小的，优先服务最急迫的任务。EEVDF 减少了对传统 CFS 启发式唤醒抢占规则的依赖，对短任务、交互任务和突发唤醒的延迟更稳定。\n\n几个重要边界：\n- CFS/EEVDF 是 fair class 的公平调度，不是硬实时。硬实时看 `SCHED_FIFO`、`SCHED_RR`、`SCHED_DEADLINE`。\n- nice 影响 fair class 内的相对比例，不跨越调度类边界。nice -20 的 SCHED_NORMAL 仍低于所有实时任务。\n- cgroup v1 的 `cpu.shares` 和 v2 的 `cpu.weight` 复用 CFS 权重思路做组间公平；`cpu.cfs_quota_us` / `cpu.max` 是节流上限（throttling），二者是不同机制。\n- 排查「CPU 不忙但 P99 飙高」时，先看 runnable 数（`/proc/loadavg` 或 `vmstat 1` 的 `r`），再用 `pidstat -w` 区分 voluntary（锁/IO 等待）和 involuntary（被抢占）上下文切换，然后用 `perf sched latency` 看唤醒到执行的等待分布。",
       "followUpQuestions": [
         {
           "question": "CFS 如何用 vruntime 实现公平？",
-          "answer": "每个任务累加 vruntime——实际运行时间按权重归一化，权重高的任务 vruntime 涨得慢。调度器总挑 vruntime 最小的跑（红黑树最左），跑一会儿它 vruntime 变大就不再最小、让位给别人。长期看每个任务获得与权重成正比的 CPU 时间，所以叫完全公平。"
+          "answer": "每个任务累加 vruntime——实际运行时间按权重归一化（`vruntime += delta_exec * NICE_0_LOAD / weight`），高权重任务涨得慢。调度器总挑 vruntime 最小的（红黑树最左）跑，跑一会儿 vruntime 增大后让位给更小的。长期收敛到每个任务按权重比例获得 CPU 时间。"
         },
         {
-          "question": "nice 值是怎么影响调度的？",
-          "answer": "nice 从 -20 到 19，映射成调度权重：nice 越小权重越大。权重越大，单位实际运行时间累加的 vruntime 越少，于是该任务的 vruntime 长期更小、更常被选中，获得更多 CPU 份额。nice 不是绝对优先级而是影响公平分配的比例。"
+          "question": "nice 值是怎么影响调度的？为什么不是绝对优先级？",
+          "answer": "nice 从 -20 到 19 映射成权重（`prio_to_weight[40]`），nice 越小权重越大，vruntime 涨得越慢，长期获得更多 CPU 份额。但它是 fair class 内的比例系数，不是跨调度类的优先级——nice -20 的 SCHED_NORMAL 仍低于任何 SCHED_FIFO/RR 实时任务。调度器先按调度类选类，类内再用各自机制。"
         },
         {
-          "question": "为什么 Linux 6.6 改用 EEVDF？CFS 不够用吗？",
-          "answer": "CFS 追求长期比例公平，但单次调度粒度受 `sched_min_granularity_ns` / `sched_wakeup_granularity_ns` 影响，突发唤醒（如网络包到达）可能等不到唤醒阈值，导致 P99 抖动。EEVDF 在 vruntime 之上为每个任务计算 `virtual deadline = vruntime + slice`，并维护 `lag`（理想获得 CPU 与实际获得 CPU 的差），lag 越深越容易被抢回。普通场景下 EEVDF 行为接近 CFS，但延迟敏感的突发负载 P99 明显更稳。"
+          "question": "Linux 6.6 为什么引入 EEVDF？CFS 有什么不够的地方？",
+          "answer": "CFS 的唤醒抢占依赖启发式规则（被唤醒者的 vruntime 小于当前运行者某个阈值就抢占），阈值不好调。EEVDF 在 vruntime 上维护 lag 和 virtual deadline：lag 为正的任务 eligible，选 deadline 最早的。这把唤醒决策从启发式变成基于公平偏差的显式计算，短任务和突发唤醒的延迟更稳定，普通负载仍服务于权重公平。"
+        },
+        {
+          "question": "cgroup 的 cpu.shares/cpu.weight 和 cpu.cfs_quota_us/cpu.max 有什么区别？",
+          "answer": "shares/weight 是组间的权重比例分配，决定这个 cgroup 相对于其他 cgroup 能获得多少 CPU——机制上复用 CFS 权重。quota/max 是硬上限，组在配额周期内用完配额就被 throttling（暂停到下一周期）。前者是比例公平，后者是节流保护。排查时区分「被调度器饿到」和「被配额限流」，看 nr_throttled 和 throttled_time。"
         }
       ]
     },
@@ -170,15 +225,16 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "调度四大目标（公平/响应/吞吐/避免饥饿）的相互冲突与权衡",
-        "FCFS/SJF/RR/MLFQ 各算法的响应/吞吐/公平/复杂度取舍与典型场景",
-        "CFS 用 vruntime + 红黑树选最左节点实现比例公平（weighted fair share）",
-        "nice → prio_to_weight[40] 映射（nice 0=1024, +5=335, -5=3121, +19=15, -20=88761）与 1.25 倍权重比",
-        "CFS 调度粒度 sysctl_sched_latency/min_granularity/wakeup_granularity 对延迟与切换开销的取舍",
-        "Linux 6.6 EEVDF 用 virtual deadline + lag 在 vruntime 之上优化延迟敏感任务",
-        "CFS（SCHED_NORMAL/BATCH/IDLE）与 SCHED_FIFO/RR/DEADLINE 的分域边界，硬实时/软实时选择",
-        "cgroup v1 cpu.shares / v2 cpu.weight 复用 CFS 权重思路，cpu.cfs_quota_us / cpu.max 是节流上限，二者区别",
-        "线上排查调度的关键工具与指标：loadavg 的 r 列、vmstat 1、pidstat -w 区分 voluntary/involuntary cswch、/proc/sched_debug、perf sched latency"
+        "调度四大目标（公平/响应/吞吐/避免饥饿）的冲突关系与各算法如何权衡",
+        "FCFS 护航效应、SJF 长任务饥饿、RR 时间片两难、MLFQ 动态调整的核心思路",
+        "CFS 用 vruntime + 红黑树选最左节点实现按权重比例公平（weighted fair share）",
+        "vruntime 公式 `vruntime += delta_exec * NICE_0_LOAD / weight` 中权重的作用",
+        "nice 到 prio_to_weight[40] 的映射（nice 0=1024, -20=88761, +19=15）与 1.25 倍权重比",
+        "CFS 调度粒度参数对延迟与切换开销的取舍方向（不背死具体默认值）",
+        "Linux 6.6 引入 EEVDF：lag 衡量公平偏差、virtual deadline 决定调度优先、eligible 条件过滤",
+        "CFS/EEVDF 属于 fair class，SCHED_FIFO/RR/DEADLINE 是实时类，nice 不跨调度类边界",
+        "cgroup cpu.shares/cpu.weight 是权重比例，cpu.cfs_quota_us/cpu.max 是节流上限，排查 throttling 看 nr_throttled",
+        "线上排查调度延迟：loadavg runnable、vmstat r/b、pidstat -w voluntary/involuntary cswch、perf sched latency"
       ]
     }
   ],
@@ -192,21 +248,35 @@
     },
     {
       "id": "os.process-thread.topic-cpu-scheduling.recall.2",
-      "prompt": "对比 FCFS、SJF、RR、多级反馈队列的优缺点和适用场景。",
+      "prompt": "对比 FCFS、SJF、RR、MLFQ 各自的权衡取舍和适用场景。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "os.process-thread.topic-cpu-scheduling.recall.3",
-      "prompt": "CPU 调度算法与 CFS 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "CFS、EEVDF、SCHED_FIFO/RR/DEADLINE 分别解决什么问题？为什么 nice -20 的普通进程也不等价于实时任务？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
-      "id": "os.process-thread.topic-cpu-scheduling.recall.production-scheduling",
-      "prompt": "生产环境 CPU 使用率不高但接口延迟升高时，你会如何结合运行队列、上下文切换和线程状态判断是不是调度问题？",
+      "id": "os.process-thread.topic-cpu-scheduling.recall.4",
+      "prompt": "生产环境 CPU 使用率不高但接口 P99 延迟升高，你会如何结合运行队列、上下文切换和线程状态判断是不是调度问题？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "os.process-thread.topic-cpu-scheduling.recall.5",
+      "prompt": "EEVDF 中的 lag 和 virtual deadline 分别是什么？它们如何影响任务被选中的顺序？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "os.process-thread.topic-cpu-scheduling.recall.6",
+      "prompt": "cgroup 的 cpu.weight 和 cpu.max 分别是什么机制？排查一个容器内进程 runnable 时间长但 CPU 利用率不高时，应该先看什么指标？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
@@ -214,20 +284,23 @@
   ],
   "rubric": {
     "mustHave": [
-      "调度目标的折中",
-      "vruntime + 红黑树选最小",
-      "权重/nice 影响 vruntime",
-      "CFS 完全公平思想"
+      "能说清调度四大目标的冲突关系及各经典算法的权衡",
+      "能准确描述 CFS 用 vruntime（按权重归一化累加）+ 红黑树选最左节点实现比例公平",
+      "能解释 nice 到权重的映射关系以及为什么高权重任务获得更多 CPU",
+      "能区分 CFS/EEVDF（fair class）与 SCHED_FIFO/RR/DEADLINE（实时类）的分域边界",
+      "能解释 EEVDF 的 lag 和 virtual deadline 如何改善唤醒延迟"
     ],
     "goodToHave": [
-      "FCFS/SJF/RR/MLFQ 对比",
-      "EEVDF(6.6+)",
-      "实时调度类区别"
+      "能对比 FCFS/SJF/RR/MLFQ 的优缺点和适用场景",
+      "能说明 cgroup cpu.shares/cpu.weight 与 cpu.cfs_quota_us/cpu.max 的区别与排查方法",
+      "能结合 runnable 数、上下文切换类型和 perf sched latency 排查调度延迟",
+      "能说明 CFS 调度粒度参数的取舍方向"
     ],
     "commonMistakes": [
-      "以为 CFS 用固定时间片配额",
-      "把 nice 当绝对优先级",
-      "认为 CFS 是实时调度"
+      "以为 CFS 用固定时间片配额，不理解 vruntime 是按权重动态归一化的",
+      "把 nice 当绝对优先级，不知道 nice 不跨越调度类边界",
+      "认为 CFS 是实时调度，不理解 SCHED_FIFO/RR/DEADLINE 的更高调度类优先级",
+      "混淆 cgroup 的权重分配（比例公平）与配额限制（节流 throttling）"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -236,8 +309,8 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "staging",
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察调度目标与经典算法，重点是 CFS 的 vruntime/红黑树公平机制与 nice 权重。"
+  "interviewerFocus": "考察调度目标与经典算法的工程取舍，重点是 CFS 的 vruntime/红黑树/权重比例公平机制、EEVDF 的 lag 与 virtual deadline、fair class 与实时调度类的边界，以及线上调度延迟的排查方法。"
 }

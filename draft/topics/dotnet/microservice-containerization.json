@@ -4,7 +4,7 @@
   "category": "microservice-dotnet",
   "group": "microservice-dotnet",
   "title": ".NET 容器化与部署",
-  "summary": "聚焦 .NET 服务容器化：多阶段 Dockerfile、镜像层缓存、健康检查、K8s 部署，以及 NativeAOT/Chiseled 镜像对体积和启动速度的影响。",
+  "summary": ".NET 容器化的核心是把多阶段构建、镜像层缓存、健康检查、配置注入和 K8s 部署串成一条可维护的链路；NativeAOT 与 Chiseled 镜像能大幅压小体积和加快冷启动，但要先验证反射、序列化和第三方库兼容性。",
   "tags": [
     ".NET",
     "容器化",
@@ -13,20 +13,35 @@
     "NativeAOT"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 40,
+  "estimatedMinutes": 33,
   "order": 40,
   "recommendWeight": 75,
   "status": "draft",
   "learningCards": [
     {
       "type": "explain",
-      "title": ".NET 容器化与部署：Dockerfile、Docker Compose",
-      "content": "容器化和编排是现代微服务部署的标准方式，Docker 和 Kubernetes 是主流技术。\n## Dockerfile\n\n**多阶段构建**：\n```dockerfile\n# 构建阶段\nFROM mcr.microsoft.com/dotnet/sdk:8.0 AS build\nWORKDIR /src\nCOPY [\"MyApp.csproj\", \".\"]\nRUN dotnet restore\nCOPY . .\nRUN dotnet publish -c Release -o /app/publish\n\n# 运行阶段\nFROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime\nWORKDIR /app\nCOPY --from=build /app/publish .\nEXPOSE 80\nEXPOSE 443\nENTRYPOINT [\"dotnet\", \"MyApp.dll\"]\n```\n\n**优化技巧**：\n```dockerfile\n# 使用更小的基础镜像\nFROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine AS runtime\n\n# 分层缓存\nCOPY [\"MyApp.csproj\", \".\"]\nRUN dotnet restore\nCOPY . .  # 这样 csproj 变化时才会重新 restore\n\n# 使用 .dockerignore\n# bin/\n# obj/\n# .git/\n```\n\n## Docker Compose\n\n```yaml\nversion: '3.8'\n\nservices:\n  api:\n    build:\n      context: .\n      dockerfile: Dockerfile\n    ports:\n      - \"5000:80\"\n    environment:\n      - ASPNETCORE_ENVIRONMENT=Production\n      - ConnectionStrings__DefaultConnection=Server=db;Database=MyDb;User=sa;Password=YourPassword123\n    depends_on:\n      - db\n      - redis\n\n  db:\n    image: mcr.microsoft.com/mssql/server:2022-latest\n    environment:\n      - ACCEPT_EULA=Y\n      - SA_PASSWORD=YourPassword123\n    ports:\n      - \"1433:1433\"\n    volumes:\n      - sqldata:/var/opt/mssql\n\n  redis:\n    image: redis:alpine\n    ports:\n      - \"6379:6379\"\n\nvolumes:\n  sqldata:\n```\n\n## Kubernetes 基础\n\n**Deployment**：\n```yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: myapp\nspec:\n  replicas: 3\n  selector:\n    matchLabels:\n      app: myapp\n  template:\n    metadata:\n      labels:\n        app: myapp\n    spec:\n      containers:\n      - name: myapp\n        image: myregistry.azurecr.io/myapp:latest\n        ports:\n        - containerPort: 80\n        env:\n        - name: ASPNETCORE_ENVIRONMENT\n          value: Production\n        resources:\n          requests:\n            memory: \"128Mi\"\n            cpu: \"250m\"\n          limits:\n            memory: \"256Mi\"\n            cpu: \"500m\"\n        livenessProbe:\n          httpGet:\n            path: /health\n            port: 80\n          initialDelaySeconds: 10\n          periodSeconds: 10\n        readinessProbe:\n          httpGet:\n            path: /health/ready\n            port: 80\n          initialDelaySeconds: 5\n          periodSeconds: 5\n```\n\n**Service**：\n```yaml\napiVersion: v1\nkind: Service\nmetadata:\n  name: myapp\nspec:\n  selector:\n    app: myapp\n  ports:\n  - port: 80\n    targetPort: 80\n  type: ClusterIP\n```\n\n**Ingress**：\n```yaml\napiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: myapp-ingress\n  annotations:\n    kubernetes.io/ingress.class: nginx\n    cert-manager.io/cluster-issuer: letsencrypt-prod\nspec:\n  tls:\n  - hosts:\n    - myapp.example.com\n    secretName: myapp-tls\n  rules:\n  - host: myapp.example.com\n    http:\n      paths:\n      - path: /\n        pathType: Prefix\n        backend:\n          service:\n            name: myapp\n            port:\n              number: 80\n```"
+      "title": "多阶段 Dockerfile 的分层与缓存",
+      "content": ".NET Dockerfile 的核心原则是「构建产物独立、镜像层可缓存、运行时镜像最小」。多阶段构建把 SDK 镜像（几百 MB）和运行时镜像（几十 MB）分开：构建阶段拷贝 csproj → restore → 拷贝全部源码 → publish；运行阶段只拷贝 publish 产物。\n\n分层缓存的关键是把变化频率低的层放在前面。csproj 变化频率远低于 .cs 文件，所以先 COPY csproj 做 restore，再 COPY 源码做 build。csproj 没变时 restore 层命中缓存，避免每次重新拉 NuGet 包。.dockerignore 排除 bin/、obj/、.git/ 等目录，进一步减小 context 体积和构建时间。\n\n基础镜像选择影响体积和安全面。aspnet:8.0 约 220 MB，aspnet:8.0-alpine 约 80 MB，Chiseled 镜像（8.0-noble-chiseled）去掉 shell、包管理器和 root 用户，约 20-30 MB。alpine 需要验证 glibc 兼容性（部分 NativeInterop 或第三方库依赖 glibc），Chiseled 则需要验证是否需要安装 ICU 或时区数据。"
     },
     {
       "type": "explain",
-      "title": ".NET 容器化与部署：CI/CD 流水线、Azure DevOps",
-      "content": "## CI/CD 流水线\n\n**GitHub Actions**：\n```yaml\nname: Build and Deploy\n\non:\n  push:\n    branches: [main]\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n    - uses: actions/checkout@v3\n\n    - name: Setup .NET\n      uses: actions/setup-dotnet@v3\n      with:\n        dotnet-version: '8.0.x'\n\n    - name: Restore dependencies\n      run: dotnet restore\n\n    - name: Build\n      run: dotnet build --no-restore\n\n    - name: Test\n      run: dotnet test --no-build --verbosity normal\n\n    - name: Login to ACR\n      uses: azure/docker-login@v1\n      with:\n        login-server: myregistry.azurecr.io\n        username: ${{ secrets.ACR_USERNAME }}\n        password: ${{ secrets.ACR_PASSWORD }}\n\n    - name: Build and push Docker image\n      run: |\n        docker build -t myregistry.azurecr.io/myapp:${{ github.sha }} .\n        docker push myregistry.azurecr.io/myapp:${{ github.sha }}\n\n  deploy:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n    - name: Deploy to Kubernetes\n      uses: azure/k8s-deploy@v1\n      with:\n        manifests: |\n          k8s/deployment.yaml\n          k8s/service.yaml\n        images: |\n          myregistry.azurecr.io/myapp:${{ github.sha }}\n```\n\n## Azure DevOps\n\n```yaml\ntrigger:\n- main\n\npool:\n  vmImage: 'ubuntu-latest'\n\nstages:\n- stage: Build\n  jobs:\n  - job: BuildJob\n    steps:\n    - task: UseDotNet@2\n      inputs:\n        version: '8.0.x'\n\n    - script: dotnet build --configuration Release\n      displayName: 'Build'\n\n    - task: Docker@2\n      inputs:\n        containerRegistry: 'MyACR'\n        repository: 'myapp'\n        command: 'buildAndPush'\n        Dockerfile: '**/Dockerfile'\n        tags: |\n          $(Build.BuildId)\n          latest\n\n- stage: Deploy\n  jobs:\n  - deployment: DeployToK8s\n    environment: 'production'\n    strategy:\n      runOnce:\n        deploy:\n          steps:\n          - task: KubernetesManifest@0\n            inputs:\n              action: 'deploy'\n              kubernetesServiceConnection: 'MyK8s'\n              manifests: 'k8s/*.yaml'\n              containers: 'myregistry.azurecr.io/myapp:$(Build.BuildId)'\n```\n\n## 环境变量管理\n\n```csharp\n// appsettings.json\n{\n  \"ConnectionStrings\": {\n    \"DefaultConnection\": \"Server=localhost;Database=MyDb\"\n  },\n  \"Redis\": {\n    \"Configuration\": \"localhost:6379\"\n  }\n}\n\n// 环境变量覆盖\n// ConnectionStrings__DefaultConnection=Server=db;Database=MyDb\n// Redis__Configuration=redis:6379\n```\n\n## 健康检查\n\n```csharp\nbuilder.Services.AddHealthChecks()\n    .AddSqlServer(connectionString)\n    .AddRedis(redisConnection)\n    .AddCheck(\"self\", () => HealthCheckResult.Healthy());\n\napp.MapHealthChecks(\"/health\");\napp.MapHealthChecks(\"/health/ready\", new HealthCheckOptions\n{\n    Predicate = check => check.Tags.Contains(\"ready\")\n});\napp.MapHealthChecks(\"/health/live\", new HealthCheckOptions\n{\n    Predicate = _ => false\n});\n```\n\n理解时可以优先抓住「掌握 Dockerfile 的编写；了解 Docker Compose 的配置；理解 Kubernetes 核心概念」。容器化的关键是镜像分层、最小基础镜像和健康检查，而不是把虚拟机那套照搬进容器"
+      "title": ".NET 容器中的配置注入与环境变量",
+      "content": "ASP.NET Core 的配置系统支持多层覆盖：appsettings.json → appsettings.{Environment}.json → 环境变量 → 命令行参数。容器化场景下，环境变量是最常用的注入方式，因为 K8s 的 ConfigMap 和 Secret 都映射为环境变量或挂载文件。\n\n环境变量的命名规则是把配置路径中的层级分隔符替换为双下划线：ConnectionStrings:DefaultConnection 变成 ConnectionStrings__DefaultConnection，Redis:Configuration 变成 Redis__Configuration。这种方式不需要修改代码，只需要在 K8s Deployment 的 env 或 envFrom 字段里配置。\n\n敏感信息（数据库密码、API Key）不应写在 Dockerfile 或 ConfigMap 中，应使用 Secret 挂载。K8s Secret 默认 base64 编码（不是加密），生产环境应配合 Vault、Azure Key Vault 或 AWS Secrets Manager 做加密存储和自动轮换。开发环境可以用 dotnet user-secrets 或 .env 文件（加入 .gitignore）。"
+    },
+    {
+      "type": "explain",
+      "title": "K8s 健康检查与优雅停机",
+      "content": "K8s 的三种探针各有用途。livenessProbe 检查进程是否存活（如死锁检测），失败会重启 Pod；readinessProbe 检查是否准备好接收流量（如依赖服务是否就绪），失败会从 Service Endpoint 移除但不重启；startupProbe 用于启动慢的应用，在它成功之前 livenessProbe 和 readinessProbe 不会生效，避免启动过程中被误杀。\n\n.NET 应用推荐配置 ASP.NET Core Health Checks（Microsoft.Extensions.Diagnostics.HealthChecks），为数据库、Redis、消息队列等依赖分别注册检查项。/health/live 对应 livenessProbe（只检查进程是否响应），/health/ready 对应 readinessProbe（检查所有依赖是否就绪）。K8s 探针的 initialDelaySeconds 和 periodSeconds 要根据应用启动时间设置，.NET 应用冷启动通常需要 5-15 秒（NativeAOT 更快）。\n\n优雅停机是容易忽略的点。K8s 发送 SIGTERM 后等待 terminationGracePeriodSeconds（默认 30 秒）再 SIGKILL。ASP.NET Core 会触发 IHostApplicationLifetime.ApplicationStopping，此时应完成正在处理的请求、刷新日志、关闭数据库连接。如果应用有消息消费者，应在收到 SIGTERM 后停止消费，等待在途消息处理完成。"
+    },
+    {
+      "type": "explain",
+      "title": "NativeAOT、Chiseled 镜像与体积优化",
+      "content": "NativeAOT（.NET 7+ GA）在 publish 时把 IL 编译为目标平台的本机代码，去掉 JIT 和大部分运行时。启动时间从几百毫秒降到几十毫秒，内存占用下降 30-50%，镜像体积减小（不需要 dotnet runtime）。但 NativeAOT 不支持动态加载程序集、部分反射特性（Type.MakeGenericType 等有限支持）、Expression.Compile 和某些序列化库。第三方库需要 AOT 兼容标签，EF Core 从 8.0 开始支持 AOT 但需要源生成器。\n\nChiseled 镜像（Ubuntu 的精简变体）去掉 shell、包管理器、root 用户，攻击面大幅减小，但调试时不能 docker exec 进入容器。需要 ICU 或时区数据时，用 chiseled-extra 包安装 AOT 编译的 ICU。Self-Contained 模式打包完整 runtime，镜像比 Framework-Dependent 大 80-100 MB，但不依赖宿主机安装 .NET。\n\n实际取舍：内部服务或函数式部署优先考虑 NativeAOT + Chiseled；需要动态插件或复杂反射的服务用 Framework-Dependent + alpine；有合规要求（无 root、无 shell）时 Chiseled 是现成方案。不管哪种方式，多阶段构建和 .dockerignore 都是基础。"
+    },
+    {
+      "type": "explain",
+      "title": "CI/CD 流水线中的构建、扫描与部署",
+      "content": "CI/CD 流水线的核心阶段是：代码检出 → 构建/测试 → 镜像构建/推送 → 部署到 K8s。GitHub Actions 和 Azure DevOps 是 .NET 生态最常用的 CI/CD 工具，都支持 YAML 配置和矩阵构建。\n\n镜像构建环节应该在 CI 中完成（而不是在 K8s 节点上），推送到 ACR/ECR/Docker Hub 等镜像仓库。镜像标签建议用 Git SHA 或 BuildId 而不是 latest，避免部署不可追溯。构建后应做镜像扫描（Trivy、Snyk、ACR 内置扫描）检查已知漏洞，生成 SBOM 用于审计。\n\n部署环节可以选择直接 apply manifest、使用 Helm Chart 或 Kustomize。滚动更新（RollingUpdate）是默认策略，maxSurge 和 maxUnavailable 控制更新速度。如果新版本启动慢，应配合 startupProbe 避免流量切到未就绪的 Pod。失败时 kubectl rollout undo 回滚到上一个版本，Deployment 会保留历史 ReplicaSet。"
     },
     {
       "type": "diagram",
@@ -54,43 +69,68 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | Docker Compose | Kubernetes |\n| --- | --- | --- |\n| 适用场景 | 本地开发、测试 | 生产环境 |\n| 规模 | 单机 | 多机集群 |\n| 复杂度 | 低 | 高 |\n| 自愈能力 | 无 | 有（自动重启、扩缩容） |\n| 服务发现 | 有限 | 完整 |\n| 存储 | 本地卷 | 持久卷、存储类 |"
+      "title": "运行时镜像变体对比",
+      "content": "| 变体 | 典型体积 | 启动时间 | shell | root | 适用场景 |\n| --- | --- | --- | --- | --- | --- |\n| aspnet:8.0 | ~220 MB | 慢 | 有 | 有 | 开发调试、需要 ICU 完整支持 |\n| aspnet:8.0-alpine | ~80 MB | 中 | 有 | 有 | 大多数生产场景，需验证 glibc 兼容 |\n| aspnet:8.0-noble-chiseled | ~20-30 MB | 中 | 无 | 无 | 合规要求、减少攻击面 |\n| NativeAOT + distroless/scratch | ~10-20 MB | 最快（几十 ms） | 无 | 无 | 冷启动敏感、无动态代码需求 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | 存活探针 | 就绪探针 |\n| --- | --- | --- |\n| 目的 | 检查应用是否运行 | 检查应用是否准备好 |\n| 失败后果 | 重启 Pod | 从 Service 移除 |\n| 适用场景 | 应用卡死、死锁 | 启动慢、依赖未就绪 |\n| 配置 | livenessProbe | readinessProbe |\n| 初始延迟 | 较长 | 较短 |"
+      "title": "K8s 三种探针对比",
+      "content": "| 探针 | 检查什么 | 失败后果 | 典型配置 | 常见误用 |\n| --- | --- | --- | --- | --- |\n| startupProbe | 应用是否启动完成 | 重启 Pod | initialDelay=0, period=5s, failureThreshold=30 | 不配 startupProbe 导致慢启动被 liveness 误杀 |\n| livenessProbe | 进程是否存活/是否死锁 | 重启 Pod | period=10-30s, failureThreshold=3 | 检查依赖服务，导致依赖抖动时频繁重启 |\n| readinessProbe | 是否准备好接收流量 | 从 Endpoint 移除 | period=5-10s, failureThreshold=3 | 不配 readinessProbe 导致流量打到启动中的 Pod |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | GitHub Actions | Azure DevOps |\n| --- | --- | --- |\n| 托管方 | GitHub | 微软 |\n| 配置方式 | YAML | YAML 或经典编辑器 |\n| 集成 | GitHub 深度集成 | Azure 深度集成 |\n| 价格 | 免费额度 + 付费（GitHub Actions） | 免费额度 + 付费（Azure DevOps） |\n| 适用场景 | GitHub 项目 | 企业项目 |"
+      "title": "Docker Compose vs Kubernetes",
+      "content": "| 维度 | Docker Compose | Kubernetes |\n| --- | --- | --- |\n| 适用场景 | 本地开发、测试、小团队 | 生产环境、多团队、多环境 |\n| 部署规模 | 单机 | 多节点集群 |\n| 自愈能力 | 无 | 自动重启、扩缩容、滚动更新 |\n| 配置管理 | .env 文件、compose 内联 | ConfigMap、Secret、Helm values |\n| 服务发现 | 容器名/网络别名 | Service DNS（ClusterIP） |\n| 存储 | 本地卷（volumes） | PV/PVC、StorageClass |"
+    },
+    {
+      "type": "compareTable",
+      "title": "GitHub Actions vs Azure DevOps",
+      "content": "| 维度 | GitHub Actions | Azure DevOps |\n| --- | --- | --- |\n| 集成优势 | GitHub 原生、社区 Action 丰富 | Azure 深度集成（ACR、AKS、Environments） |\n| 配置方式 | workflow YAML（.github/workflows/） | pipeline YAML 或经典编辑器 |\n| 矩阵构建 | strategy.matrix | matrix + stages |\n| 部署审批 | 环境 protection rules（GitHub） | Environments + Approvals |\n| 自托管 Runner | 支持（self-hosted） | 支持（自托管代理） |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Threading.Tasks;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Diagnostics.HealthChecks;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Diagnostics.HealthChecks;\n\nnamespace ContainerizationDemo\n{\n    // Dockerfile 示例\n    /*\n    # 多阶段构建\n    FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build\n    WORKDIR /src\n    COPY [\"MyApp.csproj\", \".\"]\n    RUN dotnet restore\n    COPY . .\n    RUN dotnet publish -c Release -o /app/publish\n\n    FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine AS runtime\n    WORKDIR /app\n    COPY --from=build /app/publish .\n    EXPOSE 80\n    ENTRYPOINT [\"dotnet\", \"MyApp.dll\"]\n    */\n\n    // Docker Compose 示例\n    /*\n    version: '3.8'\n    services:\n      api:\n        build:\n          context: .\n          dockerfile: Dockerfile\n        ports:\n          - \"5000:80\"\n        environment:\n          - ASPNETCORE_ENVIRONMENT=Production\n          - ConnectionStrings__DefaultConnection=Server=db;Database=MyDb;User=sa;Password=YourPassword123\n        depends_on:\n          - db\n          - redis\n\n      db:\n        image: mcr.microsoft.com/mssql/server:2022-latest\n        environment:\n          - ACCEPT_EULA=Y\n          - SA_PASSWORD=YourPassword123\n        volumes:\n          - sqldata:/var/opt/mssql\n\n      redis:\n        image: redis:alpine\n\n    volumes:\n      sqldata:\n    */\n\n    // Kubernetes Deployment 示例\n    /*\n    apiVersion: apps/v1\n    kind: Deployment\n    metadata:\n      name: myapp\n    spec:\n      replicas: 3\n      selector:\n        matchLabels:\n          app: myapp\n      template:\n        metadata:\n          labels:\n            app: myapp\n        spec:\n          containers:\n          - name: myapp\n            image: myregistry.azurecr.io/myapp:latest\n            ports:\n            - containerPort: 80\n            resources:\n              requests:\n                memory: \"128Mi\"\n                cpu: \"250m\"\n              limits:\n                memory: \"256Mi\"\n                cpu: \"500m\"\n            livenessProbe:\n              httpGet:\n                path: /health\n                port: 80\n              initialDelaySeconds: 10\n              periodSeconds: 10\n            readinessProbe:\n              httpGet:\n                path: /health/ready\n                port: 80\n              initialDelaySeconds: 5\n              periodSeconds: 5\n    */\n\n    // 应用配置\n    public static class AppConfiguration\n    {\n        public static WebApplication CreateApp(string[] args)\n        {\n            var builder = WebApplication.CreateBuilder(args);\n\n            // 配置服务\n            builder.Services.AddHealthChecks()\n                .AddCheck(\"self\", () => HealthCheckResult.Healthy())\n                .AddCheck(\"memory\", () =>\n                {\n                    var allocated = GC.GetTotalMemory(false);\n                    var threshold = 1024L * 1024L * 512L; // 512MB\n                    return allocated < threshold\n                        ? HealthCheckResult.Healthy()\n                        : HealthCheckResult.Degraded($\"内存使用: {allocated / 1024 / 1024}MB\");\n                });\n\n            var app = builder.Build();\n\n            // 配置中间件\n            app.UseHealthChecks(\"/health\", new HealthCheckOptions\n            {\n                ResponseWriter = async (context, report) =>\n                {\n                    context.Response.ContentType = \"application/json\";\n                    var result = new\n                    {\n                        status = report.Status.ToString(),\n                        checks = report.Entries.Select(e => new\n                        {\n                            name = e.Key,\n                            status = e.Value.Status.ToString(),\n                            description = e.Value.Description\n                        })\n                    };\n                    await context.Response.WriteAsJsonAsync(result);\n                }\n            });\n\n            app.MapGet(\"/\", () => \"Hello from Container!\");\n\n            return app;\n        }\n    }\n\n    // GitHub Actions 示例\n    /*\n    name: Build and Deploy\n\n    on:\n      push:\n        branches: [main]\n\n    jobs:\n      build:\n        runs-on: ubuntu-latest\n        steps:\n        - uses: actions/checkout@v3\n\n        - name: Setup .NET\n          uses: actions/setup-dotnet@v3\n          with:\n            dotnet-version: '8.0.x'\n\n        - name: Build and Test\n          run: |\n            dotnet restore\n            dotnet build --no-restore\n            dotnet test --no-build\n\n        - name: Login to Docker Hub\n          uses: docker/login-action@v2\n          with:\n            username: ${{ secrets.DOCKER_USERNAME }}\n            password: ${{ secrets.DOCKER_PASSWORD }}\n\n        - name: Build and push\n          uses: docker/build-push-action@v4\n          with:\n            push: true\n            tags: myuser/myapp:${{ github.sha }}\n    */\n\n    // Azure DevOps 示例\n    /*\n    trigger:\n    - main\n\n    pool:\n      vmImage: 'ubuntu-latest'\n\n    steps:\n    - task: UseDotNet@2\n      inputs:\n        version: '8.0.x'\n\n    - script: dotnet build --configuration Release\n      displayName: Build\n\n    - task: Docker@2\n      inputs:\n        containerRegistry: 'MyACR'\n        repository: 'myapp'\n        command: 'buildAndPush'\n        Dockerfile: '**/Dockerfile'\n        tags: |\n          $(Build.BuildId)\n          latest\n    */\n\n    // 环境变量配置示例\n    public class EnvironmentConfig\n    {\n        public string Environment { get; set; }\n        public string ConnectionString { get; set; }\n        public string RedisConnection { get; set; }\n\n        public static EnvironmentConfig Load()\n        {\n            return new EnvironmentConfig\n            {\n                Environment = Environment.GetEnvironmentVariable(\"ASPNETCORE_ENVIRONMENT\") ?? \"Development\",\n                ConnectionString = Environment.GetEnvironmentVariable(\"ConnectionStrings__DefaultConnection\"),\n                RedisConnection = Environment.GetEnvironmentVariable(\"Redis__Configuration\")\n            };\n        }\n    }\n}",
+      "title": "可运行代码：.NET 健康检查与优雅停机",
       "language": "csharp",
+      "content": "using Microsoft.AspNetCore.Diagnostics.HealthChecks;\nusing Microsoft.Extensions.Diagnostics.HealthChecks;\n\nvar builder = WebApplication.CreateBuilder(args);\n\n// 注册健康检查：数据库、Redis、自定义检查\nbuilder.Services.AddHealthChecks()\n    .AddCheck(\"self\", () => HealthCheckResult.Healthy())\n    .AddSqlServer(\n        builder.Configuration.GetConnectionString(\"DefaultConnection\"),\n        name: \"sqlserver\",\n        tags: new[] { \"ready\" })\n    .AddRedis(\n        builder.Configuration[\"Redis:Configuration\"],\n        name: \"redis\",\n        tags: new[] { \"ready\" })\n    .AddCheck(\"memory\", () =>\n    {\n        var allocated = GC.GetTotalMemory(false);\n        var threshold = 512L * 1024L * 1024L;\n        return allocated < threshold\n            ? HealthCheckResult.Healthy($\"{allocated / 1024 / 1024} MB\")\n            : HealthCheckResult.Unhealthy($\"{allocated / 1024 / 1024} MB exceeds {threshold / 1024 / 1024} MB\");\n    });\n\nvar app = builder.Build();\n\n// liveness：只检查进程是否响应，不检查依赖\napp.MapHealthChecks(\"/health/live\", new HealthCheckOptions\n{\n    Predicate = _ => false  // 不执行任何检查，只返回 200\n});\n\n// readiness：检查所有标记为 ready 的依赖\napp.MapHealthChecks(\"/health/ready\", new HealthCheckOptions\n{\n    Predicate = check => check.Tags.Contains(\"ready\"),\n    ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse\n});\n\n// 优雅停机：在 SIGTERM 时完成在途请求\nvar lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();\nlifetime.ApplicationStopping.Register(() =>\n{\n    Console.WriteLine(\"SIGTERM received, stopping gracefully...\");\n    // 停止消息消费者、刷新缓冲区等\n});\n\napp.MapGet(\"/\", () => \"Hello from .NET Container!\");\napp.Run();",
       "highlights": [
         {
-          "line": 115,
-          "note": "「return allocated < threshold」 是「.NET 容器化与部署」示例的输出边界；说明时要交代这个值来自哪一步处理，以及失败或空结果时应该如何降级。"
+          "line": 8,
+          "note": "AddSqlServer 注册 SQL Server 健康检查，标记为 ready，只有 /health/ready 会执行。"
+        },
+        {
+          "line": 21,
+          "note": "内存检查：GC.GetTotalMemory 监控堆内存，超阈值返回 Unhealthy。"
+        },
+        {
+          "line": 31,
+          "note": "liveness 的 Predicate=_=>false 意味着不执行任何检查，只返回 200，避免依赖故障导致重启。"
+        },
+        {
+          "line": 37,
+          "note": "readiness 只检查标签为 ready 的项，数据库或 Redis 不可用时从 Endpoint 移除但不重启。"
+        },
+        {
+          "line": 44,
+          "note": "SIGTERM 触发 ApplicationStopping 回调，用于停消费、刷日志、关连接。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "Docker 是容器化的核心技术，Dockerfile 定义了如何构建镜像。多阶段构建是最佳实践，它将构建和运行分离，减小最终镜像大小。优化技巧包括使用更小的基础镜像（如 alpine）、利用分层缓存、使用 .dockerignore。\nDocker Compose 用于定义和运行多容器应用，适合本地开发和测试。它定义了服务、网络和卷，可以一键启动整个应用栈。\nKubernetes 是容器编排平台，核心概念包括 Deployment（管理 Pod 副本）、Service（提供网络访问）、Ingress（管理外部访问）。Pod 是最小部署单元，Deployment 管理 Pod 的生命周期，Service 提供稳定的网络端点。\nCI/CD 流水线自动化了构建、测试和部署过程。GitHub Actions 和 Azure DevOps 是常用的 CI/CD 工具。流水线通常包括：代码检出、构建、测试、构建 Docker 镜像、推送到镜像仓库、部署到 Kubernetes。\n健康检查是容器化应用的重要部分，包括存活探针（liveness probe）和就绪探针（readiness probe）。存活探针检查应用是否运行，就绪探针检查应用是否准备好接收请求。\n在实际开发中，我会使用多阶段构建优化 Docker 镜像，配置健康检查，使用 CI/CD 自动化部署，合理配置资源限制。",
+      "content": ".NET 容器化与部署的核心是把构建、配置、健康检查和编排串成一条可维护的链路。\n\n**多阶段 Dockerfile**\n- 构建阶段用 SDK 镜像：COPY csproj → restore（缓存层） → COPY 源码 → publish\n- 运行阶段只拷贝 publish 产物，用 aspnet:alpine 或 Chiseled 镜像\n- .dockerignore 排除 bin/obj/.git，减小 context\n- 基础镜像选择：alpine（~80 MB）适合大多数场景，Chiseled（~25 MB）适合合规要求\n\n**配置注入**\n- 环境变量双下划线命名：ConnectionStrings__DefaultConnection\n- K8s 用 ConfigMap 管配置、Secret 管敏感信息\n- Secret 不要写在 Dockerfile 或 ConfigMap 中\n\n**K8s 健康检查**\n- startupProbe：慢启动保护，成功前 liveness/readiness 不生效\n- livenessProbe：检查进程存活，失败重启 Pod（/health/live 不检查依赖）\n- readinessProbe：检查依赖是否就绪，失败从 Endpoint 移除（/health/ready 检查 DB/Redis）\n- 不要在 liveness 中检查依赖，否则依赖抖动会导致 Pod 频繁重启\n\n**优雅停机**\n- K8s 发送 SIGTERM → ASP.NET Core 触发 ApplicationStopping → 完成在途请求 → 刷新日志 → SIGKILL\n- terminationGracePeriodSeconds 默认 30 秒，要大于应用最长请求处理时间\n\n**NativeAOT 与 Chiseled**\n- NativeAOT：启动几十 ms、内存降 30-50%，但不支持动态加载/部分反射/Expression.Compile\n- Chiseled：去掉 shell/root，攻击面小，调试需用 ephemeral container\n- 冷启动敏感或 Serverless 场景优先考虑 AOT\n\n**CI/CD**\n- 镜像标签用 Git SHA 或 BuildId，不用 latest\n- 构建后做镜像扫描（Trivy/Snyk）检查漏洞\n- 部署策略用 RollingUpdate，maxSurge/maxUnavailable 控制速度",
       "followUpQuestions": [
         {
-          "question": "面试官追问「.NET 容器化与部署」时，最应该展开哪条机制链？",
-          "answer": "回答「.NET 容器化与部署」时先抓住 掌握 Dockerfile 的编写，再展开 了解 Docker Compose 的配置。.NET 容器化与部署 不能停在定义层，要把 .NET 版本、GC 指标、输出结果和 P95 延迟 串起来，才像真实 .NET 工程里的判断。"
+          "question": "livenessProbe 和 readinessProbe 应该检查什么？如果把数据库连接放在 liveness 中会怎样？",
+          "answer": "livenessProbe 只检查进程是否存活（如 /health/live 返回 200，不做依赖检查），失败时 K8s 重启 Pod。如果把数据库连接检查放在 liveness 中，数据库短暂不可用时所有 Pod 会同时被重启，造成雪崩。readinessProbe 才检查依赖（DB/Redis/下游），失败时从 Endpoint 移除但不重启，数据库恢复后自动重新加入。"
         },
         {
-          "question": "如果「.NET 容器化与部署」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "可以先确认现象是否落在「了解 Docker Compose 的配置」，再结合日志、指标、输入规模和依赖状态验证。"
+          "question": ".NET 应用在 K8s 中收到 SIGTERM 后会发生什么？怎么保证优雅停机？",
+          "answer": "K8s 先把 Pod 从 Endpoint 移除（停止新流量），然后发送 SIGTERM。ASP.NET Core 触发 IHostApplicationLifetime.ApplicationStopping 事件，此时应停止消息消费者、等待在途请求完成、刷新日志缓冲区。terminationGracePeriodSeconds 到期后 K8s 发送 SIGKILL 强制终止。配置上要确保 grace period 大于应用最长请求处理时间，并在代码中正确响应 CancellationToken。"
+        },
+        {
+          "question": "NativeAOT 镜像和普通 runtime 镜像怎么选？",
+          "answer": "NativeAOT 适合冷启动敏感（Serverless/自动扩缩）、无动态代码需求的场景，启动几十 ms、内存低、镜像小。但它不支持动态加载程序集、部分反射特性、Expression.Compile，第三方库需要 AOT 兼容标签。如果应用依赖 EF Core 需要源生成器，使用 SignalR 需要验证 AOT 支持。大多数内部服务用 Framework-Dependent + alpine 就够了；Serverless 或合规场景用 AOT + Chiseled。"
         }
       ]
     },
@@ -98,54 +138,73 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "Dockerfile 多阶段构建的编写",
-        "Docker Compose 的配置和使用",
-        "Kubernetes 核心概念（Deployment、Service、Ingress）",
-        "健康检查的配置",
-        "CI/CD 流水线的实现",
-        "环境变量和配置管理"
+        "能写多阶段 Dockerfile，说明 csproj 先 restore 的缓存原理",
+        "能解释 alpine vs Chiseled vs NativeAOT 镜像的体积、启动和兼容性取舍",
+        "能配置 K8s 的 startupProbe/livenessProbe/readinessProbe 并说明各自作用",
+        "能说明 SIGTERM → ApplicationStopping → SIGKILL 的优雅停机链路",
+        "能用环境变量注入配置（ConnectionStrings__DefaultConnection 双下划线规则）",
+        "能区分 ConfigMap（配置）和 Secret（敏感信息），知道 Secret 不等于加密",
+        "能在 CI/CD 中用 Git SHA 做镜像标签，用 Trivy 做镜像扫描",
+        "能说明为什么 liveness 不应检查依赖服务"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "dotnet.microservice-dotnet.containerization.recall.1",
-      "prompt": ".NET 服务的多阶段 Dockerfile 如何设计？restore/build/publish 层为什么要分开？",
+      "prompt": ".NET 服务的多阶段 Dockerfile 如何设计？restore/build/publish 层为什么要分开？alpine 和 Chiseled 镜像怎么选？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "dotnet.microservice-dotnet.containerization.recall.2",
-      "prompt": "NativeAOT、Chiseled 镜像和普通 runtime 镜像在启动速度、体积和兼容性上如何取舍？",
+      "prompt": "NativeAOT 镜像和普通 runtime 镜像在启动速度、体积和兼容性上如何取舍？什么场景选 AOT？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "dotnet.microservice-dotnet.containerization.recall.3",
-      "prompt": "K8s 部署 .NET 服务时 readiness/liveness、配置、日志和优雅停机要注意什么？",
+      "prompt": "K8s 部署 .NET 服务时 startupProbe、readinessProbe、livenessProbe 应该怎么配置？如果把数据库检查放在 liveness 中会怎样？",
       "mode": "text",
       "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.microservice-dotnet.containerization.recall.4",
+      "prompt": ".NET 应用在 K8s 中收到 SIGTERM 后会发生什么？怎么保证优雅停机？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.microservice-dotnet.containerization.recall.5",
+      "prompt": "CI/CD 流水线中镜像构建、扫描和部署的最佳实践是什么？为什么不用 latest 标签？",
+      "mode": "text",
+      "expectedMinutes": 3,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "掌握 Dockerfile 的编写",
-      "了解 Docker Compose 的配置",
-      "理解 Kubernetes 核心概念",
-      "知道健康检查的配置"
+      "能写多阶段 Dockerfile 并解释 csproj 先 restore 的分层缓存原理",
+      "能区分 livenessProbe（进程存活，不检查依赖）和 readinessProbe（依赖就绪，从 Endpoint 移除）",
+      "能说明 NativeAOT/Chiseled 镜像的适用场景和兼容性限制",
+      "能解释 SIGTERM → ApplicationStopping → SIGKILL 的优雅停机链路"
     ],
     "goodToHave": [
-      "了解镜像优化技巧",
-      "知道资源限制和配额",
-      "理解滚动更新和回滚"
+      "能配置 startupProbe 并说明它对慢启动应用的保护作用",
+      "能说明环境变量双下划线命名规则和 ConfigMap/Secret 的使用场景",
+      "能在 CI/CD 中配置镜像扫描和 Git SHA 标签",
+      "能解释 Chiseled 镜像去掉 shell/root 对调试和安全的影响"
     ],
     "commonMistakes": [
-      "只列出 容器化、Docker、Kubernetes，但说不出触发条件、状态变化和验证证据",
-      "把「.NET 容器化与部署」的适用场景、失效条件和相邻概念混在一起",
-      "遇到.NET 工程里的真实问题时，不能说明「.NET 容器化与部署」应该观察哪些状态、日志或指标"
+      "把数据库连接检查放在 livenessProbe 中，导致依赖抖动时所有 Pod 被重启",
+      "不配 startupProbe，导致启动慢的应用在冷启动时被 liveness 误杀",
+      "用 latest 标签推送镜像，部署不可追溯、回滚困难",
+      "把 Secret 写在 ConfigMap 或 Dockerfile 中，敏感信息泄露",
+      "以为 NativeAOT 可以替代所有场景，忽略反射和第三方库兼容性限制"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -158,6 +217,6 @@
     "dotnet.microservice-dotnet.communication"
   ],
   "interviewFrequency": "low",
-  "interviewerFocus": "考察是否能围绕「.NET 容器化与部署」说清 Dockerfile、镜像构建、运行配置和部署边界，并放到 .NET 工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察是否能围绕 .NET 容器化说清多阶段 Dockerfile 的分层缓存、镜像变体选择、K8s 三种探针的正确使用、优雅停机链路，以及 NativeAOT 的适用边界和限制。",
+  "updatedAt": "2026-06-22"
 }

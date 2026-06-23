@@ -4,44 +4,49 @@
   "category": "concurrency",
   "group": "concurrency",
   "title": "ThreadLocal",
-  "summary": "讲清 ThreadLocal 的线程绑定存储、ThreadLocalMap 弱 key/强 value 结构、线程池串数据和泄漏路径、InheritableThreadLocal 边界，以及 JDK 25 ScopedValue 的现代替代场景。",
+  "summary": "讲清 ThreadLocal 的值如何挂在 Thread 上、ThreadLocalMap 开放地址哈希表的弱 key/强 value 设计、线程池复用下的串数据与泄漏路径、InheritableThreadLocal 与 ScopedValue 的边界，以及排查和清理的工程实践。",
   "tags": [
     "Java",
     "并发编程",
     "ThreadLocal"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 35,
+  "estimatedMinutes": 34,
   "order": 90,
   "recommendWeight": 86,
   "learningCards": [
     {
       "type": "explain",
-      "title": "ThreadLocal 的值挂在 Thread 上",
-      "content": "ThreadLocal 不是把变量复制给每个线程，也不是锁。它只是一个访问入口：当前线程的 `Thread.threadLocals` 字段里有一个 ThreadLocalMap，ThreadLocal 对象作为 key，业务值作为 value。调用 `set/get/remove` 时，都会先取当前 Thread，再访问这个线程自己的 map。\n\n这个设计适合保存“随当前执行线程走”的上下文，例如 requestId、用户身份、租户标识、事务上下文、日志 MDC。它不适合保存需要跨线程共享和修改的业务对象；如果多个线程要修改同一份数据，仍要使用锁、CAS、线程安全容器或消息化串行处理。\n\n现代代码还要区分“线程上下文”和“调用作用域上下文”。Java 25 已正式引入 ScopedValue（OpenJDK JEP 506），它把不可变上下文绑定在词法作用域内，结束后自动失效，更适合虚拟线程和结构化并发中的只读上下文传递。ThreadLocal 仍适合需要可变、线程私有缓存或旧框架集成的场景，但不能把它当成默认上下文传播方案。"
+      "title": "ThreadLocal 是线程私有访问入口，不是复制也不是锁",
+      "content": "ThreadLocal 不会为每个线程复制一份变量，也不涉及同步。它的值存储在当前 Thread 对象的 `threadLocals` 字段（一个 ThreadLocalMap 实例）中，ThreadLocal 对象本身只是 map 的 key。每次 `set`、`get`、`remove` 都先通过 `Thread.currentThread()` 拿到当前线程，再操作这个线程自己的 map，所以天然线程隔离。\n\n典型用途是保存「随当前执行线程走」的上下文：请求 ID、用户身份、租户标识、事务句柄、日志 MDC（SLF4J MDC 内部就是一个 ThreadLocal）。这些值在同一次请求的不同方法间需要隐式传递，但不应被其他请求看到。\n\nThreadLocal 不适合的场景：多个线程需要读写同一份业务数据（用锁、CAS 或线程安全容器）；需要跨异步调用链传播的上下文（需要显式捕获或框架传播机制）；虚拟线程数量极大时每个线程持有一个大对象（内存压力）。从 Java 25 开始，`ScopedValue`（JEP 506/429）把只读上下文绑定到词法作用域内，结束后自动失效，更适合结构化并发和虚拟线程的上下文传递。"
     },
     {
       "type": "explain",
-      "title": "ThreadLocalMap：弱 key 和强 value",
-      "content": "ThreadLocalMap 是开放地址哈希表，冲突时用线性探测。Entry 继承 `WeakReference<ThreadLocal<?>>`，所以 key 是弱引用；value 是普通强引用，指向业务对象。弱 key 的目的，是在外部已经丢掉 ThreadLocal 实例时，让 key 有机会被 GC，而不是被线程长期强引用。\n\n泄漏风险来自 value 的生命周期。假设某个线程池 worker 上存了一个大对象，后来 ThreadLocal 实例外部引用消失，GC 后 Entry 的 key 会变成 null；但 Entry 还在 worker 的 ThreadLocalMap 中，value 仍被强引用。ThreadLocalMap 会在后续 get/set/remove 的部分路径上做启发式清理，但清理时机不是请求边界，也不覆盖所有空闲线程。\n\n因此关键实践不是“key 是弱引用所以安全”，而是为每次逻辑请求定义清晰的生命周期：进入时 set，退出时 remove。Web Filter、拦截器、RPC 调用链、线程池任务包装器都应把 remove 放在 finally 中。"
+      "title": "ThreadLocalMap 的弱 key 强 value 设计及其取舍",
+      "content": "ThreadLocalMap 是一个开放地址哈希表，冲突解决使用线性探测（linear probing）。每个 Entry 继承自 `WeakReference<ThreadLocal<?>>`，所以 key（ThreadLocal 实例）是弱引用；value 是普通强引用，直接指向业务对象。\n\n弱 key 的设计意图是：当外部代码不再持有 ThreadLocal 的强引用时，GC 可以回收这个 ThreadLocal 实例，Entry 的 key 变成 null。这比线程始终强引用 key 要好——至少 key 有机会被清除。但这只解决了 key 的回收问题，不解决 value 的回收问题。\n\nThreadLocalMap 在 `get`、`set` 和 `cleanSomeSlots` 路径中会尝试清理 key 为 null 的 stale entry（启发式清理），但清理时机取决于后续操作频率，不是请求边界，也不覆盖空闲线程。这就是为什么「key 是弱引用所以安全」是一个常见误解——弱引用保护的是 key，不保护 value，而真正占内存的通常是 value。"
     },
     {
       "type": "explain",
-      "title": "线程池最怕串数据和长生命周期",
-      "content": "线程池复用的是物理线程，而 ThreadLocal 绑定在 Thread 上。上一个请求 set 了用户 A 的上下文却没有 remove，下一个请求被调度到同一个 worker 时，`get()` 可能读到用户 A 的残留值。这类问题比内存泄漏更危险，因为它会造成权限、租户、traceId 或事务上下文串线。\n\n排查时看三个点：线程 dump 中是否是同一批 worker 处理不同请求；日志 MDC、用户上下文或租户上下文是否在请求结束后仍存在；堆 dump 里 Thread -> threadLocals -> Entry -> value 是否保留了大量请求对象。修复优先级通常是补生命周期清理，其次才是调整对象大小或线程池参数。\n\n使用 `ThreadLocal.withInitial` 可以避免 null 判断，但它不会自动清理。使用 `static final ThreadLocal` 可以减少 key 丢失导致的 stale entry，但如果不 remove，线程池串数据和 value 长期驻留仍然存在。"
+      "title": "线程池串数据比泄漏更危险",
+      "content": "线程池复用的是物理线程，ThreadLocal 值绑定在物理线程上。如果上一个任务 set 了请求上下文但没有 remove，下一个被调度到同一个 worker 的任务调用 get，会读到上一个逻辑请求的残留值。这类「串数据」会导致：用户 A 看到用户 B 的数据、租户上下文错乱、traceId 串线导致链路混乱、事务上下文混在一起产生脏写。\n\n它比单纯的内存泄漏更危险：泄漏只是内存问题，可以通过堆 dump 发现；串数据是逻辑正确性问题，可能在生产环境偶发触发，且难以通过功能测试复现。\n\n修复的核心是为每次逻辑请求定义清晰的生命周期：进入时 set，退出时 remove，且 remove 必须在 finally 中。Web Filter、拦截器、RPC 调用链、线程池任务包装器（如 `TaskDecorator`）都是放置清理逻辑的常见位置。`static final ThreadLocal` 可以避免 key 被 GC 导致 stale entry，但不 remove 仍然会串数据和泄漏。"
     },
     {
       "type": "explain",
-      "title": "InheritableThreadLocal 只在创建线程时复制",
-      "content": "InheritableThreadLocal 使用 Thread 的 `inheritableThreadLocals` 字段。父线程创建子线程时，JVM 会把父线程的 inheritable map 复制到子线程；默认 `childValue` 返回同一个引用，必要时可以覆写做拷贝。\n\n它不适合普通线程池上下文传播。线程池 worker 通常在任务提交前已经创建，后续提交任务不会再次从提交者复制值；如果 worker 上曾继承或修改过旧值，新任务还可能读到旧上下文。异步链路要么显式传参，要么在提交任务时捕获上下文并在 worker 中 try/finally 恢复和清理，要么使用框架提供的上下文传播能力。\n\n在 Java 25 及以后，如果是只读上下文且能用结构化作用域表达，ScopedValue 往往比 InheritableThreadLocal 更容易推理：值只在绑定的作用域内可见，不能被远处代码 set 改写，作用域结束后自然失效。"
+      "title": "InheritableThreadLocal 只在创建子线程时做一次复制",
+      "content": "`InheritableThreadLocal` 使用 Thread 的 `inheritableThreadLocals` 字段。父线程创建子线程时，`Thread.init()` 方法会把父线程的 inheritable map 复制一份到子线程；默认 `childValue` 返回同一个引用（浅复制），子线程如果修改了引用型对象的内部状态，会影响父线程看到的同一对象。\n\n它不适合线程池场景。线程池的 worker 线程在池初始化或提交任务时就已创建，后续任务提交不会触发「创建子线程 → 复制 map」这个路径。同一个 worker 处理不同任务时，既不会读到当前提交者线程的 InheritableThreadLocal，也可能残留上一个任务的修改值。所以在 `ExecutorService` 中，InheritableThreadLocal 的行为既不是「继承提交者」，也不是「每次任务隔离」，而是「第一个创建 worker 的线程的值，后续各种修改残留」——非常不可预测。\n\n如果需要在线程池任务间传播上下文，正确做法是在提交任务时（提交者线程中）捕获上下文快照，在 worker 中执行前设置、执行后 remove。Alibaba TransmittableThreadLocal（TTL）和部分框架提供了自动捕获/恢复的装饰器。"
+    },
+    {
+      "type": "explain",
+      "title": "排查 ThreadLocal 问题的三条路径",
+      "content": "线上 ThreadLocal 相关问题主要有三种表现，排查路径不同：\n\n**串数据**：表现为用户看到别人的数据、租户上下文错乱、traceId 串线。排查看线程 dump 是否同一批 worker 处理了不同请求；在代码中搜索所有 ThreadLocal 的 set 调用点，检查是否有对应的 finally remove；在 Filter/拦截器中加日志打印 ThreadLocal 值，确认请求结束后是否为空。\n\n**内存泄漏**：表现为堆内存持续增长、GC 频繁。堆 dump 后用 MAT 或 JVisualVM 的 OQL 查 ThreadLocalMap 的 Entry 数组，找到 value 特别大的线程；查看 `Thread -> threadLocals -> table -> Entry[] -> value` 的引用链，定位是哪个 ThreadLocal 没有 remove。\n\n**InheritableThreadLocal 不生效**：线程池中任务读不到提交者的值，或读到旧值。原因是 worker 已创建，不触发复制。解法是改用显式传参或 TTL。"
     },
     {
       "type": "diagram",
       "format": "svg",
       "title": "ThreadLocalMap 存储、泄漏和上下文边界",
       "content": "assets/diagrams/java-threadlocal-map-leak-scope.svg",
-      "caption": "图中把 Thread.threadLocals 的 Entry 弱 key/强 value 结构、线程池 worker 复用导致的串数据与 value 驻留、InheritableThreadLocal 创建时复制边界、JDK 25 ScopedValue 词法作用域替代放在同一张图里。",
-      "fallback": "ThreadLocal 的值存在当前 Thread 的 ThreadLocalMap（开放地址哈希表），Entry 是 WeakReference<ThreadLocal>（弱 key）+ 强 value。线程池 worker 复用导致上一个请求未 remove 的 value 残留，可能被下一个请求读到（串数据）或长期驻留（泄漏）。InheritableThreadLocal 只在创建子线程时复制父线程 map，线程池不重新复制。JDK 25 ScopedValue 把只读上下文绑定到词法作用域，结束后自动失效，更适合虚拟线程和结构化并发。",
+      "caption": "图中把 Thread.threadLocals → ThreadLocalMap → Entry(弱 key/强 value) 的存储链路、线程池 worker 复用导致的串数据与 value 驻留、InheritableThreadLocal 创建时复制边界、JDK 25 ScopedValue 词法作用域替代放在同一张图里。",
+      "fallback": "ThreadLocal 的值存在当前 Thread 的 ThreadLocalMap（开放地址哈希表），Entry 是 WeakReference<ThreadLocal>（弱 key）+ 强 value。set/get/remove 操作当前线程的 map。线程池 worker 复用导致上一个请求未 remove 的 value 残留，可能被下一个请求读到（串数据）或长期驻留（泄漏）。InheritableThreadLocal 只在创建子线程时复制父线程 map，线程池不重新复制。JDK 25 ScopedValue 把只读上下文绑定到词法作用域，结束后自动失效。",
       "sources": [
         {
           "kind": "svg",
@@ -55,49 +60,57 @@
     },
     {
       "type": "compareTable",
-      "title": "用法边界和替代方案",
-      "content": "| 维度 | ThreadLocal | InheritableThreadLocal | ScopedValue（JDK 25） | 显式传参 |\n| --- | --- | --- | --- | --- |\n| 绑定对象 | 当前 Thread | 创建子线程时复制到子 Thread | 词法作用域内的当前执行 | 方法调用关系 |\n| 是否可变 | 可 set/remove | 可 set/remove | 绑定值只读 | 由参数对象决定 |\n| 线程池表现 | worker 复用会残留 | 不按任务重新复制 | 适合结构化并发的作用域传播 | 最清晰但改签名成本高 |\n| 典型场景 | MDC、事务上下文、线程私有缓存 | 手工 new Thread 的少量继承 | 只读请求上下文、虚拟线程、结构化并发 | 核心业务参数、跨服务边界 |\n| 主要风险 | 忘记 remove 导致串数据或泄漏 | 线程池读到旧值，引用浅拷贝 | 需要目标 JDK 和框架支持 | 参数链路显得冗长 |\n\n| 实践规则 | 原因 |\n| --- | --- |\n| set 后用 try/finally remove | 让逻辑请求生命周期和线程复用解耦 |\n| 不把大对象长期放入 ThreadLocal | worker 生命周期可能远长于请求 |\n| 不用 ThreadLocal 传递核心业务参数 | 隐式依赖让测试、异步和重构更难 |\n| 异步任务提交时显式捕获和清理上下文 | ThreadLocal 不会自动跨线程传播 |\n| 只读上下文优先评估 ScopedValue | 作用域清晰、结束后自动失效 |"
+      "title": "ThreadLocal 与替代方案的适用边界",
+      "content": "| 维度 | ThreadLocal | InheritableThreadLocal | ScopedValue（JDK 25） | 显式传参 |\n| --- | --- | --- | --- | --- |\n| 绑定对象 | 当前 Thread 的 threadLocals | 创建子线程时复制到子 Thread 的 inheritableThreadLocals | 词法作用域内的当前执行上下文 | 方法调用关系 |\n| 是否可变 | 可 set/remove | 可 set/remove | 绑定后只读 | 由参数对象决定 |\n| 线程池表现 | worker 复用，不 remove 会残留 | 不按任务重新复制，行为不可预测 | 适合结构化并发的作用域传播 | 最清晰但改签名成本高 |\n| 主要风险 | 忘记 remove → 串数据或 value 泄漏 | 读到旧值或提交者值完全不生效 | 需要 JDK 21+/25 和框架支持 | 参数链路长，改签名影响大 |\n| 适用场景 | MDC、事务上下文、线程私有缓存 | 手工 new Thread 的少量父子继承 | 只读请求上下文、虚拟线程、结构化并发 | 核心业务参数、跨服务边界 |\n\n| ThreadLocalMap 特性 | 说明 | 影响 |\n| --- | --- | --- |\n| 开放地址 + 线性探测 | 冲突时往后找空槽 | 探测链过长影响 get 性能，需要控制 entry 数量 |\n| Entry 继承 WeakReference | key 是弱引用，GC 后变 null | key 可回收，但 stale entry 仍占用槽位和持有 value |\n| 启发式清理 | get/set 时顺带扫描部分 stale entry | 不保证及时清理，不覆盖空闲线程 |\n| rehash 触发 | entry 数超过 threshold（容量的 2/3） | 扩容并清理 stale entry，但依赖操作频率 |"
     },
     {
       "type": "code",
-      "title": "可运行代码：线程池串数据与正确清理",
+      "title": "可运行代码：线程池串数据、正确清理与 InheritableThreadLocal 边界",
       "language": "java",
-      "content": "import java.util.concurrent.ExecutorService;\nimport java.util.concurrent.Executors;\nimport java.util.concurrent.Future;\n\npublic class Main {\n    private static final ThreadLocal<String> REQUEST_ID = new ThreadLocal<>();\n    private static final InheritableThreadLocal<String> INHERITED = new InheritableThreadLocal<>();\n\n    public static void main(String[] args) throws Exception {\n        demonstrateThreadPoolResidue();\n        demonstrateInheritableThreadLocalBoundary();\n    }\n\n    static void demonstrateThreadPoolResidue() throws Exception {\n        ExecutorService pool = Executors.newSingleThreadExecutor();\n        try {\n            Future<String> first = pool.submit(() -> {\n                REQUEST_ID.set(\"REQ-A\");\n                return REQUEST_ID.get();\n            });\n            System.out.println(\"first request=\" + first.get());\n\n            String leaked = pool.submit(REQUEST_ID::get).get();\n            System.out.println(\"next task sees=\" + leaked);\n            assert \"REQ-A\".equals(leaked);\n\n            String cleaned = pool.submit(() -> {\n                try {\n                    REQUEST_ID.set(\"REQ-B\");\n                    return REQUEST_ID.get();\n                } finally {\n                    REQUEST_ID.remove();\n                }\n            }).get();\n            System.out.println(\"cleaned request=\" + cleaned);\n\n            String afterClean = pool.submit(REQUEST_ID::get).get();\n            System.out.println(\"after clean=\" + afterClean);\n            assert afterClean == null;\n        } finally {\n            pool.shutdownNow();\n        }\n    }\n\n    static void demonstrateInheritableThreadLocalBoundary() throws Exception {\n        ExecutorService pool = Executors.newSingleThreadExecutor();\n        try {\n            INHERITED.set(\"parent-1\");\n            String first = pool.submit(INHERITED::get).get();\n            System.out.println(\"inherited first=\" + first);\n            assert \"parent-1\".equals(first);\n\n            INHERITED.set(\"parent-2\");\n            String second = pool.submit(INHERITED::get).get();\n            System.out.println(\"inherited second=\" + second);\n            assert \"parent-1\".equals(second);\n\n            pool.submit(() -> {\n                INHERITED.remove();\n                return null;\n            }).get();\n        } finally {\n            INHERITED.remove();\n            pool.shutdownNow();\n        }\n    }\n}",
+      "content": "import java.util.concurrent.ExecutorService;\nimport java.util.concurrent.Executors;\nimport java.util.concurrent.Future;\n\npublic class Main {\n    private static final ThreadLocal<String> REQUEST_ID = new ThreadLocal<>();\n    private static final InheritableThreadLocal<String> INHERITED = new InheritableThreadLocal<>();\n\n    public static void main(String[] args) throws Exception {\n        demonstrateThreadPoolResidue();\n        demonstrateCorrectCleanup();\n        demonstrateInheritableThreadLocalBoundary();\n    }\n\n    // 场景 1：没有 remove，下一个任务读到残留值（串数据）\n    static void demonstrateThreadPoolResidue() throws Exception {\n        ExecutorService pool = Executors.newSingleThreadExecutor();\n        try {\n            Future<String> first = pool.submit(() -> {\n                REQUEST_ID.set(\"REQ-A\");\n                return REQUEST_ID.get();\n            });\n            System.out.println(\"first request=\" + first.get());\n\n            // 第二个任务没有 set，但 get 读到了上一个任务的残留值\n            String leaked = pool.submit(REQUEST_ID::get).get();\n            System.out.println(\"next task sees=\" + leaked);\n            assert \"REQ-A\".equals(leaked) : \"串数据：新任务读到了旧请求的 requestId\";\n        } finally {\n            pool.shutdownNow();\n        }\n    }\n\n    // 场景 2：用 try/finally remove，正确清理\n    static void demonstrateCorrectCleanup() throws Exception {\n        ExecutorService pool = Executors.newSingleThreadExecutor();\n        try {\n            String cleaned = pool.submit(() -> {\n                try {\n                    REQUEST_ID.set(\"REQ-B\");\n                    return REQUEST_ID.get();\n                } finally {\n                    REQUEST_ID.remove(); // 必须在 finally 中清理\n                }\n            }).get();\n            System.out.println(\"cleaned request=\" + cleaned);\n\n            // remove 后，后续任务读不到旧值\n            String afterClean = pool.submit(REQUEST_ID::get).get();\n            System.out.println(\"after clean=\" + afterClean);\n            assert afterClean == null : \"清理后不应读到旧值\";\n        } finally {\n            pool.shutdownNow();\\        }\n    }\n\n    // 场景 3：InheritableThreadLocal 不按任务重新复制\n    static void demonstrateInheritableThreadLocalBoundary() throws Exception {\n        ExecutorService pool = Executors.newSingleThreadExecutor();\n        try {\n            INHERITED.set(\"parent-1\");\n            // worker 在 pool 初始化时创建，此时不继承当前线程的值（行为取决于创建时机）\n            String first = pool.submit(INHERITED::get).get();\n            System.out.println(\"inherited first=\" + first);\n\n            // 修改提交者线程的值，worker 不会重新继承\n            INHERITED.set(\"parent-2\");\n            String second = pool.submit(INHERITED::get).get();\n            System.out.println(\"inherited second=\" + second);\n            // 值不变：worker 的 inheritableThreadLocals 是创建时的一次性复制\n        } finally {\n            INHERITED.remove();\n            pool.shutdownNow();\n        }\n    }\n}",
       "highlights": [
         {
-          "line": 17,
+          "line": 24,
           "note": "第一个任务没有 remove，值留在单线程池的 worker 上。"
         },
         {
-          "line": 22,
-          "note": "下一次任务复用同一个 worker，因此能读到上个逻辑请求的残留值。"
+          "line": 28,
+          "note": "第二个任务没有 set，但 get 读到了上一个任务的残留值——这就是串数据。"
         },
         {
-          "line": 30,
-          "note": "正确做法是把 remove 放入 finally，让请求结束时清空线程槽位。"
+          "line": 41,
+          "note": "正确做法：set 后在 finally 中 remove，让请求结束时清空线程槽位。"
         },
         {
-          "line": 50,
-          "note": "InheritableThreadLocal 在线程创建时复制；线程池复用后不会按每次提交重新复制。"
+          "line": 53,
+          "note": "清理后，后续任务的 get 返回 null，不会读到旧上下文。"
+        },
+        {
+          "line": 63,
+          "note": "线程池 worker 早已创建，不会因为提交者修改了 InheritableThreadLocal 而重新复制。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "ThreadLocal 解决的是线程内上下文隔离，不是共享变量同步。值实际存在当前 Thread 的 ThreadLocalMap 里，ThreadLocal 对象只是 key；每个线程访问自己的 map，所以不同线程互不干扰。\n\n**底层结构（弱 key / 强 value）**\n- ThreadLocalMap 是开放地址哈希表，冲突时线性探测\n- Entry 继承 `WeakReference<ThreadLocal<?>>`：key 是弱引用\n- value 是普通强引用，指向业务对象\n- 弱 key 让 ThreadLocal 实例在外部不用时有机会被 GC\n- 但线程仍存活时，key 变 null 的 Entry 仍强持有 value\n- ThreadLocalMap 在 get/set/remove 部分路径做启发式清理，但不是请求边界\n\n**线程池串数据与泄漏**\n- worker 复用 → 上一个请求 set 后未 remove，value 残留\n- 下一个请求被同一 worker 执行，get 可能读到旧上下文（串数据）\n- value 长期驻留 → 内存泄漏\n- 比内存泄漏更危险的是串数据：权限、租户、traceId、事务上下文串线\n\n**生命周期实践**\n- Filter / Interceptor / 线程池包装器：set 后 `try/finally remove`\n- 不存大对象（worker 生命周期远长于请求）\n- 不用 ThreadLocal 隐藏核心业务参数（隐式依赖让测试、异步、重构变难）\n- 异步任务提交时显式捕获和清理上下文（ThreadLocal 不自动跨线程传播）\n\n**InheritableThreadLocal 边界**\n- 只在创建子线程时复制父线程的 inheritableThreadLocals\n- 线程池 worker 通常早已创建，提交新任务不重新复制\n- 线程池里不可靠，不要当任务级上下文传播用\n\n**现代替代（JDK 25+）**\n- `ScopedValue`（JEP 506）：只读上下文绑定到词法作用域，结束后自动失效\n- 更适合虚拟线程和结构化并发\n- ThreadLocal 仍用于：旧框架集成、可变线程私有缓存、兼容老 JDK\n\n**排查**\n- 线程 dump：同一批 worker 处理不同请求\n- 日志：MDC/用户/租户上下文是否在请求结束后仍存在\n- 堆 dump：Thread → threadLocals → Entry → value 引用链，看 retained size",
+      "content": "ThreadLocal 解决的是线程内上下文隔离，不涉及共享变量同步。值实际存在当前 Thread 的 `threadLocals` 字段（ThreadLocalMap）中，ThreadLocal 对象本身只是 key。\n\n**底层结构**\n- ThreadLocalMap 是开放地址哈希表，冲突用线性探测解决\n- Entry 继承 `WeakReference<ThreadLocal<?>>`：key 是弱引用，value 是强引用\n- 弱 key 让 ThreadLocal 实例在外部不用时有机会被 GC\n- 但线程仍存活时，key 被 GC 后 Entry 变成 stale entry，value 仍被强引用\n- ThreadLocalMap 在 get/set 时做启发式清理，但时机不保证、不覆盖空闲线程\n\n**线程池串数据（比泄漏更危险）**\n- 线程池复用 worker → ThreadLocal 值绑定在物理线程上\n- 上一个任务 set 后未 remove → worker 的 ThreadLocalMap 保留旧值\n- 下一个任务被同一 worker 执行 → get 读到旧上下文（串数据）\n- 导致：用户数据串线、租户错乱、traceId 混乱、事务上下文污染\n- 比内存泄漏更难发现：偶发触发、功能测试难复现\n\n**泄漏路径**\n- key 被 GC 后变 null，但 Entry 仍持有 value（强引用）\n- 线程长期存活（如线程池 worker）→ value 长期驻留\n- 启发式清理依赖后续操作频率，不是请求边界\n\n**生命周期实践**\n- Filter / 拦截器 / 线程池 `TaskDecorator`：set 后 try/finally remove\n- `static final ThreadLocal` 减少 key 丢失的 stale entry，但不 remove 仍会串数据\n- 不存大对象（worker 生命周期远长于请求）\n- 不用 ThreadLocal 隐藏核心业务参数（隐式依赖让测试和重构变难）\n\n**InheritableThreadLocal 边界**\n- 只在创建子线程时，由 `Thread.init()` 复制父线程的 inheritableThreadLocals\n- 线程池 worker 早已创建，提交新任务不触发复制\n- 同一 worker 可能残留上一个任务的修改值\n- 不要当线程池任务级上下文传播用\n\n**现代替代**\n- JDK 25 `ScopedValue`（JEP 506）：只读上下文绑定到词法作用域，结束后自动失效\n- 适合虚拟线程和结构化并发\n- ThreadLocal 仍用于：旧框架集成、可变线程私有缓存、兼容老 JDK\n\n**排查**\n- 串数据：日志中检查请求结束后 ThreadLocal 值是否为空；代码中搜索所有 set 点检查 finally remove\n- 泄漏：堆 dump 用 OQL 查 ThreadLocalMap 的 Entry 数组，定位 value 大的线程和 Entry\n- InheritableThreadLocal 不生效：确认 worker 创建时机，改用显式传参或 TTL",
       "followUpQuestions": [
         {
-          "question": "ThreadLocal 为什么会在线程池里发生串数据？",
-          "answer": "因为 ThreadLocal 的值绑定在 Thread 上，而线程池复用 worker。上一个任务 set 后没有 remove，worker 的 ThreadLocalMap 还保留旧值；下一个任务如果被同一个 worker 执行，调用 get 就会读到上一个逻辑请求的数据。"
+          "question": "ThreadLocal 在线程池里为什么会串数据？",
+          "answer": "ThreadLocal 的值绑定在 Thread 上，线程池复用 worker。上一个任务 set 后没有 remove，worker 的 ThreadLocalMap 还保留旧值；下一个任务被同一个 worker 执行，get 就会读到上一个逻辑请求的数据。串数据比内存泄漏更危险，因为它直接影响业务正确性。"
         },
         {
-          "question": "ThreadLocalMap 的 key 是弱引用，为什么仍会泄漏 value？",
-          "answer": "弱引用只影响 key。外部不再引用 ThreadLocal 后，key 可以被 GC 成 null，但 Entry 本身还在当前线程的 ThreadLocalMap 中，value 仍是强引用。只要线程继续存活且没有触发或完成清理，value 就可能长期保留。"
+          "question": "ThreadLocalMap 的 key 是弱引用，为什么 value 还会泄漏？",
+          "answer": "弱引用只保护 key。外部不再引用 ThreadLocal 后，key 可以被 GC 变成 null，但 Entry 本身还在线程的 ThreadLocalMap 中，value 仍是强引用。只要线程继续存活（如线程池 worker）且没有主动 remove，value 就会一直保留。ThreadLocalMap 的启发式清理时机不保证，不覆盖空闲线程。"
         },
         {
           "question": "InheritableThreadLocal 在线程池里为什么不可靠？",
-          "answer": "它只在创建子线程时复制父线程的 inheritableThreadLocals。线程池的 worker 通常早已创建，提交新任务时不会重新复制提交者上下文；同一个 worker 还可能保留旧任务修改过的值，所以容易读到过期上下文。"
+          "answer": "它只在 `Thread.init()` 创建子线程时复制父线程的 inheritableThreadLocals。线程池的 worker 通常在池初始化时就已创建，后续提交任务不会重新复制提交者的值。同一个 worker 还可能保留上一个任务的修改值，所以行为既不是「继承提交者」也不是「每次隔离」，非常不可预测。"
+        },
+        {
+          "question": "怎么在线上排查 ThreadLocal 泄漏？",
+          "answer": "堆 dump 后用 MAT 的 OQL 查 ThreadLocalMap 的 Entry 数组：`select t, t.threadLocals from java.lang.Thread t where t.threadLocals != null`，然后看每个线程的 Entry 数量和 value 的 retained size。结合代码搜索所有 ThreadLocal 的 set 调用点，检查是否有对应的 finally remove。"
         }
       ]
     },
@@ -105,13 +118,14 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 ThreadLocal 的值存放在当前 Thread 的 ThreadLocalMap 中",
-        "能解释 ThreadLocalMap 的开放地址、弱 key 和强 value 结构",
-        "能描述线程池串数据和 value 驻留的完整路径",
-        "能写出 set 后 try/finally remove 的安全结构",
-        "能说明 static final ThreadLocal 不能替代 remove",
-        "能解释 InheritableThreadLocal 只在线程创建时复制",
-        "能区分 ThreadLocal、显式传参和 JDK 25 ScopedValue 的适用边界"
+        "能说明 ThreadLocal 的值存放在当前 Thread 的 ThreadLocalMap 中，ThreadLocal 对象只是 key",
+        "能解释 ThreadLocalMap 的开放地址哈希、线性探测、弱 key/强 value 结构及其取舍",
+        "能描述线程池串数据的完整路径：worker 复用 + 未 remove → 下一个任务 get 到旧值",
+        "能说明为什么串数据比内存泄漏更危险（逻辑正确性问题、偶发、难复现）",
+        "能写出 set 后 try/finally remove 的安全结构，知道必须在 Filter/拦截器/TaskDecorator 中清理",
+        "能解释 InheritableThreadLocal 只在 Thread.init() 创建子线程时复制，在线程池中不可靠",
+        "能区分 ThreadLocal、显式传参、InheritableThreadLocal 和 ScopedValue 的适用边界",
+        "能说出堆 dump 排查 ThreadLocal 泄漏的引用链路：Thread → threadLocals → Entry[] → value"
       ]
     }
   ],
@@ -119,58 +133,65 @@
   "recallPrompts": [
     {
       "id": "java.concurrency.topic-025-a8370d9d.recall.1",
-      "prompt": "请解释 ThreadLocal 的底层结构、使用场景和为什么会发生内存泄漏。",
+      "prompt": "请完整解释 ThreadLocal 的底层结构：值存在哪里、ThreadLocalMap 的存储方式、弱 key 强 value 的设计意图和泄漏路径。",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "expectedMinutes": 4,
+      "difficulty": 4
     },
     {
       "id": "java.concurrency.topic-025-a8370d9d.recall.2",
-      "prompt": "线程池里使用 ThreadLocal 时应该如何清理？",
+      "prompt": "线程池里 ThreadLocal 不 remove 会怎样？为什么说串数据比内存泄漏更危险？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 3
+      "difficulty": 4
     },
     {
       "id": "java.concurrency.topic-025-a8370d9d.recall.3",
-      "prompt": "ThreadLocalMap 为什么使用弱引用 key？哪些场景会发生 value 泄漏，为什么要调用 remove？",
+      "prompt": "请手写代码演示：线程池中 ThreadLocal 不 remove 导致串数据，以及用 try/finally remove 正确清理。",
       "mode": "code",
-      "expectedMinutes": 10,
+      "expectedMinutes": 8,
       "difficulty": 3
     },
     {
       "id": "java.concurrency.topic-025-a8370d9d.recall.4",
-      "prompt": "请写出在线程池或拦截器中使用 ThreadLocal 后用 try/finally remove 的代码结构。",
-      "mode": "code",
-      "expectedMinutes": 5,
-      "difficulty": 3
+      "prompt": "InheritableThreadLocal 的复制时机是什么？为什么它在线程池中不可靠？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
     },
     {
       "id": "java.concurrency.topic-025-a8370d9d.recall.5",
-      "prompt": "ThreadLocal、InheritableThreadLocal 和 ScopedValue 的上下文传播边界分别是什么？",
+      "prompt": "线上出现堆内存持续增长，怀疑是 ThreadLocal 泄漏，你怎么排查？给出具体步骤和工具命令。",
       "mode": "text",
       "expectedMinutes": 4,
-      "difficulty": 3
+      "difficulty": 4
+    },
+    {
+      "id": "java.concurrency.topic-025-a8370d9d.recall.6",
+      "prompt": "ThreadLocal、InheritableThreadLocal、ScopedValue 和显式传参分别适合什么场景？选型时怎么决策？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明 ThreadLocal 的值在线程自己的 ThreadLocalMap 中",
-      "能解释弱引用 key 和强引用 value",
-      "能说清线程池串数据和 value 泄漏原因",
-      "能写出 finally remove 的清理结构"
+      "能说明 ThreadLocal 的值存在当前 Thread 的 ThreadLocalMap 中，ThreadLocal 对象只是 key",
+      "能解释 ThreadLocalMap 的弱 key/强 value 结构以及为什么弱引用不能防止 value 泄漏",
+      "能描述线程池串数据的完整路径：worker 复用 + 未 remove → 下一个任务 get 到旧值",
+      "能写出 set 后 try/finally remove 的安全清理结构"
     ],
     "goodToHave": [
-      "能说明 ThreadLocalMap 的开放地址和启发式清理",
-      "能解释 InheritableThreadLocal 在线程池里的边界",
-      "能区分 ThreadLocal、显式传参和 ScopedValue",
-      "能结合线程 dump 和堆引用链排查线上问题"
+      "能说明 ThreadLocalMap 的开放地址、线性探测和启发式清理机制",
+      "能解释 InheritableThreadLocal 只在 Thread.init() 时复制，在线程池中不可靠",
+      "能区分 ThreadLocal、ScopedValue、显式传参的适用边界",
+      "能说出堆 dump 排查 ThreadLocal 泄漏的引用链路和 OQL 查询方式"
     ],
     "commonMistakes": [
-      "把 ThreadLocal 当成锁",
-      "以为 key 是弱引用就不会泄漏",
-      "在线程池中 set 后不 remove",
-      "把 InheritableThreadLocal 当作线程池任务级上下文传播"
+      "把 ThreadLocal 当成锁或线程安全容器",
+      "以为 key 是弱引用就不会泄漏（忽略 value 是强引用）",
+      "在线程池中 set 后不 remove，导致串数据或 value 长期驻留",
+      "把 InheritableThreadLocal 当作线程池任务级上下文传播机制"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -179,11 +200,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "java.concurrency.topic-013-cc70cb0e"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否从 Thread、ThreadLocalMap、弱 key/强 value 和线程池复用解释串数据与泄漏，并能给出现代上下文传播边界。"
+  "interviewerFocus": "考察能否从 Thread → ThreadLocalMap → Entry(弱 key/强 value) → 线程池 worker 复用完整解释串数据和泄漏机制，以及能给出生命周期清理实践和现代替代方案的选型边界。"
 }

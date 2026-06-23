@@ -4,7 +4,7 @@
   "category": "csharp",
   "group": "csharp",
   "title": "反射与特性",
-  "summary": "理解 Attribute 的使用、反射的性能影响以及 Expression Tree 的应用",
+  "summary": "讲清 Attribute 的编译时存储与运行时读取机制、反射 API 的成本结构与缓存策略、Expression Tree 如何把运行时逻辑编译成近似直接调用的委托，以及 .NET Trim/Native AOT 下元数据裁剪对反射的实际影响和 Source Generator 替代路径。",
   "tags": [
     ".NET",
     "C#",
@@ -14,20 +14,30 @@
     "Expression Tree"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 40,
+  "estimatedMinutes": 38,
   "order": 50,
   "recommendWeight": 75,
   "status": "draft",
   "learningCards": [
     {
       "type": "explain",
-      "title": "反射与特性：特性（Attribute）、反射（Reflection）",
-      "content": "反射和特性是 .NET 中强大的元编程能力，它们允许我们在运行时检查类型信息和为代码添加元数据。\n\n## 特性（Attribute）\n\n特性是一种为代码元素添加元数据的方式，使用方括号语法：\n```csharp\n[Serializable]\npublic class Person\n{\n    [Required(ErrorMessage = \"姓名不能为空\")]\n    [StringLength(50)]\n    public string Name { get; set; }\n\n    [Obsolete(\"请使用 NewMethod\")]\n    public void OldMethod() { }\n}\n```\n\n**常用内置特性**：\n- `[Serializable]` - 标记类型可序列化\n- `[Obsolete]` - 标记过时的代码\n- `[AttributeUsage]` - 定义自定义特性的使用范围\n- `[Conditional]` - 条件编译\n- `[CallerMemberName]` - 自动获取调用者信息\n\n**自定义特性**：\n```csharp\n[AttributeUsage(AttributeTargets.Class | AttributeTargets.Method, AllowMultiple = true)]\npublic class CacheAttribute : Attribute\n{\n    public int Duration { get; set; }\n    public string Key { get; set; }\n\n    public CacheAttribute(int duration)\n    {\n        Duration = duration;\n    }\n}\n\n// 使用\n[Cache(300, Key = \"user\")]\npublic class UserService { }\n```\n\n## 反射（Reflection）\n\n反射提供了在运行时检查和操作类型的能力：\n\n**获取类型信息**：\n```csharp\nType type = typeof(Person);\n// 或\nType type = person.GetType();\n\n// 获取类型信息\nConsole.WriteLine(type.Name); // Person\nConsole.WriteLine(type.FullName); // Namespace.Person\nConsole.WriteLine(type.IsClass); // True\nConsole.WriteLine(type.IsPublic); // True\n```\n\n**检查成员**：\n```csharp\n// 获取所有公共属性\nPropertyInfo[] properties = type.GetProperties();\nforeach (var prop in properties)\n{\n    Console.WriteLine($\"{prop.Name}: {prop.PropertyType}\");\n}\n\n// 获取特定成员\nMethodInfo method = type.GetMethod(\"GetName\");\nConstructorInfo ctor = type.GetConstructor(new[] { typeof(string) });\n```\n\n**动态调用**：\n```csharp\n// 创建实例\nobject instance = Activator.CreateInstance(type);\n// 或带参数\nobject instance = Activator.CreateInstance(type, \"Alice\", 25);\n\n// 设置属性\nPropertyInfo nameProp = type.GetProperty(\"Name\");\nnameProp.SetValue(instance, \"Bob\");\n\n// 调用方法\nMethodInfo method = type.GetMethod(\"GetName\");\nstring result = (string)method.Invoke(instance, null);\n```\n\n**检查特性**：\n```csharp\n// 检查类型上的特性\nvar cacheAttr = type.GetCustomAttribute<CacheAttribute>();\nif (cacheAttr != null)\n{\n    Console.WriteLine($\"缓存时长: {cacheAttr.Duration}\");\n}\n\n// 检查所有特性\nobject[] attrs = type.GetCustomAttributes(false);\nforeach (var attr in attrs)\n{\n    Console.WriteLine(attr.GetType().Name);\n}\n```"
+      "title": "Attribute 编译为元数据，不改变运行时行为",
+      "content": "Attribute 本身不执行代码，它的作用是在编译时把元数据写进程序集的 IL 中。`[Serializable]` 不会帮你序列化，它只是在元数据里打个标记，真正的序列化器读到这个标记才按规则处理。`[Obsolete]` 也是同理——编译器看到后发出警告或错误，运行时没有额外行为。\n\n`[AttributeUsage]` 控制自定义特性能标在哪些元素上（`AttributeTargets`）以及是否允许多次标注（`AllowMultiple`）。`Inherited` 控制派生类是否继承基类上的特性，多数反射 API 默认遵循这个继承语义。\n\n一个自定义特性类必须继承 `System.Attribute`。属性可以有构造函数参数（定位参数）和可选的命名属性（Named Property）。`AllowMultiple = true` 在 ASP.NET 路由、Swagger 标注等场景很常见——同一个控制器方法可能同时挂多个路由模板。\n\n内置特性中，`[CallerMemberName]`、`[CallerFilePath]`、`[CallerLineNumber]` 是编译器注入的，不走反射，性能零开销；`[Conditional(\"DEBUG\")]` 让整个方法调用在 Release 编译时被移除，也不是运行时检查。分清「编译器特性和元数据特性」对回答陷阱题很重要。"
     },
     {
       "type": "explain",
-      "title": "反射与特性：反射的性能影响、Expression Tree",
-      "content": "## 反射的性能影响\n\n反射比直接调用慢很多，主要原因：\n1. 类型检查和解析开销\n2. 无法内联优化\n3. 安全检查开销\n\n**性能对比**：\n- 直接调用：~1ns\n- 反射调用：~100ns（首次）/ ~10ns（缓存后）\n\n**优化策略**：\n1. 缓存反射结果\n2. 使用 Expression Tree 编译\n3. 使用 Emit 动态生成代码\n4. 使用 Source Generator（编译时）\n\n## Expression Tree\n\nExpression Tree 将代码表示为数据结构，可以编译为委托：\n```csharp\n// 创建表达式树\nExpression<Func<int, int, int>> add = (a, b) => a + b;\n\n// 编译为委托\nFunc<int, int, int> addFunc = add.Compile();\nint result = addFunc(1, 2); // 3\n```\n\n**动态构建表达式**：\n```csharp\nvar param = Expression.Parameter(typeof(int), \"x\");\nvar body = Expression.Add(param, Expression.Constant(1));\nvar lambda = Expression.Lambda<Func<int, int>>(body, param);\n\nFunc<int, int> increment = lambda.Compile();\nint result = increment(5); // 6\n```\n\n**应用场景**：\n1. ORM 查询构建（如 Entity Framework）\n2. 动态排序和过滤\n3. 验证规则引擎\n4. 对象映射\n\n## 实际应用模式\n\n**依赖注入容器**：\n```csharp\nvar type = typeof(IUserService);\nvar implementation = serviceProvider.GetService(type);\n```\n\n**序列化框架**：\n```csharp\nvar properties = type.GetProperties()\n    .Where(p => p.GetCustomAttribute<JsonIgnoreAttribute>() == null);\n```\n\n**AOP 切面编程**：\n```csharp\n[Log]\n[Cache(300)]\npublic virtual void DoWork() { }\n```"
+      "title": "反射的 API 层次和成本结构",
+      "content": "反射的核心入口是 `System.Type`，它封装了一个类型在运行时的全部元数据。`typeof(T)` 在编译时拿到 Type 引用（JIT 后直接指向方法表），`obj.GetType()` 运行时取实际类型，`Type.GetType(\"FullName\")` 按全限定名搜索程序集——三者成本差异很大，最后一个要遍历已加载程序集。\n\n成员查询 API 的选择直接影响性能：`GetProperty(\"Name\")` 比 `GetProperties()` 再 LINQ 快，因为前者只查一个成员。`BindingFlags` 能把搜索范围压到 `Public | Instance`，避免扫描继承层次和静态成员。忘记指定 BindingFlags 是常见性能坑——默认行为会同时搜索 Public 和 NonPublic、Instance 和 Static，再做继承冲突消解。\n\n`Activator.CreateInstance` 内部走无参构造时很快（有专门的快速路径），但有参构造会做参数匹配和安全性检查，首次调用有显著开销。如果热点路径要创建大量对象，应当缓存构造函数的委托（`ConstructorInfo` → `Expression.New` → `Compile()`）。\n\n反射调用方法（`MethodInfo.Invoke`）比直接调用慢 50-100 倍，原因是每次调用要做参数装箱、安全检查、IL 栈帧构造。缓解路径是把 `Invoke` 替换为编译后的委托：`Delegate.CreateDelegate`、Expression Tree 编译、或 Emit 直接生成 IL。"
+    },
+    {
+      "type": "explain",
+      "title": "Expression Tree 把运行时逻辑变成编译后的委托",
+      "content": "Expression Tree 的本质是把 C# 表达式表示为不可变的树形数据结构（`System.Linq.Expressions` 命名空间下的节点类型）。编译器看到 `Expression<Func<int,int>> f = x => x+1` 时生成的是构造节点树的代码，而不是 IL 副本——这和直接 `Func<int,int>` 走 IL 有根本区别。\n\n手动构建时，用 `Expression.Parameter` 创建参数节点、`Expression.Property` / `Expression.Add` 等创建操作节点、`Expression.Lambda` 组装为 lambda 节点，最后调用 `Compile()` 生成 DynamicMethod 委托。编译后委托的执行速度和手写代码在同一数量级（多次调用后 JIT 内联）。\n\nEntity Framework 用 Expression Tree 解析查询表达式，把它翻译成 SQL——如果传入的是 `Func<T,bool>` 而不是 `Expression<Func<T,bool>>`，EF 无法看到表达式结构，只能在客户端做全表内存过滤。这是面试高频追问点。\n\nExpression Tree 适合「结构已知但属性名/值运行时才确定」的场景：动态 LINQ 排序、动态过滤条件拼接、ORM 查询构建、验证规则引擎。它的弱点是构建代码冗长、调试困难，以及 `Compile()` 首次调用有一定开销（内部走 JIT），所以编译结果也应缓存。"
+    },
+    {
+      "type": "explain",
+      "title": "Trim/Native AOT 下反射的裁剪风险与替代方案",
+      "content": ".NET 6 引入的 IL Trimmer 和 .NET 7+ 的 Native AOT 编译器会做静态分析，移除未被直接引用的类型和成员元数据。如果代码只通过字符串名称反射调用 `Type.GetType(\"MyPlugin\")`，Trimmer 认为 `MyPlugin` 没有静态引用，可能把它裁掉——运行时直接抛 `NullReferenceException` 或返回 null。\n\n缓解方式有三类：`[DynamicallyAccessedMembers]` 标注告诉 Trimmer 这个类型/成员必须保留（ASP.NET Minimal API 和 System.Text.Json 已经内置了大量此类标注）；`<TrimmerRootAssembly>` 在项目文件里显式保留整个程序集；或者根本不用反射，改用 Source Generator 在编译时生成等价代码。\n\nSource Generator（.NET 5+）在编译时扫描 Attribute 和类型结构，自动生成辅助类，完全不依赖运行时反射。典型例子是 `System.Text.Json` 的 Source Generator 上下文——序列化/反零分配且 AOT 兼容。但它只能处理编译时已知的类型，无法替代真正的运行时动态场景（插件系统、运行时类型发现）。\n\n面试中如果被问到「反射和 Source Generator 怎么选」，核心判断是：类型集合在编译时是否完全已知。已知用 Source Generator；不确定（插件、脚本、运行时配置）用反射但要配合 Trimmer 标注和缓存。"
     },
     {
       "type": "diagram",
@@ -55,50 +65,58 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | 直接调用 | 反射调用 | Expression Tree |\n| --- | --- | --- | --- |\n| 性能 | 最快（~1ns） | 较慢（~100ns） | 编译后接近直接调用 |\n| 类型安全 | 编译时检查 | 运行时检查 | 编译时检查 |\n| 灵活性 | 静态，编译时确定 | 动态，运行时确定 | 动态构建，可编译 |\n| 适用场景 | 常规调用 | 插件系统、DI容器 | ORM查询、动态LINQ |\n| 代码复杂度 | 低 | 中 | 高 |\n| 缓存需求 | 不需要 | 强烈建议缓存 | 编译后缓存委托 |"
+      "title": "三种动态调用路径对比",
+      "content": "| 维度 | MethodInfo.Invoke | Expression Tree.Compile | Delegate.CreateDelegate / Emit |\n| --- | --- | --- | --- |\n| 首次调用开销 | 中（反射解析） | 高（构建树 + JIT） | 低（直接绑定） |\n| 后续调用速度 | 慢 50-100x（装箱+安全检查） | 接近直接调用 | 等同直接调用 |\n| 代码复杂度 | 低 | 高（手动建树） | 高（需理解 IL 或 Emit API） |\n| 适用场景 | 偶尔调用、插件加载 | ORM 查询、动态 LINQ、验证引擎 | 高频热点、序列化器内部 |\n| 缓存需求 | 缓存 MethodInfo | 必须缓存 Compile 结果 | 缓存委托引用 |\n| AOT 兼容 | 需 Trimmer 标注 | 需 Trimmer 标注 | 需 Trimmer 标注 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | Attribute | 反射 | 编译时特性 |\n| --- | --- | --- | --- |\n| 时间 | 运行时 | 运行时 | 编译时 |\n| 存储 | 程序集元数据 | 内存中的类型信息 | 编译器生成代码 |\n| 典型应用 | 验证、序列化标记 | DI、序列化、AOP | Source Generator |\n| 性能影响 | 小（元数据读取） | 大（运行时解析） | 无（编译时生成） |"
+      "title": "Attribute / 反射 / Source Generator 决策矩阵",
+      "content": "| 维度 | Attribute + 反射 | Source Generator | 运行时纯动态（Emit） |\n| --- | --- | --- | --- |\n| 类型何时确定 | 运行时 | 编译时 | 运行时 |\n| 典型场景 | DI 容器、AOP、插件 | JSON 序列化、强类型路由 | 脚本引擎、动态代理 |\n| 性能 | 中（需缓存） | 等同手写代码 | 等同手写代码 |\n| AOT/Trim | 需 Trimmer 标注 | 完全兼容 | 需 Trimmer 标注 |\n| 调试体验 | 差（运行时异常） | 好（可直接看生成代码） | 差（IL 难读） |\n| 开发成本 | 低 | 中（需写 Generator 逻辑） | 高 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Collections.Generic;\nusing System.Linq;\nusing System.Linq.Expressions;\nusing System.Reflection;\n\nnamespace ReflectionAttributesDemo\n{\n    // 自定义特性\n    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Property, AllowMultiple = true)]\n    public class CacheAttribute : Attribute\n    {\n        public int Duration { get; set; }\n        public string Region { get; set; }\n\n        public CacheAttribute(int duration)\n        {\n            Duration = duration;\n        }\n    }\n\n    [AttributeUsage(AttributeTargets.Property)]\n    public class RequiredAttribute : Attribute\n    {\n        public string ErrorMessage { get; set; }\n    }\n\n    [AttributeUsage(AttributeTargets.Property)]\n    public class MaxLengthAttribute : Attribute\n    {\n        public int Length { get; set; }\n\n        public MaxLengthAttribute(int length)\n        {\n            Length = length;\n        }\n    }\n\n    // 使用特性\n    [Cache(300, Region = \"users\")]\n    public class User\n    {\n        [Required(ErrorMessage = \"ID 不能为空\")]\n        public int Id { get; set; }\n\n        [Required(ErrorMessage = \"姓名不能为空\")]\n        [MaxLength(50)]\n        public string Name { get; set; }\n\n        [MaxLength(100)]\n        public string Email { get; set; }\n\n        public DateTime CreatedAt { get; set; }\n\n        [Cache(60)]\n        public string GetDisplayName() => $\"{Name} ({Id})\";\n    }\n\n    // 反射工具类\n    public static class ReflectionHelper\n    {\n        // 缓存类型信息\n        private static readonly Dictionary<Type, PropertyInfo[]> PropertyCache = new();\n\n        public static PropertyInfo[] GetCachedProperties(Type type)\n        {\n            if (!PropertyCache.TryGetValue(type, out var properties))\n            {\n                properties = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);\n                PropertyCache[type] = properties;\n            }\n            return properties;\n        }\n\n        // 获取特性\n        public static T GetAttribute<T>(MemberInfo member) where T : Attribute\n        {\n            return member.GetCustomAttribute<T>();\n        }\n\n        // 验证对象\n        public static List<string> Validate(object obj)\n        {\n            var errors = new List<string>();\n            var type = obj.GetType();\n            var properties = GetCachedProperties(type);\n\n            foreach (var prop in properties)\n            {\n                var requiredAttr = prop.GetCustomAttribute<RequiredAttribute>();\n                if (requiredAttr != null)\n                {\n                    var value = prop.GetValue(obj);\n                    if (value == null || string.IsNullOrWhiteSpace(value.ToString()))\n                    {\n                        errors.Add(requiredAttr.ErrorMessage ?? $\"{prop.Name} 不能为空\");\n                    }\n                }\n\n                var maxLengthAttr = prop.GetCustomAttribute<MaxLengthAttribute>();\n                if (maxLengthAttr != null && prop.PropertyType == typeof(string))\n                {\n                    var value = prop.GetValue(obj) as string;\n                    if (value != null && value.Length > maxLengthAttr.Length)\n                    {\n                        errors.Add($\"{prop.Name} 长度不能超过 {maxLengthAttr.Length}\");\n                    }\n                }\n            }\n\n            return errors;\n        }\n\n        // 动态创建对象\n        public static T CreateInstance<T>(params object[] args)\n        {\n            return (T)Activator.CreateInstance(typeof(T), args);\n        }\n\n        // 深拷贝\n        public static T DeepCopy<T>(T source)\n        {\n            var type = source.GetType();\n            var target = Activator.CreateInstance(type);\n            var properties = GetCachedProperties(type);\n\n            foreach (var prop in properties)\n            {\n                if (prop.CanRead && prop.CanWrite)\n                {\n                    var value = prop.GetValue(source);\n                    prop.SetValue(target, value);\n                }\n            }\n\n            return (T)target;\n        }\n    }\n\n    // Expression Tree 示例\n    public static class ExpressionHelper\n    {\n        // 动态排序\n        public static IQueryable<T> OrderByDynamic<T>(\n            IQueryable<T> query,\n            string propertyName,\n            bool ascending = true)\n        {\n            var parameter = Expression.Parameter(typeof(T), \"x\");\n            var property = Expression.Property(parameter, propertyName);\n            var lambda = Expression.Lambda(property, parameter);\n\n            var methodName = ascending ? \"OrderBy\" : \"OrderByDescending\";\n            var method = typeof(Queryable).GetMethods()\n                .First(m => m.Name == methodName && m.GetParameters().Length == 2)\n                .MakeGenericMethod(typeof(T), property.Type);\n\n            return (IQueryable<T>)method.Invoke(null, new object[] { query, lambda });\n        }\n\n        // 动态过滤\n        public static IQueryable<T> WhereDynamic<T>(\n            IQueryable<T> query,\n            string propertyName,\n            object value)\n        {\n            var parameter = Expression.Parameter(typeof(T), \"x\");\n            var property = Expression.Property(parameter, propertyName);\n            var constant = Expression.Constant(value);\n            var equality = Expression.Equal(property, constant);\n            var lambda = Expression.Lambda<Func<T, bool>>(equality, parameter);\n\n            return query.Where(lambda);\n        }\n\n        // 创建属性访问器\n        public static Func<T, object> CreatePropertyAccessor<T>(string propertyName)\n        {\n            var parameter = Expression.Parameter(typeof(T), \"x\");\n            var property = Expression.Property(parameter, propertyName);\n            var convert = Expression.Convert(property, typeof(object));\n            var lambda = Expression.Lambda<Func<T, object>>(convert, parameter);\n\n            return lambda.Compile();\n        }\n    }\n\n    class Program\n    {\n        static void Main()\n        {\n            // 反射使用示例\n            var user = new User { Id = 1, Name = \"Alice\", Email = \"alice@example.com\" };\n\n            // 验证\n            var errors = ReflectionHelper.Validate(user);\n            Console.WriteLine($\"验证错误: {errors.Count}\");\n\n            // 获取特性信息\n            var type = typeof(User);\n            var cacheAttr = type.GetCustomAttribute<CacheAttribute>();\n            Console.WriteLine($\"缓存时长: {cacheAttr.Duration}, 区域: {cacheAttr.Region}\");\n\n            // 动态创建对象\n            var newUser = ReflectionHelper.CreateInstance<User>();\n\n            // 深拷贝\n            var clonedUser = ReflectionHelper.DeepCopy(user);\n\n            // Expression Tree 示例\n            var users = new List<User>\n            {\n                new User { Id = 3, Name = \"Charlie\" },\n                new User { Id = 1, Name = \"Alice\" },\n                new User { Id = 2, Name = \"Bob\" }\n            }.AsQueryable();\n\n            // 动态排序\n            var sorted = ExpressionHelper.OrderByDynamic(users, \"Name\");\n            foreach (var u in sorted)\n            {\n                Console.WriteLine($\"{u.Id}: {u.Name}\");\n            }\n\n            // 动态过滤\n            var filtered = ExpressionHelper.WhereDynamic(users, \"Id\", 2);\n            Console.WriteLine($\"过滤结果: {filtered.First().Name}\");\n\n            // 创建属性访问器\n            var nameAccessor = ExpressionHelper.CreatePropertyAccessor<User>(\"Name\");\n            Console.WriteLine($\"访问器结果: {nameAccessor(user)}\");\n        }\n    }\n}",
+      "title": "完整示例：自定义 Attribute、反射验证、Expression Tree 属性访问器",
       "language": "csharp",
+      "content": "using System;\nusing System.Collections.Generic;\nusing System.Linq;\nusing System.Linq.Expressions;\nusing System.Reflection;\n\nnamespace ReflectionDemo\n{\n    // -- 自定义特性 --\n    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Property, AllowMultiple = false)]\n    public class CacheAttribute : Attribute\n    {\n        public int Duration { get; }\n        public string Region { get; set; }\n        public CacheAttribute(int duration) => Duration = duration;\n    }\n\n    [AttributeUsage(AttributeTargets.Property)]\n    public class RequiredAttribute : Attribute\n    {\n        public string ErrorMessage { get; set; }\n    }\n\n    [AttributeUsage(AttributeTargets.Property)]\n    public class MaxLengthAttribute : Attribute\n    {\n        public int Length { get; }\n        public MaxLengthAttribute(int length) => Length = length;\n    }\n\n    // -- 被标注的实体 --\n    [Cache(300, Region = \"users\")]\n    public class User\n    {\n        [Required(ErrorMessage = \"ID 不能为空\")]\n        public int Id { get; set; }\n\n        [Required(ErrorMessage = \"姓名不能为空\")]\n        [MaxLength(50)]\n        public string Name { get; set; }\n\n        [MaxLength(100)]\n        public string Email { get; set; }\n\n        [Cache(60)]\n        public string GetDisplayName() => $\"{Name} ({Id})\";\n    }\n\n    // -- 反射工具（带缓存） --\n    public static class ReflectionHelper\n    {\n        private static readonly Dictionary<Type, PropertyInfo[]> Cache = new();\n\n        public static PropertyInfo[] GetPropertiesCached(Type type)\n        {\n            // ConcurrentDictionary 更好，这里用 Dictionary 简化演示\n            if (!Cache.TryGetValue(type, out var props))\n            {\n                props = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);\n                Cache[type] = props;\n            }\n            return props;\n        }\n\n        public static List<string> Validate(object obj)\n        {\n            var errors = new List<string>();\n            foreach (var prop in GetPropertiesCached(obj.GetType()))\n            {\n                var req = prop.GetCustomAttribute<RequiredAttribute>();\n                if (req != null)\n                {\n                    var val = prop.GetValue(obj);\n                    if (val == null || string.IsNullOrWhiteSpace(val.ToString()))\n                        errors.Add(req.ErrorMessage ?? $\"{prop.Name} 不能为空\");\n                }\n                var ml = prop.GetCustomAttribute<MaxLengthAttribute>();\n                if (ml != null && prop.PropertyType == typeof(string))\n                {\n                    var val = prop.GetValue(obj) as string;\n                    if (val != null && val.Length > ml.Length)\n                        errors.Add($\"{prop.Name} 长度不能超过 {ml.Length}\");\n                }\n            }\n            return errors;\n        }\n    }\n\n    // -- Expression Tree：动态属性访问器 --\n    public static class ExpressionHelper\n    {\n        // 编译一次，反复使用\n        private static readonly Dictionary<string, Delegate> AccessorCache = new();\n\n        public static Func<T, object> GetAccessor<T>(string propertyName)\n        {\n            var key = typeof(T).FullName + \".\" + propertyName;\n            if (AccessorCache.TryGetValue(key, out var cached))\n                return (Func<T, object>)cached;\n\n            var param = Expression.Parameter(typeof(T), \"x\");\n            var body = Expression.Convert(Expression.Property(param, propertyName), typeof(object));\n            var lambda = Expression.Lambda<Func<T, object>>(body, param);\n            var compiled = lambda.Compile();\n            AccessorCache[key] = compiled;\n            return compiled;\n        }\n\n        // 动态 LINQ 排序（用于 IQueryable）\n        public static IQueryable<T> OrderByDynamic<T>(\n            IQueryable<T> source, string propertyName, bool ascending = true)\n        {\n            var param = Expression.Parameter(typeof(T), \"x\");\n            var body = Expression.Property(param, propertyName);\n            var lambda = Expression.Lambda(body, param);\n\n            var method = typeof(Queryable).GetMethods()\n                .First(m => m.Name == (ascending ? \"OrderBy\" : \"OrderByDescending\")\n                            && m.GetParameters().Length == 2)\n                .MakeGenericMethod(typeof(T), body.Type);\n\n            return (IQueryable<T>)method.Invoke(null, new object[] { source, lambda });\n        }\n    }\n\n    class Program\n    {\n        static void Main()\n        {\n            var user = new User { Id = 1, Name = \"Alice\", Email = \"alice@example.com\" };\n\n            // 1. 验证\n            var errors = ReflectionHelper.Validate(user);\n            Console.WriteLine($\"验证错误数: {errors.Count}\"); // 0\n\n            // 2. 读取类级 Attribute\n            var cacheAttr = typeof(User).GetCustomAttribute<CacheAttribute>();\n            Console.WriteLine($\"缓存: {cacheAttr.Duration}s, 区域: {cacheAttr.Region}\"); // 300, users\n\n            // 3. Expression Tree 属性访问器（编译后性能接近直接访问）\n            var nameAccessor = ExpressionHelper.GetAccessor<User>(\"Name\");\n            Console.WriteLine($\"Name = {nameAccessor(user)}\"); // Alice\n\n            // 4. 无效对象验证\n            var bad = new User { Id = 0, Name = \"\", Email = new string('x', 200) };\n            var badErrors = ReflectionHelper.Validate(bad);\n            Console.WriteLine($\"Bad errors: {string.Join(\", \", badErrors)}\");\n        }\n    }\n}",
       "highlights": [
         {
-          "line": 11,
-          "note": "`public class CacheAttribute : Attribute` 定义了 反射与特性 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 10,
+          "note": "自定义 Attribute 类必须继承 System.Attribute，构造函数参数是定位参数，公开属性是命名参数。"
         },
         {
-          "line": 67,
-          "note": "`if (!PropertyCache.TryGetValue(type, out var properties))` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 39,
+          "note": "GetPropertiesCached 缓存 PropertyInfo[]，避免每次反射重新扫描。"
         },
         {
-          "line": 13,
-          "note": "`public int Duration { get; set; }` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "line": 47,
+          "note": "GetCustomAttribute<RequiredAttribute>() 读取属性上的元数据，null 表示未标注。"
         },
         {
-          "line": 63,
-          "note": "`private static readonly Dictionary<Type, PropertyInfo[]> PropertyCache = new();` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+          "line": 80,
+          "note": "Expression.Property + Expression.Lambda + Compile() 把反射属性访问编译成近似直接调用的委托。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "特性（Attribute）是 C# 中为代码元素添加元数据的方式，使用方括号语法。特性可以应用于类、方法、属性等各种代码元素。常用的内置特性包括 Serializable、Obsolete 等。我们可以通过 AttributeUsage 特性定义自定义特性，指定它能应用在哪些元素上以及是否允许多次使用。\n\n机制要点：\n- 反射提供了在运行时检查和操作类型的能力。通过 Type 类，我们可以获取类型的成员信息、创建实例、调用方法、读写属性等。反射的一个重要应用场景是检查特性，比如 GetCustomAttribute<T>() 方法可以获取指定类型的特性。\n- 反射的主要问题是性能开销。反射调用比直接调用慢很多，因为需要进行类型检查、安全检查等。优化策略包括缓存反射结果、使用 Expression Tree 编译、使用 Emit 动态生成代码等。\n- Expression Tree 是 C# 3.0 引入的特性，它将代码表示为数据结构，可以编译为委托。Expression Tree 在 ORM 框架中广泛应用，比如 Entity Framework 用它来构建 SQL 查询。我们也可以动态构建表达式树，实现动态排序、过滤等功能。\n- 在实际开发中，我会谨慎使用反射，优先考虑其他方案。如果必须使用反射，会做好缓存和性能优化。",
+      "content": "**结论**\nAttribute 是编译时嵌入程序集的元数据标记，不改变运行时行为；反射是运行时读取这些元数据并动态操作类型的能力；Expression Tree 是把运行时逻辑编译成高效委托的桥梁。三者构成 .NET 元编程的递进层次。\n\n**Attribute 机制**\n- 继承 `System.Attribute`，`[AttributeUsage]` 控制目标元素和 AllowMultiple\n- 编译后写入 IL 元数据表，不产生运行时代码\n- `[CallerMemberName]` 等是编译器注入，零运行时开销\n- 常见用途：验证标记、路由配置、序列化控制、AOP 切面\n\n**反射 API 层次**\n- `typeof(T)` 编译时，`obj.GetType()` 运行时，`Type.GetType(\"...\")` 按名搜索（最慢）\n- 成员查询：`GetProperty` 比 `GetProperties` 快，`BindingFlags` 压缩搜索范围\n- `MethodInfo.Invoke` 慢 50-100x（装箱+安全检查），必须缓存结果\n- `Activator.CreateInstance` 无参构造快，有参构造有额外匹配开销\n\n**Expression Tree 机制**\n- 编译器看到 `Expression<Func<>>` 时生成构建节点树的代码，不是 IL 副本\n- 手动构建：`Parameter` → `Property/Add` → `Lambda` → `Compile()`\n- EF 核心依赖：只有 `Expression<Func<T,bool>>` 才能翻译为 SQL，`Func<T,bool>` 只能客户端过滤\n- 编译结果必须缓存（首次有 JIT 开销）\n\n**工程边界**\n- 热点路径用 Expression Tree 或 Emit 编译替代 Invoke\n- 构造函数委托缓存替代 `Activator.CreateInstance`\n- AOT/Trim 环境：类型已知用 Source Generator；动态场景加 `[DynamicallyAccessedMembers]` 或 `<TrimmerRootAssembly>`\n- `ConcurrentDictionary` 缓存反射结果，避免多线程竞争",
       "followUpQuestions": [
         {
-          "question": "面试官追问「反射与特性」时，最应该展开哪条机制链？",
-          "answer": "回答「反射与特性」时先抓住 理解 Attribute 的概念和使用方法，再展开 掌握反射的常用 API。反射与特性 不能停在定义层，要把 .NET 版本、GC 指标、输出结果和 P95 延迟 串起来，才像真实 .NET 工程里的判断。"
+          "question": "为什么 `Expression<Func<T,bool>>` 能翻译成 SQL，而 `Func<T,bool>` 不行？",
+          "answer": "`Expression<Func<T,bool>>` 保留了表达式的树形结构（节点类型、操作符、成员访问），EF 的查询提供程序可以遍历这棵树翻译成 SQL。`Func<T,bool>` 是编译后的 IL 委托，运行时只能执行，无法反向解析其逻辑，所以 EF 只能在内存中调用它过滤已查询的数据。"
         },
         {
-          "question": "如果「反射与特性」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "可以先确认现象是否落在「掌握反射的常用 API」，再结合日志、指标、输入规模和依赖状态验证。"
+          "question": "`Type.GetType(\"MyNamespace.MyClass\")` 为什么经常返回 null？",
+          "answer": "这个方法只在当前程序集和 mscorlib 中搜索。如果类型在其他程序集，必须传入程序集限定名（`MyNamespace.MyClass, MyAssembly`），或者用 `Assembly.GetType` 指定程序集。忘记这点是反射调试的常见坑。"
+        },
+        {
+          "question": "Source Generator 和反射怎么选？",
+          "answer": "核心判断是类型集合是否编译时完全已知。JSON 序列化、强类型路由等场景类型确定，用 Source Generator（性能等同手写、AOT 兼容）。插件系统、运行时类型发现、脚本引擎等场景类型运行时才出现，只能用反射但要配合 Trimmer 标注和缓存。"
+        },
+        {
+          "question": "`Activator.CreateInstance` 和 `Expression.New` + `Compile()` 的性能差距有多大？",
+          "answer": "`Activator.CreateInstance` 无参构造有快速路径，差距不大（2-3x）。有参构造会做参数类型匹配和安全性检查，首次调用开销显著；编译成 `Expression.New` + `Compile()` 后后续调用接近 `new T()` 的速度，差距可达 50-100x。"
         }
       ]
     },
@@ -106,54 +124,70 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "特性的定义和使用方式",
-        "反射的常用 API 和应用场景",
-        "反射的性能影响及优化策略",
-        "Expression Tree 的概念和用途",
-        "如何动态构建表达式树",
-        "反射在 DI 容器和 ORM 中的应用"
+        "Attribute 是编译时元数据标记，不产生运行时代码；AttributeUsage 控制目标和 AllowMultiple",
+        "typeof(T) / GetType() / Type.GetType() 的成本差异和适用场景",
+        "GetProperties vs GetProperty + BindingFlags 的性能影响",
+        "MethodInfo.Invoke 慢 50-100x 的原因：装箱、安全检查、无法内联",
+        "Expression Tree 如何构建和编译，为什么 EF 必须用它而不是 Func",
+        "AOT/Trim 下反射的裁剪风险和 Source Generator 替代决策",
+        "热点路径的反射缓存策略：属性字典、构造委托、编译后委托"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "dotnet.csharp.reflection-attributes.recall.1",
-      "prompt": "什么是 Attribute？如何定义自定义特性？请举例说明。",
+      "prompt": "请解释 Attribute 的编译时存储机制、AttributeUsage 的作用，以及 [CallerMemberName] 和 [Conditional] 为什么零运行时开销。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "dotnet.csharp.reflection-attributes.recall.2",
-      "prompt": "反射有哪些性能问题？有哪些优化策略？",
+      "prompt": "反射调用比直接调用慢多少？原因是什么？有哪些优化路径？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "dotnet.csharp.reflection-attributes.recall.3",
-      "prompt": "反射与特性 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "为什么 Entity Framework 必须接收 Expression<Func<T,bool>> 而不是 Func<T,bool>？如果传错了会怎样？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.csharp.reflection-attributes.recall.4",
+      "prompt": "手写代码：定义一个自定义 Attribute，用反射扫描类上所有标注了该 Attribute 的属性，用 Expression Tree 编译一个属性访问器。",
+      "mode": "code",
+      "expectedMinutes": 12,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.csharp.reflection-attributes.recall.5",
+      "prompt": ".NET Native AOT 编译后反射可能出什么问题？怎么选择 Source Generator 还是 Trimmer 标注？",
+      "mode": "text",
+      "expectedMinutes": 4,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "理解 Attribute 的概念和使用方法",
-      "掌握反射的常用 API",
-      "了解反射的性能影响",
-      "知道 Expression Tree 的基本概念"
+      "能解释 Attribute 编译时写入元数据、不产生运行时行为的机制",
+      "能说明 typeof / GetType / Type.GetType 三种获取 Type 的成本差异",
+      "能描述 MethodInfo.Invoke 的性能瓶颈（装箱、安全检查、无法内联）",
+      "能解释 Expression Tree 为什么能翻译成 SQL 而 Func 不能"
     ],
     "goodToHave": [
-      "理解 Expression Tree 的内部结构",
-      "知道 Emit 动态生成代码",
-      "了解 Source Generator 的作用"
+      "能说明 AOT/Trim 下反射裁剪的风险和 [DynamicallyAccessedMembers] 标注",
+      "能区分 [CallerMemberName] 等编译器特性和运行时元数据特性",
+      "能解释 Source Generator 与反射的选型决策矩阵"
     ],
     "commonMistakes": [
-      "只列出 C#、反射、特性，但说不出触发条件、状态变化和验证证据",
-      "把「反射与特性」的适用场景、失效条件和相邻概念混在一起",
-      "遇到.NET 工程里的真实问题时，不能说明「反射与特性」应该观察哪些状态、日志或指标"
+      "把 Attribute 当成运行时执行的代码，而不是编译时嵌入的元数据",
+      "使用 Type.GetType(\"FullName\") 时不传程序集限定名，导致返回 null",
+      "热点路径用 MethodInfo.Invoke 循环调用，不做缓存或编译",
+      "给 EF 传 Func<T,bool> 而不是 Expression<Func<T,bool>>，导致全表内存过滤"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -166,6 +200,6 @@
     "dotnet.csharp.type-system"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「反射与特性」说清理解 Attribute 的概念和使用方法、掌握反射的常用 API，并放到.NET 工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察是否能从 Attribute 的编译时存储、反射 API 的成本结构、Expression Tree 的编译机制三个层次递进讲清 .NET 元编程，以及 AOT/Trim 下的工程边界和 Source Generator 替代路径。",
+  "updatedAt": "2026-06-22"
 }

@@ -4,26 +4,41 @@
   "category": "middleware",
   "group": "middleware",
   "title": "RocketMQ 与选型",
-  "summary": "理解 RocketMQ 的 NameServer、Broker、Topic/Queue、顺序消息、事务消息和延迟消息机制，并能和 RabbitMQ、Kafka 做选型对比。",
+  "summary": "RocketMQ 通过 NameServer 提供无状态路由发现、Broker Master-Slave 存储、MessageQueue 并行和顺序消费单元、CommitLog 顺序写保证吞吐；核心消息能力包括普通（同步/异步/单向）、顺序（同 key 进同一 Queue + 单线程消费）、延迟/定时（4.x 固定级别、5.x 按时间戳）、事务（半消息 + 回查 + 本地事务状态判断）。选型时按业务语义决定：事件流/回溯/流处理选 Kafka，灵活路由/AMQP 生态/低延迟业务消息选 RabbitMQ，交易链路事务消息/顺序消息/延迟消息且 Java 团队可运维选 RocketMQ。",
   "tags": [
     "Java",
     "中间件",
     "RocketMQ 与选型"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 39,
   "order": 90,
   "recommendWeight": 88,
   "learningCards": [
     {
       "type": "explain",
-      "title": "RocketMQ 与选型：RocketMQ 架构、消息类型",
-      "content": "## 一、RocketMQ架构\n### 1.1 整体架构\n```\n┌──────────────────────────────────────────────────────────────┐\n│                   RocketMQ架构                                │\n├──────────────────────────────────────────────────────────────┤\n│                                                              │\n│  ┌──────────┐                    ┌──────────────┐           │\n│  │Producer  │                    │  Consumer    │           │\n│  └─────┬────┘                    └──────┬───────┘           │\n│        │                                │                    │\n│        ↓                                ↓                    │\n│  ┌──────────────────────────────────────────────┐           │\n│  │              NameServer                      │           │\n│  │  （注册中心，无状态，节点间不通信）           │           │\n│  └──────────────────────────────────────────────┘           │\n│        │                                ↑                    │\n│        ↓ 注册/发现                      │ 拉取消息            │\n│  ┌──────────┐  ┌──────────┐  ┌────────┴─────┐              │\n│  │ Broker   │  │ Broker   │  │  Broker      │              │\n│  │ Master 1 │  │ Master 2 │  │  Slave       │              │\n│  │          │  │          │  │  (同步/异步)  │              │\n│  └──────────┘  └──────────┘  └──────────────┘              │\n│                                                              │\n│  核心组件：                                                   │\n│  - NameServer：注册中心，管理Broker地址                      │\n│  - Broker：消息服务器，存储和转发消息                        │\n│  - Producer：消息生产者                                      │\n│  - Consumer：消息消费者                                      │\n│  - Topic：消息主题                                           │\n│  - Queue：消息队列（类似Kafka的Partition）                   │\n└──────────────────────────────────────────────────────────────┘\n```\n\n## 二、消息类型\n### 2.1 普通消息\n```java\n// 同步发送\nDefaultMQProducer producer = new DefaultMQProducer(\"producer_group\");\nproducer.setNamesrvAddr(\"localhost:9876\");\nproducer.start();\nMessage msg = new Message(\"TopicTest\", \"TagA\", \"Hello RocketMQ\".getBytes());\nSendResult result = producer.send(msg);\n// result: SEND_OK / FLUSH_DISK_TIMEOUT / FLUSH_SLAVE_TIMEOUT / SLAVE_NOT_AVAILABLE\n// 异步发送\nproducer.send(msg, new SendCallback() {\n    @Override\n    public void onSuccess(SendResult result) {\n        log.info(\"发送成功：{}\", result);\n    }\n@Override\npublic void onException(Throwable e) {\n    log.error(\"发送失败\", e);\n}\n});\n// 单向发送（不关心结果）\nproducer.sendOneway(msg);\n```\n### 2.2 顺序消息\n保证同一业务ID的消息按顺序消费：\n```java\n// 生产端：相同orderId的消息发送到同一个Queue\nproducer.send(msg, new MessageQueueSelector() {\n    @Override\n    public MessageQueue select(List<MessageQueue> mqs, Message msg, Object arg) {\n        Integer orderId = (Integer) arg;\n        int index = orderId % mqs.size();\n        return mqs.get(index);\n    }\n}, orderId);\n// 消费端：单线程顺序消费\nconsumer.registerMessageListener(new MessageListenerOrderly() {\n    @Override\n    public ConsumeOrderlyStatus consumeMessage(List<MessageExt> msgs,\n    ConsumeOrderlyContext context) {\n        for (MessageExt msg : msgs) {\n            // 顺序处理\n            processMessage(msg);\n        }\n    return ConsumeOrderlyStatus.SUCCESS;\n}\n});\n```\n### 2.3 延迟消息\nRocketMQ 4.x 常见用固定延迟级别，RocketMQ 5.x 定时/延迟消息能力更灵活，面试要区分版本：\n```java\n// 延迟级别：1s 5s 10s 30s 1m 2m 3m 4m 5m 6m 7m 8m 9m 10m 20m 30m 1h 2h\nmsg.setDelayTimeLevel(3);  // 延迟10秒\n// RocketMQ 5.x 支持按投递时间表达更灵活的定时/延迟消息\nmsg.setDeliveryTimestamp(System.currentTimeMillis() + 60000);  // 延迟60秒\n```\n### 2.4 批量消息\n```java\n// 批量发送（同Topic，不支持延迟消息）\nList<Message> messages = new ArrayList<>();\nmessages.add(new Message(\"TopicTest\", \"TagA\", \"msg1\".getBytes()));\nmessages.add(new Message(\"TopicTest\", \"TagA\", \"msg2\".getBytes()));\nmessages.add(new Message(\"TopicTest\", \"TagA\", \"msg3\".getBytes()));\nproducer.send(messages);\n```\n\n## 三、事务消息\n### 3.1 事务消息原理\nRocketMQ的事务消息是面试重点，通过**半消息（Half Message）+ 事务回查**实现分布式事务。\n```\n┌──────────────────────────────────────────────────────────────┐\n│                   事务消息流程                                │\n├──────────────────────────────────────────────────────────────┤\n│                                                              │\n│  ① Producer发送半消息（Half Message）到Broker                │\n│     ↓                                                        │\n│  ② Broker存储半消息（对Consumer不可见），返回发送结果         │\n│     ↓                                                        │\n│  ③ Producer执行本地事务                                      │\n│     ↓                                                        │\n│  ④a 本地事务成功 → 发送Commit → Broker投递消息给Consumer     │\n│  ④b 本地事务失败 → 发送Rollback → Broker删除半消息           │\n│     ↓                                                        │\n│  ⑤ 如果Broker未收到Commit/Rollback → 定时回查Producer        │\n│     ↓                                                        │\n│  ⑥ Producer检查本地事务状态，返回Commit/Rollback             │\n│                                                              │\n│  半消息：消息已发送到Broker，但对Consumer不可见               │\n│  事务回查：Broker 按配置回查未确认的半消息，回查方法必须查询可靠本地事务状态           │\n└──────────────────────────────────────────────────────────────┘\n```\n### 3.2 事务消息代码实现\n```java\n// 事务消息生产者\nTransactionMQProducer producer = new TransactionMQProducer(\"tx_producer_group\");\nproducer.setNamesrvAddr(\"localhost:9876\");\n// 设置事务监听器\nproducer.setTransactionListener(new TransactionListener() {\n    @Override\n    public LocalTransactionState executeLocalTransaction(Message msg, Object arg) {\n        try {\n            // 执行本地事务（如数据库操作）\n            Order order = JSON.parseObject(msg.getBody(), Order.class);\n            orderMapper.insert(order);\n            // 本地事务成功，提交消息\n            return LocalTransactionState.COMMIT_MESSAGE;\n        } catch (Exception e) {\n            // 本地事务失败，回滚消息\n            return LocalTransactionState.ROLLBACK_MESSAGE;\n        }\n}\n@Override\npublic LocalTransactionState checkLocalTransaction(MessageExt msg) {\n    // 事务回查：检查本地事务状态\n    String orderId = msg.getProperty(\"orderId\");\n    Order order = orderMapper.selectById(orderId);\n    if (order != null) {\n        return LocalTransactionState.COMMIT_MESSAGE;  // 事务已提交\n    } else {\n        return LocalTransactionState.UNKNOW;  // 不确定，稍后再次回查\n    }\n}\n});\nproducer.start();\n// 发送事务消息\nMessage msg = new Message(\"TopicTest\", \"order\", JSON.toJSONString(order).getBytes());\nmsg.putUserProperty(\"orderId\", order.getId());\nSendResult result = producer.sendMessageInTransaction(msg, null);\n```\n### 3.3 事务消息注意事项\n- 半消息对Consumer不可见，需要Commit后才能被消费\n- 回查次数和间隔受 Broker 与客户端配置影响，不能把某个默认回查次数当成通用事实\n- 回查逻辑必须能可靠判断本地事务状态，不能只靠内存变量\n- 适用于分布式事务场景（如订单创建 + 库存扣减）"
+      "title": "RocketMQ 架构：NameServer 路由、Broker 存储、MessageQueue 并行",
+      "content": "RocketMQ 的架构分三层：NameServer 负责路由、Broker 负责存储转发、Producer/Consumer 负责生产和消费。\n\n**NameServer** 是无状态注册中心，多个 NameServer 之间互不通信。Broker 每隔 30 秒向所有 NameServer 发送心跳（包含 Topic 路由、Broker 地址和读写权限）。Producer 和 Consumer 启动时从 NameServer 拉取 Topic 路由表（Topic → 哪些 Broker 的哪些 MessageQueue），并定期更新（默认 30 秒）。NameServer 挂掉一个不影响整体服务——只要有一个存活就能提供路由查询。NameServer 不参与消息传输，只做路由注册和查询，所以压力很小。为什么不用 ZooKeeper？因为 NameServer 不需要选举、不需要一致性协议，功能单一到只需要维护一个内存路由表，运维简单。ZooKeeper 虽然能做注册中心，但引入了选举、watch、session 等额外复杂度。\n\n**Broker** 负责消息存储、投递和消费进度管理。Broker 部署通常是一主多从（Master-Slave）：Master 接收写入，Slave 同步或异步复制数据。同步复制（`brokerRole=SYNC_MASTER`）保证 Master 挂了数据不丢，但写入延迟更高；异步复制（`brokerRole=ASYNC_MASTER`）吞吐更高但可能丢少量数据。每个 Broker 有一个唯一的 `brokerId`，Master 是 0，Slave 大于 0。\n\n存储层面，RocketMQ 使用 **CommitLog + ConsumeQueue + IndexFile** 三层结构：\n- **CommitLog**：所有 Topic 的消息顺序追加写入同一个文件（默认 1GB），顺序写磁盘带来高吞吐\n- **ConsumeQueue**：每个 MessageQueue 维护一个逻辑队列，每个条目只记录消息在 CommitLog 中的偏移量和大小（8+4+8=20 字节），消费时通过 ConsumeQueue 快速定位到 CommitLog 中的消息\n- **IndexFile**：按消息 Key 或时间戳建立哈希索引，支持按 Key 查询和消息回溯\n\n**MessageQueue** 是 Topic 下的并行消费单元，类似 Kafka 的 Partition。一个 Topic 被拆成多个 MessageQueue 分布在不同 Broker 上。消费者通过 ConsumerGroup 消费 Topic 时，每个 MessageQueue 只能被同一个 ConsumerGroup 内的一个消费者分配（push 模式下由 rebalance 算法决定）。MessageQueue 的数量决定了消费者的最大并行度。"
     },
     {
       "type": "explain",
-      "title": "RocketMQ 与选型：MQ 选型对比、面试高频问题",
-      "content": "## 四、MQ选型对比\n### 4.2 选型建议\n```\n┌──────────────────────────────────────────────────────────────┐\n│                   MQ选型建议                                  │\n├──────────────────────────────────────────────────────────────┤\n│                                                              │\n│  RabbitMQ适合：                                              │\n│  - 中小规模、消息量不大的场景                                │\n│  - 需要复杂路由（Topic Exchange、Fanout等）                  │\n│  - 需要灵活路由、低延迟业务消息                                │\n│  - 团队熟悉AMQP协议                                          │\n│  - 企业级应用、管理界面友好                                  │\n│                                                              │\n│  Kafka适合：                                                  │\n│  - 大数据场景、日志收集、流式计算                            │\n│  - 超高吞吐、可回溯和流处理生态                                   │\n│  - 消息回溯、离线/在线消费                                   │\n│  - 与大数据生态（Spark、Flink、ELK）集成                     │\n│  - 不需要事务消息                                            │\n│                                                              │\n│  RocketMQ适合：                                              │\n│  - 电商、金融等对可靠性要求高的场景                          │\n│  - 需要事务消息（分布式事务）                                │\n│  - 需要延迟消息（定时任务）                                  │\n│  - 中大规模、需要消息回溯                                    │\n│  - Java技术栈，团队可以阅读源码                              │\n└──────────────────────────────────────────────────────────────┘\n```\n\n## 五、面试高频问题\n### Q1: RocketMQ的事务消息是如何实现的？\n**答**：\n1. Producer发送**半消息（Half Message）**到Broker\n2. Broker存储半消息，对Consumer不可见\n3. Producer执行本地事务\n4. 根据本地事务结果发送Commit或Rollback\n- Commit：消息变为可消费状态\n- Rollback：删除半消息\n5. 如果Broker未收到确认，定时**回查**Producer本地事务状态\n6. 回查次数和超时按配置控制，超过策略后要有告警和人工补偿\n**典型场景**：订单创建（本地事务）成功后才发送库存扣减消息\n### Q2: Kafka、RabbitMQ、RocketMQ各自适用于什么场景？\n**答**：\n- **Kafka**：大数据场景、日志收集、流式计算，追求超高吞吐量\n- **RabbitMQ**：中小规模、复杂路由、企业应用，追求易用性和低延迟\n- **RocketMQ**：电商金融、分布式事务、延迟消息，追求高可靠和丰富功能\n选型时考虑：消息量级、可靠性要求、功能需求（事务/延迟/回溯）、团队技术栈、运维成本。\n### Q3: RocketMQ的延迟消息是怎么实现的？和RabbitMQ有什么区别？\n**答**：\n- **RocketMQ**：RocketMQ 4.x 常见固定延迟级别，5.x 定时/延迟能力更灵活\n- 延迟消息先存入延迟Topic的内部队列\n- 到期后转移到目标Topic，对Consumer可见\n- RocketMQ 5.x 可按投递时间表达更灵活的定时/延迟需求\n- **RabbitMQ**：没有原生延迟队列\n- 方案一：TTL + 死信队列（消息过期后进入DLQ）\n- 方案二：延迟插件（rabbitmq_delayed_message_exchange）\n- **区别**：RocketMQ原生支持，更简单可靠；RabbitMQ需要额外配置\n### Q4: Kafka的Consumer如何保证消息不丢失？\n**答**：\n1. **关闭自动提交Offset**：`enable.auto.commit=false`\n2. **手动提交Offset**：处理完消息后再提交\n3. **处理逻辑**：\n```java\nwhile (true) {\n    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));\n    for (ConsumerRecord<String, String> record : records) {\n        process(record);  // 先处理\n    }\nconsumer.commitSync();  // 再提交Offset\n}\n```\n4. **注意**：如果处理一半宕机，重启后会从上次提交的Offset重新消费（可能重复），需要配合幂等性处理\n### Q5: 为什么Kafka用Pull模型而RabbitMQ用Push模型？各有什么优缺点？\n**答**：\n- **Kafka Pull模型**（消费者主动拉取）：\n- 优点：消费者控制消费速度，不会被压垮；可以批量拉取，提高效率\n- 缺点：如果没有新消息，消费者会空轮询（通过long poll优化）\n- **RabbitMQ Push模型**（Broker推送给消费者）：\n- 优点：消息到达后立即推送给消费者，实时性高\n- 缺点：如果消费者处理慢，可能被消息淹没（通过prefetch限制）\n\n## 六、参考资料\n- RocketMQ官方文档：https://rocketmq.apache.org/docs/\n- RocketMQ事务消息：https://rocketmq.apache.org/docs/featureBehavior/04transactionmessage\n- MQ选型对比：https://rocketmq.apache.org/docs/migration/01migration"
+      "title": "顺序消息：同 key 进同一 Queue，消费端单线程保序",
+      "content": "顺序消息要解决的问题是：同一个业务实体（如同一个订单）的多条消息必须被按发送顺序消费。这不是全局有序，而是**分区有序**（同一 key 的消息有序）。\n\n**生产端保序**：发送时通过 `MessageQueueSelector` 将相同业务 key（如 orderId）路由到同一个 MessageQueue。因为 MessageQueue 是 FIFO 队列，同 key 的消息在同一个 Queue 中自然有序。常见选择策略是取模：`key.hashCode() % queueCount`。注意：如果 Topic 扩容了 MessageQueue 数量，取模结果会变化，导致同一个 key 路由到不同 Queue——所以扩 Queue 时需要考虑顺序中断的影响。\n\n**消费端保序**：注册 `MessageListenerOrderly` 而不是 `MessageListenerConcurrently`。Orderly 模式下，消费端为每个分配到的 MessageQueue 维护一把锁，保证同一时刻只有一个线程消费同一个 Queue 中的消息。消息逐条或逐批（按 Queue 顺序）拉取，只有当前这批消费成功（返回 SUCCESS 或稍后重试）后才拉取下一批。这意味着单个消费者的并行度等于分配到的 MessageQueue 数量，而不是线程数。\n\n**顺序消息的风险**：\n- 消费失败会原地重试（而不是发到重试队列），阻塞整个 Queue 的后续消息\n- 如果某条消息的消费逻辑一直报错（如数据库死锁），会导致该 Queue 后面的消息全部堆积\n- 生产端选 Queue 的策略如果分布不均（热点 key），会造成某些 Queue 过载\n- 扩容 Queue 会打散 key 的映射关系，需要评估对业务的影响"
+    },
+    {
+      "type": "explain",
+      "title": "延迟消息与定时消息：4.x 固定级别 vs 5.x 灵活投递",
+      "content": "延迟消息的典型场景：订单超时取消、延迟通知、定时任务调度。\n\n**RocketMQ 4.x** 使用固定延迟级别，内置 18 个级别：1s、5s、10s、30s、1m、2m、3m、4m、5m、6m、7m、8m、9m、10m、20m、30m、1h、2h。通过 `msg.setDelayTimeLevel(level)` 设置。实现原理是：消息不直接投递到目标 Topic 的 ConsumeQueue，而是先写入内部延迟 Topic（`SCHEDULE_TOPIC_XXXX`），延迟服务定时扫描到期消息，然后投递到目标 Topic 的 ConsumeQueue。缺点是不能自定义延迟时间，只能从 18 个级别中选。\n\n**RocketMQ 5.x** 支持按投递时间戳设置更灵活的定时/延迟消息：`msg.setDeliveryTimestamp(timestamp)`。这允许任意精度的延迟时间（受 Broker 配置的最长时间限制）。5.x 还引入了定时消息的新架构，用时间轮替代了 4.x 的固定级别扫描，延迟精度更高。\n\n**实现机制的要点**：延迟消息在 Broker 内部经历了一次 Topic 转换——从延迟 Topic 到目标 Topic。这意味着消息在延迟期间对消费者不可见，延迟到期后才出现在目标 Topic 的 ConsumeQueue 中。如果 Broker 在延迟期间宕机，重启后延迟服务会继续处理到期消息（数据持久化在 CommitLog 中）。"
+    },
+    {
+      "type": "explain",
+      "title": "事务消息：半消息 + 本地事务 + Broker 回查",
+      "content": "事务消息解决的问题是：本地数据库操作和消息发送的原子性——要么都成功，要么都失败。典型场景是订单创建（本地 DB 插入）和库存扣减消息（发送给下游）的一致性。\n\n**流程（六步，顺序不能错）**：\n1. Producer 发送半消息（Half Message）到 Broker。半消息的 Topic 是 `RMQ_SYS_TRANS_HALF_TOPIC`，消费者不可见\n2. Broker 持久化半消息（写入 CommitLog），返回发送结果（SEND_OK）给 Producer\n3. Producer 收到 SEND_OK 后执行本地事务（如 `orderMapper.insert(order)`）\n4a. 本地事务成功 → Producer 发送 Commit → Broker 将半消息从内部 Topic 转移到目标 Topic，消费者可见\n4b. 本地事务失败 → Producer 发送 Rollback → Broker 删除半消息（标记为删除）\n5. 如果 Broker 在超时时间内未收到 Commit/Rollback（如 Producer 宕机、网络抖动），Broker 定时发起事务回查（调用 Producer 的 `checkLocalTransaction`）\n6. Producer 的回查方法查询本地事务状态（如查数据库看订单是否存在），返回 COMMIT/ROLLBACK/UNKNOW。返回 UNKNOW 则 Broker 稍后再次回查\n\n**回查机制的关键细节**：\n- 回查次数和间隔由 Broker 配置控制（`transactionCheckMax` 和 `transactionCheckInterval`），不要说死具体数字\n- 回查方法必须能从可靠状态（数据库、分布式缓存）判断本地事务结果，不能只靠内存变量（进程重启后丢失）\n- 如果本地事务执行很慢，可以在 `executeLocalTransaction` 中返回 UNKNOW（表示不确定），让 Broker 通过回查来最终确认\n- 事务消息不支持延迟消息和批量消息\n\n**事务消息的边界**：它保证的是「本地事务和消息投递」的最终一致性，不是强一致分布式事务。存在极短时间窗口（本地事务已提交但 Commit 尚未发送）内的一致性风险，如果此时 Producer 宕机，需要等回查来补偿。"
+    },
+    {
+      "type": "explain",
+      "title": "MQ 选型：按业务语义选，不按 QPS 数字选",
+      "content": "选型的核心原则是：先看业务需要什么语义，再看运维和生态能力，最后才看吞吐量数字。\n\n**Kafka 适合的场景**：大规模事件流（日志采集、埋点、用户行为流）、流式计算（与 Flink/Spark 集成）、需要消息回溯（按 offset 重新消费历史数据）、高吞吐（单机可达百万级 TPS）。Kafka 的 Pull 模型让消费者控制消费速率，Partition 内有序但不支持跨 Partition 全局有序。Kafka 的事务消息是 Kafka 内部事务（跨 Partition 原子写入），不是 RocketMQ 那种业务事务消息。Kafka 4.0+ 用 KRaft 替代 ZooKeeper 做元数据管理。\n\n**RabbitMQ 适合的场景**：复杂路由（Topic Exchange 按通配符路由、Fanout 广播、Direct 精确匹配、Headers 按属性路由）、低延迟业务消息（推模式，消息到达立即推送）、中小规模业务解耦、AMQP 协议生态。RabbitMQ 有成熟的确认机制（Publisher Confirm + Consumer Ack）和死信队列（DLX）。延迟消息没有原生支持，需要 TTL + 死信队列或延迟插件（`rabbitmq_delayed_message_exchange`）。\n\n**RocketMQ 适合的场景**：电商/金融交易链路（需要事务消息做最终一致）、需要局部顺序保证（同 key 有序）、需要延迟/定时消息（4.x 固定级别、5.x 灵活定时）、需要消息回溯（按时间戳回溯）、Java 技术栈且团队有能力运维（可以阅读和定制源码）。RocketMQ 的 Pull 模式（长轮询）兼顾了实时性和消费者自主控制。\n\n**选型决策树**：\n1. 需要事件流/回溯/流处理生态 → Kafka\n2. 需要复杂路由/AMQP 生态/低延迟业务消息 → RabbitMQ\n3. 需要事务消息/顺序消息/延迟消息 → RocketMQ\n4. 如果三者都不强需求 → 看团队技术栈和运维能力"
     },
     {
       "type": "diagram",
@@ -54,37 +69,61 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | RabbitMQ | Kafka | RocketMQ |\n| --- | --- | --- | --- |\n| 强项 | AMQP 路由灵活、业务消息、确认与死信成熟 | 高吞吐、事件流、可回溯、流处理生态 | 事务消息、顺序消息、延迟/定时消息、业务事件 |\n| 消息模型 | Exchange + Queue | Topic + Partition 日志 | Topic + MessageQueue + Broker |\n| 事务能力 | 有 AMQP 事务但生产常用 confirm；不等同业务事务消息 | 支持 Kafka 内部事务和幂等生产者 | 原生事务消息：半消息 + 本地事务 + 回查 |\n| 延迟能力 | TTL + DLX 或延迟插件 | 非核心原生能力，通常业务侧/调度系统实现 | 4.x 固定延迟级别，5.x 定时/延迟更灵活 |\n| 顺序能力 | 单 Queue 内有序 | Partition 内有序 | MessageQueue 内有序，支持按 message group/key 设计 |\n| 元数据/路由 | Broker 自身管理 | Kafka 4.0+ KRaft 主线 | NameServer |\n| 适用场景 | 中小型业务解耦、复杂路由 | 日志/大数据/流式计算 | 电商交易链路、最终一致、延迟/事务消息 |"
+      "title": "RabbitMQ vs Kafka vs RocketMQ 选型对比",
+      "content": "| 维度 | RabbitMQ | Kafka | RocketMQ |\n| --- | --- | --- | --- |\n| 架构模型 | Exchange + Queue，Broker 自管理元数据 | Topic + Partition 日志，4.0+ KRaft 去 ZooKeeper | NameServer 无状态路由 + Broker Master-Slave |\n| 消息语义 | Push 模式，到达即推，支持 prefetch 控速 | Pull 模式（长轮询），消费者控制速率 | Pull 模式（长轮询），兼顾实时和自主控制 |\n| 事务消息 | AMQP 事务（性能差）；生产常用 Publisher Confirm | Kafka 内部事务（跨 Partition 原子写入） | 业务事务消息：半消息 + 回查 + 本地事务 |\n| 顺序保证 | 单 Queue 内有序 | Partition 内有序 | MessageQueue 内有序，支持按业务 key 选 Queue |\n| 延迟/定时 | 无原生支持，需 TTL + DLX 或延迟插件 | 非原生能力，通常业务侧或调度系统实现 | 4.x 固定 18 级延迟，5.x 按时间戳灵活定时 |\n| 消息回溯 | 不支持，消费后删除 | 支持按 offset 回溯，可离线/在线消费 | 支持按时间戳回溯 |\n| 吞吐量 | 万级~十万级 TPS | 百万级 TPS（顺序写 + 零拷贝 + 批量） | 十万级~百万级 TPS（CommitLog 顺序写） |\n| 路由灵活性 | 最强（Topic/Fanout/Direct/Headers Exchange） | 按 Partition key 路由 | 按 Tag/Key 过滤，不如 RabbitMQ 灵活 |\n| 运维复杂度 | 低，管理界面友好 | 中等，4.0+ 简化；镜像集群较复杂 | 中等，NameServer 简单但 Broker 集群配置较多 |\n| 生态集成 | AMQP 标准，多语言 SDK 成熟 | 大数据生态（Flink/Spark/ELK/Connect） | Java 生态为主，Dubbo/Spring 集成好 |\n| 适用场景 | 中小规模业务解耦、复杂路由、低延迟 | 日志/大数据/流式计算/事件溯源 | 电商交易链路、事务消息、延迟/顺序消息 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "@Override\n    public void onSuccess(SendResult result) {\n        log.info(\"发送成功：{}\", result);\n    }\n    @Override\n    public void onException(Throwable e) {\n        log.error(\"发送失败\", e);\n    }\n});\n// 单向发送（不关心结果）\nproducer.sendOneway(msg);",
+      "title": "事务消息完整示例：半消息 + 本地事务 + 回查",
       "language": "java",
+      "content": "// 事务消息生产者\nTransactionMQProducer producer = new TransactionMQProducer(\"tx_order_group\");\nproducer.setNamesrvAddr(\"localhost:9876\");\n\n// 设置事务监听器：executeLocalTransaction 执行本地事务，checkLocalTransaction 回查状态\nproducer.setTransactionListener(new TransactionListener() {\n    @Override\n    public LocalTransactionState executeLocalTransaction(Message msg, Object arg) {\n        try {\n            Order order = JSON.parseObject(msg.getBody(), Order.class);\n            orderMapper.insert(order);  // 本地事务：插入订单\n            return LocalTransactionState.COMMIT_MESSAGE;\n        } catch (Exception e) {\n            return LocalTransactionState.ROLLBACK_MESSAGE;\n        }\n    }\n\n    @Override\n    public LocalTransactionState checkLocalTransaction(MessageExt msg) {\n        // 回查：必须从数据库等可靠状态判断\n        String orderId = msg.getProperty(\"orderId\");\n        Order order = orderMapper.selectById(orderId);\n        if (order != null) {\n            return LocalTransactionState.COMMIT_MESSAGE;\n        } else {\n            return LocalTransactionState.UNKNOW;  // 不确定，稍后再次回查\n        }\n    }\n});\nproducer.start();\n\n// 发送事务消息：sendMessageInTransaction 触发 executeLocalTransaction\nMessage msg = new Message(\"OrderTopic\", \"create\", JSON.toJSONString(order).getBytes());\nmsg.putUserProperty(\"orderId\", order.getId());\nSendResult result = producer.sendMessageInTransaction(msg, null);\n// result.getSendStatus() == SEND_OK 表示半消息已持久化\n\n// 顺序消息生产端示例：相同 orderId 路由到同一 Queue\nproducer.send(orderMsg, (mqs, m, arg) -> {\n    int orderId = (int) arg;\n    return mqs.get(orderId % mqs.size());\n}, orderId);\n\n// 顺序消息消费端：MessageListenerOrderly 保证单 Queue 内单线程消费\nconsumer.registerMessageListener((MessageListenerOrderly) (msgs, context) -> {\n    for (MessageExt msg : msgs) {\n        processOrder(msg);  // 按序处理\n    }\n    return ConsumeOrderlyStatus.SUCCESS;\n});",
       "highlights": [
         {
-          "line": 2,
-          "note": "「public void onSuccess(SendResult result) {」 是示例对外暴露的入口；讲「RocketMQ 与选型」时要围绕它说明输入、状态变化和调用方能观察到的结果。"
+          "line": 8,
+          "note": "executeLocalTransaction 在半消息发送成功后被调用，执行本地数据库操作。"
+        },
+        {
+          "line": 17,
+          "note": "checkLocalTransaction 由 Broker 定时回查触发，必须从数据库等可靠状态判断事务结果。"
+        },
+        {
+          "line": 28,
+          "note": "sendMessageInTransaction 同步发送半消息并触发本地事务，返回半消息的投递状态。"
+        },
+        {
+          "line": 33,
+          "note": "MessageQueueSelector 按业务 key 取模选择 Queue，保证同 key 消息进同一 Queue。"
+        },
+        {
+          "line": 38,
+          "note": "MessageListenerOrderly 为每个 Queue 维护锁，保证单 Queue 内单线程顺序消费。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：RocketMQ 的特点是面向业务消息场景提供较完整的能力：NameServer 路由发现、Broker 存储转发、普通/顺序/延迟/事务消息。选型时不要只看吞吐，要看“是否需要事务消息、延迟/定时消息、局部顺序、消息回溯和团队运维能力”。\n\n架构：NameServer 是无状态路由注册中心，Broker 定期上报 Topic 路由；Producer 和 Consumer 从 NameServer 获取路由后直连 Broker。Broker 负责消息存储、投递和消费进度管理，Topic 会拆成多个 MessageQueue，类似 Kafka Partition，是并行和顺序的基本单位。\n\n事务消息：Producer 先发半消息，Broker 存储但不投递；Producer 执行本地事务后提交 Commit 或 Rollback。若 Broker 长时间没收到确认，会回查 Producer 的本地事务状态。这里的关键不是“固定回查多少次”，而是回查方法必须能从数据库等可靠状态判断本地事务结果。\n\n选型：Kafka 适合大规模事件流、日志、Flink/Spark 集成和回溯；RabbitMQ 适合复杂路由、低延迟业务消息和 AMQP 生态；RocketMQ 适合交易链路里的事务消息、顺序消息和延迟/定时消息。",
+      "content": "**一句话结论**\nRocketMQ 面向业务消息场景，提供 NameServer 路由、Broker 存储、MessageQueue 并行消费单元，以及顺序消息、事务消息、延迟消息三大核心能力。选型按业务语义决定，不按吞吐数字选。\n\n**架构主线**\n- NameServer：无状态注册中心，节点间不通信，Broker 定期上报路由，Producer/Consumer 定期拉取路由\n- Broker：Master-Slave 部署，CommitLog 顺序写保证吞吐，ConsumeQueue 是消费索引\n- MessageQueue：Topic 下的并行和顺序消费单元，数量决定消费者最大并行度\n\n**核心消息类型**\n- 顺序消息：生产端按业务 key 选 Queue（MessageQueueSelector），消费端 MessageListenerOrderly 单 Queue 单线程\n- 事务消息：半消息 → 本地事务 → Commit/Rollback → Broker 超时回查\n- 延迟消息：4.x 固定 18 级（内部延迟 Topic 转换），5.x 按时间戳灵活定时\n\n**选型要点**\n- 需要事件流/回溯/流处理 → Kafka\n- 需要复杂路由/AMQP/低延迟 → RabbitMQ\n- 需要事务消息/顺序消息/延迟消息 → RocketMQ\n- 选型还要看团队技术栈、运维能力、监控告警体系",
       "followUpQuestions": [
         {
-          "question": "RocketMQ的核心特性和架构？",
-          "answer": "核心特性：1. 事务消息；2. 延迟消息；3. 消息过滤；4. 消息回溯；5. 死信队列。架构：NameServer（路由注册）→Broker（消息存储）→Producer/Consumer。存储：CommitLog（顺序写）+ConsumeQueue（逻辑队列）+IndexFile（索引）。"
+          "question": "RocketMQ 的事务消息如何保证本地事务和消息投递的一致性？",
+          "answer": "半消息先持久化到 Broker（对消费者不可见），Producer 执行本地事务后发 Commit/Rollback。如果确认丢失（如 Producer 宕机），Broker 定时回查 Producer 的本地事务状态。回查方法必须从数据库等可靠状态判断，不能用内存变量。保证的是最终一致性，不是强一致。"
         },
         {
-          "question": "MQ选型考虑哪些因素？",
-          "answer": "选型先看业务语义，不只看 QPS。需要事件流、回溯、流处理生态，优先 Kafka；需要灵活路由、业务队列、AMQP 生态，考虑 RabbitMQ；需要事务消息、顺序消息、延迟/定时消息，且 Java 团队能运维 RocketMQ，考虑 RocketMQ。还要看可靠性模型、消费幂等、监控告警、扩容和多机房方案。"
+          "question": "顺序消息的生产端和消费端分别怎么保证顺序？有什么限制？",
+          "answer": "生产端通过 MessageQueueSelector 将相同业务 key 路由到同一 MessageQueue。消费端注册 MessageListenerOrderly，为每个 Queue 维护锁，单线程消费。限制：消费失败会原地重试阻塞整个 Queue；热点 key 导致 Queue 过载；扩 Queue 会打散 key 映射。"
         },
         {
-          "question": "RocketMQ的事务消息原理？",
-          "answer": "事务消息流程：1. 发送半消息，消费者不可见；2. 执行本地事务；3. 根据本地事务结果 Commit 或 Rollback；4. 如果结果未知或确认丢失，Broker 回查本地事务状态；5. 回查方法必须查询数据库等可靠状态，不能只看进程内变量。适用最终一致场景，不是强一致分布式事务。"
+          "question": "RocketMQ 4.x 和 5.x 的延迟消息有什么区别？",
+          "answer": "4.x 使用固定 18 个延迟级别（1s 到 2h），消息先写入内部延迟 Topic，到期后投递到目标 Topic。5.x 支持按投递时间戳设置任意延迟时间，使用时间轮替代固定级别扫描，延迟精度更高。"
+        },
+        {
+          "question": "Kafka、RabbitMQ、RocketMQ 分别适合什么场景？",
+          "answer": "Kafka 适合大规模事件流、日志、流式计算、需要回溯和流处理生态。RabbitMQ 适合复杂路由、低延迟业务消息、AMQP 生态、中小规模。RocketMQ 适合交易链路的事务消息、顺序消息、延迟消息，Java 技术栈可运维。选型先看业务语义，再看运维和生态。"
+        },
+        {
+          "question": "线上 RocketMQ 消费者大量消费失败重试，Producer 端发送正常，怎么排查？",
+          "answer": "① 看消费日志和堆栈，定位失败原因（数据库超时、依赖服务不可用、消息格式解析失败）。② 检查重试策略：默认重试 16 次，间隔递增（10s 到 2h），如果消费逻辑一直报错会阻塞 Queue。③ 检查死信队列（%DLQ%ConsumerGroup）：多次重试失败的消息进入 DLQ，看 DLQ 消息内容判断根因。④ 检查 Broker 负载：消费失败重试会增加 Broker 压力，看 Broker 的消费进度延迟（ConsumerOffset vs MaxOffset）和重试队列堆积情况。⑤ 如果是顺序消息，消费失败会原地重试阻塞整个 Queue，优先排查顺序消息场景。"
         }
       ]
     },
@@ -92,62 +131,72 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说出RocketMQ的核心架构和组件",
-        "能解释NameServer与ZooKeeper的区别",
-        "能说出事务消息的实现原理",
-        "能解释顺序消息的实现方式",
-        "能说出延迟消息的使用场景",
-        "能对比RabbitMQ、Kafka、RocketMQ的适用场景",
-        "能根据业务需求做出合理的MQ选型"
+        "能画出 RocketMQ 架构：NameServer 路由发现 → Broker 存储转发 → MessageQueue 并行消费",
+        "能解释 NameServer 为什么不用 ZooKeeper：无状态、不需要选举和一致性协议",
+        "能说清 CommitLog + ConsumeQueue + IndexFile 三层存储结构各自的作用",
+        "能讲清顺序消息的生产端（MessageQueueSelector 选 Queue）和消费端（MessageListenerOrderly 单 Queue 单线程）机制",
+        "能完整描述事务消息六步流程：半消息 → 本地事务 → Commit/Rollback → Broker 超时回查",
+        "能说出 4.x 固定延迟级别和 5.x 按时间戳灵活定时的区别",
+        "能按业务语义对比 RabbitMQ（复杂路由/AMQP）、Kafka（事件流/回溯/流处理）、RocketMQ（事务/顺序/延迟）的适用场景",
+        "能说明顺序消息消费失败原地重试会阻塞整个 Queue 的风险"
       ]
     }
   ],
   "recallPrompts": [
     {
-      "prompt": "RocketMQ 的 NameServer、Broker、Producer、Consumer 四个角色各自负责什么？",
+      "prompt": "RocketMQ 的 NameServer、Broker、Producer、Consumer 四个角色各自负责什么？NameServer 为什么不用 ZooKeeper？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3,
       "id": "java.middleware.topic-081-89b01558.recall.1"
     },
     {
-      "prompt": "MQ选型考虑哪些因素，并说明关键机制和边界条件。",
+      "prompt": "RocketMQ 的事务消息完整流程是什么？回查机制的关键点是什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3,
       "id": "java.middleware.topic-081-89b01558.recall.2"
     },
     {
-      "id": "java.middleware.topic-081-89b01558.recall.3",
-      "prompt": "RocketMQ 与选型 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "MQ 选型时，Kafka、RabbitMQ、RocketMQ 分别适合什么场景？选型的核心决策因素是什么？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 3
+      "difficulty": 3,
+      "id": "java.middleware.topic-081-89b01558.recall.3"
     },
     {
-      "id": "java.middleware.topic-081-89b01558.recall.4",
       "prompt": "线上 RocketMQ 消费者出现大量消费失败重试，但 Producer 端发送正常。你会怎么从消费逻辑、重试策略、死信队列和 Broker 负载角度排查？",
       "mode": "text",
       "expectedMinutes": 6,
-      "difficulty": 3
+      "difficulty": 3,
+      "id": "java.middleware.topic-081-89b01558.recall.4"
+    },
+    {
+      "prompt": "RocketMQ 的顺序消息在生产端和消费端分别怎么保证顺序？有什么限制和风险？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3,
+      "id": "java.middleware.topic-081-89b01558.recall.5"
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说清 NameServer、Broker、Producer、Consumer 与 MessageQueue 的职责",
-      "能解释顺序消息如何按业务 key 落到同一 MessageQueue",
-      "能讲清事务消息的半消息、本地事务、Commit/Rollback 和回查",
-      "能按业务语义对比 RabbitMQ、Kafka、RocketMQ，而不是只背吞吐数字"
+      "能说清 NameServer、Broker、Producer、Consumer 与 MessageQueue 的职责，以及 NameServer 无状态设计的原因",
+      "能讲清事务消息的半消息、本地事务、Commit/Rollback 和回查六步流程",
+      "能解释顺序消息的生产端 MessageQueueSelector 选 Queue 和消费端 MessageListenerOrderly 单 Queue 单线程机制",
+      "能按业务语义对比 RabbitMQ（复杂路由/AMQP）、Kafka（事件流/回溯/流处理）、RocketMQ（事务/顺序/延迟）"
     ],
     "goodToHave": [
-      "能说出 RocketMQ 与选型 的源码关键类和扩展点",
-      "能解释 RocketMQ 与选型 与 Spring 生态其他组件的协作关系",
-      "能用具体示例、运行现象或可观测指标验证「RocketMQ 与选型」的判断"
+      "能说出 CommitLog + ConsumeQueue + IndexFile 三层存储结构的作用",
+      "能解释 4.x 固定延迟级别和 5.x 按时间戳灵活定时的区别及内部实现机制",
+      "能说明顺序消息消费失败原地重试阻塞整个 Queue 的风险和排查思路",
+      "能说出事务消息回查方法必须从可靠状态（数据库）判断，不能用内存变量"
     ],
     "commonMistakes": [
-      "对RocketMQ 与选型的核心概念理解不清晰",
-      "不能说出RocketMQ 与选型的关键实现细节",
-      "不了解RocketMQ 与选型的常见问题和解决方案"
+      "只背吞吐数字做选型，不看业务语义是否需要事务消息/顺序消息/延迟消息",
+      "把 Kafka 内部事务（跨 Partition 原子写入）和 RocketMQ 业务事务消息（半消息 + 回查）混为一谈",
+      "事务消息回查方法用内存变量判断状态，进程重启后丢失",
+      "顺序消息消费失败不处理，导致整个 Queue 后续消息堆积"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -156,9 +205,9 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「RocketMQ 与选型」说清能准确解释RocketMQ架构的核心概念、作用和适用边界、说清1.1 整体架构和1.2 NameServer vs ZooKeeper的关键机制，并放到Java 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察能否从架构（NameServer 路由、Broker 存储、MessageQueue 并行）、核心消息类型（顺序消息的 key 选 Queue + 单线程消费、事务消息的半消息 + 回查、延迟消息的版本差异）、MQ 选型（按业务语义选，不按 QPS 选）三个层次完整解释 RocketMQ，并能处理消费失败重试、顺序消息阻塞等线上排查场景。"
 }

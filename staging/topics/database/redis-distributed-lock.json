@@ -4,7 +4,7 @@
   "category": "redis-cache",
   "group": "redis-cache",
   "title": "Redis 分布式锁与一致性边界",
-  "summary": "理解 SET NX PX、唯一 token、Lua 释放、锁续期、Redlock 和 fencing token。",
+  "summary": "掌握 Redis 分布式锁基于 SET NX PX 的原子加锁、唯一标识 value 与 Lua 脚本的安全释放、锁续期机制的适用场景与风险、Redlock 的原理与局限，以及 fencing token 如何为外部强一致资源提供最终防线。",
   "tags": [
     "数据库",
     "Redis",
@@ -13,7 +13,7 @@
     "Fencing Token"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 25,
   "order": 120,
   "recommendWeight": 85,
   "status": "staging",
@@ -23,13 +23,28 @@
   "learningCards": [
     {
       "type": "explain",
-      "title": "Redis 分布式锁与一致性边界的职责边界",
-      "content": "Redis 分布式锁的基础写法是 SET key value NX PX，同时满足不存在才写入和自动过期。释放锁时必须校验 value 再删除，通常用 Lua 保证检查和删除原子执行。\n学习 Redis 分布式锁与一致性边界 时，可以先沿「客户端生成 token -> SET NX PX 加锁 -> 执行业务临界区 -> Lua 校验释放 -> fencing token 防旧写」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n- SET NX PX 保证加锁和过期时间设置是一个原子命令\n- value 使用唯一 token，释放锁时比较 token 后再删除\n- 续期机制要绑定业务生命周期，避免锁过期后任务仍在执行\n- fencing token 用单调递增版本让下游拒绝旧持有者写入\n\n把这条路径落回 Redis 分布式锁与一致性边界 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "Redis 分布式锁的正确构造与安全释放",
+      "content": "Redis 分布式锁的核心是保证「加锁」和「设置过期时间」的原子性。正确做法是使用单条命令 `SET resource_name unique_token NX PX milliseconds`。`NX` 保证仅当 key 不存在时才能设置成功，`PX` 保证设置的同时指定毫秒级过期时间，两者在 Redis 单线程中原子完成。如果分开执行 `SETNX` 和 `EXPIRE`，进程可能在两条命令之间崩溃，导致锁永远无法释放。\n\n`value`（即 unique_token）必须是全局唯一的随机字符串（如 UUID），它的唯一作用是标识锁的持有者。释放锁时，绝对不能直接执行 `DEL key`，因为当前锁可能因过期已为其他客户端持有，直接删除会误删别人的锁。必须先检查 value 是否为自己的 token，再执行删除。由于「检查」和「删除」是两个独立操作，需要使用 Lua 脚本保证原子性：\n```lua\nif redis.call('get', KEYS[1]) == ARGV[1] then\n    return redis.call('del', KEYS[1])\nelse\n    return 0\nend\n```\n这段脚本在 Redis 单线程中执行，保证了比较和删除之间不会被打断。\n\n注意：Redis 锁是「租约」模式，一旦持有者获得锁，就开始了倒计时（TTL）。Redis 本身不关心业务执行了多久，TTL 一到锁就会自动消失，这是所有后续问题的根源。"
     },
     {
       "type": "explain",
-      "title": "Redis 分布式锁与一致性边界的失败模式与排查",
-      "content": "真正难点在一致性边界：业务执行时间超过 TTL、持锁进程 STW 或网络抖动都可能让锁过期后又继续写外部资源。此时即使用了唯一 token，也只能防止误删别人的锁，不能防止旧持有者继续提交。\nRedis 分布式锁与一致性边界 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n- 锁 TTL 过短会提前过期，过长会降低故障恢复速度\n- Redlock 试图跨多个 Redis 实例降低单点风险，但仍依赖时钟和网络假设\n- Redis 锁只保护进入临界区，外部数据库或消息系统也要校验版本\n- 可重入、公平性和阻塞等待都不是 Redis 简单锁默认提供的能力\n\n排查时不要先猜结论，应把现象映射到 SET NX PX 加锁、执行业务临界区、Lua 校验释放 这些环节，再结合 锁 key TTL、业务耗时、续期日志、下游版本号、重复提交记录 验证。"
+      "title": "锁租约过期与业务执行超时：根本矛盾",
+      "content": "Redis 分布式锁最大的设计矛盾在于：锁的过期时间（TTL）是固定的，但业务执行时间是动态的。当业务执行时间超过 TTL 时，锁会自动过期，其他客户端可以重新获得锁，导致两个客户端同时认为自己持有锁，引发并发问题。\n\n典型触发场景：\n- **业务逻辑变慢**：下游数据库查询突然变慢，业务耗时超过 TTL\n- **GC STW（Stop The World）**：持有锁的 JVM 进程进入长时间 GC 暂停，暂停期间锁过期，GC 结束后进程继续执行，但锁已不属于它\n- **网络延迟或分区**：客户端获取锁后网络抖动，等网络恢复时锁已过期\n\n这些场景的共同特点是：客户端「主观」认为自己还持有锁，但 Redis（客观）已将锁分配给他人。这种主观与客观的不一致是分布式系统中租约模型的固有局限，无法通过单纯调整 TTL 根本解决。"
+    },
+    {
+      "type": "explain",
+      "title": "锁续期机制：自动续期的实现与边界",
+      "content": "为了解决业务执行时间不确定导致锁提前过期的问题，可以引入「锁续期」机制：在业务执行期间，定期（例如每隔 TTL/3 的时间）检查锁是否仍由自己持有，如果是则重置 TTL。\n\n常见的实现模式是后台守护线程（Watchdog）。例如 Redisson 客户端内置了看门狗机制：默认锁 TTL 为 30 秒，每 10 秒续期一次。只要客户端进程存活且业务仍在执行，锁就不会过期。进程崩溃后，看门狗随之停止，锁在 TTL 后自动释放。\n\n但续期机制有明确的边界和风险：\n- **续期不是万能的**：如果业务逻辑陷入死循环或无限等待，锁会被无限续期，相当于锁死资源。续期机制必须绑定业务的「合理执行时间上限」，超过阈值应主动放弃锁并终止业务。\n- **续期失败要停止业务**：如果续期操作因网络问题失败，业务必须尽快终止执行，否则会回到「锁过期但业务仍在执行」的老问题。\n- **续期无法解决 GC STW**：如果 JVM 发生长时间 GC，守护线程也被暂停，续期无法执行，锁照样过期。续期只能缓解业务变慢的问题，不能解决进程暂停的问题。"
+    },
+    {
+      "type": "explain",
+      "title": "Redlock：多节点互斥的尝试与争议",
+      "content": "单个 Redis 实例做分布式锁存在单点故障风险：如果该实例宕机，锁服务完全不可用。Redis 作者 Antirez 提出了 Redlock 算法，试图在多个独立 Redis 实例上实现更可靠的互斥。\n\n**Redlock 流程**：\n1. 获取当前时间（毫秒）\n2. 依次向 N 个（通常 5 个）独立的 Redis 实例请求加锁，使用相同的 key 和随机 value，每个实例设置较短的超时（如 5-50ms）\n3. 计算获取锁耗时，只有当在多数实例（≥ N/2 + 1）上加锁成功，且总耗时小于锁的 TTL 时，才认为获取锁成功\n4. 锁的有效时间 = TTL - 获取锁耗时\n5. 如果获取失败，向所有实例发送释放锁请求\n\n**争议与局限**：\n- **依赖时钟同步**：Redlock 假设各节点时钟大致同步，如果某个节点时钟跳跃，可能导致锁提前过期，破坏互斥。Martin Kleppmann 在其著名文章中指出，时钟跳跃（NTP 调整、闰秒）在生产环境中时有发生。\n- **网络延迟的不确定性**：即使在多数节点加锁成功，也存在「客户端 A 的锁在节点 1 过期，但客户端 B 还未在节点 1 加锁」的时间窗口，理论上仍可能出现两个客户端同时持有锁。\n- **正确性 vs 可用性**：单实例锁在主节点宕机时可能丢失锁（主从切换期间），Redlock 试图提高可用性，但引入了更复杂的失败模式。\n\n**实际选择**：对于大多数业务场景，单个 Redis 实例配合 fencing token 已经足够。如果业务对可用性要求极高（如金融交易），通常会选择 ZooKeeper 或 etcd 等基于共识算法的锁服务，而非 Redlock。"
+    },
+    {
+      "type": "explain",
+      "title": "Fencing Token：外部资源的最终防线",
+      "content": "Redis 锁（包括 Redlock）只能保证「在 Redis 内部」的互斥，无法控制客户端在获得锁之后、写入外部资源（如数据库）之前的行为。如果持有锁的客户端因 GC 暂停或网络延迟，导致锁过期后才向数据库发起写入，数据库无法判断这次写入是否合法。\n\nFencing token 解决这个问题的核心思想是：每次成功获取锁时，由锁服务生成一个单调递增的版本号（token），客户端在写入外部资源时必须携带这个 token，外部资源只接受比当前记录更大的 token。\n\n**工作流程**：\n1. 客户端 A 获取锁，得到 fencing token = 33\n2. 客户端 A 执行业务逻辑，但因 GC 暂停\n3. 客户端 A 的锁过期，客户端 B 获取锁，得到 fencing token = 34\n4. 客户端 B 完成业务，向数据库写入数据并记录 token = 34\n5. 客户端 A 恢复执行，尝试向数据库写入数据并携带 token = 33\n6. 数据库发现 33 < 34，拒绝这次写入\n\n**实现要点**：\n- Redis 本身不直接支持 fencing token，需要额外实现（如用 Redis INCR 命令生成递增 ID）\n- 外部存储（数据库）必须支持版本校验，可以在 WHERE 子句中加入 `AND version < new_version` 条件\n- Fencing token 是最后的防线，但增加了外部存储的复杂性。如果外部存储本身不支持条件写入，则无法使用 fencing token\n\n**关键认知**：Redis 锁是「进入临界区的门票」，fencing token 是「进入临界区后的安全带」。门票只能保证同一时间只有一个客户端进入，安全带保证即使门票过期，旧客户端也无法对外部资源造成破坏。"
     },
     {
       "type": "diagram",
@@ -86,9 +101,33 @@
       ]
     },
     {
+      "type": "code",
+      "title": "安全加锁、续期与释放的 Redisson 风格实现",
+      "language": "java",
+      "content": "import redis.clients.jedis.Jedis;\nimport redis.clients.jedis.params.SetParams;\nimport java.util.UUID;\nimport java.util.concurrent.*;\n\npublic class RedisDistributedLock {\n    private final Jedis jedis;\n    private final String lockKey;\n    private final String lockValue;\n    private final long ttlMillis;\n    private final ScheduledExecutorService scheduler;\n\n    public RedisDistributedLock(Jedis jedis, String lockKey, long ttlMillis) {\n        this.jedis = jedis;\n        this.lockKey = lockKey;\n        this.lockValue = UUID.randomUUID().toString();\n        this.ttlMillis = ttlMillis;\n        this.scheduler = Executors.newSingleThreadScheduledExecutor();\n    }\n\n    // 尝试获取锁\n    public boolean tryLock(long waitTime, TimeUnit unit) throws InterruptedException {\n        long deadline = System.currentTimeMillis() + unit.toMillis(waitTime);\n        while (true) {\n            // 原子加锁：SET key value NX PX ttl\n            String result = jedis.set(lockKey, lockValue, SetParams.setParams().nx().px(ttlMillis));\n            if (\"OK\".equals(result)) {\n                startRenewal(); // 启动续期\n                return true;\n            }\n            if (System.currentTimeMillis() > deadline) {\n                return false;\n            }\n            Thread.sleep(100); // 退避重试\n        }\n    }\n\n    // 释放锁：Lua 脚本保证原子性\n    private static final String UNLOCK_SCRIPT = \n        \"if redis.call('get', KEYS[1]) == ARGV[1] then \" +\n        \"  return redis.call('del', KEYS[1]) \" +\n        \"else \" +\n        \"  return 0 \" +\n        \"end\";\n\n    public boolean unlock() {\n        stopRenewal();\n        // 执行 Lua 脚本\n        Long result = (Long) jedis.eval(UNLOCK_SCRIPT, \n            Collections.singletonList(lockKey), \n            Collections.singletonList(lockValue));\n        return result != null && result == 1L;\n    }\n\n    // 启动续期（每 ttl/3 续期一次）\n    private ScheduledFuture<?> renewalTask;\n    private void startRenewal() {\n        long renewalInterval = ttlMillis / 3;\n        renewalTask = scheduler.scheduleAtFixedRate(() -> {\n            try {\n                // 续期：只有 value 匹配时才续期\n                String script = \n                    \"if redis.call('get', KEYS[1]) == ARGV[1] then \" +\n                    \"  return redis.call('pexpire', KEYS[1], ARGV[2]) \" +\n                    \"else \" +\n                    \"  return 0 \" +\n                    \"end\";\n                Long result = (Long) jedis.eval(script,\n                    Collections.singletonList(lockKey),\n                    java.util.Arrays.asList(lockValue, String.valueOf(ttlMillis)));\n                if (result == null || result == 0L) {\n                    // 锁已丢失，停止续期\n                    stopRenewal();\n                }\n            } catch (Exception e) {\n                // 续期失败，停止业务（此处简化处理）\n                stopRenewal();\n            }\n        }, renewalInterval, renewalInterval, TimeUnit.MILLISECONDS);\n    }\n\n    private void stopRenewal() {\n        if (renewalTask != null) {\n            renewalTask.cancel(false);\n        }\n    }\n}",
+      "highlights": [
+        {
+          "line": 19,
+          "note": "SET key value NX PX 原子加锁，避免 setnx+expire 分离导致的锁无法释放"
+        },
+        {
+          "line": 37,
+          "note": "Lua 脚本保证「检查 value」和「删除 key」的原子性，防止误删别人的锁"
+        },
+        {
+          "line": 52,
+          "note": "续期脚本也需检查 value，防止锁已丢失时错误续期"
+        },
+        {
+          "line": 60,
+          "note": "续期失败时停止续期任务，业务层应配合终止执行"
+        }
+      ]
+    },
+    {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：Redis 分布式锁可以提供近似互斥，但必须同时讲 token、TTL、Lua 释放和一致性边界。\n我会按这几层展开：\n1. 先说明正确加锁使用 SET NX PX，避免 setnx 和 expire 分离\n2. 再说明 value 必须是唯一 token，释放锁用 Lua 原子校验删除\n3. 然后讨论锁过期、续期、进程暂停和网络分区带来的旧持有者问题\n4. 最后补充高一致写入应使用 fencing token 或数据库版本约束兜底\n\n最后补充边界：如果业务要求严格线性一致，单纯 Redis 锁通常不够，需要下游资源参与校验。",
+      "content": "**结论**：Redis 分布式锁可以提供近似互斥，但必须同时讲 token、TTL、Lua 释放和一致性边界。\n\n**我会按这几层展开**：\n1. **正确加锁**：使用 SET NX PX 原子命令，避免 setnx 和 expire 分离\n2. **安全释放**：value 必须是唯一 token，释放锁用 Lua 脚本原子校验删除\n3. **租约矛盾**：锁 TTL 与业务执行时间的矛盾，GC STW 和网络分区带来的旧持有者问题\n4. **续期机制**：定期续期可以缓解但无法根治，续期失败必须停止业务\n5. **一致性边界**：Redis 锁只保护进入临界区，高一致写入应使用 fencing token 或数据库版本约束兜底\n6. **Redlock 争议**：多节点互斥的尝试，依赖时钟同步，存在争议\n\n**最后补充边界**：如果业务要求严格线性一致，单纯 Redis 锁通常不够，需要下游资源参与校验。可重入、公平性和阻塞等待都不是 Redis 简单锁默认提供的能力。\n\n**追问落点**：\n- 如何设计锁的 TTL？结合业务 P99 耗时和可容忍的故障恢复时间\n- 续期失败怎么办？业务必须尽快终止，避免旧持有者继续写入\n- Redlock 什么时候用？大多数场景单实例+token 足够，高可用需求考虑 ZooKeeper/etcd",
       "followUpQuestions": [
         {
           "question": "为什么释放锁要用 Lua？",
@@ -97,6 +136,10 @@
         {
           "question": "fencing token 解决什么问题？",
           "answer": "它给每次成功加锁分配递增版本，下游只接受更大的版本，旧持有者即使恢复执行也会因为版本落后被拒绝。"
+        },
+        {
+          "question": "锁续期失败了怎么办？",
+          "answer": "续期失败意味着锁可能即将过期或已过期，业务必须尽快终止执行，否则可能与其他客户端并发写入。续期机制必须绑定业务的合理执行时间上限。"
         }
       ]
     },
@@ -104,52 +147,61 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能写出 SET NX PX 加锁要点",
-        "能解释唯一 token 与 Lua 释放",
-        "能说明续期和过期边界",
-        "能讲清 fencing token 的价值"
+        "能写出 SET NX PX 加锁要点，并解释为什么不能 setnx+expire 分离",
+        "能解释唯一 token 与 Lua 释放的必要性，以及误删锁的风险",
+        "能说明 TTL、STW、网络分区带来的旧持有者问题，以及续期机制的边界",
+        "能讲清 fencing token 的价值，以及它如何为外部强一致资源提供最终防线",
+        "能说明 Redlock 的基本原理和时钟依赖的争议",
+        "能区分 Redis 锁（进入临界区门票）和 fencing token（临界区内安全带）的职责"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "database.redis-cache.redis-distributed-lock.recall.1",
-      "prompt": "Redis 分布式锁的正确加锁和释放流程是什么？",
+      "prompt": "Redis 分布式锁的正确加锁和释放流程是什么？为什么释放锁必须用 Lua 脚本？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "database.redis-cache.redis-distributed-lock.recall.2",
-      "prompt": "锁自动过期为什么仍可能导致并发写问题？",
+      "prompt": "锁自动过期为什么仍可能导致并发写问题？请结合 GC STW 或网络分区场景说明。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "database.redis-cache.redis-distributed-lock.recall.3",
-      "prompt": "Redlock 和 fencing token 分别想解决什么风险？",
+      "prompt": "Redlock 和 fencing token 分别想解决什么风险？它们各自的局限是什么？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "database.redis-cache.redis-distributed-lock.recall.4",
+      "prompt": "线上发现两个进程同时进入了 Redis 锁保护的临界区，你会怎么排查？",
+      "mode": "text",
+      "expectedMinutes": 5,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "说明 SET NX PX 的原子加锁语义",
-      "讲清唯一 token 与 Lua 释放避免误删",
+      "说明 SET NX PX 的原子加锁语义，以及为什么不能 setnx+expire 分离",
+      "讲清唯一 token 与 Lua 释放避免误删的必要性",
       "指出 TTL、STW 和网络分区带来的旧持有者风险",
       "能说明 fencing token 或版本校验的兜底作用"
     ],
     "goodToHave": [
-      "能比较 Redlock 与单实例锁边界",
+      "能比较 Redlock 与单实例锁边界，说明时钟依赖的争议",
       "能说明可重入和公平性不是默认能力",
       "能结合业务耗时设计续期停止条件"
     ],
     "commonMistakes": [
-      "setnx 后再 expire 导致非原子加锁",
-      "释放锁时直接 delete key",
-      "认为 Redis 锁能天然保证外部资源强一致"
+      "setnx 后再 expire 导致非原子加锁，进程崩溃后锁永远不释放",
+      "释放锁时直接 delete key，误删其他客户端的锁",
+      "认为 Redis 锁能天然保证外部资源强一致，忽略 fencing token 的必要性"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -158,5 +210,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-23"
 }

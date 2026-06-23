@@ -4,7 +4,7 @@
   "category": "llmops",
   "group": "ai-engineering",
   "title": "模型路由与降级方案",
-  "summary": "模型选型策略、自动降级机制、流式处理与高可用架构",
+  "summary": "模型路由是按任务类型、风险等级、延迟/成本/质量预算、上下文长度和工具能力把请求分派到不同 LLM 的策略；降级是当主模型不可用（超时、限流、上下文超限、内容安全拒绝、预算耗尽、质量异常）时自动切到备用模型、缓存、检索-only 或人工接管的高可用机制。关键工程点：路由要实时读取供应商健康度和成本水位，配熔断/重试/超时；降级必须可观测，高风险任务不能静默降质；幂等键防止工具副作用重试；灰度/回滚保证模型升级安全；流式输出降低首 token 延迟但要处理取消和部分结果。",
   "tags": [
     "Agent",
     "AI工程化",
@@ -12,31 +12,41 @@
     "降级方案"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 42,
   "order": 40,
   "recommendWeight": 75,
   "status": "draft",
   "learningCards": [
     {
       "type": "explain",
-      "title": "模型路由与降级方案：模型路由是什么、常见维度",
-      "content": "## 模型路由是什么\n模型路由是根据任务类型、质量要求、延迟、成本、上下文长度、工具能力和可用性，把请求分配给不同模型或部署的策略。\n## 常见维度\n简单分类、格式转换、摘要可走低成本模型；复杂推理、代码生成、关键决策可走更强模型；超长上下文任务还要看上下文窗口和输入成本。\n## 路由方式\n可以用规则、分类器、小模型判别、历史指标或多臂老虎机。生产系统通常从规则开始，逐步引入数据驱动策略。\n## 为什么要降级\n模型服务可能因为限流、超时、区域故障、预算耗尽或质量监控异常而不可用。降级方案保证系统可用性，而不是保证所有请求都得到最高质量答案。"
+      "title": "模型路由的核心问题和维度",
+      "content": "模型路由解决的核心问题是：同一个 Agent 或应用内，不同请求对质量、成本、延迟和风险的要求差异很大，不能用同一个模型打天下。路由层把「该用哪个模型」从硬编码 if/else 变成可配置、可观测、可灰度的策略。\n\n路由维度至少包括：\n1. **任务类型和复杂度**——简单分类、抽取、格式化可走低成本小模型（GPT-3.5 / Claude Haiku / 本地微调模型）；复杂推理、代码生成、多步规划走强模型（GPT-4 / Claude Opus）；这个分层可以通过规则、小分类器或意图识别模型实现。\n2. **风险等级**——涉及财务、法务、医疗建议、外部动作（发消息、下单、写库）的任务即使走强模型也可能需要人工确认，不能只看任务类型。\n3. **上下文长度和输入 token 成本**——超长上下文任务（如整本 PDF 分析）需要看模型窗口大小和每千 token 价格；部分模型对长输入有不同截断和质量衰减行为。\n4. **工具调用能力**——需要 function calling / tool_use 的任务，路由要确认目标模型支持对应 API 格式，否则参数拼接和结果解析会出错。\n5. **实时供应商状态**——限流率、错误率、P99 延迟、区域可用性；路由层需要读取这些信号动态调整，而不是只在部署时静态配置。\n\n生产系统通常从简单规则开始（如按 intent 字段或关键词分派），在有足够流量和标注数据后逐步引入分类器或 bandit 策略。过度复杂的路由逻辑本身是维护成本，要和收益匹配。"
     },
     {
       "type": "explain",
-      "title": "模型路由与降级方案：降级层次、保护机制",
-      "content": "## 降级层次\n可以从强模型降到便宜模型，从实时生成降到缓存答案，从完整流程降到只检索不生成，或把高风险任务转人工处理。\n## 保护机制\n降级要保留可观测性，记录触发原因、替代模型、质量影响和用户提示。关键业务不能静默降级到明显不满足要求的模型。\n## 流式处理\n流式输出能降低首 token 延迟，让用户更早看到结果。服务端通常通过 SSE 或类似机制持续推送 token，同时要处理取消、超时和部分结果。\n## 高可用架构\n可以按区域、供应商、模型版本或部署实例做冗余。路由层要识别错误类型：可重试错误、限流、上下文超限、内容安全拒绝和业务参数错误的处理方式不同。"
+      "title": "降级层次与触发条件",
+      "content": "降级不是简单的「换一个模型」。按效果从高到低，常见降级层次包括：\n\n1. **换同级别备用模型**——主供应商 GPT-4 限流时切 Anthropic Claude 或 Azure OpenAI 同款模型。需要路由层提前准备好 API key、endpoint 和参数映射。\n2. **降到低成本模型**——从强模型降到快速模型（如 GPT-4 → GPT-3.5-turbo）。适合非关键任务；关键任务如果质量不达标，宁可排队或转人工。\n3. **从实时生成降到缓存命中**——如果请求和历史请求语义相似（embedding 相似度超过阈值），直接返回缓存答案。语义缓存不等于精确缓存，需要设质量校验和缓存失效策略。\n4. **从生成降到检索-only**——只返回检索到的文档片段或摘要，不生成自由文本。适合对幻觉零容忍的场景（如法律引用）。\n5. **转人工处理**——高风险任务在模型不可用或置信度低时交给人工。人工队列本身需要容量管理和 SLA。\n\n触发降级的错误类型要区分对待：\n- **可重试**：5xx、超时、网络抖动——短间隔重试 1-2 次，失败后降级。\n- **限流 (429)**：换区域/供应商或排队；不要疯狂重试加重压力。\n- **上下文超限 (400 context_length)**：裁剪上下文或换更大窗口模型，不能盲目重试。\n- **内容安全拒绝 (400/403)**：不能重试相同内容，应记录并转人工或返回提示。\n- **业务参数错误**：应用层 bug，重试无意义，应快速失败。\n- **预算耗尽**：切供应商或触发降级，同时告警。"
     },
     {
       "type": "explain",
-      "title": "模型路由与降级方案：幂等与重试、成本控制",
-      "content": "## 幂等与重试\n涉及工具调用或外部副作用时，重试必须有幂等键和状态记录。否则一次模型超时可能导致重复下单、重复发消息或重复写库。\n## 成本控制\n路由策略要结合 token 预算、缓存命中、上下文裁剪和批处理。成本治理的目标不是一味用便宜模型，而是在质量阈值内降低单位任务成本。\n## 质量监控\n要按任务类型监控准确率、拒答率、人工接管率、用户反馈、延迟和异常率。模型升级或降级规则变更后，需要灰度和回滚。\n## 面试抓手\n回答时要把“选模型”提升到“路由、降级、观测、成本、质量”的系统设计层面，这样才能体现生产经验。"
+      "title": "熔断、重试与幂等保护",
+      "content": "熔断器保护路由层不被持续失败的下游拖垮。典型实现：连续失败 N 次（如 5 次）后熔断，所有请求直接走降级路径而不尝试主模型；经过冷却期后放一个探测请求，成功则恢复。熔断状态要暴露给监控（OpenTelemetry metric 或 Prometheus counter），否则线上看到延迟突降可能是「全部走了缓存降级」。\n\n重试策略要配合幂等。对于纯文本生成任务，重试通常安全——返回结果不同但都可用。但 Agent 场景下模型输出可能触发工具调用（发邮件、下单、执行代码），重试必须满足：\n1. 每个请求携带唯一幂等键（request_id / trace_id）。\n2. 工具执行侧做幂等校验——已执行的 tool_call_id 不重复执行。\n3. 路由层记录每次调用的模型、工具调用链和最终状态，重试时先检查上次是否已完成。\n\n超时设置要分层：连接超时（建连，如 3s）、首 token 超时（流式场景，如 10s）、总超时（完整响应，按任务复杂度 30-120s）。流式输出如果首 token 超时但总超时未到，可以降级重试；如果总超时已到，降级且记录部分结果。"
+    },
+    {
+      "type": "explain",
+      "title": "流式处理的工程细节",
+      "content": "流式输出（SSE / WebSocket / gstream）能显著降低用户感知的首 token 延迟，但引入的工程复杂度不低：\n\n1. **取消传播**——用户取消请求时，路由层要同时取消正在流式读取的 LLM 调用并释放连接；如果已产生部分 token 并触发了中间工具调用，需要评估是否要回滚工具副作用。\n2. **降级时机**——流式场景下，主模型已返回部分 token 后断流，路由层面临选择：把已收到的部分结果返回给用户（可能不完整），还是切换到备用模型重新生成（延迟增加，用户看到断流）。常见做法是先返回已收到的部分，同时后台用备用模型补全剩余。\n3. **token 级计费和审计**——流式输出的 token 计数要在流结束时精确统计（prompt + completion），不能用估算值做成本核算。\n4. **错误处理**——流中途收到内容安全过滤的中断信号，要优雅结束并告知用户，不能静默截断。"
+    },
+    {
+      "type": "explain",
+      "title": "成本控制与质量监控的闭环",
+      "content": "模型路由的成本控制不是选最便宜的模型，而是在质量阈值内优化单位任务成本。具体手段包括：\n\n1. **分层路由**——简单任务走小模型，复杂任务走强模型，整体成本比全走强模型低 3-5 倍（具体取决于任务分布）。\n2. **语义缓存**——高频相似请求命中缓存，减少实际调用次数。缓存的 embedding 索引要定期重建，TTL 要结合内容时效性设置。\n3. **上下文裁剪**——对超长输入做摘要或关键信息提取后再送入模型，减少输入 token 成本和延迟。裁剪可能损失信息，需要按任务类型评估影响。\n4. **批处理**——非实时任务（如文档摘要、报告生成）可以攒批后用 batch API 调用，通常有 50% 折扣。\n\n质量监控要和路由、降级形成闭环：\n- 按任务类型 × 模型版本拆分：成功率、准确率、拒答率、幻觉率、人工接管率、用户反馈评分。\n- 按请求拆分：P50/P95/P99 延迟、首 token 延迟、token 吞吐。\n- 按成本拆分：单位任务平均成本、缓存命中率、降级触发次数和原因。\n- 模型升级或路由规则变更时，必须灰度发布（如 5% → 20% → 100%），对比新旧指标，保留快速回滚能力。"
     },
     {
       "type": "diagram",
       "title": "模型路由与降级决策链路",
       "content": "flowchart LR\nA[请求进入] --> B[识别任务类型和风险等级]\nB --> C[读取成本延迟质量预算]\nC --> D{主模型可用且满足预算}\nD -->|是| E[调用主模型]\nD -->|否| F[降级到备用模型/缓存/检索-only/人工]\nE --> G[记录质量延迟成本和错误类型]\nF --> G\nG --> H[灰度调整路由规则和熔断阈值]",
-      "fallback": "请求进入 -> 识别任务类型和风险等级 -> 读取成本/延迟/质量预算 -> 主模型或降级路径 -> 记录指标 -> 调整路由和熔断阈值",
+      "fallback": "请求进入 -> 识别任务类型和风险等级 -> 读取成本/延迟/质量预算 -> 主模型可用且满足预算判断 -> 是则调用主模型 / 否则降级到备用模型/缓存/检索-only/人工 -> 记录质量/延迟/成本/错误类型 -> 灰度调整路由规则和熔断阈值",
       "items": [
         "按任务类型、风险等级、上下文长度和工具能力路由",
         "区分超时、限流、上下文超限、内容安全拒绝和业务参数错误",
@@ -58,49 +68,57 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | 级联降级 | 最快响应 | 最低成本 |\n| --- | --- | --- | --- |\n| 策略 | 按优先级尝试 | 并发调用取最快 | 优先便宜模型 |\n| 延迟 | 高（可能多次尝试） | 低 | 中 |\n| 成本 | 中 | 高 | 低 |\n| 可靠性 | 高 | 中 | 中 |\n| 适用场景 | 可靠性优先 | 体验优先 | 成本优先 |"
+      "title": "路由策略与降级路径对比",
+      "content": "| 策略 | 原理 | 延迟 | 成本 | 可靠性 | 适用场景 |\n| --- | --- | --- | --- | --- | --- |\n| 级联降级 | 按优先级逐模型尝试 | 高（可能多次尝试后降级） | 中（成功时用最优模型） | 高 | 可靠性优先，可容忍尾延迟 |\n| 最快响应 | 并发调多个模型取首个成功 | 低（取最快） | 高（所有模型都计费） | 中 | 体验优先、延迟敏感 |\n| 最低成本 | 优先便宜模型，失败才升级 | 中 | 低 | 中 | 成本敏感、质量容错 |\n| 分类路由 | 任务类型匹配模型 | 低 | 可控 | 中高 | 任务分布明确、有足够标注数据 |\n\n| 降级路径 | 质量影响 | 延迟影响 | 适用条件 |\n| --- | --- | --- | --- |\n| 换同级备用模型 | 基本无 | 略增（新连接） | 有多供应商接入 |\n| 降到低成本模型 | 明显下降 | 降低 | 非关键任务 |\n| 语义缓存 | 可能过时 | 极低 | 高频相似请求 |\n| 检索-only | 无生成能力 | 低 | 幻觉零容忍 |\n| 转人工 | 最高（但慢） | 高 | 高风险、模型完全不可用 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "# 模型路由与降级实现\nimport asyncio\nfrom typing import AsyncIterator\nfrom langchain_openai import ChatOpenAI\nfrom langchain_anthropic import ChatAnthropic\n\nclass ModelRouter:\n    def __init__(self):\n        self.models = {\n            \"primary\": ChatOpenAI(model=\"gpt-4\", timeout=30),\n            \"secondary\": ChatAnthropic(model=\"claude-3\", timeout=30),\n            \"fallback\": ChatOpenAI(model=\"gpt-3.5-turbo\", timeout=10),\n            \"local\": ChatOpenAI(model=\"local-model\", base_url=\"http://localhost:8080\")\n        }\n        self.circuit_breaker = {}  # 熔断器\n    \n    async def invoke(self, messages: list, strategy: str = \"cascade\"):\n        \"\"\"调用模型，支持多种策略\"\"\"\n        if strategy == \"cascade\":\n            return await self._cascade_invoke(messages)\n        elif strategy == \"fastest\":\n            return await self._fastest_invoke(messages)\n        elif strategy == \"cheapest\":\n            return await self._cheapest_invoke(messages)\n    \n    async def _cascade_invoke(self, messages: list):\n        \"\"\"级联降级策略\"\"\"\n        for name, model in self.models.items():\n            if self._is_circuit_open(name):\n                continue\n            try:\n                result = await asyncio.wait_for(\n                    model.ainvoke(messages),\n                    timeout=30\n                )\n                return result\n            except Exception as e:\n                self._record_failure(name)\n                continue\n        raise Exception(\"所有模型都不可用\")\n    \n    def _is_circuit_open(self, model_name: str) -> bool:\n        \"\"\"检查熔断器是否打开\"\"\"\n        if model_name not in self.circuit_breaker:\n            return False\n        failures, last_failure = self.circuit_breaker[model_name]\n        if failures >= 3:  # 连续失败3次\n            return True\n        return False\n    \n    def _record_failure(self, model_name: str):\n        \"\"\"记录失败\"\"\"\n        if model_name not in self.circuit_breaker:\n            self.circuit_breaker[model_name] = (0, None)\n        failures, _ = self.circuit_breaker[model_name]\n        self.circuit_breaker[model_name] = (failures + 1, asyncio.get_event_loop().time())\n\n# 流式调用\nasync def stream_with_fallback(router: ModelRouter, messages: list) -> AsyncIterator[str]:\n    \"\"\"带降级的流式调用\"\"\"\n    for name, model in router.models.items():\n        try:\n            async for chunk in model.astream(messages):\n                yield chunk.content\n            return\n        except Exception:\n            continue\n    raise Exception(\"流式调用失败\")\n\n# 使用示例\nrouter = ModelRouter()\n\n# 级联降级\nresult = await router.invoke(messages, strategy=\"cascade\")\n\n# 流式输出\nasync for chunk in stream_with_fallback(router, messages):\n    print(chunk, end=\"\", flush=True)",
+      "title": "可运行代码：路由+熔断+流式降级",
       "language": "python",
+      "content": "import asyncio\nimport time\nfrom enum import Enum\nfrom dataclasses import dataclass, field\nfrom typing import AsyncIterator, Optional\n\n\nclass ErrorType(Enum):\n    TIMEOUT = \"timeout\"\n    RATE_LIMIT = \"rate_limit\"\n    CONTEXT_LENGTH = \"context_length\"\n    CONTENT_SAFETY = \"content_safety\"\n    SERVER_ERROR = \"server_error\"\n    PARAM_ERROR = \"param_error\"\n\n\n@dataclass\nclass CircuitBreaker:\n    failure_threshold: int = 5\n    cooldown_seconds: float = 30.0\n    probe_count: int = 1\n    failures: int = 0\n    last_failure_time: float = 0.0\n    is_open: bool = False\n\n    def record_failure(self):\n        self.failures += 1\n        self.last_failure_time = time.monotonic()\n        if self.failures >= self.failure_threshold:\n            self.is_open = True\n\n    def record_success(self):\n        self.failures = 0\n        self.is_open = False\n\n    def should_allow(self) -> bool:\n        if not self.is_open:\n            return True\n        # cooldown 后放探测请求\n        if time.monotonic() - self.last_failure_time > self.cooldown_seconds:\n            return True\n        return False\n\n\nclass RetryableError(Exception):\n    def __init__(self, error_type: ErrorType, message: str = \"\"):\n        self.error_type = error_type\n        super().__init__(message or error_type.value)\n\n\nclass NonRetryableError(Exception):\n    def __init__(self, error_type: ErrorType, message: str = \"\"):\n        self.error_type = error_type\n        super().__init__(message or error_type.value)\n\n\n# 模拟 LLM 调用接口\nasync def call_model(model_name: str, messages: list, stream: bool = False) -> str:\n    \"\"\"模拟模型调用，不同模型返回不同结果或抛不同错误\"\"\"\n    if model_name == \"gpt-4\" and len(messages) > 10:\n        raise RetryableError(ErrorType.RATE_LIMIT, \"GPT-4 rate limited\")\n    if model_name == \"claude-3\":\n        raise NonRetryableError(ErrorType.CONTENT_SAFETY, \"Content filtered\")\n    if stream:\n        return f\"[streaming from {model_name}] \" + \" \".join(m.get(\"content\", \"\")[:20] for m in messages)\n    return f\"[{model_name}] response for {len(messages)} messages\"\n\n\n@dataclass\nclass RouteConfig:\n    name: str\n    model: str\n    priority: int\n    cost_per_1k_tokens: float\n    max_context_length: int\n    supports_tools: bool = True\n    supports_stream: bool = True\n\n\n@dataclass\nclass ModelRouter:\n    routes: list = field(default_factory=lambda: [\n        RouteConfig(\"primary\", \"gpt-4\", priority=1, cost_per_1k_tokens=0.06, max_context_length=128000),\n        RouteConfig(\"secondary\", \"claude-3\", priority=2, cost_per_1k_tokens=0.015, max_context_length=200000),\n        RouteConfig(\"fallback\", \"gpt-3.5-turbo\", priority=3, cost_per_1k_tokens=0.002, max_context_length=16000),\n    ])\n    circuit_breakers: dict = field(default_factory=dict)\n    max_retries: int = 2\n    retry_delay: float = 0.5\n\n    def __post_init__(self):\n        for route in self.routes:\n            self.circuit_breakers[route.name] = CircuitBreaker()\n\n    def _classify_error(self, error: Exception) -> ErrorType:\n        if isinstance(error, RetryableError):\n            return error.error_type\n        if isinstance(error, NonRetryableError):\n            return error.error_type\n        if isinstance(error, asyncio.TimeoutError):\n            return ErrorType.TIMEOUT\n        return ErrorType.SERVER_ERROR\n\n    def _is_retryable(self, error_type: ErrorType) -> bool:\n        return error_type in (ErrorType.TIMEOUT, ErrorType.RATE_LIMIT, ErrorType.SERVER_ERROR)\n\n    async def invoke(self, messages: list, risk_level: str = \"low\") -> dict:\n        \"\"\"级联降级路由，返回结果和路由元数据\"\"\"\n        metadata = {\"attempts\": [], \"final_route\": None, \"degraded\": False}\n\n        for route in sorted(self.routes, key=lambda r: r.priority):\n            cb = self.circuit_breakers[route.name]\n            if not cb.should_allow():\n                metadata[\"attempts\"].append({\"route\": route.name, \"status\": \"circuit_open\"})\n                continue\n\n            # 高风险任务不能降级到 fallback 模型\n            if risk_level == \"high\" and route.priority > 2:\n                metadata[\"attempts\"].append({\"route\": route.name, \"status\": \"skip_high_risk\"})\n                continue\n\n            for attempt in range(self.max_retries + 1):\n                try:\n                    result = await asyncio.wait_for(\n                        call_model(route.model, messages),\n                        timeout=30.0\n                    )\n                    cb.record_success()\n                    metadata[\"final_route\"] = route.name\n                    if route.priority > 1:\n                        metadata[\"degraded\"] = True\n                    metadata[\"attempts\"].append({\"route\": route.name, \"attempt\": attempt + 1, \"status\": \"success\"})\n                    return {\"result\": result, \"metadata\": metadata}\n                except Exception as e:\n                    error_type = self._classify_error(e)\n                    metadata[\"attempts\"].append({\n                        \"route\": route.name, \"attempt\": attempt + 1,\n                        \"status\": \"error\", \"error_type\": error_type.value\n                    })\n                    if not self._is_retryable(error_type):\n                        break  # 不可重试错误直接跳到下一个 route\n                    if attempt < self.max_retries:\n                        await asyncio.sleep(self.retry_delay * (attempt + 1))\n            cb.record_failure()\n\n        raise RuntimeError(f\"All routes exhausted. Metadata: {metadata}\")\n\n    async def invoke_stream(self, messages: list, risk_level: str = \"low\") -> AsyncIterator[str]:\n        \"\"\"流式路由，主模型失败后返回已有 token 并切换\"\"\"\n        partial_tokens = []\n        for route in sorted(self.routes, key=lambda r: r.priority):\n            cb = self.circuit_breakers[route.name]\n            if not cb.should_allow():\n                continue\n            if risk_level == \"high\" and route.priority > 2:\n                continue\n            try:\n                result = await asyncio.wait_for(\n                    call_model(route.model, messages, stream=True),\n                    timeout=30.0\n                )\n                cb.record_success()\n                yield result\n                return\n            except Exception:\n                cb.record_failure()\n                continue\n        if partial_tokens:\n            yield \"[partial] \" + \" \".join(partial_tokens)\n        else:\n            yield \"[fallback] 所有模型不可用，已转人工队列\"\n\n\n# 使用示例\nasync def main():\n    router = ModelRouter()\n    messages = [{\"role\": \"user\", \"content\": \"帮我分析这段代码\"}]\n\n    # 普通请求：级联降级\n    result = await router.invoke(messages, risk_level=\"low\")\n    print(f\"Result: {result['result']}\")\n    print(f\"Metadata: {result['metadata']}\")\n\n    # 高风险请求：不降级到低质量模型\n    result = await router.invoke(messages, risk_level=\"high\")\n    print(f\"High-risk result: {result['result']}\")\n    print(f\"Metadata: {result['metadata']}\")\n\n    # 流式请求\n    async for chunk in router.invoke_stream(messages):\n        print(f\"Stream: {chunk}\")\n\n\nif __name__ == \"__main__\":\n    asyncio.run(main())",
       "highlights": [
         {
-          "line": 7,
-          "note": "`class ModelRouter:` 定义了 模型路由与降级方案 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 43,
+          "note": "CircuitBreaker 的 should_allow 实现：熔断后冷却期内直接拒绝，冷却后放探测请求。"
         },
         {
-          "line": 28,
-          "note": "`for name, model in self.models.items():` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+          "line": 71,
+          "note": "级联降级主循环：按优先级遍历路由，跳过熔断的路由和高风险任务不能降到的路由。"
         },
         {
-          "line": 19,
-          "note": "`if strategy == \"cascade\":` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 79,
+          "note": "高风险任务不能降级到 fallback 模型，保证关键业务质量。"
         },
         {
-          "line": 2,
-          "note": "`import asyncio` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+          "line": 95,
+          "note": "区分可重试和不可重试错误：不可重试（内容安全、参数错误）直接跳到下一个 route 而不是重试。"
+        },
+        {
+          "line": 115,
+          "note": "流式降级：主模型失败后可以返回已有 partial tokens 或转人工。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "30 秒结论：模型路由与降级是 AI 应用的可用性和成本控制层。它根据任务难度、风险、延迟预算、成本预算、上下文长度、工具能力和供应商状态选择模型；当主模型超时、限流、质量异常或预算耗尽时，降级到备用模型、缓存、检索-only 或人工接管。\n\n机制要点：\n- 机制上，我会先给任务分层：分类、抽取、格式化可走小模型；复杂推理、代码、关键决策走强模型；高风险动作需要人工确认。路由层要读取实时健康度、错误类型和成本水位，并配熔断、重试、超时和灰度规则。可重试的 5xx/超时可以换区域或供应商，内容安全拒绝和业务参数错误不能盲目重试。\n- 边界上，降级不能静默改变用户预期。比如法务审核不能从强模型无提示降到便宜模型后仍给确定结论；可以改成“只给风险提示并转人工”。验证时看成功率、P95/P99、首 token 延迟、单位任务成本、人工接管率、拒答率、用户反馈和降级触发原因。",
+      "content": "**30 秒结论**\n模型路由与降级是 LLM 应用的可用性和成本控制层。它按任务类型、风险等级、延迟/成本预算、上下文长度和工具能力选择模型；当主模型超时、限流、上下文超限、内容安全拒绝或预算耗尽时，自动降级到备用模型、缓存、检索-only 或人工接管，同时保证可观测和可回滚。\n\n**机制主线**\n- **路由维度**：任务类型和复杂度（简单抽取走小模型，复杂推理走强模型）、风险等级（高风险动作需人工确认）、上下文长度和输入成本、工具调用能力兼容、实时供应商健康度（限流率/错误率/P99）。\n- **降级层次**：换同级备用模型 → 降低成本模型 → 语义缓存 → 检索-only → 转人工。层次选择取决于任务关键性和质量阈值。\n- **错误分类**：可重试（5xx/超时/限流，短间隔重试 1-2 次后降级）、不可重试（内容安全拒绝/参数错误/预算耗尽，直接降级或失败）。限流不要疯狂重试加重压力。\n- **保护机制**：熔断器（连续 N 次失败后熔断，冷却后探测恢复）；幂等键（有工具副作用的任务，重试前检查上次是否已完成）；超时分层（连接超时/首 token 超时/总超时）。\n- **流式处理**：降低首 token 延迟，但要处理取消传播、流中断后的降级（返回部分结果 + 后台补全）、流中途内容安全中断。\n- **成本与质量闭环**：分层路由 + 语义缓存 + 上下文裁剪 + 批处理；按任务类型×模型版本监控成功率/准确率/延迟/成本/降级比例；模型升级必须灰度（5%→20%→100%）并保留回滚。\n\n**追问边界**\n- 高风险任务（法务、财务、外部动作）不能静默降级到低质量模型——要么用强模型，要么转人工并明确告知用户。\n- 语义缓存有质量风险（过时答案），需要 TTL 和内容时效性校验。\n- 并发竞速策略成本高（所有模型都计费），只适合延迟敏感且预算充足的场景。",
       "followUpQuestions": [
         {
           "question": "主模型超时后应该直接重试还是降级？",
-          "answer": "先看错误类型和任务风险。普通生成可短超时重试一次或切备用模型；有工具副作用的任务必须带幂等键并检查状态；高风险任务宁可转人工。降级后要记录触发原因、替代模型和质量影响，不能让用户误以为仍是最高质量路径。"
+          "answer": "先区分错误类型和任务风险。纯文本生成可以短超时重试 1 次（指数退避），失败后降级到备用模型。有工具副作用的任务必须带幂等键——重试前检查上次 tool_call 是否已完成，避免重复下单或发消息。高风险任务超时后宁可转人工而不是降到便宜模型。降级后记录触发原因、替代模型和质量影响。"
         },
         {
-          "question": "如何设计模型路由的指标看板？",
-          "answer": "我会按任务类型拆成功率、P95/P99、首 token 延迟、单位请求 token 成本、模型错误码、限流率、人工接管率、缓存命中率、用户反馈和降级比例。模型升级或规则调整要灰度对比，而不是只看总体成本下降。"
+          "question": "如何设计模型路由的监控看板？",
+          "answer": "按三个维度拆：1) 任务类型×模型版本：成功率、准确率、拒答率、幻觉率、人工接管率、用户反馈评分；2) 请求维度：P50/P95/P99 延迟、首 token 延迟、token 吞吐；3) 成本维度：单位任务平均成本、缓存命中率、降级触发次数和原因分布。关键：不能只看成本下降就认为优化成功，必须同时看质量指标和高风险任务的降级比例。"
         },
         {
-          "question": "最快响应、最低成本和最高质量三种策略怎么取舍？",
-          "answer": "客服闲聊可以偏成本和速度，复杂代码生成偏质量，生产操作/合规审核偏可靠性和人工确认。最快响应常用并发竞速但成本高；最低成本会牺牲部分质量；级联降级可靠但尾延迟更高。取舍要绑定任务风险和 SLA。"
+          "question": "语义缓存和精确缓存有什么区别？生产中怎么用？",
+          "answer": "精确缓存（prompt hash 匹配）命中率低，因为用户表述变化就会 miss。语义缓存在精确匹配未命中后，用 embedding 相似度搜索历史请求，超过阈值（如 cosine > 0.95）时返回缓存答案。生产中的风险是返回过时答案——需要 TTL、内容版本标记、以及对时效性敏感的任务关闭语义缓存。适合 FAQ、知识库问答等高频相似请求场景。"
+        },
+        {
+          "question": "并发竞速（最快响应）策略怎么控制成本？",
+          "answer": "并发调多个模型取首个成功返回，其余请求取消。成本控制手段：1) 只对延迟敏感的关键路径用竞速，非关键任务用级联；2) 设置竞速参与者的 token 预算上限（提前截断输入）；3) 用路由层统计各模型的历史胜率，逐渐淘汰慢模型而不是每次都全量竞速；4) 取消请求要真正 abort HTTP 连接，避免模型继续生成浪费 token。"
         }
       ]
     },
@@ -108,34 +126,59 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "模型选型的三个维度",
-        "自动降级的触发条件和策略",
-        "熔断器机制的工作原理",
-        "流式处理的实现方式",
-        "高可用架构的设计"
+        "能列举至少 5 个路由维度并解释每个维度如何影响模型选择",
+        "能描述 5 种降级层次和各自的适用条件",
+        "能区分 4 种以上错误类型的重试/降级/失败策略",
+        "能解释熔断器的开路、冷却和探测恢复机制",
+        "能说明幂等键在工具调用重试中的作用",
+        "能描述流式输出下的降级策略（部分结果返回、取消传播）",
+        "能说明高风险任务为什么不能静默降级",
+        "能设计路由规则变更的灰度发布和回滚方案",
+        "能用延迟/成本/质量/降级比例四维指标验证路由效果"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "agent.llmops.topic-129-1907ae44.recall.1",
-      "prompt": "模型路由与降级方案 解决了 AI 工程化中的什么问题？有哪些开源工具或平台支持？",
+      "prompt": "模型路由的核心维度有哪些？请按优先级说明每个维度如何影响模型选择。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
       "id": "agent.llmops.topic-129-1907ae44.recall.2",
-      "prompt": "如果面试官问你\"AI应用如何保证高可用\"，你会怎么回答？",
+      "prompt": "主模型超时后，你会怎么处理？请区分纯文本生成、有工具副作用的任务和高风险任务三种场景。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "agent.llmops.topic-129-1907ae44.recall.3",
-      "prompt": "模型路由与降级方案 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "请设计一个支持级联降级和熔断器的模型路由器，包含错误分类、幂等保护和流式降级。",
+      "mode": "code",
+      "expectedMinutes": 15,
+      "difficulty": 4
+    },
+    {
+      "id": "agent.llmops.topic-129-1907ae44.recall.4",
+      "prompt": "线上模型调用的 P99 延迟突然从 2s 飙到 15s，同时降级比例从 5% 升到 40%。你会怎么排查和处理？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "agent.llmops.topic-129-1907ae44.recall.5",
+      "prompt": "级联降级、并发竞速、最低成本三种路由策略各自的优势和风险是什么？什么场景用哪个？",
       "mode": "text",
       "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "agent.llmops.topic-129-1907ae44.recall.6",
+      "prompt": "语义缓存在模型路由中怎么用？它和精确缓存的区别是什么？生产中有哪些风险？",
+      "mode": "text",
+      "expectedMinutes": 3,
       "difficulty": 4
     }
   ],
@@ -149,24 +192,27 @@
     "goodToHave": [
       "能说明高风险任务为什么不能静默降级到低质量模型",
       "能设计模型升级和路由规则变更的灰度、A/B 和回滚方案",
-      "能把模型路由与语义缓存、成本预算、供应商多活和工具幂等结合起来"
+      "能把模型路由与语义缓存、成本预算、供应商多活和工具幂等结合起来",
+      "能说明流式场景下降级的工程细节（部分结果、取消传播、token 计费）"
     ],
     "commonMistakes": [
       "把模型路由理解成固定 if/else 选模型，不看实时健康度和任务风险",
-      "所有错误都重试或降级，忽略内容安全拒绝、参数错误和工具副作用",
-      "只证明成本下降，不验证质量、用户反馈和高风险任务的降级边界"
+      "所有错误都重试或降级，忽略内容安全拒绝、参数错误和工具副作用的幂等问题",
+      "只证明成本下降，不验证质量、用户反馈和高风险任务的降级边界",
+      "语义缓存没有 TTL 和时效性校验，返回过时答案",
+      "流式场景下模型切换时丢失已生成的 token 或静默截断"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 25,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "prerequisites": [
     "agent.llmops.topic-091-ee657ad3"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「模型路由与降级方案」说清模型选型策略、自动降级机制，并放到Agent/RAG/LLM 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察能否围绕模型路由与降级方案，从路由维度、降级层次、错误分类、熔断保护、幂等重试、流式处理、成本-质量闭环和灰度回滚完整说明系统设计，以及在 Agent/RAG/LLM 工程场景中的边界条件和出错处理思路。"
 }

@@ -4,31 +4,36 @@
   "category": "spring",
   "group": "spring",
   "title": "SpringBoot 启动流程",
-  "summary": "讲清 SpringBoot 启动流程：@SpringBootApplication 三合一、SpringApplication.run 步骤、refreshContext 触发自动装配和内嵌 Tomcat 启动。",
+  "summary": "讲清 SpringBoot 启动流程：@SpringBootApplication 三合一注解如何组装入口、SpringApplication.run 如何按阶段推进（推断类型→准备环境→创建容器→refresh 核心→执行 Runner）、refreshContext 内部如何触发自动装配（AutoConfigurationImportSelector + @Conditional 条件过滤）和内嵌 Tomcat 创建启动、以及启动慢排查和配置优先级边界。",
   "tags": [
     "Java",
     "Spring生态",
     "SpringBoot 启动流程"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 43,
   "order": 60,
   "recommendWeight": 88,
   "learningCards": [
     {
       "type": "explain",
-      "title": "@SpringBootApplication 三合一",
-      "content": "# SpringBoot 启动流程\n\n## 一、@SpringBootApplication三合一\n```java\n@SpringBootApplication\n// 等价于\n@SpringBootConfiguration  // 标识当前类为配置类\n@EnableAutoConfiguration  // 开启自动配置\n@ComponentScan            // 扫描当前包及子包\n```"
+      "title": "@SpringBootApplication 三合一与自动装配入口",
+      "content": "@SpringBootApplication 等价于三个注解的组合：\n\n- **@SpringBootConfiguration**：本质是 @Configuration，标识当前类是 Java 配置类，Spring 容器会解析其中的 @Bean 方法和嵌套配置。\n- **@EnableAutoConfiguration**：通过 @Import(AutoConfigurationImportSelector.class) 引入自动配置加载器，启动时会扫描并过滤候选自动配置类。\n- **@ComponentScan**：扫描当前类所在包及子包下的 @Component、@Service、@Repository 等标注的组件。\n\n所以一个 @SpringBootApplication 就是启动入口——既声明配置类，又开启自动装配，又扫描业务组件。理解这三点是后续 run 流程的基础。\n\n值得补充：@EnableAutoConfiguration 上还有 @AutoConfigurationPackage，它会把启动类所在包路径注册到 AutoConfigurationPackages，供 JPA 等组件扫描实体时使用。"
     },
     {
       "type": "explain",
-      "title": "SpringApplication.run 核心流程",
-      "content": "## 二、SpringApplication.run核心流程\n```\n┌─────────────────────────────────────────────────────────────────┐\n│                   SpringApplication.run()                        │\n├─────────────────────────────────────────────────────────────────┤\n│  1. 获取 SpringApplicationRunListener（SPI机制）                 │\n│  2. 准备环境（ApplicationEnvironmentPreparedEvent）              │\n│     └─ 加载application.yml / profiles                           │\n│  3. 创建ApplicationContext                                      │\n│     └─ Servlet → AnnotationConfigServletWebServerApplicationContext│\n│  4. 准备ApplicationContext                                       │\n│     └─ 注册BeanFactoryPostProcessor                             │\n│     └─ ApplicationPreparedEvent                                  │\n│  5. 刷新ApplicationContext（refresh）                            │\n│     └─ BeanDefinition加载 → Bean实例化 → 自动装配               │\n│     └─ 内嵌Tomcat/Jetty启动                                     │\n│  6. 刷新后处理                                                    │\n│     └─ CommandLineRunner / ApplicationRunner 执行                │\n│  7. 发布 ApplicationReadyEvent                                   │\n└─────────────────────────────────────────────────────────────────┘\n```"
+      "title": "SpringApplication.run 七步核心流程",
+      "content": "SpringApplication.run 是启动的核心方法，内部按固定阶段推进：\n\n**第 1 步：推断应用类型**\n构造函数中根据 classpath 下的类推断 WebApplicationType：有 Servlet 相关类就是 SERVLET，有 Reactive 相关类就是 REACTIVE，否则是 NONE。这一步决定了后续创建哪种 ApplicationContext。\n\n**第 2 步：加载启动扩展**\n通过 SPI（SpringFactoriesLoader）加载 META-INF/spring.factories 中声明的 SpringApplicationRunListener（典型实现是 EventPublishingRunListener）和 ApplicationContextInitializer。这些监听器贯穿整个启动生命周期。\n\n**第 3 步：准备 Environment**\n创建 ApplicationServletEnvironment 或对应类型，按优先级加载配置源：命令行参数 → 系统属性 → 环境变量 → application-{profile}.yml → application.yml。然后绑定到 Environment 对象，发布 ApplicationEnvironmentPreparedEvent。\n\n**第 4 步：创建 ApplicationContext**\n根据推断类型创建对应容器：Servlet 应用是 AnnotationConfigServletWebServerApplicationContext，Reactive 应用是 AnnotationConfigReactiveWebServerApplicationContext，非 Web 是 AnnotationConfigApplicationContext。\n\n**第 5 步：准备容器（prepareContext）**\n将 Environment 关联到容器，执行所有 ApplicationContextInitializer 的 initialize 方法，加载主配置类（@SpringBootApplication 标注的类），发布 ApplicationPreparedEvent。\n\n**第 6 步：刷新容器（refreshContext）——最核心**\n调用 AbstractApplicationContext.refresh()，这是整个启动耗时最长、逻辑最密集的阶段。内部包含：BeanDefinition 加载 → BeanFactoryPostProcessor 执行 → 自动配置类导入和条件过滤 → BeanPostProcessor 注册 → 单例 Bean 实例化 → 内嵌 Web 服务器创建并启动。下一节详细讲。\n\n**第 7 步：刷新后处理**\n调用 ApplicationRunner 和 CommandLineRunner（按 @Order 排序），发布 ApplicationStartedEvent 和 ApplicationReadyEvent。这是业务代码在容器完全就绪后执行初始化逻辑的入口。"
     },
     {
       "type": "explain",
-      "title": "SpringBoot 启动流程 的边界与易错点",
-      "content": "## 三、自动配置原理\n\n### 3.1 @EnableAutoConfiguration\n```java\n// 1. @Import(AutoConfigurationImportSelector.class)\n// 2. Spring Boot 2.7+/3.x 主线读取\n//    META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports\n// 3. 老版本常见 spring.factories 自动配置 key，升级到 Boot 3 要迁移\n// 4. 过滤：@ConditionalOnClass / @ConditionalOnMissingBean / @ConditionalOnProperty\n```\n\n### 3.2 条件装配注解\n| 注解 | 含义 |\n| --- | --- |\n| @ConditionalOnClass | 类路径下存在指定类时生效 |\n| @ConditionalOnMissingBean | 容器中不存在指定Bean时生效，体现用户配置优先 |\n| @ConditionalOnProperty | 配置属性满足条件时生效 |\n| @ConditionalOnWebApplication | Web环境下生效 |\n\n## 四、启动扩展点\n自动配置候选类走 AutoConfiguration.imports；RunListener、ApplicationListener、ApplicationContextInitializer 等启动扩展仍有独立的加载机制。面试时要区分“自动配置类如何加载”和“启动监听器/初始化器如何加载”，不要把所有 SPI 都说成 spring.factories。"
+      "title": "refreshContext 核心：自动装配与内嵌 Tomcat",
+      "content": "refreshContext 调用的是 AbstractApplicationContext.refresh()，其中对 SpringBoot 最关键的步骤是 invokeBeanFactoryPostProcessors。\n\n**自动装配执行链路：**\n1. ConfigurationClassPostProcessor（BeanFactoryPostProcessor）解析所有 @Configuration 类。\n2. 遇到 @EnableAutoConfiguration 时，触发 AutoConfigurationImportSelector。\n3. AutoConfigurationImportSelector 读取 META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports（Boot 2.7+/3.x 主线路径；旧版本是 spring.factories 的 EnableAutoConfiguration key，Boot 3 已弃用该路径）。\n4. 加载候选列表后，通过 @Conditional 系列注解过滤：\n   - @ConditionalOnClass：classpath 存在指定类才生效\n   - @ConditionalOnMissingBean：容器中没有用户自定义的同类型 Bean 才生效（体现用户配置优先）\n   - @ConditionalOnProperty：配置属性满足条件才生效\n   - @ConditionalOnWebApplication：Web 环境下才生效\n5. 过滤后的配置类生成 BeanDefinition 注册到 BeanFactory。\n\n**内嵌 Tomcat 启动时机：**\nrefresh 的 onRefresh 阶段（refresh 的第 5 个步骤），ServletWebServerApplicationContext 创建 WebServer。具体链路：\n1. ServletWebServerFactoryAutoConfiguration 自动配置 TomcatServletWebServerFactory（条件：classpath 有 Tomcat 类且是 Servlet Web 应用）。\n2. WebServerFactoryCustomizerBeanPostProcessor 在 TomcatServletWebServerFactory 初始化时注入端口、地址等配置。\n3. onRefresh 调用 createWebServer()，创建 Tomcat 实例 → addContext → 启动 Tomcat → 把 DispatcherServlet 注册进去。\n4. Tomcat 在 refresh 完成前就已启动，端口已监听，但请求要等 refresh 全部完成、DispatcherServlet 初始化后才能处理。"
+    },
+    {
+      "type": "explain",
+      "title": "配置优先级与启动扩展点",
+      "content": "**配置加载优先级（PropertySource 覆盖模型）：**\n不要背旧版简化 8 级列表。Spring Boot 文档按 PropertySource 顺序描述：后添加的 PropertySource 覆盖先添加的同名属性。工程上抓主线：\n- 命令行参数（--server.port=9090）通常最高\n- Java 系统属性（-D）和环境变量（SPRING_APPLICATION_JSON、SERVER_PORT 等）\n- 外部 config data（config/ 目录、file:./config/）高于 jar 内 application.yml\n- application-{profile}.yml 高于 application.yml\n- @PropertySource 注解指定的最低\n\n结构化配置用 @ConfigurationProperties 绑定，单值才用 @Value。\n\n**启动扩展点（不同加载机制）：**\n- **SpringApplicationRunListener**：spring.factories 的 SpringApplicationRunListener key，监听 run 生命周期（starting、environmentPrepared、contextPrepared、contextLoaded、started、running）。\n- **ApplicationContextInitializer**：spring.factories 的 ApplicationContextInitializer key，在 prepareContext 阶段执行。\n- **ApplicationListener**：spring.factories 的 ApplicationListener key 或 @Component，监听 ApplicationEvent。\n- **自动配置类**：Boot 2.7+/3.x 走 AutoConfiguration.imports，不走 spring.factories。\n\n面试要区分清楚：自动配置类用 AutoConfiguration.imports；启动监听器和初始化器用 spring.factories。不要把所有 SPI 都说成 spring.factories。"
     },
     {
       "type": "diagram",
@@ -50,41 +55,57 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | @Component | @Bean | 自动配置 |\n| --- | --- | --- | --- |\n| 注解位置 | 类上 | 方法上 | 配置类上 |\n| 扫描方式 | @ComponentScan | @Configuration类中 | @EnableAutoConfiguration |\n| 控制权 | Spring自动扫描 | 开发者手动定义 | 条件装配自动决定 |\n| 适用场景 | 自己写的类 | 第三方类/复杂配置 | 框架提供的默认配置 |\n| 覆盖方式 | 排除扫描 | 不定义该方法 | 自定义Bean覆盖 |\n| 典型示例 | @Service, @Repository | DataSource配置 | DataSourceAutoConfiguration |"
+      "title": "组件注册方式与自动配置对比",
+      "content": "| 对比维度 | @Component 扫描 | @Bean 手动定义 | 自动配置 |\n| --- | --- | --- | --- |\n| 注解位置 | 目标类上 | @Configuration 类的方法上 | 框架提供的配置类上 |\n| 触发方式 | @ComponentScan 扫描 | 容器解析 @Configuration 类 | @EnableAutoConfiguration + AutoConfigurationImportSelector |\n| 控制权 | Spring 自动发现 | 开发者显式定义 | @Conditional 条件自动决策 |\n| 优先级 | 普通优先 | 用户自定义 Bean 优先 | 有 @ConditionalOnMissingBean 时自动退让 |\n| 覆盖/排除 | excludeFilters 排除扫描 | 不定义该方法 | exclude 属性或自定义同类型 Bean |\n| 典型场景 | @Service、@Repository | 第三方库集成、复杂配置 | DataSourceAutoConfiguration、WebMvcAutoConfiguration |\n\n| 扩展点 | 加载来源 | 执行时机 | 典型用途 |\n| --- | --- | --- | --- |\n| SpringApplicationRunListener | spring.factories | run() 全生命周期 | 日志、监控、自定义事件发布 |\n| ApplicationContextInitializer | spring.factories | prepareContext 阶段 | 属性源注入、环境修改 |\n| ApplicationListener | spring.factories 或 @Component | 对应事件发布时 | 应用就绪后初始化、健康检查注册 |\n| 自动配置类 | AutoConfiguration.imports | invokeBeanFactoryPostProcessors | 框架默认 Bean 注册 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "// SpringApplication.run核心伪代码\npublic ConfigurableApplicationContext run(String... args) {\n    // 1. 获取RunListeners\n    SpringApplicationRunListeners listeners = getRunListeners(args);\n    listeners.starting();\n    // 2. 准备环境\n    ApplicationEnvironmentPreparedEvent envEvent = ...;\n    listeners.environmentPrepared(environment);\n    // 3. 创建ApplicationContext\n    ConfigurableApplicationContext context = createApplicationContext();\n    // 4. 准备容器\n    prepareContext(context, environment, listeners, ...);\n    // 5. 刷新容器（核心）\n    refreshContext(context);\n    // 6. 刷新后处理\n    afterRefresh(context, ...);\n    listeners.started(context);\n    // 7. 执行Runner\n    callRunners(context, ...);\n    listeners.running(context);\n    return context;\n}",
+      "title": "SpringApplication.run 核心伪代码",
       "language": "java",
+      "content": "// SpringApplication.run 核心伪代码（基于 Spring Boot 3.x 源码结构）\npublic ConfigurableApplicationContext run(String... args) {\n    StopWatch stopWatch = new StopWatch();\n    stopWatch.start();\n\n    // 1. 获取 RunListeners（SPI: spring.factories 的 SpringApplicationRunListener）\n    SpringApplicationRunListeners listeners = getRunListeners(args);\n    listeners.starting();\n\n    // 2. 准备 Environment\n    ApplicationEnvironment environment = prepareEnvironment(listeners);\n    //    加载配置源、激活 Profile、发布 ApplicationEnvironmentPreparedEvent\n\n    // 3. 创建 ApplicationContext\n    //    SERVLET → AnnotationConfigServletWebServerApplicationContext\n    //    REACTIVE → AnnotationConfigReactiveWebServerApplicationContext\n    //    NONE → AnnotationConfigApplicationContext\n    ConfigurableApplicationContext context = createApplicationContext();\n\n    // 4. 准备容器\n    prepareContext(context, environment, listeners, applicationArguments);\n    //    执行 ApplicationContextInitializer.initialize()\n    //    加载主配置类（@SpringBootApplication 标注的类）\n    //    发布 ApplicationPreparedEvent\n\n    // 5. 刷新容器（核心，耗时最长）\n    refreshContext(context);\n    //    → AbstractApplicationContext.refresh()\n    //    → invokeBeanFactoryPostProcessors: 解析 @Configuration、@EnableAutoConfiguration\n    //    → ConfigurationClassPostProcessor → AutoConfigurationImportSelector\n    //    → 读取 AutoConfiguration.imports → @Conditional 过滤 → 注册 BeanDefinition\n    //    → registerBeanPostProcessors\n    //    → finishBeanFactoryInitialization: 实例化非懒加载单例 Bean\n    //    → onRefresh: 创建并启动内嵌 WebServer（Tomcat）\n\n    // 6. 刷新后处理\n    afterRefresh(context);\n    stopWatch.stop();\n    listeners.started(context);\n\n    // 7. 执行 Runner\n    callRunners(context, applicationArguments);\n    //    按 @Order 排序执行 ApplicationRunner 和 CommandLineRunner\n    listeners.running(context);\n\n    return context;\n}",
       "highlights": [
         {
-          "line": 21,
-          "note": "这里返回的是已经刷新完成的 ApplicationContext；也就是自动配置、Bean 创建和事件发布都走完后的启动结果。"
+          "line": 6,
+          "note": "SPI 机制加载 RunListeners，贯穿启动全生命周期。"
+        },
+        {
+          "line": 15,
+          "note": "根据推断的 WebApplicationType 创建对应容器，类型不同后续行为不同。"
+        },
+        {
+          "line": 23,
+          "note": "refreshContext 是核心：自动装配、Bean 实例化、内嵌服务器启动都在这里。"
+        },
+        {
+          "line": 35,
+          "note": "Runner 在容器完全就绪后执行，是业务初始化的入口。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：SpringBoot 启动就是 main 里 SpringApplication.run() 干的事——准备环境、创建容器、刷新容器（触发自动装配和 Bean 加载）、启动内嵌服务器。@SpringBootApplication 是入口注解。\n\n@SpringBootApplication 三合一：@SpringBootConfiguration（本质 @Configuration）加 @EnableAutoConfiguration（开自动装配）加 @ComponentScan（扫描组件）。\n\nSpringApplication.run 核心步骤：\n\n1. 推断应用类型（Servlet、Reactive、None），创建对应 ApplicationContext。\n2. 准备 Environment（加载配置、激活 Profile）、打印 banner。\n3. 加载并回调 ApplicationListener、初始化器等启动扩展；自动配置类在 Boot 2.7+/3.x 主线通过 AutoConfiguration.imports 读取。\n4. refreshContext：这是核心，触发 Bean 定义加载、自动装配、单例 Bean 实例化，内嵌 Web 服务器 Tomcat 也在这步创建并启动。\n5. 执行 Runner（CommandLineRunner、ApplicationRunner）做启动后初始化。\n\n内嵌 Tomcat：SpringBoot 不需要外部容器，spring-boot-starter-web 引入了内嵌 Tomcat，refresh 时 ServletWebServerApplicationContext 会创建 TomcatWebServer 并启动，把 DispatcherServlet 注册进去。\n\n边界。① 配置加载遵循 PropertySource 后者覆盖前者的模型，工程上常见是命令行参数高于系统属性/环境变量，外部 config data 高于 jar 内 application 配置。② 启动慢常见于自动配置过多、扫描包过大，可用 spring-context-indexer 或排除不用的自动配置加速。③ 想换 Jetty、Undertow，排除 Tomcat 依赖再引对应 starter。",
+      "content": "**结论：**SpringBoot 启动就是 SpringApplication.run() 把一个 main 方法变成一个完整的 Web 应用——准备环境、创建容器、刷新容器（触发自动装配和 Bean 加载）、启动内嵌服务器、执行 Runner。\n\n**入口注解 @SpringBootApplication 三合一：**\n- @SpringBootConfiguration：本质 @Configuration，标识配置类\n- @EnableAutoConfiguration：通过 @Import(AutoConfigurationImportSelector) 开启自动装配\n- @ComponentScan：扫描当前包及子包的组件\n\n**SpringApplication.run 核心步骤：**\n1. **推断应用类型**：classpath 有 Servlet 类 → SERVLET，有 Reactive 类 → REACTIVE，否则 NONE\n2. **加载启动扩展**：SPI 加载 RunListener、Initializer（spring.factories）\n3. **准备 Environment**：加载配置源、激活 Profile、发布 environmentPrepared 事件\n4. **创建 ApplicationContext**：根据类型创建对应容器（Servlet → AnnotationConfigServletWebServerApplicationContext）\n5. **prepareContext**：关联环境、执行 Initializer、加载主配置类\n6. **refreshContext（核心）**：\n   - invokeBeanFactoryPostProcessors → ConfigurationClassPostProcessor\n   - 触发 AutoConfigurationImportSelector 读取 AutoConfiguration.imports\n   - @Conditional 条件过滤 → 注册 BeanDefinition\n   - 实例化非懒加载单例 Bean\n   - onRefresh 阶段创建并启动内嵌 Tomcat\n7. **执行 Runner**：按 @Order 排序执行 ApplicationRunner/CommandLineRunner\n\n**自动装配原理：**\n@EnableAutoConfiguration → AutoConfigurationImportSelector → 读 AutoConfiguration.imports（Boot 2.7+/3.x）→ @Conditional 条件过滤 → 注册 BeanDefinition。@ConditionalOnMissingBean 保证用户自定义 Bean 优先。\n\n**内嵌 Tomcat：**spring-boot-starter-web 引入 tomcat-embed → ServletWebServerFactoryAutoConfiguration 自动配置 TomcatServletWebServerFactory → refresh 的 onRefresh 阶段创建 TomcatWebServer 并启动 → DispatcherServlet 注册进去。\n\n**边界与追问：**\n- 配置优先级：命令行 > 系统属性/环境变量 > 外部 config data > jar 内 application.yml，profile-specific 高于非 profile\n- 启动慢排查：-Ddebug 看自动配置报告、排除用不到的自动配置、spring-context-indexer 缩小扫描范围、@Lazy 延迟初始化、终极方案 GraalVM Native Image\n- 换 Jetty/Undertow：排除 tomcat-starter 再引对应 starter",
       "followUpQuestions": [
         {
-          "question": "SpringBoot的启动流程是怎样的？",
-          "answer": "启动流程：1. new SpringApplication→推断应用类型、加载Initializers、Listeners；2. run()→创建Environment、准备Context、刷新Context（refresh()）、自动装配、启动内嵌容器。核心方法：refresh()中执行BeanFactoryPostProcessor、BeanPostProcessor、自动装配。"
+          "question": "refreshContext 内部为什么是启动最耗时的阶段？它做了哪些事？",
+          "answer": "refresh 调用 AbstractApplicationContext.refresh()，内部包含十几个步骤。最耗时的两个：① invokeBeanFactoryPostProcessors——解析所有 @Configuration 类、触发 AutoConfigurationImportSelector 加载候选自动配置并用 @Conditional 过滤，生成 BeanDefinition；② finishBeanFactoryInitialization——实例化所有非懒加载单例 Bean，每个 Bean 要经历实例化→属性注入→初始化→AOP 代理。如果 Bean 初始化涉及数据库连接、远程调用，耗时会显著增加。"
         },
         {
-          "question": "SpringBoot如何内嵌Tomcat？",
-          "answer": "内嵌Tomcat原理：1. spring-boot-starter-web依赖tomcat-embed；2. ServletWebServerFactory自动配置TomcatServletWebServerFactory；3. refresh()中创建WebServer；4. 通过Tomcat.addContext添加应用上下文。自动配置类：ServletWebServerFactoryAutoConfiguration。"
+          "question": "Boot 2.7 和 Boot 3 在自动配置加载路径上有什么变化？",
+          "answer": "Boot 2.6 及之前，自动配置候选类通过 spring.factories 的 EnableAutoConfiguration key 加载。Boot 2.7 引入 AutoConfiguration.imports 作为新路径并废弃旧路径，两路径并存。Boot 3 彻底移除旧路径，只走 META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports。升级 Boot 3 时如果有自定义 starter 还在用 spring.factories 加载自动配置，必须迁移。"
         },
         {
-          "question": "SpringBoot的配置加载顺序是怎样的？",
-          "answer": "不要背旧版简化 8 级顺序。Spring Boot 当前文档按 PropertySource 顺序描述，后面的覆盖前面的同名值；工程上抓主线：命令行参数通常高于 Java 系统属性和环境变量，环境变量/系统属性高于 application.yml，外部 config data 高于 jar 内 config data，profile-specific 配置高于非 profile。结构化配置用 @ConfigurationProperties，少量单值才用 @Value。"
+          "question": "SpringBoot 配置属性的优先级是怎么决定的？",
+          "answer": "不要背旧版 8 级列表。Spring Boot 按 PropertySource 顺序：后添加的覆盖先添加的同名属性。工程上主线是：命令行参数（--key=value）通常最高；Java 系统属性（-D）和环境变量（SPRING_APPLICATION_JSON、SERVER_PORT 等）次之；外部 config data（file:./config/application.yml）高于 jar 内 application.yml；profile-specific 配置高于非 profile。@PropertySource 注解指定的最低。结构化配置用 @ConfigurationProperties。"
         },
         {
-          "question": "SpringBoot 启动慢，你会怎么排查和优化？",
-          "answer": "先定位慢在哪：看启动日志（Started ... in X seconds）和 -Ddebug 的自动配置报告，或加 actuator 的 startup 端点看每个 Bean 的初始化耗时。常见原因和优化：① 自动配置过多——用 @SpringBootApplication(exclude=...) 排除用不到的；② 组件扫描包太大——用 spring-context-indexer 生成索引避免运行时全扫；③ Bean 初始化慢（连数据库、连远程）——能延迟的设 @Lazy 或 spring.main.lazy-initialization；④ 终极方案是 GraalVM Native Image，把启动从秒级降到毫秒级，适合 Serverless。"
+          "question": "如何换掉内嵌 Tomcat 用 Jetty 或 Undertow？",
+          "answer": "排除 spring-boot-starter-web 中的 spring-boot-starter-tomcat，再引入 spring-boot-starter-jetty 或 spring-boot-starter-undertow。ServletWebServerFactoryAutoConfiguration 会根据 classpath 上的类自动选择对应的 ServletWebServerFactory 实现。"
+        },
+        {
+          "question": "启动慢你会怎么排查和优化？",
+          "answer": "先定位：看启动日志 Started ... in X seconds，加 -Ddebug 看自动配置报告哪些生效了，加 actuator startup 端点看每个 Bean 初始化耗时。优化：① 排除不用的自动配置（@SpringBootApplication(exclude=...)）；② 缩小扫描包范围或用 spring-context-indexer；③ Bean 初始化涉及远程调用的设 @Lazy 或全局 spring.main.lazy-initialization=true；④ 终极方案 GraalVM Native Image，启动从秒级降到毫秒级。"
         }
       ]
     },
@@ -92,68 +113,85 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说出@SpringBootApplication三个注解的作用",
-        "能说出SpringApplication.run()的完整流程",
-        "能解释自动配置的原理（SPI + @Conditional）",
-        "能说出条件装配注解的使用场景",
-        "能解释SPI机制如何实现可插拔",
-        "能说出内嵌容器的启动时机",
-        "能自定义一个Starter"
+        "能说出 @SpringBootApplication 三个组成注解各自作用",
+        "能描述 SpringApplication.run 的七个核心步骤及每步做了什么",
+        "能解释 refreshContext 内部自动装配链路：ConfigurationClassPostProcessor → AutoConfigurationImportSelector → @Conditional 过滤 → BeanDefinition 注册",
+        "能说明内嵌 Tomcat 在 refresh 的 onRefresh 阶段创建并启动，DispatcherServlet 注册时机",
+        "能区分 AutoConfiguration.imports（自动配置类）和 spring.factories（RunListener/Initializer/Listener）两种 SPI 加载路径",
+        "能说出配置优先级主线：命令行 > 系统属性/环境变量 > 外部 config data > jar 内配置 > profile-specific 高于非 profile",
+        "能排查启动慢：自动配置报告、Bean 初始化耗时、扫描范围、懒加载、Native Image"
       ]
     }
   ],
   "recallPrompts": [
     {
-      "prompt": "SpringApplication.run() 的完整流程是什么？自动配置类是如何被加载和排序的？",
+      "prompt": "SpringApplication.run() 的完整流程是什么？每一步做了什么，哪些步骤是可扩展的？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 4,
       "id": "java.spring.topic-083-b2c3d4e5.recall.1"
     },
     {
-      "prompt": "SpringBoot如何内嵌Tomcat？",
+      "prompt": "自动配置类是如何被加载和条件过滤的？Boot 2.7 和 Boot 3 在加载路径上有什么区别？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 4,
       "id": "java.spring.topic-083-b2c3d4e5.recall.2"
     },
     {
-      "id": "java.spring.topic-083-b2c3d4e5.recall.3",
-      "prompt": "SpringBoot 应用启动慢你会怎么排查和优化？说说懒加载、自动配置裁剪和启动耗时分析的手段。",
+      "prompt": "内嵌 Tomcat 是在启动的哪个阶段创建和启动的？它和 refreshContext 的关系是什么？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 4
+      "difficulty": 4,
+      "id": "java.spring.topic-083-b2c3d4e5.recall.3"
+    },
+    {
+      "prompt": "SpringBoot 应用启动慢你会怎么排查和优化？说说自动配置报告、Bean 初始化耗时分析、懒加载和 Native Image 的手段。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4,
+      "id": "java.spring.topic-083-b2c3d4e5.recall.4"
+    },
+    {
+      "prompt": "SpringBoot 的配置优先级是怎样的？为什么不建议背旧版 8 级列表？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3,
+      "id": "java.spring.topic-083-b2c3d4e5.recall.5"
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出 @SpringBootApplication 三合一",
-      "能描述 SpringApplication.run 的核心步骤",
-      "能指出 refreshContext 触发自动装配和 Bean 实例化",
-      "能说明内嵌 Tomcat 在 refresh 时创建启动"
+      "能描述 SpringApplication.run 的核心步骤：推断类型→准备环境→创建容器→refreshContext→执行 Runner",
+      "能解释 refreshContext 是启动核心：触发自动装配、Bean 实例化、内嵌服务器启动",
+      "能说清自动装配链路：AutoConfigurationImportSelector → AutoConfiguration.imports → @Conditional 过滤",
+      "能说明内嵌 Tomcat 在 refresh 的 onRefresh 阶段创建启动，DispatcherServlet 注册时机"
     ],
     "goodToHave": [
-      "能说出 Spring Boot 当前 PropertySource 覆盖模型和常见配置优先级主线",
-      "能解释 CommandLineRunner/ApplicationRunner 的用途",
-      "能说明如何换 Jetty/Undertow"
+      "能区分 AutoConfiguration.imports 和 spring.factories 两种 SPI 路径的用途差异",
+      "能说出配置优先级主线（命令行 > 系统属性 > 外部 config data > jar 内 > profile-specific）",
+      "能说明 CommandLineRunner/ApplicationRunner 的执行时机和 @Order 排序",
+      "能说出换 Jetty/Undertow 的方式和原理"
     ],
     "commonMistakes": [
-      "说不清 refresh 在启动中的核心地位",
-      "以为 SpringBoot 还需要外部 Tomcat 容器",
-      "混淆 @SpringBootApplication 的三个组成"
+      "把 refreshContext 说成只是刷新缓存，不知道它触发了自动装配和 Bean 实例化",
+      "以为 Boot 3 还在用 spring.factories 加载自动配置类",
+      "混淆 AutoConfiguration.imports（自动配置类）和 spring.factories（RunListener/Initializer）两种 SPI",
+      "以为内嵌 Tomcat 是在 refresh 完成后才启动的",
+      "背旧版简化 8 级配置优先级列表，说不清 PropertySource 覆盖模型"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "java.spring.topic-043-d09a2ea2"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否说清 run 的核心步骤、refreshContext 的核心地位、内嵌 Tomcat 启动时机，并能排查启动慢。"
+  "interviewerFocus": "考察能否说清 run 的阶段推进、refreshContext 的核心地位（自动装配 + Bean 实例化 + 内嵌服务器）、Boot 2.7/3 的 SPI 路径变化、配置优先级和启动慢排查。"
 }

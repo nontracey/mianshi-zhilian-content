@@ -4,30 +4,35 @@
   "category": "mysql-core",
   "group": "mysql-core",
   "title": "事务 ACID 与隔离级别",
-  "summary": "掌握事务 ACID、脏读、不可重复读、幻读和四种隔离级别。",
+  "summary": "掌握事务 ACID 四属性各自由 undo log / redo log / MVCC+锁 哪个机制支撑，脏读、不可重复读、幻读三种并发异常的具体场景，四种隔离级别的取舍，以及 MySQL InnoDB 如何用 ReadView 时机差异 + next-key lock 实现 RR 级别隔离并仍存在哪些残余边界。",
   "tags": [
     "数据库",
     "事务",
     "mysql-core"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 31,
   "order": 20,
   "recommendWeight": 90,
   "status": "production",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能解释 ACID、脏读/不可重复读/幻读、隔离级别差异，以及 MySQL 如何用 MVCC 和锁实现隔离。",
+  "interviewerFocus": "考察是否能解释 ACID 各属性的底层机制、脏读/不可重复读/幻读的具体场景、四种隔离级别的取舍、MySQL 如何用 ReadView 时机差异和 next-key lock 实现 RR 级别隔离、以及 RR 下幻读残余的原因。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "事务隔离是在一致性和并发之间做权衡",
-      "content": "事务把一组读写包装成一个逻辑单元，ACID 分别描述原子性、一致性、隔离性和持久性。隔离级别越强，并发异常越少，但锁竞争、等待和吞吐代价通常越高。\n\n先抓住这些机制：\n- 原子性通常依赖 undo log 回滚，持久性依赖 redo log 刷盘\n- 读未提交可能读到未提交数据，读已提交避免脏读\n- 可重复读让同一事务内快照读结果稳定，是 MySQL InnoDB 默认级别\n- 串行化最强但并发最低，通常只在极端一致性场景使用\n\n容易答错的边界：\n- ACID 不是只背四个词，要能说出每个属性由什么机制支撑\n- 可重复读不等于所有场景都完全没有幻读，当前读仍要看锁\n- 隔离级别调高不能代替业务一致性设计"
+      "title": "ACID 是四个可验证的工程属性，不是四个口号",
+      "content": "事务把一组读写包装成原子逻辑单元。ACID 的价值不在于背四个词，而在于能说出每个属性由什么具体机制保证、失败时会怎样。\n\n**原子性（Atomicity）**：事务要么全部成功，要么全部回滚。实现靠 undo log——每条修改记录的旧值写入 undo page，通过 `DB_ROLL_PTR` 指针串成版本链；回滚时从最新 undo record 逆序恢复。如果 undo log 本身损坏，InnoDB 无法完成回滚，会启动到 error 状态。\n\n**一致性（Consistency）**：事务执行前后满足完整性约束（主键唯一、外键存在、CHECK 等）。一致性是原子性、隔离性和持久性的目标，不是独立的第四种机制。应用层的业务一致性（如扣库存不能为负）需要在语句或约束中体现，数据库层的 ACID 不会替你判断业务规则。\n\n**隔离性（Isolation）**：并发事务互不干扰。InnoDB 靠 MVCC ReadView + 行级锁共同实现。ReadView 控制快照读的可见性版本，next-key lock 控制当前读的范围互斥。隔离级别调高会增加锁等待，但不能替代分布式链路或缓存的一致性设计。\n\n**持久性（Durability）**：已提交事务的修改不会因崩溃丢失。实现靠 redo log WAL：先写 redo log buffer，提交时按 `innodb_flush_log_at_trx_commit` 配置决定刷盘策略。`=1` 表示每次提交都 fsync，持久性最强但吞吐最低；`=2` 依赖 OS 刷盘，崩溃时可能丢最后几毫秒数据；`=0` 仅靠后台线程定期刷，风险最高。两阶段提交保证 redo log 和 binlog 一致，才能正确恢复和复制。"
     },
     {
       "type": "explain",
-      "title": "隔离级别要和读类型一起解释",
-      "content": "MySQL 面试常问「可重复读解决幻读了吗」。回答必须先区分快照读和当前读：\n\n**快照读**：普通 `SELECT` 语句，依赖 MVCC 可见性算法。InnoDB 为每行数据维护 undo 版本链（通过 `DB_ROLL_PTR` 指针串联），ReadView 包含 `m_ids`（活跃事务 ID 列表）、`min_trx_id`、`max_trx_id` 和 `creator_trx_id`。可见性判断规则：\n- 行的 `DB_TRX_ID` < `min_trx_id`：该版本在 ReadView 之前已提交，可见\n- 行的 `DB_TRX_ID` >= `max_trx_id`：该版本在 ReadView 之后才开启，不可见\n- 行的 `DB_TRX_ID` 在 `m_ids` 中：该事务还未提交，不可见，沿 `DB_ROLL_PTR` 找上一个版本\n- 行的 `DB_TRX_ID` 不在 `m_ids` 中且 >= `min_trx_id`：已提交，可见\n\n**当前读**：`SELECT ... FOR UPDATE`、`SELECT ... LOCK IN SHARE MODE`、`UPDATE`、`DELETE` 等语句，读取最新已提交版本并加锁。在 RR 级别下，当前读使用 next-key lock（前开后闭区间 `(a, b]`），锁住查询范围防止其他事务插入新行，从而减少幻读。\n\nRC 和 RR 在 ReadView 生成时机上的关键差异：\n- RC：`read_view_open_for` 在每条语句执行时调用，每次生成新 ReadView\n- RR：ReadView 在事务首次快照读时生成，后续复用同一 ReadView\n\n事务异常举例：\n- **脏读**：事务 A 读到事务 B 未提交的修改，B 回滚后 A 读到的是不存在的数据\n- **不可重复读**：事务 A 两次读同一行，中间事务 B 提交了修改，两次结果不同\n- **幻读**：事务 A 两次范围查询，中间事务 B 插入了新行，第二次查询多出记录\n\n长事务的工程危害：它会拖住 undo 版本链，导致 `purge` 线程（`trx_purge`）无法清理历史版本，`innodb_undo_log` 膨胀，进而影响备份（物理备份要扫描更多 undo 页）、DDL（需要等待事务结束）和主从复制延迟。可通过 `information_schema.innodb_trx` 查询 `trx_started` 和 `trx_weight` 定位长事务。"
+      "title": "三种并发异常要能举出精确的事务交错场景",
+      "content": "隔离级别按「阻止哪些异常」递进。如果只背级别名，面试官会追问：「幻读到底长什么样？不可重复读和幻读有什么区别？」必须能用两个事务的交错时序说清楚。\n\n**脏读（Dirty Read）**：事务 A 读到事务 B 尚未提交的修改。B 回滚后，A 持有的数据是不存在的。时序：\n1. B UPDATE account SET balance=100 WHERE id=1（未提交）\n2. A SELECT balance FROM account WHERE id=1 → 读到 100（脏值）\n3. B ROLLBACK → balance 回到 200，但 A 已经拿着 100 做后续判断\n\n**不可重复读（Non-Repeatable Read）**：事务 A 两次读同一行，中间事务 B 提交了修改或删除，两次结果不同。这是「同一行数据前后不一致」。时序：\n1. A SELECT balance FROM account WHERE id=1 → 200\n2. B UPDATE account SET balance=300 WHERE id=1; COMMIT\n3. A SELECT balance FROM account WHERE id=1 → 300（值变了）\n\n**幻读（Phantom Read）**：事务 A 两次范围查询，中间事务 B 插入了符合范围的新行，第二次多出记录。这是「同一查询条件的行数变了」。时序：\n1. A SELECT * FROM orders WHERE amount > 100 → 3 行\n2. B INSERT INTO orders(amount) VALUES(150); COMMIT\n3. A SELECT * FROM orders WHERE amount > 100 → 4 行（多出幻影行）\n\n容易混淆的边界：不可重复读和幻读都涉及「中间被别人改了」，区别是前者改的是已有行的值/删除，后者是新增了原本不存在的行。InnoDB 在 RR 下对快照读用 ReadView 解决不可重复读，对当前读用 next-key lock 减少幻读，但两者机制完全不同。"
+    },
+    {
+      "type": "explain",
+      "title": "隔离级别和读类型要一起解释",
+      "content": "MySQL 面试常问「可重复读解决幻读了吗」。回答必须先区分快照读和当前读，再解释 ReadView 生成时机的差异，最后指出残余边界。\n\n**快照读**：普通 `SELECT` 语句，依赖 MVCC 可见性算法。InnoDB 为每行数据维护 undo 版本链（通过 `DB_ROLL_PTR` 指针串联），ReadView 包含 `m_ids`（活跃事务 ID 列表）、`min_trx_id`、`max_trx_id` 和 `creator_trx_id`。可见性判断规则：\n- 行的 `DB_TRX_ID` < `min_trx_id`：该版本在 ReadView 之前已提交，可见\n- 行的 `DB_TRX_ID` >= `max_trx_id`：该版本在 ReadView 之后才开启，不可见\n- 行的 `DB_TRX_ID` 在 `m_ids` 中：该事务还未提交，不可见，沿 `DB_ROLL_PTR` 找上一个版本\n- 行的 `DB_TRX_ID` 不在 `m_ids` 中且 >= `min_trx_id`：已提交，可见\n\n**当前读**：`SELECT ... FOR UPDATE`、`SELECT ... LOCK IN SHARE MODE`、`UPDATE`、`DELETE` 等语句，读取最新已提交版本并加锁。在 RR 级别下，当前读使用 next-key lock（前开后闭区间 `(a, b]`），锁住查询范围防止其他事务插入新行，从而减少幻读。\n\n**RC 和 RR 在 ReadView 生成时机上的关键差异**：\n- RC：每条语句执行时调用 `read_view_open_for` 生成新 ReadView，所以同一事务内两次读可能看到不同版本（不可重复读）\n- RR：ReadView 在事务首次快照读时生成，后续复用同一 ReadView，因此快照读结果稳定\n\n**RR 下的幻读残余场景**：先快照读（看到 3 行），另一个事务插入第 4 行并提交，再当前读（`SELECT ... FOR UPDATE`）读到 4 行——ReadView 对当前读不起作用，当前读总是读最新已提交版本。或者反过来：先当前读锁住范围，再快照读——快照读的 ReadView 已经在事务开始时生成，但当前读看到的新行已经被锁住了。这种快照读和当前读混合使用的场景下，RR 级别无法完全消除幻读。\n\n**长事务的工程危害**：长事务会拖住 undo 版本链，导致 purge 线程（`trx_purge`）无法清理历史版本，`innodb_undo_log` 膨胀。具体影响包括：物理备份（如 xtrabackup）要扫描更多 undo 页导致备份变慢；DDL 需要等待长事务结束才能执行 Online DDL；主从复制中大 undo 会拖慢回放。可通过 `information_schema.innodb_trx` 查询 `trx_started` 和 `trx_weight` 定位长事务。"
     },
     {
       "type": "diagram",
@@ -67,68 +72,37 @@
     },
     {
       "type": "compareTable",
-      "title": "隔离级别对比",
-      "columns": [
-        "考点",
-        "机制含义",
-        "面试要点",
-        "常见误区"
-      ],
-      "rows": [
-        [
-          "读未提交 RU",
-          "不加读锁，可读未提交版本",
-          "几乎不用，仅做理论对比",
-          "误以为 InnoDB 有此级别的 MVCC 优化"
-        ],
-        [
-          "读已提交 RC",
-          "每条语句生成新 ReadView",
-          "Oracle/PG 默认，多数业务可接受",
-          "同事务两次读同一行结果可能不同"
-        ],
-        [
-          "可重复读 RR",
-          "事务首次快照读生成 ReadView 并复用，当前读加 next-key lock",
-          "InnoDB 默认，快照读稳定",
-          "误认为所有读都不加锁、完全无幻读"
-        ],
-        [
-          "串行化 SER",
-          "所有读加共享锁，写加排他锁，读写互斥",
-          "仅极端一致性场景使用",
-          "误用于普通高并发业务导致锁等待超时"
-        ]
-      ]
+      "title": "四种隔离级别与三种并发异常矩阵",
+      "content": "| 隔离级别 | 脏读 | 不可重复读 | 幻读 | 实现机制 | 适用场景 |\n| --- | --- | --- | --- | --- | --- |\n| 读未提交 RU | ✅ 可能发生 | ✅ 可能发生 | ✅ 可能发生 | 不加读锁，直接读最新版本 | 理论级别，几乎不用 |\n| 读已提交 RC | ❌ 不发生 | ✅ 可能发生 | ✅ 可能发生 | 每条语句新 ReadView；当前读只加行锁不加 gap lock | Oracle/PostgreSQL 默认，多数 OLTP 业务可接受 |\n| 可重复读 RR | ❌ 不发生 | ❌ 不发生 | ⚠️ 快照读不发生，当前读靠锁减少但混合使用仍有残余 | 事务级 ReadView 复用；当前读加 next-key lock | InnoDB 默认；快照读场景足够，混合读写需注意 |\n| 串行化 SER | ❌ 不发生 | ❌ 不发生 | ❌ 不发生 | 所有读加共享锁，写加排他锁，读写互斥 | 极端一致性场景；并发低，锁等待超时风险高 |"
     },
     {
       "type": "code",
-      "title": "当前读和快照读示例",
+      "title": "当前读与快照读：行为差异与隔离级别影响",
       "language": "sql",
-      "content": "-- 快照读：使用 MVCC 可见性，不加锁\nSELECT * FROM orders WHERE id = 7;\n\n-- 当前读：读取最新已提交版本并加 X 锁\nSELECT * FROM orders WHERE id = 7 FOR UPDATE;\n\n-- 范围当前读：RR 下加 next-key lock 锁住 (5, 10] 范围\nSELECT * FROM orders WHERE id BETWEEN 5 AND 10 FOR UPDATE;\n\n-- 查看当前活跃事务（定位长事务）\nSELECT trx_id, trx_started, trx_weight, trx_query\nFROM information_schema.innodb_trx\nORDER BY trx_started ASC\nLIMIT 10;",
+      "content": "-- ========================================\n-- 场景一：RR 下快照读稳定性\n-- ========================================\n-- Session A (RR)                     -- Session B (RR)\nBEGIN;                               --\nSELECT balance FROM account          --\nWHERE id = 1; -- 结果: 200           --\n--                                    UPDATE account SET balance = 300\n--                                    WHERE id = 1;\n--                                    COMMIT;\nSELECT balance FROM account          --\nWHERE id = 1; -- 仍然是 200 (ReadView 复用)\nCOMMIT;                              --\n\n-- ========================================\n-- 场景二：RR 下当前读使用 next-key lock\n-- ========================================\n-- Session A (RR)                     -- Session B (RR)\nBEGIN;                               --\nSELECT * FROM orders                 --\nWHERE id BETWEEN 5 AND 10            --\nFOR UPDATE; -- 加 next-key lock (5,10]\n--                                    INSERT INTO orders(id, amount)\n--                                    VALUES(7, 150);\n--                                    -- 被阻塞! gap lock 冲突\nCOMMIT; -- 释放锁                    -- Session B 获得锁并插入\n\n-- ========================================\n-- 场景三：RR 幻读残余（快照读+当前读混合）\n-- ========================================\n-- Session A (RR)                     -- Session B (RR)\nBEGIN;                               --\nSELECT * FROM orders                 --\nWHERE amount > 100; -- 快照读: 3 行  --\n--                                    INSERT INTO orders(amount)\n--                                    VALUES(150);\n--                                    COMMIT;\nSELECT * FROM orders                 --\nWHERE amount > 100                   --\nFOR UPDATE; -- 当前读: 4 行 (新行可见)\n-- 第二次读与第一次行数不同 => 幻读\nCOMMIT;                              --\n\n-- ========================================\n-- 定位长事务\n-- ========================================\nSELECT trx_id, trx_state,\n       trx_started, trx_weight,\n       TIMESTAMPDIFF(SECOND, trx_started, NOW()) AS running_seconds\nFROM information_schema.innodb_trx\nORDER BY trx_started ASC\nLIMIT 10;",
       "highlights": [
         {
-          "line": 2,
-          "note": "普通 SELECT 在 InnoDB 中走快照读路径，通过 ReadView 和 DB_ROLL_PTR 版本链判断可见性，不加行锁。"
+          "line": 7,
+          "note": "RR 下事务首次快照读生成 ReadView，后续复用，所以 Session B 提交后 Session A 再读仍然看到旧值。"
         },
         {
-          "line": 5,
-          "note": "FOR UPDATE 触发当前读，读取最新已提交版本并对匹配行加排他记录锁。"
+          "line": 17,
+          "note": "FOR UPDATE 触发当前读并加 next-key lock (5,10]，其他事务的范围插入被 gap lock 阻塞。"
         },
         {
-          "line": 8,
-          "note": "范围查询在 RR 级别下加 next-key lock（record lock + gap lock），锁住前开后闭区间，阻止其他事务在范围内插入。"
+          "line": 28,
+          "note": "先快照读（ReadView 旧版本），后当前读（读最新已提交版本），两次结果不同——这是 RR 幻读的残余场景。"
         },
         {
-          "line": 11,
-          "note": "通过 innodb_trx 视图查询 trx_started 字段定位运行时间最长的事务，trx_weight 反映 undo 记录数量。"
+          "line": 37,
+          "note": "trx_started 最早的事务最可能是长事务，running_seconds 帮助快速判断。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "事务隔离我会先讲 ACID 各自的底层机制，再讲隔离级别解决哪些并发异常，最后落到 MySQL 的 MVCC 和锁实现。\n\n核心展开线：\n- 原子性靠 undo log（回滚时按 undo 链逆序恢复），持久性靠 redo log WAL 刷盘（`innodb_flush_log_at_trx_commit=1`），隔离性靠 MVCC ReadView + 锁共同实现，一致性是前三者的目标\n- 四种隔离级别在脏读、不可重复读、幻读之间做取舍：RU 全放、RC 放脏读、RR 再放不可重复读、SER 全防但读写串行\n- MySQL RR 下快照读靠事务级 ReadView（首次快照读生成、后续复用）+ undo 版本链可见性判断；当前读靠 next-key lock（record lock + gap lock）锁住范围减少幻读\n- RC 和 RR 的关键差异是 ReadView 生成时机：RC 每条语句生成新的，RR 事务首次快照读生成并复用\n- 工程上要警惕长事务拖住 undo 版本链导致 purge 线程无法清理，可通过 `information_schema.innodb_trx` 定位\n\n边界补充：隔离级别只提供数据库层的并发语义，跨库、缓存和消息链路的一致性需要额外设计（分布式事务、TCC/Saga、最终一致性）。另外 RR 下先快照读再当前读仍可能看到新行，这是部分面试官认为的幻读残留场景。",
+      "content": "事务隔离我会先讲 ACID 各自的底层机制，再讲隔离级别解决哪些并发异常，最后落到 MySQL 的 MVCC 和锁实现。\n\n**核心展开线**：\n- **原子性**靠 undo log（回滚时按 undo 链逆序恢复），**持久性**靠 redo log WAL 刷盘（`innodb_flush_log_at_trx_commit=1` 保证每次提交 fsync），**隔离性**靠 MVCC ReadView + 行级锁共同实现，**一致性**是前三者共同的目标\n- **四种隔离级别**在脏读、不可重复读、幻读之间做取舍：RU 全放（几乎不用）、RC 防脏读（每条语句新 ReadView）、RR 防不可重复读（事务级 ReadView 复用 + 当前读 next-key lock 减少幻读）、SER 全防但读写串行\n- **RC 和 RR 的关键差异**是 ReadView 生成时机：RC 每条语句生成新的（可看到其他事务已提交的修改），RR 事务首次快照读生成并复用（结果稳定但 undo 版本链无法早于该 ReadView 清理）\n- **next-key lock** = record lock + gap lock，锁住前开后闭区间 `(a, b]`，阻止其他事务在范围内插入。局限：gap lock 之间不冲突可能导致死锁；快照读不加此锁；未走索引时锁全表\n- **RR 下的幻读残余**：快照读和当前读混合使用时，当前读总是读最新已提交版本而 ReadView 对其不起作用，两次读结果可能不同\n- **长事务工程危害**：拖住 undo 版本链 → purge 无法清理 → undo 膨胀 → 备份变慢、DDL 阻塞、复制延迟。通过 `information_schema.innodb_trx` 的 `trx_started` 定位\n\n**边界补充**：隔离级别只解决数据库层并发语义。跨库、缓存、消息队列的一致性需要额外设计（分布式事务、TCC/Saga、最终一致性）。业务层的一致性（如余额不能为负）需要 CHECK 约束或乐观锁保证，不能依赖隔离级别。",
       "followUpQuestions": [
         {
           "question": "RC 和 RR 在 MVCC 层面的本质区别是什么？为什么 RR 能解决不可重复读？",
@@ -141,6 +115,10 @@
         {
           "question": "线上发现 undo 表空间持续膨胀，怎么排查和解决？",
           "answer": "首先查 `information_schema.innodb_trx` 找 `trx_started` 最早的事务，确认是否有长事务或未提交的事务拖住 purge 线程。其次查 `SHOW ENGINE INNODB STATUS` 中的 `TRANSACTIONS` 段，看是否有大量活跃事务。如果确认是长事务导致，kill 掉对应连接后 purge 线程会逐步清理 undo。MySQL 5.7+ 支持 `innodb_undo_log_truncate=ON` 自动截断 undo 表空间，但前提是没有活跃事务引用旧版本。长期方案是设置 `innodb_max_undo_log_size` 和 `innodb_undo_log_truncate`，并在应用层加事务超时控制（如 `innodb_lock_wait_timeout` 和连接池的 `maxLifetime`）。"
+        },
+        {
+          "question": "隔离级别调高（比如从 RC 升到 RR）能替代业务层的乐观锁吗？",
+          "answer": "不能。隔离级别控制的是并发读写之间的可见性语义（脏读、不可重复读、幻读），乐观锁解决的是「两个事务同时读到同一版本，都想修改，谁的修改应该生效」的问题。RC 下 `UPDATE ... WHERE version=old_version` 同样能实现乐观锁，RR 也不会让两个当前读不冲突。隔离级别是数据库层机制，乐观锁是应用层协调机制，两者解决的问题域不同。"
         }
       ]
     },
@@ -148,34 +126,55 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说出 ACID 各自由 undo log / redo log / MVCC+锁 哪个机制支撑",
-        "能举例脏读、不可重复读、幻读的具体场景",
-        "能对比四个隔离级别在并发异常矩阵中的差异",
-        "能区分快照读和当前读，并说出 ReadView 生成时机的 RC/RR 差异",
-        "能解释 next-key lock = record lock + gap lock 的作用和局限",
-        "能说明长事务对 undo 版本链、purge 线程和备份的影响",
-        "能通过 information_schema.innodb_trx 定位长事务"
+        "能说出 ACID 各自由 undo log / redo log / MVCC+锁 哪个机制支撑，并举例说明失败场景",
+        "能用两个事务的交错时序精确描述脏读、不可重复读和幻读的区别",
+        "能对比四个隔离级别在三种并发异常矩阵中的差异，并说出对应实现机制",
+        "能区分快照读和当前读，并解释 RC/RR 的 ReadView 生成时机差异及影响",
+        "能解释 next-key lock = record lock + gap lock 的作用、适用场景和死锁风险",
+        "能说明 RR 下快照读+当前读混合使用时的幻读残余场景",
+        "能说明长事务对 undo 版本链、purge 线程和备份的具体影响，并用 innodb_trx 定位"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "database.mysql-core.transaction-isolation.recall.1",
-      "prompt": "请解释 ACID 分别由哪些数据库机制支撑。",
+      "prompt": "请解释 ACID 分别由哪些数据库机制支撑，失败时各自会有什么后果？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "database.mysql-core.transaction-isolation.recall.2",
-      "prompt": "脏读、不可重复读、幻读分别是什么？不同隔离级别怎么处理？",
+      "prompt": "用两个事务的交错时序分别描述脏读、不可重复读和幻读。InnoDB 的 RR 级别分别怎么处理这三种异常？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "database.mysql-core.transaction-isolation.recall.3",
+      "prompt": "MySQL 可重复读下快照读和当前读有什么区别？为什么 RR 不能完全消除幻读？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "database.mysql-core.transaction-isolation.recall.4",
+      "prompt": "RC 和 RR 在 ReadView 生成时机上有什么区别？这如何导致了不可重复读的差异？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
-      "id": "database.mysql-core.transaction-isolation.recall.3",
-      "prompt": "MySQL 可重复读下快照读和当前读有什么区别？",
+      "id": "database.mysql-core.transaction-isolation.recall.5",
+      "prompt": "线上发现 undo 表空间持续膨胀，怎么排查是长事务导致的？有哪些缓解手段？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "database.mysql-core.transaction-isolation.recall.6",
+      "prompt": "next-key lock 是怎么组成的？它防止幻读的原理和局限分别是什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -183,20 +182,22 @@
   ],
   "rubric": {
     "mustHave": [
-      "ACID",
-      "脏读/不可重复读/幻读",
-      "能说明「读已提交」在「事务 ACID 与隔离级别」里的作用和判断标准",
-      "能说明「可重复读」在「事务 ACID 与隔离级别」里的作用和判断标准"
+      "能说出 ACID 各自由 undo log / redo log / MVCC+锁 / 一致性目标 哪个机制支撑",
+      "能用事务交错时序分别描述脏读、不可重复读、幻读的具体场景",
+      "能对比四个隔离级别在三种并发异常矩阵中的差异，且知道对应实现机制",
+      "能区分快照读和当前读，并说出 RC/RR 的 ReadView 生成时机差异"
     ],
     "goodToHave": [
-      "undo/redo log",
-      "next-key lock",
-      "能说明「长事务危害」在「事务 ACID 与隔离级别」里的触发条件、收益和失效边界"
+      "能解释 next-key lock = record lock + gap lock 的作用和死锁风险",
+      "能说明 RR 下快照读+当前读混合使用时的幻读残余场景",
+      "能说明长事务对 undo 版本链和 purge 线程的具体影响，并用 innodb_trx 定位",
+      "能说明隔离级别只解决数据库层并发语义，不替代业务一致性或乐观锁"
     ],
     "commonMistakes": [
-      "把可重复读说成所有读都不加锁",
-      "只背隔离级别不举异常例子",
-      "用提高隔离级别替代业务一致性设计"
+      "把可重复读说成所有读都不加锁——当前读在 RR 下仍然加 next-key lock",
+      "只背隔离级别名称不举并发异常的具体交错场景",
+      "误认为提高隔离级别能替代业务层乐观锁或分布式一致性",
+      "忽略 RC/RR 的核心差异是 ReadView 生成时机，而不是锁策略"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -205,5 +206,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

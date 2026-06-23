@@ -4,41 +4,46 @@
   "category": "concurrency",
   "group": "concurrency",
   "title": "CompletableFuture",
-  "summary": "讲清 CompletableFuture 相比 Future 的链式编排能力、CompletionStage 方法选择、Async 与非 Async 的执行线程差异、异常和超时传播、commonPool 风险以及生产级自定义线程池隔离。",
+  "summary": "讲清 CompletableFuture 相比 Future 的链式编排能力、CompletionStage 方法选择逻辑、Async 与非 Async 的执行线程差异、异常转换与观察语义、超时与底层任务取消的分离、commonPool 共享风险及生产级自定义线程池隔离，以及何时应转向 Reactor / Flow / 虚拟线程。",
   "tags": [
     "Java",
     "并发编程",
     "CompletableFuture"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 35,
+  "estimatedMinutes": 40,
   "order": 70,
   "recommendWeight": 86,
   "learningCards": [
     {
       "type": "explain",
-      "title": "CompletableFuture 是异步编排图",
-      "content": "Future 只能代表一个异步结果，主要交互是 `get()`、取消和状态查询。CompletableFuture 同时实现 Future 和 CompletionStage，能把多个阶段连接成一个异步编排图：前一个阶段成功后转换结果、发起下一个异步调用、并行等待多个结果、处理异常或设置超时。\n\n可以把常用方法按语义分组：`thenApply` 是同步转换，类似 map；`thenCompose` 用在函数返回 CompletableFuture 时，负责把嵌套 future 扁平化；`thenCombine` 合并两个独立 future 的结果；`allOf` 等全部完成，但结果要回到各个 future 取；`anyOf` 取最快完成的一个，返回 Object，类型和取消要自己处理。\n\nCompletableFuture 的难点不在方法名，而在运行时语义：回调在哪个线程执行、异常是否被转换或继续传播、超时后底层任务是否还在跑、公共线程池是否被阻塞任务占满。"
+      "title": "CompletableFuture 是异步编排图，不只是 Future 增强",
+      "content": "Future 只能代表一个异步结果，交互方式是 `get()` 阻塞等结果、查询状态和取消。CompletableFuture 同时实现 Future 和 CompletionStage 接口，核心能力是把多个异步阶段连成一个编排图：前一个阶段完成后触发转换、下一个异步调用、并行等待多个结果、异常兜底或设置超时。\n\n编排方法可以按语义分三层：转换层——`thenApply` 同步映射，`thenCompose` 把返回 CompletableFuture 的函数扁平化，避免嵌套 `CompletableFuture<CompletableFuture<T>>`；组合层——`thenCombine` 合并两个独立结果，`allOf` 等全部完成再收集，`anyOf` 取最快返回；容错层——`exceptionally` 失败兜底，`handle` 成败都转，`whenComplete` 只观察不吞异常。\n\n难点不在方法名，而在运行时行为：回调在哪个线程执行、异常是被吞还是继续传播、超时后底层任务是否还在跑、commonPool 是否被阻塞任务占满。这些运行时语义才是面试和生产排障的核心。"
     },
     {
       "type": "explain",
-      "title": "Async 与非 Async 的线程差异",
-      "content": "`supplyAsync`、`runAsync` 不传 Executor 时使用 `ForkJoinPool.commonPool()`。这个池在 JVM 内共享，并行度默认是 `Runtime.getRuntime().availableProcessors() - 1`（至少 1），parallel stream 和其他 CompletableFuture 也用同一个池。把阻塞 RPC、数据库查询、文件 IO 放进去，会长期占住这些线程并互相拖慢。生产中阻塞任务应使用按业务隔离的自定义 Executor，并监控队列、活跃线程和拒绝数。\n\n非 Async 回调（如 `thenApply`、`thenCompose`、`whenComplete`）通常由完成前序阶段的线程执行；如果前序阶段已经完成，也可能由当前调用线程直接执行。Async 回调（如 `thenApplyAsync`）会把回调提交到默认池或指定 Executor。轻量纯计算转换可以用非 Async，阻塞或耗时回调应显式传 Executor，避免占住上游完成线程。\n\n`CompletableFuture.completedFuture(value)` 和手动 `complete(value)` 常用于把同步结果接入异步链或适配回调式 API。手动完成时要保证只完成一次，并清楚 `completeExceptionally` 会让后续阶段按异常路径传播。"
+      "title": "Async 与非 Async 的线程差异是执行位置考点",
+      "content": "`supplyAsync`、`runAsync` 不传 Executor 时使用 `ForkJoinPool.commonPool()`。这个池在 JVM 内全局共享，线程数默认是 `Runtime.getRuntime().availableProcessors() - 1`（至少 1）。parallel stream、其他 CompletableFuture 也用同一个池。把阻塞 RPC、数据库查询、文件 IO 塞进去，会把这几个线程长期占满，导致所有依赖 commonPool 的任务互相拖慢。\n\n非 Async 回调（`thenApply`、`thenCompose`、`whenComplete` 等）的执行线程取决于前序阶段的状态：前序阶段尚未完成时，回调由完成前序阶段的线程执行；前序阶段已完成时，回调可能由调用 `thenApply` 的当前线程同步执行。这意味着如果前序阶段在 IO 线程池的线程里完成，后续非 Async 回调也跑在那个 IO 线程上，轻量计算没问题，但如果回调本身也做阻塞操作就会反过来拖慢 IO 线程。\n\nAsync 后缀的回调（`thenApplyAsync` 等）会把回调显式提交到指定 Executor 或默认 commonPool，与前序阶段的完成线程解耦。生产中阻塞或耗时的回调应使用 Async 变体并传业务线程池，轻量纯计算转换可以保持非 Async 以减少一次线程切换。"
     },
     {
       "type": "explain",
-      "title": "异常处理要分清转换和观察",
-      "content": "`exceptionally` 只在异常时执行，可以把失败转换成兜底值；`handle` 成功和失败都会执行，并且能返回新结果；`whenComplete` 更像观察钩子，适合记录日志和指标，它不负责吞掉异常，如果前序失败，返回的 future 仍会失败。\n\n`join()` 和 `get()` 都会等待结果，但异常包装不同：join 抛 CompletionException，get 抛 ExecutionException 且声明受检异常。异步链里如果一直不 join/get，也没有异常处理阶段，错误可能只留在 CompletableFuture 内部，表现为调用方看不到失败。\n\nJava 9 之后常用 `orTimeout` 和 `completeOnTimeout` 表达时间预算。注意，CompletableFuture 超时只会让这个 future 完成异常或给出兜底结果，并不自动中断已经提交到线程池里的底层阻塞任务。真正释放资源还要依赖 HTTP/RPC 客户端超时、可取消任务和连接池超时。"
+      "title": "异常处理要分清转换、观察和传播",
+      "content": "`exceptionally` 只在前序阶段异常时执行，接收 `Throwable`，返回一个新值覆盖失败。它适合给兜底值（默认值、降级结果、缓存命中），但注意如果 exceptionally 本身也抛异常，返回的 future 会以新异常失败。\n\n`handle` 在成功和失败时都执行，接收 `(T result, Throwable ex)`，返回新值。它可以吞掉异常——只要 `ex != null` 时返回一个正常值即可；也可以把异常包装成另一种失败——返回值抛出异常。`whenComplete` 也接收两个参数，但语义是观察：它执行记录日志、指标上报、资源清理，不会改变原结果，前序失败则返回的 future 仍然失败。\n\n一个容易忽略的问题：如果异步链中没有任何异常处理阶段（exceptionally / handle / whenComplete 里吞异常），并且调用方也不 `join` 或 `get`，异常会静默存在于 CompletableFuture 内部。生产代码应至少有一层异常处理来保证指标和日志可见，不要依赖最后的 join 来兜底。\n\n`join()` 和 `get()` 的异常包装不同：`join` 抛 `CompletionException`（非受检），`get` 抛 `ExecutionException`（受检）且声明 `InterruptedException`。在异步链里 `join` 更常用因为它不受检查异常约束。"
+    },
+    {
+      "type": "explain",
+      "title": "超时只完成 future，不取消底层任务",
+      "content": "Java 9 引入的 `orTimeout(timeout, unit)` 在超时后让 future 以 `TimeoutException` 失败完成；`completeOnTimeout(value, timeout, unit)` 在超时后给一个兜底值完成。两者都只作用于这个 CompletableFuture 本身——让它「完成」，但不中断已经提交到线程池里的底层阻塞任务。\n\n这意味着如果底层任务在做 HTTP 调用或数据库查询，即使 future 超时完成，那个线程仍可能阻塞在 socket 上。真正释放资源要配合：HTTP/RPC 客户端自己的连接超时和读超时、`CompletableFuture` 的 `cancel(true)`（要求任务能响应中断）、数据库连接池的查询超时、以及连接池本身的最大等待时间。\n\n生产中的超时设计应分层：每一层远程调用有自己的客户端超时；聚合多个调用的 CompletableFuture 链有 `orTimeout` 控制总等待时长；网关或入口有整体超时返回降级。只在最外层设置超时而不控制底层，会导致底层线程长期被占。"
     },
     {
       "type": "explain",
       "title": "组合方法要匹配依赖关系",
-      "content": "串行依赖用 `thenCompose`。例如先查 userId，再用 userId 查订单，第二步本身是异步调用，如果用 thenApply 会得到 `CompletableFuture<CompletableFuture<Order>>`，后续处理变得别扭；thenCompose 会把它压平成一个 future。\n\n并行独立调用用 `thenCombine` 或 `allOf`。两个结果直接合并，用 thenCombine 最清晰；三个以上接口并行查询时，通常先构造多个 future，再用 allOf 等全部完成，最后逐个 join 收集结果。每个分支最好各自带超时和降级，避免一个慢接口拖垮整个聚合。\n\n竞争取最快用 `anyOf`，常见于多数据源竞速、缓存和远端谁先返回用谁。它不会帮你取消其他还在运行的任务；如果这些任务占用昂贵资源，返回最快结果后还要考虑取消、客户端超时或让任务尽快自然结束。"
+      "content": "串行依赖用 `thenCompose`。例如先根据 token 查 userId，再用 userId 查订单——第二步依赖第一步的返回值且本身是异步调用。如果用 `thenApply` 会得到 `CompletableFuture<CompletableFuture<Order>>`，后续取值还要嵌套 join；`thenCompose` 内部会把函数返回的 CompletableFuture 压平，最终结果类型是 `CompletableFuture<Order>`。\n\n并行独立调用用 `thenCombine` 或 `allOf`。两个结果直接合并成一个新值时，`thenCombine` 最清晰——回调接收两个结果返回一个值。三个以上并行查询时，通常先启动多个 future，再用 `allOf(f1, f2, ...)` 等全部完成，然后逐个 `join` 收集结果。`allOf` 本身返回 `CompletableFuture<Void>`，不携带子结果，需要自己从原始 future 取值，这是样板代码但容易写错。\n\n竞争取最快用 `anyOf`，常见于缓存 + 远端竞速或多副本读取。`anyOf` 返回 `CompletableFuture<Object>`，具体类型丢失且它不会取消其他还在运行的任务。如果其他任务占用昂贵资源（连接、文件句柄），需要在取到最快结果后主动 cancel 或依赖客户端超时释放。"
     },
     {
       "type": "explain",
       "title": "取舍：什么时候不该用 CompletableFuture",
-      "content": "CompletableFuture 适合中等复杂度的 fan-out / fan-in：两到十几个异步分支并行，再汇总结果。一旦出现以下情况，应考虑换方案。\n\n第一，流式或背压场景。CF 没有内置背压，上游不会因为下游慢而自动降速；处理 Kafka 流或大文件分块时，应使用 Reactor / Flow（Java 9 `java.util.concurrent.Flow`）这种带 `request(n)` 的反压模型。\n\n第二，复杂的错误恢复与重试。CF 的 `exceptionally` 只能兜底一次，重试需要自己组合 `handle` + 重新 `supplyAsync`；Resilience4j、Spring Retry 这类带指数退避、熔断、限流的库更合适。\n\n第三，链路超长或需要中间状态可见。CF 链一旦超过 5 层，调试和指标采集会变难；这时反应式流或显式状态机更易维护。\n\n第四，Java 21 之后的虚拟线程。Virtual Thread 让「用同步阻塞代码写高并发」重新可行——直接 `Thread.ofVirtual()` 或 `Executors.newVirtualThreadPerTaskExecutor()` 提交阻塞任务，代码更直白，CF 的线程切换价值被削弱。但 CF 在编排依赖图（多分支汇总）上仍有用，可以与虚拟线程 Executor 配合。\n\n成本上：CF 的对象分配（每个 stage 一个 CompletableFuture）和回调调度有开销，单次调用无感，热点路径上百万 QPS 时要注意 GC 压力；`allOf` 之后的逐个 `join` 是样板代码，容易写错类型和异常。"
+      "content": "CompletableFuture 适合中等复杂度的 fan-out / fan-in：两到十几个异步分支并行汇总。以下场景应考虑换方案。\n\n第一，流式或背压场景。CF 没有内置背压，上游不会因为下游慢而自动降速。处理 Kafka 流、大文件分块或 WebSocket 推送时，应使用 Reactor / `java.util.concurrent.Flow`（Java 9+）这种带 `request(n)` 背压模型。\n\n第二，复杂错误恢复与重试。CF 的 `exceptionally` 只能兜底一次，带指数退避、熔断、限流的重试需要手写循环或引入 Resilience4j / Spring Retry。\n\n第三，链路超长或需要中间状态可观测。CF 链超过 5 层后，异常堆栈和调试信息不如反应式流的 operator 链清晰，中间状态的指标采集也更难。显式状态机或反应式流更易维护。\n\n第四，Java 21 虚拟线程（JEP 444）让同步阻塞代码重新可行。`Executors.newVirtualThreadPerTaskExecutor()` 提交阻塞任务时代码更直白，CF 的线程切换优势被削弱。但 CF 在编排依赖图（多分支汇总、条件分支、竞速）上仍比纯虚拟线程更表达力强，可以与虚拟线程 Executor 配合。\n\n性能成本：每个 stage 一个 CompletableFuture 对象分配，百万 QPS 热点路径上要注意 GC 压力；`allOf` 后逐个 join 的样板代码也是 bug 高发区。"
     },
     {
       "type": "diagram",
@@ -60,33 +65,37 @@
     },
     {
       "type": "compareTable",
-      "title": "方法选择和运行边界",
-      "content": "| 场景 | 方法 | 返回/传播 | 注意点 |\n| --- | --- | --- | --- |\n| 异步无返回值 | `runAsync` | `CompletableFuture<Void>` | 阻塞任务传自定义 Executor |\n| 异步有返回值 | `supplyAsync` | `CompletableFuture<T>` | 不传 Executor 走 commonPool |\n| 同步转换 | `thenApply` | `T -> U` | 在完成线程或当前线程执行 |\n| 异步依赖 | `thenCompose` | `T -> CompletableFuture<U>` | 扁平化嵌套 future |\n| 两个结果合并 | `thenCombine` | `(A,B) -> C` | 适合两个独立任务 |\n| 多任务全部完成 | `allOf` | `CompletableFuture<Void>` | 结果要从各 future join |\n| 多任务任一完成 | `anyOf` | `CompletableFuture<Object>` | 类型、取消和剩余任务要处理 |\n| 异常兜底 | `exceptionally` | 异常转正常值 | 只在失败时执行 |\n| 成败转换 | `handle` | 成功/失败都返回新值 | 可吞掉异常并给降级值 |\n| 观察副作用 | `whenComplete` | 不改变原结果 | 前序异常会继续传播 |\n| 超时异常 | `orTimeout` | 超时后异常完成 | 不自动中断底层任务 |\n| 超时兜底 | `completeOnTimeout` | 超时后给默认值 | 仍要设置客户端真实超时 |"
+      "title": "方法选择与异常/超时语义",
+      "content": "| 场景 | 方法 | 返回类型 | 异常传播 | 线程执行 |\n| --- | --- | --- | --- | --- |\n| 异步无返回值 | `runAsync` | `CompletableFuture<Void>` | 任务异常保存在 future | 默认 commonPool 或传入 Executor |\n| 异步有返回值 | `supplyAsync` | `CompletableFuture<T>` | 任务异常保存在 future | 默认 commonPool 或传入 Executor |\n| 同步转换 | `thenApply` | `T -> U` | 前序异常继续传播 | 完成线程或当前调用线程 |\n| 异步依赖扁平化 | `thenCompose` | `T -> CF<U>` | 前序异常继续传播 | 取决于内层 CF 的 Executor |\n| 两个结果合并 | `thenCombine` | `(A,B) -> C` | 任一前序异常继续传播 | 完成线程或当前调用线程 |\n| 多任务全部完成 | `allOf` | `CF<Void>` | 任一前序异常传播到 allOf | 各子任务各自的 Executor |\n| 多任务任一完成 | `anyOf` | `CF<Object>` | 最先完成的异常或值 | 最先完成子任务的线程 |\n| 失败兜底 | `exceptionally` | `Throwable -> T` | 返回正常值则吞异常 | 完成线程或当前调用线程 |\n| 成败都转换 | `handle` | `(T,Throwable) -> U` | 取决于返回值是否抛异常 | 完成线程或当前调用线程 |\n| 只观察不改变 | `whenComplete` | `(T,Throwable) -> void` | 前序异常继续传播 | 完成线程或当前调用线程 |\n| 超时异常 | `orTimeout` | 超时后抛 TimeoutException | 不取消底层任务 | N/A（定时器触发） |\n| 超时兜底 | `completeOnTimeout` | 超时后给默认值 | 不取消底层任务 | N/A（定时器触发） |"
     },
     {
       "type": "code",
       "title": "可运行代码：编排、超时和异常传播",
       "language": "java",
-      "content": "import java.util.Arrays;\nimport java.util.List;\nimport java.util.concurrent.CompletableFuture;\nimport java.util.concurrent.CompletionException;\nimport java.util.concurrent.ExecutorService;\nimport java.util.concurrent.Executors;\nimport java.util.concurrent.ThreadFactory;\nimport java.util.concurrent.TimeUnit;\nimport java.util.concurrent.atomic.AtomicBoolean;\nimport java.util.concurrent.atomic.AtomicInteger;\nimport java.util.stream.Collectors;\n\npublic class Main {\n    public static void main(String[] args) {\n        ExecutorService ioPool = Executors.newFixedThreadPool(4, namedFactory(\"cf-io\"));\n        try {\n            CompletableFuture<Integer> userId = CompletableFuture.supplyAsync(() -> 7, ioPool);\n            CompletableFuture<String> profile = userId.thenCompose(id ->\n                    CompletableFuture.supplyAsync(() -> \"user-\" + id, ioPool));\n            CompletableFuture<Integer> orderCount = userId.thenCompose(id ->\n                    CompletableFuture.supplyAsync(() -> id - 4, ioPool));\n            String summary = profile.thenCombine(orderCount,\n                    (user, orders) -> user + \":orders=\" + orders).join();\n            System.out.println(\"summary=\" + summary);\n            assert \"user-7:orders=3\".equals(summary);\n\n            CompletableFuture<String> a = CompletableFuture.supplyAsync(() -> \"A\", ioPool);\n            CompletableFuture<String> b = CompletableFuture.supplyAsync(() -> \"B\", ioPool);\n            CompletableFuture<String> c = CompletableFuture.supplyAsync(() -> \"C\", ioPool);\n            List<String> all = CompletableFuture.allOf(a, b, c)\n                    .thenApply(ignored -> Arrays.asList(a, b, c).stream()\n                            .map(CompletableFuture::join)\n                            .collect(Collectors.toList()))\n                    .join();\n            System.out.println(\"all=\" + all);\n            assert all.equals(Arrays.asList(\"A\", \"B\", \"C\"));\n\n            String fallback = CompletableFuture.<String>supplyAsync(() -> {\n                throw new IllegalStateException(\"remote failed\");\n            }, ioPool).exceptionally(ex -> \"fallback\").join();\n            System.out.println(\"fallback=\" + fallback);\n            assert \"fallback\".equals(fallback);\n\n            AtomicBoolean observed = new AtomicBoolean(false);\n            CompletableFuture<String> observedFailure = CompletableFuture.<String>supplyAsync(() -> {\n                throw new IllegalArgumentException(\"bad data\");\n            }, ioPool).whenComplete((value, ex) -> observed.set(ex != null));\n            try {\n                observedFailure.join();\n                throw new AssertionError(\"whenComplete should not hide the failure\");\n            } catch (CompletionException expected) {\n                System.out.println(\"observed=\" + observed.get()\n                        + \", cause=\" + expected.getCause().getMessage());\n                assert observed.get();\n            }\n\n            String timed = CompletableFuture.supplyAsync(() -> {\n                sleep(120);\n                return \"slow\";\n            }, ioPool).completeOnTimeout(\"timeout-fallback\", 30, TimeUnit.MILLISECONDS).join();\n            System.out.println(\"timeout=\" + timed);\n            assert \"timeout-fallback\".equals(timed);\n        } finally {\n            ioPool.shutdownNow();\n        }\n    }\n\n    static ThreadFactory namedFactory(String prefix) {\n        AtomicInteger index = new AtomicInteger();\n        return runnable -> new Thread(runnable, prefix + \"-\" + index.incrementAndGet());\n    }\n\n    static void sleep(long millis) {\n        try {\n            Thread.sleep(millis);\n        } catch (InterruptedException e) {\n            Thread.currentThread().interrupt();\n        }\n    }\n}",
+      "content": "import java.util.Arrays;\nimport java.util.List;\nimport java.util.concurrent.CompletableFuture;\nimport java.util.concurrent.CompletionException;\nimport java.util.concurrent.ExecutorService;\nimport java.util.concurrent.Executors;\nimport java.util.concurrent.ThreadFactory;\nimport java.util.concurrent.TimeUnit;\nimport java.util.concurrent.atomic.AtomicBoolean;\nimport java.util.concurrent.atomic.AtomicInteger;\nimport java.util.stream.Collectors;\n\npublic class Main {\n    public static void main(String[] args) {\n        ExecutorService ioPool = Executors.newFixedThreadPool(4, namedFactory(\"cf-io\"));\n        try {\n            // thenCompose 串行依赖：userId -> profile, userId -> orderCount\n            CompletableFuture<Integer> userId = CompletableFuture.supplyAsync(() -> 7, ioPool);\n            CompletableFuture<String> profile = userId.thenCompose(id ->\n                    CompletableFuture.supplyAsync(() -> \"user-\" + id, ioPool));\n            CompletableFuture<Integer> orderCount = userId.thenCompose(id ->\n                    CompletableFuture.supplyAsync(() -> id - 4, ioPool));\n            // thenCombine 并行合并两个独立结果\n            String summary = profile.thenCombine(orderCount,\n                    (user, orders) -> user + \":orders=\" + orders).join();\n            System.out.println(\"summary=\" + summary);\n            assert \"user-7:orders=3\".equals(summary);\n\n            // allOf 等全部完成，逐个 join 收集\n            CompletableFuture<String> a = CompletableFuture.supplyAsync(() -> \"A\", ioPool);\n            CompletableFuture<String> b = CompletableFuture.supplyAsync(() -> \"B\", ioPool);\n            CompletableFuture<String> c = CompletableFuture.supplyAsync(() -> \"C\", ioPool);\n            List<String> all = CompletableFuture.allOf(a, b, c)\n                    .thenApply(ignored -> Arrays.asList(a, b, c).stream()\n                            .map(CompletableFuture::join)\n                            .collect(Collectors.toList()))\n                    .join();\n            System.out.println(\"all=\" + all);\n            assert all.equals(Arrays.asList(\"A\", \"B\", \"C\"));\n\n            // exceptionally 失败兜底\n            String fallback = CompletableFuture.<String>supplyAsync(() -> {\n                throw new IllegalStateException(\"remote failed\");\n            }, ioPool).exceptionally(ex -> \"fallback\").join();\n            System.out.println(\"fallback=\" + fallback);\n            assert \"fallback\".equals(fallback);\n\n            // whenComplete 只观察不吞异常\n            AtomicBoolean observed = new AtomicBoolean(false);\n            CompletableFuture<String> observedFailure = CompletableFuture.<String>supplyAsync(() -> {\n                throw new IllegalArgumentException(\"bad data\");\n            }, ioPool).whenComplete((value, ex) -> observed.set(ex != null));\n            try {\n                observedFailure.join();\n                throw new AssertionError(\"whenComplete should not hide the failure\");\n            } catch (CompletionException expected) {\n                System.out.println(\"observed=\" + observed.get()\n                        + \", cause=\" + expected.getCause().getMessage());\n                assert observed.get();\n            }\n\n            // completeOnTimeout 给兜底结果，但底层任务仍可能在跑\n            String timed = CompletableFuture.supplyAsync(() -> {\n                sleep(120);\n                return \"slow\";\n            }, ioPool).completeOnTimeout(\"timeout-fallback\", 30, TimeUnit.MILLISECONDS).join();\n            System.out.println(\"timeout=\" + timed);\n            assert \"timeout-fallback\".equals(timed);\n        } finally {\n            ioPool.shutdownNow();\n        }\n    }\n\n    static ThreadFactory namedFactory(String prefix) {\n        AtomicInteger index = new AtomicInteger();\n        return runnable -> new Thread(runnable, prefix + \"-\" + index.incrementAndGet());\n    }\n\n    static void sleep(long millis) {\n        try {\n            Thread.sleep(millis);\n        } catch (InterruptedException e) {\n            Thread.currentThread().interrupt();\n        }\n    }\n}",
       "highlights": [
         {
-          "line": 18,
-          "note": "thenCompose 用于下一步本身也是异步调用的场景，避免嵌套 future。"
+          "line": 19,
+          "note": "thenCompose 用于下一步本身也是异步调用的场景，避免嵌套 CompletableFuture<CompletableFuture<T>>。"
         },
         {
-          "line": 22,
+          "line": 25,
           "note": "thenCombine 合并两个独立异步结果，适合并行查询后组装。"
         },
         {
-          "line": 39,
+          "line": 36,
+          "note": "allOf 返回 Void，结果要从各原始 future 逐个 join 取回。"
+        },
+        {
+          "line": 44,
           "note": "exceptionally 把异常路径转换成兜底值。"
         },
         {
-          "line": 48,
-          "note": "whenComplete 只观察，不吞掉异常，join 仍会失败。"
+          "line": 53,
+          "note": "whenComplete 只观察不吞异常，join 仍会抛出 CompletionException。"
         },
         {
-          "line": 63,
+          "line": 65,
           "note": "completeOnTimeout 给 future 一个兜底结果，但底层任务仍要靠真实客户端超时释放资源。"
         }
       ]
@@ -94,19 +103,23 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "CompletableFuture 是 Future 的 CompletionStage 增强：Future 只能阻塞 `get`，一个结果难以继续编排；CompletableFuture 能把多个阶段连成异步编排图，支持链式转换、异步依赖、并行组合、异常处理和超时控制。回答按四条主线展开。\n\n**方法选择按依赖关系**\n- 同步转换：`thenApply`，`T -> U`\n- 异步依赖（下一步返回 CF）：`thenCompose`，扁平化嵌套\n- 两个独立结果合并：`thenCombine`\n- 多任务全完成：`allOf` 返回 `Void`，结果要逐个 `join`\n- 取最快：`anyOf` 返回 `Object`，要自己处理类型和取消剩余任务\n\n**异常处理分清转换和观察**\n- `exceptionally`：只在失败时执行，给兜底值\n- `handle`：成功失败都执行，可吞异常返回新值\n- `whenComplete`：只观察、记日志/指标，不吞异常，前序失败仍会传播\n\n**执行线程是核心考点**\n- 非 Async 回调：通常在完成前序阶段的线程执行；前序已完成时也可能在当前调用线程同步执行\n- Async 回调：提交到 Executor\n- 不传 Executor 的 `supplyAsync`/`runAsync` 走 `ForkJoinPool.commonPool()`，并行度等于 `Runtime.getRuntime().availableProcessors() - 1`\n- 阻塞 IO/RPC/DB 必须传业务隔离 Executor，否则 commonPool 被占满会反噬 parallel stream 和其他 CF\n\n**生产边界与取舍**\n- 每个远程分支要单独配超时和降级；`orTimeout`/`completeOnTimeout`（Java 9+）只完成 future，不取消底层任务，真正释放靠 HTTP/RPC 客户端超时、可取消任务、连接池超时\n- `join`/`get` 不要在同一个小线程池里互相等待，否则线程饥饿\n- CF 适合中等复杂度的 fan-out / fan-in；流式反压选 Reactor / `java.util.concurrent.Flow`，复杂重试熔断选 Resilience4j，Java 21 虚拟线程让同步阻塞代码重新可行\n- 编排不应掩盖容量、限流、取消和监控设计",
+      "content": "CompletableFuture 是 Future 的 CompletionStage 增强。Future 只能阻塞 get，难以编排多个异步阶段；CompletableFuture 能把多个阶段连成编排图，支持链式转换、异步依赖、并行组合、异常处理和超时控制。\n\n**方法选择按依赖关系**\n- 同步转换：`thenApply`，`T -> U`\n- 异步依赖（下一步返回 CF）：`thenCompose`，扁平化嵌套\n- 两个独立结果合并：`thenCombine`\n- 多任务全完成：`allOf` 返回 `Void`，结果逐个 join\n- 取最快：`anyOf` 返回 `Object`，自行处理类型和取消\n\n**异常处理分清转换和观察**\n- `exceptionally`：只在失败时执行，给兜底值\n- `handle`：成功失败都执行，可吞异常返回新值\n- `whenComplete`：只观察、记日志/指标，不吞异常，前序失败继续传播\n- 如果链中无异常处理且调用方不 join/get，异常会静默\n\n**执行线程是核心考点**\n- 非 Async 回调：完成前序的线程执行；前序已完成则当前调用线程同步执行\n- Async 回调：提交到 Executor，与完成线程解耦\n- 不传 Executor 的 `supplyAsync`/`runAsync` 走 `ForkJoinPool.commonPool()`，并行度 = CPU-1\n- 阻塞 IO/RPC/DB 必须传业务隔离 Executor，否则 commonPool 被占满会反噬 parallel stream 和其他 CF\n\n**超时与取消分离**\n- `orTimeout`（Java 9+）：超时后 TimeoutException\n- `completeOnTimeout`：超时后给兜底值\n- 两者只完成 future，不中断底层阻塞任务\n- 真正释放资源要配合客户端超时、cancel(true)、连接池超时\n\n**生产边界与取舍**\n- 每个远程分支单独配超时和降级\n- `join`/`get` 不要在同一个小线程池里互相等待，避免线程饥饿\n- CF 适合中等 fan-out/fan-in；流式反压选 Reactor/Flow，复杂重试熔断选 Resilience4j，Java 21 虚拟线程让同步阻塞代码重新可行\n- 编排不应掩盖容量、限流、取消和监控设计",
       "followUpQuestions": [
         {
-          "question": "thenApply、thenCompose、thenCombine 怎么区分？",
-          "answer": "thenApply 是把一个结果同步转换成另一个值；thenCompose 用在转换函数返回 CompletableFuture 的场景，会把嵌套 future 扁平化；thenCombine 用于两个彼此独立的 future 都完成后合并结果。判断标准是：下一步是否异步、是否依赖前一步、是否要合并两个独立结果。"
+          "question": "thenApply 和 thenCompose 怎么选？",
+          "answer": "thenApply 用于同步转换——函数接收一个值返回一个值；thenCompose 用于异步依赖——函数接收一个值返回 CompletableFuture。如果函数返回 CompletableFuture，用 thenApply 会得到嵌套 CF，用 thenCompose 会自动压平。判断标准：下一步是同步函数还是异步调用。"
         },
         {
-          "question": "为什么不建议阻塞任务使用 commonPool？",
-          "answer": "commonPool 是 JVM 共享的 ForkJoinPool，默认并行度接近 CPU 核数。阻塞 RPC、数据库或文件 IO 会长期占住这些线程，影响 parallel stream 和其他 CompletableFuture。业务阻塞任务应传自定义 Executor，并给线程池设置有界队列、拒绝策略和指标。"
+          "question": "不传 Executor 的 supplyAsync 有什么风险？",
+          "answer": "它走 ForkJoinPool.commonPool，这个池并行度接近 CPU 核数且 JVM 全局共享。阻塞 RPC/DB/文件 IO 会长期占住这些线程，影响 parallel stream 和所有未指定 Executor 的 CompletableFuture。生产应按业务隔离传入自定义线程池。"
         },
         {
           "question": "CompletableFuture 超时后底层任务会停止吗？",
-          "answer": "通常不会。orTimeout 会让 future 以 TimeoutException 失败，completeOnTimeout 会给兜底值，但已经提交到线程池的任务可能仍在执行。要真正释放资源，需要 HTTP/RPC 客户端超时、可取消任务、连接池超时和业务中断处理一起配合。"
+          "answer": "不会。orTimeout 让 future 以 TimeoutException 失败，completeOnTimeout 给兜底值，但已提交到线程池的任务仍可能阻塞在 socket 或 IO 上。要真正释放资源需要 HTTP/RPC 客户端超时、cancel(true) 响应中断、连接池超时配合。"
+        },
+        {
+          "question": "allOf 和 anyOf 分别适合什么场景？各自有什么坑？",
+          "answer": "allOf 适合等所有任务完成后汇总结果，坑是它返回 Void，需要逐个 join 原始 future 取值。anyOf 适合取最快完成的结果（如缓存和远端竞速），坑是返回 Object 需要自行强转，且不会自动取消其他任务，要手动释放资源。"
         }
       ]
     },
@@ -114,13 +127,14 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 CompletableFuture 相比 Future 增强了链式、组合、回调和异常处理",
-        "能区分 thenApply、thenCompose、thenCombine、allOf 和 anyOf",
-        "能解释 Async 与非 Async 回调的执行线程差异",
+        "能说明 CompletableFuture 相比 Future 增强了链式、组合、回调和异常处理能力",
+        "能区分 thenApply / thenCompose / thenCombine / allOf / anyOf 的适用场景和返回类型",
+        "能解释 Async 与非 Async 回调的执行线程差异及前序完成状态的影响",
         "能说明 commonPool 对阻塞任务的风险以及自定义线程池隔离方式",
-        "能区分 exceptionally、handle、whenComplete 的异常传播语义",
-        "能说明 completeOnTimeout/orTimeout 与底层任务取消不是一回事",
-        "能写出并行调用、汇总结果、超时兜底和异常日志的完整代码"
+        "能区分 exceptionally / handle / whenComplete 的异常转换与传播语义",
+        "能说明 orTimeout / completeOnTimeout 只完成 future 不取消底层任务，以及超时分层设计",
+        "能识别 join/get 互相等待导致的线程饥饿风险",
+        "能判断何时应转向 Reactor / Flow / 虚拟线程而不是继续用 CF"
       ]
     }
   ],
@@ -137,49 +151,57 @@
       "id": "java.concurrency.topic-026-3990751f.recall.2",
       "prompt": "CompletableFuture 在什么场景下会导致线程饥饿或性能问题？如何预防？",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "expectedMinutes": 4,
+      "difficulty": 4
     },
     {
       "id": "java.concurrency.topic-026-3990751f.recall.3",
-      "prompt": "CompletableFuture 的 thenApply、thenCompose、handle、exceptionally 分别适合什么场景？默认线程池有什么风险？",
+      "prompt": "请用 CompletableFuture 编排：并行调用两个远程服务，汇总结果，设置超时兜底，记录异常指标。解释每个方法选择的原因。",
       "mode": "code",
       "expectedMinutes": 10,
-      "difficulty": 3
+      "difficulty": 4
     },
     {
       "id": "java.concurrency.topic-026-3990751f.recall.4",
-      "prompt": "请用 CompletableFuture 编排两个并行远程调用并汇总结果，同时处理超时和异常。",
-      "mode": "code",
-      "expectedMinutes": 8,
+      "prompt": "thenApply、thenCompose、thenCombine、allOf、anyOf 分别适合什么场景？默认线程池有什么风险？",
+      "mode": "text",
+      "expectedMinutes": 5,
       "difficulty": 3
     },
     {
       "id": "java.concurrency.topic-026-3990751f.recall.5",
-      "prompt": "thenApply、thenCompose、handle、exceptionally、whenComplete 的区别和线程池风险是什么？",
+      "prompt": "CompletableFuture 的 orTimeout 只会完成 future，不会取消底层任务。请解释原因，并说明生产中应该如何分层设计超时。",
       "mode": "text",
       "expectedMinutes": 5,
-      "difficulty": 3
+      "difficulty": 4
+    },
+    {
+      "id": "java.concurrency.topic-026-3990751f.recall.6",
+      "prompt": "你在排查一个异步服务：commonPool 的 activeThread 数等于 CPU-1，queueSize 持续增长，parallel stream 也变慢。根因是什么？如何修复？",
+      "mode": "text",
+      "expectedMinutes": 6,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出 CompletableFuture 解决 Future 的链式/组合/回调痛点",
-      "能说明阻塞任务要传自定义线程池，避免 commonPool 被占满",
-      "能区分 thenApply/thenCompose/thenCombine/allOf/anyOf",
-      "能说明异步异常要用 exceptionally/handle/whenComplete 明确处理"
+      "能说出 CompletableFuture 解决了 Future 的链式编排、组合和异常处理痛点",
+      "能说明阻塞任务必须传自定义线程池，避免 commonPool 被占满影响并行流和其他 CF",
+      "能区分 thenApply / thenCompose / thenCombine / allOf / anyOf 的依赖关系和适用场景",
+      "能区分 exceptionally / handle / whenComplete 的异常转换、吞吐与传播语义"
     ],
     "goodToHave": [
-      "能解释 Async 与非 Async 回调执行线程差异",
-      "能说明 completeOnTimeout/orTimeout 不等于底层任务取消",
-      "能识别小线程池中 join/get 造成线程饥饿的风险",
-      "能写出并行调用的超时、降级、汇总和指标记录"
+      "能解释 Async 与非 Async 回调的执行线程差异及前序阶段完成状态的影响",
+      "能说明 orTimeout / completeOnTimeout 不等于底层任务取消，需要客户端超时配合",
+      "能识别小线程池中 join/get 互相等待造成的线程饥饿风险",
+      "能判断何时应转向 Reactor / Flow / 虚拟线程而不是继续用 CF"
     ],
     "commonMistakes": [
-      "不传线程池使用 commonPool 执行阻塞 IO",
-      "以为异步异常会抛到调用线程",
-      "用 thenApply 返回 CompletableFuture 导致嵌套 future",
-      "以为 anyOf 返回后其他任务会自动取消"
+      "不传线程池使用 commonPool 执行阻塞 IO，导致 parallel stream 和其他 CF 互相拖慢",
+      "用 thenApply 返回 CompletableFuture 导致嵌套 CF，应用 thenCompose 扁平化",
+      "以为 anyOf 返回后其他任务会自动取消，忽略资源释放",
+      "只在外层设超时不控制底层客户端超时，底层线程仍被占",
+      "以为异步异常会自动抛到调用线程，不写 exceptionally/handle 导致错误静默"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -188,11 +210,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "java.concurrency.topic-021-d2222a23"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否从异步编排、线程执行位置、异常和超时传播、commonPool 隔离以及生产容量边界解释 CompletableFuture。"
+  "interviewerFocus": "考察能否从异步编排方法选择、Async 与非 Async 执行线程、异常转换与传播、超时与取消分离、commonPool 隔离以及生产边界（线程饥饿、背压、虚拟线程替代）完整解释 CompletableFuture。"
 }

@@ -79,7 +79,7 @@ async function processOne(ref, { model, mock, previewDir }) {
   const topic = JSON.parse(fs.readFileSync(abs, "utf8"));
   // JSON 解析或校验失败就 re-roll 重调（MiMo 出 JSON 是随机的，重试多半能拿到合法输出）。
   const attempts = mock ? 1 : 3;
-  let merged, diagramRequests, usage = null, lastErr = null;
+  let merged, diagramRequests, usage = null, lastErr = null, rawText = null;
   for (let i = 0; i < attempts; i++) {
     try {
       let text;
@@ -87,13 +87,19 @@ async function processOne(ref, { model, mock, previewDir }) {
         text = mockResponse(topic);
       } else {
         const r = await callChat({ model, messages: buildMessages(topic) });
-        text = r.text; usage = r.usage;
+        text = r.text; usage = r.usage; rawText = text;
       }
       ({ topic: merged, diagramRequests } = mergeRewrite(topic, extractJson(text)));
       lastErr = null;
       break;
     } catch (e) {
       lastErr = e;
+      // 调试：JSON 解析失败时保存原始响应
+      if (e.jsonParse && rawText) {
+        const debugDir = path.join(REWRITE_DIR, ".debug");
+        fs.mkdirSync(debugDir, { recursive: true });
+        fs.writeFileSync(path.join(debugDir, path.basename(ref, ".json") + ".txt"), rawText);
+      }
       if (mock) break;
     }
   }

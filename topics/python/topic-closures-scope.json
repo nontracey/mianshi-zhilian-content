@@ -4,7 +4,7 @@
   "category": "python-advanced",
   "group": "python-advanced",
   "title": "Python 闭包与 LEGB 作用域",
-  "summary": "闭包原理、LEGB 规则、nonlocal 关键字、变量生命周期、常见闭包陷阱",
+  "summary": "讲清 LEGB 四层作用域的查找顺序与性能差异、闭包是函数加上对外层变量 cell 对象的引用而非值快照、nonlocal 与 global 的语义边界和使用约束、延迟绑定问题的三种修复手段与各自原理、闭包对变量生命周期的延长机制及其内存风险，以及 Python 工程中闭包在装饰器、回调、工厂函数等场景的实际应用与边界。",
   "tags": [
     "Python",
     "闭包",
@@ -13,19 +13,34 @@
     "nonlocal"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 36,
   "order": 80,
   "recommendWeight": 70,
   "learningCards": [
     {
       "type": "explain",
-      "title": "Python 闭包与 LEGB 作用域：LEGB 规则、闭包",
-      "content": "## 一、LEGB 规则\n\nPython 变量名解析遵循 LEGB 顺序：\n\n1. **L**ocal：当前函数内部的局部作用域\n2. **E**nclosing：外层函数的局部作用域（闭包相关）\n3. **G**lobal：模块级别的全局作用域\n4. **B**uilt-in：内置作用域（`builtins` 模块）\n\n```python\nx = \"global\"       # Global\ndef outer():\n    x = \"enclosing\"  # Enclosing\n    def inner():\n        x = \"local\"  # Local\n        print(x)\n    inner()\nouter()  # 输出 \"local\"\n```\n\n## 二、闭包\n\n闭包 = 函数 + 函数定义时捕获的自由变量的绑定。\n```python\ndef make_counter():\n    count = 0\n    def counter():\n        nonlocal count\n        count += 1\n        return count\n    return counter\n\nc = make_counter()\nprint(c())  # 1\nprint(c())  # 2\n# count 变量在 make_counter 返回后仍然存在\n```\n\n## 三、nonlocal 和 global\n\n- `global x`：声明 x 是模块级全局变量\n- `nonlocal x`：声明 x 是外层函数的局部变量（闭包场景）\n\n```python\ndef outer():\n    x = 0\n    def inner():\n        nonlocal x  # 否则 x += 1 会创建新的局部变量\n        x += 1\n        return x\n    return inner\n```\n\n闭包的机制是：内层函数被返回或传出去后，依然持有对外层函数变量的引用，这些自由变量的绑定不随外层函数执行结束而销毁——这正是装饰器、回调能携带上下文的原因。边界在于它捕获的是变量绑定、不是定义时的快照值，所以在循环里会触发延迟绑定问题。"
+      "title": "LEGB 四层查找规则与性能差异",
+      "content": "Python 变量名解析严格按 L → E → G → B 四层顺序，找到第一个绑定即停止。\n\n**Local（L）**：当前执行的函数体内通过赋值创建的绑定（包括参数）。Python 编译器在编译函数体时会检查是否有对某个名称的赋值，如果有，该名称就标记为局部变量。函数执行时用 `LOAD_FAST` 指令从局部变量数组（localsplus）中按索引读取，是最快的作用域查找。\n\n**Enclosing（E）**：外层函数的局部作用域。只在嵌套函数中出现。内层函数引用外层函数的变量时，编译器会把它标记为 free variable，运行时用 `LOAD_DEREF` 指令从闭包的 cell 对象中读取。cell 是一个间接层——内层函数不直接持有变量的值，而是持有 cell 对象的引用，cell 再持有当前值。这层间接性让内层和外层都能通过同一个 cell 读写同一个变量。\n\n**Global（G）**：模块作用域。函数体内出现的任何未赋值且不在 enclosing 作用域中的名称，在运行时用 `LOAD_GLOBAL` 按字典查找。字典查找是 O(1) 但比 LOAD_FAST（数组索引）慢，因为涉及哈希计算和指针解引用。模块作用域的变量在整个模块生命周期内存在，不受函数返回的影响。\n\n**Built-in（B）**：`builtins` 模块中的名称。只有在前三层都找不到时才查这里。用 `LOAD_GLOBAL` 再查一次 builtins 字典，速度最慢。正因为这个兜底，`print`、`len`、`range` 等不需要 import。但模块级代码中的 `__name__`、`__doc__` 等特殊属性不在 builtins 里，而是 Python 解释器注入到模块的全局字典中。\n\n**编译时决定变量类别**：Python 在编译函数体时就确定了每个名称属于哪个作用域（local/enclosing/global/built-in），而不是运行时逐层查找。`global x` 和 `nonlocal x` 声明就是显式告诉编译器：这个名称的归属不是默认推断结果，而是我指定的层。如果没有这些声明且函数体内对变量赋值，编译器默认把它标记为 local——这正是 `UnboundLocalError` 的来源：函数体内任何位置有赋值，该变量就是 local，即使同名全局变量存在，在赋值前读取也会报错。"
     },
     {
       "type": "explain",
-      "title": "Python 闭包与 LEGB 作用域：常见闭包陷阱、闭包的应用场景",
-      "content": "## 四、常见闭包陷阱\n\n**陷阱 1：延迟绑定（Late Binding）**\n\n```python\ndef create_multipliers():\n    return [lambda x: i * x for i in range(5)]\n\nfor m in create_multipliers():\n    print(m(2))  # 输出 8 8 8 8 8（都是 4*2）\n```\n\n**原因**：闭包捕获的是变量**绑定**，不是变量**的值**。循环结束后 i 的值是 4。\n**修复**：\n```python\ndef create_multipliers():\n    return [lambda x, i=i: i * x for i in range(5)]\n# 默认参数在定义时绑定值，i=i 把当前值复制到默认参数中\n```\n\n**陷阱 2：循环中修改闭包变量**\n\n```python\nlambdas = []\nfor i in range(5):\n    lambdas.append(lambda: i)  # 都引用同一个 i\n```\n\n## 五、闭包的应用场景\n\n- **装饰器**：捕获外层函数参数\n- **回调函数**：携带上下文\n- **偏函数**：固定部分参数\n- **惰性求值**：延迟计算\n- **工厂函数**：生成特定行为的函数\n\n## 经典陷阱与验证\n最经典的闭包坑是「循环里创建闭包」：循环中创建的函数都闭包到同一个循环变量，循环结束后变量是最终值，所有函数读到的都是那个最终值。验证：`[lambda: i for i in range(3)]` 里三个 lambda 调用都返回 2，因为它们闭包的是同一个 i 的引用、而不是当时的值。修法是用默认参数把值固定下来——`lambda i=i: i`，默认参数在定义时求值、各自捕获当时的 i。这个现象正是「闭包捕获的是变量引用而非值」的直接证据，也是 Python 和 JS（var 循环）都会踩的坑。"
+      "title": "闭包是函数加 cell 引用，不是值快照",
+      "content": "闭包的本质是：一个函数对象 + 它引用的外层函数变量的 cell 对象列表，存储在函数的 `__closure__` 属性中。\n\n当内层函数引用了外层函数的局部变量，Python 在创建内层函数对象时（`MAKE_FUNCTION`），把外层函数中被引用的变量从普通局部变量（fastlocals 槽位）转为 cell 变量。外层函数通过 `LOAD_CLOSURE` 把 cell 对象传递给内层函数的闭包元组。内层函数执行时用 `LOAD_DEREF` 从 cell 中读取当前值。\n\n关键事实：闭包捕获的是 cell 对象的引用，不是定义时的值快照。cell 内容会随外层变量被修改而改变。这可以通过 `func.__closure__[i].cell_contents` 在运行时查看和修改。\n\n```python\ndef outer():\n    x = 10\n    def inner():\n        return x\n    return inner\n\nf = outer()\nprint(f.__closure__[0].cell_contents)  # 10\n# cell 还活着，x 的值 10 没有随 outer() 返回而消失\n```\n\n闭包延长了变量的生命周期。正常情况下 outer() 返回后，它的栈帧销毁，局部变量 x 被回收。但 inner 持有 x 的 cell 对象引用，GC 引用计数不为 0，cell 以及 cell 持有的值对象都不会被回收，直到 inner 本身被回收。这是闭包能工作的基础，也是闭包可能引发内存问题的根源。\n\n闭包和全局变量的核心区别：闭包是词法作用域的，每个 outer 调用产生独立的 cell 链，互不干扰。全局变量是模块级唯一的，多个闭包共享同一份模块状态。这也是为什么实现有状态函数时，闭包比全局变量更干净——每个工厂函数调用产生独立的计数器/缓存/配置。"
+    },
+    {
+      "type": "explain",
+      "title": "nonlocal 与 global 的语义边界",
+      "content": "不加声明直接赋值 → 编译器标记为 local，这是 Python 的默认行为。当你确实需要写外层变量或全局变量时，必须显式声明。\n\n**global x**：告诉编译器「x 是模块全局字典中的名称」。效果：函数内对 x 的读写都走 `LOAD_GLOBAL` / `STORE_GLOBAL`，操作模块的 `__dict__`。x 不需要预先存在——`global x; x = 1` 会创建全局变量。\n\n**nonlocal x**：告诉编译器「x 是外层函数的局部变量」。效果：函数内对 x 的读写都走 `LOAD_DEREF` / `STORE_DEREF`，操作外层函数的 cell 对象。约束：x 必须在外层函数中已经有绑定（赋值或参数），否则 `SyntaxError`。nonlocal 不会创建新变量，只能引用已有的外层绑定。\n\n```python\ndef outer():\n    x = 0\n    def inner():\n        nonlocal x  # 必须，否则 x += 1 创建 local x，读时 UnboundLocalError\n        x += 1      # STORE_DEREF，写入 outer 的 cell\n        return x\n    return inner\n\nf = outer()\nf()  # 1\nf()  # 2\n```\n\n**常见错误**：不加 nonlocal 就试图修改外层变量。Python 编译器看到 `x += 1`，认定 x 是 local（因为有赋值），`LOAD_FAST` 读 x 时 x 未绑定，抛 `UnboundLocalError: local variable 'x' referenced before assignment`。注意：纯读外层变量不需要 nonlocal——编译器会自动把它标记为 free variable 并用 `LOAD_DEREF` 读取。只在需要写（赋值、augmented assignment）时才必须加 nonlocal。\n\n**Python 2 没有 nonlocal**，绕过方式是用可变容器：`state = [0]`，内层函数写 `state[0] += 1`——改的是容器内容，不是变量绑定本身，所以不需要 nonlocal。`collections.defaultdict` 或自定义对象同理。这个技巧在维护 Python 2 遗留代码时仍然有用。"
+    },
+    {
+      "type": "explain",
+      "title": "延迟绑定陷阱：闭包捕获引用而非值",
+      "content": "延迟绑定是闭包最经典的坑。根源：闭包捕获的是 cell 引用，不是定义时的值快照。循环中创建的多个闭包共享同一个循环变量的 cell，循环结束后变量是最终值，所有闭包调用时读到的都是那个最终值。\n\n```python\nfuncs = [lambda: i for i in range(5)]\nprint([f() for f in funcs])  # [4, 4, 4, 4, 4]\n```\n\nlambda 的 `__closure__` 中只有一个 cell，且五个 lambda 的 `__closure__[0]` 是同一个 cell 对象（可以用 `is` 验证）。循环结束时 i = 4，调用时读 cell_contents 都是 4。\n\n三种修复方式的原理不同：\n\n**方式一：默认参数（最常用）**\n```python\nfuncs = [lambda i=i: i for i in range(5)]\n```\n默认参数值在函数定义时（每次循环迭代）求值并绑定到函数对象的 `__defaults__` 元组中。此时 i 的当前值被复制进默认参数，每个函数的 `__defaults__` 各自独立。闭包 cell 和默认参数互不干扰——函数体内的 `i` 是参数（Local），不走闭包。\n\n**方式二：立即执行函数（IIFE）**\n```python\nfuncs = [(lambda j: lambda: j)(i) for i in range(5)]\n```\n外层 lambda 立即被调用，参数 j 是外层 lambda 的 local 变量，j 的值在调用时确定。内层 lambda 闭包的是外层 lambda 的 j，每次外层调用产生独立的 j 的 cell，互不干扰。\n\n**方式三：functools.partial**\n```python\nfrom functools import partial\nfuncs = [partial(lambda j: j, i) for i in range(5)]\n```\npartial 在创建时把当前 i 的值绑定到 partial 对象的 `args` 中，不涉及闭包。效果等价于默认参数，但更显式。\n\n**面试追问「什么时候会出这个问题」**：在 `for` / `while` 循环、列表推导式中创建闭包时。`map(lambda x: i * x, iterable)` 也是同理。实际场景：Django URL 配置中循环注册视图函数、Tkinter 循环绑定按钮回调、并发任务中捕获循环变量。"
+    },
+    {
+      "type": "explain",
+      "title": "闭包对变量生命周期的延长与内存风险",
+      "content": "闭包通过持有 cell 对象的强引用，阻止了外层变量被 GC 回收。正常函数返回后栈帧销毁、局部变量回收；但如果有闭包引用了局部变量，该变量会一直存活到闭包本身被回收。\n\n**正常场景**：闭包持有少量变量（配置值、计数器），生命周期合理，GC 正常工作。\n\n**风险场景一：大对象泄漏**\n```python\ndef process(data):\n    large_list = [x * 2 for x in data]  # 几 GB\n    def summary():\n        return len(large_list)\n    return summary\n\nfn = process(huge_data)\n# large_list 不会被释放，fn 活着它就活着\n```\n修复：summary 真正只需要 `len(large_list)`，把长度存为 int 就行，不要闭包整个 list。\n\n**风险场景二：循环引用**\n闭包引用了外层对象的方法，对象又持有闭包作为属性，形成循环引用。CPython 的引用计数无法处理循环引用，需要依赖 GC 的循环检测器（默认开启，generation-based）。但在某些场景（C 扩展、`__del__` 方法）下 GC 可能不回收。`weakref` 可以打破循环。\n\n**风险场景三：长期存活的闭包**\n闭包作为回调注册到全局事件系统、信号处理器、线程池中，持有对大型上下文的引用。即使业务逻辑已经「完成」，只要事件系统还持有闭包引用，变量就不会释放。解决方案：事件注销、闭包置 None、或只传递必要数据而非整个上下文。\n\n**查看闭包引用**：`func.__closure__` 返回 cell 对象元组，`func.__code__.co_freevars` 返回自由变量名元组。两者一一对应。可以通过这个机制诊断闭包到底捕获了什么。"
     },
     {
       "type": "diagram",
@@ -47,28 +62,53 @@
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "# 1. 闭包陷阱演示\n# 陷阱：延迟绑定\nfuncs = []\nfor i in range(3):\n    funcs.append(lambda: i)\n\nfor f in funcs:\n    print(f())  # 2 2 2（不是 0 1 2）\n\n# 修复方式 1：默认参数\ndef create_funcs_1():\n    return [lambda x=i: x for i in range(3)]\n\n# 修复方式 2：立即执行的函数表达式\nfuncs2 = [(lambda j: lambda: j)(j) for j in range(3)]\nfor f in funcs2:\n    print(f())  # 0 1 2\n\n# 修复方式 3：functools.partial\nfrom functools import partial\nfuncs3 = [partial(lambda x: x, i) for i in range(3)]\n\n# 2. 闭包实现记忆化\ndef memoize(func):\n    cache = {}\n    def wrapper(*args):\n        if args not in cache:\n            cache[args] = func(*args)\n        return cache[args]\n    return wrapper\n\n@memoize\ndef fib(n):\n    if n < 2:\n        return n\n    return fib(n-1) + fib(n-2)\n\n# 3. LEGB 演示\nimport builtins\nbuiltins.print(\"直接使用 builtins 的 print\")",
+      "title": "闭包陷阱、修复、诊断与实用模式",
       "language": "python",
+      "content": "# ===== 1. 延迟绑定陷阱与三种修复 =====\n\n# 陷阱：循环闭包共用同一个 cell\nfuncs_broken = [lambda: i for i in range(3)]\nprint([f() for f in funcs_broken])  # [2, 2, 2]\n\n# 修复 A：默认参数（定义时求值，绑定到 __defaults__）\nfuncs_fix_a = [lambda i=i: i for i in range(3)]\nprint([f() for f in funcs_fix_a])  # [0, 1, 2]\n\n# 修复 B：立即执行函数（每次调用产生独立的 cell）\nfuncs_fix_b = [(lambda j: lambda: j)(i) for i in range(3)]\nprint([f() for f in funcs_fix_b])  # [0, 1, 2]\n\n# 修复 C：functools.partial（值绑定到 partial.args，不走闭包）\nfrom functools import partial\nfuncs_fix_c = [partial(lambda j: j, i) for i in range(3)]\nprint([f() for f in funcs_fix_c])  # [0, 1, 2]\n\n# ===== 2. 验证闭包 cell 共享 =====\nf1, f2 = funcs_broken[0], funcs_broken[1]\nprint(f1.__closure__ is f2.__closure__)         # False（元组不同对象）\nprint(f1.__closure__[0] is f2.__closure__[0])    # True（同一个 cell 对象）\nprint(f1.__code__.co_freevars)                   # ('i',)\n\n# ===== 3. 闭包实现带状态的工厂函数 =====\ndef make_counter(start=0):\n    count = start\n    def counter():\n        nonlocal count\n        count += 1\n        return count\n    return counter\n\nc1 = make_counter()\nc2 = make_counter(100)\nprint(c1(), c1(), c1())  # 1 2 3\nprint(c2(), c2())        # 101 102\n# c1 和 c2 各自独立的 cell，互不干扰\n\n# ===== 4. 闭包实现记忆化装饰器 =====\ndef memoize(func):\n    cache = {}\n    def wrapper(*args):\n        if args not in cache:\n            cache[args] = func(*args)\n        return cache[args]\n    wrapper.__wrapped__ = func\n    return wrapper\n\n@memoize\ndef fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\nprint(fib(30))  # 832040\n\n# ===== 5. 闭包内存风险演示 =====\ndef make_closures_with_large_data():\n    large_data = list(range(10_000_000))  # ~80MB\n    def get_len():\n        return len(large_data)  # 闭包捕获整个 list\n    def get_len_fixed():\n        n = len(large_data)\n        return lambda: n  # 只闭包一个 int\n    return get_len, get_len_fixed\n\nclosure_bad, closure_good = make_closures_with_large_data()\nimport sys\nprint(sys.getsizeof(closure_bad.__closure__[0].cell_contents))  # 很大\nprint(closure_good())  # 10000000，但 cell 只存了 int\n# closure_bad 释放前，large_data 不会被 GC 回收\ndel closure_bad  # 现在 large_data 可以被回收",
       "highlights": [
         {
-          "line": 1,
-          "note": "循环里的 lambda 共用同一个 i 的绑定，调用时才读取 cell 内容，所以三个函数都会看到最终值 2。"
+          "line": 5,
+          "note": "陷阱：三个 lambda 的 __closure__ 持有同一个 cell 对象，循环结束后 i = 2，所有函数调用都返回 2。"
+        },
+        {
+          "line": 30,
+          "note": "验证：f1.__closure__[0] is f2.__closure__[0] 为 True，证明闭包共享同一个 cell。"
+        },
+        {
+          "line": 38,
+          "note": "nonlocal count 让内层函数可以修改外层变量；每次 make_counter 调用产生独立的 cell 链。"
+        },
+        {
+          "line": 60,
+          "note": "闭包持有 large_data 的强引用，GC 无法回收；修复方式是只闭包需要的标量值。"
         }
       ]
     },
     {
+      "type": "compareTable",
+      "title": "闭包变量捕获机制对比",
+      "content": "| 维度 | Python 闭包（cell） | 默认参数捕获 | 全局变量 |\n| --- | --- | --- | --- |\n| 捕获时机 | 函数定义时创建 cell 对象 | 函数定义时（每次调用）求值默认值 | 模块加载时创建 |\n| 捕获内容 | cell 对象引用（读写共享） | 值的快照（不可变对象独立副本） | 模块 __dict__ 中的绑定 |\n| 可修改性 | 需 nonlocal 声明后可写 | 只能改默认值本身（参数是 local） | 需 global 声明后可写 |\n| 独立性 | 每次外层调用产生独立 cell 链 | 每次函数定义求值独立默认值 | 模块级全局唯一 |\n| 延迟绑定风险 | 有（循环变量共享 cell） | 无（定义时已固定值） | 不适用 |\n| 内存影响 | 延长外层变量生命周期 | 默认值是函数对象的一部分 | 模块生命周期内存在 |\n| 典型用途 | 装饰器、有状态工厂函数 | 修复循环闭包陷阱、固定配置 | 模块级配置、常量 |"
+    },
+    {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**高频问题 1：什么是闭包？闭包有什么用途？**\n\n机制要点：\n- 闭包是函数及其引用的自由变量的组合。内部函数引用了外部函数的变量，即使外部函数已经返回，那些变量仍然存在。在 Python 中，闭包的应用包括：装饰器的实现基础、回调函数携带上下文、偏函数固定参数、惰性求值等场景。 **高频问题 2：Python 的闭包延迟绑定陷阱是什么？怎么解决？**\n- 延迟绑定是指闭包中引用的变量在运行时才取值，而不是在闭包定义时。典型场景是在循环中创建多个 lambda 表达式，所有 lambda 都引用同一个循环变量，最终都取到最后的值。解决方案有三种：使用默认参数（值在定义时确定）、使用立即执行函数（IIFE）、使用 `functools.partial`。 **高频问题 3：nonlocal 和 global 的区别是什么？**\n- global 用于在函数内部声明变量来自全局作用域，可读可写。nonlocal 用于在嵌套函数中声明变量来自外层函数的作用域。注意 nonlocal 的变量必须在外层函数中已经存在（已绑定），而 global 没有这个限制。在 Python 2 中没有 nonlocal，需要用可变对象（如 list）绕过限制。",
+      "content": "**一句话结论**\nPython 闭包是函数加上对外层变量 cell 对象的引用，cell 让内层和外层共享读写同一个变量；LEGB 规则在编译时就确定每个名称走哪条查找路径，运行时不会逐层查找。\n\n**LEGB 规则（简明版）**\n- L（Local）：当前函数的局部变量，LOAD_FAST 数组索引，最快\n- E（Enclosing）：外层函数变量，LOAD_DEREF 通过 cell 间接读取\n- G（Global）：模块变量，LOAD_GLOBAL 字典查找\n- B（Built-in）：内置名称，LOAD_GLOBAL 查 builtins 字典\n- 编译时决定归属，不是运行时逐层查找\n\n**闭包机制**\n- 内层函数引用外层变量 → 编译器把该变量标记为 cell 变量\n- 函数对象的 `__closure__` 持有 cell 对象元组，`__code__.co_freevars` 是变量名\n- 捕获的是 cell 引用，不是值快照 → 值会随外层修改而变化\n- 每次外层函数调用产生独立的 cell 链，不同闭包实例互不干扰\n\n**nonlocal vs global**\n- `global x`：读写模块全局字典，x 可以不存在（创建新绑定）\n- `nonlocal x`：读写外层 cell，x 必须在外层已绑定（否则 SyntaxError）\n- 纯读外层变量不需要 nonlocal，只在需要写时才必须加\n\n**延迟绑定陷阱（必考）**\n- 问题：循环中创建的闭包共用同一个循环变量的 cell，调用时读最终值\n- 修复：默认参数 i=i（定义时求值）、IIFE（立即调用产生独立 cell）、functools.partial（绑定到 args）\n- 根源：闭包捕获引用而非值\n\n**内存风险**\n- 闭包延长变量生命周期：大对象被闭包引用则无法 GC\n- 长期存活的闭包（事件回调、信号处理器）可能泄漏上下文\n- 诊断：`func.__closure__[i].cell_contents` 查看捕获了什么",
       "followUpQuestions": [
         {
-          "question": "Python 闭包中的变量是在什么时候捕获的？值还是引用？",
-          "answer": "Python 闭包捕获的是变量的「引用」（名称绑定），不是变量的「值」。函数内部引用的自由变量通过 `__closure__` 属性（cell 对象元组）在定义时绑定，但实际值在函数调用时才读取。这就是延迟绑定问题的根源。可以用 `func.__closure__` 查看闭包捕获的 cell 对象，每个 cell 的 `cell_contents` 是当前值。"
+          "question": "Python 闭包捕获的是变量的值还是引用？怎么验证？",
+          "answer": "捕获的是 cell 对象的引用。验证：创建闭包后修改外层变量的值（如果有 nonlocal），再调用闭包，会看到新值而非旧值。也可以直接查看：`func.__closure__[0].cell_contents` 是当前值，给它赋新值后闭包行为随之改变。这和默认参数不同——默认参数在定义时快照，后续修改不影响。"
         },
         {
-          "question": "闭包会导致内存泄漏吗？什么情况下需要注意？",
-          "answer": "是的，闭包会延长被引用变量的生命周期。如果闭包被长期持有（如作为回调注册在全局事件系统中），它引用的整个变量环境都不会被 GC 回收。如果闭包引用了大对象（如大的 DataFrame），即使外部函数早已返回，对象也无法释放。解决方案是：用完后显式删除闭包引用，或只引用确实需要的变量。"
+          "question": "nonlocal 声明的变量在外层函数中不存在会怎样？",
+          "answer": "SyntaxError：`no binding for nonlocal 'x' found`。nonlocal 要求变量在外层函数中已经有绑定（赋值或参数），它不会创建新的外层变量。这和 global 不同——global 声明一个不存在的变量时，首次赋值会创建全局变量。"
+        },
+        {
+          "question": "闭包和类实例方法在状态管理上有什么区别？",
+          "answer": "闭包通过 cell 隐藏状态，外部无法直接访问（除非通过 __closure__），适合简单的有状态函数和工厂模式。类实例通过 self 属性暴露状态，可以被外部读写，支持继承、多态、描述符协议。如果只需要一个可调用对象携带少量状态，闭包比类更轻量；如果需要复杂行为组合或状态需要被外部检查，类更合适。"
+        },
+        {
+          "question": "如何诊断闭包捕获了哪些变量导致内存问题？",
+          "answer": "三步：① `func.__code__.co_freevars` 看自由变量名列表；② `func.__closure__[i].cell_contents` 看每个 cell 当前持有的对象，用 `sys.getsizeof()` 估算大小；③ 如果怀疑泄漏，`gc.get_referrers(cell_object)` 查看谁还在引用这个 cell。工具上可以用 objgraph、tracemalloc 或 memory_profiler 做更系统的分析。"
         }
       ]
     },
@@ -76,34 +116,49 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释 LEGB 作用域查找规则",
-        "能说明闭包的定义和组成要素",
-        "能识别和解决延迟绑定陷阱",
-        "能区分 nonlocal 和 global 的用途",
-        "能解释闭包中变量的捕获时机",
-        "能说出闭包的实际应用场景",
-        "能通过 __closure__ 查看闭包状态"
+        "能按 L → E → G → B 顺序解释查找规则，并说明编译时而非运行时决定变量归属",
+        "能解释闭包是函数加 cell 对象引用，cell 让内外层共享读写同一个变量",
+        "能说明 LOAD_FAST、LOAD_DEREF、LOAD_GLOBAL 三种字节码指令分别对应哪些作用域",
+        "能识别延迟绑定陷阱，给出三种修复方式并解释各自原理（默认参数/IIFE/partial）",
+        "能区分 nonlocal 和 global 的语义约束：nonlocal 要求变量已存在，global 可创建新变量",
+        "能解释闭包延长变量生命周期的机制和大对象泄漏风险",
+        "能通过 __closure__ 和 __code__.co_freevars 诊断闭包捕获了什么",
+        "能在装饰器、工厂函数等实际场景中正确使用闭包"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "python.python-advanced.closures-scope.recall.1",
-      "prompt": "Python 闭包延迟绑定陷阱是什么？请至少说出三种修复方式并解释原理。",
+      "prompt": "请解释 LEGB 四层作用域查找规则，并说明 Python 是在编译时还是运行时决定变量属于哪个作用域。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "python.python-advanced.closures-scope.recall.2",
-      "prompt": "请用闭包实现一个带过期时间的缓存装饰器。",
+      "prompt": "Python 闭包延迟绑定陷阱是什么？请给出三种修复方式并解释各自的原理差异。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "python.python-advanced.closures-scope.recall.3",
+      "prompt": "请用闭包实现一个带过期时间的缓存装饰器，并解释闭包在这里的作用。",
       "mode": "code",
       "expectedMinutes": 8,
       "difficulty": 3
     },
     {
-      "id": "python.python-advanced.closures-scope.recall.3",
-      "prompt": "Python 闭包与 LEGB 作用域 和相邻概念或常见替代方案有什么关键区别？",
+      "id": "python.python-advanced.closures-scope.recall.4",
+      "prompt": "nonlocal 和 global 的语义约束有什么不同？什么情况下 nonlocal 会报 SyntaxError 而 global 不会？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "python.python-advanced.closures-scope.recall.5",
+      "prompt": "闭包会导致内存问题吗？请举出具体场景并说明如何诊断闭包捕获了哪些变量。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -111,20 +166,22 @@
   ],
   "rubric": {
     "mustHave": [
-      "能解释 LEGB 查找规则",
-      "能说明闭包的定义和组成",
-      "能识别延迟绑定问题并给出三种修复方案",
-      "能区分 nonlocal 和 global"
+      "能按 L → E → G → B 顺序解释作用域查找规则，并说明编译时决定变量归属",
+      "能解释闭包是函数加 cell 对象引用，cell 让内外层共享读写同一个变量",
+      "能识别延迟绑定陷阱，给出三种修复方式（默认参数、IIFE、partial）并解释原理",
+      "能区分 nonlocal 和 global 的语义约束（nonlocal 要求变量已存在，global 可创建新变量）"
     ],
     "goodToHave": [
-      "能通过 __closure__ 分析闭包捕获的变量",
-      "能解释闭包可能引起的内存泄漏场景",
-      "能结合装饰器示例说明闭包的实际应用"
+      "能通过 __closure__ 和 __code__.co_freevars 诊断闭包捕获了什么",
+      "能解释闭包延长变量生命周期的机制和大对象泄漏风险",
+      "能区分 LOAD_FAST、LOAD_DEREF、LOAD_GLOBAL 三种字节码指令的作用域含义",
+      "能在装饰器、工厂函数等实际场景中正确使用闭包"
     ],
     "commonMistakes": [
-      "混淆 LEGB 中 E 和 G 的查找顺序",
-      "忘记 nonlocal 导致闭包变量修改失败",
-      "在循环中创建闭包时不处理延迟绑定"
+      "混淆 nonlocal 和 global 的约束——nonlocal 要求变量在外层已存在，否则 SyntaxError",
+      "不加 nonlocal 就试图修改外层变量，导致 UnboundLocalError（编译器把赋值变量标记为 local）",
+      "在循环中创建闭包时不处理延迟绑定，所有闭包共享同一个 cell 读到最终值",
+      "闭包引用了大对象却不自知，导致变量生命周期过长造成内存泄漏"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -135,8 +192,8 @@
   },
   "status": "production",
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「Python 闭包与 LEGB 作用域」说清 LEGB 查找规则、闭包的定义和组成、nonlocal 修改边界，并放到 Python 工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-18",
+  "interviewerFocus": "考察是否能围绕 LEGB 四层查找规则（编译时决定、字节码指令差异）、闭包的 cell 机制（引用而非值快照、延迟绑定根源）、nonlocal/global 语义约束、延迟绑定的三种修复原理、闭包内存风险与诊断方法，完整且有层次地解释 Python 闭包与作用域。",
+  "updatedAt": "2026-06-23",
   "prerequisites": [
     "python.python-advanced.decorators"
   ]

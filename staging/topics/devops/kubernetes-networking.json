@@ -4,7 +4,7 @@
   "category": "container-k8s",
   "group": "container-k8s",
   "title": "Kubernetes 网络：CNI、Service 与 Ingress",
-  "summary": "讲清 CNI 模型、kube-proxy iptables/ipvs、Service 四种类型、Ingress 控制器和 NetworkPolicy 的工作机制与排查路径。",
+  "summary": "CNI 落实 Pod 扁平网络三条约定，kube-proxy 将 ClusterIP DNAT 到 Endpoints，Service 四种类型暴露边界，Ingress 做 L7 路由，NetworkPolicy 默认拒绝与排查路径。",
   "tags": [
     "DevOps",
     "Kubernetes",
@@ -21,31 +21,35 @@
   "status": "staging",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "面试官想看你能否讲清 Pod 之间为什么不需要 NAT、ClusterIP 怎么被 kube-proxy 落到 iptables/ipvs 规则、Ingress 与 Service 的分工，以及 NetworkPolicy 默认行为带来的坑。",
+  "interviewerFocus": "面试官想看你能否讲清 Pod 之间为什么不需要 NAT、ClusterIP 怎么被 kube-proxy 落到 iptables/ipvs 规则、Ingress 与 Controller 的分工，以及 NetworkPolicy 默认拒绝行为和 policyTypes 推断带来的坑。",
   "learningCards": [
     {
       "type": "explain",
       "title": "K8s 网络模型的三条铁律与 CNI 的位置",
-      "content": "Kubernetes 不自己实现网络，而是把三条硬性约定交给 CNI 插件去满足。\n\n① 每个 Pod 一个独立 IP，所有 Pod 在同一个扁平网络里。\n② Pod 之间通信不能做 SNAT/DNAT。\n③ Node 也能直接访问 Pod IP。\n\nCalico、Cilium、Flannel 都是 CNI 实现，区别只是用 BGP、VXLAN 还是 eBPF 来打通跨节点。\n\nkubelet 创建 Pod 时通过 CRI 调起容器运行时，再让 CNI 插件给 Pod 配置 veth pair、IP、路由。Pod 网卡 eth0 一端在容器 netns，另一端挂在 Node 的网桥（cni0）或 host 路由上。跨节点流量由 CNI 决定走 overlay（VXLAN 封包）还是 underlay（BGP 宣告路由）。\n\nService 和 Ingress 不是网络层，而是建立在这层 Pod IP 之上的“稳定入口”。Pod 重启 IP 会变，Service 用 iptables/ipvs 规则把 ClusterIP 的流量负载均衡到当前的 Endpoints。Ingress 再把 7 层 HTTP 路由叠在 Service 之上。"
+      "content": "Kubernetes 不自己实现网络，而是把三条硬性约定交给 CNI 插件去满足：\n\n① 每个 Pod 拥有集群唯一 IP，所有 Pod 处在同一个扁平三层网络中。\n② Pod 之间通信不做 SNAT/DNAT——任一 Pod 用自己的 Pod IP 直接访问另一个 Pod 的 Pod IP，中间不改地址。\n③ Node 本身也能直接访问任意 Pod IP。\n\n这三条约定的意义在于：应用不需要关心自己跑在哪个节点、不依赖端口映射、不需要 service mesh 就能直接用 Pod IP 互连。日志、监控、安全审计看到的源/目的 IP 也是 Pod IP，排查时才不会一脸迷茫。\n\nCNI（Container Network Interface）是 kubelet 在创建 Pod sandbox 后调用的网络配置插件。流程是：kubelet 通过 CRI 让运行时创建 Pod sandbox，运行时调 CNI binary。CNI 插件创建 veth pair：一端放入容器 network namespace 配 IP 和默认路由，另一端挂到 Node 网桥（如 cni0）或 host 路由表。跨节点流量由 CNI 决定走 overlay（Flannel VXLAN 封包）还是 underlay（Calico BGP 宣告路由到物理网络）。\n\nCNI 插件区别在跨节点打通方式。Flannel 默认 VXLAN overlay，简单但多一层封装开销。Calico 默认 BGP 直接在节点间交换路由，性能好但要求底层网络能跑 BGP。Cilium 用 eBPF 在内核层处理转发和策略，接管 kube-proxy 的 L4 转发，是性能和功能上限但对内核版本有要求（>=4.19，推荐 >=5.10）。\n\nService 和 Ingress 不是 CNI 层的东西，而是建在 Pod IP 之上的「稳定入口」抽象。Pod 重启 IP 会变，Service 用 ClusterIP + kube-proxy 规则屏蔽变化。Ingress 在 Service 之上再做 L7 路由。"
     },
     {
       "type": "explain",
       "title": "Service 四种类型与 kube-proxy 的两种模式",
-      "content": "Service 类型的选择本质是“流量从哪进来”。\n\n- ClusterIP 只在集群内可达，靠 DNS（service.namespace.svc.cluster.local）和 ClusterIP。\n- NodePort 在每个节点上开 30000-32767 的端口，外部可以打 NodeIP:NodePort。\n- LoadBalancer 在 NodePort 基础上让云厂商挂一个外部 LB，把流量打到所有节点。\n- ExternalName 只是 CNAME，不创建任何 endpoint。\n\nkube-proxy 不真的转发数据，它是一个“规则生成器”。iptables 模式下，每个 Service 会被翻译成 KUBE-SERVICES 链上的一条 DNAT 规则，再用随机模式从 Endpoints 里挑一个 Pod IP 改写目的地址。规则数量随 Service × Endpoint 线性增长，几千个 Service 时匹配会成为瓶颈。ipvs 模式用内核 LVS 表（rr/lc/sh 等算法），查找是 O(1)，大规模集群通常切到 ipvs。\n\n关键边界：\n① Service 默认是“随机负载均衡”，没有会话亲和，要靠 sessionAffinity: ClientIP。\n② externalTrafficPolicy=Local 会让 NodePort/LB 只转发到本节点的 Pod，保留客户端 IP 但可能丢流量。\n③ headless Service（clusterIP: None）不走 kube-proxy，DNS 直接返回 Pod IP 列表，常用于 StatefulSet。"
+      "content": "Service 类型选择的本质是「流量从哪里进来、暴露到什么范围」：\n\n**ClusterIP**（默认）：只在集群内可达。其他 Pod 通过 CoreDNS 解析 `service.namespace.svc.cluster.local` 拿到 ClusterIP，或者直接用环境变量。这是微服务东西向调用的默认选择。\n\n**NodePort**：在 ClusterIP 基础上，每个节点在 30000-32767 范围内开一个端口。外部可以通过任意节点的 `<NodeIP>:<NodePort>` 访问。常见于裸金属集群调试，或者前面自建 HAProxy/LVS 做负载均衡。源 IP 默认会被 SNAT 为 Node IP（除非设 externalTrafficPolicy=Local）。\n\n**LoadBalancer**：在 NodePort 基础上，cloud-controller-manager 会向云厂商 API 请求创建一个外部 LB，把流量打到所有节点的 NodePort。每个 Service 一个 LB，成本不低。它是云上生产环境最常见的入口方式之一。\n\n**ExternalName**：只是一条 CNAME 记录，把 `<svc>.<ns>.svc.cluster.local` 指向外部域名（如 `db.rds.aliyuncs.com`）。不创建 ClusterIP，不创建 Endpoints，kube-proxy 不参与。适合集群内应用用统一服务名访问外部依赖。\n\n**kube-proxy 不是代理**——它是一个规则生成器。apiserver 创建/更新 Service 和 Endpoints 时，kube-proxy watch 到变化后在本节点刷规则：\n\niptables 模式下，每个 Service 对应 KUBE-SERVICES 链的一条 DNAT 规则，指向一个按概率分布的 KUBE-SEP-* 链（每个 SEP 对应一个 Endpoint Pod）。查找是 O(n) 遍历，Service × Endpoint 数量上千后规则膨胀明显——kube-proxy 同步刷表可能耗时秒级，期间有转发中断。\n\nipvs 模式下，kube-proxy 把 Service 映射为内核 LVS 虚拟服务，Endpoint Pod 作为 real server，查找 O(1)，支持 rr（轮询）、lc（最少连接）、sh（源地址哈希）等调度算法。大规模集群（>1000 Service）通常切 ipvs。需要内核加载 ip_vs、ip_vs_rr、nf_conntrack 模块。\n\n关键边界：\n- Service 默认随机负载均衡，要会话亲和需 `sessionAffinity: ClientIP`。\n- `externalTrafficPolicy=Local` 让 NodePort/LB 只转发到本节点有对应 Pod 的请求，保留客户端源 IP，但节点上如果没有该 Service 的 Pod，请求会被丢弃（非零丢包概率）。\n- headless Service（`clusterIP: None`）不走 kube-proxy，CoreDNS 直接返回 Pod IP 列表，客户端拿到所有后端自己选，常用于 StatefulSet 的有状态服务发现。"
     },
     {
       "type": "explain",
-      "title": "Ingress 与 NetworkPolicy 的真实坑",
-      "content": "Ingress 资源本身只是一份 7 层路由声明（host/path → service），必须有 Ingress Controller（nginx-ingress、Traefik、Istio Gateway 等）真的去监听 80/443 并按规则转发。Controller 通常用 hostNetwork 或 LoadBalancer Service 暴露，TLS 证书放在 Secret 里由 Controller 加载。\n\n要注意 IngressClass：1.19 之后必须显式声明 ingressClassName，否则多 Controller 共存时规则会被错的 Controller 接管。\n\nNetworkPolicy 是“白名单防火墙”，但只有当 namespace 里至少一条 NetworkPolicy 选中某个 Pod 时，这个 Pod 才会进入“默认拒绝”状态。这是最常见的踩坑点：写了一条 ingress allow rule，结果发现 egress 全被禁，因为 podSelector 命中后 egress 默认变成 deny。要彻底拒绝必须显式写 policyTypes: [Ingress, Egress] + 空 rules。\n\n另一个易错点是 NetworkPolicy 依赖 CNI 实现：Flannel 默认不支持，必须用 Calico/Cilium。kube-proxy 转发后的流量在 Pod 视角看到的源 IP 已经是 Node IP（除非 Local 策略），所以基于源 IP 的策略可能根本不生效。"
+      "title": "Ingress 资源、Controller 与 NetworkPolicy 的真实坑",
+      "content": "**Ingress = 声明，Controller = 执行**\n\nIngress 资源本身只是一份 7 层路由规则声明（host/path → backend Service、TLS 终结配置）。必须有一个 Ingress Controller Pod 真正监听 80/443 并按这份声明做反向代理。nginx-ingress、Traefik、HAProxy Ingress、Istio Gateway 都是 Controller 的实现。Controller 本身通常通过 hostNetwork 或 LoadBalancer Service 暴露。\n\nTLS 证书存在 Secret 里，由 Controller 加载并用于 TLS 终结。证书续期要靠 cert-manager 或手动更新 Secret 后 Controller 热加载。\n\n**IngressClass 解决多 Controller 共存**\n\n集群里可能有多个 Ingress Controller（如 nginx 做内部、Istio 做外部）。1.19+ 要求显式声明 `ingressClassName`，否则 Ingress 会被默认 Controller 接管——可能是错的那个。每个 IngressClass 对应一个 Controller 实例，用 `default: true` 可以标记默认类。\n\n**Gateway API 是下一代**\n\nKubernetes SIG-Network 正在推进 Gateway API 替代 Ingress，它支持更多路由能力（header 匹配、权重分流、跨 namespace 引用），但目前还在逐步 GA，理解 Ingress 是面试必备。\n\n**NetworkPolicy 的「默认拒绝」陷阱**\n\nNetworkPolicy 是基于白名单的 Pod 级防火墙，但它不像传统防火墙那样「默认拒绝所有」。只有当 namespace 里至少有一条 NetworkPolicy 的 `podSelector` 命中某个 Pod 时，该 Pod 才进入「默认拒绝」状态——这是最常见的踩坑点：\n\n- 如果只写了 `ingress` 规则，K8s 推断 `policyTypes: [Ingress]`，只有入方向被管制，出方向不受影响。\n- 但如果手动写了 `policyTypes: [Ingress, Egress]` 却没写 egress rules，出方向就被全禁了。Pod 无法访问 DNS（CoreDNS 53）、无法访问 API Server、无法访问外部服务，排查起来极其隐蔽。\n\n修正方式：要么删掉 policyTypes 让 K8s 自动推断，要么显式写 egress allow（如放行 kube-dns 53 端口）。\n\n**NetworkPolicy 依赖 CNI**\n\nFlannel 默认不支持 NetworkPolicy，必须用 Calico 或 Cilium。kube-proxy 转发后流量在 Pod 视角的源 IP 已经是 Node IP（除非 externalTrafficPolicy=Local），所以基于 `ipBlock` 的源 IP 策略可能不生效——需要结合 `namespaceSelector` + `podSelector` 做基于身份的策略。"
     },
     {
       "type": "diagram",
       "title": "Kubernetes 网络路径：Pod IP、Service、EndpointSlice、Ingress 与策略",
-      "format": "mermaid",
+      "format": "svg",
       "content": "flowchart TD\nA[\"外部请求\"] --> B[\"LoadBalancer/Ingress Controller\"]\nB --> C[\"Ingress 规则\nHost/Path/TLS\"]\nC --> D[\"Service\nClusterIP/NodePort\"]\nD --> E[\"EndpointSlice\n选择后端 Pod\"]\nE --> F[\"Pod IP\nCNI 网络\"]\nG[\"集群内 Pod\"] --> D\nH[\"kube-proxy 或 eBPF datapath\"] --> D\nI[\"NetworkPolicy\"] --> F\nF --> J[\"容器端口\"]",
       "fallback": "图展示 Kubernetes 网络要从外部 Ingress 到 Service、EndpointSlice、CNI Pod IP 和 NetworkPolicy 看完整转发路径。",
       "caption": "Kubernetes 网络路径：Pod IP、Service、EndpointSlice、Ingress 与策略",
       "sources": [
+        {
+          "kind": "svg",
+          "path": "assets/diagrams/generated/devops-kubernetes-networking.svg"
+        },
         {
           "kind": "mermaid",
           "content": "flowchart TD\nA[\"外部请求\"] --> B[\"LoadBalancer/Ingress Controller\"]\nB --> C[\"Ingress 规则\nHost/Path/TLS\"]\nC --> D[\"Service\nClusterIP/NodePort\"]\nD --> E[\"EndpointSlice\n选择后端 Pod\"]\nE --> F[\"Pod IP\nCNI 网络\"]\nG[\"集群内 Pod\"] --> D\nH[\"kube-proxy 或 eBPF datapath\"] --> D\nI[\"NetworkPolicy\"] --> F\nF --> J[\"容器端口\"]"
@@ -79,82 +83,90 @@
           "L4 + 节点端口",
           "集群外（节点 IP）",
           "调试、自建 LB",
-          "端口范围 30000-32767，源 IP 默认被 SNAT"
+          "端口 30000-32767，源 IP 默认被 SNAT"
         ],
         [
           "LoadBalancer",
           "L4 + 云 LB",
           "公网/VPC",
           "云上生产入口",
-          "依赖 cloud-controller-manager，每个 Service 一个 LB 成本高"
+          "每 Service 一个 LB 成本高，依赖 cloud-controller-manager"
         ],
         [
           "Ingress",
-          "L7 HTTP 路由",
+          "L7 HTTP/HTTPS 路由",
           "集群外（80/443）",
-          "多域名/路径共享一个入口",
-          "需要 Controller，TLS 由 Controller 终结"
+          "多域名/路径共享入口",
+          "需要 Controller Pod，TLS 由 Controller 终结"
         ],
         [
           "kube-proxy iptables",
-          "Netfilter 链",
+          "Netfilter DNAT 链",
           "—",
-          "默认模式，中小集群",
-          "规则随 Endpoint 数线性膨胀，匹配 O(n)"
+          "中小集群默认模式",
+          "规则随 Endpoint 数 O(n) 膨胀，刷表可能秒级"
         ],
         [
           "kube-proxy ipvs",
-          "内核 LVS",
+          "内核 LVS 表",
           "—",
-          "大规模集群（>1000 svc）",
-          "查找 O(1)，支持 rr/lc/sh，需要内核模块"
+          "大规模集群 >1000 svc",
+          "查找 O(1)，支持 rr/lc/sh，需 ip_vs 内核模块"
         ]
       ]
     },
     {
       "type": "code",
-      "title": "查看 Service 落到 iptables/ipvs 的真实规则",
+      "title": "排查 Service 不通：endpoints、iptables、ipvsadm、DNS",
       "language": "bash",
-      "content": "# 1. 看 Service 和 Endpoints 是否对得上\nkubectl get svc api -o wide\nkubectl get endpoints api          # 没有 endpoint 通常是 selector 写错或 Pod 没 ready\nkubectl get endpointslices -l kubernetes.io/service-name=api\n\n# 2. iptables 模式下找 KUBE-SERVICES 规则\nsudo iptables -t nat -nL KUBE-SERVICES | grep api\n# 例: -A KUBE-SERVICES -d 10.96.50.10/32 -p tcp --dport 80 -j KUBE-SVC-XXXX\nsudo iptables -t nat -nL KUBE-SVC-XXXX    # 里面是按概率分布的 KUBE-SEP-* 规则\n\n# 3. ipvs 模式下用 ipvsadm\nsudo ipvsadm -Ln | grep -A3 10.96.50.10\n# TCP  10.96.50.10:80 rr\n#   -> 10.244.1.5:8080  Masq  1  0  0\n\n# 4. NetworkPolicy 默认拒绝排查\nkubectl get networkpolicy -A\nkubectl describe networkpolicy <name> -n <ns>   # 看 policyTypes 是 Ingress 还是 Ingress+Egress\n\n# 5. DNS 路径验证\nkubectl run -it --rm dnsutils --image=busybox:1.28 -- nslookup api.default.svc.cluster.local",
+      "content": "# === 1. Service 与 Endpoints 是否对得上 ===\nkubectl get svc api -o wide\nkubectl get endpoints api            # 空 = selector 标签错或 Pod readinessProbe 未过\nkubectl get endpointslices -l kubernetes.io/service-name=api\n\n# === 2. iptables 模式：规则有没有同步 ===\nsudo iptables -t nat -nL KUBE-SERVICES | grep api\n# 例: -A KUBE-SERVICES -d 10.96.50.10/32 -p tcp --dport 80 -j KUBE-SVC-XXXX\nsudo iptables -t nat -nL KUBE-SVC-XXXX    # 里面是按概率分布的 KUBE-SEP-*\n\n# === 3. ipvs 模式：LVS 虚拟服务表 ===\nsudo ipvsadm -Ln | grep -A3 10.96.50.10\n# TCP  10.96.50.10:80 rr\n#   -> 10.244.1.5:8080  Masq  1  0  0\n\n# === 4. DNS 路径验证 ===\nkubectl run -it --rm dnsutils --image=busybox:1.28 -- nslookup api.default.svc.cluster.local\n\n# === 5. NetworkPolicy 检查 ===\nkubectl get networkpolicy -A\nkubectl describe networkpolicy <name> -n <ns>  # 看 policyTypes 是否包含 Egress",
       "highlights": [
         {
           "line": 3,
-          "note": "endpoints 为空的最常见根因：selector 写错或 Pod readinessProbe 未通过，优先排查这两项。"
+          "note": "endpoints 为空是最常见的 Service 不通根因——selector 标签拼写错或 Pod readinessProbe 没过，优先排查。"
         },
         {
           "line": 7,
-          "note": "KUBE-SERVICES 链是 iptables 模式的入口，grep 服务名可快速定位 DNAT 规则是否存在。"
+          "note": "KUBE-SERVICES 链是 iptables DNAT 入口，grep 服务名快速定位规则是否存在。"
         },
         {
-          "line": 12,
-          "note": "ipvsadm -Ln 直接看 LVS 虚拟服务表，O(1) 查找比遍历 iptables 链更适合大规模集群。"
+          "line": 10,
+          "note": "KUBE-SVC-* 链内部是按 probability 分发的 KUBE-SEP-* 子链，每个 SEP 对应一个 Endpoint Pod。"
         },
         {
-          "line": 18,
+          "line": 13,
+          "note": "ipvsadm -Ln 直接看 LVS 虚拟服务表和 real server 列表，比遍历 iptables 链快得多。"
+        },
+        {
+          "line": 19,
+          "note": "nslookup 验证 CoreDNS 解析路径——很多 Service 不通实际是 DNS 解析失败。"
+        },
+        {
+          "line": 22,
           "note": "describe networkpolicy 重点看 policyTypes 字段，确认 egress 是否被默认拒绝。"
-        },
-        {
-          "line": 21,
-          "note": "nslookup 验证 CoreDNS 解析路径，排除 DNS 故障导致的 Service 不可达。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**30 秒结论**\n\nKubernetes 把网络拆成三层：CNI 解决 Pod IP 互通，Service + kube-proxy 解决稳定 L4 入口，Ingress Controller 解决 L7 路由。NetworkPolicy 是叠加在这层上的白名单防火墙。\n\n**机制主线**\n\n1. **CNI 插件**：给每个 Pod 分一个集群唯一 IP，Pod 之间不做 NAT。Calico 用 BGP，Flannel 用 VXLAN，Cilium 用 eBPF。\n2. **Service + kube-proxy**：Service 创建后 kube-proxy 在每个节点生成 iptables 或 ipvs 规则，把 ClusterIP 的流量随机 DNAT 到当前 Endpoints。\n3. **NodePort/LoadBalancer**：在此基础上把入口从节点端口或云 LB 引进来。\n4. **Ingress**：L7 资源，必须有 Controller（nginx-ingress 等）真正监听 80/443 并按 host/path 转发到后端 Service。\n5. **NetworkPolicy**：选中 Pod 后默认拒绝，必须显式写 allow，且依赖 CNI 实现。\n\n**边界与排查**\n\n- iptables 在几千 Service 时匹配会变慢，要切 ipvs。\n- externalTrafficPolicy=Local 能保留源 IP 但可能因为节点没 Pod 而丢包。\n- headless Service 不走 kube-proxy 直接返回 Pod IP，给 StatefulSet 用。\n- 写 NetworkPolicy 一定要确认 policyTypes 是否同时包含 Egress，避免出方向被默认拒绝。",
+      "content": "**30 秒结论**\n\nKubernetes 网络分三层：CNI 解决 Pod 间无 NAT 互通并给每个 Pod 分唯一 IP；Service + kube-proxy 解决稳定 L4 入口，把 ClusterIP 用 iptables/ipvs DNAT 到 Endpoints Pod；Ingress Controller 解决 L7 路由。NetworkPolicy 是叠加在 Pod 上的白名单防火墙，依赖 CNI 实现。\n\n**机制主线**\n\n1. **CNI 插件**：给每个 Pod 分集群唯一 IP，Pod 间不做 NAT，Node 可达 Pod。Calico 走 BGP、Flannel 走 VXLAN、Cilium 走 eBPF。\n2. **kube-proxy 规则生成**：Service 创建后 kube-proxy watch 变化，在每个节点刷 iptables DNAT 规则或 ipvs LVS 表，把 ClusterIP 流量负载均衡到 Endpoints。iptables O(n) 匹配，大规模切 ipvs O(1)。\n3. **Service 四种类型**：ClusterIP 只集群内、NodePort 开节点端口、LoadBalancer 叠云厂商 LB、ExternalName 做 CNAME。\n4. **Ingress**：L7 路由声明，必须有 Controller Pod 真正监听 80/443；IngressClass 解决多 Controller 共存；Gateway API 是下一代。\n5. **NetworkPolicy**：选中 Pod 后默认拒绝，手动加 policyTypes 时要小心 egress 被意外全禁。\n\n**排查路径**\n- Service 不通：`kubectl get endpoints` 看后端是否为空 → `iptables -t nat` 或 `ipvsadm -Ln` 看规则同步 → `nslookup` 验证 DNS → NetworkPolicy 检查 egress 方向。\n\n**边界**\n- externalTrafficPolicy=Local 保留源 IP 但节点无 Pod 时丢包。\n- headless Service 跳过 kube-proxy，DNS 直接返回 Pod IP 列表，给 StatefulSet 用。\n- Flannel 默认不支持 NetworkPolicy。\n- kube-proxy 不是代理，只生成规则。",
       "followUpQuestions": [
         {
-          "question": "kube-proxy 的 iptables 模式和 ipvs 模式什么时候必须切换，切换有什么坑？",
-          "answer": "Service 数量上千、规则匹配 CPU 占用变高（kube-proxy 同步 iptables 单次刷表可能秒级）时切 ipvs。切换前要确认内核加载了 ip_vs、ip_vs_rr、nf_conntrack 模块，并把 kube-proxy 的 mode 字段改成 ipvs。坑在于 ipvs 用的是 LVS 表而不是 iptables NAT，部分基于 conntrack 的网络策略或抓包姿势要改，且 ipvs 模式下源 IP 处理与 iptables 略有差异，灰度时要先在一两个节点验证。"
+          "question": "kube-proxy iptables 和 ipvs 什么时候必须切换，切换有什么坑？",
+          "answer": "Service 数量上千、kube-proxy 同步 iptables 刷表耗时秒级导致短暂转发中断时切 ipvs。切换前确认内核加载 ip_vs、ip_vs_rr、nf_conntrack 模块，kube-proxy config 的 mode 改成 ipvs。坑：ipvs 用 LVS 表而不是 iptables NAT，部分基于 conntrack 的网络策略或抓包姿势要调整；ipvs 模式下源 IP 处理与 iptables 略有差异，灰度时先在一两个节点验证。"
         },
         {
-          "question": "线上一个 Service 的 ClusterIP 突然连不上，你按什么顺序排查？",
-          "answer": "先 kubectl get endpoints 看后端是不是空——空通常是 selector 标签错或 Pod readiness 没就绪。有 endpoint 就在节点上 iptables -t nat -nL KUBE-SERVICES 或 ipvsadm -Ln 看规则有没有同步。再从一个 Pod 里 nslookup 服务名确认 CoreDNS 正常。如果 DNS 和规则都对，进 Pod curl ClusterIP 看是否到达后端，最后看 NetworkPolicy 是否选中了客户端 Pod 但没放行 egress。"
+          "question": "线上 Service ClusterIP 突然不通，排查顺序？",
+          "answer": "① `kubectl get endpoints` 看后端是否为空——最常见根因是 selector 标签错或 readinessProbe 未过。② 有 endpoints 就在节点上 `iptables -t nat -nL KUBE-SERVICES` 或 `ipvsadm -Ln` 看规则有没有同步。③ 从一个 Pod 里 `nslookup` 确认 CoreDNS 正常。④ `curl ClusterIP:Port` 看是否到达后端。⑤ 最后看 NetworkPolicy 是否选中了客户端 Pod 但没放行 egress。"
         },
         {
           "question": "为什么写了一条 NetworkPolicy 只 allow 了 ingress，结果 Pod 出方向也断了？",
-          "answer": "NetworkPolicy 的 policyTypes 默认会根据是否写了 ingress/egress 字段推断。只要 podSelector 命中了 Pod，没显式列出的方向就变成默认拒绝。如果只写了 ingress 规则，policyTypes 推断为 [Ingress]，egress 不受影响。但很多人手动加了 policyTypes: [Ingress, Egress] 又没写 egress 规则，就把出方向全禁了。修正方法是要么删掉 policyTypes 让 K8s 自动推断，要么显式写 egress allow 规则（比如允许到 kube-dns 53 端口）。"
+          "answer": "如果手动加了 `policyTypes: [Ingress, Egress]` 却只写了 ingress rules，egress 没有显式 allow 规则就被默认拒绝。修正：要么删掉 policyTypes 让 K8s 自动推断（只写了 ingress 就只推断为 [Ingress]），要么显式写 egress allow 规则（如放行到 kube-dns 53 端口和目标 Service 端口）。"
+        },
+        {
+          "question": "Cilium 的 eBPF 为什么能替代 kube-proxy？",
+          "answer": "kube-proxy 的工作是 watch Service/Endpoints 变化并刷 iptables/ipvs 规则，数据面在内核 Netfilter 或 LVS。Cilium 用 eBPF 程序直接挂在网卡的 TC hook 或 XDP 上，Service 的 ClusterIP → Pod IP 转换在 eBPF map 中查找完成，跳过 iptables 规则链和 conntrack 开销。好处是查找 O(1)、规则更新原子无中断、支持更细粒度的 L7 策略；代价是要求内核 ≥4.19（推荐 ≥5.10），排障工具链和 iptables 不同，团队要学新东西。"
         }
       ]
     },
@@ -162,12 +174,14 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能讲出 K8s 网络模型的三条约定（每 Pod 一 IP、Pod 间无 NAT、Node 可达 Pod）",
-        "能说明 ClusterIP/NodePort/LoadBalancer/Ingress 各自的暴露范围和典型用途",
-        "能解释 kube-proxy iptables 和 ipvs 模式的差异以及切换条件",
-        "能描述 Ingress Controller 与 Ingress 资源的分工以及 IngressClass 作用",
-        "能说出 NetworkPolicy 默认拒绝行为和 policyTypes 的坑",
-        "能用 kubectl get endpoints / iptables / ipvsadm 三步排查 Service 不通"
+        "能讲出 K8s 网络模型三条约定（Pod 一 IP、Pod 间无 NAT、Node 可达 Pod）及 CNI 如何落实",
+        "能说明 ClusterIP / NodePort / LoadBalancer / ExternalName 各自的暴露范围和典型用途",
+        "能解释 kube-proxy 是规则生成器而非代理，iptables O(n) vs ipvs O(1) 的差异和切换条件",
+        "能描述 Ingress 资源（声明）与 Ingress Controller（执行）的分工以及 IngressClass 作用",
+        "能说出 NetworkPolicy 的默认拒绝行为：podSelector 命中后未列出的方向被默认拒绝",
+        "能用 kubectl get endpoints → iptables/ipvsadm → nslookup → NetworkPolicy 四步排查 Service 不通",
+        "能解释 externalTrafficPolicy=Local 保留源 IP 但可能丢包的取舍",
+        "能说明 headless Service 跳过 kube-proxy、Flannel 不支持 NetworkPolicy、Gateway API 是 Ingress 下一代"
       ]
     }
   ],
@@ -199,26 +213,40 @@
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
+    },
+    {
+      "id": "devops.container-k8s.kubernetes-networking.recall.5",
+      "prompt": "为什么写了一条 NetworkPolicy 只 allow 了 ingress，结果 Pod 连 DNS 都解析不了了？排查思路是什么？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "devops.container-k8s.kubernetes-networking.recall.6",
+      "prompt": "externalTrafficPolicy=Local 解决了什么问题，带来什么新风险？headless Service 和普通 ClusterIP Service 在转发路径上有什么区别？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "讲出 Pod 一 IP、Pod 间无 NAT、Node 可达 Pod 这三条网络模型约定",
-      "说清 ClusterIP/NodePort/LoadBalancer/Ingress 四类入口的工作层和暴露范围",
-      "解释 kube-proxy 用 iptables 或 ipvs 把 ClusterIP DNAT 到 Endpoints 的过程",
-      "区分 Ingress 资源（声明）和 Ingress Controller（实际监听 80/443 的 Pod）"
+      "讲出 Pod 一 IP、Pod 间无 NAT、Node 可达 Pod 这三条网络模型约定及 CNI 如何落实",
+      "说清 ClusterIP / NodePort / LoadBalancer / Ingress 各自的工作层和暴露范围",
+      "解释 kube-proxy 是规则生成器，用 iptables DNAT 或 ipvs LVS 把 ClusterIP 负载均衡到 Endpoints",
+      "区分 Ingress 资源（路由声明）和 Ingress Controller（实际监听 80/443 的 Pod）"
     ],
     "goodToHave": [
-      "能说出 iptables 规则数随 Service×Endpoint 线性增长，ipvs 是 O(1) 查找",
-      "能讲 externalTrafficPolicy=Local 保留源 IP 但可能丢包的取舍",
-      "能说出 headless Service（clusterIP: None）跳过 kube-proxy 的场景",
-      "能讲 NetworkPolicy policyTypes 默认推断和 Flannel 不支持 NP 的坑"
+      "能说出 iptables 规则数随 Service×Endpoint O(n) 膨胀，大规模集群切 ipvs O(1)",
+      "能讲 externalTrafficPolicy=Local 保留源 IP 但节点无 Pod 时丢包的取舍",
+      "能讲 headless Service（clusterIP: None）跳过 kube-proxy、DNS 直接返回 Pod IP 的场景",
+      "能讲 NetworkPolicy policyTypes 推断陷阱和 Flannel 不支持 NP 的坑"
     ],
     "commonMistakes": [
       "把 Ingress 当成网络层，没意识到必须有 Controller Pod 真正在监听端口",
-      "认为 kube-proxy 真的在转发数据，实际它只生成 iptables/ipvs 规则",
-      "写 NetworkPolicy 只写 ingress 却手动加了 policyTypes: [Ingress, Egress]，把出方向默认拒绝",
-      "Service 不通时只看 Service 不看 Endpoints，错过 selector 标签错或 readiness 未就绪的根因"
+      "认为 kube-proxy 真的在转发数据，实际它只生成 iptables/ipvs 规则，数据面在内核",
+      "写 NetworkPolicy 时手动加了 policyTypes: [Ingress, Egress] 却没写 egress rules，导致出方向被全禁",
+      "Service 不通时只看 Service 不看 Endpoints，错过 selector 标签错或 readinessProbe 未就绪的根因"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -227,5 +255,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

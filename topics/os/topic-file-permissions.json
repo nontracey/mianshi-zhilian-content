@@ -4,7 +4,7 @@
   "category": "linux-basics",
   "group": "linux-basics",
   "title": "文件权限与用户管理",
-  "summary": "讲清 Linux 权限判定顺序：路径目录 x、有效 UID/GID 选择 owner/group/other、rwx 对文件和目录的不同含义、umask 按位屏蔽，以及 SUID/SGID/Sticky 的使用边界。",
+  "summary": "掌握 Linux 文件权限判定全流程：路径每级目录 x 穿越 → 进程有效 UID/GID/附加组匹配 owner/group/other → 本次操作所需 r/w/x（文件与目录含义不同）→ umask 按位屏蔽默认权限 → SUID/SGID/Sticky 三个特殊位的机制、用途与安全边界，以及 POSIX ACL 对 group 类权限的额外影响。",
   "tags": [
     "Linux",
     "文件权限",
@@ -12,7 +12,7 @@
     "chmod"
   ],
   "difficulty": 2,
-  "estimatedMinutes": 12,
+  "estimatedMinutes": 19,
   "order": 20,
   "recommendWeight": 70,
   "learningCards": [
@@ -41,49 +41,53 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 项目 | 对文件的含义 | 对目录的含义 | 常见坑 |\n| --- | --- | --- | --- |\n| r (4) | 读文件内容 | 列出目录项名称 | 目录只有 r 没 x，只能看到名字，不能通过路径访问 |\n| w (2) | 修改文件内容 | 修改目录项，通常要配合 x 才能创建、删除、重命名 | 删除文件看父目录权限，不看目标文件的 w 位 |\n| x (1) | 执行文件，脚本还要解释器可读 | 路径可穿越，可 `cd` 或访问子路径 | 上级目录缺 x 会导致文件本身有权限也访问失败 |\n| SUID (4xxx) | 可执行文件以文件所有者的有效用户运行 | Linux 上对目录通常不产生访问控制效果 | SUID 程序漏洞可能变成提权入口，需要审计 |\n| SGID (2xxx) | 可执行文件以文件属组的有效组运行 | 新建文件继承目录属组，适合共享目录 | 只设 SGID 不代表所有成员都有写权限，还要配合 group w 和 umask/ACL |\n| Sticky (1xxx) | 普通文件上现代 Linux 基本无访问控制意义 | 公共可写目录中，只有文件主、目录主或 root 可删除/重命名 | `/tmp` 常见 `1777`，但业务目录仍应避免直接开放 777 |"
+      "title": "rwx 对文件 vs 目录与三个特殊位",
+      "content": "| 项目 | 对文件的含义 | 对目录的含义 | 常见坑 |\n| --- | --- | --- | --- |\n| r (4) | 读文件内容 | 列出目录项名称（`ls` 能看到文件名） | 目录只有 r 没 x，只能看到名字，不能 `cd` 也不能通过路径访问文件 |\n| w (2) | 修改文件内容（增删改数据） | 修改目录项：创建、删除、重命名子文件 | 删除文件看**父目录**的 w+x，不看目标文件的 w 位 |\n| x (1) | 执行文件（脚本还需 r，二进制只需 x） | 路径可穿越：能 `cd` 进入、能访问子路径的元数据和内容 | 上级目录缺 x 会导致文件本身有权限也访问失败（路径断链） |\n| SUID (4xxx) | 可执行文件以文件所有者的有效用户运行 | Linux 上对目录不产生实际访问控制效果 | SUID 程序漏洞可能变成提权入口，需审计 `find / -perm -4000` |\n| SGID (2xxx) | 可执行文件以文件属组的有效组运行 | 新建文件继承目录属组，适合团队共享目录 | 只设 SGID 不代表成员有写权限，还要配合 group w 和 umask/ACL |\n| Sticky (1xxx) | 普通文件上现代 Linux 无实际访问控制意义 | 公共可写目录中，只有文件主、目录主或 root 可删除/重命名 | `/tmp` 为 `1777`；业务目录应避免直接开放 `777` |"
     },
     {
       "type": "code",
-      "title": "Bash 可运行：在临时目录验证 umask 与目录权限",
-      "content": "#!/usr/bin/env bash\nset -euo pipefail\n\nworkdir=\"$(mktemp -d \"${TMPDIR:-/tmp}/perm-demo.XXXXXX\")\"\ntrap 'rm -rf \"$workdir\"' EXIT\ncd \"$workdir\"\n\nold_umask=\"$(umask)\"\numask 027\ntouch default-file\nmkdir default-dir\numask \"$old_umask\"\n\necho \"1) umask 027: file starts from 0666, directory starts from 0777\"\nls -ld default-file default-dir\n\nmkdir shared public_drop inbox\nchmod 2770 shared\nchmod 1777 public_drop\nchmod 500 inbox\n\necho \"2) SGID shared directory and sticky public directory\"\nls -ld shared public_drop\n\necho \"3) parent directory w+x controls creation\"\nif touch inbox/new-file 2>/dev/null; then\n  echo \"unexpected: current user can create without directory w\"\nelse\n  echo \"no directory w permission: create failed as expected\"\nfi\nchmod 700 inbox\ntouch inbox/new-file\necho \"with directory w+x: create succeeded\"",
+      "title": "Bash 可运行：在临时目录验证 umask、SGID 与 Sticky",
+      "content": "#!/usr/bin/env bash\nset -euo pipefail\n\nworkdir=\"$(mktemp -d \"${TMPDIR:-/tmp}/perm-demo.XXXXXX\")\"\ntrap 'rm -rf \"$workdir\"' EXIT\ncd \"$workdir\"\n\n# --- umask 按位屏蔽 ---\nold_umask=\"$(umask)\"\numask 027\ntouch default-file\nmkdir default-dir\numask \"$old_umask\"\n\necho \"=== umask 027: file from 0666, dir from 0777 ===\"\nls -ld default-file default-dir\n# 文件: 0666 & ~027 = 0640 (-rw-r-----)\n# 目录: 0777 & ~027 = 0750 (drwxr-x---)\n\n# --- SGID 目录：新建文件继承属组 ---\nmkdir shared\nchmod 2770 shared         # SGID + owner/group rwx\nls -ld shared\necho \"SGID set: new files inside 'shared' inherit group of 'shared'\"\n\n# --- Sticky Bit：公共可写目录限制互删 ---\nmkdir public_drop\nchmod 1777 public_drop    # Sticky + 全员 rwx\nls -ld public_drop\necho \"Sticky set: only file owner / dir owner / root can delete inside 'public_drop'\"\n\n# --- 父目录 w+x 控制创建 ---\nmkdir inbox\nchmod 500 inbox           # owner r-x，缺 w\nif touch inbox/new-file 2>/dev/null; then\n  echo \"unexpected: created without parent w\"\nelse\n  echo \"expected: no parent w permission, create denied\"\nfi\nchmod 700 inbox           # 补上 w\ntouch inbox/new-file\necho \"with parent w+x: create succeeded\"",
       "language": "bash",
       "highlights": [
         {
-          "line": 9,
-          "note": "umask 027 会按位屏蔽新文件/目录的默认请求权限，普通文件通常不会凭空得到执行位。"
+          "line": 11,
+          "note": "umask 027 按位屏蔽：0666 & ~0027 = 0640，普通文件不会凭空得到 x 位。"
         },
         {
-          "line": 18,
-          "note": "2770 里的 2 是 SGID，表示共享目录中新建对象继承目录属组。"
+          "line": 22,
+          "note": "SGID（2）让 shared 目录下新建文件自动继承目录属组，团队协作常用。"
         },
         {
-          "line": 19,
-          "note": "1777 里的 1 是 Sticky Bit，常见于公共可写目录，用来限制互删。"
+          "line": 28,
+          "note": "Sticky（1）限制公共可写目录的删除权：只有文件主、目录主或 root 能删。"
         },
         {
-          "line": 25,
-          "note": "创建子文件看父目录是否有 w+x；目标文件权限在创建前还不存在。"
+          "line": 35,
+          "note": "创建子文件看父目录是否有 w+x；目标文件在创建前还不存在，谈不上自身权限。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**30 秒结论**\nLinux 文件权限要按“路径、身份、权限位”三步讲：每级父目录要能穿越；再用进程有效 UID/GID 和附加组匹配 owner、group、other；最后看本次操作需要的 `r/w/x`。文件和目录的 `r/w/x` 含义不同，`umask` 是按位屏蔽，特殊位要结合提权和共享目录风险来解释。\n\n**机制要点**\n- 文件 `r/w/x` 分别是读内容、改内容、执行；目录 `r` 是列名，`x` 是路径穿越，`w` 是改目录项。创建、删除、重命名子文件通常看父目录 `w+x`，不是看目标文件有没有 `w`。\n- 权限类别不是“谁更宽用谁”。如果有效 UID 命中文件属主，就用 owner 位；否则看 group/附加组；再否则看 other。有 POSIX ACL 时还要看 ACL 条目和 mask。\n- `umask` 不是把 `666` 减去 `022`，而是 `requested_mode & ~umask`。普通文件常从 `0666` 起步，目录常从 `0777` 起步，所以 `022` 常得到文件 `0644`、目录 `0755`。\n- SUID 让可执行文件以文件所有者身份运行，能解释 `passwd` 为什么能改受保护的密码数据；风险是 SUID 程序漏洞可能提权。SGID 目录用于共享协作，让新文件继承属组；Sticky Bit 用在公共可写目录，限制互删。\n\n**排障表达**\n服务报 `Permission denied` 时，我会先确认进程实际用户和组：`id`、`ps -o user,group` 或 systemd 配置；再逐级检查路径目录是否有 `x`；然后看目标文件/父目录的 owner/group/other 位、ACL、umask 和容器挂载权限。修复时优先改属主属组、补最小权限或调整服务用户，避免直接 `chmod -R 777` 或把目录递归改成 `644`。",
+      "content": "**30 秒结论**\nLinux 文件权限要按“路径、身份、权限位”三步讲：每级父目录要能穿越（x）；再用进程有效 UID/GID/附加组匹配 owner、group、other；最后看本次操作需要的 r/w/x。文件和目录的 r/w/x 含义不同，umask 是按位屏蔽不是减法，特殊位要结合提权和共享目录风险来解释。\n\n**机制要点**\n- 文件 r/w/x 分别是读内容、改内容、执行；目录 r 是列名，x 是路径穿越，w 是改目录项。创建、删除、重命名子文件看父目录 w+x，不看目标文件的 w。\n- 权限类别按顺序匹配：有效 UID 命中属主 → 用 owner 位；否则看 GID/附加组命中属组 → 用 group 位；再否则 → other 位。不是“谁更宽用谁”。有 POSIX ACL 时还要看 ACL 条目和 mask。\n- umask 是 `requested_mode & ~umask`，不是十进制减法。文件从 0666 起步、目录从 0777 起步，umask 022 常得文件 0644、目录 0755。\n- SUID 让可执行文件以文件所有者身份运行，能解释 passwd 改 /etc/shadow；风险是 SUID 程序漏洞可提权。SGID 目录让新文件继承属组，适合共享协作。Sticky Bit 限制公共可写目录的互删。\n\n**排障表达**\n服务报 `Permission denied` 时，先确认进程实际用户：`id`、`ps -o user,group -p $PID` 或 systemd `User=` 配置；再逐级 `namei -l /path/to/file` 检查每级目录是否有 x；然后看目标文件/父目录的 owner/group/other 位、ACL、umask 和容器挂载选项（如 `noexec`）。修复时优先改属主属组、补最小权限或调整服务用户，避免 `chmod -R 777` 或把目录递归改成 644（目录没了 x 就断路径）。",
       "followUpQuestions": [
         {
           "question": "目录只有 r 没有 x，会出现什么现象？",
-          "answer": "可以看到目录项名称，但不能进入目录，也不能通过路径访问其中的文件元数据或内容。目录 x 表示路径可穿越，很多权限问题不是文件不可读，而是上级目录缺少 x。"
+          "answer": "可以看到目录项名称列表（`ls` 能输出文件名），但不能 `cd` 进入目录，也不能通过完整路径访问其中文件的元数据或内容。目录 x 表示路径可穿越，很多权限问题不是文件不可读，而是上级目录缺少 x 导致路径断链。"
         },
         {
-          "question": "SUID 为什么能让普通用户修改密码？风险是什么？",
-          "answer": "passwd 设置 SUID 后，普通用户执行时进程有效用户变成文件所有者 root，因此能修改 /etc/shadow。风险是 SUID 程序一旦存在命令注入、路径劫持或越权漏洞，就可能变成提权入口。"
+          "question": "SUID 为什么能让普通用户修改 /etc/shadow？风险是什么？",
+          "answer": "passwd 设置了 SUID（-rwsr-xr-x），普通用户执行时进程的有效 UID 变成文件所有者 root，因此有权修改 /etc/shadow。风险是 SUID 程序一旦存在命令注入、路径劫持、缓冲区溢出或越权漏洞，攻击者就能以 root 身份执行任意操作。生产环境应定期 `find / -perm -4000` 审计 SUID 文件，移除非必要的。"
         },
         {
           "question": "共享上传目录通常如何设置权限更稳妥？",
-          "answer": "可以用专门属组管理写权限，目录设置 SGID 让新文件继承属组；如果多人公共可写又不希望互删文件，可加 Sticky Bit。还要配合 umask 或默认 ACL 控制新文件权限，避免简单粗暴 777。"
+          "answer": "创建专门的共享组，目录设 2770（SGID + owner/group rwx），新文件自动继承目录属组。如多人公共可写且不希望互删，加 Sticky Bit 变成 3770。还需配合 umask 或 `setfacl -d` 设置默认 ACL，确保新文件 group 有 r/w。避免直接 777——任何用户都能删别人文件、改别人文件。"
+        },
+        {
+          "question": "递归 `chmod -R 644` 到一个目录树，为什么服务突然打不开了？",
+          "answer": "644 对目录意味着 rw-r--r--，目录缺少 x 位。进程无法穿越任何一级目录，连子文件的元数据都访问不到，就会报 Permission denied。正确做法是对目录和文件分别设置：`find /path -type d -exec chmod 755 {} +` 和 `find /path -type f -exec chmod 644 {} +`。"
         }
       ]
     },
@@ -91,41 +95,48 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释 rwx 三种权限对文件和目录的不同含义",
-        "能用数字和符号两种方式表示和修改权限",
-        "能说明 SUID、SGID、Sticky Bit 三种特殊权限",
-        "能解释 umask 如何影响默认权限",
-        "能使用 chmod/chown 命令修改权限和所有者",
-        "能解释 Linux 权限检查的优先级逻辑",
-        "能使用 useradd/usermod 管理用户和组"
+        "能解释 rwx 对文件和目录的不同含义，尤其是目录 x 决定路径穿越、创建/删除看父目录 w+x",
+        "能用数字（r=4, w=2, x=1）和符号（u+rw, g-w）两种方式表示和修改权限",
+        "能说明 SUID（以文件所有者身份执行）、SGID（继承属组）、Sticky（限制互删）三个特殊位的机制和典型场景",
+        "能解释 umask 是按位屏蔽（requested_mode & ~umask），不是十进制减法，能算出 umask 027 下文件和目录的默认权限",
+        "能描述 Linux 权限检查顺序：有效 UID → owner 位；GID/附加组 → group 位；否则 → other 位；POSIX ACL 可能覆盖",
+        "能用 chmod/chown/chgrp 命令修改权限和所有者，能用 useradd/usermod 管理用户和组",
+        "能解释为什么 `chmod -R 644` 会破坏目录路径穿越，以及如何分别对目录和文件设置权限"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "os.linux-basics.topic-file-permissions.recall.1",
-      "prompt": "请解释 Linux 文件和目录上的 r、w、x 分别代表什么，为什么目录的 x 权限很关键？",
+      "prompt": "请解释 Linux 文件和目录上的 r、w、x 分别代表什么。删除一个文件看的是文件自身的 w 还是父目录的权限？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 2
     },
     {
       "id": "os.linux-basics.topic-file-permissions.recall.2",
-      "prompt": "/tmp 目录的权限是 1777，那个 1 是什么意思？为什么需要它？",
+      "prompt": "/tmp 目录的权限是 1777，那个前导 1 是什么意思？为什么需要它？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 2
     },
     {
       "id": "os.linux-basics.topic-file-permissions.recall.3",
-      "prompt": "一个服务启动时报 Permission denied，你会按什么顺序检查用户、属主属组、权限位和 umask？",
+      "prompt": "umask 027 的含义是什么？它对新建文件（起点 0666）和新建目录（起点 0777）分别产生什么权限？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 2
     },
     {
-      "id": "os.linux-basics.topic-file-permissions.recall.scenario",
-      "prompt": "服务进程以 app 用户启动时报 Permission denied，但目标文件看起来是 644：你会如何逐级检查路径权限、进程身份、属主属组、ACL 和 umask？",
+      "id": "os.linux-basics.topic-file-permissions.recall.4",
+      "prompt": "一个服务以 app 用户启动时报 Permission denied，但目标文件看起来是 644。你会按什么顺序检查路径权限、进程身份、属主属组、ACL 和 umask？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 2
+    },
+    {
+      "id": "os.linux-basics.topic-file-permissions.recall.5",
+      "prompt": "有人对线上目录树执行了 `chmod -R 644`，服务立刻挂了。你会如何排查和修复？说明 644 对目录意味着什么。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 2
@@ -133,39 +144,39 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说出三类身份和 rwx 含义、对文件和目录的区别",
-      "能算数字权限（r=4 w=2 x=1）和 umask 按位屏蔽",
-      "能说明 SUID/SGID/Sticky 三个特殊位的作用",
-      "能说明目录的 x 权限决定能否进入",
-      "能说明删除/重命名由父目录权限控制"
+      "能说出 owner/group/other 三类身份的匹配顺序，以及 rwx 对文件和目录的不同含义（目录 x 是路径穿越、创建/删除看父目录 w+x）",
+      "能算数字权限（r=4 w=2 x=1）和 umask 按位屏蔽（不是减法），能算出 umask 027 下文件/目录默认权限",
+      "能说明 SUID/SGID/Sticky 三个特殊位的机制、典型场景和安全风险",
+      "能说明目录 x 权限决定路径可穿越，缺 x 即使文件本身有权限也会访问失败",
+      "能说明删除/重命名由父目录 w+x 控制，不看目标文件自身权限"
     ],
     "goodToHave": [
-      "能解释 SUID 的提权风险",
-      "能说明共享目录用 SGID 加 Sticky",
-      "能说明 umask 022 下文件 644 目录 755",
-      "能提到 POSIX ACL 和 ACL mask 可能影响 group 类权限",
-      "能说明为什么递归 chmod 644 会破坏目录访问"
+      "能解释 SUID 的提权风险，知道 `find / -perm -4000` 审计 SUID 文件",
+      "能说明共享目录用 SGID（继承属组）加 Sticky（限制互删）的组合",
+      "能提到 POSIX ACL 和 mask 可能覆盖 group 类权限",
+      "能解释 `chmod -R 644` 破坏目录 x 导致路径断链，并给出正确修复命令",
+      "能用 namei -l 或逐级 ls 排查路径上哪一级目录缺 x"
     ],
     "commonMistakes": [
-      "混淆 rwx 对文件和目录的不同含义",
-      "以为目录有 r 就能访问里面的文件（还需 x）",
-      "忽略 SUID 程序的安全风险",
-      "把 umask 当成十进制减法",
-      "以为目标文件有 w 才能被删除，而忽略父目录 w+x",
-      "对目录递归 chmod 644 导致服务无法穿越路径"
+      "混淆 rwx 对文件和目录的不同含义，不知道目录 x 是路径穿越",
+      "以为目录有 r 就能访问里面的文件（实际还需 x）",
+      "忽略 SUID 程序的安全风险，生产环境未审计 SUID 文件",
+      "把 umask 当成十进制减法（如以为 666-022=644 是减法运算）",
+      "以为目标文件有 w 位才能被删除，忽略父目录 w+x 的控制作用",
+      "对目录递归 chmod 644 导致所有目录缺 x，服务无法穿越路径"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-23",
   "status": "production",
   "prerequisites": [
     "os.linux-basics.topic-linux-commands"
   ],
   "interviewFrequency": "low",
-  "interviewerFocus": "考察能否按真实访问路径排查权限问题：先确认服务进程身份和每级目录 x，再解释 rwx 对文件/目录的不同含义、umask 按位屏蔽、SUID/SGID/Sticky 的用途与风险，并能避免 chmod -R 777/644 这类危险修复。"
+  "interviewerFocus": "考察能否按真实访问路径排查权限问题：先确认进程身份和每级目录 x，再解释 rwx 对文件/目录的不同含义、umask 按位屏蔽、SUID/SGID/Sticky 的用途与风险，以及避免 chmod -R 777/644 这类危险操作。"
 }

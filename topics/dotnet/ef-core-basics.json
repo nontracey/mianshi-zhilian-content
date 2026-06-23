@@ -4,7 +4,7 @@
   "category": "ef-core",
   "group": "ef-core",
   "title": "EF Core 基础",
-  "summary": "讲清 EF Core 的 DbContext 会话、实体配置、变更跟踪与 SaveChanges、迁移机制，以及 AsNoTracking、Scoped 生命周期等要点。",
+  "summary": "讲清 EF Core 的 DbContext 作为会话和工作单元如何管理实体生命周期与变更跟踪，Fluent API 如何声明模型、关系和约束，SaveChanges 如何把状态变化一次性翻译成 SQL，迁移如何让模型和数据库结构同步演进，以及 Scoped 生命周期、AsNoTracking、Include 与 N+1、原始查询等工程要点。",
   "tags": [
     ".NET",
     "EF Core",
@@ -20,13 +20,33 @@
   "learningCards": [
     {
       "type": "explain",
-      "title": "EF Core 基础：DbContext 与模型配置",
-      "content": "Entity Framework Core 是 .NET 的主流 ORM 框架，它简化了数据库操作，让开发者可以使用 LINQ 查询数据库。\n## DbContext\n\nDbContext 是 EF Core 的核心，它代表与数据库的会话：\n```csharp\npublic class AppDbContext : DbContext\n{\n    public DbSet<User> Users { get; set; }\n    public DbSet<Order> Orders { get; set; }\n\n    public AppDbContext(DbContextOptions<AppDbContext> options)\n        : base(options) { }\nprotected override void OnModelCreating(ModelBuilder modelBuilder)\n    {\n        // 实体配置\n        modelBuilder.Entity<User>(entity =>\n        {\n            entity.HasKey(e => e.Id);\n            entity.Property(e => e.Name).IsRequired().HasMaxLength(100);\n            entity.HasIndex(e => e.Email).IsUnique();\n        });\n    }\n}\n```\n\n**注册 DbContext**：\n```csharp\nbuilder.Services.AddDbContext<AppDbContext>(options =>\n    options.UseSqlServer(connectionString));\n```\n\n## 实体配置\n\n**数据注解方式**：\n```csharp\n[Table(\"Users\")]\npublic class User\n{\n    [Key]\n    [DatabaseGenerated(DatabaseGeneratedOption.Identity)]\n    public int Id { get; set; }\n\n    [Required]\n    [StringLength(100)]\n    public string Name { get; set; }\n\n    [EmailAddress]\n    [MaxLength(200)]\n    public string Email { get; set; }\n\n    [Column(TypeName = \"decimal(18,2)\")]\n    public decimal Balance { get; set; }\n}\n```\n\n**Fluent API 方式**（推荐）：\n```csharp\nprotected override void OnModelCreating(ModelBuilder modelBuilder)\n{\n    modelBuilder.Entity<User>(entity =>\n    {\n        entity.ToTable(\"Users\");\n        entity.HasKey(e => e.Id);\n        entity.Property(e => e.Id)\n            .UseIdentityColumn();\n        \n        entity.Property(e => e.Name)\n            .IsRequired()\n            .HasMaxLength(100)\n            .HasColumnType(\"nvarchar(100)\");\n        \n        entity.Property(e => e.Email)\n            .HasMaxLength(200);\n        \n        entity.HasIndex(e => e.Email)\n            .IsUnique()\n            .HasDatabaseName(\"IX_Users_Email\");\n        \n        entity.Property(e => e.Balance)\n            .HasColumnType(\"decimal(18,2)\")\n            .HasDefaultValue(0);\n        \n        // 关系配置\n        entity.HasMany(e => e.Orders)\n            .WithOne(e => e.User)\n            .HasForeignKey(e => e.UserId)\n            .OnDelete(DeleteBehavior.Cascade);\n    });\n}\n```"
+      "title": "DbContext 是工作单元，不是数据库连接",
+      "content": "DbContext 是 EF Core 的核心抽象，但它不等于一条数据库连接——它是「一次业务操作」的工作单元（Unit of Work）。它内部持有 ChangeTracker、模型元数据和一组 DbSet，负责：① 追踪你加载和新增的所有实体；② 记录实体从加载到当前值之间的差异；③ 在调用 SaveChanges 时把差异一次性翻译成 INSERT/UPDATE/DELETE 并提交。\n\nDbSet<T> 不是表本身，而是表的入口。通过它你可以写 LINQ 查询、Add/Remove 实体，但真正的 SQL 在你调用 ToListAsync 或 SaveChanges 时才被翻译和执行。\n\n为什么注册为 Scoped：DbContext 不是线程安全的。它的 ChangeTracker 用字典记录实体状态，多线程并发读写会产生脏数据或异常。ASP.NET Core 默认把 DbContext 注册为 Scoped（每请求一个实例），这样同一个请求内的多个服务共享同一个 DbContext，能看到彼此的变更，同时又不会跨请求互相干扰。如果注册成 Singleton，高并发下必然出错；如果注册成 Transient，同一请求内不同组件持有的实例各自为政，变更无法统一提交。"
     },
     {
       "type": "explain",
-      "title": "EF Core 基础：CRUD 操作、数据库迁移",
-      "content": "## CRUD 操作\n\n**创建**：\n```csharp\nvar user = new User { Name = \"Alice\", Email = \"alice@example.com\" };\n_context.Users.Add(user);\nawait _context.SaveChangesAsync();\n```\n\n**读取**：\n```csharp\n// 根据 ID 查询\nvar user = await _context.Users.FindAsync(id);\n\n// 条件查询\nvar users = await _context.Users\n    .Where(u => u.IsActive)\n    .OrderBy(u => u.Name)\n    .ToListAsync();\n\n// 包含关联数据\nvar userWithOrders = await _context.Users\n    .Include(u => u.Orders)\n    .FirstOrDefaultAsync(u => u.Id == id);\n```\n\n**更新**：\n```csharp\nvar user = await _context.Users.FindAsync(id);\nuser.Name = \"Updated Name\";\nawait _context.SaveChangesAsync();\n\n// 或使用 Update\n_context.Users.Update(user);\nawait _context.SaveChangesAsync();\n```\n\n**删除**：\n```csharp\nvar user = await _context.Users.FindAsync(id);\n_context.Users.Remove(user);\nawait _context.SaveChangesAsync();\n```\n\n## 数据库迁移\n\n**创建迁移**：\n```bash\ndotnet ef migrations add InitialCreate\ndotnet ef migrations add AddUserEmail\n```\n\n**应用迁移**：\n```bash\ndotnet ef database update\n```\n\n**生成 SQL 脚本**：\n```bash\ndotnet ef migrations script\n```\n\n**代码中应用迁移**：\n```csharp\nusing (var scope = app.Services.CreateScope())\n{\n    var context = scope.ServiceProvider\n        .GetRequiredService<AppDbContext>();\n    context.Database.Migrate();\n}\n```\n\n## 关系配置\n\n**一对多**：\n```csharp\nmodelBuilder.Entity<Order>()\n    .HasOne(o => o.User)\n    .WithMany(u => u.Orders)\n    .HasForeignKey(o => o.UserId);\n```\n\n**多对多**：\n```csharp\nmodelBuilder.Entity<User>()\n    .HasMany(u => u.Roles)\n    .WithMany(r => r.Users)\n    .UsingEntity(j => j.ToTable(\"UserRoles\"));\n```\n\n**一对一**：\n```csharp\nmodelBuilder.Entity<User>()\n    .HasOne(u => u.Profile)\n    .WithOne(p => p.User)\n    .HasForeignKey<UserProfile>(p => p.UserId);\n```\n\n## 查询优化\n\n**AsNoTracking**：只读查询不跟踪实体\n```csharp\nvar users = await _context.Users\n    .AsNoTracking()\n    .ToListAsync();\n```\n\n**投影**：只查询需要的字段\n```csharp\nvar userDtos = await _context.Users\n    .Select(u => new UserDto\n    {\n        Id = u.Id,\n        Name = u.Name\n    })\n    .ToListAsync();\n```\n\n**分页**：\n```csharp\nvar pagedUsers = await _context.Users\n    .OrderBy(u => u.Id)\n    .Skip((page - 1) * pageSize)\n    .Take(pageSize)\n    .ToListAsync();\n```"
+      "title": "模型配置：Fluent API 覆盖一切，数据注解只覆盖简单场景",
+      "content": "EF Core 在启动时会根据你的实体类和配置构建一个内存中的模型（IModel），这个模型决定了表名、列名、类型、索引、关系和约束。配置来源有两个：\n\n**数据注解**（Attribute）：直接写在实体类上，语法简单、可读性高。`[Key]` 标主键，`[Required]` 标非空，`[StringLength(100)]` 标长度，`[Column(TypeName = \"decimal(18,2)\")]` 标列类型。但它能覆盖的配置有限——复合主键、复合索引、命名策略、删除行为、影子属性、查询过滤器都配不了。\n\n**Fluent API**（OnModelCreating）：在 DbContext 的 `OnModelCreating` 方法里用链式调用配置一切。它能覆盖数据注解的全部功能，并且是唯一能配置关系（HasMany/WithOne/HasForeignKey）、级联删除（OnDelete）、索引排序（HasDatabaseName）、默认值（HasDefaultValueSql）、影子属性（Property<DateTime>(\"LastModified\")）和全局查询过滤器（HasQueryFilter）的地方。\n\n实际项目中的常见做法：用 `[Table]`、`[Key]`、`[Required]` 等少量注解表达实体的基本语义，复杂配置（关系、索引、删除策略、查询过滤器）全放 Fluent API。这样实体类保持干净，配置逻辑集中在 DbContext 里，也方便按实体拆分配置类（`IEntityTypeConfiguration<T>`）。"
+    },
+    {
+      "type": "explain",
+      "title": "变更跟踪与 SaveChanges：内存状态差异才是真相",
+      "content": "EF Core 的变更跟踪是它和直接写 SQL 最大的区别。当你通过 DbSet 查询实体时，DbContext 会把查出来的实体「物化」（materialize）成对象，并在 ChangeTracker 里为每个实体存一份快照（原始值）。\n\n之后你修改实体属性，ChangeTracker 并不会立刻发 SQL——它只是在内存里记录「当前值」和「快照值」不同。直到你调用 SaveChanges()，它才会扫描所有被跟踪的实体，逐个比对状态：\n- Added：调用过 Add 的实体 → 生成 INSERT\n- Modified：当前值与快照不同的实体 → 生成 UPDATE（只更新变化的列）\n- Deleted：调用过 Remove 的实体 → 生成 DELETE\n- Unchanged：没变，跳过\n\nSaveChanges 是一次事务。要么全部成功、要么全部回滚（数据库层面），所以你可以在一个 SaveChanges 里同时新增订单和扣库存。\n\n但这也意味着：如果你查出实体后长时间持有不提交，ChangeTracker 里的实体越来越多，内存压力和 SaveChanges 的扫描开销都会增长。高并发场景下，建议缩短 DbContext 的使用范围——查完改完就 SaveChanges，不要把 DbContext 当缓存池。"
+    },
+    {
+      "type": "explain",
+      "title": "迁移让模型和数据库结构同步演进",
+      "content": "迁移是 EF Core 解决「代码里的模型和数据库里的表结构怎么保持一致」的方案。它的核心流程是：\n\n1. **Add-Migration（dotnet ef migrations add）**：EF Core 对比当前模型（基于你的 DbContext 和实体类编译出来的）和上一次迁移的快照（存储在 Migrations 文件夹的 Designer.cs 里），自动生成一个 C# 迁移类，包含 Up（正向操作，比如建表、加列）和 Down（回滚操作）。\n\n2. **Update-Database（dotnet ef database update）**：按时间顺序执行数据库里还没应用过的迁移（EF Core 在 __EFMigrationsHistory 表记录已应用的迁移），执行 Up 方法里的 SQL。\n\n3. **Script-Migration（dotnet ef migrations script）**：生成全部或指定范围的 SQL 脚本，适合生产环境由 DBA 评审后手动执行。\n\n团队协作注意：迁移文件必须提交到版本控制；多人同时改模型会产生冲突的迁移，合并后要验证 Up/Down 的 SQL 顺序和正确性。生产环境一般不直接跑 Update-Database，而是生成 SQL 脚本走审批流程；破坏性变更（删列、改类型、缩小长度）要分步上线，先新增列、迁移数据、再删旧列。"
+    },
+    {
+      "type": "explain",
+      "title": "Include、N+1 和查询性能陷阱",
+      "content": "EF Core 默认使用「懒加载」（Lazy Loading）导航属性——如果你配置了懒加载代理，访问 `user.Orders` 时会自动发一条查询。但 EF Core 6+ 默认不启用懒加载代理，所以如果你不 Include，访问导航属性返回的是 null 或空集合（取决于是否已加载），而不是自动查询。\n\n**N+1 问题**：如果你在一个循环里逐个加载关联实体，比如先查 100 个 User，再在循环里每个 User 访问 Orders，就会产生 1 + 100 = 101 条查询。解决方法是用 `.Include(u => u.Orders)` 预加载，让 EF Core 在一次查询里用 JOIN 把关联数据一起取回来。\n\n**AsNoTracking**：只读查询（报表、列表、API 响应）不需要修改实体，加上 `.AsNoTracking()` 可以告诉 EF Core 不建快照、不进 ChangeTracker，省内存、省 CPU。查出来的实体是「游离」状态，修改它不会被 SaveChanges 保存。\n\n**投影（Select）**：如果只需要几个字段，用 `.Select(u => new { u.Id, u.Name })` 投影成匿名对象或 DTO，避免查出整行数据。这比 AsNoTracking 更进一步——它连实体对象都不创建。"
+    },
+    {
+      "type": "explain",
+      "title": "关系配置、级联删除与全局查询过滤器",
+      "content": "关系是模型配置里最复杂的部分。EF Core 通过 Fluent API 声明导航属性和外键：\n\n**一对多**：`entity.HasMany(u => u.Orders).WithOne(o => o.User).HasForeignKey(o => o.UserId)` —— 一个 User 有多个 Order，Order 通过 UserId 外键指向 User。\n\n**一对一**：`entity.HasOne(u => u.Profile).WithOne(p => p.User).HasForeignKey<UserProfile>(p => p.UserId)` —— 两个实体共享一个外键，注意外键放在「依赖方」。\n\n**多对多**：EF Core 5+ 原生支持跳过连接实体（Skip Navigation）。`entity.HasMany(u => u.Roles).WithMany(r => r.Users)`，EF Core 自动生成中间表。如果需要额外字段（比如 AddedAt），可以显式定义连接实体。\n\n**级联删除（OnDelete）**：`DeleteBehavior.Cascade`（删主键方时级联删依赖方）、`DeleteBehavior.Restrict`（禁止删主键方如果有依赖方）、`DeleteBehavior.SetNull`（把外键设为 null）、`DeleteBehavior.NoAction`（不生成 FK 约束的删除行为，SQL Server 默认）。选择不当会导致运行时报错或数据不一致，生产环境务必理解数据库层面的 FK 约束和 EF Core 层面的行为差异。\n\n**全局查询过滤器（HasQueryFilter）**：`entity.HasQueryFilter(e => e.IsActive)` 会让该 DbSet 的所有查询自动加上 `WHERE IsActive = 1`，适合软删除。但注意：Include 的导航属性也会被过滤器影响；如果需要绕过过滤器，用 `IgnoreQueryFilters()`。"
     },
     {
       "type": "diagram",
@@ -48,50 +68,62 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | 数据注解 | Fluent API |\n| --- | --- | --- |\n| 配置位置 | 实体类上 | OnModelCreating 方法 |\n| 可读性 | 高（直接看到配置） | 中（需要查看方法） |\n| 灵活性 | 有限 | 高（支持所有配置） |\n| 适用场景 | 简单配置 | 复杂配置、关系配置 |\n| 推荐程度 | 简单项目 | 生产项目 |"
+      "title": "数据注解 vs Fluent API",
+      "content": "| 维度 | 数据注解 | Fluent API |\n| --- | --- | --- |\n| 配置位置 | 实体类上的 Attribute | DbContext.OnModelCreating |\n| 可读性 | 直观，配置和实体在一起 | 需要查看 DbContext 或独立配置类 |\n| 能覆盖的范围 | 主键、必填、长度、列类型、表名 | 一切（含关系、索引、删除行为、查询过滤器、影子属性） |\n| 适合场景 | 简单实体、快速原型 | 生产项目、复杂模型 |\n| 维护性 | 实体类会变臃肿 | 可拆分 IEntityTypeConfiguration<T>，单一职责 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | DbContext 生命周期 | Repository 生命周期 |\n| --- | --- | --- |\n| 推荐作用域 | Scoped（DbContext 生命周期） | Scoped（Repository 生命周期） |\n| 线程安全 | 非线程安全（DbContext 生命周期） | 非线程安全（Repository 生命周期） |\n| 注册方式 | AddDbContext | AddScoped |\n| 适用场景 | 直接使用 | 封装数据访问 |\n| 依赖注入 | 自动注入 | 需要注册 |"
+      "title": "DbContext 生命周期对比",
+      "content": "| 维度 | Scoped（推荐） | Singleton | Transient |\n| --- | --- | --- | --- |\n| 实例数 | 每请求一个 | 全局一个 | 每次注入一个 |\n| 线程安全 | 同一请求内安全 | 高并发必出错 | 同一请求内不同实例各自为政 |\n| 变更跟踪 | 同一请求共享，SaveChanges 一次提交 | 全局实体堆积，内存泄漏 | 变更分散，无法统一提交 |\n| 典型错误 | 无 | 跨线程读写 ChangeTracker 报错 | 两个服务改同一个实体但不共享状态 |\n| 注册方式 | AddDbContext（默认 Scoped） | 手动改为 Singleton（几乎不该用） | 手动改为 Transient（很少用） |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Collections.Generic;\nusing System.ComponentModel.DataAnnotations;\nusing System.ComponentModel.DataAnnotations.Schema;\nusing System.Linq;\nusing System.Threading.Tasks;\nusing Microsoft.EntityFrameworkCore;\nusing Microsoft.Extensions.DependencyInjection;\n\nnamespace EFCoreBasicsDemo\n{\n    // 实体类\n    public class User\n    {\n        public int Id { get; set; }\n        public string Name { get; set; }\n        public string Email { get; set; }\n        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;\n        public bool IsActive { get; set; } = true;\n\n        // 导航属性\n        public ICollection<Order> Orders { get; set; } = new List<Order>();\n    }\n\n    public class Order\n    {\n        public int Id { get; set; }\n        public string ProductName { get; set; }\n        public decimal Price { get; set; }\n        public int Quantity { get; set; }\n        public DateTime OrderDate { get; set; } = DateTime.UtcNow;\n\n        // 外键\n        public int UserId { get; set; }\n        public User User { get; set; }\n    }\n\n    // DbContext\n    public class AppDbContext : DbContext\n    {\n        public DbSet<User> Users { get; set; }\n        public DbSet<Order> Orders { get; set; }\n\n        public AppDbContext(DbContextOptions<AppDbContext> options)\n            : base(options) { }\n\n        protected override void OnModelCreating(ModelBuilder modelBuilder)\n        {\n            // User 配置\n            modelBuilder.Entity<User>(entity =>\n            {\n                entity.HasKey(e => e.Id);\n                entity.Property(e => e.Id)\n                    .UseIdentityColumn();\n\n                entity.Property(e => e.Name)\n                    .IsRequired()\n                    .HasMaxLength(100);\n\n                entity.Property(e => e.Email)\n                    .HasMaxLength(200);\n\n                entity.HasIndex(e => e.Email)\n                    .IsUnique();\n\n                entity.Property(e => e.CreatedAt)\n                    .HasDefaultValueSql(\"GETUTCDATE()\");\n\n                entity.HasQueryFilter(e => e.IsActive);\n            });\n\n            // Order 配置\n            modelBuilder.Entity<Order>(entity =>\n            {\n                entity.HasKey(e => e.Id);\n\n                entity.Property(e => e.ProductName)\n                    .IsRequired()\n                    .HasMaxLength(200);\n\n                entity.Property(e => e.Price)\n                    .HasColumnType(\"decimal(18,2)\");\n\n                entity.HasOne(e => e.User)\n                    .WithMany(u => u.Orders)\n                    .HasForeignKey(e => e.UserId)\n                    .OnDelete(DeleteBehavior.Cascade);\n            });\n\n            // 种子数据\n            modelBuilder.Entity<User>().HasData(\n                new User { Id = 1, Name = \"Alice\", Email = \"alice@example.com\" },\n                new User { Id = 2, Name = \"Bob\", Email = \"bob@example.com\" }\n            );\n        }\n    }\n\n    // 仓储模式\n    public interface IRepository<T> where T : class\n    {\n        Task<T> GetByIdAsync(int id);\n        Task<IEnumerable<T>> GetAllAsync();\n        Task AddAsync(T entity);\n        void Update(T entity);\n        void Delete(T entity);\n        Task SaveChangesAsync();\n    }\n\n    public class Repository<T> : IRepository<T> where T : class\n    {\n        protected readonly AppDbContext _context;\n        protected readonly DbSet<T> _dbSet;\n\n        public Repository(AppDbContext context)\n        {\n            _context = context;\n            _dbSet = context.Set<T>();\n        }\n\n        public async Task<T> GetByIdAsync(int id)\n        {\n            return await _dbSet.FindAsync(id);\n        }\n\n        public async Task<IEnumerable<T>> GetAllAsync()\n        {\n            return await _dbSet.ToListAsync();\n        }\n\n        public async Task AddAsync(T entity)\n        {\n            await _dbSet.AddAsync(entity);\n        }\n\n        public void Update(T entity)\n        {\n            _dbSet.Update(entity);\n        }\n\n        public void Delete(T entity)\n        {\n            _dbSet.Remove(entity);\n        }\n\n        public async Task SaveChangesAsync()\n        {\n            await _context.SaveChangesAsync();\n        }\n    }\n\n    // 使用示例\n    public class UserService\n    {\n        private readonly IRepository<User> _repository;\n\n        public UserService(IRepository<User> repository)\n        {\n            _repository = repository;\n        }\n\n        public async Task<User> GetUserWithOrdersAsync(int userId)\n        {\n            var user = await _repository.GetByIdAsync(userId);\n            return user;\n        }\n\n        public async Task CreateUserAsync(string name, string email)\n        {\n            var user = new User\n            {\n                Name = name,\n                Email = email\n            };\n\n            await _repository.AddAsync(user);\n            await _repository.SaveChangesAsync();\n        }\n    }\n\n    // 配置服务\n    public static class EFCoreServiceCollectionExtensions\n    {\n        public static IServiceCollection AddEFCoreServices(\n            this IServiceCollection services,\n            string connectionString)\n        {\n            services.AddDbContext<AppDbContext>(options =>\n                options.UseSqlServer(connectionString)\n                    .EnableSensitiveDataLogging()\n                    .LogTo(Console.WriteLine, LogLevel.Information));\n\n            services.AddScoped(typeof(IRepository<>), typeof(Repository<>));\n\n            return services;\n        }\n    }\n\n    // 迁移应用\n    public static class DatabaseExtensions\n    {\n        public static async Task InitializeDatabaseAsync(this IServiceProvider serviceProvider)\n        {\n            using var scope = serviceProvider.CreateScope();\n            var context = scope.ServiceProvider\n                .GetRequiredService<AppDbContext>();\n\n            // 应用迁移\n            await context.Database.MigrateAsync();\n\n            // 检查是否有数据\n            if (!context.Users.Any())\n            {\n                // 添加种子数据\n                context.Users.AddRange(\n                    new User { Name = \"Admin\", Email = \"admin@example.com\" },\n                    new User { Name = \"User1\", Email = \"user1@example.com\" }\n                );\n                await context.SaveChangesAsync();\n            }\n        }\n    }\n}",
+      "title": "完整示例：DbContext 配置、CRUD、迁移应用与 AsNoTracking",
       "language": "csharp",
+      "content": "using System;\nusing System.Collections.Generic;\nusing System.Linq;\nusing System.Threading.Tasks;\nusing Microsoft.EntityFrameworkCore;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Logging;\n\nnamespace EFCoreBasicsDemo\n{\n    // 实体类\n    public class User\n    {\n        public int Id { get; set; }\n        public string Name { get; set; } = string.Empty;\n        public string Email { get; set; } = string.Empty;\n        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;\n        public bool IsActive { get; set; } = true;\n\n        public ICollection<Order> Orders { get; set; } = new List<Order>();\n    }\n\n    public class Order\n    {\n        public int Id { get; set; }\n        public string ProductName { get; set; } = string.Empty;\n        public decimal Price { get; set; }\n        public int Quantity { get; set; }\n        public DateTime OrderDate { get; set; } = DateTime.UtcNow;\n\n        public int UserId { get; set; }\n        public User User { get; set; } = null!;\n    }\n\n    // DbContext\n    public class AppDbContext : DbContext\n    {\n        public DbSet<User> Users => Set<User>();\n        public DbSet<Order> Orders => Set<Order>();\n\n        public AppDbContext(DbContextOptions<AppDbContext> options)\n            : base(options) { }\n\n        protected override void OnModelCreating(ModelBuilder modelBuilder)\n        {\n            modelBuilder.Entity<User>(entity =>\n            {\n                entity.HasKey(e => e.Id);\n                entity.Property(e => e.Id).UseIdentityColumn();\n                entity.Property(e => e.Name).IsRequired().HasMaxLength(100);\n                entity.Property(e => e.Email).HasMaxLength(200);\n                entity.HasIndex(e => e.Email).IsUnique();\n                entity.Property(e => e.CreatedAt).HasDefaultValueSql(\"GETUTCDATE()\");\n                entity.HasQueryFilter(e => e.IsActive); // 全局软删除过滤器\n            });\n\n            modelBuilder.Entity<Order>(entity =>\n            {\n                entity.HasKey(e => e.Id);\n                entity.Property(e => e.ProductName).IsRequired().HasMaxLength(200);\n                entity.Property(e => e.Price).HasColumnType(\"decimal(18,2)\");\n                entity.HasOne(e => e.User)\n                    .WithMany(u => u.Orders)\n                    .HasForeignKey(e => e.UserId)\n                    .OnDelete(DeleteBehavior.Cascade);\n            });\n\n            modelBuilder.Entity<User>().HasData(\n                new User { Id = 1, Name = \"Alice\", Email = \"alice@example.com\" },\n                new User { Id = 2, Name = \"Bob\", Email = \"bob@example.com\" }\n            );\n        }\n    }\n\n    public static class Demo\n    {\n        public static async Task RunAsync()\n        {\n            var services = new ServiceCollection()\n                .AddDbContext<AppDbContext>(options =>\n                    options.UseInMemoryDatabase(\"demo\")\n                        .EnableSensitiveDataLogging()\n                        .LogTo(Console.WriteLine, LogLevel.Information))\n                .BuildServiceProvider();\n\n            await using var scope = services.CreateAsyncScope();\n            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();\n\n            // 确保数据库创建（生产环境用 MigrateAsync）\n            await db.Database.EnsureCreatedAsync();\n\n            // --- 创建 ---\n            var user = new User { Name = \"Charlie\", Email = \"charlie@example.com\" };\n            db.Users.Add(user);\n            await db.SaveChangesAsync();\n            Console.WriteLine($\"Created user Id={user.Id}\");\n\n            // --- 读取（Tracking） ---\n            var tracked = await db.Users.FirstAsync(u => u.Id == user.Id);\n            tracked.Name = \"Charlie Updated\";\n            await db.SaveChangesAsync(); // UPDATE 只改 Name\n\n            // --- 读取（AsNoTracking） ---\n            var readOnly = await db.Users\n                .AsNoTracking()\n                .Select(u => new { u.Id, u.Name, u.Email })\n                .ToListAsync();\n            Console.WriteLine($\"Read-only count={readOnly.Count}\");\n\n            // --- Include 预加载关联数据 ---\n            var userWithOrders = await db.Users\n                .Include(u => u.Orders)\n                .FirstAsync(u => u.Id == user.Id);\n            Console.WriteLine($\"User {userWithOrders.Name} has {userWithOrders.Orders.Count} orders\");\n\n            // --- 删除 ---\n            db.Users.Remove(user);\n            await db.SaveChangesAsync();\n            Console.WriteLine(\"Deleted.\");\n        }\n    }\n}",
       "highlights": [
         {
-          "line": 13,
-          "note": "`public class User` 定义了 EF Core 基础 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 72,
+          "note": "HasQueryFilter 全局过滤器：所有查询自动加 WHERE IsActive = true，实现软删除。"
         },
         {
-          "line": 211,
-          "note": "`if (!context.Users.Any())` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 78,
+          "note": "Cascade 删除行为：删 User 时级联删除其所有 Order。"
         },
         {
-          "line": 15,
-          "note": "`public int Id { get; set; }` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "line": 97,
+          "note": "SaveChanges 一次性提交所有变更，是事务性的。"
         },
         {
-          "line": 6,
-          "note": "`using System.Threading.Tasks;` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+          "line": 103,
+          "note": "AsNoTracking + Select 投影：不建快照、不创建实体对象，最省资源。"
+        },
+        {
+          "line": 110,
+          "note": "Include 预加载关联实体，避免 N+1 查询。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：EF Core 是 .NET 主流 ORM，核心是 DbContext——它代表一次数据库会话，管理实体、跟踪变更、把 LINQ 翻译成 SQL。用它的关键是理解「实体配置 + 变更跟踪 + 迁移」三件事。\n\n要点：\n\n1. DbContext 加 DbSet<T>：DbContext 是工作单元，DbSet 是表的入口；通常注册成 Scoped（每请求一个），因为它不是线程安全的。\n2. 模型配置：数据注解（[Key]、[Required]）简单，Fluent API（OnModelCreating）更强、推荐，能配主键、索引、关系、列类型。\n3. CRUD 与变更跟踪：增删改是在内存里改实体、调 SaveChanges 才一次性生成 SQL 提交；EF 靠变更跟踪知道哪些实体被改了。\n4. 迁移：Add-Migration 根据模型变化生成迁移代码，Update-Database 应用到库，让模型和数据库结构同步演进。\n\n边界和坑。① 只读查询用 AsNoTracking 关掉变更跟踪，省内存、更快。② DbContext 不能跨线程共享、生命周期要 Scoped，否则并发出错。③ 关系导航属性要 Include 预加载，否则要么是 null、要么触发 N+1。",
+      "content": "结论：EF Core 是 .NET 的 ORM 框架，核心是 DbContext——它代表一次数据库会话，是工作单元（Unit of Work），管理实体、跟踪变更、把 LINQ 翻译成 SQL 并在 SaveChanges 时一次性提交。\n\n**主线要点**\n- **DbContext + DbSet<T>**：DbContext 是工作单元，持有 ChangeTracker 和模型元数据；DbSet 是表的入口，不是表本身。注册为 Scoped（每请求一个），因为它不是线程安全的。\n- **模型配置**：数据注解（[Key]、[Required]）覆盖简单场景；Fluent API（OnModelCreating）能配一切——关系、索引、删除行为、查询过滤器、影子属性。生产项目推荐 Fluent API。\n- **变更跟踪与 SaveChanges**：查实体时 EF 记快照，修改只改内存当前值，SaveChanges 时扫描差异、生成 INSERT/UPDATE/DELETE 并以事务提交。高并发下缩短 DbContext 使用范围。\n- **迁移**：Add-Migration 生成 Up/Down 迁移代码，Update-Database 按顺序执行未应用的迁移，生产环境用 Script-Migration 生成 SQL 评审后执行。\n- **查询优化**：只读查询加 AsNoTracking 省内存省 CPU；用 Select 投影只查需要的字段；用 Include 预加载关联实体避免 N+1。\n\n**边界和坑**\n- DbContext 不能跨线程、不能 Singleton、不能长时间持有不释放。\n- 导航属性不 Include 可能返回 null 或触发 N+1（取决于懒加载是否启用）。\n- 全局查询过滤器也会影响 Include 的导航属性，需要时用 IgnoreQueryFilters() 绕过。\n- 级联删除配置不当会在运行时报外键约束错误或删错数据。\n- 生产环境迁移要生成 SQL 脚本走审批，破坏性变更分步上线。",
       "followUpQuestions": [
         {
-          "question": "EF Core 的变更跟踪是怎么工作的？AsNoTracking 为什么更快？",
-          "answer": "DbContext 查出实体后会为每个实体保存一份快照，SaveChanges 时把当前值和快照逐字段比对、得出 Added/Modified/Deleted 状态，再据此生成 INSERT/UPDATE/DELETE，这就是变更跟踪。它的代价是要存快照、SaveChanges 要扫描比对，实体多时有内存和 CPU 开销。AsNoTracking 用于只读查询，告诉 EF 不建快照、不进跟踪器，所以更省内存、更快，但查出来的实体改了也不会被 SaveChanges 保存。报表、列表展示这类只读场景应默认 AsNoTracking。"
+          "question": "变更跟踪是怎么工作的？AsNoTracking 为什么更快？",
+          "answer": "DbContext 查出实体后在 ChangeTracker 里存一份快照（原始值），SaveChanges 时把当前值和快照逐字段比对，得出 Added/Modified/Deleted 状态，再生成对应的 INSERT/UPDATE/DELETE。代价是存快照要内存、SaveChanges 要扫描。AsNoTracking 让 EF 不建快照、不进跟踪器，省内存省 CPU，但查出来的实体修改不会被保存。只读场景（报表、列表、API 响应）应默认 AsNoTracking。"
         },
         {
-          "question": "EF Core 的迁移是怎么回事？团队协作和生产环境要注意什么？",
-          "answer": "迁移把「模型的变化」固化成可执行代码：Add-Migration 对比当前模型和上一个迁移快照、生成 Up 和 Down 方法，Update-Database 按顺序执行没应用过的迁移并记录在 __EFMigrationsHistory 表里。团队协作要注意：迁移文件提交进版本控制、按时间顺序应用；多人同时改模型容易产生冲突的迁移，合并后要检查生成的 SQL。生产环境一般不直接 Update-Database，而是用 Script-Migration 生成 SQL 评审后由 DBA 执行，破坏性变更（删列、改类型）要谨慎、分步上线。"
+          "question": "为什么 DbContext 要注册为 Scoped？注册为 Singleton 或 Transient 会怎样？",
+          "answer": "Scoped 保证每请求一个实例，同请求内的多个服务共享同一个 DbContext，能看到彼此的变更、SaveChanges 一次提交。Singleton 在高并发下多个线程同时读写 ChangeTracker，必然报错或产生脏数据。Transient 在同一请求内不同组件拿到不同实例，A 的变更对 B 不可见，SaveChanges 只提交自己实例的变更。"
+        },
+        {
+          "question": "N+1 问题是什么？怎么解决？",
+          "answer": "先查 N 个主实体，再在循环里逐个查关联实体，产生 1 + N 条 SQL。比如查 100 个 User 再逐个访问 user.Orders，就是 101 条查询。解决方法：用 `.Include(u => u.Orders)` 预加载，EF Core 用 JOIN 一次查回；如果只需要部分字段，用 Select 投影成 DTO。"
+        },
+        {
+          "question": "EF Core 的迁移在团队协作和生产环境要注意什么？",
+          "answer": "迁移文件提交版本控制、按时间顺序应用。多人同时改模型会产生冲突的迁移，合并后要验证 SQL 顺序。生产环境不直接 Update-Database，而是用 Script-Migration 生成 SQL 脚本由 DBA 评审后执行。破坏性变更（删列、改类型）分步上线：先加新列、迁移数据、再删旧列。"
         }
       ]
     },
@@ -99,33 +131,42 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "DbContext 的作用和生命周期",
-        "数据注解和 Fluent API 的配置方式",
-        "数据库迁移的创建和应用",
-        "关系配置（一对多、多对多、一对一）",
-        "CRUD 操作的基本使用",
-        "查询优化技巧（AsNoTracking、投影、分页）"
+        "能说明 DbContext 是工作单元，持有 ChangeTracker，注册为 Scoped 的原因",
+        "能区分数据注解与 Fluent API 的适用场景和能力边界",
+        "能描述变更跟踪的快照机制和 SaveChanges 的差异提交流程",
+        "能解释迁移的 Add-Migration → Update-Database → Script-Migration 完整流程",
+        "能用 AsNoTracking 优化只读查询、用 Select 投影减少数据传输",
+        "能用 Include 预加载关联实体避免 N+1",
+        "能配置一对多、一对一、多对多关系及级联删除行为",
+        "能说明全局查询过滤器的用途和 IgnoreQueryFilters 的绕过方式"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "dotnet.ef-core.basics.recall.1",
-      "prompt": "请说明 EF Core 基础 的核心机制、典型使用场景和常见坑。",
+      "prompt": "请解释 EF Core 中 DbContext 的角色、变更跟踪机制和 SaveChanges 的提交流程。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "dotnet.ef-core.basics.recall.2",
-      "prompt": "什么是数据库迁移？如何创建和应用迁移？",
+      "prompt": "EF Core 的迁移是怎么工作的？生产环境怎么安全地应用迁移？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "dotnet.ef-core.basics.recall.3",
-      "prompt": "EF Core 的变更跟踪是怎么工作的？AsNoTracking 什么时候该用、能省什么开销？",
+      "prompt": "你在代码里发现一个接口响应慢，排查后发现是查询 User 时 N+1 问题。请解释原因和解决方案。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.ef-core.basics.recall.4",
+      "prompt": "DbContext 注册成 Singleton 会出什么问题？为什么推荐 Scoped？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -133,29 +174,32 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说出 DbContext 是会话/工作单元、DbSet 是表入口",
-      "能区分数据注解与 Fluent API 配置",
-      "能解释变更跟踪和 SaveChanges 的提交时机",
-      "能说明迁移如何同步模型与数据库结构"
+      "能说出 DbContext 是工作单元，持有 ChangeTracker，管理实体生命周期",
+      "能解释变更跟踪的快照机制和 SaveChanges 如何生成差异 SQL",
+      "能说明数据注解与 Fluent API 的适用场景和能力边界",
+      "能描述迁移的核心流程（Add-Migration → Update-Database → Script-Migration）"
     ],
     "goodToHave": [
-      "能说明 DbContext 注册为 Scoped、不能跨线程",
-      "能用 AsNoTracking 优化只读查询",
-      "能用 Include 预加载避免 N+1"
+      "能解释 DbContext 为 Scoped 的原因及 Singleton/Transient 的问题",
+      "能用 AsNoTracking 和 Select 投影优化只读查询",
+      "能用 Include 预加载避免 N+1 并说明懒加载的默认行为",
+      "能说明全局查询过滤器和级联删除的配置与风险"
     ],
     "commonMistakes": [
-      "跨线程共享 DbContext 或注册成 Singleton",
-      "只读查询不用 AsNoTracking",
-      "访问导航属性不 Include 触发 N+1"
+      "DbContext 注册为 Singleton，高并发下 ChangeTracker 并发出错",
+      "只读查询不加 AsNoTracking，实体多了内存和 SaveChanges 开销都大",
+      "访问导航属性不 Include，要么返回 null 要么触发 N+1",
+      "生产环境直接跑 Update-Database，破坏性变更无审批",
+      "级联删除配置不当，运行时报 FK 约束错误或误删数据"
     ],
     "scoreWeights": {
       "coverage": 35,
-      "accuracy": 30,
+      "accuracy": 25,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否解释 DbContext 与变更跟踪、区分配置方式、说清迁移机制，并知道 AsNoTracking、Scoped 生命周期、N+1 等实践要点。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察能否从工作单元、变更跟踪、SaveChanges 差异提交、迁移机制、Scoped 生命周期、AsNoTracking、N+1 和关系配置等维度完整解释 EF Core 的核心工作原理，以及工程实践中的常见陷阱。",
+  "updatedAt": "2026-06-22"
 }

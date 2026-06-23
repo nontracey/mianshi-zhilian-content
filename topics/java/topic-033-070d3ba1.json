@@ -7,7 +7,7 @@
   "status": "production",
   "order": 80,
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 49,
   "interviewFrequency": "high",
   "recommendWeight": 86,
   "tags": [
@@ -19,22 +19,32 @@
     "java.jvm.topic-001-ebcc71cb",
     "java.jvm.topic-009-e1efbeeb"
   ],
-  "summary": "从 Class 元数据身份、反射 API、JPMS 访问边界、注解保留阶段和性能替代路径理解框架如何用反射与注解工作。",
+  "summary": "从 Class 元数据身份（ClassLoader 决定）、反射 API 三层入口（字段/方法/构造器）、JPMS 模块访问边界（setAccessible 不能穿透模块约束）、注解保留阶段与消费链路（SOURCE/CLASS/RUNTIME 各自被谁读取）、性能瓶颈诊断与替代路径（MethodHandle、LambdaMetafactory、字节码生成）五个维度理解框架如何用反射与注解工作。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "反射先定位 Class 镜像",
-      "content": "反射不是“绕过编译器的任意调用器”，而是运行时围绕 `Class` 镜像读取和操作类型元数据。`T.class`、`obj.getClass()`、`Class.forName(\"pkg.T\")` 都能拿到 `Class` 对象，但要注意两个边界。第一个是同一个二进制类名在不同 `ClassLoader` 下会对应不同 `Class` 对象。第二个是 `Class.forName(String)` 默认会触发类初始化，而类字面量和 `getClass()` 不等价。\n\n拿到 `Class` 后，常用入口是 `Constructor`、`Field`、`Method`。`getField/getMethod` 只看 public 且包含继承成员，`getDeclaredField/getDeclaredMethod` 看当前类声明的成员但不包含继承成员。`Method.invoke` 会把目标方法抛出的异常包在 `InvocationTargetException` 里，排查时要看 `getCause()`。\n\n`setAccessible(true)` 或 `trySetAccessible()` 只能跳过 Java 语言层访问检查，不能无条件穿透 Java 9+ 的模块边界。跨模块访问非开放包时可能失败并抛出 `InaccessibleObjectException`，生产里应通过显式 API、`opens`、`--add-opens`、`MethodHandles.privateLookupIn` 等方式处理，而不是把 private 访问当作稳定契约。"
+      "title": "Class 镜像由类名和 ClassLoader 共同决定",
+      "content": "反射不是「绕过编译器的魔法」，而是运行时围绕 `Class` 对象读取和操作类型元数据。三种获取方式表面上等价，实际有微妙差异：`T.class` 是编译期字面量，不触发类初始化（clinit 不执行）；`obj.getClass()` 用运行时实例获取，不触发 clinit；`Class.forName(\"pkg.T\")` 默认会触发类初始化——Spring 用它加载 JDBC 驱动就是利用这个特性执行驱动的 static 块。\n\n更关键的边界是 ClassLoader 同等性：同一个二进制类名，如果由不同 ClassLoader 加载，会产生不同的 `Class` 对象，`==` 比较为 false，互相赋值抛 `ClassCastException`。这不是 bug，而是 Tomcat WebAppClassLoader、OSGi、自定义插件隔离的基石。线上常见的 `ClassCastException: cannot cast X to X`（类名完全一样）几乎都是这个原因。排查时看 `obj.getClass().getClassLoader()` 和预期类的 ClassLoader 是否相同。\n\n拿到 `Class` 后，元数据分三层展开：`Constructor`（构造器）、`Field`（字段）、`Method`（方法）。获取时注意两组 API 的区别：`getField/getMethod` 只返回 public 成员且包含父类继承的；`getDeclaredField/getDeclaredMethod` 返回当前类声明的所有可见性成员但不含继承成员。要访问父类 private 成员必须递归遍历 `getSuperclass()`。"
     },
     {
       "type": "explain",
-      "title": "注解是元数据，处理器才产生行为",
-      "content": "注解类型用 `@interface` 定义，本质上仍是接口，属性返回类型只能是基本类型、`String`、`Class`、枚举、注解以及这些类型的数组。`@Target` 限定能贴在哪些程序元素上，`@Retention` 决定它被保留到哪个阶段；如果省略 `@Retention`，默认是 `CLASS`。\n\n`SOURCE` 注解只给编译器或源码工具看，典型场景是检查、代码生成或 Lombok 这类编译期变换；`CLASS` 注解会写进 class 文件，常供字节码工具读取，但普通运行时反射读不到；`RUNTIME` 注解会保留到运行时，Spring、JUnit、Bean Validation、路由框架才能通过反射扫描到。\n\n注解本身不会创建 Bean、校验字段或开启事务，行为来自消费它的处理器。编译期处理器通过 APT 的 `AbstractProcessor` 读取元素并生成代码或报错；运行时框架通过扫描 `Class/Field/Method` 上的注解建立 BeanDefinition、路由表、校验规则或测试用例。解释注解时要把“声明元数据”和“处理器执行逻辑”分开。"
+      "title": "反射调用的实际开销：访问检查、装箱、间接分派",
+      "content": "`Method.invoke` 的完整路径包括：校验目标对象类型、参数数量和类型、执行语言层访问检查、处理可变参数数组（varargs）、把基本类型参数装箱成 Object、通过 JNI 或 MethodAccessor 进行间接调用、最后把返回值拆箱或向上转型。每一步单独看成本不大，但高频循环下累积后可能成为热点。\n\n更深层的 JIT 影响是调用点不稳定：同一个 `Method` 对象在不同反射调用中可能指向不同目标（多态、代理、重载），导致 JVM 的内联缓存（inline cache）频繁失效，本可以内联的直接调用退化为间接跳转。JMH 基准测试里，反射调用在 JDK 8 到 JDK 21 上通常比直接调用慢 3-10 倍，但具体倍数取决于目标方法复杂度、JIT 预热程度和调用频率——背固定倍数是面试减分项。\n\n权限检查也有成本差异：`setAccessible(true)` 跳过语言层检查后，后续调用走 ReflectionAccessor（JDK 9+ 重命名为更高效的 native 路径），但仍比直接调用多一层间接。如果模块边界阻止了 `setAccessible`，每次调用都会重新校验并最终失败。"
     },
     {
       "type": "explain",
-      "title": "性能问题来自动态分派和边界检查",
-      "content": "反射慢不应该背固定倍数。真实成本取决于 JDK 版本、是否预热、调用频率、访问权限、参数装箱、异常路径和 JIT 能否优化。常见开销包括元数据查找、访问检查、可变参数数组、装箱拆箱、`Method.invoke` 的间接调用，以及调用点不稳定导致内联困难。\n\n优化先做低风险项：把 `Class`、`Constructor`、`Field`、`Method` 缓存起来，避免请求路径里反复 `getDeclaredMethod`；初始化阶段完成访问检查或模块开放校验；热点循环里尽量改成直接调用、函数对象、策略表或预生成访问器。反射仍然合适的地方是框架启动、对象装配、配置驱动扩展和低频管理动作。\n\n如果高频路径还需要动态能力，可以评估 `MethodHandle`、`LambdaMetafactory` 或字节码生成。`MethodHandle` 的类型签名更明确，JVM 更容易优化稳定调用点；`LambdaMetafactory` 可把目标方法适配成函数式接口；ASM/CGLIB/Byte Buddy 常用于生成代理或访问器。选择替代方案前要用 JFR、async-profiler 或火焰图确认热点确实在反射调用上。"
+      "title": "setAccessible 不能穿透 JPMS 模块边界",
+      "content": "`setAccessible(true)` 只能绕过 Java 语言层的 private/protected/package-private 访问控制。Java 9 引入 JPMS 后，模块系统在 JVM 层新增了一层封装：如果目标类所在的包没有被模块导出（`exports`）或开放（`opens`）给调用方，即使 `setAccessible(true)` 也不会成功，抛出 `InaccessibleObjectException`。\n\n`opens` 与 `exports` 的区别是关键：`exports` 让其他模块能编译和运行时访问该包的 public 类型；`opens` 额外允许运行时反射访问该包的非 public 成员（包括 private 字段和方法）。Spring Boot 推荐在模块化应用里对需要反射的包使用 `opens`，而非把整个模块 `exports`。\n\n工程实践中的四个处理层次：第一优先用公开 API 替代反射；第二在 `module-info.java` 中对特定包 `opens to <使用方模块>`；第三在启动脚本用 `--add-opens pkg/target=spring.core` 这种临时方案（JDK 会警告）；第四用 `MethodHandles.privateLookupIn(TargetClass, callerLookup)` 获取更高权限的 Lookup 对象——但这同样受模块 opens 约束，不是万能钥匙。生产代码不能把 private 反射当稳定契约，JDK 内部类的布局随时可能变。"
+    },
+    {
+      "type": "explain",
+      "title": "注解保留阶段决定谁能读到它",
+      "content": "`@Retention` 有三个值，每个值决定注解被保留在哪个阶段：`SOURCE` 只存在于源码中，编译后 class 文件里没有，典型如 `@Override`、`@NonNull`、Lombok 的 `@Data`；`CLASS`（省略 @Retention 时的默认值）写入 class 文件的属性表，但 JVM 不会把它放进运行时的反射元数据，普通 `getAnnotation()` 读不到——字节码增强工具（ASM、ByteBuddy）和 APT 离线扫描可以读到；`RUNTIME` 同时写入 class 文件并可通过 `getAnnotation/getAnnotations` 在运行时读取。\n\n典型误判：以为 `@Transactional` 是 RUNTIME 所以 Spring 在运行时才读取。实际上 Spring 在启动期用 ASM 扫描注解元数据（避免加载所有类），只在需要代理的方法上才触发类加载。注解的保留阶段和「何时被消费」是两件事。\n\n注解本身是纯元数据标记——用 `@interface` 定义，本质上仍是接口，属性返回类型限于基本类型、String、Class、枚举、注解及这些类型的数组。注解不会创建 Bean、不会校验字段、不会开启事务。行为完全来自消费它的处理器：编译期处理器（APT 的 `AbstractProcessor`）生成代码或报错；字节码处理器读取 CLASS 注解做增强；运行时框架通过反射读取 RUNTIME 注解建立 BeanDefinition、路由表、校验规则。"
+    },
+    {
+      "type": "explain",
+      "title": "性能优化：从缓存到 MethodHandle 到字节码生成",
+      "content": "优化反射性能的第一步永远是先确认瓶颈在哪。用 JFR（JDK Flight Recorder）或 async-profiler 采样，看热点是否真在反射调用上。很多时候「反射慢」的感知来自启动期全量扫描而非运行期单次调用。\n\n低风险优化项：把 `Method`/`Field`/`Constructor` 缓存到 `ConcurrentHashMap` 或 final 字段，避免每次请求都调 `getDeclaredMethod`（这个方法要遍历类的方法表并做字符串匹配）；初始化阶段完成 `setAccessible` 和模块开放校验；高频字段读写改成预生成的 getter/setter 或直接字段访问。\n\n当反射确实是热点且不能改成直接调用时，有三个替代方案。`MethodHandle`（JDK 7 引入，JDK 9 增强 `privateLookupIn`）是 JVM 原生的类型化调用点，签名更明确，调用点稳定后 JIT 可以内联——但创建和适配（`asType`、`asSpreader`）有成本，适合「创建一次、调用多次」的模式。`LambdaMetafactory`（JDK 8 引入）能在运行时生成函数式接口适配器，初始化一次后运行期接近普通方法调用，Spring 的 `BeanFactory.getBean(Class)` 在某些路径用了这个思路。字节码生成（ASM/CGLIB/Byte Buddy）适合 ORM 映射器、RPC 序列化器、AOP 代理等需要高频稳定调用的框架路径，代价是生成类增加 Metaspace 占用和调试复杂度。"
     },
     {
       "type": "diagram",
@@ -56,53 +66,65 @@
     },
     {
       "type": "compareTable",
-      "title": "反射、方法句柄和字节码生成怎么选",
-      "content": "| 方案 | 适合场景 | 主要成本 | 面试表达抓手 |\n| --- | --- | --- | --- |\n| 直接调用 | 业务代码、编译期类型已知 | 灵活性低 | 编译期检查强，JIT 最容易内联 |\n| 反射 `Method.invoke` | 框架启动、配置驱动、低频动态调用 | 查找、访问检查、装箱、间接调用 | 缓存元数据，避免在热点循环里反复查找 |\n| `MethodHandle` | 仍需动态绑定，但调用点较稳定 | 签名适配和 lookup 复杂度 | 类型化调用点更利于 JVM 优化，可配合 `privateLookupIn` |\n| `LambdaMetafactory` | 把方法适配成函数式接口 | 生成和引导成本 | 初始化一次，运行期接近普通函数对象调用 |\n| 字节码生成/代理 | ORM、RPC、AOP、序列化等高频框架路径 | 生成、类加载、调试复杂度 | 用生成类换取稳定调用路径，常见工具有 ASM、CGLIB、Byte Buddy |\n\n| `@Retention` | 是否进 class 文件 | 普通运行时反射能否读取 | 典型消费者 |\n| --- | --- | --- | --- |\n| `SOURCE` | 否 | 否 | 编译器、源码检查、代码生成工具 |\n| `CLASS` | 是 | 否 | 字节码增强、离线扫描工具 |\n| `RUNTIME` | 是 | 是 | Spring、JUnit、Bean Validation、路由注册 |"
+      "title": "反射 API 获取方式与行为差异",
+      "content": "| 获取方式 | 触发类初始化 | 典型场景 | 注意事项 |\n| --- | --- | --- | --- |\n| `T.class` | 否 | 常量式引用、注解属性类型值 | 编译期确定，不需要处理 ClassNotFoundException |\n| `obj.getClass()` | 否 | 运行时根据实例类型判断 | 多态下返回实际类型，不一定是声明类型 |\n| `Class.forName(\"pkg.T\")` | 是（默认） | 需要触发 static 块（如 JDBC 驱动注册） | 同名类不同 ClassLoader 得到不同 Class |\n| `ClassLoader.loadClass(\"pkg.T\")` | 否 | 框架延迟加载、插件隔离 | loadClass 遵循双亲委派，defineClass 才是真正加载 |\n\n| 反射 API | 包含继承成员 | 可见性范围 | 适用场景 |\n| --- | --- | --- | --- |\n| `getField`/`getMethod` | 是 | 仅 public | 快速访问公开成员 |\n| `getDeclaredField`/`getDeclaredMethod` | 否 | 当前类所有声明 | 需要访问 private/protected/package-private |\n| `getConstructors` | 不适用 | 仅 public | 外部创建实例 |\n| `getDeclaredConstructors` | 不适用 | 当前类所有声明 | 框架注入、反序列化 |\n\n| 性能替代方案 | 调用点稳定性 | JIT 优化友好度 | 适用场景 |\n| --- | --- | --- | --- |\n| 直接调用 | 最稳定 | 最好，可内联 | 编译期已知目标 |\n| 反射 `Method.invoke` | 不稳定（多态/代理） | 差，间接跳转 | 框架启动、低频动态调用 |\n| `MethodHandle`（JDK 7+） | 稳定后可内联 | 较好 | 需要动态绑定且调用频繁 |\n| `LambdaMetafactory`（JDK 8+） | 最稳定 | 接近直接调用 | 函数式接口适配、初始化一次 |\n| 字节码生成（ASM/CGLIB/Byte Buddy） | 最稳定 | 等同于直接调用 | ORM/RPC/AOP 高频框架路径 |"
     },
     {
       "type": "code",
       "title": "可运行代码：反射读取注解、调用私有方法并观察模块边界",
-      "content": "import java.lang.annotation.ElementType;\nimport java.lang.annotation.Retention;\nimport java.lang.annotation.RetentionPolicy;\nimport java.lang.annotation.Target;\nimport java.lang.invoke.MethodHandle;\nimport java.lang.invoke.MethodHandles;\nimport java.lang.invoke.MethodType;\nimport java.lang.reflect.Constructor;\nimport java.lang.reflect.Field;\nimport java.lang.reflect.Method;\n\npublic class Main {\n    @Retention(RetentionPolicy.RUNTIME)\n    @Target({ElementType.FIELD, ElementType.METHOD})\n    @interface Label {\n        String value();\n    }\n\n    static class User {\n        @Label(\"display-name\")\n        private String name;\n\n        private User(String name) {\n            this.name = name;\n        }\n\n        @Label(\"greeting\")\n        private String greet(String prefix) {\n            return prefix + \", \" + name;\n        }\n    }\n\n    public static void main(String[] args) throws Throwable {\n        Class<User> literal = User.class;\n        Class<?> forName = Class.forName(\"Main$User\");\n        assert literal == forName;\n\n        Constructor<User> constructor = literal.getDeclaredConstructor(String.class);\n        constructor.setAccessible(true);\n        User user = constructor.newInstance(\"Ada\");\n\n        Field nameField = literal.getDeclaredField(\"name\");\n        nameField.setAccessible(true);\n        assert nameField.get(user).equals(\"Ada\");\n        nameField.set(user, \"Grace\");\n\n        Method greet = literal.getDeclaredMethod(\"greet\", String.class);\n        greet.setAccessible(true);\n        String reflectValue = (String) greet.invoke(user, \"Hi\");\n        System.out.println(\"reflect invoke: \" + reflectValue);\n\n        Label fieldLabel = nameField.getAnnotation(Label.class);\n        Label methodLabel = greet.getAnnotation(Label.class);\n        System.out.println(\"labels: \" + fieldLabel.value() + \", \" + methodLabel.value());\n\n        MethodHandle privateGreet = MethodHandles.privateLookupIn(User.class, MethodHandles.lookup())\n                .findVirtual(User.class, \"greet\", MethodType.methodType(String.class, String.class));\n        System.out.println(\"method handle private: \" + (String) privateGreet.invoke(user, \"Hello\"));\n\n        Field stringValue = String.class.getDeclaredField(\"value\");\n        System.out.println(\"String.value trySetAccessible: \" + stringValue.trySetAccessible());\n\n        assert \"Hi, Grace\".equals(reflectValue);\n    }\n}",
+      "content": "import java.lang.annotation.ElementType;\nimport java.lang.annotation.Retention;\nimport java.lang.annotation.RetentionPolicy;\nimport java.lang.annotation.Target;\nimport java.lang.invoke.MethodHandle;\nimport java.lang.invoke.MethodHandles;\nimport java.lang.invoke.MethodType;\nimport java.lang.reflect.Constructor;\nimport java.lang.reflect.Field;\nimport java.lang.reflect.Method;\nimport java.util.HashMap;\nimport java.util.Map;\n\npublic class Main {\n    // 元信息：保留到运行时，注解本身不产生行为\n    @Retention(RetentionPolicy.RUNTIME)\n    @Target({ElementType.FIELD, ElementType.METHOD})\n    @interface Label {\n        String value();\n    }\n\n    static class User {\n        @Label(\"display-name\")\n        private String name;\n\n        private User(String name) {\n            this.name = name;\n        }\n\n        @Label(\"greeting\")\n        private String greet(String prefix) {\n            return prefix + \", \" + name;\n        }\n    }\n\n    // 模拟框架的元数据缓存\n    private static final Map<String, Method> methodCache = new HashMap<>();\n    private static final Map<String, Field> fieldCache = new HashMap<>();\n\n    public static void main(String[] args) throws Throwable {\n        demonstrateClassLoaderIdentity();\n        demonstrateAccessAPIs();\n        demonstrateAnnotationRetention();\n        demonstrateModuleBoundary();\n        demonstrateCachePerformance();\n    }\n\n    // 1. Class 镜像由 ClassLoader 共同决定\n    static void demonstrateClassLoaderIdentity() throws ClassNotFoundException {\n        Class<User> literal = User.class;           // 不触发初始化\n        Class<?> forName = Class.forName(\"Main$User\"); // 触发初始化\n        System.out.println(\"same Class object: \" + (literal == forName)); // true（同一 ClassLoader）\n    }\n\n    // 2. getDeclaredXxx vs getXxx、setAccessible\n    static void demonstrateAccessAPIs() throws Exception {\n        Class<User> cls = User.class;\n\n        // getDeclaredConstructor 能拿到 private 构造器\n        Constructor<User> ctor = cls.getDeclaredConstructor(String.class);\n        ctor.setAccessible(true);  // 跳过语言层访问检查\n        User user = ctor.newInstance(\"Ada\");\n\n        // getDeclaredField 能拿到 private 字段\n        Field nameField = cls.getDeclaredField(\"name\");\n        nameField.setAccessible(true);\n        System.out.println(\"get value: \" + nameField.get(user));\n        nameField.set(user, \"Grace\");\n\n        // getDeclaredMethod 能拿到 private 方法\n        Method greet = cls.getDeclaredMethod(\"greet\", String.class);\n        greet.setAccessible(true);\n        String result = (String) greet.invoke(user, \"Hi\");\n        System.out.println(\"reflect invoke: \" + result);\n\n        // InvocationTargetException 包装了真实异常\n        // 真实框架里要 catch InvocationTargetException 并 getCause()\n    }\n\n    // 3. 注解保留阶段：只有 RUNTIME 能被普通反射读到\n    static void demonstrateAnnotationRetention() throws Exception {\n        Class<User> cls = User.class;\n        Field nameField = cls.getDeclaredField(\"name\");\n        Method greet = cls.getDeclaredMethod(\"greet\", String.class);\n\n        Label fieldLabel = nameField.getAnnotation(Label.class);\n        Label methodLabel = greet.getAnnotation(Label.class);\n        System.out.println(\"field @Label: \" + fieldLabel.value());   // display-name\n        System.out.println(\"method @Label: \" + methodLabel.value()); // greeting\n        // 如果 @Retention 是 SOURCE 或 CLASS，getAnnotation 返回 null\n    }\n\n    // 4. JPMS 模块边界：setAccessible 不能无条件穿透\n    static void demonstrateModuleBoundary() throws Throwable {\n        // String 是 java.base 模块的类，其 value 字段不会对应用代码开放\n        Field stringValue = String.class.getDeclaredField(\"value\");\n        boolean accessible = stringValue.trySetAccessible();\n        System.out.println(\"String.value trySetAccessible: \" + accessible); // 通常 false\n        // 尝试 setAccessible(true) 会抛 InaccessibleObjectException\n    }\n\n    // 5. MethodHandle 是更明确的替代路径\n    static void demonstrateCacheAndMethodHandle() throws Throwable {\n        User user = User.class.getDeclaredConstructor(String.class)\n                .newInstance(\"Hopper\");\n\n        // MethodHandle：privateLookupIn 需要模块 opens 或同模块\n        MethodHandle privateGreet = MethodHandles.privateLookupIn(User.class, MethodHandles.lookup())\n                .findVirtual(User.class, \"greet\",\n                        MethodType.methodType(String.class, String.class));\n        String mhResult = (String) privateGreet.invoke(user, \"Hello\");\n        System.out.println(\"MethodHandle invoke: \" + mhResult);\n    }\n\n    // 模拟框架的缓存策略：初始化时缓存，运行时复用\n    static void demonstrateCachePerformance() throws Exception {\n        Class<User> cls = User.class;\n        // 初始化阶段：缓存 Method\n        Method cachedGreet = cls.getDeclaredMethod(\"greet\", String.class);\n        cachedGreet.setAccessible(true);\n        methodCache.put(\"User.greet\", cachedGreet);\n\n        // 运行阶段：从缓存取，不再查找\n        User user = cls.getDeclaredConstructor(String.class).newInstance(\"Cache\");\n        Method m = methodCache.get(\"User.greet\");\n        String cached = (String) m.invoke(user, \"Hi\");\n        System.out.println(\"cached invoke: \" + cached);\n    }\n}",
       "language": "java",
       "highlights": [
         {
-          "line": 35,
-          "note": "`Class.forName(String)` 默认会触发类初始化；这里用断言验证同一 ClassLoader 下拿到同一个 Class 镜像。"
+          "line": 44,
+          "note": "methodCache/fieldCache 模拟框架在启动期缓存反射元数据的策略。"
         },
         {
-          "line": 49,
-          "note": "`Method.invoke` 的返回值和异常都要显式处理，真实框架会缓存这个 Method。"
+          "line": 51,
+          "note": "Class.forName 默认触发类初始化，T.class 不触发——这是两者的关键区别。"
         },
         {
-          "line": 53,
-          "note": "只有 `RUNTIME` 注解能通过普通反射读取到。"
+          "line": 62,
+          "note": "getDeclaredConstructor 能拿到 private 构造器，getXxx 系列只返回 public。"
         },
         {
-          "line": 57,
-          "note": "`privateLookupIn` 是模块化后更明确的私有访问入口，但仍受 lookup 权限和模块开放约束。"
+          "line": 68,
+          "note": "setAccessible(true) 只跳过语言层访问检查，不解决模块封装问题。"
         },
         {
-          "line": 61,
-          "note": "JDK 自身模块里的私有字段通常不会因为 `trySetAccessible` 就开放。"
+          "line": 82,
+          "note": "如果注解的 @Retention 不是 RUNTIME，getAnnotation 返回 null。"
+        },
+        {
+          "line": 93,
+          "note": "String.class 的内部字段被 java.base 模块封装，trySetAccessible 返回 false。"
+        },
+        {
+          "line": 102,
+          "note": "MethodHandles.privateLookupIn 是模块化后访问私有成员的正确入口，但仍受 opens 约束。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "反射是运行时读取和操作类型元数据的能力（JDK 1.1 引入），注解是贴在类/方法/字段上的元数据（JDK 5 引入）；真正产生行为的是读取这些元数据的框架或编译期处理器。\n\n**反射入口（Class 镜像）**\n- 获取方式：`T.class`、`obj.getClass()`、`Class.forName(\"pkg.T\")`\n- 边界 1：同名类在不同 `ClassLoader` 下不是同一个 `Class`\n- 边界 2：`Class.forName(String)` 默认初始化类，类字面量不初始化\n- `getDeclaredXxx`：当前类声明成员（含 private，不含继承）\n- `getXxx`：public 成员 + 继承成员\n- `Method.invoke` 异常包装在 `InvocationTargetException`，看 `getCause()`\n\n**访问控制与模块边界**\n- `setAccessible(true)` / `trySetAccessible()`：跳过语言层访问检查\n- Java 9+ JPMS：模块边界可能拒绝，抛 `InaccessibleObjectException`\n- 跨模块访问：`opens`、`--add-opens`、`MethodHandles.privateLookupIn`\n- 不能把 private 反射访问当稳定契约\n\n**注解保留阶段（@Retention）**\n- `SOURCE`：编译器/源码工具（如 `@Override`、Lombok）\n- `CLASS`：进 class 文件，运行时反射读不到（默认值）\n- `RUNTIME`：运行时可被 Spring/JUnit/校验框架反射扫描\n- 注解本身无行为，APT/字节码工具/运行时框架读取后才生成代码、注册 Bean、执行校验\n\n**性能与优化**\n- 成本来源：查找、访问检查、装箱、间接调用、JIT 内联困难\n- 缓存 `Method/Field/Constructor` 元数据\n- 反射放初始化或低频路径\n- 热点路径替代：直接调用、`MethodHandle`（JDK 7+）、`LambdaMetafactory`（JDK 8+）、字节码生成\n- 用火焰图/JFR 证明瓶颈，不背固定倍数\n\n**框架实践**\n- Spring：启动期集中扫描 + 缓存反射元数据 + 生成代理/访问器\n- 业务请求路径不重复扫描和查找方法\n- APT（编译期） vs 运行时反射：APT 更快但限制更多",
+      "content": "反射是运行时围绕 `Class` 元数据进行类型读取和操作的能力（JDK 1.1），注解是贴在程序元素上的元数据标记（JDK 5）。注解本身不产生行为，行为来自消费它的处理器。\n\n**Class 镜像（反射入口）**\n- 三种获取方式：`T.class`（不初始化）、`obj.getClass()`（不初始化）、`Class.forName(String)`（默认触发 clinit）\n- 核心边界：同名类在不同 ClassLoader 下对应不同 Class 对象——这是 Tomcat/OSGi/插件隔离的基础，也是 `ClassCastException: cannot cast X to X` 的常见根因\n- API 区分：`getXxx`（public + 含继承）vs `getDeclaredXxx`（当前类声明 + 不含继承）\n- `Method.invoke` 把目标方法异常包装在 `InvocationTargetException` 里，要 `getCause()`\n\n**JPMS 模块访问边界（Java 9+）**\n- `setAccessible(true)` 只跳过语言层访问检查，不能穿透模块封装\n- 模块没有 `opens` 目标包给调用方时，抛 `InaccessibleObjectException`\n- `exports` vs `opens`：exports 只允许编译/运行时访问 public 类型；opens 额外允许反射访问非 public 成员\n- 工程层次：公开 API > `opens to` > `--add-opens`（临时，JDK 警告）> `MethodHandles.privateLookupIn`（仍受 opens 约束）\n\n**注解保留阶段**\n- `SOURCE`：只在源码中，编译后消失，消费者是编译器/源码工具（`@Override`、Lombok `@Data`）\n- `CLASS`（默认）：写入 class 文件但普通反射读不到，消费者是字节码增强工具（ASM、Byte Buddy）\n- `RUNTIME`：运行时可被 `getAnnotation()` 读到，消费者是 Spring/JUnit/Bean Validation\n- 注意：保留阶段 ≠ 消费时机。Spring 启动期用 ASM（字节码层面）扫描 RUNTIME 注解，不一定走反射\n\n**性能优化路径**\n- 成本来源：getDeclaredMethod 的方法表遍历、访问检查、参数装箱、间接调用、JIT 内联困难\n- 低风险项：缓存 Method/Field/Constructor 到 Map 或 final 字段；初始化阶段完成 setAccessible\n- 替代方案（调用频率从低到高）：\n  - `MethodHandle`（JDK 7+）：类型化调用点，JVM 更容易优化稳定调用点\n  - `LambdaMetafactory`（JDK 8+）：生成函数式接口适配器，初始化一次后接近直接调用\n  - 字节码生成（ASM/CGLIB/Byte Buddy）：为高频路径生成等同于直接调用的访问器类\n- 验证工具：JFR、async-profiler、火焰图——先确认瓶颈在反射调用上再做优化\n\n**框架如何用反射与注解**\n- Spring 启动：ASM 扫描注解 → 建立 BeanDefinition → 缓存反射元数据 → 生成代理/访问器\n- MyBatis：RUNTIME 注解标记 SQL → 启动期解析 → 运行期用缓存的 Method 执行\n- JUnit 5：`@Test`/`@BeforeEach` 等 RUNTIME 注解 → 启动期扫描测试类 → 反射调用测试方法\n- Bean Validation：`@NotNull` 等 RUNTIME 注解 → 校验框架反射读取注解属性 → 执行校验逻辑",
       "followUpQuestions": [
         {
-          "question": "为什么说“每个类只有一个 Class 对象”这句话不够严谨？",
-          "answer": "更严谨的说法是：同一个二进制类名在同一个定义它的 ClassLoader 下对应一个 Class 镜像。不同 ClassLoader 可以加载同名 class 文件，得到的 Class 对象不同，类型也互不相等。这正是插件隔离、Web 容器隔离、热部署和某些 ClassCastException 的根源。"
+          "question": "为什么说「每个类只有一个 Class 对象」这句话不够严谨？",
+          "answer": "更严谨的说法是：同一个二进制类名在同一个定义它的 ClassLoader 下对应一个 Class 镜像。不同 ClassLoader 可以加载同一个 class 文件的字节码，得到的 Class 对象不同，`==` 比较为 false，类型互不兼容。这正是 Tomcat WebAppClassLoader（不同 WAR 包隔离）、OSGi bundle 隔离和热部署的底层机制，也是 `ClassCastException: cannot cast X to X` 的常见根因。排查时看 `cls.getClassLoader()` 是否一致。"
         },
         {
-          "question": "Java 9 以后 `setAccessible(true)` 为什么可能失效？",
-          "answer": "因为 JPMS 引入了模块边界。`setAccessible` 只能处理语言访问检查；如果目标包没有被模块导出或开放给调用方，访问 JDK 内部类或跨模块私有成员时可能失败。工程上应优先使用公开 API，确实需要反射时通过 `opens`、`--add-opens` 或合适的 `MethodHandles.Lookup` 明确开放范围。"
+          "question": "Spring 启动时扫描注解为什么不用反射，而是用 ASM？",
+          "answer": "Spring 要扫描大量候选类，如果每个类都用 `Class.forName()` 或 `ClassLoader.loadClass()` 再调 `getAnnotation()`，会把所有扫描到的类都加载进 JVM 并触发 clinit，开销很大且有副作用。ASM 直接读取 class 文件的字节码（属性表），只解析注解元数据而不加载类本身。只有确定某个类是 Bean 后，Spring 才加载它并用反射做详细解析。这样启动更快，也避免了不必要的类初始化。"
         },
         {
-          "question": "Spring 这类框架为什么大量使用反射，如何控制性能风险？",
-          "answer": "框架无法在编译期知道用户会写哪些 Bean、字段、构造器和注解，所以需要在运行时扫描类、读取注解、创建对象和注入依赖。性能风险主要通过启动期集中扫描、缓存反射元数据、生成代理类或访问器、把高频调用改成稳定调用点来控制；真正的业务请求路径不会每次都重新扫描和查找方法。"
+          "question": "Java 9 以后 `setAccessible(true)` 为什么可能失效？你会怎么处理？",
+          "answer": "因为 JPMS 在 JVM 层引入了模块封装。`setAccessible` 只能绕过语言层的 private/protected 检查；如果目标类所在的包没有通过 `opens` 声明给调用方模块，JVM 会拒绝反射访问并抛 `InaccessibleObjectException`。处理层次：优先用公开 API；其次在 `module-info.java` 里 `opens pkg to spring.core`；再次在启动脚本用 `--add-opens`（临时方案，JDK 会警告）；最后用 `MethodHandles.privateLookupIn` 获取更高权限 Lookup，但同样受 opens 约束。"
+        },
+        {
+          "question": "线上发现 Method.invoke 成为火焰图热点时，你会怎么做？",
+          "answer": "第一步确认是单次慢还是调用量大：看采样占比和调用次数。第二步看是否在循环里重复调 `getDeclaredMethod`——这种情况先加缓存。第三步如果反射调用本身是热点（缓存后仍占比高），评估替代方案：调用点稳定且频繁的用 `MethodHandle`；需要适配函数式接口的用 `LambdaMetafactory`；ORM/RPC/AOP 高频路径用字节码生成（Byte Buddy 等）生成专用访问器。优化前后都要有基准数据对比，不能凭感觉。"
         }
       ]
     },
@@ -110,17 +132,19 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 Class 镜像由二进制类名和定义它的 ClassLoader 共同决定",
-        "能区分 `T.class`、`obj.getClass()`、`Class.forName` 的初始化和使用场景",
-        "能解释 `getXxx` 与 `getDeclaredXxx`、`setAccessible` 与 JPMS 模块边界",
-        "能说清 `SOURCE`、`CLASS`、`RUNTIME` 注解分别被谁消费",
-        "能把注解本身和 APT、字节码工具、运行时框架处理器区分开",
-        "能说明反射性能成本，并给出缓存、MethodHandle、LambdaMetafactory、字节码生成等替代路径",
-        "能结合 Spring、JUnit、MyBatis 或校验框架说明反射与注解如何驱动框架行为"
+        "能说明 Class 镜像由二进制类名和定义它的 ClassLoader 共同决定，`ClassCastException: X to X` 是 ClassLoader 隔离导致的",
+        "能区分 `T.class`、`obj.getClass()`、`Class.forName(String)` 的类初始化行为差异",
+        "能解释 `getXxx`（public+含继承）与 `getDeclaredXxx`（当前类声明+不含继承）的适用场景",
+        "能说清 `setAccessible` 只跳过语言层访问检查，JPMS 模块没有 opens 时仍会抛 InaccessibleObjectException",
+        "能解释 `exports` vs `opens` 的区别以及 `--add-opens`、`privateLookupIn` 的适用层次",
+        "能说明 SOURCE/CLASS/RUNTIME 三种保留阶段各自的消费者，以及「保留阶段 ≠ 消费时机」",
+        "能把注解本身（纯元数据）和处理器（APT/字节码增强/运行时反射）区分开",
+        "能解释反射性能成本来源，并给出缓存、MethodHandle、LambdaMetafactory、字节码生成四层优化路径",
+        "能结合 Spring/MyBatis/JUnit 说明框架在启动期集中扫描+缓存元数据、运行期复用的模式"
       ]
     }
   ],
-  "interviewerFocus": "考察候选人能否把反射、ClassLoader、JPMS 访问边界、注解保留阶段和框架消费链路连起来，并能说明性能优化与高频路径替代方案。",
+  "interviewerFocus": "考察候选人能否把反射 API、ClassLoader 身份、JPMS 模块访问边界、注解保留阶段与消费链路（APT/字节码增强/运行时框架）连起来，并能说明性能瓶颈诊断和高频路径替代方案。",
   "recallPrompts": [
     {
       "id": "java.jvm.topic-033-070d3ba1.recall.1",
@@ -138,32 +162,53 @@
     },
     {
       "id": "java.jvm.topic-033-070d3ba1.recall.3",
-      "prompt": "线上发现 Method.invoke 成为热点时，你会如何验证和优化？请同时说明 JPMS 访问边界。",
+      "prompt": "线上发现 Method.invoke 成为火焰图热点时，你会如何验证和优化？请同时说明 JPMS 对 setAccessible 的约束。",
       "mode": "text",
       "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "java.jvm.topic-033-070d3ba1.recall.4",
+      "prompt": "Spring 启动时扫描注解为什么用 ASM 而不是反射？这对理解注解的保留阶段和消费链路有什么帮助？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "java.jvm.topic-033-070d3ba1.recall.5",
+      "prompt": "请说明 Java 9+ 的 exports 和 opens 有什么区别，以及在模块化应用中如何正确处理反射访问。",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "java.jvm.topic-033-070d3ba1.recall.6",
+      "prompt": "反射调用 Method.invoke 的性能开销来自哪些环节？MethodHandle 和 LambdaMetafactory 分别在什么场景下替代反射？",
+      "mode": "text",
+      "expectedMinutes": 6,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出反射是围绕 Class 元数据进行运行时操作的能力",
-      "能说明 Class 身份受 ClassLoader 影响，避免把“每个类只有一个 Class”说绝对",
-      "能解释 @Retention 三个值及其消费者，知道注解需要处理器读取",
-      "能说明 setAccessible/trySetAccessible 与 Java 9+ 模块开放边界",
-      "能解释反射性能成本，并给出缓存、MethodHandle 或字节码生成等优化路径"
+      "能说出反射是围绕 Class 元数据进行运行时操作的能力，并说明 Class 身份受 ClassLoader 影响",
+      "能区分 T.class/obj.getClass()/Class.forName 的初始化行为差异和使用场景",
+      "能解释 @Retention 三个值及其消费者，能把注解本身和处理器行为分开",
+      "能说明 setAccessible 只跳过语言层检查，JPMS 的 opens/exports 和 InaccessibleObjectException 是什么",
+      "能解释反射性能成本来源，并给出缓存、MethodHandle、LambdaMetafactory、字节码生成的优化层次"
     ],
     "goodToHave": [
       "能区分 getXxx 与 getDeclaredXxx 的继承和可见性差异",
-      "能说明 Method.invoke 的异常包装和参数适配成本",
-      "能结合 Spring、JUnit、MyBatis、Bean Validation 说明真实框架场景",
-      "能用 JFR 或火焰图验证反射热点，而不是只凭经验改代码"
+      "能解释 Method.invoke 的 InvocationTargetException 包装和参数装箱成本",
+      "能说明 Spring 用 ASM 扫描注解而非反射启动的原因",
+      "能结合 JFR/async-profiler 验证反射热点，给出具体的优化前后对比思路"
     ],
     "commonMistakes": [
-      "忽略 ClassLoader 导致同名类对应不同 Class 对象",
-      "以为 setAccessible 可以无条件访问所有 private 成员",
-      "混淆 CLASS 与 RUNTIME，误以为写进 class 文件就能被普通反射读取",
-      "把注解当作自动执行逻辑，忽略编译期或运行时处理器",
-      "在热点循环里反复查找 Method/Field 而不缓存"
+      "忽略 ClassLoader 导致同名类对应不同 Class 对象，把「每个类只有一个 Class」说绝对",
+      "以为 setAccessible 可以无条件访问所有 private 成员，不知道 InaccessibleObjectException",
+      "混淆 CLASS 与 RUNTIME，误以为写进 class 文件就能被 getAnnotation 读到",
+      "把注解当作自动执行逻辑，忽略编译期/运行时处理器的作用",
+      "在热点循环里反复调 getDeclaredMethod 查找而不缓存 Method 对象"
     ],
     "scoreWeights": {
       "coverage": 20,
@@ -172,5 +217,5 @@
       "depth": 30
     }
   },
-  "updatedAt": "2026-06-19"
+  "updatedAt": "2026-06-22"
 }

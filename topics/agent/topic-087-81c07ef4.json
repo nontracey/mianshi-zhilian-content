@@ -4,7 +4,7 @@
   "category": "tool-agent",
   "group": "llm",
   "title": "Function Calling 与工具调用",
-  "summary": "理解工具调用的真实边界：模型只产出工具名和结构化参数，业务系统负责参数校验、鉴权、执行、结果回填、重试与审计。",
+  "summary": "理解工具调用的真实边界：模型只产出工具名和结构化参数，业务系统负责参数校验、鉴权、执行、结果回填、重试与审计；工具 schema 设计质量直接决定模型选对工具、填对参数的概率。",
   "tags": [
     "Function Calling",
     "工具调用",
@@ -19,21 +19,31 @@
   "learningCards": [
     {
       "type": "explain",
-      "title": "Function Calling 与工具调用：Function Calling 核心原理、工具设计最佳实践",
-      "content": "## 一、工具调用的真实流程\n1. 开发者声明工具名称、描述、参数 JSON Schema 和返回语义。\n2. 模型根据用户意图决定是否调用工具，并输出工具名与结构化参数。\n3. 应用层解析参数，做 schema 校验、业务校验、权限校验和幂等检查。\n4. 后端执行真实 API/数据库/内部系统调用。\n5. 工具结果以 tool message 回填给模型。\n6. 模型基于结果生成最终回答，或继续下一步工具调用。\n\n关键边界：模型不直接执行工具，也不应该拥有超出用户身份的权限。工具调用只是“决策与参数生成”，执行权在业务系统。\n\n## 二、工具设计原则\n工具名用动词+名词，描述写清何时调用、输入含义、输出内容和限制；参数尽量用明确类型、枚举、范围、必填项和默认值。工具数量过多时要做路由或按任务加载，避免模型在相似工具之间摇摆。"
+      "title": "Function Calling 的核心流程与权限边界",
+      "content": "Function Calling 的本质是让模型在对话中决定\"什么时候该调用什么工具、传什么参数\"。模型把决策结果以结构化的 tool_calls 交给应用层去执行。模型本身不访问任何外部系统、数据库或 API——它只是产出一个 JSON payload，包含 tool name 和 arguments。\n\n完整闭环是：开发者预先声明一组工具（名称、描述、参数 JSON Schema）；模型根据用户意图判断是否需要调用工具，如果需要则输出一个或多个 tool_calls。应用层拿到 tool_calls 后依次做参数 schema 校验、业务规则校验、服务端鉴权（按用户身份、租户、资源、动作判断）。通过后才执行真实调用，执行结果以 tool message 回填到对话历史。模型基于结果生成最终回答，或者继续发起下一轮工具调用。\n\n权限隔离是这条链路的安全基石。模型不持有任何 API key 或用户 token；所有凭证和权限判断都在应用层完成。这意味着即使模型幻觉出一个危险参数（比如 `delete_all: true`），只要后端做了白名单、范围约束和权限校验，就不会真正执行。生产系统绝不应该让模型的输出直接透传到外部 API。"
     },
     {
       "type": "explain",
-      "title": "Function Calling 与工具调用：Java 生态实现（LangChain4j）、面试高频问题",
-      "content": "## 三、错误处理与重试\n错误要分层返回：\n- 参数错误：告诉模型哪个字段不合法、允许值是什么，可以让模型修正后重试。\n- 权限错误：不要让模型“换个参数绕过”，直接拒绝或引导申请权限。\n- 超时/临时故障：指数退避，限制最大次数。\n- 副作用工具：必须有幂等键和操作状态，避免重试导致重复下单、重复发消息或重复写库。\n\n## 四、流式与并行\n流式工具调用时，参数可能跨多个 chunk 到达，必须等完整 tool call 结束后再执行。多个互不依赖的 tool call 可以并行执行，但共享状态或有副作用的工具要串行化或加锁。\n\n## 五、Java 生态表达\nLangChain4j、Spring AI 等框架能把注解方法暴露为工具，但框架只是适配层；生产仍要在服务端做鉴权、参数白名单、限流、审计和回滚。"
+      "title": "工具 Schema 设计：决定模型表现的第一道关",
+      "content": "工具描述的质量直接决定模型是否选对工具、填对参数。几个关键点：\n\n**命名与描述**：工具名用 `动词_名词` 格式（如 `search_documents`、`create_invoice`），让模型一看就知道功能。description 要写清三件事——何时该调用这个工具、输入参数的含义、返回内容的格式。模糊描述会导致模型在相似工具之间犹豫，或者在不该调用时调用。\n\n**参数约束**：尽量用明确类型（string/number/boolean/array/object）、enum 枚举值、min/max 范围、pattern 正则和必填/可选标记。这些约束不仅帮模型理解参数含义，还能被 JSON Schema 验证器直接用来校验模型输出。`default` 值能避免模型被无意义的必填项卡住。\n\n**工具数量与路由**：工具数量超过 15-20 个时，模型选择准确率会明显下降。常见做法是按任务类型或用户意图做前置路由，只把相关工具集传给模型；或者用分层结构，先选类别再选具体工具。每个工具描述过长也会挤占上下文窗口，需要平衡描述精确度和 token 消耗。"
+    },
+    {
+      "type": "explain",
+      "title": "错误分层与副作用控制",
+      "content": "工具调用失败不能一刀切处理，必须区分错误类型：\n\n**参数错误（可恢复）**：模型生成的参数不满足 schema 约束或业务规则时，把具体错误信息（哪个字段不合法、允许值是什么、缺少什么字段）以 tool error 回填给模型，让它修正后重试。这是 Function Calling 最自然的纠错路径——模型能理解结构化错误描述并生成修正后的参数。\n\n**权限错误（不可恢复）**：用户没有操作权限时，直接返回拒绝，不能让模型\"换个参数试试\"。正确做法是告知需要什么权限或引导用户走授权流程。如果让模型重试，它可能会尝试猜测其他参数组合来绕过限制，这是安全风险。\n\n**超时与临时故障**：应用层做指数退避重试，限制最大重试次数（通常 2-3 次），超时后返回明确的失败信息给模型，让它告诉用户稍后重试或换一种方式。\n\n**副作用工具**：涉及写入、支付、发送消息等不可逆操作的工具，必须做到三点：幂等键（idempotency key）确保重试不会重复执行；操作状态表记录每次调用的执行状态；高风险操作加入二次确认流程和审计日志。没有幂等保护的副作用工具在模型自动重试时会造成灾难性后果（重复下单、重复发消息、重复扣款）。"
+    },
+    {
+      "type": "explain",
+      "title": "流式处理、并行调用与 Java 生态",
+      "content": "**流式 tool_calls 处理**：在流式响应中，模型的 tool_calls 参数是跨多个 chunk 到达的。应用层必须累积完整的 JSON 参数后才能发起执行，不能拿到部分 JSON 就开始校验。判断 tool_calls 是否完整的方法是检查 `finish_reason == 'tool_calls'` 或检测 JSON 括号闭合。部分框架（如 Vercel AI SDK）已内置了这个累积逻辑，但自研实现时要自己处理。\n\n**并行 tool_calls**：模型可以在一次响应中输出多个 tool_calls（OpenAI 称 parallel function calling）。互不依赖的调用可以并行执行以降低延迟；但如果多个调用涉及共享状态（比如都写同一个数据库表）、有顺序依赖（第二个调用的参数依赖第一个的结果）或有副作用，就必须串行化或加锁。\n\n**Java 生态**：LangChain4j 和 Spring AI 都支持用注解把 Java 方法暴露为工具（如 `@Tool` 注解），框架负责生成 JSON Schema、解析 tool_calls 和回填结果。但框架只是适配层，生产环境的服务端鉴权、参数白名单、限流、审计和回滚逻辑仍然需要在业务代码中实现，不能依赖框架默认行为。"
     },
     {
       "type": "diagram",
       "title": "工具调用闭环：模型决策、后端执行、错误回填与权限边界",
       "format": "mermaid",
       "content": "flowchart LR\nA[\"用户请求\"] --> B[\"模型选择工具\n输出 tool name + JSON args\"]\nB --> C[\"应用层解析参数\"]\nC --> D{\"schema/业务校验\"}\nD -->|失败| E[\"tool error 回填\n可恢复错误允许修正\"]\nD -->|通过| F[\"服务端鉴权\n用户/租户/资源/动作\"]\nF -->|拒绝| G[\"拒绝/申请权限\n不让模型绕过\"]\nF -->|通过| H{\"是否有副作用\"}\nH -->|是| I[\"幂等键 + 二次确认/审计\"]\nH -->|否| J[\"执行查询类工具\"]\nI --> K[\"执行动作类工具\"]\nJ --> L[\"结果回填给模型\"]\nK --> L\nL --> M[\"生成最终回答或继续调用\"]",
-      "caption": "Function Calling 的核心边界是“模型负责选择和填参，系统负责授权和执行”。",
-      "fallback": "图展示工具调用不是模型直接访问外部世界，而是由应用层完成参数校验、服务端鉴权、幂等确认、执行和结果回填。",
+      "caption": "Function Calling 的核心边界是\"模型负责选择和填参，系统负责授权和执行\"。错误分层回填让模型能修正参数错误，但权限拒绝和副作用操作必须由系统控制。",
+      "fallback": "图展示工具调用不是模型直接访问外部世界，而是由应用层完成参数校验、服务端鉴权、幂等确认、执行和结果回填。参数错误回填给模型修正，权限拒绝不让模型绕过，副作用工具走幂等键和审计。",
       "sources": [
         {
           "kind": "mermaid",
@@ -47,33 +57,53 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | 工具调用 | 直接 Prompt 生成 | 传统硬编码 API |\n| --- | --- | --- | --- |\n| 决策方式 | 模型按意图选择工具并填参 | 模型自由生成文本/JSON | 代码固定调用路径 |\n| 结构约束 | JSON Schema/参数校验 | 主要靠提示词，稳定性弱 | 由代码类型系统和接口保证 |\n| 执行方 | 业务系统执行 | 无真实执行或需自行解析 | 业务系统执行 |\n| 权限控制 | 必须服务端鉴权 | 难以可靠控制 | 服务端鉴权 |\n| 适用场景 | 查询、检索、计算、受控动作 | 简单原型、非关键输出 | 确定流程和固定业务 |\n| 主要风险 | 参数幻觉、误选工具、越权、副作用重试 | 格式不稳、不可执行 | 灵活性低 |"
+      "title": "工具调用 vs 直接 Prompt vs 硬编码 API",
+      "content": "| 对比维度 | Function Calling 工具调用 | 直接 Prompt 生成 JSON | 传统硬编码 API 调用 |\n| --- | --- | --- | --- |\n| 决策方 | 模型按意图选择工具并填参 | 模型自由生成文本或 JSON | 代码固定调用路径 |\n| 结构约束 | JSON Schema 约束参数，可自动校验 | 主要靠提示词，格式不稳定 | 由代码类型系统和接口保证 |\n| 执行方 | 应用后端执行，模型不触达外部 | 无真实执行，需自行解析再调用 | 应用后端执行 |\n| 权限控制 | 服务端鉴权，不信任模型输出 | 难以在 prompt 层可靠控制 | 服务端鉴权 |\n| 多工具编排 | 模型可一次输出多个 tool_calls，支持并行 | 不支持 | 需代码编排 |\n| 容错 | 参数错误可回填修正，权限拒绝不可绕过 | 格式错只能重 prompt | 编译期/运行时错误 |\n| 典型场景 | 查询、检索、计算、受控动作 | 简单原型、非关键结构化输出 | 确定流程、固定业务逻辑 |\n| 核心风险 | 参数幻觉、误选工具、越权、副作用重试 | 格式不稳、不可执行 | 灵活性低、无法应对开放意图 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "from pydantic import BaseModel, Field, ValidationError\n\nclass SearchArgs(BaseModel):\n    query: str = Field(min_length=2, max_length=200)\n    category: str = Field(default=\"all\", pattern=\"^(all|policy|tech|sales)$\")\n    max_results: int = Field(default=5, ge=1, le=20)\n\ndef execute_search_tool(raw_args: dict, user):\n    try:\n        args = SearchArgs.model_validate(raw_args)\n    except ValidationError as exc:\n        return {\"ok\": False, \"retryable\": True, \"error\": str(exc)}\n\n    if not can_read_category(user, args.category):\n        return {\"ok\": False, \"retryable\": False, \"error\": \"permission denied\"}\n\n    docs = search_documents(args.query, args.category, args.max_results)\n    return {\"ok\": True, \"documents\": docs}\n\n# 有副作用的工具要额外传 idempotency_key，并在服务端记录状态",
+      "title": "Python 工具执行：校验、鉴权、幂等完整示例",
       "language": "python",
+      "content": "from pydantic import BaseModel, Field, ValidationError\nfrom uuid import uuid4\nfrom datetime import datetime\nimport hashlib\n\nclass SearchArgs(BaseModel):\n    query: str = Field(min_length=2, max_length=200)\n    category: str = Field(default=\"all\", pattern=r\"^(all|policy|tech|sales)$\")\n    max_results: int = Field(default=5, ge=1, le=20)\n\nclass CreateOrderArgs(BaseModel):\n    product_id: str = Field(min_length=1)\n    quantity: int = Field(ge=1, le=100)\n    idempotency_key: str = Field(min_length=8)\n\ndef execute_search_tool(raw_args: dict, user):\n    \"\"\"查询类工具：参数校验 + 权限校验 + 执行\"\"\"\n    try:\n        args = SearchArgs.model_validate(raw_args)\n    except ValidationError as exc:\n        # 可恢复错误：回填给模型修正\n        return {\"ok\": False, \"retryable\": True, \"error\": str(exc)}\n\n    if not can_read_category(user, args.category):\n        # 不可恢复错误：不让模型绕过\n        return {\"ok\": False, \"retryable\": False, \"error\": \"permission denied\"}\n\n    docs = search_documents(args.query, args.category, args.max_results)\n    return {\"ok\": True, \"documents\": docs}\n\ndef execute_create_order(raw_args: dict, user):\n    \"\"\"副作用工具：额外幂等检查 + 审计\"\"\"\n    try:\n        args = CreateOrderArgs.model_validate(raw_args)\n    except ValidationError as exc:\n        return {\"ok\": False, \"retryable\": True, \"error\": str(exc)}\n\n    if not can_create_order(user):\n        return {\"ok\": False, \"retryable\": False, \"error\": \"permission denied\"}\n\n    # 幂等键检查：防止重试导致重复下单\n    existing = find_order_by_idempotency_key(args.idempotency_key)\n    if existing:\n        return {\"ok\": True, \"order_id\": existing.id, \"cached\": True}\n\n    order = create_order(user, args.product_id, args.quantity)\n    save_idempotency_record(args.idempotency_key, order.id)\n    audit_log(\"create_order\", user, args, order.id)\n    return {\"ok\": True, \"order_id\": order.id}",
       "highlights": [
         {
-          "line": 4,
-          "note": "date_range 设成可选参数，避免工具调用被无意义必填项卡住；同时它仍然表达了检索范围，可由模型在需要时补充。"
+          "line": 26,
+          "note": "可恢复错误：把具体校验失败信息返回给模型，让它修正参数后重试。"
+        },
+        {
+          "line": 30,
+          "note": "不可恢复错误：权限拒绝直接返回，不让模型尝试\"换个参数绕过\"。"
+        },
+        {
+          "line": 48,
+          "note": "幂等键先查已有记录，防止重试导致重复下单。"
+        },
+        {
+          "line": 52,
+          "note": "副作用操作必须记录审计日志。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "标准面试回答",
-      "content": "结论：Function Calling/工具调用让模型根据上下文选择工具并生成结构化参数，但真正执行工具的一定是应用后端。生产回答要围绕 schema、校验、鉴权、执行、回填、重试和审计展开。\n\n高水平回答会强调三点：\n1. 工具描述决定模型是否选对工具，参数 schema 决定填参空间，但两者都不能替代服务端校验。\n2. 权限必须在后端按用户身份、租户、资源和动作判断；模型不能因为“会调用工具”就获得权限。\n3. 错误分为可恢复和不可恢复。参数格式错可以回填给模型修正；权限拒绝、业务禁止、危险动作不能靠重试解决。\n\n涉及副作用时还要讲幂等键、状态表、二次确认、最大重试次数和审计日志。",
+      "content": "**30 秒结论**：Function Calling 的核心机制是模型只负责选择工具和填充参数（输出 tool_calls），所有校验、鉴权和执行都由应用后端完成——模型不接触外部系统，也不持有任何凭证。\n\nFunction Calling 让模型根据上下文决定\"调用哪个工具、传什么参数\"，输出结构化的 tool_calls，但真正执行工具的一定是应用后端。模型不直接访问任何外部系统，也不持有 API 凭证。\n\n**工具 Schema 设计**\n- 工具名用 `动词_名词`，描述写清何时调用、输入含义、输出内容\n- 参数用明确类型、enum、范围、必填/可选约束，既是给模型的提示也是校验规则\n- 工具数量超过 15-20 时做路由或分层加载，避免模型在相似工具间摇摆\n\n**执行链路**\n- 参数 schema 校验 → 业务规则校验 → 服务端鉴权（用户身份/租户/资源/动作）→ 执行 → 结果回填\n- 查询类工具直接执行；副作用工具走幂等键 + 二次确认 + 审计\n\n**错误分层处理**\n- 参数错误（可恢复）：把具体字段错误回填给模型，让它修正后重试\n- 权限错误（不可恢复）：直接拒绝，不让模型\"换个参数绕过\"\n- 超时/临时故障：应用层指数退避重试，限制最大次数\n- 副作用重试：必须有幂等键和操作状态表，防止重复执行\n\n**流式与并行**\n- 流式场景下 tool_calls 参数跨 chunk 到达，必须等完整 JSON 后再执行\n- 一次响应中多个 tool_calls 可并行执行，但共享状态或有副作用的要串行化\n\n**Java 生态**\n- LangChain4j/Spring AI 用注解暴露工具，但鉴权、限流、审计仍要在业务层实现",
       "followUpQuestions": [
         {
-          "question": "Function Calling 和传统 API 调用区别是什么？",
-          "answer": "传统 API 由代码固定调用路径，Function Calling 由模型在 schema 约束下决定是否调用和如何填参，但执行权仍在后端。"
+          "question": "模型返回的工具参数不合法（缺字段、类型错），应该怎么处理？",
+          "answer": "把具体的校验失败信息（哪个字段不合法、期望什么类型、允许值是什么）以 tool error message 回填给模型。模型能理解结构化错误描述并生成修正后的参数。如果连续修正多次仍失败（比如 3 次），则降级为通用回答或引导用户换一种表述。"
         },
         {
-          "question": "如何防止工具越权？",
-          "answer": "按用户身份、资源范围和任务上下文做服务端鉴权，不信任模型生成的参数；敏感操作加入确认和审计。"
+          "question": "为什么权限拒绝不能让模型重试或绕过？",
+          "answer": "如果把权限错误当成可恢复错误回填给模型，模型可能会尝试猜测其他参数组合来绕过权限限制。比如用户没权限删除某个文件，模型可能尝试用不同的文件名或路径。权限判断的结果是确定性的，重试不会改变结果，反而增加安全风险。正确做法是直接告诉用户需要什么权限，或引导走授权流程。"
+        },
+        {
+          "question": "多个工具同时调用时怎么处理副作用冲突？",
+          "answer": "互不依赖的查询类工具可以并行执行。但如果多个工具写同一个资源、有顺序依赖（第二个调用的参数依赖第一个的结果），或都有副作用，必须串行化。可以用资源锁、队列、或在工具描述中标注依赖关系让框架自动编排。有副作用的工具各自都需要幂等键保护。"
+        },
+        {
+          "question": "工具数量很多时怎么避免模型选错？",
+          "answer": "工具数量超过 15-20 时模型选择准确率下降。做法：1) 按任务类型做前置意图路由，只给模型相关子集；2) 用分层结构，先选类别再选具体工具；3) 每个工具描述要精确但简洁，避免相似工具之间的歧义；4) 用评估集定期测试工具选择准确率。"
         }
       ]
     },
@@ -81,32 +111,48 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说清工具调用完整闭环：schema -> 模型选择 -> 参数校验 -> 后端执行 -> 结果回填",
-        "能区分模型决策和业务系统授权执行",
-        "能设计清晰的工具名、描述、参数枚举和范围约束",
-        "能处理参数错误、权限错误、超时和副作用重试",
-        "能说明幂等键、二次确认和审计日志对高风险工具的必要性"
+        "能说清工具调用完整闭环：Schema 声明 → 模型选择工具 → 参数校验 → 服务端鉴权 → 执行 → 结果回填 → 模型生成回答",
+        "能区分模型决策（选择工具+填参）和业务系统执行（校验+鉴权+调用）的边界",
+        "能设计清晰的工具名、描述、参数类型/枚举/范围/必填约束",
+        "能把错误分为可恢复（参数错误）、不可恢复（权限拒绝）和副作用重试三种，分别说明处理策略",
+        "能解释幂等键、二次确认、审计日志对副作用工具的必要性",
+        "能说明流式 tool_calls 的参数累积问题和并行 tool_calls 的串行化需求",
+        "能对比工具调用、直接 Prompt 生成和硬编码 API 的适用场景与风险"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "agent.tool-agent.topic-087-81c07ef4.recall.1",
-      "prompt": "请解释 Function Calling 的工作流程，以及工具 Schema、参数校验和结果回填的作用。",
+      "prompt": "请解释 Function Calling 的完整工作流程，包括工具 Schema 声明、模型选择工具、参数校验、服务端鉴权、执行和结果回填。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "agent.tool-agent.topic-087-81c07ef4.recall.2",
-      "prompt": "工具调用失败、参数错误或越权时应该怎么处理？",
+      "prompt": "工具调用的参数错误、权限错误、超时和副作用重试分别应该怎么处理？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "agent.tool-agent.topic-087-81c07ef4.recall.3",
-      "prompt": "模型返回的工具调用参数不合法（缺字段、类型错）时，你的调用链路应该怎么处理？说说参数校验、重试和兜底的完整做法。",
+      "prompt": "你设计了一个有副作用的工具（比如创建订单），模型可能多次重试。怎么保证重试不会导致重复执行？请说清幂等键、状态表和审计日志的完整做法。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.tool-agent.topic-087-81c07ef4.recall.4",
+      "prompt": "模型返回的工具调用参数不合法（缺字段、类型错），你的调用链路应该怎么处理？说清参数校验、错误回填、重试次数限制和兜底策略。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.tool-agent.topic-087-81c07ef4.recall.5",
+      "prompt": "工具数量很多（超过 20 个）时，模型选择准确率下降。你有哪些工程手段可以改善？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -114,21 +160,24 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说明模型只输出工具调用意图，真实执行在应用后端",
-      "能设计工具 schema、参数校验和错误回填机制",
-      "能说明权限隔离、租户/资源鉴权、危险动作确认和审计",
-      "能区分可恢复错误、不可恢复错误和副作用重试"
+      "能说明模型只输出工具调用意图（tool name + JSON args），真实执行在应用后端",
+      "能设计工具 schema（命名、描述、参数类型/枚举/范围/必填）并说明其对模型选择准确率的影响",
+      "能把错误分为可恢复（参数错误回填修正）、不可恢复（权限拒绝不让绕过）和副作用重试（幂等键+状态表）三类",
+      "能说明服务端鉴权按用户身份、租户、资源、动作判断，不信任模型输出"
     ],
     "goodToHave": [
       "能处理流式 tool_calls 的参数累积与完成检测",
-      "能设计工具路由、并行工具调用和共享状态串行化",
-      "能结合 LangChain4j/Spring AI/OpenAI tools 说明框架和业务边界"
+      "能设计并行 tool_calls 的执行策略（并行 vs 串行化）",
+      "能结合 LangChain4j/Spring AI/OpenAI tools API 说明框架适配层与业务层的职责边界",
+      "能说明工具数量过多时的路由、分层加载和评估集策略"
     ],
     "commonMistakes": [
-      "认为模型直接执行工具",
-      "不校验模型生成参数或让模型绕过后端权限",
-      "高风险副作用工具没有幂等键、确认和审计",
-      "用不可验证的固定数字替代工具调用评估集和线上指标"
+      "认为模型直接执行工具或直接访问外部 API",
+      "不校验模型生成的参数，直接透传到后端执行",
+      "权限拒绝时让模型重试或尝试绕过",
+      "副作用工具没有幂等键、操作状态表和审计日志",
+      "工具描述模糊导致模型选错工具或在相似工具间摇摆",
+      "流式场景下拿到部分 JSON 就开始校验执行"
     ],
     "scoreWeights": {
       "coverage": 35,
@@ -137,11 +186,11 @@
       "depth": 15
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "prerequisites": [
     "agent.llm-foundation.topic-090-357bf78b"
   ],
   "status": "production",
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能围绕「Function Calling 与工具调用」说清工具 schema、模型选择工具，并放到Agent/RAG/LLM 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察是否能围绕 Function Calling 与工具调用说清工具 Schema 设计、模型决策与后端执行的边界、错误分层处理（参数/权限/副作用）、幂等与审计，以及在 Agent/RAG/LLM 工程场景中的实际落地思路。"
 }

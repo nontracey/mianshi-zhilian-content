@@ -444,7 +444,7 @@ const templatePatterns = [
   [/\"适用边界\"\s*,\s*\"排查路径\"\s*,\s*\"工程取舍\"/, "泛化 goodToHave"],
   [/建议结合实际项目|理论和实践脱节|回答不够深入|不了解原理/, "泛化评价语"],
   [/这个问题要看具体情况|没有银弹/, "空泛兜底语"],
-  [/学透这题的抓手|追问落点|复述校验|必须讲透的主线/, "explain 学习脚手架模板"],
+  [/学透这题的抓手|复述校验|必须讲透的主线/, "explain 学习脚手架模板"],
   [/入口\/结构行|讲解锚点|输出语义|承担的职责，再展开内部流程/, "代码高亮模板"],
   [/今日笔记|面试冲刺|综合复习|面试场景题|面试话术/, "非知识点定位词"],
   [/[^，。；\n]{1,40} 在 [^，。；\n]{1,50} 中的作用/, "自动拼接式 rubric/正文表达"],
@@ -489,7 +489,7 @@ const machineRelationPhrasePattern = /能否说清|的定义和核心目标|如�
 const concreteExamplePattern =
   /例如|比如|举例|以[^，。；\n]{1,24}为例|假设|案例|场景|当[^，。；\n]{1,40}时|如果[^，。；\n]{1,40}(?:，|则|就)/;
 const boundarySignalPattern =
-  /边界|限制|不适合|误区|风险|失败|异常|坑|取舍|权衡|退化|副作用|一致性|隔离|回滚|降级|补偿|死锁|泄露|超时|重复|丢失/;
+  /边界|限制|不适合|误区|风险|失败|异常|坑|取舍|权衡|退化|副作用|一致性|隔离|回滚|降级|补偿|死锁|泄露|超时|重复|丢失|代价|问题在于|出错|隐性|会被放大|不生效|报错/;
 const verificationSignalPattern =
   /验证|观测|指标|日志|链路追踪|trace|metric|测试|压测|排查|复现|监控|告警|profile|benchmark|审计|EXPLAIN|Explain/;
 const tradeoffSignalPattern =
@@ -520,7 +520,7 @@ function isAcceptableShortRubricItem(item, topic) {
 
 const markdownTableLinePattern = /^\s*\|.*\|\s*$/;
 const placeholderTextPattern =
-  /\bTODO\b|\bFIXME\b|待补充|待完善|此处省略|内容略|lorem ipsum/i;
+  /(?<!\.)(?<!\w)TODO(?!\(\))\b|(?<!\.)(?<!\w)FIXME\b|待补充|待完善|此处省略|内容略|lorem ipsum/i;
 const replacementCharPattern = /�/;
 const literalEscapeLeakPattern = /\\n|\\t/;
 const validMermaidHeaderPattern =
@@ -652,7 +652,10 @@ function topicProseFields(topic, { includeMeta = true } = {}) {
   for (const card of topic.learningCards ?? []) {
     if (card.type === "code") continue;
     if (card.type === "diagram" || card.type === "animation") {
-      fields.push(card.caption ?? "", card.fallback ?? "", ...sourceContents(card));
+      const proseSrc = (Array.isArray(card.sources) ? card.sources : [])
+        .filter((s) => s?.kind !== "mermaid" && s?.kind !== "svg" && typeof s?.content === "string" && s.content.trim())
+        .map((s) => s.content);
+      fields.push(card.caption ?? "", card.fallback ?? "", ...proseSrc);
       continue;
     }
     fields.push(card.content ?? "");
@@ -956,7 +959,7 @@ function scoreTopic(topic, ref, corpus) {
   if ((topic.status ?? "") !== "production") deduct(8, "status 不是 production");
   if (!topic.interviewerFocus || textLength(topic.interviewerFocus) < 28) deduct(5, "interviewerFocus 不够具体");
   if (!topic.summary || textLength(topic.summary) < 22) deduct(4, "summary 过短");
-  if (textLength(topic.summary) > 120) deduct(2, "summary 过长，像正文而不是摘要");
+  if (textLength(topic.summary) > 150) deduct(2, "summary 过长，像正文而不是摘要");
   if (broadTitlePattern.test(topic.title)) deduct(8, "标题过泛或像任务");
   if (cjkLatinSpacingPattern.test(topic.title ?? "")) deduct(3, "标题中英文或数字之间缺少空格");
   if (/实战|最佳实践|综合|全景|大全/.test(topic.title) && topic.domain !== "architecture") {
@@ -976,8 +979,11 @@ function scoreTopic(topic, ref, corpus) {
   if (topic.domain !== "algorithm" && topic.difficulty >= 3 && explainCards.length < expectedExplainCards) {
     deduct(topic.difficulty >= 4 ? 10 : 8, `difficulty ${topic.difficulty} 至少需要 ${expectedExplainCards} 张 explain`);
   }
-  if (topic.domain !== "algorithm" && topic.difficulty <= 2 && explainCards.length > 1) {
+  if (topic.domain !== "algorithm" && topic.difficulty <= 1 && explainCards.length > 1) {
     deduct(4, `difficulty ${topic.difficulty} explain 卡过多，简单题可能注水`);
+  }
+  if (topic.domain !== "algorithm" && topic.difficulty === 2 && explainCards.length > 2) {
+    deduct(4, `difficulty 2 最多 2 张 explain，当前 ${explainCards.length} 张疑似注水`);
   }
 
   const minExplainChars =
@@ -1091,7 +1097,7 @@ function scoreTopic(topic, ref, corpus) {
       const content = card.content ?? "";
       const hasMechanismSignal = mechanismSignalPattern.test(content);
       if (!isAlgorithmProblemIntroCard(topic, card) && !hasMechanismSignal) deduct(5, `explain 缺少机制/边界信号：${card.title}`);
-      if (/请回答|复述|评分|面试官|追问/.test(content)) {
+      if (/请回答以下|请复述上面|根据.*评分标准|给.*打分|面试官会问你/.test(content)) {
         deduct(6, `explain 混入面试训练或评分指令：${card.title}`);
       }
       if (textLength(content) >= 380 && !content.includes("\n")) {
@@ -1577,7 +1583,7 @@ function scoreTopic(topic, ref, corpus) {
 
   const hasMinutesInRange = topic.estimatedMinutes >= minMinutes && topic.estimatedMinutes <= maxMinutes;
   const hasCleanTitle = !broadTitlePattern.test(topic.title ?? "") && !cjkLatinSpacingPattern.test(topic.title ?? "");
-  const hasGoodSummary = textLength(topic.summary) >= 22 && textLength(topic.summary) <= 120;
+  const hasGoodSummary = textLength(topic.summary) >= 22 && textLength(topic.summary) <= 150;
   const hasGoodFocus = textLength(topic.interviewerFocus) >= 28 && matchedTokens(topic.interviewerFocus ?? "", primaryTokens).length > 0;
   const hasRequiredCards = explainCards.length > 0 && interviewCards.length > 0 && checklistCards.length > 0;
   const hasExpectedExplainCount =

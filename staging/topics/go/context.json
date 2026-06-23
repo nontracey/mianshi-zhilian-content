@@ -4,7 +4,7 @@
   "category": "concurrency",
   "group": "concurrency",
   "title": "Context 超时、取消与链路传递",
-  "summary": "理解 context 在请求生命周期、超时取消、元数据传递和 Goroutine 退出中的作用。",
+  "summary": "Context 是 Go 跨调用链传递取消信号、截止时间和请求级元数据的机制：cancelCtx 广播取消、timerCtx 到点触发、Value 放请求级元数据；下游必须主动 select Done()，runtime 不会强杀 goroutine。",
   "tags": [
     "Go",
     "Context",
@@ -12,7 +12,7 @@
     "取消"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 33,
   "order": 60,
   "recommendWeight": 90,
   "status": "staging",
@@ -20,22 +20,22 @@
     "go.concurrency.channel-select"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "重点在能否说清 cancelCtx 通过 children map 向下广播取消、Done() 是被关闭的只读 channel、Err() 区分 Canceled 与 DeadlineExceeded、以及为什么 Value 的 key 必须用非导出类型。",
+  "interviewerFocus": "重点考察能否说清 cancelCtx 通过 children map 向下广播取消的内部机制、Done() 是被关闭的只读 channel 触发 select、Err() 区分 Canceled 与 DeadlineExceeded、Value key 必须用非导出类型实现类型隔离、defer cancel 释放 Timer 和 children 引用、子 deadline 被夹到父 deadline 的语义。",
   "learningCards": [
     {
       "type": "explain",
       "title": "Context 接口的 4 个方法和 4 种内置实现",
-      "content": "context.Context 是只有 4 个方法的接口：Deadline()(time.Time, bool) 返回截止时间、\nDone() <-chan struct{} 返回一个会被关闭的只读 channel、\nErr() error 在 Done 关闭后返回原因（context.Canceled 或 context.DeadlineExceeded）、\nValue(key any) any 取请求级元数据。\n\n标准库给了 4 种实现，回答时最好能点名：\n- emptyCtx：顶层根上下文和临时根上下文返回的单例，Done() 永远返回 nil（永不关闭），Deadline 返回 false。源码里就是 type emptyCtx int。\n- cancelCtx：WithCancel 派生出来的，内部有 done chan struct{}（lazy 初始化）、\nerr error、children map[canceler]struct{}、mu sync.Mutex。cancel 时关闭 done、\n设置 err、遍历 children 递归取消、把自己从父亲的 children 里摘掉。\n- timerCtx：WithTimeout/WithDeadline 派生，嵌入 cancelCtx 再加一个 *time.Timer 和 deadline。到点 timer 触发自身 cancel(true, DeadlineExceeded)。\n- valueCtx：WithValue 派生，存一对 key/val，Value 查找时先比自己再向父亲递归。\n\n面试常考的边界：emptyCtx.Done() 返回 nil channel，select 在 nil channel 上永远阻塞——这就是 Background 不会让 select 走 Done 分支的原因。"
+      "content": "context.Context 是只有 4 个方法的接口：\n- `Deadline()(time.Time, bool)` 返回截止时间和是否设置了截止时间\n- `Done() <-chan struct{}` 返回一个会被关闭的只读 channel，关闭时机对应取消或超时发生\n- `Err() error` 在 Done 关闭后返回原因：`context.Canceled`（主动取消）或 `context.DeadlineExceeded`（超时）\n- `Value(key any) any` 取请求级元数据\n\n标准库给了 4 种实现，面试回答时逐一点名能体现源码级理解：\n\n**emptyCtx**：`Background()` 和 `TODO()` 返回的根上下文实现。`Done()` 永远返回 nil channel（select 在 nil channel 上永远不会被选中，这就是 Background 永不取消的实现方式），`Deadline()` 返回 `(time.Time{}, false)`，`Err()` 返回 nil。源码里就是 `type emptyCtx int`，零内存开销的单例。\n\n**cancelCtx**：`WithCancel` 派生出来的，内部有 `done chan struct{}`（lazy 初始化，第一次调 Done 才创建）、`err error`、`children map[canceler]struct{}`、`mu sync.Mutex`。cancel 时关闭 done、设置 err、遍历 children 递归取消、把自己从父亲的 children 里摘掉。children map 是取消广播的核心数据结构。\n\ntimerCtx**：`WithTimeout`/`WithDeadline` 派生，嵌入 cancelCtx 再加一个 `*time.Timer` 和 `deadline time.Time`。到点 timer 触发 `self.cancel(true, DeadlineExceeded)`。构造时还会比较父 deadline，取更早的值——子 deadline 永远不会超过父 deadline。\n\n**valueCtx**：`WithValue` 派生，存一对 `key any / val any`。`Value` 查找时先比自己，不匹配就向父亲递归，是单链表回溯，O(链长)。所以不要塞几十层 Value。"
     },
     {
       "type": "explain",
       "title": "取消是协作式的：广播 + 主动观察",
-      "content": "取消的真实路径：父 cancelCtx.cancel 被调用后，会 close(c.done)，再遍历 c.children，对每个子 canceler 调用 child.cancel(false, err)。最后它会解除与父亲的关联，避免 GC 泄漏。整棵以这个 ctx 为根的子树都会很快收到关闭信号。\n\n但 Go runtime 不会强杀任何 goroutine。下游必须主动观察：\n- 在 for-select 里写一个 case <-ctx.Done(): return ctx.Err()。\n- 把 ctx 透传给底层 IO，例如 net/http、database/sql、gRPC、redis-go 这些支持 ctx 的 API。\n- 自己写阻塞循环时不要用裸 time.Sleep，要改成 select { case <-time.After(d): case <-ctx.Done(): }，否则 sleep 期间无法响应取消。\n\n几个面试爱问的边界：cancel 必须 defer 调用，即使超时也要调。否则 timerCtx 内的 *time.Timer 在到期前不会被 Stop，父 ctx 的 children map 里也会一直挂着这个子节点。Done() 返回的是同一个 channel，多次调用不会新建。Err() 在 Done 未关闭前返回 nil，关闭后返回 Canceled 或 DeadlineExceeded；可以用 errors.Is(err, context.DeadlineExceeded) 判断是否超时。"
+      "content": "Go 的取消模型是**协作式广播**，不是强制终止。\n\n**广播路径**：父 `cancelCtx.cancel()` 被调用后，执行以下操作（都在持锁状态下）：\n1. 设置 `c.err`\n2. 关闭 `c.done` channel\n3. 遍历 `c.children`，对每个子 canceler 调用 `child.cancel(false, err)`——递归下去，整棵子树的 done 都会被关闭\n4. 把自己从父亲的 children map 里摘掉，解除父子引用，避免 GC 沿链不回收\n\n**下游必须主动观察**，runtime 不会强杀任何 goroutine：\n- 在 for-select 里写 `case <-ctx.Done(): return ctx.Err()`\n- 把 ctx 透传给底层 IO：`db.QueryContext(ctx, ...)`、`req.WithContext(ctx)`、gRPC `metadata.NewOutgoingContext` 等\n- 自己写的阻塞循环不能用裸 `time.Sleep`，要改成 `select { case <-time.After(d): case <-ctx.Done(): }`，否则 sleep 期间完全无法响应取消\n\n**取消原因的判断**：`Err()` 在 Done 未关闭前返回 nil，关闭后返回 Canceled 或 DeadlineExceeded。线上用 `errors.Is(err, context.DeadlineExceeded)` 区分，Canceled 通常是客户端断开或 fan-out 竞争取消，DeadlineExceeded 才是真超时——监控指标必须分开打。\n\n**容易遗漏的边界**：cancel 必须 defer 调用，即使 WithTimeout 的 timer 会自动 cancel 也要 defer。原因是 timerCtx 的 `*time.Timer` 在到期前可以通过 `Stop()` 提前释放，同时子 ctx 会立即从父 children map 里摘掉自己。不 defer 的后果是：短命请求高 QPS 下，timer、父子引用和相关资源一直等到超时才释放，runtime timer 数和 context 子节点数偏高。"
     },
     {
       "type": "explain",
-      "title": "传递规范、Value 的 key 类型与 HTTP 服务器集成",
-      "content": "工程上几条硬规矩，违反就是 review 必打回：\n\n1. ctx 永远是函数的第一个参数，命名 ctx，类型 context.Context；不要塞进 struct 字段。struct 上的 ctx 会让生命周期变模糊，并发调用也容易互相影响 cancel。\n\n2. WithValue 的 key 必须是非导出的自定义类型，不能直接用 string。context.Value 基于 == 比较，如果两个包都用了 'userID' 这个 string 当 key 就会撞车。标准做法是 type ctxKey int; const userIDKey ctxKey = 0，外部包拿不到这个 key 类型，天然隔离。\n\n3. net/http 的 *http.Request 自带 r.Context()。客户端断开 TCP 连接时，server 会自动 cancel 这个 ctx。handler 里的 DB、RPC 调用都应该把 r.Context() 传下去，让下游查询能及时中断。\n\n4. 不要在已经超时的 ctx 上再 WithTimeout 一个更长的时间。子 ctx 的 deadline 会被夹到父 deadline，永远不会超过父亲。可以更短，不能更长。\n\n5. 不要把 ctx 传 nil。需要顶层 ctx 时用 context.Background()；还不知道该用哪个根 ctx 时，用“临时根上下文”表达待接入真实上游。"
+      "title": "传递规范、Value key 的类型隔离与 HTTP 集成",
+      "content": "context 在工程上有一套硬规矩，违反就是 review 必打回：\n\n**ctx 作为函数第一个参数，不放 struct**。struct 上存 ctx 会让生命周期变模糊，并发调用同一个 struct 的多个方法时，一个方法 cancel 会连带影响另一个。正确做法：每个方法自己接收 ctx 参数，或在方法内用 `context.TODO()` 标记「还没接入上游生命周期」。\n\n**Value 的 key 必须用非导出自定义类型**。`context.Value` 用 `==` 比较 key。如果两个包都用 string `\"userID\"` 当 key，后写入的会覆盖先写的查询结果，且编译期和静态分析都查不出。标准做法是 `type ctxKey int; const userIDKey ctxKey = 0`，ctxKey 是非导出类型，外部包根本造不出同类型的值，类型系统天然隔离。同理禁止用 `int`、可导出 struct 当 key。\n\n**Value 只放请求级元数据**：trace id、request id、租户 id、登录用户 id 这类贯穿请求生命周期但不改变函数签名语义的信息。业务必需参数（用户输入、查询条件）仍然显式写函数签名，不要塞进 Value 来「省事」——Value 是链表回溯，查找 O(链长)，且没有编译期类型检查。\n\n**net/http 的 r.Context()**：`*http.Request` 自带 `r.Context()`，客户端断开 TCP 连接时 server 会自动 cancel 这个 ctx。handler 里的 DB、RPC、Redis 调用都应该 `r.Context()` 透传下去，让下游查询能及时中断。\n\n**子 deadline 被夹到父 deadline**：`WithTimeout(parent, 5*time.Second)` 如果 parent 的 deadline 还剩 2 秒，子 ctx 的 deadline 实际只有 2 秒。这意味着分层超时预算只能逐层缩短，不能跨层放大——想给某个下游更长时间，必须从更上层或新的根 ctx 派生。\n\n**不要传 nil**：需要顶层根上下文时用 `context.Background()`；代码还没接入真实上游生命周期但未来要替换时，用 `context.TODO()` 明确标记。"
     },
     {
       "type": "diagram",
@@ -58,92 +58,60 @@
     {
       "type": "compareTable",
       "title": "4 个 With* 派生函数的语义边界",
-      "columns": [
-        "派生函数",
-        "底层实现",
-        "Err() 返回",
-        "典型场景",
-        "易错点"
-      ],
-      "rows": [
-        [
-          "WithCancel(parent)",
-          "新建 cancelCtx，加入 parent.children",
-          "context.Canceled",
-          "用户主动断开、上游 fan-out 后某个分支拿到结果就取消其余",
-          "返回的 cancel 必须调用，否则 children 里挂着空引用直到父 cancel"
-        ],
-        [
-          "WithTimeout(parent, d)",
-          "等价 WithDeadline(parent, time.Now().Add(d))，timerCtx 持 *time.Timer",
-          "context.DeadlineExceeded",
-          "RPC/HTTP 客户端单次调用预算，常见 200ms~3s",
-          "d 比父 deadline 大时被夹到父值；忘 defer cancel 会让 Timer 到点才回收"
-        ],
-        [
-          "WithDeadline(parent, t)",
-          "timerCtx，到 t 触发 cancel(DeadlineExceeded)",
-          "context.DeadlineExceeded",
-          "跨服务共享的绝对截止时间（gRPC metadata 里的 grpc-timeout）",
-          "t 已过则立即 cancel；机器时钟漂移会让结果不稳"
-        ],
-        [
-          "WithValue(parent, k, v)",
-          "valueCtx 链表，Value 查找递归回溯",
-          "继承父 ctx 的 Err",
-          "trace id、租户 id、登录用户等请求级元数据",
-          "key 用 string 会跨包撞车；查找 O(链长)，不要塞几十层"
-        ]
-      ]
+      "content": "| 派生函数 | 底层实现 | Err() 返回 | 典型场景 | 易错点 |\n| --- | --- | --- | --- | --- |\n| `WithCancel(parent)` | 新建 cancelCtx，加入 parent.children | context.Canceled | 用户断开、fan-out 竞争取消 | 返回的 cancel 必须 defer 调用，否则 children 里挂着子节点 |\n| `WithTimeout(parent, d)` | 等价 WithDeadline(parent, time.Now().Add(d))，timerCtx 持 *time.Timer | context.DeadlineExceeded | RPC/HTTP 客户端单次调用预算 200ms~3s | d 比父 deadline 大时被夹到父值；忘 defer cancel 让 Timer 到点才回收 |\n| `WithDeadline(parent, t)` | timerCtx，到 t 触发 cancel(DeadlineExceeded) | context.DeadlineExceeded | 跨服务共享绝对截止时间（gRPC grpc-timeout） | t 已过则立即 cancel；机器时钟漂移影响实际触发时机 |\n| `WithValue(parent, k, v)` | valueCtx 链表节点，Value 查找递归回溯 | 继承父 ctx 的 Err | trace id、租户 id、登录用户等请求级元数据 | key 用 string 跨包撞车；查找 O(链长)，不要塞几十层 |"
     },
     {
       "type": "code",
       "title": "HTTP handler 透传 ctx + 子超时 + 安全的 Value key",
       "language": "go",
-      "content": "package main\n\nimport (\n\t\"context\"\n\t\"database/sql\"\n\t\"errors\"\n\t\"net/http\"\n\t\"time\"\n)\n\n// 1) 用非导出类型当 key，外部包拿不到，避免冲突\ntype ctxKey int\n\nconst traceIDKey ctxKey = 0\n\nfunc handler(w http.ResponseWriter, r *http.Request, db *sql.DB) {\n\t// 2) r.Context() 在客户端断开 TCP 时由 net/http 自动 cancel\n\tparent := context.WithValue(r.Context(), traceIDKey, r.Header.Get(\"X-Trace-Id\"))\n\n\t// 3) 给下游 DB 调用一个更短的子超时（父 deadline 再夹一刀）\n\tctx, cancel := context.WithTimeout(parent, 300*time.Millisecond)\n\tdefer cancel() // 必须 defer：及时 Stop timer 并从父 children 摘除\n\n\trows, err := db.QueryContext(ctx, \"SELECT id FROM orders WHERE uid=$1\", 42)\n\tif err != nil {\n\t\t// 4) 用 errors.Is 区分超时还是主动取消\n\t\tswitch {\n\t\tcase errors.Is(err, context.DeadlineExceeded):\n\t\t\thttp.Error(w, \"db timeout\", http.StatusGatewayTimeout)\n\t\tcase errors.Is(err, context.Canceled):\n\t\t\t// 客户端早断开，不用回写\n\t\t\treturn\n\t\tdefault:\n\t\t\thttp.Error(w, err.Error(), http.StatusInternalServerError)\n\t\t}\n\t\treturn\n\t}\n\tdefer rows.Close()\n}\n\n// 5) 下游若是自己写的循环，必须 select Done，否则收不到取消\nfunc poll(ctx context.Context, tick time.Duration) error {\n\tt := time.NewTicker(tick)\n\tdefer t.Stop()\n\tfor {\n\t\tselect {\n\t\tcase <-ctx.Done():\n\t\t\treturn ctx.Err() // Canceled or DeadlineExceeded\n\t\tcase <-t.C:\n\t\t\t// do work\n\t\t}\n\t}\n}",
+      "content": "package main\n\nimport (\n\t\"context\"\n\t\"database/sql\"\n\t\"errors\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"time\"\n)\n\n// 1) 非导出类型当 key，外部包拿不到，从根源避免跨包撞车\ntype ctxKey int\n\nconst (\n\ttraceIDKey ctxKey = iota\n\ttenantIDKey\n)\n\nfunc handler(w http.ResponseWriter, r *http.Request, db *sql.DB) {\n\t// 2) r.Context() 在客户端断开 TCP 时由 net/http 自动 cancel\n\tparent := r.Context()\n\tparent = context.WithValue(parent, traceIDKey, r.Header.Get(\"X-Trace-Id\"))\n\tparent = context.WithValue(parent, tenantIDKey, r.Header.Get(\"X-Tenant-Id\"))\n\n\t// 3) 给下游 DB 调用一个更短的子超时\n\t//    如果 parent deadline 还剩 200ms，这里 300ms 会被夹到 200ms\n\tctx, cancel := context.WithTimeout(parent, 300*time.Millisecond)\n\tdefer cancel() // 必须 defer：Stop timer 并从父 children map 摘除\n\n\trows, err := db.QueryContext(ctx, \"SELECT id FROM orders WHERE uid=$1\", 42)\n\tif err != nil {\n\t\t// 4) errors.Is 区分超时和取消，监控指标分开打\n\t\tswitch {\n\t\tcase errors.Is(err, context.DeadlineExceeded):\n\t\t\thttp.Error(w, \"db timeout\", http.StatusGatewayTimeout)\n\t\tcase errors.Is(err, context.Canceled):\n\t\t\t// 客户端早断开，不用回写\n\t\t\treturn\n\t\tdefault:\n\t\t\thttp.Error(w, err.Error(), http.StatusInternalServerError)\n\t\t}\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\t// 5) 从 ctx 取 Value，用类型断言\n\tif tid, ok := ctx.Value(traceIDKey).(string); ok {\n\t\tw.Header().Set(\"X-Trace-Id\", tid)\n\t}\n\tfmt.Fprintf(w, \"ok\")\n}\n\n// 6) 自己写的循环必须 select Done，裸 time.Sleep 无法响应取消\nfunc poll(ctx context.Context, tick time.Duration) error {\n\tt := time.NewTicker(tick)\n\tdefer t.Stop()\n\tfor {\n\t\tselect {\n\t\tcase <-ctx.Done():\n\t\t\treturn ctx.Err() // Canceled or DeadlineExceeded\n\t\tcase <-t.C:\n\t\t\t// do work\n\t\t}\n\t}\n}",
       "highlights": [
         {
-          "line": 11,
-          "note": "ctxKey 是非导出 int 类型，外部包即使 import 也拿不到这个类型，从根源避免 Value key 撞车。"
+          "line": 13,
+          "note": "ctxKey 是非导出 int 类型，外部包即使 import 也拿不到，类型系统天然隔离 Value key。"
         },
         {
-          "line": 19,
-          "note": "r.Context() 是 net/http 自动管理的 ctx，TCP 断开时 server 调用其 cancel；handler 里透传它能让 DB 查询随客户端断开立刻中止。"
+          "line": 24,
+          "note": "r.Context() 是 net/http 自动管理的 ctx，TCP 断开时 server 调用其 cancel，透传它能让 DB 查询随客户端断开立刻中止。"
         },
         {
-          "line": 23,
+          "line": 29,
           "note": "defer cancel() 不可省：即使 300ms 自动到点，提前返回路径上必须立即 Stop *time.Timer 并把自己从父 children map 摘掉。"
         },
         {
-          "line": 31,
-          "note": "errors.Is 是区分两类原因的标准方式：Canceled 通常是客户端断开，DeadlineExceeded 才是真超时，监控指标要分开打。"
+          "line": 37,
+          "note": "errors.Is 区分两类原因：Canceled 通常是客户端断开，DeadlineExceeded 才是真超时。"
+        },
+        {
+          "line": 51,
+          "note": "Value 取出后必须类型断言，因为返回值是 any。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "30 秒结论：context.Context 是 Go 跨调用链传递取消信号、截止时间和请求级元数据的标准接口。它有 Deadline/Done/Err/Value 4 个方法，实现上分 emptyCtx、cancelCtx、timerCtx、valueCtx 四种。\n\n机制层我会展开 4 点：\n1. **取消传播**：cancelCtx 内部有 done channel 和 children map。cancel 时关闭 done 并递归 cancel 子节点；runtime 不会强杀 goroutine，下游必须 select Done 或调用支持 ctx 的 IO。\n2. **超时预算**：WithTimeout/WithDeadline 底层都是 timerCtx，区别只是相对/绝对时间。子 ctx 的 deadline 会被夹到父 deadline，所以分层预算只能缩短。\n3. **资源释放**：cancel 函数必须 defer 调用，用来关闭 *time.Timer，并把自己从父 children map 里摘掉，避免短命请求里 timer 资源堆积。\n4. **Value 边界**：key 必须用非导出自定义类型，靠类型隔离防止跨包撞 key。Value 只放 trace id、租户 id 这类请求级元数据，业务必需参数仍然显式写函数签名。\n\n工程边界我会主动给：context 不能放在 struct 字段里，不能传 nil；HTTP handler 应透传 r.Context()；用 errors.Is 区分超时和主动取消；裸 time.Sleep 要换成 select+ctx.Done。",
+      "content": "**30 秒结论**：context.Context 是 Go 跨调用链传递取消信号、截止时间和请求级元数据的协作式机制。它有 Deadline/Done/Err/Value 四个方法，底层四种实现：emptyCtx（永不取消的根）、cancelCtx（通过 children map 广播取消）、timerCtx（到点自动触发 cancel）、valueCtx（链表存元数据）。\n\n**机制主线（4 点）**：\n1. **取消广播**：cancelCtx 内部有 done channel 和 children map。cancel 时关闭 done 并递归 cancel 子节点，整棵子树同步收到信号。runtime 不会强杀 goroutine，下游必须 select Done 或调用支持 ctx 的 IO API。\n2. **超时预算**：WithTimeout/WithDeadline 底层都是 timerCtx。构造时比较父 deadline 取更早值，所以分层超时只能逐层缩短，不能跨层放大。\n3. **资源释放**：cancel 必须 defer 调用，提前 Stop *time.Timer 并从父 children map 摘除。高 QPS 下不 defer 会让 timer 和父子引用堆积到超时才释放。\n4. **Value 隔离**：key 用非导出自定义类型，类型系统防止跨包撞车。只放请求级元数据（trace id、租户 id），业务必需参数显式写函数签名。\n\n**工程边界我会主动给**：ctx 作为函数第一个参数，不放 struct 字段；不传 nil；HTTP handler 透传 r.Context()；errors.Is 区分超时和取消；裸 time.Sleep 要换 select+ctx.Done；子 deadline 被夹到父 deadline。",
       "followUpQuestions": [
         {
           "question": "WithTimeout 后为什么必须 defer cancel？不调用会发生什么？",
-          "answer": "WithTimeout 内部是 timerCtx，构造时 time.AfterFunc 启动一个 *time.Timer，并把自己注册到父 ctx 的 children map。defer cancel 做两件事：调用 timer.Stop() 立刻回收 timer（Go 1.21 前不调用就要等到点才回收），并从父 children 里 delete 自己。短命请求高 QPS 下不调 cancel 会出现 goroutine 不漏但 timer 与 children 引用堆积的隐性泄漏，pprof 看 runtime.timer 数量异常增长就是这个症状。"
+          "answer": "WithTimeout 内部是 timerCtx，构造时挂上 `*time.Timer` 并把自己注册到父 ctx 的 children map。defer cancel 做两件事：一是调 `timer.Stop()` 提前释放定时器持有的回调和内存引用；二是把自己从父 children map 里摘掉，解除父子引用链。短命请求高 QPS 下不调 cancel，timer 会一直等到超时才触发回调、父子引用才释放，线上表现为 runtime timer 数和 context 子节点数偏高。goroutine 泄漏倒不常见，因为 cancel 不控制 goroutine 生命周期。"
         },
         {
           "question": "Context.Value 的 key 为什么不能直接用 string？",
-          "answer": "context.Value 用的是 == 比较，如果两个包都写 ctx.WithValue(parent, \"userID\", x)，后写的会覆盖先写的查询结果，且静态分析查不出来。标准做法是 type ctxKey int; const userIDKey ctxKey = 0，ctxKey 是非导出类型，外部包根本造不出同类型的 key，类型系统天然保证隔离。同样的理由也禁止用 int、自定义可导出类型当 key。"
+          "answer": "context.Value 用 `==` 比较 key。如果两个包都写 `ctx.WithValue(parent, \"userID\", x)`，后写入的会覆盖先写的，查询时只返回最内层匹配的值，且编译期和静态分析都查不出冲突。标准做法是 `type ctxKey int; const userIDKey ctxKey = 0`，ctxKey 是非导出类型，外部包根本造不出同类型的值。即使两个包各自定义了同名 `ctxKey`，它们也是不同类型，key 不会撞车。"
         },
         {
           "question": "已经被 cancel 的 ctx 再 WithTimeout 一个更长的时间会怎样？",
-          "answer": "派生时 context 包会先比较 parent.Deadline 和新的 deadline，取更早的那个，所以子 ctx 的 deadline 不会超过父亲；如果 parent 已经 cancel/超时，新建的子 ctx 在构造完成的瞬间就会被 cancel，Err 直接返回父亲的 err。这意味着分层预算只能逐层缩短，不能跨层放大；想给某个下游更长时间，必须从更上层的 ctx 派生。"
+          "answer": "派生时 context 包会先比较 `parent.Deadline()` 和新 deadline，取更早的那个。如果 parent 已经 cancel，新建的子 ctx 在构造完成的瞬间就会被 cancel（`Done()` 立即关闭，`Err()` 返回父亲的 err）。这意味着分层预算只能逐层缩短，想给某个下游更长时间，必须从更上层或全新的根 ctx 派生。"
         },
         {
           "question": "为什么 select 在 context.Background() 上永远不会走 Done 分支？",
-          "answer": "Background 返回的是 emptyCtx 单例（源码里是 type emptyCtx int 加几个空方法），它的 Done() 直接返回 nil channel。select 的语义是在 nil channel 上的 case 永远不会被选中，所以 case <-ctx.Done() 永远阻塞，这正是 Background 设计为永不取消的实现方式。同理 emptyCtx.Deadline 返回 (time.Time{}, false)，Err 返回 nil。"
+          "answer": "Background 返回 emptyCtx 单例（源码 `type emptyCtx int`），它的 `Done()` 直接返回 nil channel。select 的语义是在 nil channel 上的 case 永远不会被选中，所以 `case <-ctx.Done()` 永远阻塞——这正是 Background 设计为永不取消的实现方式。同理 `emptyCtx.Deadline()` 返回 `(time.Time{}, false)`，`Err()` 返回 nil。"
         },
         {
-          "question": "线上接口偶尔超时但日志没有 context canceled，你怎么确认是 context 超时还是下游慢？",
-          "answer": "排查步骤：\n\n1. **确认超时配置**：看 context.WithTimeout 设置的 deadline 是否合理。\n2. **加 trace**：在 ctx.Done() 触发时打日志 `fmt.Println(\"context done:\", ctx.Err())`，区分 Canceled vs DeadlineExceeded。\n3. **看下游耗时**：在 HTTP/gRPC 调用前后记录 elapsed，对比 context 的 deadline。\n4. **检查级联取消**：父 ctx cancel 后子 ctx 也会取消，排查是否上层主动 cancel 导致。\n\n关键区分：DeadlineExceeded = 超时触发；Canceled = 主动取消（如客户端断连）。"
+          "question": "线上接口偶尔超时但日志没有 context canceled，你怎么排查是 context 超时还是下游慢？",
+          "answer": "先把超时来源拆开，不能只看一条错误日志。第一，检查 handler、RPC 客户端、DB 查询各层的 deadline 链路，确认是不是父 ctx 快到期导致子 WithTimeout 形同虚设。第二，在链路追踪或结构化日志里同时打 deadline、elapsed、ctx.Err()、下游错误码，把 DeadlineExceeded、Canceled、driver timeout 分开统计。第三，确认下游是否用了支持 ctx 的 API（如 QueryContext、req.WithContext）；如果底层驱动不尊重 ctx，上游 cancel 也不能中断 IO。第四，检查 fan-out 场景是否有「一个分支成功后 cancel 全局 ctx」，表现为 Canceled 而不是超时。最后用故障注入验证：人为拉慢 DB、主动断开客户端、缩短父 deadline，三种情况指标应分别落到超时、取消和预算不足三个桶。"
         }
       ]
     },
@@ -151,13 +119,15 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能列出 Context 接口的 4 个方法和 emptyCtx/cancelCtx/timerCtx/valueCtx 4 种实现",
-        "能描述 cancelCtx 通过 done channel + children map 实现取消广播",
-        "能区分 context.Canceled 和 context.DeadlineExceeded，并用 errors.Is 判断",
-        "能解释 WithTimeout 的 defer cancel 在 Timer 和 children map 上的作用",
-        "能说明 Value key 必须用非导出自定义类型的原因",
-        "能写出 HTTP handler 透传 r.Context() 并叠加子超时的代码骨架",
-        "能指出禁止把 Context 放在 struct 字段、不能传 nil 等工程红线"
+        "能列出 Context 接口的 4 个方法和 emptyCtx/cancelCtx/timerCtx/valueCtx 4 种实现的内部结构",
+        "能描述 cancelCtx 通过 done channel + children map 广播取消的完整路径",
+        "能区分 context.Canceled 和 context.DeadlineExceeded，并说明 errors.Is 的用法",
+        "能解释 WithTimeout 的 defer cancel 在 *time.Timer 和父 children map 上的作用",
+        "能说明 Value key 必须用非导出自定义类型的类型隔离原理",
+        "能写出 HTTP handler 透传 r.Context() 并叠加子超时 + Value 的代码骨架",
+        "能解释子 deadline 被夹到父 deadline 的语义，说明分层超时只能缩短",
+        "能指出禁止把 ctx 放 struct 字段、不传 nil、不用裸 time.Sleep 等工程红线",
+        "能用链路追踪 + 错误码分类 + 故障注入排查线上超时 vs 取消问题"
       ]
     }
   ],
@@ -182,34 +152,49 @@
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
+    },
+    {
+      "id": "go.concurrency.context.recall.4",
+      "prompt": "在已超时的父 ctx 上 WithTimeout 一个更长的时间会发生什么？分层超时预算为什么只能逐层缩短？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "go.concurrency.context.recall.5",
+      "prompt": "线上接口偶尔超时，日志里 DeadlineExceeded 和 Canceled 混在一起，你怎么确认是 context 超时还是下游慢还是客户端断开？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "Context 接口 4 方法 Deadline/Done/Err/Value",
-      "emptyCtx/cancelCtx/timerCtx/valueCtx 四种实现",
-      "cancelCtx 的 done channel + children map 广播取消",
-      "WithCancel/WithTimeout/WithDeadline/WithValue 各自语义",
-      "defer cancel 释放 *time.Timer 与父 children 引用",
+      "Context 接口 4 方法 Deadline/Done/Err/Value 的语义",
+      "emptyCtx/cancelCtx/timerCtx/valueCtx 四种实现及其内部结构",
+      "cancelCtx 通过 done channel + children map 广播取消的机制",
+      "WithCancel/WithTimeout/WithDeadline/WithValue 各自的底层实现和语义",
+      "defer cancel 释放 *time.Timer 与从父 children map 摘除的作用",
       "errors.Is 区分 context.Canceled 与 context.DeadlineExceeded",
       "ctx 作为函数第一个参数，禁止放进 struct 字段"
     ],
     "goodToHave": [
-      "WithValue 的 key 用非导出自定义类型避免跨包冲突",
+      "WithValue 的 key 用非导出自定义类型实现类型隔离",
       "net/http 的 r.Context() 在客户端断开时自动 cancel",
       "子 deadline 被夹到父 deadline，分层超时只能缩短",
-      "数据库/gRPC/redis 等 IO 必须用支持 ctx 的 API",
+      "database/sql、gRPC、redis 等 IO 必须用支持 ctx 的 API 才能响应取消",
       "select+ctx.Done() 替代裸 time.Sleep",
-      "Background、临时根上下文与空上下文的语义区分"
+      "Background、context.TODO() 与 emptyCtx 的语义区分"
     ],
     "commonMistakes": [
-      "把 *Context 存进 struct 字段，导致并发调用互相影响 cancel",
-      "WithTimeout 后忘记 defer cancel，*time.Timer 堆积",
-      "用 string 字面量当 WithValue 的 key，跨包撞键覆盖",
-      "在循环里用 time.Sleep 而不是 select <-ctx.Done()",
-      "把业务必需参数塞进 Value 来避免改函数签名",
-      "传 nil 当 ctx 而不是 context.Background() 替代传 nil",
-      "下游不透传 ctx，导致 HTTP 客户端断开后 SQL 仍跑完"
+      "把 *Context 或 context.Context 存进 struct 字段，导致并发调用互相影响 cancel",
+      "WithTimeout 后忘记 defer cancel，*time.Timer 和 children 引用堆积到超时才释放",
+      "用 string 字面量当 WithValue 的 key，跨包撞键导致后写覆盖先写",
+      "在循环里用 time.Sleep 而不是 select <-ctx.Done()，sleep 期间无法响应取消",
+      "把业务必需参数塞进 Value 来避免改函数签名，丢失类型安全和编译期检查",
+      "传 nil 当 ctx 而不是用 context.Background()，导致 panic",
+      "下游不透传 ctx 或用了不支持 ctx 的 API，客户端断开后底层 IO 仍跑完",
+      "以为 cancel 能强杀 goroutine，实际 runtime 不会强制终止，下游必须主动观察 Done"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -218,5 +203,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

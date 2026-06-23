@@ -4,7 +4,7 @@
   "category": "container-k8s",
   "group": "container-k8s",
   "title": "Kubernetes 核心对象与 Pod 生命周期",
-  "summary": "Pod/Deployment/StatefulSet/DaemonSet/Job/CronJob、Service/Ingress、ConfigMap/Secret 的职责差异与 Pod 生命周期。",
+  "summary": "Pod 是调度最小单元，Deployment/StatefulSet/DaemonSet/Job/CronJob 五类控制器按工作负载特征选型；Pod 生命周期覆盖调度、init containers、probe 链、终止顺序与 preStop 关键作用；Service/Ingress 提供服务发现与七层暴露，ConfigMap/Secret 注入配置且热更新行为因注入方式而异。",
   "tags": [
     "DevOps",
     "Kubernetes",
@@ -16,90 +16,33 @@
     "ConfigMap"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 35,
+  "estimatedMinutes": 43,
   "order": 50,
   "recommendWeight": 90,
   "status": "production",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "看是否能按工作负载类型（无状态/有状态/守护/批处理）选对控制器，并讲清 Pod 从创建到终止的完整生命周期，包括 readiness/liveness 与 preStop。",
+  "interviewerFocus": "看是否能按工作负载类型（无状态/有状态/守护/批处理）选对控制器，讲清 Pod 从创建到终止的完整生命周期（含 startupProbe/readinessProbe/livenessProbe 区别、preStop 与 endpoints 异步摘除的关系），以及 Service/ConfigMap/Secret 的工程细节与常见坑。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "六类工作负载控制器选哪个",
-      "content": "Pod 是 K8s 调度的最小单元。一个 Pod 内多容器共享 network namespace 和 volumes。但生产里几乎不直接创建 Pod，而是用控制器声明期望状态，由 controller-manager 不断对齐。\n\n按工作负载特征选控制器：\n\n- Deployment：无状态服务，通过 ReplicaSet 维持副本数。滚动更新时新 RS 逐步扩、旧 RS 逐步缩，maxSurge/maxUnavailable 控制并行度。Pod 名字随机（如 web-7d8c-xk2lp），随时可替换。\n- StatefulSet：有状态服务（MySQL、Kafka、Redis Cluster）。Pod 名字稳定有序（mysql-0、mysql-1），按序启动按逆序终止。每个 Pod 绑定独立 PVC，支持 headless Service 给每个 Pod 一个 DNS（mysql-0.mysql.default.svc）。\n- DaemonSet：每个节点跑一份（日志采集 fluent-bit、监控 node-exporter、CNI）。节点加入自动调度，节点下线自动清理。可用 nodeSelector/taints 限定节点子集。\n- Job：跑到成功为止，失败按 backoffLimit 重试。completions/parallelism 控制总数与并发，常用于一次性数据迁移、批量计算。\n- CronJob：基于时间触发 Job，concurrencyPolicy（Allow/Forbid/Replace）控制重叠。startingDeadlineSeconds 限制错过窗口后是否补跑。\n- ReplicaSet：Deployment 的实现细节，几乎不直接用。\n\n选错的代价：用 Deployment 跑 MySQL 主从会因为 Pod 无序重建丢主。用 StatefulSet 跑无状态 API 会因为有序滚动拖慢发布。DaemonSet 用 Deployment 替代会漏节点。"
+      "title": "六类工作负载控制器：选型逻辑与选错代价",
+      "content": "Pod 是 Kubernetes 调度和管理的最小单元。一个 Pod 内的容器共享 network namespace（同一个 IP、端口空间）和 volumes，通常一个 Pod 放一个主容器加若干 sidecar。生产环境几乎不直接创建裸 Pod——裸 Pod 挂了不会被拉起，节点驱逐后就丢了。用控制器声明「我要 3 个副本、这个镜像、这个更新策略」，controller-manager 持续对齐实际状态到期望状态。\n\n**五类控制器的核心差异**\n\nDeployment 管无状态服务。它底下套一层 ReplicaSet，改镜像或配置会新建 ReplicaSet 并滚动切换。Pod 名字随机（web-7d8c-xk2lp），随时可替换，配合 Service 负载均衡。maxSurge 控制发布时多建几个 Pod，maxUnavailable 控制最多有几个不可用。典型调法 maxSurge=1、maxUnavailable=0 保证发布过程中始终有 N 个可用副本。\n\nStatefulSet 管有状态服务。三个关键能力：稳定网络标识（Pod 名有序如 mysql-0、mysql-1，配合 headless Service 得到固定 DNS mysql-0.mysql.default.svc.cluster.local）、稳定存储（volumeClaimTemplates 为每个 Pod 生成独立 PVC，Pod 重建后还是挂载原来的盘）、有序部署与缩容（按序启动 0→1→2，逆序终止 2→1→0）。MySQL 主从、Kafka broker、ES data node、Redis Cluster 都需要这些能力。如果用 Deployment 跑 MySQL，Pod 重建后名字变了、盘换了、启动顺序不可控，主从关系必然乱。\n\nDaemonSet 确保每个（或指定）节点运行一个 Pod 副本。节点加入集群时自动调度，节点下线时自动清理。典型场景：日志采集（fluent-bit）、节点监控（node-exporter）、CNI 插件、kube-proxy。如果用 Deployment 替代 DaemonSet，副本数得手动跟节点数对齐，新节点加入时不会自动补 Pod，就会漏采集。\n\nJob 运行一次性任务，Pod 跑完就终止。backoffLimit 控制失败重试次数，completions 控制总共要成功几次（比如拆成 10 个分片），parallelism 控制并发数。activeDeadlineSeconds 可以设全局超时。Job 的 restartPolicy 必须是 OnFailure 或 Never，不能是 Always（否则 Pod 完成后也会被重启）。\n\nCronJob 基于 cron 表达式定时创建 Job。concurrencyPolicy 有三个值：Allow 允许多个 Job 并发（上次没跑完又触发新的）、Forbid 跳过新触发（上次还在跑就不跑了）、Replace 取消上次正在跑的 Job 用新的替换。startingDeadlineSeconds 定义错过调度窗口后是否补跑。注意 CronJob 历史 Job 对象会累积，需要设 successfulJobsHistoryLimit 和 failedJobsHistoryLimit 清理。\n\nReplicaSet 是 Deployment 的内部实现细节，几乎不直接使用。直接创建 ReplicaSet 会失去版本管理、回滚和声明式更新能力。"
     },
     {
       "type": "explain",
-      "title": "Pod 生命周期：从 Pending 到 Terminated 的关键钩子",
-      "content": "Pod 状态机：Pending → Running → Succeeded/Failed，外加 Unknown。每一段都有可干预的钩子，面试常问的就是这些钩子在做什么。\n\n创建阶段：\n1. apiserver 写入 etcd，scheduler 根据 resources.requests、nodeSelector、affinity、taints/tolerations 选节点。\n2. kubelet 拉镜像（imagePullPolicy=IfNotPresent/Always），启动 init containers（顺序串行，全部成功才进入主容器）。init containers 常用于等依赖、做 schema migration。\n3. 主容器启动后并发跑 startupProbe（首次就绪前用，避免慢启动被 liveness 误杀）→ readinessProbe（决定是否进 Service endpoints）→ livenessProbe（失败则 kubelet restart 容器，按 restartPolicy 决定是否拉起）。\n4. postStart hook 与主进程并发执行，不保证在进程之前。\n\n终止阶段（最容易答错）：\n1. 用户 kubectl delete 或 controller 触发删除，apiserver 给 Pod 打 deletionTimestamp。同时 endpoints controller 把 Pod 从 Service endpoints 摘除。但这一步是异步的，Pod 仍可能收到几百毫秒的旧请求。\n2. kubelet 调用 preStop hook（同步执行，常用 sleep 5/10s 等待 endpoints 同步与连接 drain）。\n3. 给容器发 SIGTERM，应用应捕获并优雅退出（关闭监听、等存量请求完成）。\n4. 等到 terminationGracePeriodSeconds（默认 30s）超时仍未退出，发 SIGKILL 强杀。\n\nrestartPolicy 只对 Pod 内容器生效：Always（Deployment/StatefulSet/DaemonSet 默认）、OnFailure（Job 常用）、Never。控制器层面的副本拉起是另一回事（Deployment 删除 Pod 后 ReplicaSet 会建新的）。"
+      "title": "Pod 生命周期：创建链路、Probe 链与终止顺序",
+      "content": "Pod 的状态机很简单：Pending → Running → Succeeded/Failed，加上异常态 Unknown。但面试和生产中真正重要的是每一阶段背后发生了什么、有哪些钩子可以干预。\n\n**创建阶段**\n\n1. 用户 kubectl apply 或 CI/CD 调 apiserver，apiserver 校验后把 Pod 对象写入 etcd，此时 Pod 进入 Pending。\n2. scheduler watch 到未调度的 Pod，根据 resources.requests（不是 limits）、nodeSelector、nodeAffinity、podAffinity/antiAffinity、taints/tolerations 选一个节点，把 nodeName 写回 Pod 对象。\n3. 目标节点的 kubelet watch 到绑定到自己的 Pod，开始启动流程：拉镜像（imagePullPolicy 决定行为——IfNotPresent 本地有就用、Always 每次都拉、Never 只用本地）、按顺序串行执行 init containers（每个 init container 必须成功退出才进下一个，全部成功才进主容器）。init containers 常用于等待依赖服务就绪（如等 MySQL ready）、执行数据库 migration、生成配置文件。\n4. 主容器启动，postStart hook 与主进程并发执行（注意：不保证 postStart 在 ENTRYPOINT 之前完成，只是说两者并发启动）。然后三个 probe 按需配置——startupProbe 先行，用于慢启动应用（如 Java 大型服务冷启动 30s+），在它成功之前 readinessProbe 和 livenessProbe 不会执行，避免应用还没启动完就被 liveness 误杀；readinessProbe 决定 Pod 是否进入 Service 的 Endpoints（即能不能接流量）；livenessProbe 失败则 kubelet 会 kill 容器并按 restartPolicy 重启。\n\n三个 probe 的区别是高频考点：readinessProbe 失败只摘流量（从 Endpoints 移除），容器不会重启；livenessProbe 失败会触发容器重启；startupProbe 是前两者的门控，startupProbe 失败也会重启容器。\n\n**终止阶段（最容易答错）**\n\n1. 触发删除（kubectl delete、Deployment 滚动更新缩旧 RS、节点 drain）→ apiserver 给 Pod 设置 deletionTimestamp（不是立即删对象）。同时 endpoints controller 异步地把 Pod 从 Service Endpoints 摘除。关键点：这个摘除是异步的，kube-proxy 刷 iptables/IPVS 规则也有延迟，在这几百毫秒到几秒的窗口内，新请求仍可能打到正在终止的 Pod。\n2. kubelet 看到 deletionTimestamp 后，调用 preStop hook（同步阻塞执行）。生产中 preStop 几乎必定写 sleep 5-10s，目的就是等 endpoints 同步完成、负载均衡器规则刷新。\n3. preStop 结束后，kubelet 给容器发 SIGTERM。应用应捕获 SIGTERM 执行优雅退出：停止接受新连接、等待存量请求处理完毕、关闭数据库连接池、刷新日志缓冲区。\n4. 从 deletionTimestamp 开始计时，terminationGracePeriodSeconds（默认 30s）到期后如果容器还没退出，kubelet 发 SIGKILL 强杀。所以 terminationGracePeriodSeconds 必须大于 preStop 耗时 + 最长请求处理时间。\n\nrestartPolicy 只对 Pod 内容器生效：Always（Deployment/StatefulSet/DaemonSet 默认，容器退出就重启）、OnFailure（Job 常用，只有非零退出码才重启）、Never（不重启，适合调试或 Job 场景）。注意：restartPolicy 是 Pod 级别的，不是容器级别的，一个 Pod 内所有容器共享同一个 restartPolicy。控制器层面的副本恢复是另一回事——Deployment 的 ReplicaSet 发现 Pod 不存在了会创建新 Pod。"
     },
     {
       "type": "explain",
-      "title": "Service/Ingress 与 ConfigMap/Secret 的边界",
-      "content": "服务发现与暴露：\n\n- ClusterIP（默认）：集群内虚拟 IP，kube-proxy 通过 iptables/IPVS 把 VIP DNAT 到后端 Pod。selector 匹配 Pod label 生成 Endpoints（或 EndpointSlice，1.21+ 默认）。selector 写错或 Pod label 改了会出现 Endpoints 为空。kubectl get endpoints svc-name 是排查首选。\n- NodePort：在每个节点开一个 30000-32767 端口，外部 LB 转到任意节点都能访问，适合本地或简单场景。\n- LoadBalancer：云厂商 LB（ELB/SLB）打通公网，每个 Service 一个 LB，成本高。\n- Headless Service（clusterIP: None）：不分配 VIP，DNS 直接返回所有 Pod IP，配合 StatefulSet 做点对点发现。\n- Ingress：七层入口，一个 Ingress Controller（nginx-ingress、Traefik、ALB Controller）背后挂多个 Service，按 host/path 路由，支持 TLS termination。Ingress 资源本身不工作，必须有 Controller 实现。\n\n配置注入：\n\n- ConfigMap：明文配置（feature flag、JVM 参数、配置文件），可通过 env、envFrom 或 volumeMount 注入。volumeMount 方式支持热更新（kubelet 周期性同步，约 1 分钟），env 方式不会更新（要重启 Pod）。\n- Secret：base64 编码（不是加密），适合 DB 密码、TLS 证书、镜像拉取凭证（type=kubernetes.io/dockerconfigjson）。生产应配合 KMS/sealed-secrets/external-secrets-operator 做静态加密。size 上限 1MiB。\n\n常见坑：把密码写进 ConfigMap、改了 ConfigMap 但用 env 方式注入导致没生效、Service selector 与 Pod label 大小写不一致导致空 endpoints、Ingress 配了 TLS 但 Secret 不在同 namespace。"
+      "title": "Service 类型、Ingress 与服务发现机制",
+      "content": "Service 解决的核心问题是：Pod IP 随时会变（重建、调度），应用不能把后端 IP 硬编码。Service 给一组 Pod 一个稳定的虚拟 IP 和 DNS 名，kube-proxy 负责把这个 VIP 转发到实际 Pod。\n\n**四种 Service 类型**\n\nClusterIP（默认）：分配一个集群内虚拟 IP（如 10.96.0.100），kube-proxy 通过 iptables 或 IPVS 模式把访问 VIP 的流量 DNAT 到后端 Pod IP。后端 Pod 由 selector 匹配 Pod label 自动生成 Endpoints 对象（1.21+ 默认 EndpointSlice，分片存储更适合大规模集群）。selector 写错、Pod label 不匹配、Pod 的 readinessProbe 失败，都会导致 Endpoints 为空——Service VIP 存在但没有后端，访问会超时或连接被拒。kubectl get endpoints <svc-name> 是排查的第一步。\n\nNodePort：在 ClusterIP 基础上，每个节点开放一个 30000-32767 范围内的端口。外部负载均衡器或直接访问任意节点的 NodePort 都能到达后端。适合开发环境或没有云 LB 的场景。缺点是端口范围有限、暴露节点 IP 不安全。\n\nLoadBalancer：云厂商（AWS ELB、阿里 SLB、GCP LB）自动创建公网 LB 并把流量导向 NodePort/ClusterIP。每个 LoadBalancer 类型的 Service 会创建一个独立的云 LB，成本高。多 Service 共用一个 LB 通常需要 Ingress 或 Gateway API。\n\nHeadless Service（clusterIP: None）：不分配 VIP，DNS 查询直接返回所有后端 Pod IP 列表。配合 StatefulSet 使用时，DNS 还会为每个 Pod 创建一条 A 记录（如 mysql-0.mysql-headless.default.svc.cluster.local → 10.244.1.5），实现点对点寻址。适合需要客户端做负载均衡或主从发现的场景。\n\n**Ingress**\n\nIngress 是七层（HTTP/HTTPS）入口的声明式描述：按 host 和 path 路由到不同 Service，支持 TLS termination、路径重写、限流等。但 Ingress 资源本身不工作——必须有一个 Ingress Controller（nginx-ingress、Traefik、AWS ALB Controller 等）来 watch Ingress 对象并生成实际的代理配置。一个 Controller 可以服务多个 Ingress 资源。Ingress 的 TLS 证书通过引用 Secret（type=kubernetes.io/tls）实现，Secret 必须和 Ingress 在同一个 namespace。"
     },
     {
-      "type": "compareTable",
-      "title": "六类工作负载控制器对比",
-      "columns": [
-        "控制器",
-        "Pod 标识",
-        "更新策略",
-        "存储",
-        "典型场景",
-        "选错代价"
-      ],
-      "rows": [
-        [
-          "Deployment",
-          "随机名，可替换",
-          "RollingUpdate/Recreate，maxSurge/maxUnavailable",
-          "emptyDir 或共享 PVC",
-          "无状态 API、Web",
-          "用它跑有状态服务会丢数据"
-        ],
-        [
-          "StatefulSet",
-          "有序稳定名 mysql-0",
-          "OnDelete/RollingUpdate，按逆序",
-          "每 Pod 独立 PVC（volumeClaimTemplates）",
-          "MySQL、Kafka、ES、Redis Cluster",
-          "用它跑无状态服务发布慢且没必要"
-        ],
-        [
-          "DaemonSet",
-          "按节点一份",
-          "RollingUpdate/OnDelete",
-          "通常 hostPath 或 emptyDir",
-          "日志采集、监控、CNI、kube-proxy",
-          "用 Deployment 替代会漏节点"
-        ],
-        [
-          "Job",
-          "完成即终止",
-          "无滚动，按 backoffLimit 重试",
-          "按需 PVC",
-          "数据迁移、批量计算、报表",
-          "当成长服务跑会反复重启"
-        ],
-        [
-          "CronJob",
-          "按时间生成 Job",
-          "concurrencyPolicy 控制重叠",
-          "继承 Job",
-          "定时清理、对账、备份",
-          "concurrencyPolicy=Allow 时任务堆积"
-        ],
-        [
-          "ReplicaSet",
-          "随机名",
-          "无独立更新策略",
-          "同 Deployment",
-          "Deployment 内部使用",
-          "直接用会失去版本管理与回滚"
-        ]
-      ]
+      "type": "explain",
+      "title": "ConfigMap 与 Secret：配置注入方式与热更新陷阱",
+      "content": "ConfigMap 存储非敏感的明文配置：feature flags、JVM 参数、Nginx 配置文件、环境变量集。Secret 存储敏感信息：数据库密码、API key、TLS 证书、Docker Registry 拉取凭证。两者结构相同，区别在于语义和 RBAC 控制。\n\n**注入方式与热更新行为**\n\n环境变量注入（env / envFrom）：kubelet 在容器启动时把 ConfigMap/Secret 的值注入为环境变量。之后 ConfigMap 改了，容器内的环境变量不会变——环境变量是进程启动时一次性写死的，没有机制通知进程更新。要生效只能重启 Pod（kubectl rollout restart deployment/xxx）。\n\nVolume 挂载注入（volumeMounts）：kubelet 把 ConfigMap/Secret 挂载为文件。kubelet 会周期性同步（通过 watch 或 ttl，默认约 1 分钟），文件内容更新后容器内能看到新值。但进程是否真的读到了新值取决于应用本身——很多框架只在启动时读一次配置文件。所以 volumeMount 热更新的可靠性取决于应用的 reload 机制（如 Nginx 的 nginx -s reload、Spring 的 @RefreshScope）。\n\n**生产中绕开热更新不靠谱的做法**：给 Deployment 的 spec.template.metadata.annotations 加一个基于 ConfigMap 内容的 hash（Helm chart 里常用 {{ include (print $.Template.BasePath \"/configmap.yaml\") . | sha256sum }}），ConfigMap 内容变了 hash 变了，Pod template 就变了，Deployment 自动触发滚动更新。这个方案比等 kubelet 同步 + 期望应用 reload 靠谱得多。\n\n**Secret 的注意点**\n\nSecret 的 data 字段是 base64 编码，不是加密。kubectl get secret -o yaml 能直接看到 base64 值，base64 -d 就能还原。所以 Secret 不能替代静态加密。生产中应配合：etcd 加密配置（EncryptionConfiguration，apiserver 层面加密 etcd 中的 Secret）、sealed-secrets（把 Secret 加密成 SealedSecret 对象可以安全提交到 Git）、external-secrets-operator（从 Vault/AWS Secrets Manager 等外部系统同步 Secret）。Secret 单个对象大小上限 1MiB。\n\n**常见坑汇总**：密码写进 ConfigMap 而不是 Secret；用 env 方式注入后期望热更新生效；Service selector 与 Pod label 大小写不一致导致 Endpoints 为空；Ingress 引用的 Secret 不在同 namespace 导致 TLS 不生效；ConfigMap 体积超过 kubelet 的配置限制。"
     },
     {
       "type": "diagram",
@@ -120,49 +63,145 @@
       ]
     },
     {
+      "type": "compareTable",
+      "title": "五类工作负载控制器对比",
+      "columns": [
+        "控制器",
+        "Pod 标识",
+        "更新策略",
+        "存储",
+        "典型场景",
+        "选错代价"
+      ],
+      "rows": [
+        [
+          "Deployment",
+          "随机名，可替换",
+          "RollingUpdate/Recreate，maxSurge/maxUnavailable",
+          "emptyDir 或共享 PVC",
+          "无状态 API、Web、微服务",
+          "跑有状态服务：Pod 重建后身份丢失、主从错乱"
+        ],
+        [
+          "StatefulSet",
+          "有序稳定名（mysql-0）",
+          "OnDelete/RollingUpdate，逆序更新",
+          "每 Pod 独立 PVC（volumeClaimTemplates）",
+          "MySQL、Kafka、ES、Redis Cluster",
+          "跑无状态服务：有序滚动拖慢发布，PVC 管理复杂"
+        ],
+        [
+          "DaemonSet",
+          "按节点一份",
+          "RollingUpdate/OnDelete",
+          "通常 hostPath 或 emptyDir",
+          "日志采集、节点监控、CNI",
+          "用 Deployment 替代：新节点加入漏调度"
+        ],
+        [
+          "Job",
+          "完成即终止",
+          "无滚动更新，backoffLimit 重试",
+          "按需",
+          "数据迁移、批量计算、报表生成",
+          "当长期服务跑：完成后反复重启浪费资源"
+        ],
+        [
+          "CronJob",
+          "按时间生成 Job",
+          "concurrencyPolicy 控制并发",
+          "继承 Job",
+          "定时备份、对账、清理",
+          "Allow 并发策略下任务堆积挤占集群资源"
+        ]
+      ]
+    },
+    {
+      "type": "compareTable",
+      "title": "readinessProbe vs livenessProbe vs startupProbe",
+      "columns": [
+        "Probe",
+        "失败后果",
+        "决定什么",
+        "典型配置",
+        "常见误用"
+      ],
+      "rows": [
+        [
+          "readinessProbe",
+          "摘流量（从 Endpoints 移除），容器不重启",
+          "Pod 能否接 Service 流量",
+          "periodSeconds=5, failureThreshold=3",
+          "探测路径太简单（如只返回 200 不检查依赖），流量打到实际不可用的 Pod"
+        ],
+        [
+          "livenessProbe",
+          "kill 容器并重启",
+          "是否需要重启容器恢复",
+          "initialDelaySeconds=30, periodSeconds=10",
+          "慢启动应用没配 startupProbe，启动期被误杀进入 restart loop"
+        ],
+        [
+          "startupProbe",
+          "kill 容器并重启（启动期门控）",
+          "应用是否启动完成",
+          "failureThreshold=30, periodSeconds=10（共 300s 窗口）",
+          "不配 startupProbe 时 livenessProbe 的 initialDelaySeconds 设太短"
+        ]
+      ]
+    },
+    {
       "type": "code",
-      "title": "Deployment + Service + ConfigMap 最小可用片段",
+      "title": "Deployment + Service + ConfigMap 生产可用片段",
       "language": "yaml",
-      "content": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 3\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 1\n      maxUnavailable: 0\n  selector:\n    matchLabels: { app: web }\n  template:\n    metadata:\n      labels: { app: web }\n    spec:\n      terminationGracePeriodSeconds: 60\n      containers:\n      - name: app\n        image: registry/web:v1.2.3\n        ports: [{ containerPort: 8080 }]\n        envFrom:\n        - configMapRef: { name: web-config }\n        readinessProbe:\n          httpGet: { path: /healthz/ready, port: 8080 }\n          periodSeconds: 5\n          failureThreshold: 3\n        livenessProbe:\n          httpGet: { path: /healthz/live, port: 8080 }\n          initialDelaySeconds: 30\n          periodSeconds: 10\n        lifecycle:\n          preStop:\n            exec:\n              command: ['/bin/sh','-c','sleep 10']\n---\napiVersion: v1\nkind: Service\nmetadata: { name: web }\nspec:\n  selector: { app: web }\n  ports: [{ port: 80, targetPort: 8080 }]",
+      "content": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 3\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 1        # 发布时最多多 1 个 Pod\n      maxUnavailable: 0   # 发布时始终 3 个可用\n  selector:\n    matchLabels: { app: web }\n  template:\n    metadata:\n      labels: { app: web }\n      annotations:\n        # ConfigMap 内容变化时 hash 变 → 触发滚动更新\n        config-hash: \"PLACEHOLDER_CONFIGMAP_SHA256\"\n    spec:\n      terminationGracePeriodSeconds: 60\n      containers:\n      - name: app\n        image: registry/web:v1.2.3\n        ports: [{ containerPort: 8080 }]\n        envFrom:\n        - configMapRef: { name: web-config }\n        startupProbe:\n          httpGet: { path: /healthz/startup, port: 8080 }\n          failureThreshold: 30   # 30*10s=300s 启动窗口\n          periodSeconds: 10\n        readinessProbe:\n          httpGet: { path: /healthz/ready, port: 8080 }\n          periodSeconds: 5\n          failureThreshold: 3\n        livenessProbe:\n          httpGet: { path: /healthz/live, port: 8080 }\n          periodSeconds: 10\n          failureThreshold: 3\n        lifecycle:\n          preStop:\n            exec:\n              command: ['/bin/sh','-c','sleep 10']\n---\napiVersion: v1\nkind: Service\nmetadata: { name: web }\nspec:\n  selector: { app: web }\n  ports: [{ port: 80, targetPort: 8080 }]\n---\napiVersion: v1\nkind: ConfigMap\nmetadata: { name: web-config }\ndata:\n  LOG_LEVEL: info\n  FEATURE_FLAG_V2: \"true\"",
       "highlights": [
         {
-          "line": 8,
-          "note": "maxUnavailable: 0 保证滚动更新时始终有 3 个副本在线，配合 preStop 实现零中断发布。"
+          "line": 10,
+          "note": "maxUnavailable: 0 + maxSurge: 1 保证发布过程中始终有 3 个可用 Pod，配合 preStop 实现零中断。"
         },
         {
-          "line": 18,
-          "note": "terminationGracePeriodSeconds: 60 给优雅退出留足时间，必须大于最长请求耗时 + preStop sleep。"
+          "line": 17,
+          "note": "config-hash annotation：ConfigMap 内容变化时 hash 变，Pod template 变，自动触发滚动更新。"
         },
         {
-          "line": 24,
-          "note": "readinessProbe 决定 Pod 是否进入 Service endpoints，必须真实反映业务可用性。"
+          "line": 20,
+          "note": "terminationGracePeriodSeconds: 60 必须大于 preStop(10s) + 最长请求耗时。"
         },
         {
-          "line": 28,
-          "note": "livenessProbe 失败会触发容器重启，但不会摘流量；摘流量是 readinessProbe 的职责。"
+          "line": 23,
+          "note": "startupProbe 给慢启动应用 300s 窗口，在此之前 readiness/liveness 不会执行。"
         },
         {
-          "line": 33,
-          "note": "preStop sleep 10s 等待 endpoints 异步摘除完成，避免 SIGTERM 期间仍收到新请求。"
+          "line": 27,
+          "note": "readinessProbe 失败只摘流量不重启；livenessProbe 失败会重启容器。"
+        },
+        {
+          "line": 34,
+          "note": "preStop sleep 10s 等待 endpoints 异步摘除完成，避免 SIGTERM 期间仍收到新请求造成 502。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**30 秒结论**\n\nK8s 把工作负载抽象成 Pod，通过五类控制器声明期望状态。Service 提供集群内稳定访问入口，Ingress 做七层暴露，ConfigMap/Secret 注入配置。整套机制围绕「控制器对齐期望状态 + Pod 生命周期 + 服务发现」三件事。\n\n**机制主线**\n\n1. **选控制器**：无状态选 Deployment（滚动更新、随机名）；有状态选 StatefulSet（稳定名、独立 PVC、按序启动）；节点级选 DaemonSet；一次性任务选 Job；定时任务选 CronJob。\n2. **Pod 生命周期**：scheduler 调度后 kubelet 拉镜像、跑 init containers、启动主容器。readinessProbe 决定进不进 Service endpoints，livenessProbe 决定要不要重启容器。删除时打 deletionTimestamp，endpoints 异步摘除的同时跑 preStop，再发 SIGTERM，超过 terminationGracePeriodSeconds 才 SIGKILL。\n3. **服务发现**：Service 通过 selector 找 Pod 生成 Endpoints，kube-proxy 用 iptables/IPVS 实现 VIP 转发。headless Service 配合 StatefulSet 做点对点，Ingress 由 Controller 实现七层路由与 TLS。\n4. **配置注入**：ConfigMap 给明文配置，Secret 给敏感信息。volumeMount 方式支持热更新，env 方式不会更新。\n\n**边界与追问**\n\n- preStop + 优雅退出是高可用发布的关键。\n- selector 与 Pod label 不一致会出现 Endpoints 为空。\n- ConfigMap 改了但 env 注入不会更新。\n- StatefulSet 缩容不会删 PVC，需要手动清理。",
+      "content": "**30 秒结论**\n\nKubernetes 把工作负载抽象为 Pod，通过 Deployment/StatefulSet/DaemonSet/Job/CronJob 五类控制器声明期望状态并持续对齐。Service 提供稳定的服务发现入口，Ingress 做七层路由暴露，ConfigMap/Secret 注入配置。整套机制的核心是三件事：控制器对齐期望状态、Pod 生命周期管理（probe 链 + 优雅终止）、服务发现与配置注入。\n\n**机制主线**\n\n1. **选控制器**：无状态 → Deployment（滚动更新、Pod 名随机可替换）；有状态 → StatefulSet（稳定名 + 独立 PVC + 按序启停）；节点级守护 → DaemonSet（每节点一个，自动跟随节点变化）；一次性任务 → Job（成功即终止，backoffLimit 重试）；定时任务 → CronJob（concurrencyPolicy 控制并发重叠）。选错的代价：Deployment 跑 MySQL 主从 → Pod 重建主从错乱；StatefulSet 跑无状态 API → 有序滚动拖慢发布；DaemonSet 用 Deployment 替代 → 新节点漏调度。\n\n2. **Pod 创建链路**：apiserver 写 etcd → scheduler 选节点 → kubelet 拉镜像 → init containers 串行（等依赖、做 migration）→ 主容器 + postStart → startupProbe 门控 → readinessProbe（决定进不进 Service endpoints）→ livenessProbe（失败则重启容器）。\n\n3. **Pod 终止链路（高可用关键）**：deletionTimestamp → endpoints 异步摘除（有延迟！）+ kubelet 执行 preStop（生产几乎必写 sleep 5-10s 等同步）→ SIGTERM（应用优雅退出）→ terminationGracePeriodSeconds 到期未退出 → SIGKILL。502 的根因是 endpoints 摘除与 SIGTERM 并行，窗口期内请求打到正在退出的 Pod。\n\n4. **服务发现**：Service selector 匹配 Pod label 生成 Endpoints，kube-proxy 用 iptables/IPVS 做 VIP→Pod DNAT。Endpoints 为空的常见原因：selector 与 label 不匹配、Pod readinessProbe 失败。headless Service 配合 StatefulSet 做点对点寻址。Ingress 由 Ingress Controller 实现七层路由和 TLS termination。\n\n5. **配置注入**：env 方式一次性注入不会热更新；volumeMount 方式 kubelet 约 1 分钟同步但应用是否读到取决于 reload 机制。生产推荐 ConfigMap hash annotation 触发滚动更新。Secret 是 base64 不是加密，生产需配合 KMS/sealed-secrets。\n\n**高频追问准备**\n\n- 滚动更新 502：preStop sleep + 优雅退出 + terminationGracePeriodSeconds 配合\n- StatefulSet vs Deployment：身份（稳定名 + headless DNS）、存储（独立 PVC）、顺序（有序启停）\n- ConfigMap 改了没生效：env 不更新 vs volumeMount 取决于应用 reload vs hash annotation 触发滚动更新",
       "followUpQuestions": [
         {
-          "question": "滚动更新时为什么会出现 502/连接被重置？怎么彻底解决？",
-          "answer": "根因是 endpoints 摘除与 SIGTERM 是并行异步的：kube-proxy 还没把 iptables 规则刷掉，新请求继续打到正在退出的 Pod。解决方案是三件事一起做：preStop 里 sleep 5-10s 等 endpoints 同步；应用收到 SIGTERM 后停止接受新连接但继续处理存量请求；terminationGracePeriodSeconds 设到大于最长请求耗时（一般 60s）。另外 readinessProbe 必须真实反映服务可用性，否则 Pod 一启动就被打流量也会 502。"
+          "question": "滚动更新时为什么会出现 502 或连接被重置？要让发布做到零中断需要在哪几层做哪些动作？",
+          "answer": "根因：endpoints 摘除是异步的，kube-proxy 刷 iptables/IPVS 规则有延迟，窗口期内新请求仍打到正在退出的 Pod。三层配合解决：(1) preStop sleep 5-10s 等 endpoints 同步和 LB 规则刷新；(2) 应用收到 SIGTERM 后停止 accept 新连接但继续处理存量请求；(3) terminationGracePeriodSeconds 设到大于 preStop + 最长请求处理时间。另外 readinessProbe 必须真实反映业务可用性，否则刚启动就被打流量也会 502。"
         },
         {
-          "question": "什么时候必须用 StatefulSet 而不是 Deployment？只是为了固定 Pod 名吗？",
-          "answer": "三个核心差异：稳定的网络标识（mysql-0.mysql.default.svc 配合 headless Service 做主从发现）、稳定的存储（每个 Pod 通过 volumeClaimTemplates 绑独立 PVC，重建后还是同一块盘）、有序部署与缩容（按序启动逆序终止，避免主从同时挂）。MySQL 主从、Kafka broker、ES data node、Redis Cluster 这种需要点对点寻址 + 持久化数据 + 启动顺序的场景必须用。固定名字只是表象，本质是身份与存储的绑定。"
+          "question": "StatefulSet 的三个核心能力是什么？什么场景必须用它？",
+          "answer": "稳定网络标识（Pod 名有序如 mysql-0，配合 headless Service 固定 DNS）、稳定存储（volumeClaimTemplates 为每个 Pod 绑独立 PVC，重建后还是同一块盘）、有序部署与缩容（按序启动 0→1→2，逆序终止 2→1→0）。必须用的场景：需要点对点寻址 + 持久化数据 + 启动顺序的有状态服务，如 MySQL 主从、Kafka broker、ES data node、Redis Cluster。固定名字只是表象，本质是身份与存储的绑定关系。"
         },
         {
-          "question": "ConfigMap 改了 Pod 没生效，怎么排查与修复？",
-          "answer": "先看注入方式：env/envFrom 是注入时一次性读的，ConfigMap 改了不会更新，必须重启 Pod（kubectl rollout restart deployment/xxx）。volumeMount 方式 kubelet 会周期性同步（约 1 分钟），但应用必须自己监听文件变化或定期 reload，否则进程内的配置仍然是旧的。常见做法是给 Deployment 加一个基于 ConfigMap hash 的 annotation（很多 Helm chart 用 sha256sum 计算 ConfigMap 内容写到 spec.template.metadata.annotations），ConfigMap 一变 hash 变 Pod template 变就触发滚动更新，绕开热更新不可靠的问题。"
+          "question": "ConfigMap 改了 Pod 没生效，怎么排查和修复？",
+          "answer": "先看注入方式：env/envFrom 是一次性注入，ConfigMap 改了不会更新，必须重启 Pod（kubectl rollout restart）。volumeMount 方式 kubelet 约 1 分钟同步文件，但应用自己不 reload 的话进程内仍是旧值。根本解法是给 Deployment 加 ConfigMap 内容的 hash annotation，ConfigMap 变 → hash 变 → Pod template 变 → 自动触发滚动更新，绕开热更新不可靠的问题。"
+        },
+        {
+          "question": "Service 的 Endpoints 为空有哪些原因？怎么排查？",
+          "answer": "(1) selector 与 Pod label 不匹配（最常见，包括大小写不一致），kubectl get pod -l <selector> 看能不能选到 Pod；(2) Pod 的 readinessProbe 持续失败，Pod 不是 Ready 状态就不会进 Endpoints，kubectl describe pod 看 Conditions；(3) Pod 处于 Terminating 状态（正在被删除）；(4) namespace 不对。排查步骤：kubectl get endpoints <svc-name> → kubectl get pod -l <selector> --show-labels → kubectl describe pod 看 Ready 状态和 Events。"
         }
       ]
     },
@@ -170,20 +209,21 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "六类控制器分别解决什么场景，选错的代价",
-        "Pod 从 apiserver 写入到 Terminated 的完整链路，以及 init/start/readiness/liveness/preStop 各自负责什么",
-        "endpoints 摘除与 SIGTERM 的异步关系，以及为什么需要 preStop sleep",
-        "StatefulSet 与 Deployment 在身份、存储、启动顺序上的差异",
-        "Service 四种类型与 headless Service 的用途",
-        "Ingress 资源与 Ingress Controller 的关系",
-        "ConfigMap/Secret 注入方式（env vs volumeMount）对热更新的影响"
+        "五类控制器（Deployment/StatefulSet/DaemonSet/Job/CronJob）分别解决什么场景，选错的代价",
+        "Pod 创建链路：scheduler 调度 → kubelet 拉镜像 → init containers → 主容器 + postStart → startupProbe → readinessProbe → livenessProbe",
+        "startupProbe/readinessProbe/livenessProbe 三者的区别：失败后果、决定什么、如何配合",
+        "Pod 终止链路：deletionTimestamp → endpoints 异步摘除 + preStop → SIGTERM → terminationGracePeriodSeconds → SIGKILL",
+        "endpoints 异步摘除与 SIGTERM 的并行关系，以及为什么 preStop sleep 是零中断发布的关键",
+        "StatefulSet 与 Deployment 在身份、存储、启动顺序上的三个核心差异",
+        "Service 四种类型和 headless Service 的用途，Endpoints 为空的排查方法",
+        "ConfigMap 的 env 注入与 volumeMount 注入对热更新的影响差异"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "devops.container-k8s.kubernetes-objects.recall.1",
-      "prompt": "讲一下 Pod 从创建到终止的完整生命周期，重点说 readinessProbe、livenessProbe、preStop 各在哪个阶段、解决什么问题。",
+      "prompt": "讲一下 Pod 从创建到终止的完整生命周期，重点说 startupProbe、readinessProbe、livenessProbe 各在哪个阶段、解决什么问题、失败后果分别是什么。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
@@ -204,7 +244,14 @@
     },
     {
       "id": "devops.container-k8s.kubernetes-objects.recall.4",
-      "prompt": "Service 的 endpoints 为空可能是哪些原因？你会按什么顺序排查？",
+      "prompt": "Service 的 Endpoints 为空可能是哪些原因？你会按什么顺序排查？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "devops.container-k8s.kubernetes-objects.recall.5",
+      "prompt": "ConfigMap 用 env 注入和 volumeMount 注入有什么区别？改了 ConfigMap 但 Pod 没生效，你会怎么排查和解决？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -212,26 +259,27 @@
   ],
   "rubric": {
     "mustHave": [
-      "区分 Deployment/StatefulSet/DaemonSet/Job/CronJob 五类控制器的适用场景",
-      "讲清 Pod 创建链路：scheduler 调度→kubelet 拉镜像→init containers→主容器+postStart→startupProbe→readinessProbe→livenessProbe",
-      "讲清 Pod 终止链路：deletionTimestamp→endpoints 异步摘除+preStop→SIGTERM→terminationGracePeriodSeconds 超时→SIGKILL",
-      "说明 readinessProbe 与 livenessProbe 的差别（前者只摘流量、后者会重启容器）",
-      "说明 Service selector 与 Pod label 一致性对 Endpoints 的决定作用",
-      "区分 ConfigMap 的 env 注入与 volumeMount 注入对热更新的影响"
+      "区分 Deployment/StatefulSet/DaemonSet/Job/CronJob 五类控制器的适用场景和选错代价",
+      "讲清 Pod 创建链路：scheduler 调度 → kubelet 拉镜像 → init containers → 主容器+postStart → startupProbe → readinessProbe → livenessProbe",
+      "讲清 Pod 终止链路：deletionTimestamp → endpoints 异步摘除 + preStop → SIGTERM → terminationGracePeriodSeconds 超时 → SIGKILL",
+      "区分 readinessProbe（摘流量）与 livenessProbe（重启容器）的差别，理解 startupProbe 的门控作用",
+      "说明 Service selector 与 Pod label 一致性对 Endpoints 的决定作用，以及 Endpoints 为空的排查方法",
+      "区分 ConfigMap 的 env 注入（不热更新）与 volumeMount 注入（kubelet 同步但取决于应用 reload）"
     ],
     "goodToHave": [
-      "能解释 maxSurge/maxUnavailable 在滚动更新中的取舍",
+      "能解释 maxSurge/maxUnavailable 在滚动更新中的取舍以及如何实现零中断",
       "能讲 StatefulSet 通过 volumeClaimTemplates + headless Service 实现身份与存储绑定",
-      "能解释 kube-proxy iptables/IPVS 模式下 endpoints 同步延迟带来的 502",
+      "能解释 kube-proxy iptables/IPVS 模式下 endpoints 同步延迟导致 502 的机理",
       "能用 ConfigMap hash annotation 触发滚动更新解决热更新不生效",
-      "了解 Secret 静态加密、external-secrets-operator、sealed-secrets 等生产方案"
+      "了解 Secret base64 不是加密，知道 sealed-secrets/external-secrets-operator 等生产方案"
     ],
     "commonMistakes": [
       "把 ConfigMap 用 env 注入后期望热更新生效",
-      "用 Deployment 跑 MySQL 主从，导致 Pod 重建后主从关系错乱",
-      "认为 livenessProbe 失败会摘流量（实际是重启容器，摘流量是 readinessProbe）",
-      "preStop 不做 sleep，发布期间出现 502 误以为是应用 bug",
-      "Service selector 与 Pod label 大小写不一致导致 Endpoints 永远为空，却去看 Pod 状态"
+      "用 Deployment 跑 MySQL 主从，Pod 重建后主从关系错乱",
+      "认为 livenessProbe 失败会摘流量（实际是 readinessProbe 摘流量，livenessProbe 重启容器）",
+      "preStop 不做 sleep 就发 SIGTERM，发布期间出现 502 误以为是应用 bug",
+      "Service selector 与 Pod label 大小写不一致导致 Endpoints 为空，却去排查 Pod 状态",
+      "不知道 startupProbe 的存在，慢启动应用的 livenessProbe initialDelaySeconds 设太短导致 restart loop"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -240,5 +288,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

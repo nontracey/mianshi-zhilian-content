@@ -4,35 +4,45 @@
   "category": "mysql-core",
   "group": "mysql-core",
   "title": "MySQL MVCC 与 ReadView",
-  "summary": "理解 Undo Log 版本链、ReadView、当前读和快照读。",
+  "summary": "讲清 undo log 版本链如何串联历史版本、ReadView 四字段可见性判断的完整分支逻辑、RC 与 RR 下 ReadView 生成时机差异、快照读与当前读的边界、MVCC 与 Next-Key Lock 如何协同防幻读、长事务持有老 ReadView 导致 purge 滞后和 undo 膨胀的线上排查。",
   "tags": [
     "数据库",
     "MySQL",
     "mysql-core"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 29,
   "order": 40,
   "recommendWeight": 90,
   "status": "staging",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "能否讲清 ReadView 四字段可见性判断的分支逻辑、RR 与 RC 下 ReadView 生成时机的差异、快照读与当前读在加锁和版本选择上的区别，以及长事务导致 purge 滞后的线上排查思路。",
+  "interviewerFocus": "能否讲清 ReadView 四字段可见性判断的完整分支逻辑、RC 与 RR 下 ReadView 生成时机的差异根因、快照读与当前读在加锁和版本选择上的根本区别、RR 下幻读的真实边界（混用两种读），以及长事务导致 purge 滞后的线上排查思路。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "MVCC 用版本链让一致性读减少阻塞",
-      "content": "MVCC 是多版本并发控制。InnoDB 更新记录时不会直接覆盖旧值，而是先把旧版本写入 undo log，再通过记录头中的 `roll_pointer`（回滚指针）把历史版本串成链表，形成版本链（undo log chain）。快照读根据 ReadView 判断哪个版本对当前事务可见，从而在不加锁的情况下实现一致性读。\n\n核心机制：\n- 每次 update/delete 会在聚簇索引记录上写入新版本，旧版本通过 undo log 保留，`roll_pointer` 指向前一个版本\n- ReadView 包含四个关键字段：`m_ids`（生成 ReadView 时活跃事务 id 集合）、`min_trx_id`（m_ids 中最小值）、`max_trx_id`（下一个将分配的事务 id）、`creator_trx_id`（创建该 ReadView 的事务 id）\n- 读已提交（RC）：每条普通 SELECT 语句开始时生成新 ReadView\n- 可重复读（RR）：事务中第一次执行普通 SELECT 时生成 ReadView，之后整个事务复用\n\n容易答错的边界：\n- MVCC 只服务普通 SELECT（快照读），update/delete/insert/`SELECT ... FOR UPDATE`/`SELECT ... LOCK IN SHARE MODE` 都是当前读，读取最新已提交版本并加锁\n- RR 下 ReadView 在第一次快照读时才生成，不是 `BEGIN` 时生成——如果事务先执行了一条当前读再执行快照读，快照读的 ReadView 仍以第一次快照读时刻为准\n- 长事务持有老 ReadView，导致 purge 线程无法清理 undo log，版本链变长、ibdata1 或 undo tablespace 膨胀"
+      "title": "MVCC 用版本链让一致性读不加锁",
+      "content": "InnoDB 更新记录时不会直接覆盖旧值。修改发生前，旧版本先写入 undo log（准确说是 undo log segment 中的 undo log record），然后新版本写入聚簇索引。聚簇索引记录头中有一个固定字段 `DB_ROLL_PTR`（代码中叫 `roll_pointer`，7 字节，编码了 undo log 的 page number 和 offset），每次版本更新都会把 `roll_pointer` 指向刚写入的旧版本 undo record，形成单向链表——这就是 undo log version chain（版本链）。链的头节点始终是聚簇索引上的最新版本，尾节点是该行第一次被修改前的初始状态（insert undo 在事务结束后即被回收，update undo 才进入 purge 链表）。\n\n快照读（普通 SELECT）根据事务启动时获得的 ReadView，沿这条链逐版本判断可见性，找到第一个可见版本就返回，不需要加任何行锁。这意味着读操作不需要等写操作提交，写操作也不需要等读操作释放锁——读写并发大幅提高。代价是每行可能存在多个版本占用空间，并且需要后台 purge 线程定期清理不再被任何 ReadView 需要的旧版本。\n\n这里要厘清一个常见误解：undo log 的主要用途是事务回滚（提供原值），MVCC 版本链是它的副产品——恰好复用了回滚所需的旧值来支持一致性读。因此 undo log 不能在事务提交后立即删除，必须等所有可能访问它的 ReadView 都释放后，由 purge 线程安全回收。"
     },
     {
       "type": "explain",
-      "title": "ReadView 可见性判断的分支逻辑",
-      "content": "拿到一条记录的最新版本后，InnoDB 用版本头中的 `trx_id`（最后修改该版本的事务 id）与 ReadView 的四个字段做判断，沿版本链逐版本比较，直到找到第一个可见版本。\n\n判断规则（按顺序）：\n1. `trx_id == creator_trx_id`：版本是当前事务自己修改的，可见\n2. `trx_id < min_trx_id`：修改该版本的事务在 ReadView 生成前已提交，可见\n3. `trx_id >= max_trx_id`：修改该版本的事务在 ReadView 生成后才启动，不可见，沿 `roll_pointer` 找旧版本\n4. `min_trx_id <= trx_id < max_trx_id` 且 `trx_id` 在 `m_ids` 中：修改者仍活跃，不可见，继续找旧版本\n5. `min_trx_id <= trx_id < max_trx_id` 且 `trx_id` 不在 `m_ids` 中：修改者已提交，可见\n\n面试常追问 RC 和 RR 的差异根因：RC 每条语句生成新 ReadView，所以同事务两次 SELECT 可能看到别的事务新提交的数据；RR 复用第一次快照读的 ReadView，所以同事务内多次快照读结果一致。\n\n再补一句当前读：`UPDATE`、`DELETE`、`SELECT ... FOR UPDATE` 读取最新版本并加记录锁/间隙锁，不走 ReadView 可见性判断，因此它们不等同于快照读。"
+      "title": "ReadView 四字段与可见性判断分支逻辑",
+      "content": "ReadView 是事务生成一致性视图时的快照数据结构，核心只有四个字段：\n\n- `m_ids`（`m_low_limit_id` 以下、`m_up_limit_id` 以上的活跃事务 id 列表）：生成 ReadView 时所有尚未提交的读写事务 id 集合，注意只收集有写操作的事务，只读事务不会出现在 `m_ids` 中\n- `min_trx_id`（`m_up_limit_id`）：`m_ids` 中的最小值，如果 `m_ids` 为空则为 `max_trx_id`（下一个待分配 id）\n- `max_trx_id`（`m_low_limit_id`）：ReadView 生成时系统应分配的下一个事务 id，注意这个 id 本身并未分配，是一个「未来 id」的上界\n- `creator_trx_id`：创建该 ReadView 的事务自身 id\n\n拿到一条记录后，取其最新版本的 `trx_id`（记录头中的 `DB_TRX_ID`，最后修改它的事务 id），沿版本链做以下三分支判断：\n\n**第一判**：`trx_id == creator_trx_id` → 自己改的，可见。\n**第二判**：`trx_id < min_trx_id` → 修改者在 ReadView 生成前已提交，可见。\n**第三判**：`trx_id >= max_trx_id` → 修改者在 ReadView 生成后才启动，不可见，沿 `roll_pointer` 找旧版本。\n**第四判**（区间内）：`min_trx_id <= trx_id < max_trx_id` → 检查 `trx_id` 是否在 `m_ids` 中：\n  - 在 → 修改者仍活跃（未提交），不可见，找旧版本\n  - 不在 → 修改者已提交，可见\n\n找到可见版本就返回；不可见就沿 `roll_pointer` 继续遍历，直到找到可见版本或到达版本链尾部（说明该行对当前事务不可见，不返回）。\n\n有个边界值得讲：`m_ids` 里只收集有写操作的活跃事务，因为只读事务不会修改数据，不需要纳入并发控制的活跃集合。InnoDB 分配事务 id 的时机是事务首次执行写操作，纯 SELECT 事务的 `trx_id` 始终为 0，不会出现在 `m_ids` 中。"
     },
     {
       "type": "explain",
-      "title": "可重复读下仍可能发生幻读及 MVCC 与幻读的关系",
-      "content": "幻读指同一事务内两次相同范围查询，第二次出现了之前不存在的行。很多人认为 RR 下完全不会有幻读，这不准确。\n\nMVCC 对幻读的「部分解决」：\n- 快照读场景：RR 下复用同一 ReadView，两次普通 SELECT 沿版本链看到的可见版本集合不变，别的事务新插入的行 `trx_id >= max_trx_id` 不可见，因此快照读不会幻读\n- 当前读场景：`SELECT ... FOR UPDATE` 不走 ReadView，读的是最新版本。如果只靠 MVCC，两次当前读之间别的事务插入新行，第二次当前读就会多出行——这就是幻读\n\nInnoDB 在 RR 下的完整方案是 MVCC + Next-Key Lock：\n- 快照读靠 MVCC 版本链保证一致性\n- 当前读靠 Next-Key Lock（记录锁 + 间隙锁）锁住查询范围，阻止别的事务在间隙内插入，从而避免当前读的幻读\n\n线上排查线索：如果业务反馈「同事务两次查询结果不一致」，先确认是否混用了快照读和当前读——先 `SELECT FOR UPDATE` 再普通 `SELECT`，快照读的 ReadView 在第一次快照读时才生成，但当前读已经看到了最新数据，可能造成感知上的不一致。"
+      "title": "RC 与 RR 的 ReadView 生成时机差异是隔离级别实现的核心",
+      "content": "RC（读已提交）和 RR（可重复读）的隔离语义差异，InnoDB 并没有用锁来区分，而是用 ReadView 生成时机来区分：\n\n**RC（READ COMMITTED）**：每条普通 SELECT 语句执行时，创建一个新的 ReadView。这意味着同一事务中，第一条 SELECT 看到的活跃事务集合和第二条 SELECT 看到的可能不同——如果两条语句之间有其他事务提交了，新 ReadView 的 `m_ids` 不再包含已提交事务，第二条 SELECT 就能看到新提交的数据。这就是「不可重复读」的根源。\n\n**RR（REPEATABLE READ）**：事务中第一次执行普通 SELECT 时创建 ReadView，之后整个事务复用这个 ReadView。不管其他事务是否提交，`m_ids` 和 `min_trx_id`/`max_trx_id` 都固定，后续所有快照读看到的数据快照一致。但注意——这个 ReadView 不是 `BEGIN` 时生成的，而是第一条快照读语句时生成。如果事务先做了写操作或其他当前读（如 `SELECT ... FOR UPDATE`），ReadView 要等到第一条普通 SELECT 才创建。这个设计的好处是减少持有 ReadView 的时间窗口，降低对 purge 的压力；坏处是如果业务先执行当前读看到最新数据，再执行快照读用新 ReadView，两次读可能看到不同时刻的数据，产生感知上的不一致。\n\n**SERIALIZABLE**：在 RR 基础上，所有 SELECT 隐式转为 `SELECT ... LOCK IN SHARE MODE`，全部走当前读，MVCC 快照读基本不参与，读写冲突通过锁机制解决。"
+    },
+    {
+      "type": "explain",
+      "title": "快照读与当前读是两套完全不同的读取路径",
+      "content": "「MVCC 让所有读都不加锁」是最常见的错误说法。InnoDB 有两种读取路径，加锁行为完全不同：\n\n**快照读（Snapshot Read）**：普通 `SELECT`，走版本链 + ReadView，不加行锁。适合读多写少场景，读写完全不阻塞。但注意：快照读读到的不是「当前最新数据」，而是 ReadView 生成时刻的数据快照。\n\n**当前读（Current Read）**：以下操作都是当前读——\n- `SELECT ... FOR UPDATE`：读最新版本 + 加 X 锁（Next-Key Lock）\n- `SELECT ... LOCK IN SHARE MODE`：读最新版本 + 加 S 锁\n- `INSERT`/`UPDATE`/`DELETE`：先以当前读方式读到最新版本，在其上修改\n\n当前读完全不走 ReadView，直接读聚簇索引上的最新版本（如果最新版本不可见，需要等其他事务提交或回滚让版本可见），并在读到的记录及其间隙上加锁。这意味着当前读和写操作共享同一套锁机制，读写冲突通过锁等待解决。\n\n混用两种读是线上常见的 bug 来源：事务中先 `SELECT ... FOR UPDATE` 看到最新数据，再普通 `SELECT` 走快照读，可能看到不同版本的数据。业务如果需要读写一致，应全程使用当前读；如果需要快照一致性，应全程使用快照读，避免混用。"
+    },
+    {
+      "type": "explain",
+      "title": "RR 下幻读靠 MVCC + Next-Key Lock 协同解决",
+      "content": "幻读指同一事务内，两次相同范围查询，第二次返回了第一次没有的行。RR 隔离级别下幻读的防护需要分场景讨论：\n\n**快照读场景（普通 SELECT）**：完全靠 MVCC。RR 下 ReadView 复用，两次快照读的 `m_ids` 和 `max_trx_id` 相同，其他事务新插入的行 `trx_id >= max_trx_id`，不可见，两次查询结果一致。所以快照读不会幻读。\n\n**当前读场景（SELECT ... FOR UPDATE / UPDATE / DELETE）**：MVCC 不参与。如果只有 MVCC，两次当前读之间其他事务可以插入新行，第二次就会多出——幻读。InnoDB 的解决方案是 Next-Key Lock（记录锁 + 间隙锁）：当前读不仅锁住已有的匹配记录，还锁住记录之间的间隙，阻止其他事务在间隙内 `INSERT`。两次当前读之间因为间隙已被锁住，不会有新行插入，幻读不会发生。\n\n**RR 下仍有幻读的真实场景**：先快照读、再当前读、再快照读。步骤如下：\n1. 事务 A 快照读，ReadView 创建（`max_trx_id = 101`），某个范围返回 3 行\n2. 事务 B 插入一行并提交（`trx_id = 101`）\n3. 事务 A 当前读同一范围，读到最新版本，看到 4 行（101 已提交）\n4. 事务 A 再次快照读，复用步骤 1 的 ReadView，`trx_id=101 >= max_trx_id=101`，新插入行不可见，仍是 3 行\n\n这里步骤 3 和步骤 4 结果不一致，且步骤 3 的当前读因为读到了新行，可能会触发后续更新逻辑产生数据不一致。这就是所谓的「RR 下快照读和当前读混用导致的幻读感知」，也是面试高频追问点。"
     },
     {
       "type": "diagram",
@@ -60,44 +70,13 @@
     {
       "type": "compareTable",
       "title": "MVCC 读类型与隔离级别对比",
-      "columns": [
-        "考点",
-        "机制含义",
-        "面试要点",
-        "常见误区"
-      ],
-      "rows": [
-        [
-          "快照读",
-          "普通 SELECT 沿版本链找 ReadView 可见版本，不加锁",
-          "读多写少场景下降低读写阻塞",
-          "以为所有 SELECT 都走快照读"
-        ],
-        [
-          "当前读",
-          "读取最新已提交版本并加记录锁/间隙锁",
-          "UPDATE/DELETE/FOR UPDATE/LOCK IN SHARE MODE",
-          "误以为 FOR UPDATE 也走旧快照"
-        ],
-        [
-          "读已提交 RC",
-          "每条语句生成新 ReadView",
-          "同事务两次 SELECT 可能看到新提交数据",
-          "把不可重复读和脏读混淆"
-        ],
-        [
-          "可重复读 RR",
-          "事务首次快照读生成 ReadView 后复用",
-          "MySQL 默认隔离级别",
-          "认为 RR 下当前读也不会幻读"
-        ]
-      ]
+      "content": "| 考点 | 机制含义 | 面试要点 | 常见误区 |\n| --- | --- | --- | --- |\n| 快照读 | 普通 SELECT，沿版本链找 ReadView 可见版本，不加行锁 | 读多写少下降低读写阻塞，但读到的是生成 ReadView 时刻的快照 | 以为所有 SELECT 都走快照读 |\n| 当前读 | 读最新已提交版本 + 加记录锁/间隙锁 | UPDATE/DELETE/FOR UPDATE/LOCK IN SHARE MODE 都是当前读 | 误以为 FOR UPDATE 也走旧快照 |\n| RC（读已提交） | 每条语句生成新 ReadView | 同事务两次 SELECT 可能看到新提交数据 | 把不可重复读和脏读混淆（脏读是 RU 级别） |\n| RR（可重复读） | 事务首次快照读生成 ReadView 后复用 | MySQL 默认隔离级别；快照读一致，但当前读可能幻读 | 认为 RR 下当前读也不会幻读 |\n| SERIALIZABLE | SELECT 隐式转为当前读加 S 锁 | 通过锁机制解决所有并发冲突，性能最差 | 认为它只是更严格的 RR |"
     },
     {
       "type": "code",
       "title": "快照读与当前读对比及线上排查命令",
       "language": "sql",
-      "content": "-- 快照读：根据 ReadView 沿版本链找可见版本\nSELECT balance FROM account WHERE id = 1;\n\n-- 当前读：读最新版本并加 Next-Key Lock\nSELECT balance FROM account WHERE id = 1 FOR UPDATE;\n\n-- 查看当前活跃事务（排查长事务导致 purge 滞后）\nSELECT trx_id, trx_state, trx_started, trx_mysql_thread_id\nFROM information_schema.INNODB_TRX\nORDER BY trx_started ASC\nLIMIT 10;\n\n-- 查看 undo log 堆积情况（MySQL 5.7+）\nSHOW ENGINE INNODB STATUS\\G\n-- 关注 TRANSACTIONS 段中的 History list length\n-- 该值持续增长说明 purge 线程跟不上 undo 回收",
+      "content": "-- 快照读：根据 ReadView 沿版本链找可见版本\nSELECT balance FROM account WHERE id = 1;\n\n-- 当前读：读最新版本并加 Next-Key Lock\nSELECT balance FROM account WHERE id = 1 FOR UPDATE;\n\n-- 查看当前活跃事务（排查长事务导致 purge 滞后）\nSELECT trx_id, trx_state, trx_started, trx_mysql_thread_id\nFROM information_schema.INNODB_TRX\nORDER BY trx_started ASC\nLIMIT 10;\n\n-- 查看 undo log 堆积情况（MySQL 5.7+）\nSHOW ENGINE INNODB STATUS\\G\n-- 关注 TRANSACTIONS 段中的 History list length\n-- 该值持续增长说明 purge 线程跟不上 undo 回收\n\n-- MySQL 8.0 查 undo tablespace 使用量\nSELECT NAME, FILE_SIZE, ALLOCATED_SIZE\nFROM information_schema.INNODB_TABLESPACES\nWHERE NAME LIKE '%undo%';",
       "highlights": [
         {
           "line": 2,
@@ -105,7 +84,7 @@
         },
         {
           "line": 5,
-          "note": "FOR UPDATE 是当前读，不走 ReadView 可见性判断，直接读最新版本并加锁。"
+          "note": "FOR UPDATE 是当前读，不走 ReadView 可见性判断，直接读最新版本并加 Next-Key Lock。"
         },
         {
           "line": 8,
@@ -113,26 +92,30 @@
         },
         {
           "line": 13,
-          "note": "History list length 反映未清理的 undo log 数量，持续增长是长事务拖累 MVCC 的直接证据。"
+          "note": "History list length 反映未清理的 update undo log 数量，持续增长是长事务拖累 MVCC 的直接证据。"
+        },
+        {
+          "line": 16,
+          "note": "MySQL 8.0 支持独立 undo tablespace，可通过 INNODB_TABLESPACES 查其文件大小，辅助判断膨胀程度。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "MVCC 我会围绕 undo 版本链、ReadView 可见性判断和读类型来回答。\n\n**30 秒结论**：MVCC 通过 undo log 版本链保留历史版本，快照读用 ReadView 判断哪个版本可见，从而在不加锁的情况下实现一致性读；RC 和 RR 的核心差异是 ReadView 生成时机。\n\n**机制要点**：\n1. 更新记录时旧版本写入 undo log，通过 `roll_pointer` 串成版本链\n2. ReadView 四字段：`m_ids`（活跃事务集合）、`min_trx_id`、`max_trx_id`、`creator_trx_id`\n3. 可见性判断是三分支决策：`trx_id < min_trx_id` 可见；`trx_id >= max_trx_id` 不可见；落在区间内看是否在 `m_ids` 中\n4. RC 每条语句生成新 ReadView，RR 事务首次快照读生成后复用\n5. 当前读（FOR UPDATE/UPDATE/DELETE）不走 ReadView，读最新版本并加锁\n\n**边界与追问应对**：\n- RR 下快照读不会幻读（ReadView 复用），但当前读可能幻读，InnoDB 用 Next-Key Lock 补充解决\n- 长事务持有老 ReadView 导致 purge 线程无法清理 undo，线上用 `INNODB_TRX` 视图查 `trx_started` 最早的事务，`SHOW ENGINE INNODB STATUS` 看 History list length 是否持续增长\n- MVCC 降低读写冲突但不能替代锁，写写冲突和当前读仍依赖 InnoDB 锁机制",
+      "content": "MVCC 我会围绕版本链、ReadView 可见性判断、读类型边界和线上排查来回答。\n\n**30 秒结论**：MVCC 通过 undo log 版本链保留历史版本，快照读用 ReadView 判断哪个版本可见，在不加锁的情况下实现一致性读；RC 和 RR 的核心差异是 ReadView 生成时机——RC 每条语句生成新 ReadView，RR 事务首次快照读生成后复用。\n\n**机制主线**：\n1. 更新时旧版本写入 undo log，新版本在聚簇索引上，`roll_pointer`（7 字节，编码 page number + offset）把历史版本串成单向链表\n2. ReadView 四字段：`m_ids`（活跃读写事务 id 集合）、`min_trx_id`（最小活跃 id）、`max_trx_id`（下一个待分配 id）、`creator_trx_id`（自身事务 id）\n3. 可见性三分支判断：`trx_id < min_trx_id` → 可见；`trx_id >= max_trx_id` → 不可见，沿版本链找旧版；区间内看是否在 `m_ids` 中\n4. 快照读（普通 SELECT）走版本链 + ReadView，不加锁；当前读（FOR UPDATE/UPDATE/DELETE）读最新版本 + 加锁，不走 ReadView\n5. RR 下快照读靠 MVCC 防幻读，当前读靠 Next-Key Lock（记录锁 + 间隙锁）防幻读；混用快照读和当前读时仍可能感知幻读\n\n**线上排查（长事务导致 undo 膨胀）**：\n- `SELECT * FROM information_schema.INNODB_TRX ORDER BY trx_started ASC`：定位最老的活跃事务\n- `SHOW ENGINE INNODB STATUS` → TRANSACTIONS 段 → `History list length`：持续增长说明 purge 无法回收 undo\n- MySQL 8.0 可查 `INNODB_TABLESPACES` 中 undo tablespace 的 FILE_SIZE\n- 解决：kill 长事务；MySQL 8.0 可设 `innodb_undo_log_truncate` 自动收缩；评估业务是否需要在事务中做大量慢查询",
       "followUpQuestions": [
         {
-          "question": "RR 隔离级别下还会发生幻读吗？MVCC 如何处理幻读？",
-          "answer": "要分快照读和当前读两种情况。快照读复用同一 ReadView，别的事务新插入行的 trx_id >= max_trx_id 不可见，所以快照读不会幻读。但当前读（SELECT FOR UPDATE）不走 ReadView，读最新版本，两次当前读之间如果有新插入就会幻读。InnoDB 在 RR 下用 Next-Key Lock（记录锁+间隙锁）锁住查询范围来阻止插入，从而避免当前读的幻读。所以 RR 防幻读是 MVCC + Next-Key Lock 共同完成的。"
+          "question": "RR 隔离级别下还会发生幻读吗？",
+          "answer": "分场景。快照读复用同一 ReadView，新插入行的 trx_id >= max_trx_id 不可见，不会幻读。当前读（SELECT FOR UPDATE）不走 ReadView，读最新版本，需要依赖 Next-Key Lock 锁住查询范围阻止插入来防幻读。但如果事务中先做快照读、再让其他事务提交插入、再做当前读，当前读会看到新行，后续再做快照读又看不到——混用两种读时会产生感知不一致，这是 RR 的设计边界。"
         },
         {
-          "question": "线上发现 undo log 持续膨胀，如何排查是否与 MVCC 长事务有关？",
-          "answer": "三步排查：第一步查 information_schema.INNODB_TRX 视图，按 trx_started 升序找最早开始的事务，确认是否有长事务未提交；第二步执行 SHOW ENGINE INNODB STATUS，看 TRANSACTIONS 段的 History list length，如果持续增长说明 purge 线程无法回收 undo；第三步确认该事务是否持有老 ReadView（RR 下首次快照读后 ReadView 一直复用），导致 purge 必须保留该 ReadView 可能看到的版本。解决方式是 kill 长事务或设置 innodb_kill_idle_transaction 主动清理。"
+          "question": "ReadView 为什么是首次快照读时生成而不是 BEGIN 时生成？",
+          "answer": "推迟创建可以缩短持有 ReadView 的时间窗口。如果事务先执行当前读、DDL 或其他写操作而不做快照读，就不会创建 ReadView，purge 线程不受影响。代价是如果事务先做当前读再做快照读，两者可能看到不同时刻的数据。这是 InnoDB 在一致性保证和 purge 效率之间的工程取舍。"
         },
         {
-          "question": "为什么 ReadView 在 RR 下是首次快照读时生成而不是 BEGIN 时生成？这样设计有什么取舍？",
-          "answer": "InnoDB 的设计是事务中第一条普通 SELECT 触发 ReadView 创建，而不是 BEGIN 时。好处是如果事务先做一些不需要一致性视图的操作（如当前读或 DDL），可以推迟 ReadView 创建，减少持有老视图的时间，降低对 purge 的影响。坏处是如果事务先执行当前读看到最新数据，再执行快照读时 ReadView 以快照读时刻为准，可能和之前当前读看到的数据不一致，造成业务感知上的混淆。这是灵活性和一致性之间的工程取舍。"
+          "question": "线上发现 History list length 持续增长，怎么定位和解决？",
+          "answer": "第一步查 INNODB_TRX 按 trx_started 排序，找最老的活跃事务及其 thread_id、运行时长。第二步确认该事务是否处于 RR 隔离级别并持有老 ReadView（快照读过一次后一直复用）。第三步 kill 长事务（`KILL thread_id`）。长期方案：业务侧拆分大事务、避免事务中做耗时外部调用、设置合理的 `innodb_lock_wait_timeout`、MySQL 8.0 启用 `innodb_undo_log_truncate` 自动收缩 undo tablespace。"
         }
       ]
     },
@@ -140,65 +123,73 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "undo log 版本链通过 roll_pointer 串联历史版本",
-        "ReadView 四字段 m_ids/min_trx_id/max_trx_id/creator_trx_id 的含义",
-        "可见性判断的三分支逻辑：小于 min_trx_id 可见、大于等于 max_trx_id 不可见、区间内看 m_ids",
-        "RC 每条语句生成 ReadView，RR 首次快照读生成后复用",
-        "快照读走 MVCC 版本链，当前读读最新版本并加锁",
-        "RR 下快照读不幻读靠 MVCC，当前读不幻读靠 Next-Key Lock",
-        "长事务持有老 ReadView 阻止 purge 清理 undo，用 INNODB_TRX 和 History list length 排查"
+        "undo log 版本链通过 roll_pointer（7 字节 page number + offset）串联历史版本，链头是聚簇索引最新版本",
+        "ReadView 四字段 m_ids/min_trx_id/max_trx_id/creator_trx_id 的精确含义和 m_ids 只包含读写事务",
+        "可见性三分支判断：trx_id < min_trx_id 可见 / trx_id >= max_trx_id 不可见 / 区间内看 m_ids",
+        "RC 每条语句生成 ReadView，RR 首次快照读生成后复用，两者都不是 BEGIN 时生成",
+        "快照读走 MVCC 版本链不加锁，当前读读最新版本并加 Next-Key Lock，不走 ReadView",
+        "RR 下快照读防幻读靠 MVCC，当前读防幻读靠 Next-Key Lock，混用两种读可能感知幻读",
+        "长事务持有老 ReadView 阻止 purge 清理 undo，用 INNODB_TRX + History list length 排查"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "database.mysql-core.mysql-mvcc.recall.1",
-      "prompt": "请讲清楚 undo 版本链和 ReadView 如何决定可见性。",
+      "prompt": "请完整讲清楚 undo log 版本链是怎么构建的，ReadView 的四个字段分别是什么含义，以及可见性判断的完整逻辑。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "database.mysql-core.mysql-mvcc.recall.2",
-      "prompt": "快照读和当前读有什么区别，并说明关键机制和边界条件。",
+      "prompt": "快照读和当前读有什么区别？请分别说明加锁行为、读取版本和适用场景，并解释为什么 FOR UPDATE 不走 MVCC。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "database.mysql-core.mysql-mvcc.recall.3",
-      "prompt": "RR 隔离级别下还会发生幻读吗？MVCC 和 Next-Key Lock 各自如何处理？",
+      "prompt": "RR 隔离级别下还会发生幻读吗？请分快照读、当前读和混用场景分别分析 MVCC 与 Next-Key Lock 各自如何处理。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "database.mysql-core.mysql-mvcc.recall.4",
-      "prompt": "线上 undo log 持续膨胀，如何排查是否与 MVCC 长事务有关？",
+      "prompt": "线上发现 History list length 持续增长、undo tablespace 膨胀，请描述你的排查步骤和解决方案。",
       "mode": "text",
       "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "database.mysql-core.mysql-mvcc.recall.5",
+      "prompt": "为什么 InnoDB 设计 ReadView 在首次快照读时生成而不是 BEGIN 时生成？这个取舍会带来什么问题？",
+      "mode": "text",
+      "expectedMinutes": 3,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "undo log 版本链通过 roll_pointer 串联历史版本",
-      "ReadView 四字段 m_ids/min_trx_id/max_trx_id/creator_trx_id",
-      "可见性判断三分支逻辑",
-      "RC 语句级 ReadView 与 RR 事务级 ReadView 的生成时机差异",
-      "当前读读最新版本并加锁不走 ReadView"
+      "能说清 undo log 版本链通过 roll_pointer 串联历史版本的构建机制",
+      "能准确描述 ReadView 四字段 m_ids/min_trx_id/max_trx_id/creator_trx_id 的含义",
+      "能讲清可见性三分支判断的完整逻辑",
+      "能说明 RC 语句级 ReadView 与 RR 事务级 ReadView 的生成时机差异及根因",
+      "能区分快照读与当前读的加锁行为、版本选择和适用场景"
     ],
     "goodToHave": [
-      "purge 线程清理 undo log 的机制",
-      "RR 下快照读靠 MVCC 防幻读、当前读靠 Next-Key Lock 防幻读",
-      "长事务导致 History list length 持续增长",
-      "INNODB_TRX 视图排查长事务"
+      "能解释 RR 下快照读靠 MVCC 防幻读、当前读靠 Next-Key Lock 防幻读的协同机制",
+      "能说明长事务持有老 ReadView 导致 History list length 持续增长的根因和排查方法",
+      "能解释 ReadView 推迟到首次快照读创建的工程取舍",
+      "能说明 m_ids 只包含读写事务而非所有活跃事务"
     ],
     "commonMistakes": [
-      "认为 MVCC 让所有读都不加锁",
-      "认为 RR 下当前读也不会幻读",
-      "把 ReadView 生成时机说成 BEGIN 时生成",
-      "忽略长事务对 purge 和 undo 回收的阻塞"
+      "认为 MVCC 让所有读都不加锁，忽略当前读（FOR UPDATE/UPDATE/DELETE）走锁机制",
+      "认为 RR 下当前读也不会幻读，不知道当前读防幻读依赖的是 Next-Key Lock 而非 MVCC",
+      "把 ReadView 生成时机说成 BEGIN 时生成，不知道是首次快照读时",
+      "忽略长事务对 purge 和 undo 回收的阻塞作用",
+      "把 m_ids 误以为包含所有活跃事务，不知道只读事务不分配 trx_id 且不进入 m_ids"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -207,5 +198,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

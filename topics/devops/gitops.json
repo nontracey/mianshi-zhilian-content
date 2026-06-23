@@ -4,7 +4,7 @@
   "category": "delivery",
   "group": "delivery",
   "title": "GitOps 发布模型",
-  "summary": "用 Git 作为期望状态源，ArgoCD/Flux 控制器持续 reconcile，结合 pull 模式与多环境 promotion 替代脚本化推送。",
+  "summary": "用 Git 作为期望状态唯一真相源，ArgoCD/Flux 控制器持续 reconcile 算 diff 并按 SyncPolicy 决定是否自愈，pull 模式把集群凭据锁在集群内，Kustomize overlay + 改 image tag 的 PR 做多环境 promotion，git revert 即回滚——但有状态变更（DB schema、MQ offset）不能靠 revert，必须配套兼容性策略。",
   "tags": [
     "DevOps",
     "GitOps",
@@ -13,7 +13,7 @@
     "Reconcile"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 37,
   "order": 20,
   "recommendWeight": 82,
   "status": "production",
@@ -25,13 +25,28 @@
   "learningCards": [
     {
       "type": "explain",
-      "title": "GitOps 的四条核心原则与控制器机制",
-      "content": "GitOps 由 Weaveworks 在 2017 年提出，CNCF OpenGitOps 工作组在 2022 年正式收敛为四条原则：声明式（Declarative）、版本化（Versioned & Immutable）、自动拉取（Pulled Automatically）、持续 reconcile（Continuously Reconciled）。其中第三、第四条是它和传统 push 式 CD 的真正分水岭。\n\n控制器侧以 ArgoCD 和 Flux 为代表。ArgoCD 用 Application CRD 描述「Git repo + path + revision -> 目标 cluster + namespace」，application-controller 默认每 3 分钟跑一次 reconcile（可调 timeout.reconciliation），通过 gitops-engine 计算 desired manifest 和 live state 的 diff，按 SyncPolicy 决定是 manual approve 还是 automated（含 prune/selfHeal）。Flux v2 拆成多个 controller：source-controller 拉取 GitRepository/HelmRepository/OCIRepository 产物，kustomize-controller 渲染 Kustomization，helm-controller 执行 HelmRelease，notification-controller 发事件，默认 interval 1m。\n\n关键技术点：\n- Drift 来源不只是人手 kubectl edit，还包括 HPA 改 replicas、Mutating Webhook 注入字段、Operator 写回 status。selfHeal=true 会把这些都当 drift 拽回去，所以 ArgoCD 提供 ignoreDifferences（按 jsonPointers 或 jqPathExpressions）放过 HPA 的 spec.replicas、Istio 注入的 sidecar 等。\n- Sync wave / sync hook 解决依赖顺序：CRD 必须先于使用它的 CR 部署，Job 类的 PreSync hook 跑数据库迁移。\n- Secret 不能明文进 Git，常见组合是 Bitnami Sealed Secrets（kubeseal 加密成 SealedSecret CRD）、SOPS + age/KMS（Flux 原生支持 decryption.provider=sops）、或 External Secrets Operator 引用 Vault/AWS Secrets Manager。\n- App-of-Apps（ArgoCD）/ Kustomization 树（Flux）实现「一个根 Application 管 N 个子 Application」，是多团队多服务下的标准结构。"
+      "title": "GitOps 不是「Git 触发部署」，是控制器驱动的对账模型",
+      "content": "Weaveworks 2017 年提出 GitOps，CNCF OpenGitOps 工作组 2022 年正式收敛为四条原则：声明式（Declarative）、版本化（Versioned & Immutable）、自动拉取（Pulled Automatically）、持续 reconcile（Continuously Reconciled）。前两条几乎是 Kubernetes 原生就支持的事，后两条才是它和传统脚本化 CD 的真正分水岭——集群内有控制器主动拉取 Git 里的期望状态，算出和 live state 的差异，按策略把集群「掰回来」。\n\n这个模型的核心收益有三个：\n1. **审计天然闭合**：谁改了什么、什么时候改的、改前改后长什么样，全在 Git 历史里，不需要额外审计系统。\n2. **回滚=git revert**：期望状态是一条条 commit，回退到上一条 commit 就是回退到上一个版本，不需要重跑流水线、不需要在 runner 上保留旧构建产物。\n3. **漂移可观测可修复**：控制器每个周期都在算 diff，人手 kubectl edit 改坏的配置在下个周期就会被拉回来（前提是 selfHeal 打开）。\n\n但 GitOps 不是银弹。它只管声明式状态，不擅长一次性动作（数据库 migration、需要外部输入的 smoke test、需要随机数的初始化 job），这些仍需 PreSync hook、Argo Workflows 或手动 Job 补位。"
     },
     {
       "type": "explain",
-      "title": "Pull vs Push、多环境 promotion 与 CI/CD 的真正分工",
-      "content": "Pull vs Push 的差异不在术语，而在凭据流向。Push 模式（Jenkins/GitLab Runner 直连 kubectl apply）要求 CI 持有每个目标集群的 kubeconfig 或 cluster-admin token，凭据外露面广；一旦 runner 被攻陷，所有环境都暴露。Pull 模式下 ArgoCD/Flux 跑在目标集群内，只需出向访问 Git/OCI registry，集群 API 凭据从不离开集群，符合最小权限。代价是边缘场景（一次性数据库 migration、需要外部输入的 smoke test）不适合声明式表达，仍要靠 Job/Argo Workflows 配合。\n\n多环境 promotion 的两种主流物理结构：\n1. 分支策略（environment-per-branch）：dev/staging/prod 各一条长期分支，promotion = cherry-pick 或 merge。问题是分支间漂移、merge conflict 频发，CNCF 已在 2023 年的 GitOps Working Group 文档里明确不推荐。\n2. 目录 + Kustomize overlay（推荐）：单一 main 分支，envs/dev、envs/staging、envs/prod 三个 overlay 各自 patch image tag、replicas、resources。promotion 就是一个 PR：把 envs/staging/kustomization.yaml 里的 image tag 从 sha256:abc 改成 sha256:def。配合 Renovate 或 image-updater 自动开 PR，CODEOWNERS 卡审批。\n\nCI/CD 的边界因此被重新切分：CI 的产物是 immutable 制品（容器镜像 + Helm chart + manifest 渲染产物，最好推到 OCI registry 并打 cosign 签名），并把「新版本可用」这件事写回 Git（一个改 image tag 的 commit）。CD 完全交给集群内控制器。常见反模式是在 GitHub Actions 里 kubectl apply 一把梭，那是 push 式 CD 套了 GitOps 的皮，不享有审计、回滚和漂移检测的好处。\n\n回滚策略：因为期望状态在 Git，回滚 = git revert 那次 image bump 的 commit，控制器在下一个 reconcile 周期把集群拉回旧版本。数据库 schema、消息队列 offset 这类有状态变更不能这样回滚，必须在设计变更时就走兼容性策略（expand-contract、双写、feature flag）。"
+      "title": "ArgoCD 与 Flux 的 reconcile 机制差异",
+      "content": "ArgoCD 用 Application CRD 描述「Git repo + path + revision → 目标 cluster + namespace」，application-controller 默认每 3 分钟跑一次 reconcile（`timeout.reconciliation` 可调）。核心流程是：拉 Git manifest → 用 gitops-engine 计算 desired manifest 和 live state 的 diff → 按 SyncPolicy 决定是 manual approve 还是 automated（含 prune 删除 Git 中已移除的资源、selfHeal 拉回漂移）。Sync wave（注解 `argocd.argoproj.io/sync-wave`）控制多个资源的部署顺序，PreSync/PostSync hook 跑 migration Job 或通知。\n\nFlux v2 拆成四个独立 controller，各司其职：\n- **source-controller**：拉取 GitRepository/HelmRepository/OCIRepository 产物，负责认证、校验签名、缓存 artifact。\n- **kustomize-controller**：消费 Kustomization CRD，渲染 Kustomize overlay，apply 到集群。\n- **helm-controller**：消费 HelmRelease CRD，驱动 Helm 渲染和升级。\n- **notification-controller**：把控制器事件（reconcile 成功/失败/漂移检测）发到 Slack/Teams/Webhook/另外的 Flux receiver。\n\n默认 reconcile interval 1 分钟，每个 Kustomization 独立配置。Flux 不提供 Web UI（需要 Weave GitOps 或 Grafana dashboard），但原生支持 SOPS 解密和 OCI Repository，控制器拆分更细，适合需要深度定制控制平面的团队。\n\n两个工具都是 CNCF Graduated 项目，技术上没有绝对优劣：ArgoCD 强在 UI 和多租户（AppProject + SSO/RBAC），Flux 强在 controller 解耦和 GitOps toolkit 可组合性。"
+    },
+    {
+      "type": "explain",
+      "title": "drift 的真实来源与 selfHeal 的工程陷阱",
+      "content": "selfHeal（ArgoCD）或 prune=true（Flux）听起来是好事：有人偷改了集群，控制器自动拉回来。但 drift 来源远不止人手 kubectl edit：\n- **HPA 调 spec.replicas**：HorizontalPodAutoscaler 修改 Deployment 的 replicas 字段，这是正常行为。如果 Application 没有在 `ignoreDifferences` 里放过 `/spec/replicas`，application-controller 会在下一个 sync 把副本数拽回 Git 里写的数字，和 HPA 反复抢，监控表现为副本数在 Git 写的值和 HPA 目标值之间抖动。\n- **MutatingWebhook 注入字段**：Istio sidecar injector 注入的 sidecar container、Kyverno 策略注入的 label，这些字段不在 Git 里，但存在于 live state，diff 会被算出来。\n- **Operator 写回 status 和默认值**：很多 Operator 会给 CR 加默认值（比如 cert-manager 给 Certificate 写 duration/schedule），控制器可能把这些当 drift 处理。\n- **cert-manager 写 tls.crt/tls.key**：Secret 被 cert-manager 更新后，如果 Git 里也有同名 Secret，会被拉回旧证书。\n\nArgoCD 提供 `ignoreDifferences`（按 `jsonPointers` 或 `jqPathExpressions`）放过这些字段，常见必配项：Deployment 的 `/spec/replicas`、Service 的 `/spec/clusterIP`、Istio 注入的 sidecar 容器数组。Flux 的 kustomize-controller 用 `spec.patches` 或 `spec.ignore` 里的 `target` 过滤。不配这些就开 selfHeal，等于和 kube-controller-manager、cert-manager 打架。"
+    },
+    {
+      "type": "explain",
+      "title": "Pull 模式的凭据流向与安全边界",
+      "content": "传统 push 式 CD（Jenkins/GitLab Runner 直连 kubectl apply）要求 CI runner 持有每个目标集群的 kubeconfig 或 service account token。一旦 runner 被攻陷，攻击者可以横向移动到所有环境（dev、staging、prod）。这是 push 模式最大的安全缺陷：凭据外露面太广，一个点沦陷等于全盘。\n\nPull 模式下 ArgoCD/Flux 控制器跑在目标集群内部，只有控制器 Pod 需要访问 Kubernetes API server（通过 Pod 的 ServiceAccount，角色绑定在本地）。控制器的出向流量只需要访问 Git repository 和 OCI registry（通过 SSH key 或 HTTP token，可限制到特定 repo）。集群 API 凭据从不离开集群边界，符合最小权限原则。\n\n但 pull 模式也有代价：\n- **一次性动作不擅长**：数据库 migration 需要外部输入（target schema version）、smoke test 需要跑测试并拿到结果、初始化 job 需要随机 seed——这些不是声明式状态，需要 PreSync hook、Argo Workflows 或外部编排系统配合。\n- **控制器本身是新的信任根**：ArgoCD 的 argocd-server 和 argocd-repo-server、Flux 的 source-controller 都有较高权限，需要 RBAC 限制和网络策略保护。\n- **边缘场景延迟**：如果集群到 Git server 有网络隔离（air-gapped 环境），需要把 Git mirror 或 OCI registry 放在集群可达的内网。"
+    },
+    {
+      "type": "explain",
+      "title": "多环境 promotion 的物理结构与回滚边界",
+      "content": "多环境 promotion 的两种主流物理结构：\n\n**分支策略（environment-per-branch）**：dev/staging/prod 各一条长期分支，promotion 就是 cherry-pick 或 merge。CNCF GitOps Working Group 2023 年文档明确不推荐这种做法：分支间长期漂移导致 merge conflict 频发、无法用单一 commit 代表「某个版本在所有环境的状态」、回滚 cherry-pick 容易漏改。只适合历史包袱极重、无法短期迁移的仓库。\n\n**目录 + Kustomize overlay（推荐）**：单一 main 分支，目录结构是 `apps/<service>/base`（通用模板）+ `apps/<service>/envs/dev`、`apps/<service>/envs/staging`、`apps/<service>/envs/prod`（各环境 overlay patch image tag、replicas、resources limits）。promotion 就是一个 PR：把 `envs/staging/kustomization.yaml` 里的 image tag 从 `sha256:abc` 改成 `sha256:def`。配 Renovate 或 ArgoCD image-updater 自动开 PR，CODEOWNERS 卡审批。\n\n回滚策略：git revert 那次 image bump 的 commit，控制器在下一个 reconcile 周期把集群拉回旧版本。这是声明式状态的优势——不需要重跑流水线。\n\n**回滚边界**：数据库 schema 变更、消息队列 topic 结构变更、API 契约 breaking change 不能靠 git revert 回滚。必须在变更设计时就走兼容性策略：expand-contract pattern（先加新列、迁移数据、再删旧列）、双写、feature flag 控制新旧逻辑、灰度发布。这类变更需要应用代码层面的兼容性设计，不是 GitOps 能解决的问题。"
     },
     {
       "type": "diagram",
@@ -53,57 +68,8 @@
     },
     {
       "type": "compareTable",
-      "title": "Push 式 CD vs GitOps Pull 模式 vs 主流控制器选型",
-      "columns": [
-        "维度",
-        "传统 Push CD（Jenkins kubectl apply）",
-        "ArgoCD",
-        "Flux v2"
-      ],
-      "rows": [
-        [
-          "凭据流向",
-          "CI runner 持有目标集群 kubeconfig，外露面广",
-          "控制器在集群内，只需出向访问 Git/OCI",
-          "同 ArgoCD，pull 模式"
-        ],
-        [
-          "期望状态来源",
-          "脚本 + 流水线变量，难审计",
-          "Application CRD 引用 Git repo + path + revision",
-          "GitRepository + Kustomization/HelmRelease CRD"
-        ],
-        [
-          "Reconcile 频率",
-          "无，仅在流水线触发时",
-          "默认 3 分钟，可调 timeout.reconciliation",
-          "默认 1 分钟，每个 Kustomization 独立 interval"
-        ],
-        [
-          "漂移处理",
-          "完全感知不到",
-          "selfHeal=true 自动拉回，配 ignoreDifferences 放过 HPA",
-          "prune=true + 各 controller 重新 apply"
-        ],
-        [
-          "多环境 promotion",
-          "流水线参数 + 多 Job",
-          "App-of-Apps + Kustomize overlay，PR 改 image tag",
-          "Kustomization 树 + image-automation-controller 自动 bump"
-        ],
-        [
-          "Secret 方案",
-          "CI 变量或 Vault 注入运行时",
-          "依赖 Sealed Secrets / ESO，原生不解密",
-          "原生支持 SOPS（age/KMS），decryption.provider=sops"
-        ],
-        [
-          "回滚",
-          "重跑旧流水线，状态可能漂移",
-          "git revert + Argo 自动 sync，或 UI 一键 rollback 到历史 revision",
-          "git revert，source-controller 拉到后链路自动收敛"
-        ]
-      ]
+      "title": "Push CD vs GitOps vs ArgoCD vs Flux 的关键维度对比",
+      "content": "| 维度 | 传统 Push CD | GitOps Pull 模式 |\n| --- | --- | --- |\n| 凭据流向 | CI runner 持有目标集群 kubeconfig，外露面广 | 控制器在集群内，只需出向访问 Git/OCI |\n| 漂移感知 | 无，仅流水线触发时同步 | 控制器每 1-3 分钟算 diff，有 drift 立即可观测 |\n| 回滚方式 | 重跑旧流水线或手动 apply，状态可能漂移 | git revert，控制器下个周期自动拉回 |\n| 审计 | 需要单独搭审计系统 | Git history 天然审计链 |\n| 一次性动作 | 直接跑脚本 | 需要 PreSync hook / Argo Workflows 补位 |\n\n| 维度 | ArgoCD | Flux v2 |\n| --- | --- | --- |\n| CRD 模型 | Application（一个 CRD 描述完整应用） | GitRepository + Kustomization/HelmRelease（拆分） |\n| Reconcile 频率 | 默认 3 分钟 | 默认 1 分钟，每个 Kustomization 独立 |\n| UI | 内置 Web UI + CLI（argocd app diff/sync） | 无原生 UI，需 Weave GitOps 或 Grafana |\n| Secret 方案 | 需 Sealed Secrets 或 ESO（ksops 插件） | 原生 SOPS（decryption.provider=sops） |\n| 多租户 | AppProject + SSO/RBAC，适合平台团队对接多业务 | controller 拆分 + Kustomization 树，适合控制平面定制 |\n| OCI 支持 | Helm OCI registry | 原生 OCIRepository CRD |\n| image 自动 bump | 需额外 image-updater | 原生 image-automation-controller |"
     },
     {
       "type": "code",
@@ -112,27 +78,43 @@
       "content": "# apps/payment/envs/prod/application.yaml\napiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: payment-prod\n  namespace: argocd\n  finalizers: [resources-finalizer.argocd.argoproj.io]\nspec:\n  project: payment\n  source:\n    repoURL: git@github.com:acme/platform-config.git\n    targetRevision: main          # 不要用 HEAD，留下可回滚的 revision\n    path: apps/payment/envs/prod  # overlay 目录，里面是 kustomization.yaml\n  destination:\n    server: https://kubernetes.default.svc\n    namespace: payment\n  syncPolicy:\n    automated:\n      prune: true                 # Git 删了的资源也从集群删\n      selfHeal: true              # 漂移自动拉回\n    syncOptions:\n      - CreateNamespace=true\n      - ApplyOutOfSyncOnly=true\n    retry:\n      limit: 5\n      backoff: { duration: 10s, factor: 2, maxDuration: 3m }\n  ignoreDifferences:              # HPA 改 replicas 不算 drift\n    - group: apps\n      kind: Deployment\n      jsonPointers: [/spec/replicas]\n    - group: \"\"\n      kind: Service\n      jsonPointers: [/spec/clusterIP]\n---\n# apps/payment/envs/prod/kustomization.yaml\napiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - ../../base\nimages:\n  - name: registry.acme.io/payment\n    newTag: sha256:9f2c...e1     # promotion 就是改这一行的 PR\npatches:\n  - path: replicas-prod.yaml      # prod 副本数与 dev 不同\n  - path: resources-prod.yaml",
       "highlights": [
         {
-          "line": 1,
-          "note": "`# apps/payment/envs/prod/application.yaml` 绑定 GitOps 发布模型 的核心状态，面试时要说明它和前后步骤的关系。"
+          "line": 22,
+          "note": "targetRevision 指定具体 revision 而非 HEAD，git revert 后控制器能精确回退到上一个版本。"
+        },
+        {
+          "line": 28,
+          "note": "prune=true 让 Git 中删除的资源也从集群删除，保持声明式完整性。"
+        },
+        {
+          "line": 29,
+          "note": "selfHeal=true 会拉回漂移，但必须配合下面的 ignoreDifferences 避免和 HPA/cert-manager 打架。"
+        },
+        {
+          "line": 38,
+          "note": "ignoreDifferences 放过 HPA 改的 replicas 和 kube-apiserver 分配的 clusterIP。"
+        },
+        {
+          "line": 48,
+          "note": "promotion 就是改 newTag 这一行的 PR，CODEOWNERS 卡审批后 ArgoCD 自动 sync。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论先抛：GitOps 不是「用 Git 触发部署」，而是「Git 是期望状态的唯一真相源 + 集群内控制器持续 reconcile」，CNCF OpenGitOps 把它定义为声明式、版本化、自动拉取、持续 reconcile 四条原则。\n\n机制要点：\n- 接着展开三层： 第一层讲机制。以 ArgoCD 为例，Application CRD 引用 Git 的 repo+path+revision，application-controller 每 3 分钟跑 gitops-engine 算 desired manifest 和 live state 的 diff，按 SyncPolicy 决定是手动 approve 还是 automated（prune + selfHeal）。Flux v2 拆成 source/kustomize/helm/notification 四个 controller，默认 interval 1m。\n- 第二层讲 pull vs push 的本质差异。push 模式 CI runner 必须持有目标集群凭据，攻陷一台 runner 等于攻陷所有环境；pull 模式控制器跑在集群内，只需出向访问 Git 和 OCI registry，集群 API 凭据从不离开集群。代价是一次性 migration、需要外部输入的 smoke test 仍需 Job 或 Argo Workflows 补位。\n- 第三层讲多环境 promotion。我会明确反对 environment-per-branch（CNCF GitOps WG 已不推荐），推荐单 main 分支 + envs/dev、envs/staging、envs/prod 三个 Kustomize overlay，promotion 就是一个改 image tag 的 PR，配 Renovate 或 ArgoCD image-updater 自动开 PR、CODEOWNERS 卡审批。回滚是 git revert，控制器在下个周期把集群拉回旧版本——但数据库 schema 这类有状态变更不能这样回滚，必须配合 expand-contract。\n- 最后点边界：CI 的边界是产出 immutable 制品（镜像 + cosign 签名 + 渲染产物推 OCI），并把「新版本可用」写回 Git；CD 完全交给集群内控制器。在 GitHub Actions 里 kubectl apply 一把梭只是 push 式 CD 套了 GitOps 的皮。",
+      "content": "结论先抛：GitOps 不是「用 Git 触发部署」，而是「Git 是期望状态的唯一真相源 + 集群内控制器持续 reconcile」，CNCF OpenGitOps 把它定义为声明式、版本化、自动拉取、持续 reconcile 四条原则。后面三条是它和传统 push 式 CD 的分水岭。\n\n**机制（以 ArgoCD 为例）**\n- Application CRD 引用 Git 的 repo + path + revision\n- application-controller 默认每 3 分钟跑 gitops-engine 计算 desired manifest 和 live state 的 diff\n- SyncPolicy 决定是手动 approve 还是 automated（prune 删除已移除资源 + selfHeal 拉回漂移）\n- Flux v2 拆成 source/kustomize/helm/notification 四个 controller，interval 1 分钟\n\n**pull vs push 的安全差异**\n- Push 模式：CI runner 持有目标集群 kubeconfig，runner 被攻陷 → 所有环境暴露\n- Pull 模式：控制器在集群内，只需出向访问 Git/OCI registry，集群 API 凭据从不离开集群边界\n- 代价：一次性 migration、需要外部输入的 smoke test 仍需 Job 或 Argo Workflows 补位\n\n**多环境 promotion**\n- 反对 environment-per-branch（CNCF GitOps WG 不推荐，分支间漂移 + merge conflict）\n- 推荐单 main 分支 + Kustomize overlay（envs/dev、envs/staging、envs/prod）\n- promotion = 一个改 image tag 的 PR，配 Renovate/image-updater 自动开 PR、CODEOWNERS 卡审批\n- 回滚 = git revert，控制器下个周期拉回旧版本\n- DB schema 变更不能 revert，必须配套 expand-contract/双写/feature flag\n\n**drift 与 selfHeal 的工程陷阱**\n- drift 来源：人手 kubectl edit、HPA 改 replicas、MutatingWebhook 注入 sidecar、Operator 写默认值\n- 不配 ignoreDifferences 就开 selfHeal → 和 HPA 反复抢 spec.replicas，副本数抖动\n- 常见必配项：Deployment 的 /spec/replicas、Service 的 /spec/clusterIP、sidecar 注入字段\n\n**CI/CD 边界**\n- CI 产物：immutable 制品（容器镜像 + cosign 签名 + 渲染产物推 OCI），并把「新版本可用」写回 Git\n- CD：完全交给集群内控制器\n- GitHub Actions 里 kubectl apply → push 式 CD 套了 GitOps 的皮，没有漂移检测和审计",
       "followUpQuestions": [
         {
           "question": "selfHeal=true 开了之后线上副本数一直被拽回 1，怎么排查？",
-          "answer": "先看 ArgoCD UI 的 Diff 视图，大概率是 HPA 在改 spec.replicas 而 Application 没配 ignoreDifferences。修法是在 spec.ignoreDifferences 里加上 group=apps、kind=Deployment、jsonPointers=[/spec/replicas]，让 application-controller 在 diff 阶段就忽略这个字段，否则会和 kube-controller-manager 反复抢，监控上表现为副本数在 1 和 HPA 目标值之间抖动。同类型坑还有 Service 的 clusterIP、Istio sidecar 注入字段、cert-manager 写回的 tls.crt。"
+          "answer": "大概率是 HPA 在改 spec.replicas 而 Application 没配 ignoreDifferences。application-controller 在 diff 阶段把 HPA 改的 replicas 算成 drift，下一个 sync 把它拽回 Git 写的值，和 kube-controller-manager 反复抢，监控表现为副本数在两个值之间抖动。修法：在 spec.ignoreDifferences 加 group=apps、kind=Deployment、jsonPointers=[/spec/replicas]。同类型坑还有 Service 的 clusterIP、Istio sidecar 注入字段、cert-manager 写回的 tls.crt。"
         },
         {
           "question": "GitOps 下 Secret 怎么处理？为什么不能直接进 Git？",
-          "answer": "明文 Secret 进 Git 等于把凭据公开到所有有 repo 读权限的人。三种主流方案：(1) Bitnami Sealed Secrets，用 kubeseal CLI 把 Secret 加密成集群专属的 SealedSecret CRD，控制器在集群内用私钥解密，私钥不离开集群；(2) SOPS + age 或 KMS，Flux v2 原生支持 decryption.provider=sops，ArgoCD 需要配 ksops 插件；(3) External Secrets Operator，Git 里只放 ExternalSecret 引用，真值在 Vault/AWS Secrets Manager，运行时 ESO 拉下来生成 Secret。生产里 ESO 用得最多，因为它把 secret 生命周期和 IAM 解耦。"
+          "answer": "明文 Secret 进 Git 等于把凭据暴露给所有有 repo 读权限的人，Git 历史还删不掉。三种方案：(1) Sealed Secrets，kubeseal 用集群公钥加密成 SealedSecret CRD，集群内私钥解密，私钥不离开集群；(2) SOPS + age/KMS，Flux 原生支持 decryption.provider=sops，ArgoCD 需 ksops 插件；(3) External Secrets Operator，Git 里只放 ExternalSecret 引用，真值在 Vault/AWS SM，运行时 ESO 拉下生成 Secret。生产 ESO 用最多，因为它把 secret 生命周期和 IAM 解耦，支持多种后端。"
         },
         {
           "question": "ArgoCD 和 Flux 怎么选？",
-          "answer": "ArgoCD 强在 UI 和多租户：可视化 Diff、Sync wave、SSO/RBAC、AppProject 隔离，适合平台团队对接多个业务团队、需要给开发者一个 self-service 入口的场景。Flux v2 强在 controller 拆分清晰、原生 SOPS、原生 OCI Repository、image-automation-controller 自动 bump image tag，更贴近 Kubernetes-native 风格，适合控制平面深度定制、不需要重 UI 的平台。两者都是 CNCF Graduated 项目，技术选型上没有对错，看团队是否需要 UI 和多租户能力。"
+          "answer": "ArgoCD 强在 UI、多租户、Sync wave 和 AppProject 隔离，适合平台团队对接多业务团队、需要给开发者 self-service 入口。Flux 强在 controller 拆分清晰、原生 SOPS/OCI/image-automation，更贴近 Kubernetes-native，适合控制平面深度定制、不需要重 UI 的平台。两者都是 CNCF Graduated，技术选型看团队是否需要 UI 和多租户，没有绝对对错。"
         }
       ]
     },
@@ -140,13 +122,14 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能背出 OpenGitOps 四原则（声明式、版本化、自动拉取、持续 reconcile）并解释每条的工程含义",
-        "能画出 ArgoCD application-controller 的 reconcile 循环：拉 Git -> 算 diff -> 按 SyncPolicy sync -> 监听 live state",
-        "能讲清 pull 模式相对 push 模式的安全收益（凭据不出集群）以及它不擅长的场景（一次性 migration）",
-        "能说出多环境 promotion 推荐用 Kustomize overlay + 改 image tag 的 PR，反对 environment-per-branch 的原因",
-        "能解释 selfHeal 与 ignoreDifferences 的协作，知道 HPA replicas、Service clusterIP 必须放进 ignoreDifferences",
-        "能列举至少两种 GitOps 下的 Secret 方案（Sealed Secrets / SOPS / ESO）并说出适用边界",
-        "能区分 CI 与 CD 的新边界：CI 产 immutable 制品并写回 Git，CD 由集群内控制器完成"
+        "能背出 OpenGitOps 四原则并解释每条的工程含义，区分「Git 触发」和「控制器 reconcile」",
+        "能画出 ArgoCD application-controller 的 reconcile 循环：拉 Git → 算 diff → 按 SyncPolicy sync → 监听 live state",
+        "能讲清 pull 模式相对 push 模式的安全收益（凭据不出集群）及其不擅长的场景（一次性 migration）",
+        "能说出多环境 promotion 推荐 Kustomize overlay + 改 image tag 的 PR，能解释反对 environment-per-branch 的原因",
+        "能解释 selfHeal 与 ignoreDifferences 的协作，知道 HPA replicas、Service clusterIP、sidecar 注入字段必须忽略",
+        "能列举 Sealed Secrets / SOPS / ESO 三种 Secret 方案并说出适用边界",
+        "能区分 CI 与 CD 的边界：CI 产 immutable 制品并写回 Git，CD 由集群内控制器完成",
+        "能解释 git revert 回滚机制及其对 DB schema 等有状态变更的局限"
       ]
     }
   ],
@@ -171,12 +154,26 @@
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
+    },
+    {
+      "id": "devops.delivery.gitops.recall.4",
+      "prompt": "ArgoCD 和 Flux v2 的架构模型有什么区别？各自适合什么场景？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "devops.delivery.gitops.recall.5",
+      "prompt": "GitOps 下 Secret 为什么不能明文进 Git？对比 Sealed Secrets、SOPS、External Secrets Operator 三种方案的取舍。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
       "OpenGitOps 四原则：声明式、版本化、自动拉取、持续 reconcile",
-      "ArgoCD Application CRD + application-controller 3 分钟 reconcile 循环，或 Flux v2 source/kustomize/helm/notification controller 拆分",
+      "ArgoCD Application CRD + application-controller reconcile 循环，或 Flux v2 source/kustomize/helm/notification controller 拆分",
       "Pull 模式 vs Push 模式的凭据流向差异（控制器在集群内，只需出向访问 Git/OCI）",
       "多环境 promotion 用 Kustomize overlay + 改 image tag 的 PR，而非 environment-per-branch",
       "git revert 回滚机制及其对有状态变更（DB schema）的局限"
@@ -202,5 +199,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

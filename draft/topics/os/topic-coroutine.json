@@ -4,7 +4,7 @@
   "category": "process-thread",
   "group": "process-thread",
   "title": "协程与纤程",
-  "summary": "讲清协程作为用户态协作式轻量线程的切换优势、只并发不并行、有栈与无栈两种实现，以及 Go GMP 和 Python asyncio 的差异。",
+  "summary": "讲清协程/纤程作为运行时调度的轻量执行单元，为什么适合高并发 IO（等待时不占 OS 线程）、并行能力取决于是否映射到多个 OS 线程，以及有栈协程（Go goroutine/GMP）、无栈 async（Python asyncio）、M:N 调度、抢占机制、函数染色和 CPU 密集场景的边界。",
   "tags": [
     "操作系统",
     "协程",
@@ -12,72 +12,132 @@
     "asyncio"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 32,
   "order": 50,
   "recommendWeight": 88,
   "learningCards": [
     {
       "type": "explain",
-      "title": "协程与纤程：是什么、协程 vs 线程（核心对比）",
-      "content": "## 是什么\n协程是**用户态的轻量级“线程”**，由程序/运行时自己调度，**不依赖内核**。它的切换发生在用户态，不用陷入内核，所以开销极小，能轻松开几十万个。\n\n## 协程 vs 线程（核心对比）\n- **调度**：线程由内核**抢占式**调度（时间片到了就被切走）；协程是**协作式**——只在自己主动让出（如遇到 IO `await`）时才切换。\n- **切换开销**：线程切换要进内核、保存大量上下文、刷 TLB；协程只在用户态保存少量寄存器，快一两个数量级。\n- **栈**：线程默认栈 1–8MB；协程栈通常几 KB（goroutine 初始 2KB 可增长）。\n- **并行性关键点**：**协程本身只是并发不是并行**——单线程内的协程同一时刻只有一个在跑；要利用多核，得靠运行时把协程调度到多个线程上（Go 的 GMP 就是干这个）。"
+      "title": "协程与纤程是运行时调度的任务，不是线程的替代品",
+      "content": "协程/纤程是由语言运行时或库调度的轻量执行单元，其本质特征是：创建、挂起和恢复主要在用户态完成，不强制每个任务独占一个 OS 线程。但「轻量」不是零成本——有栈协程仍有栈，无栈协程仍有状态机对象，运行时仍需调度器和数据结构。\n\n协程与 OS 线程的关键区别：\n- **调度者**：OS 线程由内核调度器管理；协程由用户态运行时调度，再映射到一个或多个 OS 线程上执行。\n- **切换路径**：OS 线程切换要经过内核调度器，涉及线程上下文保存/恢复和内核队列操作；同进程线程共享地址空间，不应简单说成「每次切换刷 TLB」。协程切换通常只保存栈指针和少量寄存器（有栈）或状态机位置（无栈），完全在用户态。\n- **栈形态**：OS 线程默认栈较大（Linux 默认 8MB，可用 `ulimit -s` 或 `pthread_attr_setstack` 调整）；Go goroutine 初始栈仅 2-8KB，按需增长/缩减；无栈 async 没有调用栈，状态保存在编译器生成的 `Future`/`Promise` 对象中。\n- **并行性**：协程本身只表达并发（多任务交替推进），不自动等于多核并行。能否并行取决于运行时是否把任务映射到多个 OS 线程：Go GMP 可以多核并行，Python asyncio 的单线程事件循环同一时刻只执行一个 Task。"
     },
     {
       "type": "explain",
-      "title": "协程与纤程：为什么适合高并发 IO、两种实现模型",
-      "content": "## 为什么适合高并发 IO\n传统“一连接一线程”在十万连接下线程数爆炸、切换和内存都扛不住（C10K）；协程用极小的栈和用户态切换，让一个线程能承载海量“看起来在阻塞、实则挂起让出”的连接，**专治 IO 密集**。\n\n## 两种实现模型\n- **有栈协程 Stackful**：每个协程有自己独立的栈，因此**能在任意嵌套函数里挂起/恢复**，用起来像普通同步代码。代表：Go goroutine、Lua 协程。代价是每个协程要占一块栈。\n- **无栈协程 Stackless**：没有独立栈，编译器把 `async` 函数转成**状态机**，挂起点就是状态机的断点。内存更省，但**只能在标了 `await`/`yield` 的地方挂起**，会“传染”整条调用链（函数染色）。代表：Python 生成器、Rust/JS 的 async/await。"
+      "title": "为什么适合高并发 IO：不加速 IO，而是释放线程",
+      "content": "传统「一连接一线程」模型在 C10K 场景下每个连接占一个 OS 线程和几 MB 栈内存，线程总数和调度开销成为瓶颈。协程的价值不是让 IO 更快，而是：当任务等待 IO（网络读写、数据库查询、文件操作）时，把它挂起，把 OS 线程还给运行时去执行别的就绪任务。\n\n这意味着一个 OS 线程可以承载成千上万个并发 IO 任务。每个任务只在实际运行时才占线程时间片，等待期间的开销仅是运行时保存的状态（有栈协程的栈、无栈协程的状态机对象）。所以协程特别适合 Web 服务、代理、聊天、数据库连接池等大量连接都在等 IO 的场景。\n\n但协程不能解决 IO 延迟本身。如果下游数据库慢，协程只是不浪费线程等待，总耗时仍然受限于 IO 本身。协程也不减少 IO 调用次数——该发的 syscall 还是要发，该等的网络往返还是要等。"
     },
     {
       "type": "explain",
-      "title": "协程与纤程：两个主流实现",
-      "content": "## 两个主流实现\n- **Go goroutine（有栈）**：runtime 用 **GMP 模型**调度——G=goroutine、M=OS 线程、P=处理器（持有可运行 G 队列）。调度器把 G 分配到绑了 P 的 M 上跑，**能跨多线程真正并行**；Go 1.14+ 支持基于信号的抢占，避免某个 G 死循环饿死别人。\n- **Python asyncio（无栈）**：单线程**事件循环** + `async/await`，遇到 IO 就挂起切到别的任务。单线程内高并发 IO，但**受 GIL 限制不能并行算 CPU**，只适合 IO 密集。"
+      "title": "有栈协程：嵌套任意挂起，代价是栈管理",
+      "content": "有栈协程（Stackful Coroutine）给每个任务分配独立的调用栈。任务可以在任意嵌套深度的函数调用中挂起——调用 `yield` 或进入 IO 等待时，运行时把当前栈帧、寄存器状态保存起来，切换到别的任务。恢复时弹出保存的栈即可继续执行。\n\n优势是代码形态接近同步：开发者不需要在每个可能挂起的地方加 `await` 标记，嵌套调用链中间也能挂起。劣势是每个任务都需要栈空间，运行时要处理栈增长（如 Go 的分段栈→连续栈迁移）、栈溢出保护和 GC 扫描栈上的指针。\n\n代表实现：Go goroutine（初始 2-8KB，可增长到 GB 级）、Lua coroutine、Java Loom 的 virtual thread（JEP 444，JDK 21 正式发布）、Erlang process。"
+    },
+    {
+      "type": "explain",
+      "title": "无栈协程：状态机拆分，代价是函数染色",
+      "content": "无栈协程（Stackless Coroutine）没有独立调用栈。编译器/解释器把 `async` 函数拆成状态机：每个 `await`/`yield` 是一个状态转移点，局部变量被提升到堆上的状态对象（如 Rust 的 `Future`、Python 的 coroutine object、JS 的 Promise 链）。\n\n优势是每个任务的状态对象通常比完整栈小得多，内存效率更高。劣势是「函数染色」（Function Coloring）：`async` 函数只能 `await` 别的 `async` 函数，同步函数不能直接调用 `await`，异步性沿调用链向上传播。这意味着不能在嵌套调用链深处任意位置插入挂起点，只能在显式标记的 `await` 处挂起。\n\n代表实现：Python `async def` + `await`、JS `async function` + `await`、Rust `async fn` + `.await`、C# `async`/`await`。函数染色不是缺陷而是设计取舍：明确标记挂起点让编译器能做更好的优化和状态压缩。"
+    },
+    {
+      "type": "explain",
+      "title": "Go GMP：有栈 + M:N 调度 + 异步抢占",
+      "content": "Go 的调度模型是 GMP：\n- **G（Goroutine）**：用户态轻量任务，初始栈 2-8KB（Go 1.4 起用连续栈，增长时重新分配更大栈并拷贝）。\n- **M（Machine）**：OS 线程，实际执行 G 的载体。M 的数量可以远大于 P，因为阻塞的 syscall 会让 M 跟着阻塞，运行时会创建新 M 来继续服务 P 上的其他 G。\n- **P（Processor）**：逻辑处理器，持有本地可运行队列。P 的数量由 `GOMAXPROCS` 决定（默认等于 CPU 核数），决定同时并行执行的 goroutine 上限。\n\n调度流程：Go scheduler 把 G 放到 P 的本地队列；P 绑定一个 M 从队列取 G 执行；本地队列空时尝试从全局队列或其他 P 偷取（work stealing）。当 G 进入阻塞 syscall 时，M 被阻塞，但 P 会被解绑并交给新的 M 继续执行其他 G，保证并行度不下降。\n\nGo 1.14 引入基于信号的异步抢占（`SIGURG` 信号），解决了此前长时间无函数调用的纯计算循环无法被抢占、导致 GC STW 延迟的问题。但异步抢占不是万能的：CPU 密集 goroutine 仍会占用核心和调度资源，大量热点计算任务应拆分或交给 worker pool。"
+    },
+    {
+      "type": "explain",
+      "title": "Python asyncio：无栈 + 单线程事件循环 + 协作式",
+      "content": "Python asyncio 是典型的无栈 async + 单线程事件循环模型：\n- `async def` 返回 coroutine object，包装成 Task 后由 event loop 调度。\n- Task 遇到 `await`（如 `await asyncio.sleep()`、`await reader.read()`）时挂起，把控制权还给 event loop，loop 继续调度其他就绪 Task。\n- 整个事件循环运行在一个 OS 线程里，同一时刻只执行一个 Python Task。这是并发但不是并行。\n\n**GIL 的影响**：CPython 的 GIL（Global Interpreter Lock）限制同一时刻只有一个线程执行 Python 字节码。所以即使把 asyncio 事件循环放到多线程，CPU 密集的 Python 代码也无法并行。突破方式：multiprocessing（进程级并行）、释放 GIL 的 C 扩展（NumPy/PyTorch 的矩阵运算）、把 CPU 任务交给 `loop.run_in_executor()` 提交到线程池/进程池。\n\n**CPU 阻塞饿死**：如果一个 Task 在事件循环线程里做纯 CPU 计算（无 `await`），它会占住整个 loop，其他 Task（包括 IO 完成回调）全部延迟。这是 asyncio 最常见的误用之一。"
+    },
+    {
+      "type": "explain",
+      "title": "抢占机制与调度公平性",
+      "content": "协程调度的公平性取决于抢占策略：\n\n**纯协作式**：任务只在 `await`/`yield` 显式让出点让出。Python asyncio、JS event loop、Rust async 都是这种模式。好处是切换开销可预测，坏处是忘记让出就会饿死其他任务。\n\n**Go 的混合式**：Go 1.14 前是「函数调用点插入抢占检查」的协作式，纯循环无法被抢占。Go 1.14 起加入基于 `SIGURG` 的异步抢占，运行时可以向长时间运行的 goroutine 发信号强制切换，解决 GC STW 等待问题。但异步抢占不是 OS 级时间片抢占——不保证严格公平，CPU 密集 goroutine 仍然会长时间独占 P。\n\n**Java Loom（Virtual Thread）**：JDK 21 正式发布。Virtual Thread 在阻塞操作（`synchronized`、文件 IO、`sleep`）时自动卸载（unmount）载体线程，由 ForkJoinPool 调度。CPU 密集任务仍受载体线程数限制。\n\n**OS 级抢占**：OS 线程由内核时间片抢占，公平性最好但切换开销最大。"
     },
     {
       "type": "diagram",
-      "format": "mermaid",
-      "title": "协程与纤程：机制分支与风险路径",
-      "content": "flowchart TD\nNs7pykeS[协程与纤程 触发入口] --> Ns7pykeM[核心对象或状态: 操作系统]\nNs7pykeM --> Ns7pykeC{协程与纤程 是否走正常路径}\nNs7pykeC -->|正常| Ns7pykeN[执行 协程与纤程 主流程]\nNs7pykeC -->|异常| Ns7pykeF[处理 协程与纤程 边界风险]\nNs7pykeN --> Ns7pykeO[输出结果或交给下一组件]\nNs7pykeF --> Ns7pykeR[按 协程与纤程 语义降级/重试/报错]\nNs7pykeO --> Ns7pykeV[验证 协程与纤程 日志、指标或测试]\nNs7pykeR --> Ns7pykeV",
-      "caption": "协程与纤程 图中的分支用于区分本题正常机制、异常边界和工程验证路径。",
-      "fallback": "协程与纤程 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。",
+      "format": "svg",
+      "title": "有栈/无栈、GMP 与 asyncio 运行时模型",
+      "content": "assets/diagrams/os-coroutine-runtime.svg",
+      "caption": "左图展示 Go GMP 模型：多个 G 被调度到 P 的本地队列，P 绑定 M（OS 线程）执行，阻塞 syscall 时 P 解绑到新 M。右图展示 asyncio 单线程事件循环：多个 Task 在一个 loop 线程内协作切换，await 点是唯一让出时机。",
+      "fallback": "Go GMP：多个 Goroutine（G）分布在多个 P 的本地队列中，每个 P 绑定一个 M（OS 线程）并行执行。阻塞 syscall 时 M 阻塞但 P 解绑给新 M。asyncio：多个 Task 由单线程 event loop 调度，await 点切换，CPU 阻塞 Task 会卡住整个 loop。",
       "sources": [
         {
-          "kind": "mermaid",
-          "content": "flowchart TD\nNs7pykeS[协程与纤程 触发入口] --> Ns7pykeM[核心对象或状态: 操作系统]\nNs7pykeM --> Ns7pykeC{协程与纤程 是否走正常路径}\nNs7pykeC -->|正常| Ns7pykeN[执行 协程与纤程 主流程]\nNs7pykeC -->|异常| Ns7pykeF[处理 协程与纤程 边界风险]\nNs7pykeN --> Ns7pykeO[输出结果或交给下一组件]\nNs7pykeF --> Ns7pykeR[按 协程与纤程 语义降级/重试/报错]\nNs7pykeO --> Ns7pykeV[验证 协程与纤程 日志、指标或测试]\nNs7pykeR --> Ns7pykeV"
+          "kind": "svg",
+          "path": "assets/diagrams/os-coroutine-runtime.svg"
         },
         {
           "kind": "text",
-          "content": "协程与纤程 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。"
+          "content": "有栈协程能在嵌套调用深处挂起，代价是每个任务要有栈；无栈 async 把函数拆成状态机，只能在 await/yield 点挂起。Go GMP 用 G、M、P 把 goroutine 映射到多个 OS 线程并行；Python asyncio 由单线程事件循环调度 Task，CPU 阻塞会拖慢整个 loop。"
         }
       ]
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | 进程 | 线程 | 协程 |\n| --- | --- | --- | --- |\n| 调度 | 内核 | 内核 | 用户态 |\n| 切换开销 | 最大 | 中 | 最小 |\n| 栈大小 | 独立地址空间 | 1-8MB | 几 KB |\n| 并行能力 | 可多核并行 | 可多核并行 | 单线程内并发 |\n| 数据共享 | IPC | 共享内存 | 共享线程变量 |\n| 抢占式 | 是 | 是 | 通常协作式 |"
+      "title": "线程、goroutine、asyncio Task 的边界",
+      "content": "| 对比项 | OS 线程 | Go goroutine | Python asyncio Task |\n| --- | --- | --- | --- |\n| 调度者 | 内核调度器 | Go runtime GMP | 单线程 event loop |\n| 切换路径 | 内核态，涉及调度器队列和上下文 | 用户态，保存少量寄存器和栈指针 | 用户态，保存状态机对象 |\n| 并行能力 | 多线程多核并行 | 多个 P/M 多核并行（`GOMAXPROCS` 控制） | 单 loop 不并行 CPU |\n| 抢占策略 | 内核时间片抢占 | Go 1.14+ 异步抢占（SIGURG） | 纯协作式 await/yield |\n| 栈形态 | 大栈（Linux 默认 8MB） | 小栈起步（2-8KB），连续栈可增长 | 无栈，状态机堆对象 |\n| 挂起粒度 | 阻塞占住线程 | IO/syscall 可 park G，P 解绑给新 M | 只在 await 点让出 |\n| CPU 密集风险 | 占用核心时间片 | 占用 P 核心和调度资源 | 卡住整个事件循环 |\n| 典型场景 | CPU 并行、阻塞库隔离 | 高并发 IO + 多核并行 | 单线程高并发 IO、协议客户端/服务端 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// 1. Go goroutine 示例\npackage main\n\nimport (\n    \"fmt\"\n    \"sync\"\n)\n\nfunc main() {\n    var wg sync.WaitGroup\n    for i := 0; i < 100000; i++ {\n        wg.Add(1)\n        go func(id int) { // 启动 10 万个 goroutine\n            defer wg.Done()\n            // 每个 goroutine 仅占几 KB 内存\n            fmt.Printf(\"goroutine %d\\n\", id)\n        }(i)\n    }\n    wg.Wait()\n}\n\n// 2. Python asyncio 示例\nimport asyncio\n\nasync def fetch_data(url: str) -> str:\n    print(f\"Fetching {url}\")\n    await asyncio.sleep(1)  # 模拟 IO 等待，让出执行权\n    return f\"Data from {url}\"\n\nasync def main():\n    # 并发执行多个协程\n    tasks = [fetch_data(f\"http://example.com/{i}\") for i in range(10)]\n    results = await asyncio.gather(*tasks)\n    for r in results:\n        print(r)\n\nasyncio.run(main())\n// 10 个请求并发执行，总耗时约 1 秒而非 10 秒",
-      "language": "markdown",
+      "title": "Python 可运行：asyncio IO 并发与 CPU 阻塞边界",
+      "content": "import asyncio\nimport time\n\nasync def io_task(i: int) -> str:\n    await asyncio.sleep(0.1)  # 非阻塞等待，控制权交还 event loop\n    return f\"io-{i}\"\n\nasync def cpu_blocking(duration: float) -> str:\n    deadline = time.perf_counter() + duration\n    while time.perf_counter() < deadline:\n        pass  # 故意不 await，模拟 CPU 计算卡住事件循环\n    return \"cpu-blocked\"\n\nasync def main() -> None:\n    # 1) 纯 IO 并发：5 个任务并发推进，总耗时约 0.1s\n    start = time.perf_counter()\n    results = await asyncio.gather(*(io_task(i) for i in range(5)))\n    print(\"io results:\", results)\n    print(\"io elapsed:\", round(time.perf_counter() - start, 2), \"s\")\n\n    # 2) CPU 阻塞 + IO 混合：cpu_blocking 占住 loop，io_task 延迟\n    start = time.perf_counter()\n    mixed = await asyncio.gather(cpu_blocking(0.2), io_task(99))\n    print(\"mixed results:\", mixed)\n    print(\"mixed elapsed:\", round(time.perf_counter() - start, 2), \"s\")\n    # mixed elapsed ≈ 0.3s，因为 cpu_blocking 先占住 loop 0.2s，\n    # io_task 才有机会开始并再等 0.1s\n\nasyncio.run(main())",
+      "language": "python",
       "highlights": [
         {
-          "line": 11,
-          "note": "「for i := 0; i < 100000; i++ {」 是这段示例的主遍历；它决定处理顺序和成本上界，说明「协程与纤程」时要补上每轮维护的状态。"
+          "line": 5,
+          "note": "await asyncio.sleep 是非阻塞的：它注册一个定时器回调然后挂起 Task，控制权交还 event loop，其他 Task 可以运行。"
+        },
+        {
+          "line": 10,
+          "note": "纯 CPU 循环没有 await，永远不让出控制权。event loop 被占住，所有其他 Task（包括 IO 完成回调）全部延迟。"
+        },
+        {
+          "line": 19,
+          "note": "io_task 5 个并发，总耗时约 0.1s 而非 0.5s——证明 await 让多个 IO 任务真正并发推进。"
+        },
+        {
+          "line": 26,
+          "note": "cpu_blocking(0.2) + io_task(99) 放一起，总耗时约 0.3s：CPU 任务卡住 loop 0.2s 后 io_task 才开始执行。"
+        }
+      ]
+    },
+    {
+      "type": "code",
+      "title": "Go 可运行：goroutine 并发与阻塞 syscall 分离",
+      "content": "package main\n\nimport (\n\t\"fmt\"\n\t\"runtime\"\n\t\"sync\"\n\t\"time\"\n)\n\nfunc main() {\n\tfmt.Println(\"GOMAXPROCS:\", runtime.GOMAXPROCS(0))\n\n\t// 1) 多个 goroutine 并发 IO\n\tvar wg sync.WaitGroup\n\tstart := time.Now()\n\tfor i := 0; i < 5; i++ {\n\t\twg.Add(1)\n\t\tgo func(id int) {\n\t\t\tdefer wg.Done()\n\t\t\ttime.Sleep(100 * time.Millisecond) // 模拟 IO 等待\n\t\t\tfmt.Printf(\"goroutine %d done\\n\", id)\n\t\t}(i)\n\t}\n\twg.Wait()\n\tfmt.Println(\"io elapsed:\", time.Since(start).Round(10*time.Millisecond))\n\t// 总耗时约 100ms，5 个 goroutine 并发\n\n\t// 2) CPU 密集 goroutine 不会阻止其他 goroutine 运行\n\t//    （Go 1.14+ 异步抢占，但热点计算仍占用核心资源）\n\tgo func() {\n\t\tend := time.Now().Add(200 * time.Millisecond)\n\t\tfor time.Now().Before(end) {\n\t\t\t// CPU 热循环\n\t\t}\n\t}()\n\n\tgo func() {\n\t\ttime.Sleep(50 * time.Millisecond)\n\t\tfmt.Println(\"other goroutine ran during CPU hotspot\")\n\t}()\n\ttime.Sleep(300 * time.Millisecond)\n}",
+      "language": "go",
+      "highlights": [
+        {
+          "line": 12,
+          "note": "runtime.GOMAXPROCS(0) 返回当前 P 的数量，即并行度上限。默认等于 CPU 核数。"
+        },
+        {
+          "line": 26,
+          "note": "5 个 goroutine 各 sleep 100ms，总耗时约 100ms——证明它们在不同 P/M 上并发执行，而非串行。"
+        },
+        {
+          "line": 33,
+          "note": "CPU 热循环 goroutine 不会阻止其他 goroutine 被调度——Go 1.14+ 异步抢占保证了这一点。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：协程是用户态的轻量级「线程」，由程序或运行时自己调度、不陷内核，所以切换开销极小、能开几十万个，专治 IO 密集（解决 C10K）。关键认知：协程本身只是并发不是并行，要利用多核得靠运行时把协程调度到多个线程上。\n\n协程 vs 线程：\n\n1. 调度：线程是内核抢占式（时间片到就切）；协程是协作式（只在主动让出如 await 时才切）。\n2. 切换开销：线程切换进内核、保存大量上下文、刷 TLB；协程只在用户态存少量寄存器，快一两个数量级。\n3. 栈：线程默认 1-8MB；协程几 KB（goroutine 初始 2KB 可增长）。\n\n两种实现模型：\n\n1. 有栈协程 Stackful：每个协程有独立栈，能在任意嵌套函数里挂起恢复、用起来像同步代码，代价是占栈。代表 Go goroutine、Lua。\n2. 无栈协程 Stackless：编译器把 async 函数转成状态机，挂起点是状态机断点，省内存但只能在 await/yield 处挂起、会函数染色传染调用链。代表 Python、Rust/JS 的 async/await。\n\n两个主流实现：Go goroutine 用 GMP 模型（G 协程、M 线程、P 处理器）跨多线程真正并行、1.14+ 支持抢占防死循环饿死；Python asyncio 是单线程事件循环加 async/await、受 GIL 不能并行算 CPU、只适合 IO 密集。\n\n边界。① 协作式调度下，协程里写死循环或重 CPU 计算会霸占线程、饿死其他协程（Go 1.14 前尤其，靠抢占缓解），CPU 活儿要丢到别的线程。② 无栈协程的 async 传染性是设计取舍。",
+      "content": "**30 秒结论**：协程/纤程是由运行时调度的轻量执行单元，核心价值是 IO 等待时不占 OS 线程，让一个线程承载成千上万并发连接。协程只表达并发，并行取决于运行时是否映射到多个 OS 线程。\n\n**协程 vs 线程**\n- 调度者：OS 线程由内核调度，协程由用户态运行时调度后落到一个或多个 OS 线程。\n- 切换开销：线程切换走内核态（调度器队列+上下文），协程切换在用户态（栈指针或状态机），成本更低。\n- 栈形态：OS 线程有大栈（MB 级）；有栈协程栈更小且可增长（Go goroutine 2-8KB 起步）；无栈协程没有调用栈，状态保存在堆上的状态机对象。\n\n**两种实现模型**\n- 有栈协程：每个任务有调用栈，可在嵌套调用深处任意挂起，代码接近同步形态。代表：Go goroutine、Lua、Java Loom virtual thread。\n- 无栈协程：编译器把 async 函数拆成状态机，只能在 await/yield 点挂起。更省内存，但有「函数染色」——async 性沿调用链传播。代表：Python/JS/Rust async/await。\n\n**Go GMP 模型**\n- G（Goroutine）：用户态轻量任务，2-8KB 起步栈。\n- M（Machine）：OS 线程，执行 G 的载体。阻塞 syscall 时 M 阻塞，运行时创建新 M 给 P。\n- P（Processor）：逻辑处理器，持有本地可运行队列，数量由 `GOMAXPROCS`（默认 CPU 核数）控制，并行度上限。\n- 调度策略：本地队列→全局队列→其他 P 偷取（work stealing）。\n- Go 1.14+ 异步抢占（SIGURG）：解决纯 CPU 循环无法被抢占导致 GC STW 延迟的问题。\n\n**Python asyncio**\n- 无栈 async + 单线程事件循环，await 点协作切换。\n- 单个 loop 不并行 CPU，CPU 阻塞 Task 会卡住整个事件循环。\n- CPython GIL 限制 CPU 并行，突破方式：multiprocessing、释放 GIL 的 C 扩展、executor。\n\n**边界与取舍**\n- 协程不是免费并行，不是消息队列。IO 密集用协程减少线程浪费；CPU 密集要拆分、限流或交给线程池/进程池/多核并行。\n- 无栈 async 的函数染色是设计取舍，不能在同步调用链任意位置插入挂起点。\n- 抢占机制决定调度公平性：纯协作式最简单但容易饿死，Go 异步抢占改善了但不保证严格时间片公平。",
       "followUpQuestions": [
         {
-          "question": "协程是协作式调度，如果一个协程里写了死循环或重计算会发生什么？",
-          "answer": "协作式调度的前提是协程会主动让出（遇到 IO、await、channel 阻塞等让出点）。如果某个协程陷入纯 CPU 死循环、又没有任何让出点，它就会一直占着所在的线程不放，同一线程上其他协程被饿死、无法被调度。早期 Go（1.14 前）就有这个问题，后来引入基于信号的抢占式调度，能强行打断长时间运行的 goroutine。所以纯 CPU 密集任务不适合堆协程，要么拆出让出点、要么交给真正的多线程并行；协程的主场是 IO 密集——靠 IO 让出点自然交还控制权。"
+          "question": "如果一个 Go goroutine 里写了纯 CPU 死循环（Go 1.14+），会发生什么？",
+          "answer": "Go 1.14 起基于 SIGURG 信号的异步抢占可以让运行时中断长时间运行的 goroutine，解决此前 GC STW 被阻塞的问题。但异步抢占不是 OS 级时间片抢占——CPU 密集 goroutine 仍然会长时间占用一个 P 核心和绑定的 M，减少其他 goroutine 的可用并行度。大量 CPU 热点任务应拆分、限流或交给 worker pool。"
         },
         {
-          "question": "协程能利用多核吗？为什么说 Python asyncio 单线程、而 Go 能并行？",
-          "answer": "协程本身只是并发模型，能不能并行取决于运行时把协程映射到几个 OS 线程上。Python asyncio 是单线程事件循环，所有协程跑在一个线程里，加上 GIL 限制，同一时刻只有一个协程在执行 Python 字节码，所以它解决的是 IO 并发、不能并行算 CPU。Go 的 GMP 把成千上万的 G（goroutine）调度到多个 M（OS 线程）上，P 的数量默认等于 CPU 核数，因此多个 goroutine 能真正在多核上并行执行。区别就在于：asyncio 是 N 个协程对 1 个线程，Go 是 N 个协程对 M 个线程对多核。"
+          "question": "Python asyncio 单线程事件循环里做 CPU 计算会怎样？如何解决？",
+          "answer": "asyncio 事件循环运行在一个 OS 线程里，协作式调度只在 await 点切换。如果 Task 里做纯 CPU 计算没有 await，它会占住 loop 线程，其他所有 Task（包括 IO 完成回调）全部延迟。解决方式：①把 CPU 任务用 `loop.run_in_executor()` 提交到 `ThreadPoolExecutor` 或 `ProcessPoolExecutor`；②用释放 GIL 的 C 扩展做计算（NumPy/PyTorch）；③用 `multiprocessing` 做进程级并行。"
+        },
+        {
+          "question": "无栈 async 的「函数染色」具体指什么？有什么影响？",
+          "answer": "函数染色是指 async 函数只能 await 别的 async 函数，同步函数不能直接调用 await。这意味着异步性沿调用链向上传播：如果最底层一个函数改成 async，所有调用它的函数都要改成 async。影响是：①不能在嵌套调用链深处任意位置插入挂起点，只能在显式标记的 await 处；②同步库和异步库不能混用，需要 adapter 或重写；③但好处是编译器能做更好的状态压缩和优化，且开发者能明确看到哪些地方会挂起。"
+        },
+        {
+          "question": "Go goroutine 阻塞在 syscall 上时，对并行度有什么影响？",
+          "answer": "当一个 G 进入阻塞 syscall（如文件 IO、CGO 调用），它绑定的 M 会跟着阻塞。Go runtime 会把该 P 解绑并交给一个新的（或空闲的）M 继续执行 P 上的其他 G，所以并行度不会因为一个阻塞 syscall 而下降。这就是为什么 Go 能用大量 goroutine 做阻塞 IO 而不损失并行度。但大量阻塞 syscall 会导致 M 数量膨胀，消耗 OS 资源。"
         }
       ]
     },
@@ -85,55 +145,80 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释协程是用户态调度的轻量级线程",
-        "能比较协程和线程在调度方式、切换开销、栈大小上的差异",
-        "能区分有栈协程和无栈协程的实现方式",
-        "能说明 Go 的 GMP 调度模型",
-        "能解释 Python asyncio 的事件循环机制",
-        "能说明协程的适用场景和局限性",
-        "能解释协程如何解决 C10K 问题"
+        "能解释协程/纤程是运行时调度的轻量执行单元，不等于 OS 线程，主要价值是 IO 等待时不占线程",
+        "能区分有栈协程（任意深度挂起、需管理栈）和无栈 async（状态机、只能 await 点挂起、函数染色）",
+        "能说明 Go GMP 模型：G/M/P 的角色、本地队列与 work stealing、阻塞 syscall 时 P 解绑给新 M",
+        "能解释 Go 1.14+ 异步抢占（SIGURG）解决什么问题及其局限",
+        "能说明 Python asyncio 单线程事件循环的协作式调度、CPU 阻塞饿死问题和 GIL 限制",
+        "能对比 OS 线程/goroutine/asyncio Task 在调度者、并行能力、抢占策略、栈形态上的差异",
+        "能说清协程适合高并发 IO，CPU 密集任务要拆分、限流或交给线程池/进程池/多核并行"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "os.process-thread.topic-coroutine.recall.1",
-      "prompt": "协程为什么通常比线程更轻？请从调度位置、栈/状态保存和阻塞代价说明。",
+      "prompt": "协程为什么通常比线程更轻？请从调度位置、栈/状态保存和切换路径说明。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
       "id": "os.process-thread.topic-coroutine.recall.2",
-      "prompt": "Go 的 GMP 调度模型是如何工作的？当 M 阻塞时如何处理？",
+      "prompt": "Go 的 GMP 调度模型是如何工作的？G 阻塞在 syscall 上时如何保证并行度不下降？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "os.process-thread.topic-coroutine.recall.3",
-      "prompt": "协程与纤程 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "有栈协程、无栈 async 状态机、Go goroutine、Python asyncio Task 分别有什么关键区别？各适合什么场景？",
       "mode": "text",
       "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "os.process-thread.topic-coroutine.recall.4",
+      "prompt": "在 Python asyncio 事件循环里做 CPU 密集计算会发生什么？有哪些解决方案？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
+      "id": "os.process-thread.topic-coroutine.recall.5",
+      "prompt": "Go 1.14 的异步抢占解决了什么问题？它和 OS 级时间片抢占有什么区别？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "os.process-thread.topic-coroutine.recall.6",
+      "prompt": "无栈 async 的「函数染色」是什么？它带来了什么好处和限制？",
+      "mode": "text",
+      "expectedMinutes": 3,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出协程是用户态轻量线程、协作式调度、切换开销小",
-      "能区分协程的协作式与线程的抢占式调度",
-      "能指出协程本身只并发、多核要调度到多线程",
-      "能区分有栈与无栈协程"
+      "能说出协程/纤程是运行时调度的轻量执行单元，核心价值是 IO 等待时释放 OS 线程",
+      "能区分有栈协程（任意深度挂起、栈管理开销）和无栈 async（状态机、await 点挂起、函数染色）",
+      "能说明协程本身只表达并发，多核并行取决于运行时映射到多个 OS 线程",
+      "能解释 Go GMP 模型中 G/M/P 的角色和阻塞 syscall 时 P 的迁移机制",
+      "能说明 Python asyncio 单线程事件循环的 CPU 阻塞饿死问题和 GIL 限制"
     ],
     "goodToHave": [
-      "能解释 Go GMP 模型跨线程并行",
-      "能说明 Python asyncio 受 GIL 只适合 IO 密集",
-      "能说明无栈协程的函数染色"
+      "能解释 Go 1.14+ 异步抢占（SIGURG）的机制、解决的问题和局限",
+      "能说明无栈协程函数染色的具体含义、影响和设计取舍",
+      "能区分纯协作式（asyncio/JS）和混合式（Go）调度对公平性的影响",
+      "能说明 Java Loom Virtual Thread 的阻塞卸载机制"
     ],
     "commonMistakes": [
-      "以为协程能自动利用多核",
-      "在协程里做重 CPU 计算饿死其他协程",
-      "混淆有栈和无栈协程的挂起能力"
+      "以为协程能自动利用多核，忽略并行取决于运行时是否映射到多个 OS 线程",
+      "把 Go goroutine、Python asyncio、JS async 都说成完全相同的协作式协程，忽略 Go 有异步抢占",
+      "在单线程 asyncio 事件循环里做重 CPU 计算，导致所有 Task 延迟",
+      "混淆有栈协程（有调用栈、任意深度挂起）和无栈协程（状态机、只能 await 点挂起）",
+      "认为线程切换每次都刷 TLB——同进程线程共享地址空间，TLB 不一定失效"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -142,11 +227,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "draft",
   "prerequisites": [
     "os.process-thread.topic-process-vs-thread"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察能否区分协程与线程的调度和开销、说清协程只并发要靠运行时并行、区分有栈无栈，并知道协程死循环饿死和 GIL 限制。"
+  "interviewerFocus": "考察能否区分协程与线程的调度和开销、说清协程只并发要靠运行时并行、区分有栈无栈及其工程取舍、知道 CPU 阻塞饿死和 GIL 限制、能解释 GMP 和异步抢占机制。"
 }

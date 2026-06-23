@@ -4,7 +4,7 @@
   "category": "jvm",
   "group": "jvm",
   "title": "方法区与元空间",
-  "summary": "方法区是 JVM 规范概念，PermGen/Metaspace 是 HotSpot 实现；要分清类元数据、StringTable、静态字段值、Code Cache 和 Metaspace OOM 排查。",
+  "summary": "方法区是 JVM 规范概念，PermGen/Metaspace 是 HotSpot 实现；要分清类元数据、StringTable、静态字段值、Code Cache 的存储边界，理解 MetaspaceSize 与 MaxMetaspaceSize 的行为差异，掌握类加载器泄漏导致 Metaspace OOM 的排查路径。",
   "tags": [
     "Java",
     "JVM",
@@ -12,19 +12,29 @@
     "Metaspace"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 32,
   "order": 30,
   "recommendWeight": 88,
   "learningCards": [
     {
       "type": "explain",
-      "title": "方法区是规范，元空间是实现",
-      "content": "方法区（Method Area）是 JVM 规范中的线程共享区域概念，用于保存类级结构，例如运行时常量池、字段和方法数据等。它不是某个单一物理内存块，也不等同于 Java 堆。不同虚拟机可以用不同方式实现这个规范概念。\n\nHotSpot JDK 7 及以前用永久代（PermGen）承载方法区的一部分，受 `PermSize/MaxPermSize` 约束；JDK 8 起移除永久代，类元数据主要放到使用本地内存的 Metaspace。这个迁移降低了永久代容量难估带来的 OOM 风险，但并不表示类元数据可以无边界增长；类加载器泄漏、动态生成类过多或热部署不卸载仍会导致 `OutOfMemoryError: Metaspace`。"
+      "title": "方法区是规范，永久代和元空间是 HotSpot 的不同实现",
+      "content": "方法区（Method Area）是 JVM 规范定义的线程共享区域，存放类级结构：类的字段/方法元数据、运行时常量池、方法字节码等。规范只说「逻辑上存在」，不限定物理实现方式，不同虚拟机各选各的。\n\nHotSpot JDK 7 及以前用永久代（PermGen）实现方法区的一部分——把类元数据和运行时常量池放在 JVM 管理内存里，受 `-XX:PermSize` / `-XX:MaxPermSize` 约束。问题是：PermGen 大小需要预估，设小了容易 PermGen OOM，设大了浪费且与堆 GC 耦合（Major/Full GC 才能回收 PermGen）；同时 HotSpot 与 JRockit 合并后，JRockit 没有永久代概念，统一实现也需要移除 PermGen。\n\nJDK 8 起永久代被彻底移除，类元数据迁移到 Metaspace——使用本地内存（native memory），按需增长。迁移的好处是：不再需要预估 PermGen 大小；类元数据分配与堆 GC 解耦，Minor GC 不再背负 PermGen 回收压力。但 Metaspace 不是无限的：`-XX:MaxMetaspaceSize` 可设硬上限，不设则受进程虚拟地址空间和操作系统可用内存约束。类加载器泄漏、动态生成类过多（CGLIB、Groovy、JSP 热编译）仍会导致 `OutOfMemoryError: Metaspace`。"
     },
     {
       "type": "explain",
-      "title": "StringTable、静态字段值和 Code Cache 不要混放",
-      "content": "HotSpot JDK 8+ 里，类元数据主要在 Metaspace；`Class` 镜像对象和静态字段值在 Java 堆；JIT 编译后的机器码在 Code Cache；字符串 intern 表（StringTable）在 JDK 7 起移到堆。运行时常量池是每个类的常量池结构，StringTable 是全局字符串驻留表，两者不能简单画等号。\n\n`MetaspaceSize` 更像触发元空间扩容、类卸载检查和 Full GC 的高水位；`MaxMetaspaceSize` 是硬上限。线上不要只把上限调大，应该确认加载类数量、ClassLoader 数量和类卸载是否正常。"
+      "title": "MetaspaceSize 是触发水位，MaxMetaspaceSize 是硬上限",
+      "content": "`-XX:MetaspaceSize` 不是初始分配大小，更像一个高水位阈值：当 Metaspace 使用量达到这个值时，触发一次 Full GC（伴随类卸载检查）。如果 Full GC 后使用量仍高于此值，MetaspaceSize 会被自动提升（默认翻倍），下次触发 GC 的阈值也跟着升。这意味着：MetaspaceSize 设太小会导致频繁 Full GC，设太大会延迟类卸载的回收时机。\n\n`-XX:MaxMetaspaceSize` 是硬上限，超了就 OOM。不设这个参数时，Metaspace 会一直增长直到进程虚拟地址空间耗尽或操作系统拒绝 mmap——在容器环境下尤其危险，因为容器内存限制可能远小于物理机。\n\n线上调优建议：MetaspaceSize 结合应用启动后类加载峰值设，避免启动阶段频繁 Full GC；MaxMetaspaceSize 按容器/进程内存预算设一个合理上限，配合类加载数量监控，防止 ClassLoader 泄漏吃光内存。"
+    },
+    {
+      "type": "explain",
+      "title": "类加载器泄漏是 Metaspace OOM 的主要元凶",
+      "content": "Metaspace 存放的每个类元数据都关联一个 ClassLoader。只要 ClassLoader 对象本身还活着（被某个强引用链可达），它加载的所有类的元数据就不会被回收——即使这些类已经不再使用。这就是 ClassLoader 泄漏。\n\n典型场景：热部署框架（如 Tomcat 的 WebAppClassLoader、Spring DevTools、OSGi）在重新部署时，如果旧 ClassLoader 的引用被某个静态变量、ThreadLocal、Timer、后台线程或 JMX 注册残留，旧的整个类层次都无法回收。另一个常见来源是动态代理/字节码生成：CGLIB、Javassist、Groovy 脚本引擎反复生成新类，如果生成的类没有缓存复用而是每次都新定义，Metaspace 增长速度会很快。\n\n判断类加载是否正常，核心看三个指标：已加载类数量趋势是否持续上升、ClassLoader 实例数是否只增不减、已卸载类数量是否正常（`-XX:+TraceClassUnloading` 或 `jcmd <pid> GC.class_stats`）。如果类数量持续增长且卸载数为零，几乎可以确认 ClassLoader 泄漏。"
+    },
+    {
+      "type": "explain",
+      "title": "HotSpot JDK 8+ 的内存分区：不要把不同区域混在一起",
+      "content": "JDK 8+ 的 HotSpot 里，类相关数据分散在多个区域，不能笼统说「在方法区」或「在 Metaspace」：\n\n- **类元数据**（方法字节码、字段/方法描述符、常量池解析结果等）：在 Metaspace（本地内存）。\n- **运行时常量池**：是每个类加载后形成的结构，其结构体在 Metaspace，但如果常量池条目引用的对象（如 String 字面量、MethodHandle）则在堆。\n- **StringTable**（字符串驻留表）：JDK 7 起从永久代移到堆。StringTable 是全局哈希表，存字符串对象引用，和运行时常量池是两个东西。JDK 9+ StringTable 默认有 60013 个桶（可用 `-XX:StringTableSize` 调），高并发 intern 场景可能成为锁竞争瓶颈。\n- **Class 镜像对象**（`java.lang.Class` 实例）和**静态字段值**：在堆。`Class` 对象是普通 Java 对象，静态字段存在其 mirror 对象的末尾或附近（HotSpot 实现细节）。\n- **JIT 编译后的机器码**：在 Code Cache（CodeHeap），按类型分 non-method（解释器、适配器）、profiled methods、non-profiled methods 三个 segment。\n\n混淆这些区域会导致排查方向错误——比如以为 Metaspace 用满了是 JIT 问题，或以为 StringTable 在 Metaspace 里。"
     },
     {
       "type": "diagram",
@@ -46,66 +56,75 @@
     },
     {
       "type": "compareTable",
-      "title": "PermGen、Metaspace 与相关内存位置",
-      "content": "| 维度 | PermGen（HotSpot JDK 7-） | Metaspace（HotSpot JDK 8+） | 说明 |\n| --- | --- | --- | --- |\n| 定位 | HotSpot 旧实现 | HotSpot 新实现 | 都是方法区规范的实现相关概念 |\n| 内存来源 | JVM 管理内存 | 本地内存 | 仍受进程和系统内存约束 |\n| 上限参数 | `MaxPermSize` | `MaxMetaspaceSize` | 不设置上限不代表没有风险 |\n| 字符串驻留表 | JDK 6 在永久代 | JDK 7+ 在堆 | StringTable 与运行时常量池不同 |\n| 静态字段值 | HotSpot 后期随 Class 镜像在堆 | 在堆 | 不是 Metaspace 里的一块普通字段区 |\n| JIT 代码 | 与实现相关 | Code Cache | 排查看 CodeHeap/Code Cache 指标 |"
+      "title": "PermGen vs Metaspace 与相关内存区域位置",
+      "content": "| 维度 | PermGen（HotSpot JDK 7-） | Metaspace（HotSpot JDK 8+） | 说明 |\n| --- | --- | --- | --- |\n| 内存来源 | JVM 管理内存 | 本地内存（native memory） | Metaspace 不在堆上，但受进程/系统内存约束 |\n| 上限参数 | `MaxPermSize` | `MaxMetaspaceSize` | 不设 MaxMetaspaceSize 不代表无风险 |\n| 触发回收 | Major/Full GC 时回收 | 达到 MetaspaceSize 触发 Full GC | MetaspaceSize 达标后自动翻倍提升 |\n| 与堆 GC 关系 | 耦合，PermGen 满会触发 Full GC | 类元数据分配与堆 GC 解耦 | 迁移后 Minor GC 不再背负 PermGen 回收 |\n| StringTable | JDK 6 在 PermGen | JDK 7+ 在堆 | 不要和 Metaspace 混淆 |\n| 静态字段值 | 随 Class 镜像在堆（后期版本） | 在堆 | 不在 Metaspace |\n| JIT 代码 | 实现相关 | Code Cache（CodeHeap） | 排查看 CodeHeap 指标 |\n\n| 区域 | JDK 8+ 位置 | 容易被误认的位置 | 关键区分点 |\n| --- | --- | --- | --- |\n| 类元数据 | Metaspace | 堆 | 结构体在本地内存，不在堆 |\n| 运行时常量池 | Metaspace（结构）+ 堆（引用对象） | 只在 Metaspace | 引用的对象（如 String）在堆 |\n| StringTable | 堆 | Metaspace/PermGen | JDK 7 已移到堆，是全局驻留表 |\n| Class 镜像 / 静态字段 | 堆 | Metaspace | `java.lang.Class` 是普通 Java 对象 |\n| Code Cache | CodeHeap（本地内存） | Metaspace | JIT 机器码，与类元数据无关 |"
     },
     {
       "type": "code",
-      "title": "Java 可运行：观察 Metaspace、CodeHeap、Class 和 intern 行为",
-      "content": "import java.lang.management.ManagementFactory;\nimport java.lang.management.MemoryPoolMXBean;\nimport java.lang.management.MemoryUsage;\nimport java.lang.reflect.Field;\nimport java.util.Map;\nimport java.util.Set;\nimport java.util.stream.Collectors;\n\npublic class Main {\n    static class Example {\n        static String staticField = \"static-value\";\n        static final int COMPILE_TIME_CONSTANT = 100;\n        void method() {}\n    }\n\n    static Map<String, MemoryUsage> poolUsages() {\n        return ManagementFactory.getMemoryPoolMXBeans().stream()\n            .collect(Collectors.toMap(MemoryPoolMXBean::getName, MemoryPoolMXBean::getUsage));\n    }\n\n    public static void main(String[] args) throws Exception {\n        Map<String, MemoryUsage> pools = poolUsages();\n        Set<String> names = pools.keySet();\n        long metaspaceUsed = pools.entrySet().stream()\n            .filter(e -> e.getKey().contains(\"Metaspace\"))\n            .mapToLong(e -> e.getValue().getUsed())\n            .sum();\n        long codeHeapUsed = pools.entrySet().stream()\n            .filter(e -> e.getKey().contains(\"CodeHeap\") || e.getKey().contains(\"Code Cache\"))\n            .mapToLong(e -> e.getValue().getUsed())\n            .sum();\n\n        Class<?> clazz = Example.class;\n        Field field = clazz.getDeclaredField(\"staticField\");\n        String staticValue = (String) field.get(null);\n        String heapString = new String(\"meta\");\n        String interned = heapString.intern();\n\n        System.out.println(\"pools: \" + names);\n        System.out.println(\"metaspace/code used: \" + metaspaceUsed + \"/\" + codeHeapUsed);\n        System.out.println(\"class loader: \" + clazz.getClassLoader());\n        System.out.println(\"static field: \" + staticValue + \", interned same as literal: \" + (interned == \"meta\"));\n\n        assert names.stream().anyMatch(name -> name.contains(\"Metaspace\"));\n        assert names.stream().anyMatch(name -> name.contains(\"CodeHeap\") || name.contains(\"Code Cache\"));\n        assert metaspaceUsed > 0;\n        assert codeHeapUsed > 0;\n        assert staticValue.equals(\"static-value\");\n        assert Example.COMPILE_TIME_CONSTANT == 100;\n        assert interned == \"meta\";\n        assert heapString != \"meta\";\n    }\n}",
+      "title": "观察 Metaspace、CodeHeap、类加载和 intern 行为",
       "language": "java",
+      "content": "import java.lang.management.ManagementFactory;\nimport java.lang.management.MemoryPoolMXBean;\nimport java.lang.management.MemoryUsage;\nimport java.lang.reflect.Field;\nimport java.util.Map;\nimport java.util.Set;\nimport java.util.stream.Collectors;\n\npublic class Main {\n    static class Example {\n        static String staticField = \"static-value\";\n        static final int COMPILE_TIME_CONSTANT = 100;\n        void method() {}\n    }\n\n    static Map<String, MemoryUsage> poolUsages() {\n        return ManagementFactory.getMemoryPoolMXBeans().stream()\n            .collect(Collectors.toMap(MemoryPoolMXBean::getName, MemoryPoolMXBean::getUsage));\n    }\n\n    public static void main(String[] args) throws Exception {\n        // 1. 观察各内存池，区分 Metaspace 和 CodeHeap\n        Map<String, MemoryUsage> pools = poolUsages();\n        Set<String> names = pools.keySet();\n        long metaspaceUsed = pools.entrySet().stream()\n            .filter(e -> e.getKey().contains(\"Metaspace\"))\n            .mapToLong(e -> e.getValue().getUsed())\n            .sum();\n        long codeHeapUsed = pools.entrySet().stream()\n            .filter(e -> e.getKey().contains(\"CodeHeap\") || e.getKey().contains(\"Code Cache\"))\n            .mapToLong(e -> e.getValue().getUsed())\n            .sum();\n\n        // 2. 静态字段值在堆上的 Class 镜像对象里\n        Class<?> clazz = Example.class;\n        Field field = clazz.getDeclaredField(\"staticField\");\n        String staticValue = (String) field.get(null);\n\n        // 3. StringTable 在堆，intern 行为验证\n        String heapString = new String(\"meta\");\n        String interned = heapString.intern();\n\n        // 4. 类加载统计\n        long loadedClassCount = ManagementFactory.getClassLoadingMXBean().getLoadedClassCount();\n        long totalLoaded = ManagementFactory.getClassLoadingMXBean().getTotalLoadedClassCount();\n        long unloaded = ManagementFactory.getClassLoadingMXBean().getUnloadedClassCount();\n\n        System.out.println(\"pools: \" + names);\n        System.out.println(\"metaspace/code used: \" + metaspaceUsed + \"/\" + codeHeapUsed);\n        System.out.println(\"class loader: \" + clazz.getClassLoader());\n        System.out.println(\"static field: \" + staticValue);\n        System.out.println(\"interned same as literal: \" + (interned == \"meta\"));\n        System.out.println(\"loaded/total/unloaded: \" + loadedClassCount + \"/\" + totalLoaded + \"/\" + unloaded);\n\n        assert names.stream().anyMatch(name -> name.contains(\"Metaspace\"));\n        assert names.stream().anyMatch(name -> name.contains(\"CodeHeap\") || name.contains(\"Code Cache\"));\n        assert metaspaceUsed > 0;\n        assert codeHeapUsed > 0;\n        assert staticValue.equals(\"static-value\");\n        assert Example.COMPILE_TIME_CONSTANT == 100;\n        // StringTable 在堆：intern 返回常量池中已有引用\n        assert interned == \"meta\";\n        // new String 创建的是堆上新对象，不等于常量池引用\n        assert heapString != \"meta\";\n    }\n}",
       "highlights": [
         {
-          "line": 16,
-          "note": "MemoryPoolMXBean 能观察 Metaspace、CodeHeap 等 HotSpot 内存池，是把概念落到指标的入口。"
+          "line": 25,
+          "note": "MemoryPoolMXBean 列出 HotSpot 所有内存池名称，是把概念落到指标的第一步。"
         },
         {
-          "line": 24,
-          "note": "Metaspace 池体现类元数据占用；线上 Metaspace OOM 先看这里和类加载数量。"
+          "line": 30,
+          "note": "Metaspace 池体现类元数据占用；线上 Metaspace OOM 先看这里趋势和类加载数量。"
         },
         {
-          "line": 28,
-          "note": "CodeHeap/Code Cache 是 JIT 编译代码相关内存，不要和 Metaspace 混为一块。"
+          "line": 34,
+          "note": "CodeHeap/Code Cache 是 JIT 编译代码相关内存，不要和 Metaspace 混淆。"
         },
         {
-          "line": 33,
-          "note": "Class 对象和静态字段值可以通过反射访问；HotSpot JDK 8+ 中它们属于堆上 Class 镜像相关对象。"
+          "line": 38,
+          "note": "静态字段值在堆上的 Class 镜像对象里，通过反射可访问。"
         },
         {
-          "line": 36,
-          "note": "intern 返回 StringTable 中的引用；JDK 7+ StringTable 位于堆中。"
+          "line": 42,
+          "note": "intern 返回 StringTable（堆）中的引用；JDK 7+ StringTable 已不在 PermGen/Metaspace。"
+        },
+        {
+          "line": 47,
+          "note": "类加载 MXBean 的 loaded/unloaded 计数是排查 ClassLoader 泄漏的关键指标。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
-      "title": "面试回答抓手",
-      "content": "回答方法区与元空间先分三层：第一，方法区是 JVM 规范概念，保存类级结构和运行时常量池等；第二，永久代是 HotSpot JDK 7 及以前的实现，元空间是 HotSpot JDK 8+ 的实现；第三，HotSpot JDK 8+ 中类元数据在 Metaspace，Class 镜像、静态字段值和 StringTable 在堆，JIT 代码在 Code Cache。\n\n迁移原因不要只说“内存变大了”。更准确的是：永久代容量难预估、和堆 GC 耦合、容易因为类加载多而 PermGen OOM；Metaspace 使用本地内存，按需增长，并通过 `MaxMetaspaceSize` 控制上限。排查 Metaspace OOM 时，重点看动态类生成、ClassLoader 泄漏、热部署未卸载、类加载/卸载日志和 `jcmd VM.metaspace`、`jmap -clstats`。",
+      "title": "面试回答思路",
+      "content": "**先分三层说清关系**\n- 方法区是 JVM 规范概念，保存类级结构（字段/方法元数据、运行时常量池等）\n- 永久代是 HotSpot JDK 7 及以前的实现，使用 JVM 管理内存，受 MaxPermSize 约束\n- 元空间是 HotSpot JDK 8+ 的实现，使用本地内存（native memory），按需增长\n\n**迁移原因（不要只说「内存变大了」）**\n- PermGen 大小需预估，设小了 PermGen OOM，设大了浪费\n- PermGen 与堆 GC 耦合，Full GC 才能回收\n- HotSpot 与 JRockit 合并需要统一实现\n- Metaspace 使用本地内存，按需增长，分配与堆 GC 解耦\n\n**HotSpot JDK 8+ 各区域位置（容易混淆的考点）**\n- 类元数据 → Metaspace（本地内存）\n- 运行时常量池 → Metaspace（结构体）+ 堆（引用的对象）\n- StringTable → 堆（JDK 7 起），是全局驻留表，不等于运行时常量池\n- Class 镜像 / 静态字段值 → 堆\n- JIT 代码 → Code Cache（CodeHeap）\n\n**MetaspaceSize 与 MaxMetaspaceSize**\n- MetaspaceSize：触发 Full GC 的高水位阈值，达标后自动翻倍提升\n- MaxMetaspaceSize：硬上限，超了就 OOM；不设则受进程/系统内存约束\n\n**Metaspace OOM 排查**\n- 常见根因：ClassLoader 泄漏、动态代理/字节码生成无界（CGLIB、Groovy）、热部署旧 ClassLoader 未释放、脚本引擎反复编译\n- 排查工具：`jcmd <pid> VM.metaspace`（各 ClassLoader 加载类数量和 Metaspace 占用）、`jmap -clstats`（类加载统计）、`-XX:+TraceClassUnloading`（类卸载日志）、heap dump 看 ClassLoader 引用链\n- 关键指标：已加载类数量趋势是否持续上升、ClassLoader 实例数是否只增不减、已卸载类数量是否为零",
       "followUpQuestions": [
         {
           "question": "为什么 JDK 8 要从永久代迁到元空间？",
-          "answer": "永久代容量需要预估，设小了容易 PermGen OOM，设大了浪费并和堆 GC 耦合；元空间把类元数据放到本地内存，按需增长，并可用 MaxMetaspaceSize 设硬上限。迁移还和 HotSpot/JRockit 融合、简化类元数据管理有关。"
+          "answer": "PermGen 大小需预估，设小了频繁 PermGen OOM；设大了浪费且与堆 GC 耦合（Full GC 才能回收）。迁移到 Metaspace 后类元数据在本地内存按需增长，分配与堆 GC 解耦。同时 HotSpot 与 JRockit 合并，JRockit 没有永久代，统一实现也需要移除。"
         },
         {
-          "question": "Metaspace OOM 一般怎么排查？",
-          "answer": "先确认异常是 `OutOfMemoryError: Metaspace`，再看类加载数量、Metaspace 使用趋势和 ClassLoader 数量。工具上用 `jcmd <pid> VM.metaspace`、`jmap -clstats`、类加载/卸载日志，必要时结合 heap dump 看 ClassLoader 引用链。常见根因是动态代理/字节码生成无界、热部署旧 ClassLoader 未释放、脚本引擎反复编译。"
+          "question": "MetaspaceSize 和 MaxMetaspaceSize 分别起什么作用？不设 MaxMetaspaceSize 是不是就没风险？",
+          "answer": "MetaspaceSize 是触发 Full GC 的高水位：Metaspace 使用量达到此值时触发 Full GC + 类卸载检查，达标后阈值自动翻倍提升。MaxMetaspaceSize 是硬上限，超了就 OOM。不设 MaxMetaspaceSize 不代表无风险——Metaspace 会增长到进程虚拟地址空间或操作系统内存耗尽，在容器环境下尤其危险。"
         },
         {
-          "question": "运行时常量池和字符串常量池有什么区别？",
-          "answer": "运行时常量池是每个类加载后形成的常量池结构，属于方法区规范的一部分；字符串常量池通常说的是 HotSpot 的 StringTable，是字符串驻留表。JDK 7 起 StringTable 位于堆中，因此不要把它和 Metaspace 或运行时常量池直接等同。"
+          "question": "线上 Metaspace OOM 如何判断是 ClassLoader 泄漏？",
+          "answer": "三个关键指标：已加载类数量趋势是否持续上升、ClassLoader 实例数是否只增不减、已卸载类数量是否为零。工具：`jcmd <pid> VM.metaspace` 看各 ClassLoader 加载类数和占用；`jmap -clstats` 看类加载统计；heap dump 看 ClassLoader 被谁引用（静态变量、ThreadLocal、Timer、后台线程、JMX 注册等）。"
+        },
+        {
+          "question": "运行时常量池和 StringTable 有什么区别？",
+          "answer": "运行时常量池是每个类加载后形成的常量池结构，属于方法区规范的一部分，结构体在 Metaspace，但其引用的对象在堆。StringTable 是 HotSpot 的全局字符串驻留表，JDK 7 起在堆中，存的是字符串对象引用。两者是不同层面的东西——一个是 per-class 结构，一个是全局哈希表。"
         }
       ]
     },
     {
       "type": "checklist",
-      "title": "自查清单",
+      "title": "学完后应能说清楚",
       "items": [
-        "能说明方法区是 JVM 规范概念，不是永久代或元空间本身",
-        "能区分 HotSpot JDK 7- PermGen 与 JDK 8+ Metaspace",
-        "能说清类元数据、运行时常量池、StringTable、Class 镜像、静态字段值、Code Cache 的位置边界",
-        "能解释 MetaspaceSize 和 MaxMetaspaceSize 的作用差异",
-        "能描述 Metaspace OOM 的常见根因：动态类过多、ClassLoader 泄漏、热部署未卸载",
-        "能使用 jcmd、jmap、类加载日志和 heap dump 排查元空间问题"
+        "能说明方法区是 JVM 规范概念，不等于永久代或元空间",
+        "能区分 HotSpot JDK 7- PermGen 与 JDK 8+ Metaspace 的内存来源和回收机制",
+        "能说清 MetaspaceSize（触发水位、自动提升）和 MaxMetaspaceSize（硬上限）的行为差异",
+        "能准确描述类元数据、运行时常量池、StringTable、Class 镜像/静态字段值、Code Cache 在 JDK 8+ 的位置",
+        "能解释 ClassLoader 泄漏导致 Metaspace OOM 的因果链",
+        "能用 jcmd VM.metaspace、jmap -clstats、类加载/卸载日志和 heap dump 排查元空间问题",
+        "能说明不设 MaxMetaspaceSize 在容器环境下的风险"
       ]
     }
   ],
@@ -119,7 +138,7 @@
     },
     {
       "id": "java.jvm.topic-003-d63af565.recall.2",
-      "prompt": "类元数据、运行时常量池、StringTable、静态字段值和 Code Cache 分别在哪里？哪些容易被混淆？",
+      "prompt": "类元数据、运行时常量池、StringTable、静态字段值和 Code Cache 在 HotSpot JDK 8+ 中分别存放在哪里？哪些容易被混淆？",
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 3
@@ -130,28 +149,36 @@
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 3
+    },
+    {
+      "id": "java.jvm.topic-003-d63af565.recall.4",
+      "prompt": "MetaspaceSize 和 MaxMetaspaceSize 分别起什么作用？不设 MaxMetaspaceSize 是不是就没风险？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出方法区是 JVM 规范概念，并区分类元数据、运行时常量池、StringTable 和 Code Cache",
-      "能区分永久代（HotSpot JDK 7 及以前）和元空间（HotSpot JDK 8+ 本地内存）",
-      "能说明 HotSpot JDK 8+ 中 Class 镜像、静态字段值和字符串常量池与堆的关系",
-      "能解释 Metaspace OOM 与类加载器泄漏、动态代理、热部署之间的因果关系",
-      "能说明 MetaspaceSize 与 MaxMetaspaceSize 的区别"
+      "能说出方法区是 JVM 规范概念，区分类元数据、运行时常量池、StringTable 和 Code Cache 的位置",
+      "能区分永久代（HotSpot JDK 7-）和元空间（HotSpot JDK 8+ 本地内存）及迁移原因",
+      "能说明 HotSpot JDK 8+ 中 Class 镜像、静态字段值和 StringTable 在堆",
+      "能解释 MetaspaceSize（触发水位）和 MaxMetaspaceSize（硬上限）的行为差异",
+      "能解释 ClassLoader 泄漏导致 Metaspace OOM 的因果关系"
     ],
     "goodToHave": [
-      "能说明运行时常量池和 StringTable 的差异",
+      "能说明运行时常量池和 StringTable 的差异（per-class vs 全局驻留表）",
       "能用 jcmd VM.metaspace、jmap -clstats、类加载日志和 heap dump 排查元空间",
-      "能解释类卸载条件和 ClassLoader 可达性",
-      "能指出不设置 MaxMetaspaceSize 仍受进程/系统内存约束"
+      "能解释类卸载条件和 ClassLoader 可达性对 Metaspace 回收的影响",
+      "能指出不设 MaxMetaspaceSize 在容器环境下的风险"
     ],
     "commonMistakes": [
       "把方法区直接等同于永久代或元空间",
-      "以为字符串常量池还在永久代或 Metaspace",
-      "把 JIT 代码放到 Metaspace 里解释",
-      "只调大 MaxMetaspaceSize，不查 ClassLoader 泄漏",
-      "把运行时常量池和 StringTable 混为一个概念"
+      "以为 StringTable 还在永久代或 Metaspace",
+      "把 JIT 代码（Code Cache）放到 Metaspace 里解释",
+      "只调大 MaxMetaspaceSize，不查 ClassLoader 泄漏和动态类生成",
+      "把运行时常量池和 StringTable 混为一个概念",
+      "不设 MaxMetaspaceSize 以为无风险，忽略容器内存限制"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -160,11 +187,11 @@
       "depth": 20
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "java.jvm.topic-001-ebcc71cb"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "重点考察候选人能否说清方法区规范、PermGen/Metaspace 实现、StringTable/Code Cache/静态字段值边界，以及 Metaspace OOM 的类加载器泄漏排查路径。"
+  "interviewerFocus": "重点考察候选人能否说清方法区规范、PermGen/Metaspace 实现差异及迁移原因、HotSpot JDK 8+ 中各数据区域（类元数据/StringTable/静态字段/Code Cache）的准确位置，以及 MetaspaceSize/MaxMetaspaceSize 行为和 ClassLoader 泄漏排查路径。"
 }

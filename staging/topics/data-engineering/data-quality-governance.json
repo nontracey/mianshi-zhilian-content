@@ -4,7 +4,7 @@
   "category": "foundation",
   "group": "foundation",
   "title": "数据质量与数据治理",
-  "summary": "用完整性、准确性、一致性、及时性、唯一性五维度定义规则，靠 Great Expectations/Deequ、血缘和 SLA 形成发现-定位-修复-预防闭环。",
+  "summary": "数据质量的本质是「脏数据不进入下游决策」，按 DAMA 完整性/准确性/一致性/及时性/唯一性五维度定义可执行规则，靠 Great Expectations/Deequ/dbt tests 落地校验、字段级血缘做影响分析、SLA + 质量门禁阻断脏数据流通，最终形成发现-定位-修复-预防闭环。",
   "tags": [
     "数据工程",
     "数据质量",
@@ -20,119 +20,82 @@
   "status": "staging",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "重点考察五维度规则如何落到 Great Expectations/Deequ、血缘如何支撑影响分析，以及 SLA 与质量门禁如何阻断脏数据进入下游报表。",
+  "interviewerFocus": "考察五维度规则如何落地到 Great Expectations/Deequ/dbt tests、字段级血缘如何支撑影响分析、SLA 与质量门禁如何阻断脏数据进入下游报表，以及质量分和告警分级如何让治理真正落地。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "五维度怎么落成可执行的规则",
-      "content": "数据质量按 DAMA 的五维度展开，但要落到工程层面，必须明确「在哪一层加什么规则、阈值多少、违反后怎么处置」。\n\n- 完整性（Completeness）：关键字段不为空，规则形如 `expect_column_values_to_not_be_null('order_id')`。订单号、user_id、支付时间这种主键和事实键必须 100%；地址、备注这类描述字段允许 95% 阈值，并按月观察趋势。\n- 准确性（Accuracy）：值符合真实业务，靠和参照源对账。例如 `paid_amount = sum(order_item.amount)` 在 ODS 落地后做行级对账，差异 > 0.01 元就告警；状态字段用枚举校验 `expect_column_values_to_be_in_set('status', ['CREATED','PAID','REFUNDED'])`。\n- 一致性（Consistency）：跨表/跨系统口径一致。GMV 在交易域和报表域必须按同一口径统计，常用「主键关联后每日比例差 < 0.5%」的对账规则。外键完整性可以用 Deequ 的 `referentialIntegrity` 检查 `fact_order.user_id` 是否都能在 `dim_user` 找到。\n- 及时性（Timeliness）：在 SLA 前产出。Airflow 里给关键 DAG 设 `sla=timedelta(hours=2)`，迟到触发 `sla_miss_callback`；Flink 实时链路看 watermark 与处理时间差，超过 5 分钟就报警。\n- 唯一性（Uniqueness）：主键/业务键不重复。`expect_compound_columns_to_be_unique(['order_id','dt'])`，注意分区表要带分区列，否则跨分区误报。\n\n每条规则必须记录三件事：阈值、严重等级（warn/error/block）、责任人。block 级直接让下游任务失败，warn 级只发钉钉，否则告警一多就被忽视。"
+      "title": "五维度落成可执行规则的关键是阈值、分级和责任人",
+      "content": "数据质量按 DAMA 的五维度展开，但工程落地的核心不是「有了规则」，而是「规则有阈值、有分级、有责任人、有处置流程」。\n\n**完整性（Completeness）**：关键字段不为空。规则形如 `expect_column_values_to_not_be_null('order_id')`。订单号、user_id、支付时间这种主键和事实键必须 100%；地址、备注等描述字段允许 95% 阈值并按月观察趋势。主键一旦缺失，下游 join 直接丢单、报表少计 GMV。\n\n**准确性（Accuracy）**：值符合真实业务，靠和参照源对账。例如 `paid_amount = sum(order_item.amount)` 在 ODS 落地后做行级对账，差异 > 0.01 元就告警；状态字段用枚举校验 `expect_column_values_to_be_in_set('status', ['CREATED','PAID','REFUNDED'])`。金额不对直接影响财务对账。\n\n**一致性（Consistency）**：跨表/跨系统口径一致。GMV 在交易域和报表域必须按同一口径统计，常用「主键关联后每日比例差 < 0.5%」的对账规则。外键完整性用 Deequ 的 `Check.satisfies('user_id IN (SELECT user_id FROM dim_user)')` 或 GE 自定义 SQL Expectation 检查。口径不一致最典型的表现是同一指标多个版本，业务方互相不信。\n\n**及时性（Timeliness）**：在 SLA 前产出。离线调度看 SLA（Airflow `sla=timedelta(hours=2)`，迟到触发 `sla_miss_callback`）；实时计算看 Event Time 与 Processing Time 的 Watermark 差，超过阈值报警。注意：及时性不只是「晚了告警」，延迟产出可能导致晨会看不到日报、决策延后。\n\n**唯一性（Uniqueness）**：主键/业务键不重复。`expect_compound_columns_to_be_unique(['order_id','dt'])`。注意分区表必须带分区列，否则跨分区误报。重复最危险的后果是重复计费、用户被重复发券。\n\n每条规则必须记录三件事：**阈值**（主键 100%、金额 0.01 元、比例差 0.5%）、**严重等级**（block 让下游失败、warn 只发告警、info 仅记录质量分）、**责任人**。等级划分的目的不是技术问题，是治理问题——告警一多没人看，只有 block 级才真正有人修。"
     },
     {
       "type": "explain",
-      "title": "Great Expectations 与 Deequ 的差异和落地",
-      "content": "选型差异和工程化细节是面试考察重点，不能只报名字，必须落到具体实现。\n\n- Great Expectations（Python 生态）：核心是 Expectation Suite（一组 JSON 化规则） + Checkpoint（运行时上下文） + Data Docs（HTML 报告）。和 Airflow 集成用 `GreatExpectationsOperator`，每次任务跑完调一次 checkpoint，失败会让 DAG 走 `on_failure_callback`。优点是能 profile 自动生成基线 suite，缺点是大表全量校验慢，需要按分区或抽样跑。\n- Deequ（Spark/Scala 生态）：AWS 开源，跑在 Spark executor 上，适合 PB 级。核心是 `Check` + `VerificationSuite`，能算 Constraints（强校验）和 Metrics（指标）。还能用 `AnomalyDetection` 做基于历史的趋势校验，比如 `RowCount` 突降 30% 自动报警。PyDeequ 是 Python 包装，但生态没 Scala 完整。\n- 量级和团队栈选择：Python/dbt 栈选 GE 或 dbt tests（轻量、社区活跃）；Spark 数仓选 Deequ；湖仓一体可以用 Soda Core（YAML 化规则，对接 Snowflake/BigQuery 友好）。\n\n落地时要把规则版本化进 Git，禁止在 UI 改完不留痕；CI 里对 suite 做 lint，比如禁止阈值写 0% 或 100% 这种「永远过」或「永远不过」的退化规则。"
+      "title": "Great Expectations、Deequ 和 dbt tests 的选型差异与工程化细节",
+      "content": "选型差异和工程化细节是面试考察重点，不能只报名字，必须落到具体实现和适用场景。\n\n**Great Expectations（Python 生态）**：核心概念是 Expectation Suite（一组 JSON 化规则） + Checkpoint（运行时上下文，绑定数据源和 suite） + Data Docs（自动生成的 HTML 报告）。和 Airflow 集成用 `GreatExpectationsOperator`，每次 DAG 跑完调一次 checkpoint。`fail_task_on_validation_failure=True` 让 block 级失败直接抛异常阻断下游。GE 能对数据做 profile 自动生成基线 suite，适合冷启动场景；缺点是大表全量校验慢，需要按分区跑 `batch_request` 或抽样。SqlAlchemy backend 可以下推 SQL 到 BigQuery/Snowflake 执行，避免拉数据到 Python 进程。\n\n**Deequ（Spark/Scala 生态）**：AWS 开源，跑在 Spark executor 上，天然适合 PB 级数据。核心是 `Check` + `VerificationSuite`，能算 Constraints（强校验，pass/fail）和 Metrics（指标，只算不判）。最大差异化能力是 `AnomalyDetection`：基于历史指标做趋势校验，比如 `RowCount` 突降 30% 自动报警，不需要人工拍固定阈值。PyDeequ 是 Scala 实现的 Python 包装，依赖 Spark 环境，Python 生态不如 Scala 完整。\n\n**dbt tests（SQL 生态）**：最轻量，用 YAML 定义 `not_null`、`unique`、`accepted_values`、`relationships`，自定义用 `singular test` 写 SQL。社区包 `dbt-expectations`（移植了 GE 的大量 expectation 到 SQL）和 `dbt-utils` 提供开箱即用规则。dbt `--fail-fast` + `severity: error` 直接阻断 DAG。适合 dbt 用户内嵌到 model 开发流程中，不需要额外基础设施。\n\n**Soda Core（YAML 化）**：规则用 YAML 定义，对接 Snowflake/BigQuery/Spark 友好，适合湖仓一体栈。和 dbt 类似是轻量方案，但不绑定 dbt 生态。\n\n**工程化共性**：规则必须版本化进 Git，禁止在 UI 改完不留痕；CI 里对 suite 做 lint，比如禁止阈值写 0% 或 100% 这种退化规则（永远过或永远不过）。"
     },
     {
       "type": "explain",
-      "title": "血缘、SLA 与质量门禁如何兜底",
-      "content": "规则只是把脏数据「检出」，要让脏数据「不流到下游」，靠的是血缘 + SLA + 质量门禁三件套。\n\n- 数据血缘：字段级血缘比表级血缘有用得多。Apache Atlas、DataHub、OpenLineage 都能从 SQL/Spark plan 解析 column-level lineage。出问题时，第一动作是按字段血缘找到下游所有依赖，包括报表、特征和下游 ETL。然后评估影响半径，再决定是回滚还是热修。\n- 数据 SLA / SLO：每个核心数据集要定义 SLI（如「日订单宽表 09:00 前产出且行数偏差 < 2%」）、SLA（对外承诺）和 error budget。SLA miss 不只是延迟，规则失败导致的「带病产出」也算。错误预算耗尽时冻结新需求、回头补质量。\n- 质量门禁（Circuit Breaker）：在 ETL DAG 里把 GE/Deequ 检查作为前置 task，block 级失败直接让下游 skip 或 retry，避免脏数据被覆盖到 ADS 层。Airflow 用 `ShortCircuitOperator` 或 `TriggerRule.NONE_FAILED`。dbt 用 `--fail-fast` + `severity: error`。Flink 用旁路 dead-letter topic。\n\n常见坑：只在数仓出口加门禁，源系统脏数据已经污染中间层；只看任务成功率，不看规则命中率，结果规则全 warn 没人看。要把「质量分」（规则通过率加权）做成数据集卡片上的核心指标，和负责人 OKR 挂钩。"
+      "title": "血缘、SLA 与质量门禁三件套让脏数据不流到下游",
+      "content": "规则只是把脏数据「检出」，要让脏数据「不流到下游」，靠的是血缘 + SLA + 质量门禁三件套。\n\n**数据血缘（Lineage）**：字段级血缘比表级血缘有用得多。Apache Atlas、DataHub、OpenLineage 都能从 SQL/Spark plan 解析 column-level lineage。出问题时，第一动作是按字段血缘找到下游所有依赖——报表、特征工程、下游 ETL、对外 API。然后评估影响半径，决定是回滚分区、标记数据集不可用，还是通知下游 owner 暂停消费。没有字段级血缘，排查时只能全量搜表名，效率极低。\n\n**数据 SLA / SLO**：每个核心数据集要定义 SLI（指标，如「日订单宽表 09:00 前产出且行数偏差 < 2%」）、SLA（对外承诺）和 error budget（允许的违规次数/时长）。SLA miss 不只是延迟——规则失败导致的「带病产出」也算 SLA 违规。error budget 耗尽时冻结新需求、回头补质量。SLA 不是一张贴在墙上的文档，要接进调度系统的告警和可观测性面板。\n\n**质量门禁（Circuit Breaker）**：在 ETL DAG 里把校验作为前置 task，block 级失败直接让下游 skip。Airflow 用 `ShortCircuitOperator` 或 `TriggerRule.NONE_FAILED`；dbt 用 `--fail-fast` + `severity: error`；Flink 实时链路用旁路 dead-letter topic 把异常数据导走。门禁的核心价值不是「报错」，是「阻断」——避免脏数据被覆盖到 ADS 层后才被发现。\n\n**常见坑**：①只在数仓出口加门禁，源系统脏数据已经污染中间层——要在 ODS/DWD 每层都加规则。②只看任务成功率不看规则命中率，结果规则全 warn 没人看。③100% 严格阈值导致全员忽略告警。要把「质量分」（规则通过率加权）做成数据集卡片上的核心指标，和负责人 OKR 挂钩。"
+    },
+    {
+      "type": "explain",
+      "title": "质量分和告警分级是治理能落地的关键",
+      "content": "很多团队引入质量工具后发现没人看告警，根因不是工具不好，是告警策略和治理机制没设计好。\n\n**告警分级**：block 级——关键规则失败（主键缺失、金额对账不过、SLA miss），直接阻断下游并电话告警 oncall；warn 级——趋势异常或非核心字段缺失，发钉钉/Slack 到 owner，要求 48 小时内修；info 级——仅记录到质量分面板，用于趋势分析和 OKR 考核。不同团队对「关键」的定义不同，要在规则创建时就定好，而不是出了事后临时调。\n\n**质量分（Quality Score）**：按规则权重加权计算通过率。主键唯一性权重高于描述字段完整性。质量分出现在三个地方：数据集卡片（一眼看出数据集健康度）、负责人 OKR（个人/团队质量考核）、数据发布门禁（质量分 < 80 禁止发布新版本）。质量分的作用是把分散的告警信号聚合为一个可比较、可追踪的数字。\n\n**告警疲劳治理**：连续 N 天 warn 不修的规则，自动升级为 block；退化规则（阈值 0% 或 100%、连续 30 天全部通过）标记为待清理或待加强。引入 anomaly detection（Deequ AnomalyDetection 或 Prophet）替代固定阈值，让规则跟着数据趋势走，减少误报。建立规则 owner 和豁免流程：owner 可以申请临时豁免但必须写原因，豁免超过 3 次自动升级审查。"
     },
     {
       "type": "diagram",
       "title": "数据质量治理闭环：规则、校验、阻断、血缘与责任人",
-      "format": "mermaid",
       "content": "flowchart TD\nA[\"数据源/数据集\"] --> B[\"元数据采集\nSchema/分区/产出时间\"]\nB --> C[\"质量规则\n完整性/唯一性/及时性/一致性\"]\nC --> D[\"质量作业执行\"]\nD --> E{\"是否通过阈值\"}\nE -->|通过| F[\"发布到下游表/指标\"]\nE -->|失败| G[\"阻断或降级\n冻结分区/标记不可用\"]\nG --> H[\"告警到 owner\n生成修复单\"]\nF --> I[\"血缘和数据目录更新\"]\nH --> I\nI --> J[\"复盘规则和 SLA\"]",
-      "fallback": "图展示数据质量不是一次校验，而是规则、阈值、发布门禁、告警 owner、血缘目录和 SLA 复盘组成的治理闭环。",
-      "caption": "数据质量治理闭环：规则、校验、阻断、血缘与责任人",
-      "sources": [
-        {
-          "kind": "mermaid",
-          "content": "flowchart TD\nA[\"数据源/数据集\"] --> B[\"元数据采集\nSchema/分区/产出时间\"]\nB --> C[\"质量规则\n完整性/唯一性/及时性/一致性\"]\nC --> D[\"质量作业执行\"]\nD --> E{\"是否通过阈值\"}\nE -->|通过| F[\"发布到下游表/指标\"]\nE -->|失败| G[\"阻断或降级\n冻结分区/标记不可用\"]\nG --> H[\"告警到 owner\n生成修复单\"]\nF --> I[\"血缘和数据目录更新\"]\nH --> I\nI --> J[\"复盘规则和 SLA\"]"
-        },
-        {
-          "kind": "text",
-          "content": "图展示数据质量不是一次校验，而是规则、阈值、发布门禁、告警 owner、血缘目录和 SLA 复盘组成的治理闭环。"
-        }
-      ]
+      "format": "mermaid",
+      "caption": "数据质量治理闭环：规则校验通过才发布，失败则阻断并告警 owner，血缘追踪影响范围，最后复盘补规则和 SLA。",
+      "fallback": "图展示数据质量不是一次校验，而是规则定义、校验执行、阈值判定、阻断/发布、告警 owner、血缘目录更新和 SLA 复盘组成的完整治理闭环。"
     },
     {
       "type": "compareTable",
-      "title": "五维度的规则形态与典型工具",
-      "columns": [
-        "维度",
-        "典型规则",
-        "GE/Deequ 表达",
-        "失效后的业务表现"
-      ],
-      "rows": [
-        [
-          "完整性",
-          "主键/事实键非空率 100%",
-          "expect_column_values_to_not_be_null / Check.isComplete",
-          "下游 join 丢单，报表少计 GMV"
-        ],
-        [
-          "准确性",
-          "金额对账差异 < 0.01",
-          "自定义 SQL Expectation / Check.satisfies",
-          "财务对账失败，需要补数据并道歉"
-        ],
-        [
-          "一致性",
-          "跨表 GMV 比例差 < 0.5%",
-          "multi-table custom expectation / Deequ referentialIntegrity",
-          "同一指标多个口径，业务方互相不信"
-        ],
-        [
-          "及时性",
-          "DAG 09:00 前产出",
-          "Airflow SLA + freshness check",
-          "晨会看不到日报，决策延后"
-        ],
-        [
-          "唯一性",
-          "(order_id, dt) 唯一",
-          "expect_compound_columns_to_be_unique / Check.isUnique",
-          "重复计费、用户被重复发券"
-        ]
-      ]
+      "title": "五维度规则形态、工具表达与失效后果",
+      "content": "| 维度 | 典型规则 | GE/Deequ 表达 | 失效后果 |\n| --- | --- | --- | --- |\n| 完整性 | 主键/事实键非空率 100% | `expect_column_values_to_not_be_null` / `Check.isComplete` | join 丢单，报表少计 GMV |\n| 准确性 | 金额对账差异 < 0.01 元 | 自定义 SQL Expectation / `Check.satisfies` | 财务对账失败，需补数据 |\n| 一致性 | 跨表 GMV 比例差 < 0.5% | multi-table expectation / `referentialIntegrity` | 同一指标多个口径，业务互不信 |\n| 及时性 | DAG 09:00 前产出 | Airflow SLA + freshness check | 晨会无日报，决策延后 |\n| 唯一性 | `(order_id, dt)` 唯一 | `expect_compound_columns_to_be_unique` / `Check.isUnique` | 重复计费、重复发券 |"
+    },
+    {
+      "type": "compareTable",
+      "title": "质量工具选型对比",
+      "content": "| 工具 | 语言/生态 | 适用数据量 | 核心差异化能力 | 典型集成 |\n| --- | --- | --- | --- | --- |\n| Great Expectations | Python | 中小到中大（按分区/抽样） | Expectation Suite + Data Docs，profiling 自动生成基线 | Airflow Operator，dbt 插件 |\n| Deequ | Scala/Spark | PB 级 | AnomalyDetection 趋势校验，Metrics 指标采集 | Spark job 内嵌 |\n| dbt tests | SQL | 取决于 warehouse | 最轻量，内嵌 model 开发流程 | dbt `--fail-fast` + `severity: error` |\n| Soda Core | YAML | 中到大 | YAML 化规则，Snowflake/BigQuery 原生支持 | CI/CD，调度系统 |"
     },
     {
       "type": "code",
       "title": "Great Expectations + Airflow 质量门禁示例",
-      "language": "python",
-      "content": "from airflow import DAG\nfrom airflow.operators.python import ShortCircuitOperator\nfrom great_expectations_provider.operators.great_expectations import GreatExpectationsOperator\n\nwith DAG('dwd_order', schedule='0 2 * * *', sla_miss_callback=notify_oncall) as dag:\n    extract = ...\n\n    quality_gate = GreatExpectationsOperator(\n        task_id='ge_dwd_order',\n        data_context_root_dir='/opt/ge',\n        checkpoint_name='dwd_order_daily',\n        fail_task_on_validation_failure=True,  # block 级：失败直接抛异常\n        return_json_dict=True,\n    )\n\n    def has_critical_failure(ti):\n        result = ti.xcom_pull(task_ids='ge_dwd_order')\n        # 只在 critical 规则失败时阻断下游，warn 级允许通过\n        return not any(r['severity'] == 'critical' and not r['success']\n                       for r in result['results'])\n\n    circuit = ShortCircuitOperator(task_id='block_if_critical',\n                                   python_callable=has_critical_failure)\n\n    load_ads = ...\n    extract >> quality_gate >> circuit >> load_ads",
+      "content": "from airflow import DAG\nfrom airflow.operators.python import ShortCircuitOperator\nfrom great_expectations_provider.operators.great_expectations import GreatExpectationsOperator\n\ndef notify_oncall(context):\n    \"\"\"sla_miss_callback：及时性和质量共用同一套告警通道\"\"\"\n    send_alert(f\"DAG {context['dag'].dag_id} SLA miss, task {context['task_instance'].task_id}\")\n\nwith DAG('dwd_order', schedule='0 2 * * *', sla_miss_callback=notify_oncall) as dag:\n    extract = ...\n\n    quality_gate = GreatExpectationsOperator(\n        task_id='ge_dwd_order',\n        data_context_root_dir='/opt/ge',\n        checkpoint_name='dwd_order_daily',\n        fail_task_on_validation_failure=True,  # block 级：失败直接抛异常\n        return_json_dict=True,\n    )\n\n    def has_critical_failure(ti):\n        result = ti.xcom_pull(task_ids='ge_dwd_order')\n        # result['results'] 是列表，每个元素含 success/expectation_config/exception_info\n        # 只在 critical 规则失败时阻断，warn 级允许通过但降质量分\n        return not any(r.get('severity') == 'critical' and not r['success']\n                       for r in result['results'])\n\n    circuit = ShortCircuitOperator(task_id='block_if_critical',\n                                   python_callable=has_critical_failure)\n\n    load_ads = ...\n    extract >> quality_gate >> circuit >> load_ads",
       "highlights": [
         {
-          "line": 6,
-          "note": "sla_miss_callback 把及时性也接进同一套告警，避免延迟和质量分开两套监控。"
+          "line": 7,
+          "note": "sla_miss_callback 把及时性和质量规则接进同一套告警通道，避免延迟和质量分开监控。"
         },
         {
-          "line": 13,
-          "note": "fail_task_on_validation_failure=True 让 block 级规则失败直接让下游 skip，是质量门禁的关键开关。"
+          "line": 14,
+          "note": "fail_task_on_validation_failure=True 让 block 级规则失败直接阻断下游，是质量门禁的关键开关。"
         },
         {
-          "line": 19,
-          "note": "区分 critical 和 warn：warn 级只降质量分，避免告警噪音淹没真正的阻断信号。"
+          "line": 22,
+          "note": "区分 critical 和 warn 级别：warn 级只降质量分不阻断，避免告警噪音淹没真正需要处理的问题。"
         }
-      ]
+      ],
+      "language": "python"
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "数据质量治理我会从「让脏数据不进入下游决策」这个目标切入，而不是只说规则平台。整体是五维度规则 + 工具落地 + 血缘门禁的闭环。\n\n核心机制：\n1. 按 DAMA 五维度定义规则——完整性看主键非空、准确性靠对账、一致性看跨表口径、及时性靠 SLA、唯一性看主键重复。每条规则必须带阈值、严重等级和责任人。\n2. 工具上 Python/dbt 栈用 Great Expectations 的 Expectation Suite + Checkpoint。Spark 大数据量用 Deequ 的 VerificationSuite 加 AnomalyDetection。规则版本化进 Git。\n3. 靠字段级血缘（Atlas/DataHub/OpenLineage）做影响分析。靠 Airflow SLA + ShortCircuitOperator 做质量门禁，block 级直接阻断下游，warn 级降质量分，避免脏数据流到 ADS 层。\n\n边界与坑：\n1. 常见误区是只在出口加门禁，源系统脏数据已经污染中间层。\n2. 只看任务成功率不看规则命中率，结果规则全 warn 没人看。\n3. 100% 严格阈值导致全员忽略告警。要按字段重要性分级阈值，并把质量分挂到负责人 OKR。",
+      "content": "数据质量治理的核心目标是「让脏数据不进入下游决策」，不是建规则平台。整体是五维度规则 + 工具落地 + 血缘门禁的闭环。\n\n**核心机制**\n- 按 DAMA 五维度定义规则：完整性看主键非空、准确性靠对账、一致性看跨表口径、及时性靠 SLA、唯一性看主键重复。每条规则必须带阈值、严重等级（block/warn/info）和责任人。\n- 工具选型：Python/dbt 栈用 Great Expectations 的 Expectation Suite + Checkpoint；Spark 大数据量用 Deequ 的 VerificationSuite + AnomalyDetection；轻量场景用 dbt tests。规则版本化进 Git，CI lint 退化规则。\n- 靠字段级血缘（Atlas/DataHub/OpenLineage）做影响分析。靠 Airflow SLA + ShortCircuitOperator 做质量门禁，block 级直接阻断下游，warn 级降质量分。\n\n**关键边界**\n- 只在出口加门禁是常见坑，脏数据已经污染中间层——每层都加规则。\n- 只看任务成功率不看规则命中率，结果规则全 warn 没人看——质量分挂 OKR。\n- 100% 严格阈值导致告警疲劳——按字段重要性分级阈值 + anomaly detection 替代固定阈值。\n- 质量分（规则通过率加权）要出现在数据集卡片、负责人 OKR 和发布门禁三处。",
       "followUpQuestions": [
         {
           "question": "Great Expectations 跑全量数据太慢，怎么优化？",
-          "answer": "三种思路：一是按分区跑，checkpoint 里用 `batch_request` 限定 `dt=today`。二是抽样校验，对趋势型规则用 1% 抽样跑分布检查，强校验仍走全量但只校验关键列。三是把 GE 改成在 Spark/BigQuery 上原生执行，避免拉数据到 Python 进程。比如用 GE 的 SqlAlchemy backend 直接下推 SQL，或者大表直接换 Deequ。"
+          "answer": "三种思路：①按分区跑，checkpoint 里用 `batch_request` 限定 `dt=today`。②抽样校验，趋势型规则用 1% 抽样跑分布检查，强校验（主键非空/唯一）仍走全量。③用 GE 的 SqlAlchemy backend 下推 SQL 到 BigQuery/Snowflake 执行，避免拉数据到 Python 进程；大表直接换 Deequ 跑在 Spark executor 上。"
         },
         {
           "question": "线上发现指标对不上，你会怎么排查？",
-          "answer": "先在 DataHub/Atlas 查字段级血缘锁定影响范围，看是哪一层 ETL 产出有问题。再对比当天和昨天的 GE/Deequ 规则报告，看是规则新失败还是规则一直没覆盖。如果规则没覆盖，临时跑 ad-hoc SQL 对账，定位到具体字段和分区。修复后把这次的对账逻辑沉淀成新 expectation，更新责任人和 SLA。整个过程要在事故复盘里补「这条规则为什么之前没有」。"
+          "answer": "先在 DataHub/Atlas 查字段级血缘锁定影响范围，看哪一层 ETL 产出有问题。再对比当天和昨天的 GE/Deequ 规则报告，看是规则新失败还是规则一直没覆盖。如果规则没覆盖，临时跑 ad-hoc SQL 对账定位到具体字段和分区。修复后把这次的对账逻辑沉淀成新 expectation，更新责任人和 SLA。整个过程要在事故复盘里补「这条规则为什么之前没有」。"
         },
         {
           "question": "质量规则误报多导致团队疲劳，怎么治理？",
-          "answer": "分三步：第一步是分级告警，critical 级 block，warn 级钉钉，info 级仅记录质量分。按业务容忍度调阈值，金额 0.01 元，UV 允许 1% 波动。第二步是引入异常检测，用 Deequ AnomalyDetection 或 Prophet 替代固定阈值，让规则跟着趋势走。第三步是建立规则 owner 和豁免流程，连续 N 天 warn 不修就升级到 block，强制治理。核心是让告警「少而准」，否则没人会看。"
+          "answer": "分三步：①分级告警——critical block，warn 钉钉，info 仅记录质量分。②引入 anomaly detection（Deequ AnomalyDetection/Prophet）替代固定阈值，让规则跟着趋势走。③建规则 owner 和豁免流程——连续 N 天 warn 不修自动升级为 block，豁免超 3 次触发审查。核心是让告警「少而准」。"
         }
       ]
     },
@@ -140,64 +103,65 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能列出 DAMA 五维度并各举一个可执行的规则示例（含阈值和工具表达）",
-        "能比较 Great Expectations、Deequ、dbt tests 的适用栈和工程化差异",
-        "能解释字段级血缘在事故影响分析中的作用，以及 Atlas/DataHub/OpenLineage 的角色",
-        "能描述 Airflow SLA + ShortCircuitOperator 实现质量门禁的具体写法",
-        "能区分 block / warn / info 三档告警，并说明为什么不能一刀切 100% 阈值"
+        "能列出 DAMA 五维度并各举一条可执行规则（含阈值、严重等级和工具表达）",
+        "能比较 Great Expectations、Deequ、dbt tests、Soda Core 的适用栈和核心差异化能力",
+        "能解释字段级血缘在事故影响分析中的作用及 Atlas/DataHub/OpenLineage 的定位",
+        "能描述 Airflow SLA + ShortCircuitOperator 实现 block/warn 两级质量门禁的具体写法",
+        "能说明质量分的计算方式、展示位置及其和 OKR 挂钩的治理价值",
+        "能解释告警疲劳的根因和分级、anomaly detection、owner 豁免流程三种治理手段"
       ]
     }
   ],
   "recallPrompts": [
     {
+      "difficulty": 3,
+      "expectedMinutes": 4,
       "id": "data-engineering.foundation.data-quality-governance.recall.1",
-      "prompt": "请用 DAMA 五维度各举一条规则，并说明你会用 Great Expectations 还是 Deequ 落地、阈值大概设多少。",
       "mode": "text",
-      "expectedMinutes": 4,
-      "difficulty": 3
+      "prompt": "请用 DAMA 五维度各举一条规则，并说明你会用 Great Expectations 还是 Deequ 落地、阈值大概设多少。"
     },
     {
+      "difficulty": 4,
+      "expectedMinutes": 4,
       "id": "data-engineering.foundation.data-quality-governance.recall.2",
-      "prompt": "线上发现 dwd_order 表昨天的 GMV 比业务后台少了 1.2%，你会怎么用血缘和质量规则定位？",
       "mode": "text",
-      "expectedMinutes": 4,
-      "difficulty": 4
+      "prompt": "线上发现 dwd_order 表昨天的 GMV 比业务后台少了 1.2%，你会怎么用血缘和质量规则定位？"
     },
     {
-      "id": "data-engineering.foundation.data-quality-governance.recall.3",
-      "prompt": "团队抱怨 GE 告警太多没人看，你作为数据负责人会怎么改造规则、阈值和门禁来重建信任？",
-      "mode": "text",
+      "difficulty": 4,
       "expectedMinutes": 4,
-      "difficulty": 4
+      "id": "data-engineering.foundation.data-quality-governance.recall.3",
+      "mode": "text",
+      "prompt": "团队抱怨 GE 告警太多没人看，你作为数据负责人会怎么改造规则、阈值和门禁来重建信任？"
     }
   ],
   "rubric": {
     "mustHave": [
-      "DAMA 五维度（完整性/准确性/一致性/及时性/唯一性）的定义和典型规则",
+      "DAMA 五维度（完整性/准确性/一致性/及时性/唯一性）的定义和典型规则，含阈值与严重等级",
       "Great Expectations 的 Expectation Suite + Checkpoint 与 Deequ 的 VerificationSuite + AnomalyDetection 选型差异",
       "字段级血缘（Atlas/DataHub/OpenLineage）在影响分析中的作用",
-      "Airflow SLA + ShortCircuitOperator 实现的 block / warn 两级质量门禁",
+      "Airflow SLA + ShortCircuitOperator 实现的 block/warn 两级质量门禁",
       "规则必须带阈值、严重等级、责任人三要素"
     ],
     "goodToHave": [
-      "用 Deequ AnomalyDetection 或 Prophet 做基于历史趋势的异常检测",
+      "用 Deequ AnomalyDetection 或 Prophet 做基于历史趋势的异常检测，替代固定阈值",
       "把质量分（规则通过率加权）做成数据集卡片指标并挂到负责人 OKR",
       "规则版本化进 Git 并在 CI 里 lint 退化规则（阈值 0% 或 100%）",
-      "湖仓栈用 Soda Core / dbt tests 替代或补充 GE 的经验"
+      "能比较 dbt tests 和 Soda Core 与 GE/Deequ 的适用场景差异"
     ],
     "commonMistakes": [
-      "只跑空值/重复值校验，不做跨表对账和口径一致性",
-      "所有规则都设 100% 严格阈值，告警全是 warn 没人看",
-      "只在 ADS 出口加门禁，脏数据已经污染中间层",
-      "出事只修当天分区，不沉淀新 expectation 也不补责任人",
-      "把及时性单独放在调度告警里，不和质量分共用一套面板"
+      "只跑空值/重复值校验，不做跨表对账和口径一致性检查",
+      "所有规则都设 100% 严格阈值，告警全是 warn 没人看——没有分级就没有治理",
+      "只在 ADS 出口加门禁，脏数据已经污染中间层 ODS/DWD",
+      "出事只修当天分区，不沉淀新 expectation 也不补责任人和 SLA",
+      "把及时性单独放在调度告警里，不和质量分共用一套面板，导致两个指标互相掩盖"
     ],
     "scoreWeights": {
-      "coverage": 30,
       "accuracy": 25,
-      "interviewExpression": 20,
-      "depth": 25
+      "coverage": 30,
+      "depth": 25,
+      "interviewExpression": 20
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

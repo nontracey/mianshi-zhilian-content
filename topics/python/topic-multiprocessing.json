@@ -4,7 +4,7 @@
   "category": "concurrent-python",
   "group": "concurrent-python",
   "title": "多进程编程",
-  "summary": "讲清 Python 多进程绕过 GIL 做 CPU 并行、进程不共享内存靠 IPC、Pool 并行计算、spawn/fork 启动，以及 main 保护和 pickle 等坑。",
+  "summary": "讲清 Python 多进程绕过 GIL 实现 CPU 真并行、进程独立内存空间靠 IPC 通信、Pool 并行计算模式与进程数选择、spawn/fork/forkserver 启动机制差异、main 保护与 pickle 序列化限制、以及进程创建开销与任务粒度的工程取舍。",
   "tags": [
     "Python",
     "多进程",
@@ -13,32 +13,47 @@
     "进程池"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 31,
   "order": 130,
   "recommendWeight": 75,
   "learningCards": [
     {
       "type": "explain",
-      "title": "多进程编程：为什么需要多进程、multiprocessing 模块",
-      "content": "## 一、为什么需要多进程\n\n多进程**绕过 GIL 限制**，每个进程有独立的 Python 解释器和 GIL，可以实现真正的并行。适用于 CPU 密集型任务。\n## 二、multiprocessing 模块\n\n### 基本用法\n\n```python\nimport multiprocessing as mp\n\ndef worker(n):\n    return n * n\n\nwith mp.Pool(processes=4) as pool:\n    results = pool.map(worker, range(100))\n```\n\n### 进程与线程创建对比\n\n```python\nfrom multiprocessing import Process\n\ndef work(name):\n    print(f\"{name} running, PID: {mp.current_process().pid}\")\n\np = Process(target=work, args=(\"p1\",))\np.start()\np.join()  # 等待进程结束\n```"
+      "title": "为什么需要多进程：GIL 与 CPU 并行的本质矛盾",
+      "content": "CPython 的 GIL（Global Interpreter Lock）保证同一时刻只有一个线程执行 Python 字节码。这意味着即使机器有 8 核，多线程做 CPU 密集计算时也只有一个核在跑 Python 代码，其他线程在等锁。GIL 在 IO 等待时会释放，所以多线程做 IO 密集没问题；但纯计算密集任务，多线程比单线程还慢（多了上下文切换开销）。\n\n多进程的解法是每个进程有独立的 Python 解释器和独立的 GIL，操作系统调度它们到不同 CPU 核上并行执行。代价也明确：进程比线程重（创建慢、内存开销大）、进程间数据完全隔离，通信必须走 IPC（管道、队列、共享内存），不能像线程一样直接读写同一块堆内存。\n\n所以选型逻辑是：CPU 密集用多进程，IO 密集用多线程或 asyncio，混合场景可以进程池 + 线程池组合。不要用多线程做 CPU 密集——GIL 让它退化成串行还多了切换开销。"
     },
     {
       "type": "explain",
-      "title": "多进程编程：进程间通信（IPC）、进程池 Pool",
-      "content": "## 三、进程间通信（IPC）\n\n| 方式 | 说明 | 适用场景 |\n| --- | --- | --- |\n| `Queue` | 进程安全队列（基于 pipe+lock） | 生产者-消费者 |\n| `Pipe` | 双向/单向通道 | 两个进程通信 |\n| `Value`/`Array` | 共享内存（ctypes） | 简单数据共享 |\n| `Manager` | 管理进程代理复杂对象 | 复杂数据结构共享 |\n\n```python\nfrom multiprocessing import Queue, Process\n\ndef producer(q):\n    q.put(\"data\")\n\ndef consumer(q):\n    print(q.get())\n\nq = Queue()\np1 = Process(target=producer, args=(q,))\np2 = Process(target=consumer, args=(q,))\np1.start()\np2.start()\np1.join()\np2.join()\n```\n\n## 四、进程池 Pool\n\n```python\nfrom multiprocessing import Pool\n\ndef cpu_intensive(x):\n    return sum(i * i for i in range(x * 1000000))\n\n# map：阻塞，返回结果列表\n# map_async：非阻塞，返回 AsyncResult\n# apply：单任务同步\n# apply_async：单任务异步\n# imap / imap_unordered：惰性迭代返回\n\nwith Pool(processes=4) as pool:\n    # 惰性迭代，适合结果集很大时\n    for result in pool.imap_unordered(cpu_intensive, range(10)):\n        print(f\"Got: {result}\")\n```\n\n### 进程池大小选择\n\n经验公式：`Pool(processes=os.cpu_count() or 1)`。CPU 密集型任务设置为 CPU 核心数，I/O 密集型可以适当增加。"
+      "title": "进程不共享内存：IPC 四种方式与取舍",
+      "content": "进程拥有独立的虚拟地址空间，一个进程写入的数据另一个进程看不到。multiprocessing 提供四种 IPC 方式，按共享程度和性能排序：\n\n**Queue**：基于底层 Pipe + Lock 实现的进程安全队列。适合生产者-消费者模型，多对多通信。底层用 pickle 序列化数据通过管道传输，数据量大时序列化开销明显。`q.put()` 和 `q.get()` 都是阻塞操作，`q.put_nowait()` 满时抛 `Full`。\n\n**Pipe**：返回一对 `Connection` 对象（默认双向），基于操作系统管道或 socket。两端各一个进程时延迟最低（少了一层锁），但不支持多对多——超过两个进程用 Pipe 容易出竞争条件。`conn.send()` 用 pickle 序列化，`conn.recv()` 阻塞等待。\n\n**Value/Array**：基于 `ctypes` 的共享内存，多个进程直接读写同一块内存，不需要序列化，速度最快。但只支持 ctypes 原生类型（`'i'` 整数、`'d'` 双精度、`'c'` 字符等），复杂对象不行。需要用 `Lock` 或 `get_lock()` 手动加锁防止竞争。Value 的 `.value` 属性读写是原子的吗？不是，Python 层面的 `counter.value += 1` 可能不原子，需要锁。\n\n**Manager**：启动一个独立的 Manager Server 进程，其他进程通过代理对象（`manager.dict()`、`manager.list()`）访问。代理底层走 socket 通信 + pickle 序列化，灵活但最慢。适合需要共享复杂数据结构且性能不是瓶颈的场景。Manager 退出时自动清理 Server 进程。"
     },
     {
       "type": "explain",
-      "title": "多进程编程：Value 和 Array（基于 ctypes）、Manager（更灵活但更慢）",
-      "content": "### Value 和 Array（基于 ctypes）\n\n```python\nfrom multiprocessing import Value, Array\n\ncounter = Value('i', 0)  # 共享整数\narr = Array('d', [1.0, 2.0, 3.0])  # 共享双精度数组\n```\n\n### Manager（更灵活但更慢）\n\n```python\nfrom multiprocessing import Manager\n\nwith Manager() as manager:\n    d = manager.dict()\n    l = manager.list()\n    # 可以在进程间安全共享\n```\n\n## 六、启动方法\n\n| 方法 | 说明 | 平台 |\n| --- | --- | --- |\n| `spawn`（默认 3.8+） | 新进程运行新解释器 | 跨平台 |\n| `fork` | 复制当前进程（更快但有线程问题） | Unix |\n| `forkserver` | 通过服务进程 fork | Unix |\n\nmacOS 上默认使用 spawn，fork 在某些场景（如 PyTorch）可能有兼容问题。"
+      "title": "Pool 并行计算：map/imap/apply 选型与进程数",
+      "content": "Pool 把任务分发到固定数量的工作进程，避免手动管理进程生命周期。核心 API 的差异：\n\n`pool.map(func, iterable)`：把 iterable 切块分发，阻塞等所有结果完成后返回结果列表。简单但大结果集全部驻留内存。`pool.map(func, iterable, chunksize)` 的 chunksize 控制每个进程一次拿多少任务——任务很小时加大 chunksize 减少 IPC 次数，任务粒度大时保持默认。\n\n`pool.imap(func, iterable)`：返回迭代器，结果按输入顺序逐个返回（前一个完成才返回，有 head-of-line blocking）。`pool.imap_unordered(func, iterable)`：结果准备好一个返回一个，不保序，适合「谁先完成谁先消费」。\n\n`pool.apply_async(func, args, callback)`：提交单个任务，返回 `AsyncResult` 对象。`callback` 在主进程回调（适合写日志、聚合），`error_callback` 处理异常。注意：不调 `pool.close()` + `pool.join()` 或用 `with` 语句，async 提交的任务可能没执行完就退出。\n\n**进程数选择**：CPU 密集任务 `Pool(os.cpu_count())` 是合理起点。任务有 IO 等待可以略多于核心数，但多了增加进程切换开销。经验法则：先按核心数跑，测 CPU 利用率——如果不满载说明有 IO 瓶颈，再调。Pool 的 `processes` 参数不传时默认取 `os.cpu_count()`。"
+    },
+    {
+      "type": "explain",
+      "title": "启动方法：spawn、fork、forkserver 的机制与风险",
+      "content": "启动方法决定子进程如何创建，直接影响性能、安全性和兼容性。\n\n**spawn**（Python 3.8+ 默认，所有平台）：启动全新的 Python 解释器，不复制父进程内存。优点是干净、安全，没有 fork 的锁状态问题。缺点是启动慢（要重新 import 模块、重新初始化解释器）。spawn 模式下子进程会重新 import 主模块，所以 **所有启动代码必须放在 `if __name__ == '__main__'` 下**，否则子进程 import 时会递归创建新进程，无限循环直到资源耗尽。\n\n**fork**（Unix 默认 3.8 之前）：`os.fork()` 复制父进程内存页（copy-on-write）。启动快，父进程的变量、锁、线程状态全复制过去。问题在于：如果父进程有多线程，fork 只复制调用 fork 的那个线程，其他线程持有的锁永远不会释放——可能导致子进程死锁。C 扩展库（如某些加密库、数据库驱动）内部有线程，fork 后可能崩溃。macOS 10.14+ 已废弃 fork 作为默认方式，Python 3.12 的 multiprocessing 在 macOS 上强制 spawn。\n\n**forkserver**（Unix）：先 fork 出一个「服务器进程」，后续创建子进程时复用这个服务器进程来 fork。启动比 fork 慢（首次要启动服务器），但比 spawn 快（服务器已经 import 好了模块）。比 fork 安全（服务器进程状态干净，没有随机线程）。在大量创建/销毁进程的场景（如进程池）中比纯 spawn 效率高。"
+    },
+    {
+      "type": "explain",
+      "title": "pickle 序列化：多进程数据传输的核心限制",
+      "content": "spawn 和 forkserver 模式下，进程间传递数据（Process 的 target/args、Pool 的函数和参数、Queue 的消息）都要经过 pickle 序列化。这意味着 **不可 pickle 的对象不能跨进程传递**，包括：\n\n- lambda 和嵌套函数（定义在函数内部的函数）——模块级函数可以 pickle，闭包不行\n- 文件句柄、数据库连接、socket 等操作系统资源\n- 带有不可 pickle 属性的自定义对象（如 `__slots__` 中有不可 pickle 的类型）\n- 第三方库中用 C 扩展实现且未实现 `__reduce__` 的对象\n\n解决方案：改写成模块级函数；用 `__reduce__` 或 `copyreg` 自定义序列化；用 Manager 代理模式避免直接传对象；用 `concurrent.futures.ProcessPoolExecutor`（底层也是 multiprocessing，但 API 更现代）。\n\n另一个隐含开销：大对象序列化慢。如果每个任务传递 100MB 的 numpy 数组，序列化成本可能抵消并行收益。对于 numpy 数组可以用共享内存（`multiprocessing.shared_memory`，Python 3.8+）避免复制。"
+    },
+    {
+      "type": "explain",
+      "title": "进程创建开销与任务粒度：什么时候多进程反而更慢",
+      "content": "进程创建本身有成本：spawn 模式需要启动新解释器、import 模块、初始化对象，开销在几十到几百毫秒；fork 模式复制页表，小任务开销几毫秒，大进程内存多则慢。加上 IPC 的 pickle 序列化/反序列化和管道传输，每次任务通信的额外开销在微秒到毫秒量级。\n\n**规则：单个任务的执行时间必须显著大于进程创建+IPC 开销的总和，多进程才有收益。** 如果一个任务只做 1ms 的计算，进程创建+IPC 可能就占了 0.5ms，4 进程并行的净收益非常有限。这种场景更适合用 Pool 的 `chunksize` 参数把大量小任务打包成大块，减少 IPC 次数。\n\nbenchmark 经验：对纯 CPU 计算，任务粒度在 10ms 以上通常能看到明显加速；低于 1ms 的任务用多进程通常是负优化。Pool.map 的 `chunksize` 默认值会根据 iterable 长度和进程数自动计算，但自动值不一定最优——实测调优最可靠。"
     },
     {
       "type": "diagram",
       "format": "mermaid",
       "title": "多进程编程：机制分支与风险路径",
       "content": "flowchart TD\nN1ahb96mS[多进程编程 触发入口] --> N1ahb96mM[核心对象或状态: Python]\nN1ahb96mM --> N1ahb96mC{多进程编程 是否走正常路径}\nN1ahb96mC -->|正常| N1ahb96mN[执行 多进程编程 主流程]\nN1ahb96mC -->|异常| N1ahb96mF[处理 多进程编程 边界风险]\nN1ahb96mN --> N1ahb96mO[输出结果或交给下一组件]\nN1ahb96mF --> N1ahb96mR[按 多进程编程 语义降级/重试/报错]\nN1ahb96mO --> N1ahb96mV[验证 多进程编程 日志、指标或测试]\nN1ahb96mR --> N1ahb96mV",
-      "caption": "多进程编程 图中的分支用于区分本题正常机制、异常边界和工程验证路径。",
-      "fallback": "多进程编程 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。",
+      "caption": "多进程编程：触发入口 → 核心状态判断 → 正常主流程/异常边界 → 结果验证，重点看 spawn/fork 选择、IPC 方式和 pickle 限制如何影响正常路径和失败路径。",
+      "fallback": "多进程编程流程：入口 → 解释器/GIL 判断 → 独立进程正常并行路径或 fork 死锁/spawn 无限递归/pickle 失败的异常路径 → 结果验证。",
       "sources": [
         {
           "kind": "mermaid",
@@ -52,44 +67,44 @@
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "# 1. Pool 并行计算\nimport os\nfrom multiprocessing import Pool\n\ndef is_prime(n):\n    if n < 2:\n        return False\n    for i in range(2, int(n ** 0.5) + 1):\n        if n % i == 0:\n            return False\n    return True\n\nif __name__ == \"__main__\":\n    numbers = list(range(100000, 101000))\n    with Pool(os.cpu_count()) as pool:\n        primes = pool.map(is_prime, numbers)\n    print(f\"找到 {sum(primes)} 个素数\")\n\n# 2. 进程池 + 回调\nfrom multiprocessing import Pool\n\ndef process_item(x):\n    return x * x\n\ndef callback(result):\n    print(f\"结果: {result}\")\n\nif __name__ == \"__main__\":\n    with Pool(4) as pool:\n        for i in range(10):\n            pool.apply_async(process_item, args=(i,), callback=callback)\n        pool.close()\n        pool.join()\n\n# 3. Manager 共享复杂数据结构\nfrom multiprocessing import Process, Manager\n\ndef worker(d, key, value):\n    d[key] = value\n\nif __name__ == \"__main__\":\n    with Manager() as manager:\n        d = manager.dict()\n        processes = []\n        for i in range(10):\n            p = Process(target=worker, args=(d, f\"key{i}\", i))\n            processes.append(p)\n            p.start()\n        for p in processes:\n            p.join()\n        print(dict(d))\n\n# 4. 进程池上下文管理器（Python 3.3+）\nwith Pool() as pool:  # 自动使用 os.cpu_count()\n    result = pool.apply(time.sleep, (1,))",
+      "title": "可运行代码：Pool 并行计算、IPC 通信、共享内存与 main 保护",
       "language": "python",
+      "content": "# 1. Pool 并行计算 + imap_unordered 惰性迭代\nimport os\nimport time\nfrom multiprocessing import Pool\n\ndef is_prime(n):\n    if n < 2:\n        return False\n    for i in range(2, int(n ** 0.5) + 1):\n        if n % i == 0:\n            return False\n    return True\n\ndef count_primes_in_range(args):\n    start, end = args\n    return sum(1 for n in range(start, end) if is_prime(n))\n\nif __name__ == \"__main__\":\n    # 切分任务为 8 块，减少 IPC 次数\n    chunk_size = 125\n    ranges = [(i, min(i + chunk_size, 101000)) for i in range(100000, 101000, chunk_size)]\n    start_time = time.perf_counter()\n    with Pool(os.cpu_count()) as pool:\n        # imap_unordered: 谁先完成谁先返回，不保序\n        total = sum(pool.imap_unordered(count_primes_in_range, ranges))\n    elapsed = time.perf_counter() - start_time\n    print(f\"多进程: {total} 个素数, 耗时 {elapsed:.3f}s\")\n\n# 2. Queue 生产者-消费者 IPC\nfrom multiprocessing import Process, Queue\n\ndef producer(q, n):\n    for i in range(n):\n        q.put(i * i)\n    q.put(None)  # 哨兵值，通知消费者结束\n\ndef consumer(q):\n    while True:\n        item = q.get()\n        if item is None:\n            break\n        # 处理 item\n    print(\"消费者完成\")\n\nif __name__ == \"__main__\":\n    q = Queue(maxsize=100)  # 有界队列，防止生产者过快\n    p1 = Process(target=producer, args=(q, 1000))\n    p2 = Process(target=consumer, args=(q,))\n    p1.start()\n    p2.start()\n    p1.join()\n    p2.join()\n\n# 3. Value 共享内存 + Lock（counter.value += 1 不是原子的）\nfrom multiprocessing import Process, Value, Lock\n\ndef increment(counter, lock, n):\n    for _ in range(n):\n        with lock:\n            counter.value += 1\n\nif __name__ == \"__main__\":\n    counter = Value('i', 0)\n    lock = Lock()\n    processes = [Process(target=increment, args=(counter, lock, 100000)) for _ in range(4)]\n    for p in processes:\n        p.start()\n    for p in processes:\n        p.join()\n    print(f\"Counter: {counter.value}\")  # 应为 400000\n\n# 4. ProcessPoolExecutor（更现代的 API）\nfrom concurrent.futures import ProcessPoolExecutor, as_completed\n\nif __name__ == \"__main__\":\n    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:\n        futures = {executor.submit(count_primes_in_range, r): r for r in ranges}\n        total = 0\n        for future in as_completed(futures):\n            total += future.result()  # 异常在这里抛出\n        print(f\"ProcessPoolExecutor: {total} 个素数\")",
       "highlights": [
         {
-          "line": 5,
-          "note": "`def is_prime(n):` 定义了 多进程编程 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 20,
+          "note": "chunksize 对比：任务粒度小时大 chunksize 减少 IPC 次数；ranges 手动切分比传大 iterable 更可控。"
         },
         {
-          "line": 8,
-          "note": "`for i in range(2, int(n ** 0.5) + 1):` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+          "line": 25,
+          "note": "imap_unordered 不保序，结果准备好一个消费一个，大结果集时避免全部驻留内存。"
         },
         {
-          "line": 6,
-          "note": "`if n < 2:` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 37,
+          "note": "Queue(maxsize=100) 有界队列防止生产者过快压垮消费者。"
         },
         {
-          "line": 47,
-          "note": "`processes.append(p)` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "line": 52,
+          "note": "counter.value += 1 不是原子操作，必须加 Lock 防止竞争。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：Python 多进程靠 multiprocessing 模块，每个进程有独立解释器和 GIL，所以能真正并行、专治 CPU 密集型任务（线程因 GIL 做不了 CPU 并行）。代价是进程比线程重、数据不共享、要走 IPC。\n\n要点：\n\n1. 用法：Process 起进程、Pool 起进程池做并行计算（如 pool.map 把任务分发到多个进程）。\n2. 进程数：CPU 密集设 os.cpu_count()，IO 密集可适当多一点。\n3. 进程间通信（不共享内存，要 IPC）：Queue（进程安全队列，生产者-消费者）、Pipe（两进程通道）、Value/Array（ctypes 共享内存，简单数据）、Manager（代理复杂对象，灵活但慢）。\n4. 启动方式：spawn（3.8+ 默认、跨平台、新解释器）、fork（Unix、快但复制线程有坑）、forkserver。macOS 默认 spawn，fork 在 PyTorch 等有兼容问题。\n\n边界和坑。① 多进程数据不共享，传参和返回值要 pickle 序列化，不能 pickle 的对象（lambda、本地函数、文件句柄）传不了。② spawn 模式下子进程会重新 import 主模块，所以启动代码必须放在 if __name__ == '__main__' 里，否则无限递归创建进程。③ 进程创建和 IPC 有开销，任务太小时多进程反而比单进程慢，适合粗粒度 CPU 密集任务。④ CPU 密集用多进程、IO 密集用多线程或 asyncio，别搞反。",
+      "content": "Python 多进程的核心价值是绕过 GIL 实现 CPU 真并行。GIL 保证同一时刻只有一个线程执行 Python 字节码，多线程做 CPU 密集计算退化成串行。多进程每个进程有独立解释器和 GIL，操作系统调度到不同核并行执行。\n\n**核心 API 选型**\n- Process：手动管理单个进程，适合一次性后台任务\n- Pool：进程池，固定 worker 数复用进程，适合批量并行计算\n  - map/map_async：一次性分发，阻塞/非阻塞返回结果列表\n  - imap/imap_unordered：惰性迭代返回，大数据集避免内存峰值\n  - apply_async：单任务异步提交 + callback\n- ProcessPoolExecutor（concurrent.futures）：更现代的 API，支持 as_completed 和 Future 异常处理\n\n**IPC 四种方式（进程不共享内存）**\n- Queue：进程安全队列，基于 Pipe + Lock，适合生产者-消费者\n- Pipe：双向通道，两点通信延迟最低，不适合多对多\n- Value/Array：ctypes 共享内存，最快但只支持原生类型，需要 Lock 保护\n- Manager：代理对象走 socket + pickle，灵活但最慢\n\n**启动方法**\n- spawn（3.8+ 默认）：新解释器，安全但慢，必须 main 保护\n- fork：复制父进程，快但继承锁状态有多线程死锁风险\n- forkserver：复用服务器进程 fork，兼顾安全和性能\n\n**工程边界**\n- 传参/返回值要可 pickle，lambda、文件句柄、闭包传不了\n- spawn 模式不加 `if __name__ == '__main__'` 会无限递归创建进程\n- 任务粒度太小（<1ms）多进程反而更慢，创建+IPC 开销抵消并行收益\n- CPU 密集用多进程，IO 密集用多线程/asyncio，别搞反\n- 大 numpy 数组用 multiprocessing.shared_memory 避免 pickle 复制",
       "followUpQuestions": [
         {
-          "question": "Pool 的 map 和 imap_unordered 有什么区别？大数据量时用哪个？",
-          "answer": "map 阻塞所有进程完成后一次性返回结果列表。imap_unordered 返回迭代器，结果准备好一个就返回一个，不保持输入顺序。大数据量时用 imap_unordered 可以边处理边消费，避免所有结果同时占用内存。但如果需要保持顺序，用 imap（保持顺序的惰性版本）。"
+          "question": "Pool 的 map、imap、imap_unordered 和 apply_async 分别适合什么场景？",
+          "answer": "map 适合任务量确定、结果集不大的场景，一次性返回列表。imap 保持输入顺序但有 head-of-line blocking（前面的没完成后面即使完成了也不返回）。imap_unordered 谁先完成谁先返回，适合大结果集边处理边消费。apply_async 适合逐个提交异步任务，配合 callback 做回调处理，适合任务动态生成的场景。"
         },
         {
-          "question": "进程池的进程数和 CPU 核心数怎么配？怎么排查进程池的性能瓶颈？",
-          "answer": "CPU 密集型通常设置为 `os.cpu_count()`。如果任务有 I/O 等待可以适当增加。性能瓶颈看：CPU 使用率是否都满载（是则加核心数没用）、进程间通信是否成为瓶颈（考虑减少共享数据大小）、序列化开销是否过大（用 Value/Array 替代 Manager）。"
+          "question": "为什么 spawn 模式必须加 if __name__ == '__main__'？fork 模式不需要吗？",
+          "answer": "spawn 启动新解释器后会重新 import 主模块。如果不加 main 保护，import 时又执行到创建子进程的代码，子进程再 import，无限递归直到资源耗尽。fork 是 copy-on-write 复制整个进程内存，不重新 import，所以不需要 main 保护。但 fork 有多线程死锁风险：只有调 fork 的线程被复制，其他线程持有的锁永远不会释放。"
         },
         {
-          "question": "多进程编程 在真实项目里怎么做取舍和验证？",
-          "answer": "我会先明确 Python、多进程、multiprocessing 的业务约束，再比较收益、成本和失败边界。落地后用 对象生命周期、解释器行为、异常栈和包版本 做闭环：既看正常路径是否达标，也看异常路径能否告警、回滚和复盘。"
+          "question": "如何把一个不可 pickle 的对象（如数据库连接）传给子进程？",
+          "answer": "不能直接传。解决方案：1) 在子进程内部初始化连接（把连接配置传过去，不传连接本身）；2) 用 Manager 的代理模式，连接在 Manager 进程内，其他进程通过代理调用；3) 用 multiprocessing.shared_memory 传原始数据，连接逻辑在子进程重建。最常见的是方案 1——在 worker 函数开头初始化连接资源。"
         }
       ]
     },
@@ -97,13 +112,15 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说出多进程与多线程的适用场景差异",
-        "能使用 Pool 进行并行计算",
-        "能使用 Queue 和 Pipe 进行进程间通信",
-        "能理解 Value/Array 和 Manager 的区别",
-        "能理解 `if __name__ == \"__main__\"` 的必要性",
-        "能说出三种启动方法（spawn/fork/forkserver）的区别",
-        "能选择合适数量的进程池大小"
+        "能解释 GIL 如何限制多线程 CPU 并行，以及多进程如何绕过",
+        "能说明进程独立内存空间意味着什么，以及为什么必须用 IPC",
+        "能对比 Queue、Pipe、Value/Array、Manager 四种 IPC 方式的适用场景和性能差异",
+        "能区分 Pool 的 map、imap、imap_unordered、apply_async 的行为差异",
+        "能解释 spawn/fork/forkserver 三种启动方式的机制、安全性、性能差异",
+        "能说明 spawn 模式为什么必须加 if __name__ == '__main__' 保护",
+        "能说明 pickle 序列化限制——哪些对象不能传给子进程",
+        "能判断任务粒度是否适合用多进程——太小时 IPC 开销抵消并行收益",
+        "能说出 Value/Array 的 counter.value += 1 不是原子的，需要 Lock 保护"
       ]
     }
   ],
@@ -124,7 +141,28 @@
     },
     {
       "id": "python.concurrent-python.multiprocessing.recall.3",
-      "prompt": "多进程编程 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "spawn 和 fork 两种启动方式的机制差异是什么？各自有什么工程风险？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "python.concurrent-python.multiprocessing.recall.4",
+      "prompt": "一个子进程需要访问数据库连接，但连接对象不能 pickle。怎么处理？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
+      "id": "python.concurrent-python.multiprocessing.recall.5",
+      "prompt": "多进程共享一个计数器，多个进程同时 increment，不加锁会怎样？Value('i', 0) 的 .value += 1 是原子的吗？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
+      "id": "python.concurrent-python.multiprocessing.recall.6",
+      "prompt": "多进程编程 和相邻概念（多线程、asyncio、concurrent.futures）有什么关键区别？各自适合什么场景？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
@@ -132,20 +170,25 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说出多进程绕过 GIL 实现 CPU 并行、适合 CPU 密集",
-      "能说明进程不共享内存、要用 IPC",
-      "能列出 Queue/Pipe/共享内存/Manager 等 IPC 方式",
-      "能用 Pool 做并行计算并合理设进程数"
+      "能说出多进程绕过 GIL 实现 CPU 并行、适合 CPU 密集型任务",
+      "能说明进程独立内存空间、数据不共享、必须用 IPC",
+      "能列出 Queue/Pipe/Value+Array/Manager 四种 IPC 方式及其适用场景",
+      "能用 Pool 做并行计算并合理设进程数",
+      "能说明 spawn 模式必须加 if __name__ == '__main__' 保护的原因"
     ],
     "goodToHave": [
-      "能说明 spawn/fork 区别和 main 保护",
-      "能指出传参要可 pickle",
-      "能说明任务太小时多进程反而更慢"
+      "能区分 spawn/fork/forkserver 的机制差异和安全风险",
+      "能说明 pickle 序列化限制及解决方案",
+      "能解释任务粒度与进程创建开销的关系——太小时多进程反而更慢",
+      "能说明 Value/Array 的 counter.value += 1 不是原子的",
+      "能区分 Pool 的 map/imap/imap_unordered/apply_async 行为差异"
     ],
     "commonMistakes": [
-      "用多线程做 CPU 密集（受 GIL）",
-      "忘记 if __name__ == main 导致 spawn 无限递归",
-      "传不可 pickle 的对象给子进程"
+      "用多线程做 CPU 密集计算——GIL 让它退化成串行",
+      "spawn 模式忘记 if __name__ == '__main__' 导致无限递归创建进程",
+      "给子进程传 lambda、文件句柄等不可 pickle 的对象",
+      "以为 Value 的 .value += 1 是原子的，不加 Lock 导致竞争",
+      "任务粒度太小时用多进程，IPC 开销抵消并行收益甚至更慢"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -156,8 +199,8 @@
   },
   "status": "production",
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察能否说清多进程绕过 GIL、IPC 方式、Pool 用法和进程数，并知道 spawn 的 main 保护、pickle 限制、CPU/IO 选型。",
-  "updatedAt": "2026-06-18",
+  "interviewerFocus": "考察能否说清多进程绕过 GIL 的原理、IPC 四种方式的取舍、Pool 用法与进程数选择，并知道 spawn 的 main 保护、pickle 限制、任务粒度门槛、以及 Value 的非原子操作风险。",
+  "updatedAt": "2026-06-22",
   "prerequisites": [
     "python.concurrent-python.gil-threading"
   ]

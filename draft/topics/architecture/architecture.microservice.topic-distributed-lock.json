@@ -4,7 +4,7 @@
   "category": "microservice",
   "group": "microservice",
   "title": "分布式锁实现方案",
-  "summary": "讲清分布式锁解决跨进程互斥、Redis（SET NX PX + Lua + 看门狗）与 ZooKeeper 两类实现，以及 Redlock 争议和 GC 暂停、主从切换、租约过期等危险窗口。",
+  "summary": "讲清分布式锁解决跨进程互斥的动机与四个硬约束（互斥、防死锁、安全释放、租约边界），Redis 单节点锁的 SET NX PX 加锁 + Lua 校验释放 + Redisson watchdog 续期链路，Redlock 多节点多数派模型与 Kleppmann 争议的实质分歧，ZooKeeper 临时顺序节点 + 前驱 watch 的一致性优势与性能代价，以及主从切换、GC 暂停、租约过期导致双持锁的危险窗口必须由资源侧幂等键、唯一约束、版本号或 fencing token 兜底。",
   "tags": [
     "架构设计",
     "微服务",
@@ -14,20 +14,30 @@
     "Redlock"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 39,
   "order": 30,
   "recommendWeight": 85,
   "status": "draft",
   "learningCards": [
     {
       "type": "explain",
-      "title": "分布式锁实现方案：为什么需要分布式锁、Redis 分布式锁",
-      "content": "## 一、为什么需要分布式锁\n单机 `synchronized`、`ReentrantLock` 只约束同一个 JVM 内的线程。微服务多副本部署后，同一个用户下单、同一个 SKU 扣库存、同一个定时任务分片、同一条对账记录重试，可能由不同进程同时执行。分布式锁的目标是把「跨进程临界区」串行化，降低重复执行和并发写冲突。\n\n但它不是分布式事务，也不能替代数据库唯一约束、乐观锁版本号、幂等表和消息去重。锁只能降低并发进入临界区的概率；一旦发生网络分区、客户端长时间 STW、Redis 主从切换或租约过期，业务层仍要靠幂等和条件更新兜底。\n\n一把可上线的分布式锁至少要回答四个问题：\n- **互斥**：同一资源同一时刻只能有一个持有者进入临界区。\n- **防死锁**：持锁进程崩溃后锁能自动释放，通常依赖租约 TTL。\n- **安全释放**：只能删除自己加的锁，不能删掉别人后续获得的锁。\n- **租约边界**：业务耗时超过 TTL、GC 暂停、网络抖动时，如何续期、失败退出或靠业务幂等修正。\n\n## 二、Redis 分布式锁\n### 2.1 加锁：一条原子 SET 命令\nRedis 2.6.12 之后可以使用扩展 `SET` 命令完成「不存在才写入 + 设置过期时间」：\n```bash\nSET lock:order:1001 7f3c2c6d-req-91 NX PX 30000\n```\n- `NX`：只有 key 不存在时才写入，用于互斥。\n- `PX 30000`：租约 30 秒，避免客户端崩溃后永久占锁；也可以用 `EX` 设置秒级 TTL。\n- `value`：必须是每次请求唯一的 token，例如 UUID、线程 id 组合请求 id。它不是装饰字段，而是解锁时判断持有者的凭据。\n\n不要用 `SETNX` 后再单独 `EXPIRE`：如果 `SETNX` 成功后进程在 `EXPIRE` 前崩溃，会留下无 TTL 的死锁。也不要用固定 value，否则不同线程或不同实例无法判断这把锁是不是自己持有。\n\n### 2.2 释放锁：Lua 比对 value 再删除\n解锁必须把「读 value」和「删除 key」放在 Redis 单线程执行的 Lua 脚本里：\n```lua\nif redis.call('get', KEYS[1]) == ARGV[1] then\n    return redis.call('del', KEYS[1])\nelse\n    return 0\nend\n```\n危险路径是：客户端 A 获得锁，业务执行超时导致锁过期；客户端 B 随后获得同一把锁；A 终于执行到 `DEL lock_key`。如果 A 不校验 value，会把 B 的锁删掉，临界区出现并发执行。Lua 脚本把校验和删除合成一个原子操作，可以避免误删后继持有者的锁。\n\n### 2.3 Redisson 看门狗\nRedisson 的 `RLock.tryLock(waitTime, leaseTime, unit)` 有一个关键差异：\n- `leaseTime > 0`：锁按指定租约过期，Redisson 不启动默认看门狗续期。\n- `leaseTime = -1`：使用默认 watchdog，`lockWatchdogTimeout` 默认 30 秒，后台续期任务通常按超时时间的约三分之一节奏续期。\n\n看门狗解决的是「业务正常执行但耗时超过初始 TTL」的问题。例如导入任务、外部支付回调、库存重算偶发超过 30 秒，如果没有续期，锁会提前释放。它解决不了所有问题：客户端发生长时间 GC 暂停、进程假死、网络长期不可达时，续期可能来不及；业务线程恢复后仍可能以为自己还在临界区，所以关键写操作要带库存版本号、订单状态机或幂等键。\n\n### 2.4 Redlock 算法与争议\nRedlock 的思路是准备 N 个相互独立的 Redis master，常见建议 N=5；客户端按较短超时时间向各节点加锁，获得多数派（例如 3/5）且总耗时小于锁有效期才算成功，并把剩余有效期扣除网络耗时和时钟漂移预算。\n\n它试图缓解单 Redis master 异步复制下的丢锁问题：A 在 master 加锁成功但还没复制到 replica，master 宕机，replica 晋升后没有这把锁，B 又获得锁。争议点在于 Redlock 依赖客户端本地时间、租约和多数节点可用性；Martin Kleppmann 指出在 GC 暂停、网络延迟放大、时钟漂移和存储系统没有 fencing token 的情况下，客户端可能在租约失效后继续写共享资源。Antirez 的回应强调 Redlock 适合效率型锁和部分容错互斥，但对于强正确性资源，仍建议引入资源侧校验。\n\n工程结论是：Redis 锁适合「重复执行可补偿、吞吐和延迟敏感」的场景；如果锁失效会造成不可逆资金损失、超卖或权限越权，必须增加数据库唯一约束、版本条件更新、fencing token 或状态机校验。"
+      "title": "分布式锁的动机与四个硬约束",
+      "content": "单机 `synchronized`、`ReentrantLock` 只约束同一个 JVM 内的线程。微服务多副本部署后，同一个用户下单、同一个 SKU 扣库存、同一个定时任务分片，可能由不同进程同时执行。分布式锁的目标是把「跨进程临界区」串行化，降低重复执行和并发写冲突。\n\n但它不是分布式事务，也不能替代数据库唯一约束、乐观锁版本号、幂等表和消息去重。锁只能降低并发进入临界区的概率；一旦发生网络分区、客户端长时间 STW、Redis 主从切换或租约过期，业务层仍要靠幂等和条件更新兜底。\n\n一把可上线的分布式锁至少要回答四个问题：\n- **互斥**：同一资源同一时刻只能有一个持有者进入临界区。Redis 的 NX 语义、ZooKeeper 的最小序号持锁、数据库的唯一索引，本质都是把「谁先拿到」的判断交给一个单点仲裁者。\n- **防死锁**：持锁进程崩溃后锁能自动释放。Redis 靠 TTL 过期，ZooKeeper 靠临时节点随会话消亡自动删除。没有 TTL 的 SETNX 就是一把死锁——进程崩了，锁永远在。\n- **安全释放**：只能删除自己加的锁，不能删掉别人后续获得的锁。这要求锁的 value 能标识持有者身份（UUID + 线程 id），释放时先校验再删除。\n- **租约边界**：业务耗时超过 TTL、客户端 GC 暂停、网络抖动时，锁可能提前释放而持有者并不知道。续期（watchdog）能缓解正常超时，但无法解决长时间暂停和网络不可达。所以关键写操作必须带资源侧校验。\n\n理解这四个约束是后续所有实现选型和故障分析的前提——Redis 锁为什么必须 NX + PX + token、为什么必须 Lua 解锁、为什么 Redlock 争议不断、为什么 ZooKeeper 一致性更强但延迟更高，都可以从这四个约束推导出来。"
     },
     {
       "type": "explain",
-      "title": "分布式锁实现方案的边界、坑点与答题抓手",
-      "content": "ZooKeeper 分布式锁利用的是临时顺序节点和会话语义。客户端在固定目录下创建 `EPHEMERAL_SEQUENTIAL` 节点，例如 `/locks/stock/lock-0000000123`；序号最小的客户端获得锁，其余客户端只 watch 自己前一个节点。前驱节点删除或会话过期时，下一个客户端收到通知后重新判断自己是否最小。只 watch 前驱节点可以避免所有等待者同时被唤醒导致惊群。\n\nZooKeeper 的优势来自 ZAB 协议下的顺序一致视图和临时节点自动清理：持锁客户端进程崩溃或会话过期后，节点会被删除，后继者接管。代价是写路径要经过 leader 协调，吞吐和尾延迟通常不如 Redis；如果会话超时时间设置过短，网络抖动会触发误释放；设置过长，故障恢复又会变慢。Curator 的 `InterProcessMutex` 已经封装了可重入、前驱 watch、异常释放等细节，生产里通常不要手写原生 ZooKeeper 锁。\n\n典型故障要按链路拆开看：\n- **Redis 主从切换**：异步复制导致新主没有旧锁，两个客户端都以为自己持锁；资源侧要有唯一约束或版本号。\n- **业务超过租约**：锁过期后其他实例进入，原持有者继续写；使用 Redisson 看门狗或拆短临界区，并在写入时校验状态。\n- **长 GC 暂停**：客户端暂停期间无法续期，恢复后本地线程并不知道锁已失效；不要把锁当成写入权限的唯一证明。\n- **锁粒度过粗**：例如用全局 `lock:stock` 锁全部 SKU，会把热点和冷门资源串行化；应按 `skuId`、`userId`、租户等业务主键缩小粒度。\n- **阻塞等待无上限**：高峰期所有请求阻塞排队会放大线程池耗尽；应设置 `waitTime`、快速失败或降级返回，并监控获取锁耗时、失败率、持锁耗时和续期失败次数。\n\n面试中最好用一句话划清边界：分布式锁负责控制进入临界区，真正保证数据正确性的最后防线应在被保护资源本身，例如数据库唯一索引、`where version = ?` 的条件更新、订单状态流转约束、去重表或 fencing token。"
+      "title": "Redis 单节点锁：SET NX PX 加锁、Lua 校验释放、watchdog 续期",
+      "content": "**加锁：一条原子 SET 命令**\nRedis 2.6.12 之后可以使用扩展 `SET` 命令完成「不存在才写入 + 设置过期时间」：\n```bash\nSET lock:order:1001 7f3c2c6d-req-91 NX PX 30000\n```\n`NX` 保证只有 key 不存在时才写入，实现互斥。`PX 30000` 设置 30 秒租约，避免客户端崩溃后永久占锁。`value` 是每次请求唯一的 token（UUID + 线程 id），它是解锁时判断持有者的凭据——不是装饰字段。\n\n不要用 `SETNX` 后再单独 `EXPIRE`：如果 `SETNX` 成功后进程在 `EXPIRE` 前崩溃，会留下无 TTL 的死锁。也不要固定 value，否则不同实例无法区分锁是谁的。Redisson 的 `tryLock` 内部就是一条 Lua 脚本完成 `SET NX PX` 的原子语义，避免了上述两个陷阱。\n\n**释放锁：Lua 比对 value 再删除**\n解锁必须把「读 value」和「删除 key」放在 Redis 单线程执行的 Lua 脚本里：\n```lua\nif redis.call('get', KEYS[1]) == ARGV[1] then\n    return redis.call('del', KEYS[1])\nelse\n    return 0\nend\n```\n危险路径：客户端 A 获得锁，业务执行超时导致锁过期；客户端 B 随后获得同一把锁；A 终于执行到 `DEL`。如果 A 不校验 value，会把 B 的锁删掉。Lua 脚本在 Redis 单线程中原子执行读取和删除，A 的 `get` 读到的是 B 的 token，比较不等，不会误删。\n\n**Redisson watchdog 续期**\nRedisson 的 `RLock.tryLock(waitTime, leaseTime, unit)` 有关键差异：\n- `leaseTime > 0`：锁按指定租约过期，Redisson 不启动 watchdog。\n- `leaseTime = -1`：使用默认 watchdog，`lockWatchdogTimeout` 默认 30 秒，后台续期任务按超时时间的约三分之一（10 秒）节奏 `PEXPIRE` 续期。\n\n看门狗解决的是「业务正常执行但耗时超过初始 TTL」的问题。它解决不了：客户端发生长时间 GC 暂停、进程假死、网络长期不可达时，续期任务本身也无法执行。所以 watchdog 降低的是正常场景的误释放概率，不是绝对安全。"
+    },
+    {
+      "type": "explain",
+      "title": "Redlock 多节点多数派模型与 Kleppmann 争议的实质",
+      "content": "**Redlock 的设计思路**\nRedlock 准备 N 个相互独立的 Redis master（建议 N=5），客户端按较短超时依次向各节点加锁：`SET key random_value NX PX ttl`。获得多数派（≥3/5）且总耗时小于锁有效期才算成功，剩余有效期 = 原始 TTL - 获取耗时 - 时钟漂移预算（通常几毫秒到几十毫秒）。\n\n它的目标是缓解单 Redis master 异步复制下的丢锁问题：A 在 master 加锁成功但还没复制到 replica，master 宕机，replica 晋升后没有这把锁，B 又获得锁。多节点多数派加锁降低了单点 failover 导致双持锁的概率。\n\n**Kleppmann 的质疑（The sad state of distributed locks）**\nMartin Kleppmann 指出 Redlock 有三个根本假设在工程上难以保证：\n1. **时钟假设**：Redlock 依赖客户端本地时钟计算「剩余有效期」。如果某台机器时钟跳变（NTP 校正、闰秒、虚拟机时钟漂移），客户端会错误判断锁是否还有效。\n2. **GC 暂停 / 网络延迟放大**：客户端 A 获取锁后进入长 GC 暂停。暂停期间租约在 Redis 侧过期，B 获取锁。A 恢复后并不知道锁已失效，继续写共享资源。这个窗口在单节点锁和 Redlock 中都存在。\n3. **缺少 fencing token**：即使锁本身正确分配，客户端到存储系统（数据库、文件系统）的写请求可能在网络中排队。旧持有者的写请求到达时，存储系统无法判断它是否仍有效。\n\n**Antirez 的回应**\nAntirez 强调 Redlock 的设计目标是效率型锁和具有容错能力的互斥，而非强一致事务锁。对于 GC 暂停问题，他建议客户端在执行关键操作前验证锁的剩余时间；对于 fencing token 问题，他认为可以在锁的 value 中包含单调递增的 token 供下游校验。\n\n**工程结论**\nRedlock 降低但不消除单点故障风险。它适合「重复执行可补偿、吞吐和延迟敏感」的场景。如果锁失效会造成不可逆资金损失，必须引入 fencing token（单调递增，由锁管理器分配，写入时下游校验「只接受更大 token」）、数据库唯一约束、版本条件更新。Redlock 的真正价值是在单节点 Redis 锁和 ZooKeeper 之间提供了一个折中选项——比单节点更耐故障，比 ZooKeeper 延迟更低，但不能替代资源侧正确性保证。"
+    },
+    {
+      "type": "explain",
+      "title": "ZooKeeper 临时顺序节点锁：一致性优势与性能代价",
+      "content": "**锁实现机制**\nZooKeeper 利用临时顺序节点（EPHEMERAL_SEQUENTIAL）实现分布式锁。客户端在 `/locks/stock` 目录下创建节点，如 `/locks/stock/lock-0000000123`；ZooKeeper 保证序号严格递增且不重复。序号最小的客户端获得锁，其余客户端只 watch 自己前一个节点（而非所有节点）。\n\n**为什么只 watch 前驱节点**\n如果所有等待者都 watch 锁持有者，锁释放时会同时唤醒所有等待者——这就是惊群效应。每个等待者检查自己是否最小，发现不是，再重新 watch，产生大量无效通知。只 watch 前驱节点，锁释放时只唤醒后继一个客户端，通知链路是 O(1) 的逐个传递。\n\n**临时节点的自动清理**\nZooKeeper 临时节点与客户端会话绑定。持锁客户端崩溃或会话过期后，临时节点被自动删除，后继客户端收到 watcher 通知后接管锁。这比 Redis 的 TTL 模型更可靠——不需要租约续期，不会出现「业务还在跑但锁已过期」的窗口（只要会话还活着，节点就在）。\n\n但临时节点的正确性依赖会话超时配置：`sessionTimeout` 过短，网络抖动会触发误释放；过长，真正的故障恢复要等很久。Curator 的默认重连策略会尝试在会话超时前重建连接，但网络分区超过超时时间时，锁仍会丢失。\n\n**与 Redis 的性能对比**\nZooKeeper 的写路径要经过 leader 的 ZAB 协议提交，吞吐通常在 1 万 TPS 级别（单集群），尾延迟（P99）通常高于 Redis。对于热点资源的高频短临界区，ZooKeeper 的创建节点 + watch + 删除节点开销显著高于 Redis 的 SET + DEL。这就是为什么 Redis 适合热点防重、任务互斥这类对延迟敏感的场景，而 ZooKeeper 更适合配置变更锁、主节点选举、低频长临界区等一致性优先的场景。\n\n**Curator 封装**\n生产里通常用 Curator 的 `InterProcessMutex`，它封装了临时顺序节点创建、前驱 watcher 注册、可重入计数、异常时自动释放等细节。不建议手写原生 ZooKeeper 锁——会话语义、watcher 一次性触发、节点路径管理等细节很容易出错。"
     },
     {
       "type": "diagram",
@@ -49,74 +59,78 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | Redis SET NX PX | Redlock | ZooKeeper |\n| --- | --- | --- | --- |\n| 互斥基础 | 单 Redis 实例的原子 SET，依赖 key TTL 和唯一 token | 多个独立 Redis master 多数派成功，扣除加锁耗时后计算剩余租约 | 临时顺序节点最小者持锁，等待者 watch 前驱节点 |\n| 一致性风险 | 主从异步复制和 failover 可能丢锁，租约过期后旧持有者可能继续写 | 降低单点 failover 风险，但仍受时钟、GC 暂停、网络延迟和租约模型影响 | ZAB 提供一致视图，主要风险来自会话超时配置和客户端暂停 |\n| 性能与延迟 | 延迟低、吞吐高，适合热点资源短临界区 | 需要访问多个节点，延迟高于单 Redis 锁 | 写入经 leader 协调，吞吐和尾延迟通常低于 Redis |\n| 自动清理 | TTL 到期释放，可能提前释放仍在执行的业务 | 多节点 TTL 到期释放，释放时需尽力删除已加锁节点 | 客户端 release 删除节点，进程崩溃后会话过期删除临时节点 |\n| 典型工程补丁 | Lua 校验 token 删除、Redisson 看门狗、幂等键、版本号更新 | 多节点超时控制、漂移预算、资源侧 fencing token 或条件写 | Curator InterProcessMutex、合理 sessionTimeout、只 watch 前驱 |\n| 推荐场景 | 防重复提交、幂等任务、可补偿库存预占等效率型互斥 | 跨 Redis 故障域的效率型互斥，不建议单独承载资金级正确性 | 正确性优先、锁竞争不极端、已有 ZK 基础设施的协调场景 |"
+      "title": "Redis 单节点锁 vs Redlock vs ZooKeeper 锁",
+      "content": "| 维度 | Redis SET NX PX | Redlock | ZooKeeper |\n| --- | --- | --- | --- |\n| 互斥基础 | 单 Redis 实例原子 SET，依赖 TTL + 唯一 token | 多个独立 Redis master 多数派成功，扣除加锁耗时计算剩余租约 | 临时顺序节点最小者持锁，等待者 watch 前驱 |\n| 一致性风险 | 主从异步复制和 failover 可能丢锁 | 降低单点 failover 风险，仍受时钟漂移、GC 暂停影响 | ZAB 一致视图，风险来自会话超时配置 |\n| 性能 | 延迟低（微秒级），吞吐高 | 多节点 RTT 累加，延迟高于单 Redis | 写入经 leader 协调，吞吐约 1w TPS，尾延迟高于 Redis |\n| 自动清理 | TTL 到期释放，可能提前释放仍在执行的业务 | 多节点 TTL 到期，需尽力删除已加锁节点 | 临时节点随会话消亡自动删除，不会提前释放 |\n| 工程补丁 | Lua 校验 token 删除、watchdog 续期、幂等键 | 多节点超时控制、漂移预算、资源侧 fencing token | Curator InterProcessMutex、合理 sessionTimeout |\n| 推荐场景 | 防重复提交、幂等任务、短临界区效率型互斥 | 跨故障域效率型互斥，不单独承载资金级正确性 | 配置变更锁、主节点选举、正确性优先协调场景 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | 手动实现 Redis 锁 | Redisson RLock |\n| --- | --- | --- |\n| 加锁语义 | 需要显式使用 `SET key value NX PX ttl`，容易误写成 SETNX 后 EXPIRE | 封装 `tryLock(waitTime, leaseTime, unit)`，支持等待时间和租约时间 |\n| 安全释放 | 需要自己写 Lua 校验 token 再删除，少一步就可能误删后继锁 | `unlock` 内部校验锁归属，调用前仍建议 `isHeldByCurrentThread` 防误释放异常 |\n| 续期能力 | 需要自建续期线程、续期失败检测和退出策略 | `leaseTime=-1` 时启用 watchdog，默认 `lockWatchdogTimeout` 为 30 秒 |\n| 可重入与线程归属 | 需要自己维护持有次数和线程标识 | 支持可重入，锁 value 中包含客户端实例和线程维度的持有信息 |\n| 生产建议 | 只适合非常简单、可充分测试的短临界区 | 更适合业务系统默认选择，但仍要配合幂等、监控和资源侧校验 |"
+      "title": "手动 Redis 锁 vs Redisson RLock",
+      "content": "| 维度 | 手动实现 | Redisson RLock |\n| --- | --- | --- |\n| 加锁 | 需显式 `SET NX PX`，容易误写成 SETNX + EXPIRE | `tryLock(wait, lease, unit)` 封装，内部 Lua 原子加锁 |\n| 释放 | 自己写 Lua 校验 token 再删除，少一步就误删 | `unlock` 内部校验锁归属 + isHeldByCurrentThread 双保险 |\n| 续期 | 需自建续期线程和失败检测 | `leaseTime=-1` 启用 watchdog，lockWatchdogTimeout 默认 30 秒 |\n| 可重入 | 自己维护持有次数和线程标识 | 内置可重入，value 含客户端实例和线程维度信息 |\n| 生产建议 | 仅适合简单、充分测试的短临界区 | 业务系统默认选择，仍需配合幂等和资源侧校验 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// 1. Redis 分布式锁：手动实现最小安全闭环\npublic class RedisLock {\n    private final StringRedisTemplate redis;\n    private static final String LOCK_PREFIX = \"lock:\";\n\n    public boolean tryLock(String key, String token, long expireMs) {\n        Boolean result = redis.opsForValue()\n            .setIfAbsent(LOCK_PREFIX + key, token, expireMs, TimeUnit.MILLISECONDS);\n        return Boolean.TRUE.equals(result);\n    }\n\n    public boolean unlock(String key, String token) {\n        String luaScript = \"if redis.call('get', KEYS[1]) == ARGV[1] \" +\n            \"then return redis.call('del', KEYS[1]) else return 0 end\";\n        Long deleted = redis.execute(new DefaultRedisScript<>(luaScript, Long.class),\n            Collections.singletonList(LOCK_PREFIX + key), token);\n        return Long.valueOf(1L).equals(deleted);\n    }\n}\n\n// 2. Redisson 分布式锁：使用 watchdog 的短临界区示例\n@Service\npublic class OrderService {\n    @Autowired\n    private RedissonClient redisson;\n\n    public void createOrder(String userId) throws InterruptedException {\n        RLock lock = redisson.getLock(\"lock:order:\" + userId);\n        boolean locked = false;\n        try {\n            locked = lock.tryLock(5, -1, TimeUnit.SECONDS);\n            if (!locked) {\n                throw new BusyException(\"系统繁忙，请稍后重试\");\n            }\n            doCreateOrderWithIdempotency(userId);\n        } finally {\n            if (locked && lock.isHeldByCurrentThread()) {\n                lock.unlock();\n            }\n        }\n    }\n}\n\n// 3. ZooKeeper 分布式锁：Curator 封装临时顺序节点和前驱监听\npublic class ZookeeperLock {\n    private final InterProcessMutex lock;\n\n    public ZookeeperLock(CuratorFramework client, String path) {\n        this.lock = new InterProcessMutex(client, path);\n    }\n\n    public void executeWithLock(Runnable task, long timeout, TimeUnit unit) {\n        boolean acquired = false;\n        try {\n            acquired = lock.acquire(timeout, unit);\n            if (!acquired) {\n                throw new TimeoutException(\"获取锁超时\");\n            }\n            task.run();\n        } catch (Exception e) {\n            throw new RuntimeException(\"分布式锁异常\", e);\n        } finally {\n            if (acquired) {\n                try {\n                    lock.release();\n                } catch (Exception e) {\n                    throw new RuntimeException(\"释放 ZooKeeper 锁失败\", e);\n                }\n            }\n        }\n    }\n}\n\n// 4. 被锁保护的写操作仍然使用业务条件兜底\npublic void deductStock(String skuId, int quantity) {\n    ZookeeperLock lock = new ZookeeperLock(zkClient, \"/locks/stock/\" + skuId);\n    lock.executeWithLock(() -> {\n        int updated = inventoryRepo.deductIfEnough(skuId, quantity);\n        if (updated != 1) {\n            throw new InsufficientStockException();\n        }\n    }, 10, TimeUnit.SECONDS);\n}",
+      "title": "三种分布式锁实现与资源侧兜底",
       "language": "java",
+      "content": "// 1. Redis 手动锁：SET NX PX 加锁 + Lua 校验释放\npublic class RedisLock {\n    private final StringRedisTemplate redis;\n    private static final String LOCK_PREFIX = \"lock:\";\n\n    public boolean tryLock(String key, String token, long expireMs) {\n        Boolean result = redis.opsForValue()\n            .setIfAbsent(LOCK_PREFIX + key, token, expireMs, TimeUnit.MILLISECONDS);\n        return Boolean.TRUE.equals(result);\n    }\n\n    public boolean unlock(String key, String token) {\n        String luaScript = \"if redis.call('get', KEYS[1]) == ARGV[1] \" +\n            \"then return redis.call('del', KEYS[1]) else return 0 end\";\n        Long deleted = redis.execute(\n            new DefaultRedisScript<>(luaScript, Long.class),\n            Collections.singletonList(LOCK_PREFIX + key), token);\n        return Long.valueOf(1L).equals(deleted);\n    }\n}\n\n// 2. Redisson RLock：watchdog 续期 + 临界区幂等保护\n@Service\npublic class OrderService {\n    @Autowired\n    private RedissonClient redisson;\n\n    public void createOrder(String userId) throws InterruptedException {\n        RLock lock = redisson.getLock(\"lock:order:\" + userId);\n        boolean locked = false;\n        try {\n            locked = lock.tryLock(5, -1, TimeUnit.SECONDS);\n            if (!locked) throw new BusyException(\"系统繁忙\");\n            doCreateOrderWithIdempotency(userId); // 临界区内仍走幂等\n        } finally {\n            if (locked && lock.isHeldByCurrentThread()) {\n                lock.unlock();\n            }\n        }\n    }\n}\n\n// 3. ZooKeeper Curator 锁：临时顺序节点 + 超时\npublic class ZookeeperLock {\n    private final InterProcessMutex lock;\n\n    public ZookeeperLock(CuratorFramework client, String path) {\n        this.lock = new InterProcessMutex(client, path);\n    }\n\n    public void executeWithLock(Runnable task, long timeout, TimeUnit unit) {\n        boolean acquired = false;\n        try {\n            acquired = lock.acquire(timeout, unit);\n            if (!acquired) throw new TimeoutException(\"获取锁超时\");\n            task.run();\n        } catch (Exception e) {\n            throw new RuntimeException(\"分布式锁异常\", e);\n        } finally {\n            if (acquired) {\n                try { lock.release(); }\n                catch (Exception e) { throw new RuntimeException(\"释放失败\", e); }\n            }\n        }\n    }\n}\n\n// 4. 资源侧条件更新兜底：即使锁失效也不允许扣成负数\npublic void deductStock(String skuId, int quantity) {\n    ZookeeperLock lock = new ZookeeperLock(zkClient, \"/locks/stock/\" + skuId);\n    lock.executeWithLock(() -> {\n        int updated = inventoryRepo.deductIfEnough(skuId, quantity);\n        if (updated != 1) throw new InsufficientStockException();\n    }, 10, TimeUnit.SECONDS);\n}",
       "highlights": [
         {
           "line": 8,
-          "note": "加锁使用 Redis 的单条 SET NX PX 语义，避免 SETNX 成功后还没设置 TTL 就崩溃造成死锁。"
+          "note": "SET NX PX 一条命令完成互斥 + 租约，避免 SETNX 成功后未设 TTL 的死锁。"
         },
         {
           "line": 14,
-          "note": "Lua 脚本把读取 token 和删除 key 合并为一次 Redis 原子执行，防止旧持有者删除新持有者的锁。"
+          "note": "Lua 脚本在 Redis 单线程中原子执行 get + 比较 + del，防止旧持有者删除新持有者的锁。"
         },
         {
-          "line": 17,
-          "note": "返回删除结果，调用方可以记录解锁失败或锁已过期的监控信号。"
+          "line": 29,
+          "note": "`leaseTime=-1` 触发 Redisson watchdog 续期，而非固定到期释放。"
         },
         {
-          "line": 30,
-          "note": "`leaseTime=-1` 触发 Redisson watchdog 自动续期，而不是固定到期释放。"
+          "line": 32,
+          "note": "临界区内仍调用幂等业务方法，锁失效后不会产生重复订单。"
         },
         {
           "line": 34,
-          "note": "临界区内仍调用带幂等或条件校验的业务方法，避免锁失效后直接产生重复订单。"
+          "note": "unlock 前检查 isHeldByCurrentThread，防止锁已过期或未获得时调用 unlock 抛异常。"
         },
         {
-          "line": 36,
-          "note": "解锁前检查当前线程是否仍持有锁，避免锁过期或未获得锁时调用 unlock 抛出异常。"
+          "line": 46,
+          "note": "Curator InterProcessMutex 封装临时顺序节点、前驱 watch 和可重入计数。"
         },
         {
-          "line": 47,
-          "note": "Curator 的 InterProcessMutex 封装 ZooKeeper 临时顺序节点、前驱 watch 和可重入计数。"
+          "line": 50,
+          "note": "获取锁设超时，避免请求线程在锁竞争高峰无限阻塞拖垮线程池。"
         },
         {
-          "line": 53,
-          "note": "获取 ZooKeeper 锁设置超时时间，避免请求线程在锁竞争高峰无限阻塞。"
-        },
-        {
-          "line": 77,
-          "note": "库存扣减使用资源侧条件更新兜底，即使分布式锁出现危险窗口也不允许扣成负数。"
+          "line": 62,
+          "note": "deductIfEnough 条件更新：即使锁出现双持窗口，SQL 层 WHERE stock >= quantity 也不允许超卖。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "30 秒结论：分布式锁用于多个服务实例竞争同一业务资源时做跨进程互斥。Redis 锁的主线是 `SET NX PX` 加唯一 token、Lua 校验 token 解锁、必要时用 Redisson watchdog 续期；ZooKeeper 锁的主线是临时顺序节点和前驱 watch。它只能控制进入临界区，不能单独承担资金、库存这类强正确性，最终还要靠幂等、唯一约束、版本号或状态机兜底。\n\n机制要点：\n- Redis 加锁必须是一条原子命令：`SET lockKey token NX PX ttl`，`NX` 保证不存在才写入，`PX/EX` 防止进程崩溃后死锁，`token` 标识持有者。\n- Redis 解锁不能直接 `DEL`，必须用 Lua 脚本先比较 value 再删除，避免旧持有者在锁过期后删掉新持有者的锁。\n- Redisson 的 `tryLock(waitTime, -1, unit)` 会启用 watchdog，默认锁看门狗超时时间是 30 秒，后台续期可以缓解业务耗时超过初始 TTL 的问题。\n- watchdog 不是绝对安全：长 GC、网络分区、Redis failover 都可能让客户端在租约失效后继续执行，所以写数据库时仍要带幂等键、唯一索引或 `where version = ?` 这类资源侧保护。\n- ZooKeeper 通过创建临时顺序节点实现锁，序号最小者获得锁，等待者 watch 前一个节点；会话断开后临时节点自动删除，正确性更强但吞吐和尾延迟通常不如 Redis。\n- Redlock 通过多个独立 Redis 节点多数派加锁降低单主故障风险，但它依赖租约、时间和网络假设，不能把它当成强一致事务锁；强正确性场景最好增加 fencing token 或资源侧条件写。\n\n边界与追问应对：\n- 如果面试官追问选型，我会说高吞吐、可补偿、短临界区优先 Redis/Redisson；锁竞争不极端且更看重协调语义时用 ZooKeeper；数据库唯一索引或乐观锁能直接表达约束时，不必额外引入分布式锁。\n- 如果追问线上问题，我会看四类指标：获取锁等待耗时和失败率、持锁耗时 P95/P99、续期失败次数、业务侧幂等冲突或条件更新失败数。定位时再结合 Redis failover 日志、JVM GC 日志和线程池阻塞情况。\n- 如果追问极端场景，我会强调锁粒度要按业务主键收敛，例如 `lock:stock:{skuId}`，并设置等待超时、退避重试和降级，避免热点锁把 Web 线程池拖死。",
+      "content": "**30 秒结论**\n分布式锁用于多个服务实例竞争同一业务资源时做跨进程互斥。Redis 锁的主线是 `SET NX PX` 加唯一 token、Lua 校验 token 解锁、必要时用 Redisson watchdog 续期；ZooKeeper 锁的主线是临时顺序节点和前驱 watch。它只能控制进入临界区，不能单独承担强正确性，最终靠幂等、唯一约束、版本号或 fencing token 兜底。\n\n**机制主线**\n- **加锁**：`SET lockKey token NX PX ttl`，NX 互斥，PX 防死锁，token 标识持有者。一条命令原子完成，不要 SETNX + EXPIRE。\n- **解锁**：Lua 脚本先 `get` 比较 token 再 `del`，原子执行防止误删后继持有者的锁。\n- **续期**：Redisson `tryLock(wait, -1, unit)` 启用 watchdog，默认 30 秒锁看门狗超时，后台按约 10 秒节奏 `PEXPIRE` 续期。降低正常超时误释放概率，但不能覆盖长 GC、网络分区、Redis failover。\n- **ZooKeeper**：临时顺序节点，最小序号持锁，等待者 watch 前驱节点避免惊群。会话断开临时节点自动删除，比 Redis TTL 更可靠，但写路径经 leader 协调，吞吐和尾延迟高于 Redis。\n- **Redlock**：多独立 Redis master 多数派加锁，降低单点 failover 风险。但依赖时钟、网络和租约假设，不能替代 fencing token 和资源侧条件写。\n\n**边界与追问应对**\n- **选型**：高吞吐、可补偿、短临界区 → Redis/Redisson；一致性优先、锁竞争不极端 → ZooKeeper；数据库唯一索引或乐观锁能直接表达约束时，不必引入分布式锁。\n- **排查**：看获取锁等待耗时和失败率、持锁耗时 P99、续期失败次数、Redis failover 时间点、JVM GC 暂停、条件更新失败数。\n- **极端场景**：锁粒度按业务主键收敛（`lock:stock:{skuId}`），设等待超时和退避重试，避免热点锁拖垮线程池。",
       "followUpQuestions": [
         {
-          "question": "为什么 Redis 分布式锁释放时必须校验 value，而不是加锁成功后 finally 里直接 DEL？",
-          "answer": "因为锁有租约。客户端 A 可能在业务执行或 GC 暂停中超过 TTL，Redis 自动删除旧锁；客户端 B 随后用新 token 获得同一把锁。A 恢复后如果直接 DEL，会删除 B 的锁，导致两个实例同时进入临界区。Lua 脚本比较 `get(key)` 与 A 的 token，只有仍是 A 持有时才删除，读和删在 Redis 内原子完成。"
+          "question": "为什么 Redis 分布式锁释放时必须校验 value，而不是 finally 里直接 DEL？",
+          "answer": "因为锁有租约。客户端 A 可能在 GC 暂停中超过 TTL，Redis 自动删除旧锁；客户端 B 随后用新 token 获得锁。A 恢复后如果直接 DEL，会删掉 B 的锁，两个实例同时进入临界区。Lua 脚本比较 get(key) 与 A 的 token，只有仍是 A 持有时才删除，读和删在 Redis 单线程中原子完成。"
         },
         {
-          "question": "Redisson 看门狗能不能让 Redis 锁变成绝对安全？如果线上仍出现重复扣减，你会怎么查？",
-          "answer": "不能。watchdog 只是在客户端存活且能及时和 Redis 通信时续期，长 GC、网络分区、Redis 主从切换、线程池阻塞都可能让续期失败或让旧线程在租约失效后继续写。排查时先看 Redisson 续期失败日志和 `lockWatchdogTimeout`，再看 JVM GC 暂停、Redis failover 时间点、锁持有耗时 P99、获取锁失败率，最后核对库存扣减是否有 `deductIfEnough` 这类条件更新或幂等流水兜底。"
+          "question": "Redisson watchdog 能不能让 Redis 锁绝对安全？线上仍出现重复扣减怎么查？",
+          "answer": "不能。watchdog 只在客户端存活且能与 Redis 通信时续期，长 GC、网络分区、Redis 主从切换、线程池阻塞都可能让续期失败。排查：① 看 Redisson 续期失败日志和 lockWatchdogTimeout 配置；② 看 JVM GC 暂停时长和 Redis failover 时间点；③ 看锁持有耗时 P99 和获取锁失败率；④ 核对库存扣减是否有 deductIfEnough 条件更新或幂等流水兜底。"
         },
         {
-          "question": "Redis 锁、Redlock、ZooKeeper 锁分别适合什么业务？为什么不是所有场景都用最强的一种？",
-          "answer": "Redis/Redisson 适合低延迟、高吞吐、重复执行可补偿的效率型互斥，例如防重复提交和短时间任务互斥。Redlock 适合希望跨 Redis 故障域提高可用性的效率型锁，但不能单独保证强正确性。ZooKeeper 适合已有 ZK 基础设施且更看重顺序协调的场景，例如主节点选举、低频配置变更锁。不是全用 ZooKeeper，是因为它的写路径和会话机制带来更高尾延迟和运维成本；不是全用 Redis，是因为异步复制和租约模型有危险窗口。"
+          "question": "Redis 锁、Redlock、ZooKeeper 锁分别适合什么场景？为什么不全用最强的一种？",
+          "answer": "Redis 适合低延迟高吞吐的效率型互斥（防重、短临界区）。Redlock 适合希望跨 Redis 故障域提高可用性的效率型锁，但不能单独保证强正确性。ZooKeeper 适合正确性优先、已有 ZK 基础设施的协调场景。不全用 ZooKeeper 是因为写路径经 leader 协调带来更高尾延迟和运维成本；不全用 Redis 是因为异步复制和租约模型有双持窗口。"
+        },
+        {
+          "question": "什么是 fencing token？它和分布式锁是什么关系？",
+          "answer": "fencing token 是锁管理器在每次加锁时分配的单调递增编号。持有者在写入共享资源（数据库、文件系统）时带上这个 token，资源侧只接受 token ≥ 已见过最大值的写入。这样即使旧持有者因 GC 暂停在租约过期后仍尝试写入，资源侧也会拒绝。它是分布式锁的补强层——锁控制进入临界区，fencing token 保证资源侧不接受过期写入。Redlock 本身不强制使用 fencing token，但 Kleppmann 认为任何分布式锁都应配合 fencing token 才能保证正确性。"
+        },
+        {
+          "question": "锁粒度过粗会出什么问题？怎么确定合理的锁粒度？",
+          "answer": "锁粒度过粗（如全局 lock:stock）会把所有 SKU 的库存操作串行化，热点 SKU 会阻塞冷门 SKU，大幅降低并发吞吐。在锁竞争高峰，大量请求阻塞等待会耗尽 Web 线程池。合理粒度按业务主键收敛：`lock:stock:{skuId}`、`lock:order:{userId}`、`lock:tenant:{tenantId}`。粒度也不能过细——过细会导致大量锁对象占用 Redis 内存或 ZK 节点。核心原则是：同一业务实体的并发操作需要互斥，不同实体之间不应相互阻塞。"
         }
       ]
     },
@@ -124,74 +138,90 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "Redis 分布式锁的 `SET key token NX PX ttl` 原子加锁语义",
-        "Lua 校验 token 后删除锁防止误删后继持有者",
-        "Redisson `leaseTime=-1`、`lockWatchdogTimeout` 与 watchdog 续期边界",
-        "Redis 主从切换、长 GC、租约过期导致双持锁的危险窗口",
-        "Redlock 多节点多数派加锁模型及 Martin Kleppmann 争议点",
-        "ZooKeeper 临时顺序节点、最小序号持锁、等待者 watch 前驱节点",
-        "分布式锁之外的幂等键、唯一约束、版本号、状态机兜底",
-        "锁粒度、等待超时、持锁耗时和续期失败的生产监控指标"
+        "分布式锁的四个硬约束：互斥、防死锁（TTL/临时节点）、安全释放（token + Lua）、租约边界",
+        "Redis `SET key token NX PX ttl` 为什么必须一条命令完成，SETNX + EXPIRE 为什么不行",
+        "Lua 校验 token 再删除锁的原子性保证，以及为什么直接 DEL 会误删后继持有者的锁",
+        "Redisson `leaseTime=-1` 启用 watchdog 续期的机制和边界（覆盖正常超时，不覆盖长 GC/网络分区）",
+        "Redlock 多节点多数派加锁模型和 Kleppmann 争议的三个实质分歧：时钟、GC 暂停、fencing token",
+        "ZooKeeper 临时顺序节点 + 前驱 watch 的机制和惊群避免",
+        "Redis 主从切换、长 GC、租约过期导致双持锁的三种危险窗口",
+        "幂等键、唯一约束、版本号、fencing token 作为资源侧最终防线",
+        "锁粒度按业务主键收敛，等待超时 + 退避重试避免热点锁拖垮线程池",
+        "生产监控：获取锁耗时、持锁耗时 P99、续期失败次数、条件更新失败数"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "architecture.microservice.topic-distributed-lock.recall.1",
-      "prompt": "分布式锁实现方案解决了什么架构问题？Redis、Redlock、ZooKeeper 分别适合哪些场景，哪些场景不能只靠锁？",
+      "prompt": "请完整讲一下 Redis 分布式锁的加锁、解锁和续期链路。为什么加锁必须是一条命令？为什么解锁必须用 Lua？watchdog 续期的边界在哪里？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "architecture.microservice.topic-distributed-lock.recall.2",
-      "prompt": "Redisson 的看门狗机制是如何工作的？它能覆盖哪些租约过期问题，又覆盖不了哪些 GC 暂停或网络故障场景？",
+      "prompt": "Redis 主从切换、客户端长 GC、租约过期这三个场景，分别会怎样导致分布式锁失效？业务层应该如何兜底？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "architecture.microservice.topic-distributed-lock.recall.3",
+      "prompt": "Redlock 算法是怎么工作的？Martin Kleppmann 对它的核心质疑是什么？工程上应该怎么取舍？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "architecture.microservice.topic-distributed-lock.recall.4",
+      "prompt": "ZooKeeper 分布式锁用的是什么数据结构和协议机制？为什么等待者只 watch 前驱节点而不是锁持有者？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
-      "id": "architecture.microservice.topic-distributed-lock.recall.3",
-      "prompt": "Redis 分布式锁为什么要设置随机 token 并用 Lua 脚本解锁？锁过期了但业务还没执行完时，如何从锁层和业务层同时兜底？",
+      "id": "architecture.microservice.topic-distributed-lock.recall.5",
+      "prompt": "如果你的系统同时用了 Redis 分布式锁和数据库，锁失效导致重复扣减，你怎么排查？看哪些指标和日志？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 5,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "跨进程临界区互斥与单机 JVM 锁边界",
-      "Redis `SET NX PX` 原子加锁、唯一 token、Lua 校验释放",
-      "Redisson watchdog 续期语义与 `leaseTime=-1` 边界",
-      "ZooKeeper 临时顺序节点、最小序号持锁、前驱 watch",
-      "Redis 主从切换、租约过期、长 GC 导致双持锁的危险窗口",
-      "幂等键、唯一约束、版本号或状态机作为资源侧兜底"
+      "能讲清 SET NX PX 原子加锁语义和 token 作为持有者凭据的作用",
+      "能解释 Lua 脚本校验 token 后删除锁的原子性保证，以及不校验会误删后继持有者的锁",
+      "能说清 Redisson watchdog 续期的触发条件（leaseTime=-1）、续期节奏（约 1/3 TTL）和覆盖边界",
+      "能解释 ZooKeeper 临时顺序节点 + 前驱 watch 的互斥机制和惊群避免",
+      "能分析 Redis 主从切换、长 GC、租约过期导致双持锁的三种危险窗口",
+      "能说明资源侧兜底手段：幂等键、唯一约束、版本号、fencing token"
     ],
     "goodToHave": [
-      "Redlock 多独立 master 多数派模型与时钟漂移争议",
-      "Curator `InterProcessMutex` 的生产使用取舍",
-      "锁粒度按业务主键收敛与热点锁退避策略",
-      "获取锁耗时、持锁耗时、续期失败、条件更新失败的监控口径"
+      "能讲清 Redlock 多节点多数派模型和 Kleppmann 三个质疑（时钟、GC、fencing token）的实质",
+      "能解释 Curator InterProcessMutex 的封装价值和 sessionTimeout 配置取舍",
+      "能说明锁粒度按业务主键收敛的原则和热点锁退避策略",
+      "能列出生产监控指标：获取锁耗时、持锁耗时 P99、续期失败、条件更新失败"
     ],
     "commonMistakes": [
-      "释放锁不校验 token 导致误删后继持有者的锁",
+      "释放锁不校验 token，直接 DEL 导致误删后继持有者的锁",
       "使用 SETNX 后单独 EXPIRE，崩溃时留下无 TTL 死锁",
-      "把 watchdog 误认为能覆盖长 GC、网络分区和 Redis failover",
-      "锁粒度过粗导致热点资源串行化并拖垮线程池",
+      "把 watchdog 当成绝对安全保障，忽略长 GC、网络分区和 Redis failover",
+      "锁粒度过粗（如全局 lock:stock），热点资源串行化拖垮线程池",
       "认为加了分布式锁就不需要数据库唯一约束、幂等表或版本号",
-      "把 Redlock 当成强一致事务锁使用在不可补偿资金链路"
+      "把 Redlock 当强一致事务锁用于不可补偿资金链路"
     ],
     "scoreWeights": {
       "coverage": 25,
-      "accuracy": 25,
+      "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 30
+      "depth": 25
     }
   },
   "prerequisites": [
     "architecture.microservice.topic-split-principles"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "重点看候选人是否能把 Redis 锁的原子加锁、token 解锁、watchdog 续期和 ZooKeeper 临时顺序节点讲成一条可落地链路，并能主动指出主从切换、长 GC、租约失效后的双持锁风险需要由资源侧幂等和条件写兜底。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "重点看候选人能否把 Redis 锁的原子加锁、token 解锁、watchdog 续期讲成一条完整链路，能否主动指出主从切换、长 GC、租约失效后的双持锁风险需要资源侧幂等和条件写兜底，以及能否区分 Redis、Redlock、ZooKeeper 的适用边界和工程取舍。",
+  "updatedAt": "2026-06-23"
 }

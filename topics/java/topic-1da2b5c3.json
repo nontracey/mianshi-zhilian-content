@@ -4,37 +4,42 @@
   "category": "spring",
   "group": "spring",
   "title": "Spring AOP 深入",
-  "summary": "深入理解 Spring AOP 的 Advisor 匹配、代理创建、拦截器链、通知顺序与事务失效边界。",
+  "summary": "讲清 Spring AOP 的 Advisor 匹配→代理创建→MethodInterceptor 链执行的完整路径、两种代理的边界与 Boot 默认口径、通知执行顺序（洋葱模型）、事务失效的六个根因和验证方法、以及何时该换 AspectJ。",
   "tags": [
     "Java",
     "Spring生态",
     "Spring AOP 深入"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 35,
+  "estimatedMinutes": 32,
   "order": 110,
   "recommendWeight": 70,
   "status": "production",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Spring AOP 深入：五种通知类型",
-      "content": "## 一、Spring AOP 的核心对象\n- **Aspect**：横切关注点的模块化，例如日志、鉴权、事务。\n- **Pointcut**：匹配哪些方法连接点。Spring AOP 是代理式 AOP，只拦截 Spring Bean 的方法调用。\n- **Advice**：在连接点前后执行的动作。\n- **Advisor**：Pointcut + Advice 的组合，最终会变成代理里的拦截器。\n\n五类通知：`@Before`、`@After`、`@AfterReturning`、`@AfterThrowing`、`@Around`。`@Around` 最强，因为它能决定是否调用 `proceed()`、何时调用、是否替换返回值或转换异常。"
+      "title": "Spring AOP 是代理拦截器，不是编译时织入",
+      "content": "Spring AOP 的核心是「调用是否经过代理对象」。它不会改写原始字节码，而是在 Bean 初始化后期为目标对象包一层代理，所有增强都在代理层的 MethodInterceptor 链里完成。\n\n四个核心概念的关系：`Aspect` 是切面模块（一个 `@Aspect` 类），`Pointcut` 描述匹配哪些方法，`Advice` 是「在连接点做什么」，`Advisor` 是 Pointcut + Advice 的一对一组合。BeanPostProcessor 处理阶段，`AbstractAutoProxyCreator.postProcessAfterInitialization()` 遍历所有候选 Advisor，用 Pointcut 判断当前 Bean 的类和方法是否命中；命中就用 ProxyFactory 创建代理，把匹配到的 Advisor 转成 `MethodInterceptor` 放进拦截器链。没命中就返回原始 Bean。\n\n所以 Spring AOP 的边界就是代理的边界：不拦截字段访问、不拦截构造器、不拦截同类 `this` 调用、不拦截非容器管理对象。理解这条主线，后面的代理选型、事务失效、通知顺序都好解释。"
     },
     {
       "type": "explain",
-      "title": "Spring AOP 深入：两种代理方式",
-      "content": "## 二、代理创建与选择\nSpring 在 Bean 初始化后期通过自动代理创建器找出匹配的 Advisor，并为目标 Bean 创建代理对象。\n\n- **JDK 动态代理**：基于接口，代理类型是接口代理，适合面向接口编程。\n- **CGLIB 代理**：基于生成子类，不能代理 final 类和 final 方法。\n- **Spring Boot 默认口径**：Boot 默认倾向 class-based 代理（`spring.aop.proxy-target-class=true`），因此很多项目看到的是 CGLIB；纯 Spring Framework 或显式关闭该配置时，会按接口/JDK 代理策略运行。\n\n不要把 JDK 代理和 CGLIB 简化成“一个慢一个快”。现代 JVM 下主要差异是代理边界、类型暴露、final 限制和配置语义。"
+      "title": "JDK Proxy 与 CGLIB 的真实差异不在性能",
+      "content": "两种代理的差异是代理边界和类型暴露，不是「一个快一个慢」。\n\n**JDK 动态代理**（`java.lang.reflect.Proxy`）：基于接口，生成的代理类实现目标接口。代理对象只能按接口类型注入，目标类没有接口就用不了。反射调用有一定开销，但现代 JVM 对热点路径有内联优化，不应把它当作性能瓶颈。\n\n**CGLIB 代理**（`org.springframework.cglib.proxy.Enhancer`）：基于继承，生成目标类的子类。代理对象可以按具体类注入，但 `final` 类不能被继承（Enhancer 直接报错），`final` 方法不能被覆盖（增强静默失效）。此外 CGLIB 代理的构造器会调用父类无参构造器，如果目标类只有有参构造器且没有默认实现，创建代理时会失败。\n\n**Spring Boot 的默认口径**：从 Spring Boot 2.0 起 `spring.aop.proxy-target-class` 默认为 `true`，即默认 CGLIB。纯 Spring Framework 5.x 不设此配置时，有接口的 Bean 用 JDK 代理，无接口的用 CGLIB。Spring Boot 3.x（基于 Spring 6）延续了 CGLIB 默认。线上如果依赖代理对象的类型（`instanceof`、`@Autowired` 按具体类注入），要明确知道用的是哪种代理。"
     },
     {
       "type": "explain",
-      "title": "Spring AOP 深入：切面执行顺序",
-      "content": "## 三、通知顺序与事务失效\n同一个调用会经过一条拦截器链。多个切面可用 `@Order` 控制优先级，值越小越靠外层。典型顺序可以按洋葱模型理解：外层 `Around` 前置逻辑 → `Before` → 目标方法 → `AfterReturning/AfterThrowing` → `After` → 外层 `Around` 后置/异常处理。\n\n事务失效常见原因：\n1. 同类内部 `this.method()` 调用绕过代理。\n2. 方法或类没有被 Spring 容器管理。\n3. final 类/final 方法无法被 CGLIB 覆盖。\n4. 异常被 catch 吞掉，事务拦截器看不到回滚信号。\n5. 默认只对运行时异常回滚，受检异常要配置 `rollbackFor`。\n6. 非 public 方法是否被代理受 Spring 版本、代理方式和配置影响，工程上不要把它当稳定事务入口。"
+      "title": "拦截器链执行顺序：洋葱模型与 @Order",
+      "content": "方法调用进入代理后，执行引擎是 `ReflectiveMethodInvocation.proceed()`。它维护一个拦截器索引，每次调用 `proceed()` 索引递增，走到链末尾才调用目标方法。这是一个递归责任链：每个 `MethodInterceptor.intercept()` 调用 `invocation.proceed()` 拿到下一个拦截器的返回值或异常，然后决定自己在「前」「后」怎么处理。\n\n五种通知在链里的位置：`@Around`（`MethodInterceptor`）最外层，能控制是否调 `proceed()`、何时调、替换返回值、转换异常。`@Before`（`MethodBeforeAdviceInterceptor`）在 `proceed()` 之前执行。`@AfterReturning`（`AfterReturningAdviceInterceptor`）在正常返回后执行。`@AfterThrowing` 在抛异常后执行。`@After`（`AspectJAfterAdvice`，即 finally 语义）无论正常还是异常都执行，因为它在 `try-finally` 块里。\n\n多切面场景下，`@Order` 控制 Advisor 在链中的排列顺序，值越小越靠外层（先前置，后后置）。经典理解：外层 `Around` 前半 → `Before` → 目标方法 → `AfterReturning` 或 `AfterThrowing` → `After`（finally）→ 外层 `Around` 后半。排查时不要只背注解名，要看最终 Advisor 链的顺序。"
     },
     {
       "type": "explain",
-      "title": "取舍：Spring AOP vs AspectJ，什么时候该换",
-      "content": "Spring AOP 是代理式 AOP（runtime weaving），只拦截 Spring Bean 的方法调用。它的边界很明确：不拦截字段访问、构造器、方法内部调用（this 调用绕过代理）、非 Spring 对象。对大多数工程场景（事务、日志、鉴权、监控）足够。\n\nAspectJ 支持编译时编织（compile-time weaving，用 ajc 编译器）和加载时编织（LTW，`-javaagent:aspectjweaver.jar`）。它能拦截字段、构造器、方法内部调用、非 Spring 对象，粒度更细。代价是构建复杂度增加（ajc 或 LTW agent），调试更难。\n\n选型取舍：\n- 只需拦截 Bean 的 public 方法 → Spring AOP 足够\n- 需要拦截字段、构造器、方法内部调用 → AspectJ\n- 需要拦截非 Spring 对象 → AspectJ\n- 不想改构建链 → Spring AOP\n- 极致性能（避免代理开销）→ AspectJ 编译时编织，但现代 JVM 下代理开销可忽略\n\nJDK Proxy vs CGLIB 取舍：\n- JDK Proxy：基于接口，代理对象只能按接口注入。目标类无接口时不可用\n- CGLIB：基于子类，不能代理 final 类/final 方法。Spring Boot 2.x/3.x 默认 `spring.aop.proxy-target-class=true`（CGLIB）\n- 性能差异在现代 JVM 可忽略，选型看代理边界和类型暴露需求\n\n事务回滚边界（Spring 6 / Spring Boot 3）：\n- 默认只对 `RuntimeException` 和 `Error` 回滚\n- 受检异常要 `@Transactional(rollbackFor = Exception.class)`\n- Spring 6 起 JTA 规范变化，但默认回滚规则不变\n- 异常被 catch 吞掉 → 事务拦截器看不到 → 不回滚"
+      "title": "@Transactional 失效的六个根因",
+      "content": "事务失效本质是「TransactionInterceptor 有没有机会包住这次调用，以及它能不能拿到回滚信号」。按这个标准，六个根因可以归为两类。\n\n**第一类：调用根本没经过事务代理**\n1. **同类 `this` 调用**：`A` 类的 `a()` 方法调同一个对象的 `b()`（`this.b()`），`b()` 上的 `@Transactional` 不生效，因为 `this` 是原始对象，不经过代理。这是最常见的失效原因。解法：注入自身代理（`@Lazy` 自注入、`AopContext.currentProxy()`），或拆成两个 Bean。\n2. **对象不是 Spring Bean**：手动 `new` 出来的对象不受容器管理，自然没有代理。检查 Bean 注册方式。\n3. **`final` 类或 `final` 方法**：CGLIB 代理基于继承，`final` 方法无法覆盖，增强静默不生效。JDK 代理场景下，接口方法没有 `final` 限制，但实现类的 `final` 方法在 CGLIB 场景下确实会出问题。\n\n**第二类：代理在，但事务拦截器拿不到回滚信号**\n4. **异常被 catch 吞掉**：事务拦截器靠 `catch` 到异常才触发回滚；如果业务代码 `try-catch` 了异常且没有 `re-throw`，拦截器看到的是正常返回，提交事务。\n5. **受检异常未配置 `rollbackFor`**：Spring 事务默认只对 `RuntimeException` 和 `Error` 回滚。`throws IOException` 之类的受检异常需要 `@Transactional(rollbackFor = Exception.class)`。\n6. **非 public 方法的可见性**：Spring 官方要求事务方法是 `public` 的。非 public 方法是否能被代理取决于 Spring 版本、代理模式和 Pointcut 匹配策略，工程上不要把它当稳定事务入口。"
+    },
+    {
+      "type": "explain",
+      "title": "Spring AOP vs AspectJ：边界清楚就好选",
+      "content": "Spring AOP 是运行时代理，只拦截 Spring Bean 的公开方法调用。对事务、日志、鉴权、监控这些「Bean 方法级别」的横切关注点足够。构建零成本，调试透明。\n\nAspectJ 是编译时或加载时字节码编织。编译时用 ajc 编译器改写 `.class` 文件，加载时（LTW）通过 `-javaagent:aspectjweaver.jar` 在类加载时织入。它能拦截字段访问、构造器、`this` 内部调用、非 Spring 对象，粒度远超 Spring AOP。代价是构建链变复杂（需要 ajc 或 LTW agent），调试更难（织入点不在源码里直接可见）。\n\n选型标准很简单：只拦截 Bean 方法 → Spring AOP；需要拦截字段、构造器、内部调用、非容器对象 → AspectJ；不想改构建链 → Spring AOP。性能角度，AspectJ 编译时编织确实省去代理开销，但现代 JVM 下代理开销在绝大多数业务场景可忽略，不应作为选型主因。\n\nSpring 框架本身也支持 AspectJ 的 Pointcut 表达式语法（`execution()`、`within()` 等），但底层执行还是 Spring 代理，不要混淆。"
     },
     {
       "type": "diagram",
@@ -56,25 +61,41 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | JDK 动态代理 | CGLIB 代理 |\n| --- | --- | --- |\n| 代理基础 | 接口代理，生成实现接口的代理类 | 子类代理，生成目标类子类 |\n| 类型暴露 | 代理对象通常只能按接口注入 | 可按具体类注入 |\n| 限制 | 目标最好有稳定接口 | final 类/final 方法不能增强 |\n| Spring Boot 默认 | 可通过配置切换 | Boot 默认倾向 class-based 代理 |\n| 关注重点 | 接口边界、代理类型 | 继承边界、final/private 方法 |\n| 性能口径 | 现代 JVM 下不应笼统说慢 | 现代 JVM 下不应笼统说快 |"
+      "title": "两种代理方式与 AspectJ 对比",
+      "content": "| 维度 | JDK 动态代理 | CGLIB 代理 | AspectJ（编译时/LTW） |\n| --- | --- | --- | --- |\n| 代理基础 | 接口代理，`Proxy.newProxyInstance()` | 子类代理，`Enhancer` 生成目标类子类 | 字节码编织，改写 `.class` 文件 |\n| 能拦截什么 | 接口方法 | 公开非 final 方法 | 字段、构造器、this 调用、非 Bean 对象 |\n| 限制 | 目标必须有接口 | final 类/final 方法不可用 | 构建链复杂，调试成本高 |\n| Boot 默认 | 可通过配置切换 | Boot 2.x/3.x 默认 `proxy-target-class=true` | 需 ajc 或 LTW agent |\n| 性能口径 | 热点路径 JVM 内联，不应笼统说慢 | 反射/子类创建差异可忽略 | 编译时织入无代理开销，但业务场景差异极小 |\n| 类型暴露 | 只能按接口注入 | 可按具体类注入 | 原始类被织入，无代理层 |\n| 适用场景 | 面向接口编程的标准场景 | Boot 默认，需要按类注入 | 需要拦截非 Bean 调用/字段/构造器 |"
+    },
+    {
+      "type": "code",
+      "title": "事务失效复现与修复：同类 this 调用",
+      "language": "java",
+      "content": "import org.springframework.stereotype.Service;\nimport org.springframework.transaction.annotation.Transactional;\nimport org.springframework.context.annotation.AnnotationConfigApplicationContext;\nimport org.springframework.context.annotation.ComponentScan;\nimport org.springframework.context.annotation.Configuration;\nimport org.springframework.context.annotation.EnableAspectJAutoProxy;\n\n// ====== 场景：同类 this 调用导致 @Transactional 失效 ======\n\n@Service\npublic class OrderService {\n\n    // 外部入口：经过代理，事务生效\n    @Transactional\n    public void placeOrder() {\n        // 写库操作\n        System.out.println(\"[placeOrder] insert order, tx active=\"\n                + org.springframework.transaction.support.TransactionSynchronizationManager\n                .isActualTransactionActive());\n        // this 调用：不经过代理，cancel() 上的 @Transactional 失效\n        this.cancelOrder();\n    }\n\n    @Transactional\n    public void cancelOrder() {\n        System.out.println(\"[cancelOrder] tx active=\"\n                + org.springframework.transaction.support.TransactionSynchronizationManager\n                .isActualTransactionActive());\n        // 期望：cancelOrder 有独立事务或共享事务\n        // 实际（this 调用时）：tx active=false，事务失效\n    }\n}\n\n@Configuration\n@EnableAspectJAutoProxy(exposeProxy = true) // exposeProxy 允许 AopContext.currentProxy()\n@ComponentScan\npublic class AppConfig {\n}\n\npublic class Main {\n    public static void main(String[] args) {\n        var ctx = new AnnotationConfigApplicationContext(AppConfig.class);\n        var service = ctx.getBean(OrderService.class);\n\n        System.out.println(\"--- placeOrder（代理调用，事务生效）---\");\n        service.placeOrder();\n\n        // 修复方案：通过 AopContext 获取代理对象调用\n        System.out.println(\"\\n--- 通过代理对象调用 cancelOrder ---\");\n        OrderService proxy = (OrderService) org.springframework.aop.framework.AopContext\n                .currentProxy();\n        proxy.cancelOrder();\n\n        ctx.close();\n    }\n}",
+      "highlights": [
+        {
+          "line": 21,
+          "note": "this.cancelOrder() 是同类内部调用，不经过代理，cancelOrder 上的 @Transactional 失效（tx active=false）。"
+        },
+        {
+          "line": 42,
+          "note": "exposeProxy=true 使 AopContext.currentProxy() 可用，拿到代理对象后调用走代理链，事务生效。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**Q1：Spring AOP 的实现原理是什么？**\n\nSpring AOP 是代理式 AOP。Bean 初始化后，自动代理创建器根据 Advisor 的 Pointcut 判断目标 Bean 是否需要增强；需要增强就创建 JDK Proxy 或 CGLIB 代理。调用进入代理对象后，会依次经过 MethodInterceptor 链，最后才到目标方法。\n\n**Q2：@Transactional 为什么会失效？**\n\n判断标准是“事务拦截器有没有机会包住这次调用”。同类 `this` 调用、对象不是 Spring Bean、final 方法、异常被 catch 吞掉、受检异常未配置 rollbackFor，都会让事务边界不成立或拿不到回滚信号。\n\n**Q3：多个切面执行顺序怎么讲？**\n\n用洋葱模型：`@Order` 值小的在外层，前置逻辑先执行，后置/异常逻辑后执行。真实排查时看最终 Advisor 链，而不是只背注解名称。",
+      "content": "**Spring AOP 实现原理**\nSpring AOP 是代理式 AOP。`AbstractAutoProxyCreator`（BeanPostProcessor）在 Bean 初始化后遍历候选 Advisor，用 Pointcut 判断是否匹配。匹配则通过 ProxyFactory 创建 JDK Proxy 或 CGLIB 代理。方法调用进入代理后，由 `ReflectiveMethodInvocation` 递归执行 MethodInterceptor 链（Around → Before → 目标 → AfterReturning/AfterThrowing → After → Around 后），最后到目标方法。\n\n**代理选择**\n- JDK Proxy：基于接口，代理对象只能按接口注入\n- CGLIB：基于子类，不能代理 final 类/final 方法\n- Spring Boot 默认 CGLIB（`spring.aop.proxy-target-class=true`）\n- 性能差异在现代 JVM 可忽略，选型看代理边界和类型暴露\n\n**@Transactional 为什么失效**\n判断标准：事务拦截器有没有包住这次调用，能不能拿到回滚信号。\n- 没经过代理：同类 `this` 调用、非 Bean、final 方法\n- 拿不到回滚信号：异常被 catch 吞、受检异常缺 `rollbackFor`、非 public 方法\n- 验证：`TransactionSynchronizationManager.isActualTransactionActive()` 打日志确认\n\n**多切面顺序**\n`@Order` 值越小越靠外层（先前置，后后置）。典型链：外层 Around 前 → Before → 目标 → AfterReturning/AfterThrowing → After → 外层 Around 后。\n\n**何时换 AspectJ**\n只拦截 Bean 方法 → Spring AOP 足够。需要拦截字段访问、构造器、`this` 内部调用、非 Spring 对象 → AspectJ。不想改构建链 → Spring AOP。",
       "followUpQuestions": [
         {
-          "question": "Spring AOP的源码实现？",
-          "answer": "源码实现：1. AnnotationAwareAspectJAutoProxyCreator（BeanPostProcessor）；2. postProcessAfterInstantiation中创建代理；3. 选择JDK代理或CGLIB；4. 代理对象包装目标对象；5. 调用时执行拦截链。核心类：ProxyFactory、AdvisedSupport、MethodInterceptor。"
+          "question": "AbstractAutoProxyCreator 如何决定是否创建代理？",
+          "answer": "`postProcessAfterInitialization()` 中调用 `wrapIfNecessary()`：先用 `getAdvicesAndAdvisorsForBean()` 找到匹配当前 Bean 类和方法的 Advisor 列表。如果列表非空，就用 ProxyFactory 创建代理；如果为空，返回原始 Bean 不做代理。这个过程对每个 Bean 只执行一次，代理对象会被缓存。"
         },
         {
-          "question": "AOP的拦截链执行原理？",
-          "answer": "拦截链执行：1. 责任链模式；2. MethodInterceptor.intercept()；3. 递归调用invoke()；4. 执行目标方法。拦截器链：@Around→@Before→目标方法→@AfterReturning/@AfterThrowing→@After→@Around后置。通过ReflectiveMethodInvocation实现。"
+          "question": "AopContext.currentProxy() 的原理是什么？为什么默认关闭？",
+          "answer": "它依赖 `ThreadLocal`。`@EnableAspectJAutoProxy(exposeProxy=true)` 时，`AopContext` 在每次代理调用前把代理对象塞进 ThreadLocal，调用后移除。默认关闭是因为 ThreadLocal 有性能开销，且暴露代理对象让业务代码耦合了 AOP 内部机制。更干净的解法是把需要独立事务的方法拆到另一个 Bean。"
         },
         {
-          "question": "如何自定义AOP注解？",
-          "answer": "自定义AOP注解：1. 定义注解（@Target、@Retention）；2. 定义切面（@Aspect）；3. 定义切入点（@Pointcut）；4. 定义通知（@Before/@After/@Around）。应用场景：日志记录、权限校验、性能监控、事务管理。"
+          "question": "Spring AOP 的 Pointcut 表达式和 AspectJ 一样，它们是同一个东西吗？",
+          "answer": "表达式语法一样（`execution()`、`within()`、`@annotation()` 等），Spring 直接复用了 AspectJ 的 Pointcut 解析器（`aspectjweaver` 包）。但执行层完全不同：Spring AOP 用代理拦截，AspectJ 用字节码编织。用 Spring 的 `@Pointcut` 注解写的表达式，底层还是 Spring 代理在执行，不是 AspectJ 织入。"
         }
       ]
     },
@@ -82,11 +103,13 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说出 Aspect、Pointcut、Advice、Advisor、Interceptor 链的关系",
-        "能解释 JDK Proxy 和 CGLIB 的代理边界、final 限制和 Boot 默认口径",
-        "能按“调用是否经过代理”判断事务/切面是否生效",
-        "能说清 @Order 与 Around/Before/AfterReturning/AfterThrowing/After 的执行关系",
-        "能列举 @Transactional 失效原因，并给出验证方式"
+        "能说清 Advisor 匹配→代理创建→MethodInterceptor 链执行的三阶段路径",
+        "能解释 JDK Proxy 与 CGLIB 的代理边界、final 限制和 Boot 默认 CGLIB 口径",
+        "能用「调用是否经过代理」判断 @Transactional 是否生效",
+        "能描述洋葱模型：Around 前 → Before → 目标 → AfterReturning/AfterThrowing → After(finally) → Around 后",
+        "能列举 @Transactional 失效的六个根因，并给出 `isActualTransactionActive()` 验证方法",
+        "能说明 Spring AOP 与 AspectJ 的边界和选型标准",
+        "能解释 ReflectiveMethodInvocation 的递归 proceed 机制"
       ]
     }
   ],
@@ -99,7 +122,7 @@
       "id": "java.spring.topic-1da2b5c3.recall.1"
     },
     {
-      "prompt": "如何自定义AOP注解，并说明关键机制和边界条件。",
+      "prompt": "如何自定义 AOP 注解，并说明关键机制和边界条件。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4,
@@ -118,36 +141,50 @@
       "mode": "text",
       "expectedMinutes": 6,
       "difficulty": 4
+    },
+    {
+      "id": "java.spring.topic-1da2b5c3.recall.5",
+      "prompt": "多个切面作用于同一个方法时，执行顺序由什么决定？请用洋葱模型描述 Around/Before/AfterReturning/AfterThrowing/After 的实际链路。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "java.spring.topic-1da2b5c3.recall.6",
+      "prompt": "同类 A 调用 this.b()，b() 上有 @Transactional。请从源码角度解释为什么事务不生效，以及有哪些修复方案。",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说清 Advisor 匹配、代理创建、MethodInterceptor 链三个阶段",
-      "能准确区分 JDK Proxy、CGLIB、Spring Boot 默认代理口径和 final 限制",
-      "能用“调用是否经过代理”解释 @Transactional 失效",
-      "能描述多切面顺序和异常/返回信号对事务回滚的影响"
+      "能说清 Advisor 匹配→代理创建→MethodInterceptor 链执行的三阶段路径",
+      "能准确区分 JDK Proxy、CGLIB 的代理边界、final 限制和 Boot 默认 CGLIB 口径",
+      "能用「调用是否经过代理」和「拦截器能否拿到异常信号」解释 @Transactional 失效",
+      "能描述多切面 @Order 和洋葱模型的执行顺序"
     ],
     "goodToHave": [
-      "能结合 AutoProxyCreator、TransactionInterceptor、AopContext 等机制深入说明",
-      "能给出日志、断点、代理类型、事务日志等验证手段",
-      "能区分代理式 AOP 与 AspectJ 编织式 AOP 的边界"
+      "能结合 AutoProxyCreator、ReflectiveMethodInvocation、AopContext 等机制深入说明",
+      "能给出 `isActualTransactionActive()`、代理类型检查、事务日志等验证手段",
+      "能区分代理式 AOP 与 AspectJ 编织式 AOP 的边界和选型标准"
     ],
     "commonMistakes": [
-      "只背五种通知，不知道 Advisor/Interceptor 链如何执行",
-      "把 Spring Boot 2.x 说成唯一口径，忽略 Boot 3/Spring Framework 配置差异",
-      "笼统说非 public 一定失败，忽略版本与代理方式差异",
-      "把 JDK Proxy/CGLIB 简化成绝对性能差异"
+      "只背五种通知注解名，不知道 Advisor 如何变成 MethodInterceptor 链",
+      "笼统说「非 public 一定失败」，忽略版本和代理方式差异",
+      "把 JDK Proxy/CGLIB 简化成性能差异，忽略代理边界和类型暴露",
+      "以为 Spring 的 Pointcut 表达式语法和 AspectJ 一样就等于用了 AspectJ 织入"
     ],
     "scoreWeights": {
-      "coverage": 30,
+      "coverage": 25,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 20
+      "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "interviewFrequency": "low",
-  "interviewerFocus": "考察 Spring AOP 代理链路、代理方式选择、通知顺序和事务失效边界，重点看能否用真实调用路径解释问题。",
+  "interviewerFocus": "考察能否从 Advisor 匹配、代理创建、MethodInterceptor 链、通知顺序、事务失效根因和 AspectJ 边界完整解释 Spring AOP 机制，重点看能否用真实调用路径解释问题。",
   "prerequisites": [
     "java.spring.topic-043-d09a2ea2"
   ]

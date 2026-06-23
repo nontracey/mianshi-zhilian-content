@@ -4,31 +4,41 @@
   "category": "middleware",
   "group": "middleware",
   "title": "RabbitMQ 原理",
-  "summary": "讲清 RabbitMQ 的 AMQP 0-9-1 路由模型、Exchange/Binding/Queue、Publisher Confirm、Consumer Ack、DLX 和现代队列类型取舍。",
+  "summary": "讲清 RabbitMQ 的 AMQP 0-9-1 路由模型、Exchange/Binding/Queue 拓扑、Publisher Confirm 与 mandatory return 覆盖发布链路、manual ack 覆盖消费链路、DLX 死信触发条件、policy 优于硬编码 x-arguments、4.x 队列类型（classic / quorum / streams）选型及 delayed-message exchange 旧插件归档后延迟设计边界。",
   "tags": [
     "Java",
     "中间件",
     "RabbitMQ"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 32,
+  "estimatedMinutes": 42,
   "order": 60,
   "recommendWeight": 86,
   "learningCards": [
     {
       "type": "explain",
-      "title": "核心模型：Producer 先到 Exchange，再由 Binding 路由",
-      "content": "RabbitMQ 是消息 broker。用 AMQP 0-9-1 讲时，生产者不是直接把消息塞进 Queue，而是发布到 Exchange；Exchange 根据类型、routing key、binding key 和 header 条件，把消息路由到一个或多个 Queue，也可能路由不到任何队列。\n\n几个概念要分清：Connection 是 TCP/TLS 连接；Channel 是连接上的轻量逻辑会话，绝大多数发布、声明、消费动作都在 Channel 上完成。Virtual Host 是逻辑隔离边界，不同 vhost 下的 exchange、queue、binding 和权限彼此独立。\n\n四类常见 Exchange 的语义不同：Direct 按 routing key 精确匹配，默认交换机也是 direct 语义；Topic 按点分隔单词，用 `*` 匹配一个单词、`#` 匹配零个或多个单词；Fanout 忽略 routing key，广播给所有绑定队列；Headers 依赖消息头匹配，表达力强但通常不是高吞吐主路径。"
+      "title": "AMQP 0-9-1 路由：Producer → Exchange → Binding → Queue → Consumer",
+      "content": "RabbitMQ 实现的是 AMQP 0-9-1 协议。Producer 不是直接写 Queue，而是把消息发布到 Exchange；Exchange 根据自身类型、消息的 routing key、Queue 的 binding key 以及 header 条件，决定把消息投递到哪些 Queue。消息可能进入一个、多个或零个队列——进入零个就是不可路由。\n\n连接层分两层：Connection 是一条 TCP/TLS 连接，建立时握手、认证，开销大；Channel 是 Connection 上的逻辑复用，几乎所有 publish、declare、consume、ack 动作都在 Channel 上完成。一个 Connection 下可以开很多 Channel，避免频繁建连。\n\nVirtual Host 是逻辑隔离边界。不同 vhost 下的 exchange、queue、binding、用户权限完全独立，生产环境常用 vhost 隔离业务域或租户。vhost 之间没有内置消息路由，跨 vhost 通信要走外部桥接或客户端中转。"
     },
     {
       "type": "explain",
-      "title": "可靠性要分成发布确认、路由失败和消费确认",
-      "content": "Publisher Confirm 和 Consumer Ack 是两套独立确认。Publisher Confirm 覆盖的是生产者到 RabbitMQ 节点、队列或 stream leader replica 的交互；它不关心消费者是否处理成功。Consumer Ack 覆盖的是 RabbitMQ 到消费者的投递处理；消费者 ack 后，Broker 才能把这次 delivery 标记为可删除。\n\n发布端常见三件事一起做：Exchange/Queue durable，消息设置 persistent，打开 publisher confirm。还要处理路由失败：AMQP 0-9-1 发布时 `mandatory=false` 是默认值，不可路由消息会被丢弃或转到 alternate exchange；`mandatory=true` 时会通过 return 机制回给生产者，应用必须记录、告警或改路由重发。\n\n消费端不要用自动 ack 承担关键业务。手动 ack 下，如果消费者进程、Connection 或 Channel 在确认前断开，未确认消息会回到队列并重新投递。重复消费、乱序和红elivery 都是工程现实，业务侧要用幂等键、状态机或消费日志兜住。"
+      "title": "四类 Exchange 的匹配语义和选型判断",
+      "content": "Direct Exchange：消息的 routing key 必须和 binding key 完全相等才匹配。RabbitMQ 默认的无名交换机就是 direct 语义——声明队列时如果不指定 exchange，会自动绑定到无名 direct 交换机，binding key 等于队列名。适合一个队列只消费一种明确业务事件的场景，如 `order.created` 绑一个下单队列。\n\nTopic Exchange：routing key 和 binding key 都是点分隔的单词序列。`*` 恰好匹配一个单词，`#` 匹配零个或多个单词。`order.*` 匹配 `order.created` 和 `order.cancelled`，但不匹配 `order.item.added`；`order.#` 能匹配 `order.created` 和 `order.item.added`。`#` 单独作为 binding key 等价于全量匹配——用它做全局审计或死信收集。如果 binding pattern 过宽，消息会进到不该进的队列，设计时要像设计路由表一样审核每条 binding。\n\nFanout Exchange：完全忽略 routing key，把消息广播给所有绑定队列。适合缓存刷新、配置变更通知、事件扇出。注意 fanout 下不能靠 routing key 做定向路由；如果需要「广播给部分队列」，要用 topic 或 direct 的 binding key 组合来过滤，或者用不同 exchange 隔开。\n\nHeaders Exchange：匹配规则基于消息属性里的 headers 字段，不看 routing key。binding 时声明 `x-match=all`（所有 header 键值对都匹配）或 `x-match=any`（任一匹配即可）。表达力强，适合少量复杂条件路由。但 header 匹配开销比 key 比较大，高吞吐主链路不推荐滥用。"
     },
     {
       "type": "explain",
-      "title": "DLX、延迟和队列类型要按版本口径回答",
-      "content": "Dead Letter Exchange 是普通 Exchange，只是被队列配置成死信出口。RabbitMQ 4.3 文档列出的死信触发包括：消费者 `basic.reject` 或 `basic.nack` 且 `requeue=false`、消息 TTL 过期、队列长度限制导致丢弃、quorum queue 超过 delivery-limit。队列整体过期不会把其中消息逐条死信化。\n\nDLX 配置更推荐用 policy，而不是把 `x-dead-letter-exchange`、TTL、长度限制等 x-arguments 硬编码在应用声明里；policy 可在线调整，硬编码参数要改应用并重新声明拓扑。还要注意：普通 DLX 的内部重发布默认不等同端到端无丢；关键链路要评估 quorum queue 的 at-least-once dead lettering。\n\n队列类型也要跟上 4.x 口径。Classic queue 适合低开销通用任务队列，但 classic mirrored queues 在 4.x 已移除；需要复制和数据安全时优先看 quorum queue，它基于 Raft，RabbitMQ 4.3 又增加 delayed retry、consumer timeout、严格优先级等能力；大 backlog、重复读取和日志式消费更适合 streams。延迟消息不要再把旧的 delayed-message exchange 插件当成默认推荐，因为该插件仓库已在 2026 年归档。"
+      "title": "可靠性链路：Publisher Confirm、mandatory return 和 Consumer Ack",
+      "content": "RabbitMQ 的可靠性要拆成三段：发布到 Broker、路由到队列、消费端处理。每段有独立机制。\n\nPublisher Confirm 覆盖「发布到 Broker」。打开 confirm 模式后，每条消息被 Broker 持久化到目标队列（或 quorum queue leader replica）后，Broker 会异步回 confirm 给生产者。confirm 不等于消费者已处理。生产端通常用 confirm 机制做重试：超时未 confirm 的消息重新发布（要带幂等 ID，避免 Broker 端重复）。批量 confirm（`waitForConfirms()`）延迟低但出错时定位慢，异步 confirm（per-message callback）更精细，高吞吐场景推荐异步。\n\nmandatory 和 alternate exchange 覆盖「路由到队列」。AMQP 0-9-1 默认 `mandatory=false`，消息不可路由时被 Broker 静默丢弃。设 `mandatory=true` 后，不可路由消息会通过 return 机制（`basic.return`）回给生产者，应用必须注册 return handler 来记录、告警或改路由重发。更简洁的方案是配置 alternate exchange：exchange 自身声明时指定一个备用交换机，不可路由消息自动转发到备用交换机，备用交换机通常绑定一个 catch-all 队列做兜底。\n\nConsumer Ack 覆盖「消费端处理」。自动 ack（`autoAck=true`）在 Broker 推送消息后立即视为已消费，消费者崩溃时消息永久丢失——绝对不要用在关键业务。手动 ack 下，消费者处理成功后调 `basic.ack`，Broker 才标记 delivery 完成；处理失败可 `basic.nack` 或 `basic.reject`，`requeue=true` 让消息回到队列头部重新投递，`requeue=false` 则走死信（若配置了 DLX）。连接断开时 Broker 会自动 requeue 该连接上未 ack 的所有 delivery。prefetch count 控制 Broker 向单个消费者推送的未 ack 消息上限，过大会让消费者积压、内存飙升，过小会浪费吞吐。"
+    },
+    {
+      "type": "explain",
+      "title": "DLX 死信触发条件和 policy 治理",
+      "content": "Dead Letter Exchange 就是一个普通 Exchange，被队列通过 `x-dead-letter-exchange`（可选 `x-dead-letter-routing-key`）配置为死信出口。RabbitMQ 4.3 文档列出的死信触发条件有四类：\n\n1. 消费者 `basic.reject` 或 `basic.nack` 且 `requeue=false`\n2. 消息 TTL 过期（可以是消息自身 `expiration` 属性，也可以是队列 `x-message-ttl`）\n3. 队列达到 `x-max-length` 或 `x-max-length-bytes` 上限，头部消息被丢弃时\n4. Quorum queue 超过 delivery-limit（`delivery-limit` 参数，超过后消息进入 DLX 而不是继续重投）\n\n注意：队列整体 TTL（`x-expires`）过期时队列本身被删除，队列中的消息不会逐条死信化。\n\n生产环境推荐用 policy 管 DLX、TTL、长度限制。Policy 在运行时生效、可在线调整、不需要重启消费者或重新声明队列。硬编码 x-arguments 在应用声明队列时写死，改参数要改应用代码、重新声明队列（可能丢消息）。Policy 还能用正则批量匹配队列名，统一管理一组队列的死信策略。\n\nDLX 的内部重新发布不是原子事务。消息到达 DLX 后可能被路由到 DLQ，但这个过程中如果 DLX 节点崩溃，消息有极端小概率丢失。关键链路如果要求严格 at-least-once，要配合 quorum queue 的 delivery-limit + DLX，或在消费端写补偿表。"
+    },
+    {
+      "type": "explain",
+      "title": "4.x 队列类型选型和延迟消息边界",
+      "content": "Classic Queue：RabbitMQ 传统队列，持久化消息写磁盘、非持久化内存优先。适合低开销通用任务队列、不需要跨节点复制的场景。重要变化：classic mirrored queue（HA 镜像队列）已在 4.x 移除。如果你的面试答案里还提到镜像队列做高可用，说明没跟上版本。Classic queue 本身在 4.x 依然可用，但不提供复制——数据只在单节点。\n\nQuorum Queue：基于 Raft 共识协议的复制队列，多数节点写入成功后才确认。适合关键持久消息、需要数据安全和高可用的场景。RabbitMQ 4.3 增强了 quorum queue：delivery-limit 控制重投上限后进 DLX（避免无限 requeue 热循环）、consumer timeout 自动 nack 长时间未 ack 的 delivery、严格优先级队列支持。Quorum queue 的写入延迟高于 classic queue（多数派写盘），不适合把所有队列都换成 quorum——按数据重要性分级选。\n\nStream：追加日志式存储，消息持久化且不删除（直到保留期过期），多个消费者可以独立维护 offset 回放。适合事件溯源、大 backlog、多消费者独立进度。Stream 的消费模型不同于传统队列：不支持 ack/nack 精确控制，消息不会因消费而移除。把 stream 当普通队列替代会丢失经典 ack 语义。\n\n延迟消息：旧的 `rabbitmq_delayed_message_exchange` 插件（社区维护）仓库已在 2025 年归档（archived），不再推荐作为默认方案。RabbitMQ 4.3 的 quorum queue 支持 delayed retry——消费失败后消息按退避间隔延迟重投，适合秒级到分钟级重试退避。跨小时、跨天级延迟调度不适合用 Broker 内机制实现，更稳妥的方案是把延迟任务写入数据库 + 外部调度器扫描触发。"
     },
     {
       "type": "diagram",
@@ -50,8 +60,13 @@
     },
     {
       "type": "compareTable",
-      "title": "Exchange 和队列类型速查",
-      "content": "| 对象 | 核心语义 | 适合场景 | 常见误区 |\n| --- | --- | --- | --- |\n| Direct exchange | routing key 与 binding key 精确匹配 | 订单、支付、任务分发等明确路由 | 以为生产者直接写队列 |\n| Topic exchange | `*` 一个单词，`#` 零个或多个单词 | 日志、领域事件、按租户/类型分类 | 绑定过宽导致消息进错队列 |\n| Fanout exchange | 忽略 key，发给所有绑定队列 | 广播通知、缓存刷新、事件扇出 | 用它做精确路由 |\n| Headers exchange | 按 header 条件匹配 | 少量复杂条件路由 | 高吞吐主链路滥用 |\n| Classic queue | 普通队列，低开销，功能丰富 | 非关键复制、低成本任务队列 | 继续使用 4.x 已移除的镜像队列思路 |\n| Quorum queue | Raft 复制，数据安全优先 | 关键持久消息、需要复制和 delivery-limit | 把它用于大量短生命周期临时队列 |\n| Stream | 追加日志，可重复读，适合大积压 | 事件回放、大 backlog、多消费者独立 offset | 当成普通队列替代所有场景 |"
+      "title": "Exchange 类型匹配语义对比",
+      "content": "| Exchange 类型 | 匹配规则 | 典型场景 | 设计风险 |\n| --- | --- | --- | --- |\n| Direct | routing key == binding key 精确相等 | 订单事件、支付回调、任务分发 | 以为 Producer 直接写 Queue，忽略 Binding |\n| Topic | 点分隔单词，`*` 一词、`#` 零或多词 | 日志分级、领域事件、租户分类 | binding pattern 过宽导致消息进错队列 |\n| Fanout | 忽略 routing key，广播全部绑定 | 缓存刷新、配置广播、事件扇出 | 拿来做定向路由，无法按 key 过滤 |\n| Headers | 按消息 header 键值对匹配，`x-match=all/any` | 少量复杂条件路由 | 高吞吐主链路滥用导致匹配开销大 |"
+    },
+    {
+      "type": "compareTable",
+      "title": "4.x 队列类型选型对比",
+      "content": "| 队列类型 | 复制机制 | 数据语义 | 适用场景 | 不适用场景 |\n| --- | --- | --- | --- | --- |\n| Classic queue | 无复制（单节点） | 消费即删除 | 低成本任务队列、非关键临时消息 | 需要节点故障后数据不丢失 |\n| Quorum queue | Raft 多数派写入 | 消费即删除，delivery-limit 进 DLX | 关键持久消息、高可用、重试退避 | 大量短生命周期临时队列（Raft 开销大） |\n| Stream | 追加日志，按保留期过期 | 消费不删除，独立 offset 回放 | 事件溯源、大 backlog、多消费者独立进度 | 需要精确 ack/nack 和即时删除 |"
     },
     {
       "type": "code",
@@ -80,24 +95,23 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "我会先画主链路：Producer 通过 Connection/Channel 发布消息到 Exchange，Exchange 根据类型和 Binding 路由到 Queue，Consumer 从 Queue 拉取或被推送消息。四种常见 Exchange 分别是 direct 精确匹配、topic 通配符、fanout 广播、headers 按消息头匹配。\n\n然后拆可靠性。发布端要打开 publisher confirm，确认消息被 RabbitMQ 接收并写入目标队列或 leader replica；同时要处理不可路由消息，`mandatory=true` 时看 return callback，或配置 alternate exchange。Broker 端要让 exchange、queue durable，消息 persistent。消费端用 manual ack，处理成功后 ack，失败时按异常类型选择重试、nack requeue、nack 到 DLX 或写业务补偿表。\n\nDLX 可以这样讲：消息被 nack/reject 且 requeue=false、TTL 过期、队列长度限制触发丢弃、quorum queue 超过 delivery-limit 时，会被重新发布到配置的死信交换机。生产上更推荐用 policy 管 DLX、TTL、长度限制，便于在线调整。\n\n最后补 4.x 版本边界：classic mirrored queue 已退出，关键持久队列要考虑 quorum queue；大 backlog 和事件回放看 streams；延迟消息不能只背旧插件，RabbitMQ 4.3 的 quorum delayed retry 更适合失败重投退避，跨天级调度要用外部调度和业务库更稳。"
-      ,
+      "content": "**主链路（先画图再说机制）**\nProducer 通过 Connection/Channel 发布消息到 Exchange，Exchange 根据自身类型和 Binding 规则路由到 Queue，Consumer 从 Queue 消费。Connection 是 TCP/TLS 连接，Channel 是其上的轻量逻辑会话，Virtual Host 提供逻辑隔离。\n\n**Exchange 四类型**\n- Direct：routing key == binding key 精确匹配，默认无名交换机就是 direct\n- Topic：点分隔单词，`*` 匹配一个词，`#` 匹配零或多词\n- Fanout：忽略 key，广播全部绑定队列\n- Headers：按消息头键值对匹配，`x-match=all/any`\n\n**可靠性三段**\n- 发布到 Broker → Publisher Confirm（异步回调，超时重试要带幂等 ID）\n- 路由到队列 → `mandatory=true` + return handler 或 alternate exchange 兜底\n- 消费端处理 → manual ack；成功 ack，失败按场景选 nack requeue / nack 到 DLX / 写补偿表\n- Broker 端：exchange + queue durable，消息 persistent\n\n**DLX 死信**\n四类触发：nack/reject 且 requeue=false、消息 TTL 过期、队列长度限制丢弃、quorum queue 超 delivery-limit。队列整体过期（x-expires）不触发死信。生产用 policy 管 DLX/TTL/长度，不用硬编码 x-arguments。\n\n**4.x 队列选型**\n- Classic queue：单节点无复制，低成本任务队列\n- Quorum queue：Raft 多数派复制，关键持久消息，4.3 支持 delivery-limit + delayed retry\n- Stream：追加日志，独立 offset 回放，适合事件溯源和大 backlog\n- Classic mirrored queue 已在 4.x 移除\n\n**延迟消息边界**\n旧 delayed-message exchange 插件已归档。秒/分钟级重试退避用 quorum queue delayed retry；跨小时/天级延迟用数据库 + 外部调度器。",
       "followUpQuestions": [
         {
-          "question": "Publisher Confirm 和 Consumer Ack 有什么区别？",
-          "answer": "Publisher Confirm 是 Broker 给生产者的确认，说明发布动作被 Broker 接收并到达目标队列或 leader replica；Consumer Ack 是消费者处理完成后给 Broker 的确认，两者彼此独立。Confirm 成功不代表消费者已经处理。"
+          "question": "Publisher Confirm 和 Consumer Ack 解决的是同一个问题吗？",
+          "answer": "不是。Publisher Confirm 是 Broker 告诉生产者「消息已被我接收并写入目标队列或 leader replica」，覆盖的是发布链路。Consumer Ack 是消费者告诉 Broker「我已处理完这条消息」，覆盖的是消费链路。两者独立——confirm 成功不等于消费者已处理。"
         },
         {
-          "question": "不可路由消息怎么处理？",
-          "answer": "AMQP 0-9-1 下可以设置 mandatory=true 并注册 return handler；也可以配置 alternate exchange 承接不可路由消息。默认 mandatory=false 时，不可路由消息可能被丢弃。"
+          "question": "mandatory=true 和 alternate exchange 有什么区别？",
+          "answer": "`mandatory=true` 让 Broker 对不可路由消息触发 `basic.return`，生产者必须注册 return handler 来处理。alternate exchange 是在声明 Exchange 时指定一个备用交换机，不可路由消息自动转发过去，生产者不需要注册回调。alternate exchange 更简洁但信息粒度低（生产者可能不知道哪些消息没路由成功），mandatory 更精确但要写更多代码。"
         },
         {
-          "question": "RabbitMQ 4.x 队列高可用怎么选？",
-          "answer": "classic mirrored queues 已从 4.x 移除。普通低成本任务可用 classic queue；关键持久数据用 quorum queue；需要事件回放、大 backlog 和多消费者独立进度时用 streams。"
+          "question": "为什么经典面试说法「Mirror Queue 做高可用」已经过时？",
+          "answer": "RabbitMQ 4.x 移除了 classic mirrored queue（ha-mode=all/exactly/nodes）。原因是 mirror queue 的同步复制在脑裂、慢消费者场景下故障多且运维复杂。替代方案是 quorum queue（Raft 共识，多数派写入确认）或 streams。面试时如果还在说镜像队列，面试官会判断你停留在 3.x 时代。"
         },
         {
-          "question": "为什么消费端仍要幂等？",
-          "answer": "消费者可能处理成功但 ack 丢失，连接断开会让未确认消息重新入队，生产者重试也可能生成重复消息。业务要用 messageId、业务唯一键或状态机避免重复生效。"
+          "question": "消费端为什么必须做幂等？",
+          "answer": "三个原因：1）消费者处理成功但 ack 丢失，连接断开后 Broker 自动 requeue 导致重投；2）生产者 confirm 超时后重试发布产生重复消息；3）requeue 消息回到队列头部可能被其他消费者再次消费。业务侧要用 messageId、业务唯一键或状态机保证幂等。"
         }
       ]
     },
@@ -105,12 +119,12 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能画出 Producer、Connection、Channel、Exchange、Binding、Queue、Consumer 的 AMQP 0-9-1 链路",
-        "能区分 Direct、Topic、Fanout、Headers 四类 Exchange 的匹配语义",
-        "能说明 Publisher Confirm、mandatory return、alternate exchange 和 Consumer Ack 的边界",
-        "能解释 DLX 的触发条件，以及 policy 比硬编码 x-arguments 更适合生产治理",
-        "能说明 classic queue、quorum queue、streams 的适用场景和 4.x 版本边界",
-        "能指出自动 ack、不可路由无处理、无幂等、队头阻塞、无限 requeue 这些常见风险"
+        "能画出 Producer → Connection → Channel → Exchange → Binding → Queue → Consumer 的 AMQP 0-9-1 链路",
+        "能区分 Direct（精确）、Topic（通配 `*`/`#`）、Fanout（广播）、Headers（header 匹配）四类 Exchange 的匹配语义",
+        "能说明 Publisher Confirm（发布到 Broker）、mandatory return（路由失败）、Consumer Ack（消费处理）三个机制分别覆盖哪个失败窗口",
+        "能解释 DLX 的四类触发条件，以及 policy 比硬编码 x-arguments 更适合在线治理",
+        "能说明 classic queue（单节点）、quorum queue（Raft 复制）、streams（追加日志回放）的适用场景和 4.x 镜像队列移除的版本边界",
+        "能指出自动 ack 导致消息丢失、不可路由无处理导致静默丢、无限 requeue 导致热循环、延迟消息插件归档等常见风险"
       ]
     }
   ],
@@ -123,38 +137,54 @@
       "id": "java.middleware.topic-077-0f4a426f.recall.1"
     },
     {
-      "prompt": "Publisher Confirm、mandatory return、alternate exchange、Consumer Ack 分别解决哪个失败窗口？",
+      "prompt": "Publisher Confirm、mandatory return、alternate exchange、Consumer Ack 分别解决哪个失败窗口？三者能互相替代吗？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3,
       "id": "java.middleware.topic-077-0f4a426f.recall.2"
     },
     {
-      "id": "java.middleware.topic-077-0f4a426f.recall.3",
-      "prompt": "RabbitMQ 4.x 下 classic queue、quorum queue、streams 怎么选？DLX 和 delayed retry 的边界是什么？",
+      "prompt": "RabbitMQ 4.x 下 classic queue、quorum queue、streams 怎么选？classic mirrored queue 为什么被移除？",
       "mode": "text",
       "expectedMinutes": 4,
-      "difficulty": 3
+      "difficulty": 3,
+      "id": "java.middleware.topic-077-0f4a426f.recall.3"
+    },
+    {
+      "prompt": "DLX 的四类触发条件是什么？队列整体过期（x-expires）会不会触发死信？生产上为什么要用 policy 管理 DLX 配置？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3,
+      "id": "java.middleware.topic-077-0f4a426f.recall.4"
+    },
+    {
+      "prompt": "消费者自动 ack 为什么危险？手动 ack 下如果消费者崩溃，消息会怎样？无限 nack requeue 会造成什么问题？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3,
+      "id": "java.middleware.topic-077-0f4a426f.recall.5"
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明 RabbitMQ 的 AMQP 0-9-1 路由模型和 Exchange/Binding/Queue 关系",
-      "能区分 Direct/Topic/Fanout/Headers 四种 Exchange",
-      "能讲清 Publisher Confirm、mandatory return 和 Consumer Ack 的不同责任",
-      "能解释 DLX 的触发条件和消费幂等的必要性"
+      "能说明 RabbitMQ 的 AMQP 0-9-1 路由模型：Producer → Exchange → Binding → Queue → Consumer",
+      "能区分 Direct/Topic/Fanout/Headers 四种 Exchange 的匹配语义和适用场景",
+      "能讲清 Publisher Confirm（发布到 Broker）、mandatory return（路由失败）、Consumer Ack（消费处理）三个独立机制",
+      "能解释 DLX 的四类触发条件和消费端幂等的必要性"
     ],
     "goodToHave": [
-      "能说明 policy 管理 DLX、TTL、长度限制优于硬编码 x-arguments",
-      "能结合 RabbitMQ 4.x 说明 classic mirrored queues 移除、quorum queue 与 streams 的取舍",
-      "能指出 delayed-message exchange 旧插件归档后，延迟和重试设计要按实际版本选择"
+      "能说明 policy 管理 DLX/TTL/长度限制优于硬编码 x-arguments（在线调整 vs 改应用重声明）",
+      "能结合 RabbitMQ 4.x 说明 classic mirrored queue 移除、quorum queue（Raft + delivery-limit）与 streams 的取舍",
+      "能指出 delayed-message exchange 旧插件归档后延迟设计要按版本选型（quorum delayed retry vs 外部调度）",
+      "能说明 mandatory=true 与 alternate exchange 的粒度差异"
     ],
     "commonMistakes": [
-      "以为 Producer 直接写 Queue，忽略 Exchange 和 Binding",
-      "把 Publisher Confirm 理解成消费者处理成功",
-      "自动 ack 处理关键业务，消费者崩溃时导致消息丢失",
-      "不可路由消息没有 return handler 或 alternate exchange",
-      "无限 requeue 造成热循环，不做 DLQ、重试退避和幂等"
+      "以为 Producer 直接写 Queue，忽略 Exchange 和 Binding 在路由中的角色",
+      "把 Publisher Confirm 理解成「消费者处理成功」的确认",
+      "自动 ack 处理关键业务，消费者崩溃时消息永久丢失",
+      "不可路由消息没有 return handler 也没有 alternate exchange，静默丢消息",
+      "无限 nack requeue 造成热循环（消息在队头反复被消费、nack、回到队头），不配置 delivery-limit 或 DLX",
+      "面试时说 Mirror Queue 做高可用，RabbitMQ 4.x 已移除镜像队列"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -163,9 +193,9 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否画出 AMQP 0-9-1 路由链路，区分 Exchange 类型，讲清发布确认、路由失败、消费确认、DLX 和 4.x 队列类型取舍。"
+  "interviewerFocus": "考察能否画出 AMQP 0-9-1 路由链路，区分 Exchange 类型匹配语义，讲清发布确认、路由失败处理、消费确认三个独立可靠性机制，解释 DLX 死信触发条件和 policy 治理，以及 4.x 队列类型（classic/quorum/streams）选型和镜像队列移除的版本边界。"
 }

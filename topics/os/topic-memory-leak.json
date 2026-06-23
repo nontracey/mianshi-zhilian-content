@@ -4,7 +4,7 @@
   "category": "memory-management",
   "group": "memory-management",
   "title": "内存泄漏与溢出",
-  "summary": "用“趋势判定 + 内存区域归因 + 持有者定位 + 修复验证”的闭环区分内存泄漏、OOM 和栈溢出，并掌握 Java heap/native、C/C++、fd/cgroup 等真实线上排查边界。",
+  "summary": "用“趋势判定 + 内存区域归因 + 持有者定位 + 修复验证”的闭环区分内存泄漏、OOM 和栈溢出；掌握 Java heap/native/direct、C/C++ 所有权、fd/cgroup、容器 OOM 等真实排查路径，并理解泄漏修复必须落到持有链释放点或容量上限而非单纯调大配置。",
   "tags": [
     "操作系统",
     "内存泄漏",
@@ -12,19 +12,29 @@
     "堆栈溢出"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 30,
   "order": 40,
   "recommendWeight": 75,
   "learningCards": [
     {
       "type": "explain",
-      "title": "泄漏 vs 溢出 vs 栈溢出，与泄漏成因",
-      "content": "## 先分清三个词\n- **内存泄漏**是过程：对象、堆外内存、文件描述符或连接在业务上已经不需要，却仍被引用或未释放，导致基线持续抬升。\n- **内存溢出 / OOM**是结果：进程或 cgroup 再申请内存时失败，可能抛异常，也可能被内核 OOM killer 杀掉。泄漏会导致 OOM，但峰值过高、配置太小、瞬时大对象也会导致 OOM。\n- **栈溢出**是调用栈空间耗尽，常见于递归没有收敛、栈帧过大。它和堆泄漏不是同一类问题，不能用堆 dump 直接解释。\n\n## 判断是否真泄漏\n真正有价值的问题不是“内存有没有涨”，而是**压力释放或回收后基线是否回落**。Java 里看 Full GC 后 old gen 是否持续抬升；Native 服务看 RSS、heap profiler 或 allocator 指标在流量回落后是否仍不降；容器里还要看 cgroup 的 `memory.current` 和 OOM 事件。能回落通常是峰值或容量问题，不回落才进入泄漏定位。\n\n## 常见泄漏持有者\n- **手动内存未释放**：C/C++ `malloc/new` 后缺 `free/delete`，或异常路径提前返回导致 cleanup 没执行。\n- **长生命周期对象持有短生命周期对象**：Java 静态 Map/List 只增不减、监听器未注销、ThreadLocal 未 remove、缓存没有上限或 TTL。\n- **堆外和句柄泄漏**：DirectByteBuffer、mmap、JNI native 内存、文件 fd、socket、DB 连接未关闭。表现可能是 RSS 涨而 Java heap 不涨。\n- **容量策略错误**：没有分页、限流、背压、LRU/TTL，严格说不一定是泄漏，但会制造和泄漏相同的 OOM 结局。"
+      "title": "泄漏 vs 溢出 vs 栈溢出：三个不同层面的问题",
+      "content": "内存泄漏、OOM 和栈溢出经常被混用，但它们是不同层面的概念。\n\n**内存泄漏**是过程。对象、堆外内存、文件描述符或连接在业务上已不需要，却仍被引用或未释放，导致基线持续抬升。关键不是“内存涨了”，而是**压力释放后基线不回落**。Java 里看 Full GC 后 old gen 是否持续增长；Native 服务看 RSS 或 heap profiler 指标在流量回落后是否仍不降；容器里还要看 cgroup 的 `memory.current` 和 OOM 事件计数。\n\n**OOM / 内存溢出**是结果。进程或 cgroup 再申请内存时失败——JVM 抛 `OutOfMemoryError`，或 Linux 内核 OOM killer 杀掉进程。泄漏会导致 OOM，但瞬时大对象、配置过小、page cache 挤占 cgroup 额度、native 分配过快同样会 OOM。所以 OOM 不等于泄漏。\n\n**栈溢出**是调用栈空间耗尽。递归没有终止条件、栈帧内放了大数组、或者某些编译器 bug 导致帧布局异常，都会触发 `StackOverflowError` 或段错误。它和堆泄漏不是同一类问题，不能用 heap dump 解释，排查时要看调用栈深度和帧大小。\n\n区分三者的意义在于：如果把“内存涨了”一律当泄漏处理，会浪费大量时间；如果把 OOM 只归因于堆，会漏掉 native、cgroup、fd 等真实原因。"
     },
     {
       "type": "explain",
-      "title": "OOM 的几类场景与排查工具",
-      "content": "## 按内存区域选工具\n- **Java heap**：`jstat -gcutil <pid> 1s` 看 GC 后 old gen 是否回落；必要时 `jcmd <pid> GC.heap_dump file.hprof` 或 `jmap -dump:format=b,file=heap.hprof <pid>` 导出堆，用 MAT 的 Dominator Tree、Histogram、GC Roots 引用链找“谁持有最多且不该持有”。\n- **Java native / direct**：heap 没涨但 RSS 涨，要看 DirectByteBuffer、线程栈、JNI、mmap、class metadata、allocator。可用 `jcmd <pid> VM.native_memory summary`（需要启动 NMT）和 `/proc/<pid>/smaps_rollup`、`pmap -x` 交叉验证。\n- **C/C++**：开发和压测环境优先用 AddressSanitizer/LeakSanitizer；无法插桩时用 Valgrind、heap profiler 或 allocator 统计。目标是拿到分配栈和未释放对象大小，而不是只看到 RSS 上涨。\n- **fd / 连接 / 资源句柄**：`lsof -p <pid>`、`ls /proc/<pid>/fd | wc -l`、连接池指标、`ss -s`。句柄泄漏经常和内存泄漏一起出现。\n- **容器和系统 OOM**：看 cgroup `memory.current`、`memory.events`、`oom_kill`，以及 `dmesg`/`journalctl -k` 的 OOM killer 记录。容器被杀不一定是进程堆满，也可能是 cgroup 限制、page cache、native 内存或旁路进程挤压。\n\n## 修复要闭环\n修复不是“把 Xmx 调大”就结束。必须说明持有者、释放点或容量上限：缓存加 LRU/TTL，监听器注销，ThreadLocal 在 finally 里 remove，连接和文件用 try-with-resources/RAII，native 内存明确 owner。最后用同等压测证明 RSS、old gen、native、fd 数在峰值后回到稳定基线。"
+      "title": "Java 泄漏与 OOM 的几类场景及定位路径",
+      "content": "Java 应用的 OOM 并不只来自堆。把不同内存区域搞清楚，排查才不会盲人摸象。\n\n**Java heap 泄漏**是最常见的场景。`jstat -gcutil <pid> 1s` 看 GC 后 old gen 是否回落；不回落就 `jcmd <pid> GC.heap_dump file.hprof` 或 `jmap -dump:format=b,file=heap.hprof <pid>` 导出堆，用 MAT 的 Dominator Tree 和 Histogram 找“谁持有最多内存”，再用 GC Roots 引用链追溯到长生命周期持有者。典型持有者：static Map/List 只增不减、监听器未注销、ThreadLocal 未 remove、缓存没有上限或 TTL、线程池队列堆积。\n\n**Java heap 不涨但 RSS 涨**——泄漏在 native 或 direct 区域。常见原因：DirectByteBuffer 分配了大量堆外缓冲区但未释放；JNI 调用的 native 库分配内存后未 free；mmap 映射文件后未 munmap；线程数过多导致栈内存累加；allocator 碎片化。工具组合：`jcmd <pid> VM.native_memory summary`（需启动 NMT）、`/proc/<pid>/smaps_rollup` 看 RSS/PSS 分解、`pmap -x` 看映射段大小。三者交叉验证，避免被单一指标误导。\n\n**fd / 连接 / 资源句柄泄漏**不直接导致堆 OOM，但会通过耗尽内核资源引发其他失败（连接拒绝、too many open files）。用 `lsof -p <pid>`、`ls /proc/<pid>/fd | wc -l`、连接池指标、`ss -s` 观察。句柄泄漏经常和内存泄漏同时出现——一个 handler 既持有 socket fd 又持有缓冲区引用。\n\n**容器 OOM** 是另一层。被杀不一定是进程堆满：cgroup limit 设太小、page cache 计入 cgroup 额度、旁路进程（sidecar、agent）挤占内存、native 分配过快都会触发 `memory.events` 中的 `oom_kill`。排查要看 cgroup `memory.current`、`memory.events`、`dmesg`/`journalctl -k` 的 OOM killer 日志，结合进程级 RSS 分解判断是哪块内存超限。"
+    },
+    {
+      "type": "explain",
+      "title": "C/C++ 泄漏：所有权问题而非可达性问题",
+      "content": "Java 用可达性分析判断存活，C/C++ 用手动管理或 RAII 判断是否释放。两者的排查思路不同。\n\nC/C++ 泄漏的核心问题是**所有权不清**：谁分配、谁释放、异常路径是否漏 cleanup。开发和压测环境优先用 **AddressSanitizer + LeakSanitizer**（ASan/LSan），编译时加 `-fsanitize=address,leak`，运行时即可报告未释放块和完整分配栈。无法插桩时用 **Valgrind --leak-check=full**，但性能开销大，适合开发而非生产。生产环境可接 allocator hook 或 heap profiler（如 jemalloc 的 `malloc_stats_print`、gperftools 的 tcmalloc）做采样。\n\n常见模式：malloc/new 后异常路径提前 return，free/delete 没执行；容器（vector、map）持有裸指针，元素 clear 了但指针没 delete；循环引用（两个对象互相持有 shared_ptr）。修复方向：RAII（智能指针、scope guard）、明确 owner、补 cleanup 路径和 sanitizer 测试。\n\nC/C++ 不能用“GC 后基线回落”判断泄漏，因为没有 GC。所以判断标准是：压力测试结束后 RSS 是否回落到接近初始值；不回落就 dump allocator 统计或跑 sanitizer。"
+    },
+    {
+      "type": "explain",
+      "title": "修复闭环：从持有者到验证曲线",
+      "content": "内存问题的修复不是“把 Xmx 调大”就结束，也不是“加个 try-finally”就完成。修复必须形成闭环。\n\n**定位持有者**：heap dump 找到 dominator 对象后，要沿 GC Roots 回溯到根——是 static 字段、ThreadLocal、注册的 listener、定时任务引用、还是某个缓存。native 泄漏要找到分配栈和 owner 代码路径。fd 泄漏要找到 open 点和缺失的 close。\n\n**修复方式按类型**：\n- 集合类：加容量上限 + 淘汰策略（LRU/TTL），或改用 WeakReference/SoftReference。\n- ThreadLocal：在 finally 块里 `threadLocal.remove()`，线程池场景尤其重要。\n- 监听器/回调：注册时记录引用，注销时 remove；生命周期绑定到注册对象的 destroy/close。\n- 缓存：用 Guava Cache、Caffeine 等有界缓存，设定 maxSize/expireAfterWrite/expireAfterAccess。\n- 文件/连接/Socket：try-with-resources（Java）、RAII + defer（Go/C++）、with 语句（Python）。\n- native 内存：明确 owner 和释放点，JNI 层加泄漏检测，mmap 对应 munmap。\n\n**验证闭环**：用同等压测流量回放，观察 RSS、old gen、native（NMT）、fd 数、cgroup memory.current 在峰值后是否回落到稳定基线。只看“没再 OOM”不够——可能只是阈值还没到，或者流量变小了。"
     },
     {
       "type": "diagram",
@@ -53,45 +63,49 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 现象 | 关键证据 | 常见根因 | 处理方向 |\n| --- | --- | --- | --- |\n| Java heap 持续上涨 | Full GC 后 old gen 不回落，heap dump dominator 集中 | 静态集合、无界缓存、ThreadLocal、listener 未注销 | 找 GC Roots 持有链，加容量上限/TTL/remove/unregister |\n| RSS 涨但 Java heap 不涨 | smaps/pmap/NMT 显示 native/direct/mmap/线程栈增长 | DirectByteBuffer、JNI、mmap、线程过多、allocator 碎片 | 限制 direct memory，关闭映射，减少线程，定位 native 分配栈 |\n| C/C++ 泄漏 | ASan/LSan/Valgrind 给出未释放块和分配栈 | owner 不清、异常路径漏 free、循环引用 | RAII/智能指针/cleanup 路径，补测试和 sanitizer |\n| fd/连接泄漏 | `lsof -p` 或 `/proc/<pid>/fd` 持续增长 | 文件、socket、DB 连接未 close | try-with-resources/defer/连接池上限和泄漏检测 |\n| 容器 OOM kill | cgroup memory.events 有 oom_kill，dmesg 有 killer 记录 | cgroup 上限、native/page cache、旁路进程挤压 | 按 cgroup 视角拆分 heap/native/cache，校准 limit 和请求量 |\n| 栈溢出 | StackOverflowError/递归栈帧重复 | 递归不收敛、栈帧过大 | 改迭代，限制深度，必要时调整栈大小 |"
+      "title": "现象、证据、根因与处理方向",
+      "content": "| 现象 | 关键证据 | 常见根因 | 处理方向 |\n| --- | --- | --- | --- |\n| Java heap 持续上涨 | Full GC 后 old gen 不回落，heap dump dominator 集中 | 静态集合、无界缓存、ThreadLocal、listener 未注销 | 找 GC Roots 持有链，加容量上限/TTL/remove/unregister |\n| RSS 涨但 Java heap 不涨 | smaps/pmap/NMT 显示 native/direct/mmap/线程栈增长 | DirectByteBuffer、JNI、mmap、线程过多、allocator 碎片 | 限制 direct memory，关闭映射，减少线程，定位 native 分配栈 |\n| C/C++ 泄漏 | ASan/LSan/Valgrind 给出未释放块和分配栈 | owner 不清、异常路径漏 free、循环引用 | RAII/智能指针/cleanup 路径，补 sanitizer 测试 |\n| fd/连接泄漏 | `lsof -p` 或 `/proc/<pid>/fd` 持续增长 | 文件、socket、DB 连接未 close | try-with-resources/defer/连接池上限和泄漏检测 |\n| 容器 OOM kill | cgroup memory.events 有 oom_kill，dmesg 有 killer 记录 | cgroup 上限、native/page cache、旁路进程挤压 | 按 cgroup 视角拆分 heap/native/cache，校准 limit 和请求量 |\n| 栈溢出 | StackOverflowError 或段错误，调用栈帧重复 | 递归不收敛、栈帧过大 | 改迭代，限制深度，必要时调整栈大小（-Xss/ulimit -s） |"
     },
     {
       "type": "code",
       "title": "Python 可运行：无界持有 vs 有界缓存的内存曲线",
-      "content": "import collections\nimport gc\nimport tracemalloc\n\n\ndef mem_kib():\n    current, peak = tracemalloc.get_traced_memory()\n    return current // 1024, peak // 1024\n\n\ndef print_mem(label):\n    current, peak = mem_kib()\n    print(f\"{label}: current={current} KiB, peak={peak} KiB\")\n\n\ntracemalloc.start()\n\nunbounded_cache = []\nfor i in range(8):\n    unbounded_cache.append(bytearray(128 * 1024))\nprint_mem(\"after unbounded cache\")\n\nunbounded_cache.clear()\ngc.collect()\nprint_mem(\"after clear and gc\")\n\nbounded_cache = collections.OrderedDict()\nfor i in range(8):\n    bounded_cache[i] = bytearray(128 * 1024)\n    if len(bounded_cache) > 2:\n        bounded_cache.popitem(last=False)\n\nassert len(bounded_cache) == 2\nprint(\"bounded cache entries:\", len(bounded_cache))\nprint_mem(\"after bounded cache\")",
+      "content": "import collections\nimport gc\nimport tracemalloc\n\n\ndef mem_kib():\n    current, peak = tracemalloc.get_traced_memory()\n    return current // 1024, peak // 1024\n\n\ndef print_mem(label):\n    current, peak = mem_kib()\n    print(f\"{label}: current={current} KiB, peak={peak} KiB\")\n\n\ntracemalloc.start()\n\n# 无界持有：列表只增不减，模拟静态集合泄漏\nunbounded_cache = []\nfor i in range(8):\n    unbounded_cache.append(bytearray(128 * 1024))\nprint_mem(\"after unbounded cache\")\n\n# 清除引用 + GC：模拟 \"回收点\"，看基线是否回落\nunbounded_cache.clear()\ngc.collect()\nprint_mem(\"after clear and gc\")\n\n# 有界缓存：用淘汰策略控制长期持有量\nbounded_cache = collections.OrderedDict()\nfor i in range(8):\n    bounded_cache[i] = bytearray(128 * 1024)\n    if len(bounded_cache) > 2:\n        bounded_cache.popitem(last=False)  # LRU 淘汰\n\nassert len(bounded_cache) == 2\nprint(\"bounded cache entries:\", len(bounded_cache))\nprint_mem(\"after bounded cache\")\n\n# 预期输出：\n# after unbounded cache: current≈1024 KiB\n# after clear and gc: current 回落（基线回落 = 峰值问题）\n# after bounded cache: current≈256 KiB（有界缓存控制持有量）",
       "language": "python",
       "highlights": [
         {
-          "line": 19,
-          "note": "这里模拟无界缓存持续持有对象引用，逻辑上不再需要时仍无法被回收。"
+          "line": 20,
+          "note": "无界缓存持续持有引用，模拟 static 集合或无界缓存泄漏。"
         },
         {
-          "line": 23,
-          "note": "清空引用并触发回收后，当前内存应明显回落；这对应线上判断“基线是否回落”。"
+          "line": 25,
+          "note": "清空引用 + gc.collect() 对应回收点；基线回落说明是峰值问题，不回落才是真泄漏。"
         },
         {
           "line": 30,
-          "note": "有界缓存用淘汰策略控制长期持有量，修复方向不是单纯调大内存。"
+          "note": "OrderedDict + popitem(last=False) 实现 FIFO 淘汰，控制长期持有量——这是修复方向。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**30 秒结论**\n内存泄漏是基线持续抬升的过程，OOM 是申请失败或被 OOM killer 杀掉的结果，栈溢出是调用栈耗尽。排查时不能只说“内存涨了”，要先制造回收点，看 Full GC、流量回落、缓存释放或连接关闭后基线是否下降；不下降才按泄漏处理。\n\n**排查闭环**\n1. 先统一观测口径：RSS、Java heap、native/direct、fd 数、cgroup `memory.current` 各自含义不同，不能把 VIRT 或 page cache 直接等同于泄漏。\n2. Java heap 泄漏看 GC 后 old gen 趋势，用 heap dump + MAT Dominator Tree/GC Roots 找长生命周期持有者，比如 static Map、ThreadLocal、listener、无界缓存。\n3. RSS 涨但 heap 不涨时，重点查 DirectByteBuffer、JNI、mmap、线程栈和 allocator，可用 NMT、`smaps_rollup`、`pmap` 交叉验证。\n4. C/C++ 关注所有权边界，用 ASan/LSan/Valgrind 拿到未释放块和分配栈；fd、socket、DB 连接则看 `lsof`、`/proc/<pid>/fd` 和连接池指标。\n5. 如果是容器 OOM，要看 cgroup OOM 事件和内核日志，确认是进程堆、native、page cache 还是 limit 配置问题。\n\n**收口方式**\n修复必须落到持有者或释放点：缓存加上限/TTL，ThreadLocal 在 finally 里 remove，listener unregister，文件和连接用 try-with-resources/RAII。上线前用同等压测证明 RSS、old gen、native 和 fd 数在峰值后回到稳定基线。",
+      "content": "**30 秒结论**\n内存泄漏是过程——对象或资源在业务上不再需要却仍被引用，导致基线持续抬升；OOM 是结果——申请内存失败或被 OOM killer 杀掉；栈溢出是调用栈耗尽，通常由递归不收敛导致。排查的关键不是“内存涨了”，而是**回收点后基线是否回落**：能回落多是峰值或容量问题，不回落才进入泄漏定位。\n\n**排查主线（按内存区域）**\n1. **统一观测口径**：RSS、Java heap、native/direct、fd 数、cgroup memory.current 各自含义不同。VIRT 高不代表泄漏，page cache 不等于进程堆。\n2. **Java heap**：`jstat -gcutil` 看 Full GC 后 old gen 趋势；不回落就 `jcmd GC.heap_dump`，用 MAT 的 Dominator Tree + GC Roots 找长生命周期持有者（static Map、ThreadLocal、listener、无界缓存）。\n3. **RSS 涨但 heap 不涨**：查 DirectByteBuffer、JNI、mmap、线程栈、allocator。工具组合：NMT + smaps_rollup + pmap 交叉验证。\n4. **C/C++**：关注所有权，用 ASan/LSan/Valgrind 拿未释放块和分配栈；修复用 RAII/智能指针/cleanup 路径。\n5. **fd/连接**：`lsof -p`、`/proc/<pid>/fd` 数、连接池指标。句柄泄漏常和内存泄漏同时出现。\n6. **容器 OOM**：看 cgroup memory.events、oom_kill、dmesg，确认是 heap/native/page cache 还是 limit 问题。\n\n**修复收口**\n落到持有者或释放点：缓存加 LRU/TTL，ThreadLocal 在 finally 里 remove，listener unregister，文件和连接用 try-with-resources/RAII。上线前用同等流量压测，证明 RSS、old gen、native、fd 数在峰值后回落到稳定基线。",
       "followUpQuestions": [
         {
-          "question": "C/C++ 和 Java 排查内存泄漏的手段有什么不同？",
-          "answer": "C/C++ 主要找所有权错误：谁分配、谁释放、异常路径是否漏 cleanup，工具上用 ASan/LSan/Valgrind 或 heap profiler 拿分配栈。Java 主要找仍然可达的对象：先用 jstat 看 Full GC 后 old gen 是否回落，再 dump heap，用 MAT 的 Dominator Tree 和 GC Roots 找长生命周期持有者。还要补一句边界：Java heap 不涨但 RSS 涨时，泄漏可能在 DirectByteBuffer、JNI、mmap 或线程栈等 native 区域。"
+          "question": "C/C++ 和 Java 排查内存泄漏的手段有什么根本不同？",
+          "answer": "核心差异是判断标准不同。Java 用可达性分析：对象仍被 GC Roots 引用就是“活着”，排查工具（MAT）帮你找谁引用了不该引用的对象。C/C++ 没有 GC，判断标准是所有权：谁分配谁释放、异常路径是否漏 cleanup，排查工具（ASan/LSan/Valgrind）帮你找分配了但没释放的块和分配栈。所以 Java 侧重“找持有链”，C/C++ 所有权不清则用 RAII/智能指针/cleanup 路径修复。"
         },
         {
-          "question": "Java 有 GC，为什么还会内存泄漏？最典型的几个例子是什么？",
-          "answer": "GC 只回收不可达对象。对象业务上已经无用，但仍被 static 集合、单例缓存、线程池里的 ThreadLocal、事件源 listener、定时任务、队列或回调引用时，GC 会认为它仍然存活。典型修复不是“等 GC”，而是移除引用、注销监听器、给缓存加容量和 TTL、在 finally 里 remove ThreadLocal，并用压测确认 Full GC 后基线回落。"
+          "question": "Java 有 GC 为什么还会内存泄漏？",
+          "answer": "GC 只回收不可达对象。如果对象业务上已无用，但仍被 static 集合、单例缓存、线程池里的 ThreadLocal、事件 listener、定时任务、消息队列回调引用，GC 会认为它仍然存活。最典型的场景是 static HashMap 只 put 不 remove，或线程池里 ThreadLocal 没有在 finally 里 remove——线程复用导致旧值一直挂着。修复不是等 GC，而是移除引用、注销监听器、给缓存加容量和 TTL。"
         },
         {
-          "question": "线上一个 Java 服务内存持续上涨最后 OOM，你的排查步骤是什么？",
-          "answer": "我会先止血并保留证据：确认是否允许重启、是否有 HeapDumpOnOutOfMemoryError、容器是否发生 oom_kill。然后看 GC 后 old gen、RSS、native、fd、cgroup 指标是否持续抬升；heap 泄漏就 dump 后用 MAT 查 dominator 和 GC Roots，heap 不涨但 RSS 涨就查 NMT、smaps、DirectByteBuffer、JNI、mmap 和线程数。定位后把修复落到具体持有链或资源 owner，再用同等流量回放证明基线稳定。"
+          "question": "线上 Java 服务 OOM 后你会怎么排查？",
+          "answer": "先止血：确认是否重启、是否有 HeapDumpOnOutOfMemoryError 生成了 hprof、容器是否发生 oom_kill。然后看指标趋势：GC 后 old gen、RSS、native（NMT）、fd 数、cgroup memory.current 是否持续抬升。heap 泄漏就 dump + MAT 查 dominator 和 GC Roots；heap 不涨但 RSS 涨就查 NMT、smaps、DirectByteBuffer、JNI、mmap 和线程数；容器 OOM 就看 cgroup OOM 事件和内核日志。定位后修复落到具体持有链或 resource owner，再用同等流量回放验证基线稳定。"
+        },
+        {
+          "question": "什么情况下 OOM 不是泄漏导致的？",
+          "answer": "至少四种：(1) 瞬时大对象——一次分配一个超大数组或字符串，heap 够用但一次申请超过剩余空间；(2) 容器 cgroup limit 设太小，page cache 或 native 内存计入限额；(3) 峰值流量超出容量设计，队列堆积或缓存膨胀但没有泄漏——流量回落就恢复；(4) native 分配过快（JNI、DirectByteBuffer），GC 来不及回收引用，RSS 先撑爆。这些都是容量或配置问题，不是泄漏。"
         }
       ]
     },
@@ -99,55 +113,65 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能区分内存泄漏、OOM、栈溢出，并说明泄漏是过程、OOM 是结果",
-        "能用“回收后基线是否回落”判断峰值/容量问题和真泄漏",
-        "能按 Java heap、native/direct、C/C++、fd/连接、cgroup 选择排查工具",
-        "能解释 MAT Dominator Tree、GC Roots、NMT、smaps、ASan/LSan 的适用边界",
-        "能说清 static 集合、ThreadLocal、listener、无界缓存、fd/socket 未关闭等持有者",
-        "能把修复落到 remove/unregister/容量上限/TTL/RAII/try-with-resources",
-        "能用压测和指标证明 RSS、old gen、native、fd 数回到稳定基线"
+        "能区分内存泄漏（过程）、OOM（结果）、栈溢出（调用栈耗尽）并说明它们的关系",
+        "能用“回收点后基线是否回落”判断峰值/容量问题和真泄漏",
+        "能按 Java heap、native/direct、C/C++、fd/连接、cgroup 选择排查工具和验证方法",
+        "能解释 MAT Dominator Tree、GC Roots、NMT、smaps、ASan/LSan 的适用场景和局限",
+        "能列举 static 集合、ThreadLocal、listener、无界缓存、fd/socket 未关闭等典型持有者",
+        "能把修复落到具体持有链：remove/unregister/容量上限/TTL/RAII/try-with-resources",
+        "能用压测和指标证明 RSS、old gen、native、fd 数在峰值后回到稳定基线",
+        "能解释容器 OOM 不等于进程堆满——page cache、native、cgroup limit、旁路进程都可能是原因"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "os.memory-management.topic-memory-leak.recall.1",
-      "prompt": "请区分内存泄漏、内存溢出和栈溢出，并说明它们常见的触发原因。",
+      "prompt": "请区分内存泄漏、内存溢出和栈溢出，并说明它们的常见触发原因和排查思路差异。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "os.memory-management.topic-memory-leak.recall.2",
-      "prompt": "如果线上 Java 服务出现 OOM，你的排查思路是什么？",
+      "prompt": "线上 Java 服务出现 OOM，你的排查思路是什么？请按内存区域分别说明。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "os.memory-management.topic-memory-leak.recall.3",
-      "prompt": "内存泄漏与溢出 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "Java 有 GC 为什么还会内存泄漏？举三个典型场景并说明修复方式。",
       "mode": "text",
       "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "os.memory-management.topic-memory-leak.recall.4",
+      "prompt": "容器中 Java 服务被 OOM killer 杀掉，但 Java heap 没满。可能的原因是什么？怎么排查？",
+      "mode": "text",
+      "expectedMinutes": 4,
       "difficulty": 3
     }
   ],
   "rubric": {
-      "mustHave": [
-      "内存泄漏是过程、OOM 是结果、栈溢出是调用栈耗尽",
-      "用回收点后的基线变化区分峰值/容量问题和真泄漏",
-      "按 Java heap、native/direct、C/C++、fd/连接、cgroup 选择工具",
-      "能把修复落到持有者、释放点、容量上限和压测验证"
+    "mustHave": [
+      "能区分内存泄漏（过程）、OOM（结果）、栈溢出（调用栈耗尽）并说明关系",
+      "能用回收点后基线回落判断峰值/容量问题和真泄漏",
+      "能按 Java heap、native/direct、C/C++、fd/连接、cgroup 选择排查工具",
+      "能把修复落到持有者、释放点、容量上限，并用压测验证基线稳定"
     ],
     "goodToHave": [
-      "MAT Dominator Tree、Histogram、GC Roots 的分析思路",
-      "NMT、smaps_rollup、pmap 对 RSS 涨但 Java heap 不涨的定位价值",
-      "ASan/LSan、Valgrind、RAII/try-with-resources 的工程化修复方式"
+      "MAT Dominator Tree + GC Roots 的分析思路和典型持有链",
+      "NMT、smaps_rollup、pmap 对 RSS 涨但 Java heap 不涨的交叉验证",
+      "ASan/LSan + RAII/智能指针的 C/C++ 泄漏修复方式",
+      "容器 OOM 不等于进程堆满——page cache、native、旁路进程的排查视角"
     ],
     "commonMistakes": [
-      "把内存上涨直接等同于泄漏，没有看回收后基线",
+      "把内存上涨直接等同于泄漏，没有制造回收点看基线是否回落",
       "只盯 Java heap，忽略 direct/native、fd、cgroup 和 page cache",
-      "只说调大内存，不说明持有链、释放点和验证曲线"
+      "只说“调大 Xmx”或“加内存”，不说明持有链、释放点和验证曲线",
+      "以为有 GC 就不会泄漏，忽略 static 集合、ThreadLocal、listener 等强引用持有"
     ],
     "scoreWeights": {
       "coverage": 35,
@@ -156,11 +180,11 @@
       "depth": 15
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "os.memory-management.topic-virtual-memory"
   ],
   "interviewFrequency": "low",
-  "interviewerFocus": "考察是否能围绕「内存泄漏与溢出」说清内存泄漏是过程、内存溢出是结果的关系、资源未关闭、集合持有引用等常见泄漏原因，并放到操作系统与 Linux 排查场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察能否围绕内存泄漏（过程）、OOM（结果）、栈溢出（调用栈耗尽）三个概念说清关系和排查差异；能否按内存区域（Java heap、native/direct、C/C++、fd、cgroup）选择正确的工具和验证方法；能否把修复落到持有链释放点并用压测证明基线稳定。"
 }

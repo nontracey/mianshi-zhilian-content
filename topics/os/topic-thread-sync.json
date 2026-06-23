@@ -4,7 +4,7 @@
   "category": "process-thread",
   "group": "process-thread",
   "title": "线程同步机制",
-  "summary": "围绕共享不变量、等待方式和所有权语义，讲清 mutex/futex、spinlock、rwlock、condition variable、semaphore、CAS 的选型边界、常见错误和验证方法。",
+  "summary": "围绕共享不变量、等待方式和所有权语义，讲清 mutex/futex 快慢路径、spinlock 忙等边界、rwlock 写饥饿与锁升级、condition variable 的 while-predicate-wait、semaphore 计数许可、atomic/CAS 的 ABA 与内存序，以及 TSAN、futex 延迟、上下文切换和 P99 的工程验证。",
   "tags": [
     "操作系统",
     "线程同步",
@@ -12,19 +12,29 @@
     "条件变量"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 38,
   "order": 20,
   "recommendWeight": 89,
   "learningCards": [
     {
       "type": "explain",
-      "title": "同步的核心：保护共享不变量，而不是背锁名",
-      "content": "## 为什么需要同步\n线程共享同一进程地址空间，多个线程同时读写同一对象时，结果会取决于调度顺序，这就是竞态。同步机制的目标不是“把代码串行化”这么简单，而是保护共享不变量：例如队列长度不能为负、连接池许可不能超发、缓存索引和数据必须一起更新。\n\n## 选型先问三个问题\n1. **保护什么状态**：是一个简单计数器、一个临界区、一组读多写少的数据，还是“队列非空”这种条件？\n2. **抢不到时应该怎样等**：忙等适合极短临界区且持锁者正在运行；睡眠适合临界区较长或等待条件不确定的场景。\n3. **释放者是谁**：mutex 强调加锁线程负责解锁；semaphore 是计数许可，可以由不同线程释放；condition variable 不保存通知，必须配合 mutex 和 predicate 使用。\n\n## 经验规则\n临界区较长或可能阻塞，用 mutex；临界区极短且不允许睡眠，才考虑 spinlock；读远多于写且能接受策略复杂度，用 rwlock；等待状态变化，用 condition variable；限制 N 个资源，用 semaphore；单变量简单更新，用 atomic/CAS。"
+      "title": "同步不是串行化，是保护共享不变量",
+      "content": "线程共享同一进程地址空间，多个线程同时读写同一对象时，结果取决于调度顺序——这就是竞态（race condition）。同步的目标不是「把代码串行化」这么简单，而是保护共享不变量（shared invariant）：比如队列长度不能为负、连接池许可不能超发、链表的 prev/next 指针必须一致、缓存索引和数据必须一起更新。如果两个线程各自递增一个计数器，不变量就是「最终值 = 初始值 + 操作次数」；如果一边插入链表节点一边遍历，不变量就是「任意时刻 next 指针能形成完整链」。\n\n选型前必须先回答三个问题：\n1. **保护什么状态**：是一个简单计数器、一个临界区、一组读多写少的数据，还是「队列非空」这种条件谓词？不同的状态粒度对应不同的原语。\n2. **抢不到时应该怎样等**：忙等（spin）适合极短临界区且持锁者正在其他核上运行；睡眠适合临界区较长或等待条件不确定的场景。选错等待方式会导致 CPU 空转或不必要的上下文切换。\n3. **释放者是谁**：mutex 强调所有权——谁加锁谁解锁；semaphore 是计数许可，可以由任意线程释放；condition variable 不保存通知，必须配合 mutex 和 predicate 使用。把 semaphore 当 mutex 用会导致所有权混乱和许可泄漏。\n\n经验规则：临界区较长或可能阻塞（IO、锁嵌套），用 mutex；临界区极短（几条指令）且不允许睡眠（中断上下文、持有自旋锁的嵌套路径），才考虑 spinlock；读远多于写且写延迟可控，用 rwlock；等待状态变化（队列非空、连接就绪），用 condition variable；限制 N 个并发资源，用 semaphore；单变量简单更新，用 atomic/CAS。"
     },
     {
       "type": "explain",
-      "title": "常见同步原语的真实边界",
-      "content": "## mutex 与 futex\nLinux 用户态 `pthread_mutex` 常见实现思路是：无竞争时用原子指令在用户态完成加锁；发现竞争后才通过 futex 进入内核睡眠/唤醒。这就是“快路径用户态、慢路径内核态”。mutex 适合保护临界区，但持锁期间不要做慢 IO、远程 RPC 或长时间计算，否则等待线程会堆积。\n\n## spinlock、rwlock、condition variable\nspinlock 抢不到时忙等，适合持锁时间极短、持锁者大概率正在其他核上运行的场景；单核或可抢占场景里盲目自旋会烧 CPU。rwlock 允许多读单写，但读多不一定就更快：写者饥饿、锁升级死锁、读侧缓存行争用都可能抵消收益。condition variable 解决“等条件成立”，正确形式是持 mutex 检查 predicate，并用 `while (!predicate) wait()`；wait 会原子地释放 mutex 并睡眠，被唤醒后还要重新抢锁、重查条件，防止虚假唤醒、广播惊群和其他线程先消费。\n\n## semaphore、atomic 与 CAS\nsemaphore 是带计数的许可，适合限流、连接池、生产者消费者的空槽/满槽计数；它不强调锁所有权，不能简单等同 mutex。atomic/CAS 适合计数器、状态位、引用计数这类小粒度更新，但复杂不变量通常仍要锁或无锁数据结构；CAS 还要处理 ABA、内存序、缓存行争用和可维护性问题。"
+      "title": "mutex/futex 快慢路径与 spinlock/rwlock 的真实边界",
+      "content": "**mutex 与 futex 快慢路径**\nLinux 的 pthread_mutex 常见实现（glibc + NPTL）采用快慢路径设计：无竞争时，用户态一条原子 CAS 把锁状态从「未持有」改为「持有」，全程不进内核，成本极低（纳秒级）；发现竞争（CAS 失败或锁已被持有时才加锁的乐观自旋也不成功）后，通过 futex 系统调用进入内核，等待线程被挂到等待队列并睡眠，释放锁的一方再通过 futex(FUTEX_WAKE) 唤醒一个或多个等待者。这意味着轻度竞争下 mutex 成本接近一次原子操作；重度竞争下每次加锁都可能陷入内核，瓶颈从 CPU 变成调度器。\n\nmutex 的关键工程约束：持锁期间不要做慢 IO、远程 RPC、长计算或嵌套锁获取。持锁时间越长，等待线程堆积越多，tail latency 越恶化。如果必须做 IO 或网络调用，应该先释放锁、完成 IO、再重新获取锁（lock-free 读取 + 拷贝 + 外部处理）。\n\n**spinlock 的适用边界**\nspinlock 抢不到时忙等，省掉了睡眠/唤醒的上下文切换开销。但它只在以下条件同时满足时才是好选择：① 持锁时间极短（几微秒以内）；② 持锁者大概率正在其他核上运行（多核 SMP）；③ 当前执行路径不允许睡眠（中断上下文、持有另一个 spinlock 时）。单核系统上自旋等于让持锁者也被自旋线程抢占了 CPU，根本无法推进；持锁者被抢占（preempted）时自旋者白白烧 CPU。Linux 内核中 spinlock 搭配 preempt_disable 使用就是为了防止后者。\n\n**rwlock 的隐藏成本**\nrwlock 允许多个读者同时持有读锁，只在写者获取时排他。但「读多写少」并不自动等于 rwlock 更快：① 写者饥饿：大量读者持续持有读锁，写者长时间无法获取写锁，写延迟不可控；② 锁升级死锁：持有读锁的线程尝试升级为写锁，如果实现不支持升级或有其他读者等待写锁，会死锁；③ 读侧缓存行争用：即使读者之间不互斥，rwlock 的内部计数器通常在一个缓存行上，多个核同时递增读计数会导致缓存行 bouncing，高频场景下 rwlock 可能比 mutex 更慢。一些实现（如 Linux 的 per-CPU rwlock）通过分散读计数缓解此问题，但增加了复杂度。"
+    },
+    {
+      "type": "explain",
+      "title": "condition variable 的 while-predicate-wait 与信号语义",
+      "content": "condition variable 解决的问题是「在某个条件不满足时睡眠，条件满足时被唤醒」——它本身不保存条件状态，只是一个睡眠/通知通道。正确的使用模式必须同时满足四个要素：\n\n1. **持 mutex 修改 predicate**：比如 `queue.size > 0` 这个条件，生产者在 mutex 保护下执行 `queue.push(item)`，把 predicate 从 false 变为 true，然后 signal。消费者在 mutex 保护下检查 predicate。\n2. **用 while 而不是 if 等待**：`while (!predicate) pthread_cond_wait(&cond, &mutex)`。必须用 while 的三个原因：① 虚假唤醒（spurious wakeup）——内核实现可能在没有 signal 的情况下唤醒线程；② broadcast 后多个线程同时醒来，只有一个能消费，其余必须重新检查；③ 被唤醒到重新拿锁之间有时间窗口，另一个线程可能已经消费了数据、predicate 回到 false。用 if 等待是条件变量最常见的 bug，线上表现为偶发的空读、越界或状态破坏。\n3. **wait 原子释放 mutex 并睡眠**：`pthread_cond_wait` 内部先释放 mutex、再把线程挂到条件变量的等待队列上、然后睡眠——这三步是原子的，不会在释放 mutex 和睡眠之间插入其他线程的检查。醒来后，wait 会重新获取 mutex，然后返回。\n4. **signal 不传递数据**：signal 只是唤醒一个在该条件变量上等待的线程，不携带任何信息。被唤醒的线程必须重新检查 predicate，因为条件可能已经不满足。如果把 signal 当成消息队列（每次 signal 对应一条消息），在 broadcast 或多个消费者场景下会丢消息。\n\n常见错误：① 用 if 不用 while；② 未持锁就修改 predicate（生产者不拿 mutex 直接 push，消费者可能看不到更新）；③ 把 signal 写在 mutex 外面（虽然在某些实现上可行，但放里面语义更清晰且避免唤醒时序问题）；④ 用 broadcast 代替 signal 但等待者不多，白白唤醒所有线程。"
+    },
+    {
+      "type": "explain",
+      "title": "semaphore 的计数许可语义与 CAS/atomic 的适用范围",
+      "content": "**semaphore：计数许可，不是互斥锁**\nsemaphore 的核心语义是维护一个非负整数计数器：`wait`（P 操作）检查计数器 > 0 则减 1 并返回，否则阻塞；`post`（V 操作）加 1 并唤醒一个等待者。关键区别在于：① 不要求谁 wait 谁 post，任意线程都可以释放许可——这适合生产者 post、消费者 wait 的不对称模式；② 计数器 > 1 时允许多个线程同时通过——适合限制 N 个并发资源（数据库连接池、连接限流）；③ 没有所有权语义——一个线程 release 的许可可以被另一个线程 acquire。\n\n二值信号量（计数器 = 1）看起来像 mutex，但语义不同：mutex 要求加锁者解锁，违反时实现可以报错或死锁检测；二值信号量没有此约束。用信号量模拟互斥会导致所有权混乱、忘记 release 或重复 release 而无法检测。正确用法：互斥用 mutex，限并发用 semaphore。\n\n**atomic/CAS：适合小粒度，不适合复杂不变量**\natomic 操作（如 `atomic_inc`、`compare_and_swap`）在硬件层面保证操作原子性，不需要锁。适合的场景：单个变量的简单更新（计数器、状态位、引用计数）、自旋锁的底层实现、无锁数据结构的局部操作。\n\n但 CAS 有四个隐藏成本：① ABA 问题——值从 A 变 B 再变回 A，CAS 认为没变过但中间状态已丢失。解决用版本号（double-width CAS 或 hazard pointer）。② 内存序——x86 是 TSO（Total Store Order），天然保证大部分顺序；ARM/RISC-V 是弱内存序，需要显式 barrier（acquire/release）。用错内存序会导致其他核看不到更新。③ 伪共享（false sharing）——两个 atomic 变量在同一个缓存行（64 字节）上，分别被不同核修改，导致缓存行反复失效。解决用 padding 或 `alignas(64)`。④ 可维护性——无锁代码难以理解和审查，复杂不变量（多字段一致性）通常仍需要锁或成熟的无锁数据结构库。"
     },
     {
       "type": "diagram",
@@ -47,7 +57,7 @@
     {
       "type": "compareTable",
       "title": "同步原语对比与高频坑",
-      "content": "| 机制 | 等待位置 | 适用场景 | 高频坑 |\n| --- | --- | --- | --- |\n| Mutex | 竞争时睡眠，Linux 常见慢路径 futex | 普通临界区、需要所有权语义 | 持锁做慢 IO/RPC，锁粒度过大，忘记异常路径释放 |\n| Spinlock | 忙等，占 CPU | 内核/运行时极短临界区，不适合睡眠的路径 | 单核或持锁者被抢占时空转；临界区稍长就恶化 |\n| RWLock | 读共享、写排他，通常会阻塞等待 | 读远多于写、读侧短且写延迟可控 | 写饥饿、锁升级死锁、读侧缓存行争用 |\n| Condition variable | wait 原子解锁并睡眠，醒后重抢锁 | 等待 predicate，如队列非空、状态变化 | 用 if 不用 while；未持锁改 predicate；把 signal 当消息队列 |\n| Semaphore | 计数许可，许可不足时阻塞 | 限并发、资源池、空槽/满槽计数 | 和 mutex 混淆所有权；许可泄漏或重复 release |\n| Atomic/CAS | 不睡眠，失败重试 | 简单计数、状态位、引用计数 | ABA、内存序错误、伪共享、复杂不变量难维护 |"
+      "content": "| 机制 | 等待方式 | 所有权 | 适用场景 | 高频坑 |\n| --- | --- | --- | --- | --- |\n| Mutex | 竞争时 futex 睡眠 | 谁加锁谁解锁 | 普通临界区、需要所有权语义 | 持锁做慢 IO/RPC；粒度过大；忘记异常路径释放 |\n| Spinlock | 忙等，占 CPU | 无所有权，通常搭配中断/抢占控制 | 内核/运行时极短临界区（微秒级） | 单核或持锁者被抢占时空转；临界区稍长就恶化 |\n| RWLock | 读共享写排他，竞争时阻塞 | 读锁无所有权限制，写锁排他 | 读远多于写、读侧短且写延迟可控 | 写饥饿；锁升级死锁；读侧缓存行争用反升 |\n| Condvar | wait 原子释放 mutex 并睡眠 | 无所有权，必须搭配 mutex | 等待 predicate（队列非空、状态变化） | 用 if 不用 while；未持锁改 predicate；signal 当消息 |\n| Semaphore | 计数许可不足时阻塞 | 无所有权，任意线程可 release | 限并发、资源池、空槽/满槽计数 | 和 mutex 混淆所有权；许可泄漏或重复 release |\n| Atomic/CAS | 不睡眠，失败重试 | 无 | 简单计数、状态位、引用计数 | ABA；内存序错误；伪共享；复杂不变量难维护 |"
     },
     {
       "type": "code",
@@ -57,38 +67,66 @@
       "highlights": [
         {
           "line": 18,
-          "note": "生产者也用 while 等空槽，避免覆盖尚未消费的数据；这比只 signal 不看状态的示例更接近真实写法。"
+          "note": "生产者也用 while 等空槽（has_item == 0），防止覆盖尚未消费的数据——这比只用 if 等待的示例更健壮。"
         },
         {
           "line": 33,
-          "note": "消费者用 while 等非空，能抵御虚假唤醒、广播惊群和其他线程先消费。"
+          "note": "消费者用 while 等非空，能抵御虚假唤醒、broadcast 后多个线程同时醒、或被唤醒后条件已被其他线程消费。"
         },
         {
           "line": 39,
-          "note": "先修改受 mutex 保护的 predicate，再 signal；通知不是状态本身，状态才是判断依据。"
+          "note": "先在 mutex 保护下修改 predicate（has_item = 0），再 signal 通知生产者——通知不是状态本身，状态才是判断依据。"
         },
         {
           "line": 55,
-          "note": "用断言验证每个 item 被消费一次，避免示例只打印不验证正确性。"
+          "note": "用断言验证 consumed_sum == 0+1+2+3+4 = 10，确保每个 item 被恰好消费一次，不是只靠打印验证正确性。"
+        }
+      ]
+    },
+    {
+      "type": "code",
+      "title": "C 可运行：semaphore 限并发（模拟连接池）",
+      "content": "#include <assert.h>\n#include <pthread.h>\n#include <semaphore.h>\n#include <stdio.h>\n#include <unistd.h>\n\nenum { MAX_CONCURRENT = 3, TOTAL_TASKS = 10 };\n\nsem_t pool_slots;\nint max_concurrent_seen = 0;\npthread_mutex_t stat_mutex = PTHREAD_MUTEX_INITIALIZER;\n\nvoid* worker(void* arg) {\n    int id = *(int*)arg;\n    sem_wait(&pool_slots);  // 获取许可，不足则阻塞\n\n    // 模拟占用连接\n    pthread_mutex_lock(&stat_mutex);\n    static int current = 0;\n    current++;\n    if (current > max_concurrent_seen) max_concurrent_seen = current;\n    pthread_mutex_unlock(&stat_mutex);\n\n    printf(\"task %d acquired slot (current=%d)\\n\", id, current);\n    usleep(100000);  // 模拟 100ms 工作\n\n    pthread_mutex_lock(&stat_mutex);\n    current--;\n    pthread_mutex_unlock(&stat_mutex);\n\n    sem_post(&pool_slots);  // 释放许可，任意线程可释放\n    return NULL;\n}\n\nint main(void) {\n    sem_init(&pool_slots, 0, MAX_CONCURRENT);\n\n    pthread_t threads[TOTAL_TASKS];\n    int ids[TOTAL_TASKS];\n    for (int i = 0; i < TOTAL_TASKS; i++) {\n        ids[i] = i;\n        pthread_create(&threads[i], NULL, worker, &ids[i]);\n    }\n    for (int i = 0; i < TOTAL_TASKS; i++) {\n        pthread_join(threads[i], NULL);\n    }\n\n    printf(\"max concurrent seen: %d (limit: %d)\\n\", max_concurrent_seen, MAX_CONCURRENT);\n    assert(max_concurrent_seen <= MAX_CONCURRENT);\n    puts(\"concurrency correctly bounded\");\n    sem_destroy(&pool_slots);\n    return 0;\n}",
+      "language": "c",
+      "highlights": [
+        {
+          "line": 15,
+          "note": "sem_wait 获取许可：计数器 > 0 则减 1 返回，否则阻塞——限并发的核心操作。"
+        },
+        {
+          "line": 30,
+          "note": "sem_post 释放许可：计数器加 1 并唤醒一个等待者。注意任意线程都可以 post，不要求和 wait 的是同一线程——这是 semaphore 和 mutex 的关键区别。"
+        },
+        {
+          "line": 46,
+          "note": "验证最大并发数不超过 MAX_CONCURRENT，证明 semaphore 正确限制了同时运行的任务数。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**30 秒结论**\n线程同步是为了保护共享不变量，避免并发读写把状态改坏。回答时不要只背 mutex、spinlock、rwlock 名字，而要说明保护什么、抢不到时在哪里等待、释放者是谁，以及如何验证没有竞态、丢唤醒或锁竞争。\n\n**按场景选型**\n1. 普通临界区用 mutex。Linux 用户态 mutex 常见是无竞争时原子指令完成，竞争时 futex 进内核睡眠/唤醒。临界区里不要做慢 IO 或远程调用。\n2. 极短且不允许睡眠的路径才考虑 spinlock。它省掉睡眠/唤醒，但抢不到就烧 CPU；单核、持锁者可能被抢占、临界区不可控时通常是坏选择。\n3. 读远多于写可以用 rwlock，但要看写者饥饿、锁升级、读侧缓存行争用和实现策略，不是读多就必胜。\n4. 等“状态变化”用 condition variable。必须持 mutex 检查 predicate，`wait` 会原子释放锁并睡眠，醒后重新拿锁，再用 while 重查条件。\n5. 限制并发资源用 semaphore。它是计数许可，常见于连接池、并发限流、生产者消费者空槽/满槽计数，不等同 mutex 的所有权语义。\n6. 单变量更新可用 atomic/CAS，但复杂不变量、跨字段一致性、ABA 和内存序会让无锁设计变难。\n\n**工程验证**\n正确性用压测、TSAN/race detector、状态断言；性能看锁等待时间、上下文切换、CPU 自旋比例、run queue、futex wait/wake 延迟、P99 和吞吐。真正的修复可能是缩短临界区、分片锁、读写分离、队列化、不可变数据或减少共享，而不只是把 mutex 换成 rwlock。",
+      "content": "**30 秒结论**\n线程同步的本质是保护共享不变量，不是简单地把代码串行化。回答时先说清楚保护什么状态、抢不到时在哪里等、释放者是谁，然后根据这三个维度选型——mutex（临界区互斥 + 所有权）、spinlock（极短临界区 + 忙等）、rwlock（读多写少 + 写饥饿可控）、condition variable（等 predicate + 搭配 mutex）、semaphore（计数许可 + 限并发）、atomic/CAS（单变量更新）。\n\n**机制主线**\n1. **mutex/futex 快慢路径**：无竞争时用户态原子 CAS 完成加锁，成本纳秒级；竞争后通过 futex 进入内核睡眠，释放方 futex wake。持锁期间不能做慢 IO 或远程调用。\n2. **spinlock 边界**：省掉睡眠/唤醒但烧 CPU，只在持锁极短 + 多核 + 不允许睡眠时适用；单核或持锁者被抢占时是坏选择。\n3. **rwlock 隐藏成本**：写饥饿（读者不断）、锁升级死锁（读锁升写锁）、读侧缓存行争用（读计数器在同一缓存行上 bouncing）。不是读多就必胜。\n4. **condition variable 四要素**：持 mutex 改 predicate → while 等待 → wait 原子释放锁并睡眠 → 醒后重查条件。signal 不传数据，只是唤醒。\n5. **semaphore vs mutex**：semaphore 是计数许可（任意线程可释放，无所有权），mutex 是互斥锁（必须加锁者解锁）。二值信号量模拟 mutex 会导致所有权混乱。\n6. **CAS 的隐藏成本**：ABA（用版本号解决）、内存序（ARM 需显式 barrier）、伪共享（alignas(64) padding）、复杂不变量仍需锁。\n\n**工程验证**\n- 正确性：TSAN (ThreadSanitizer) 检测数据竞争、状态断言、压测下的不变量检查\n- 性能：perf lock 看锁等待时间、上下文切换率、CPU 自旋比例、futex wait/wake 延迟分布\n- 业务指标：P99 延迟、吞吐、锁持有时间百分位\n- 真正的修复可能是缩短临界区、分片锁、读写分离、队列化、不可变数据或减少共享，而不只是把 mutex 换成 rwlock",
       "followUpQuestions": [
         {
           "question": "条件变量为什么必须配合 mutex，并且等待要写成 while？",
-          "answer": "condition variable 本身不保存条件，只负责睡眠和唤醒；真正的条件是受 mutex 保护的 predicate，比如队列是否非空。`pthread_cond_wait` 会原子地释放 mutex 并睡眠，醒来后重新拿锁。必须用 while 是因为可能有虚假唤醒、broadcast 后多个线程同时醒、或者被唤醒后条件已经被其他线程消费。如果用 if，线程可能在条件不满足时继续执行，造成越界、空读或状态破坏。"
+          "answer": "condition variable 本身不保存条件状态，只负责睡眠和唤醒。真正的条件（predicate）是受 mutex 保护的共享状态，比如 `queue.size > 0`。`pthread_cond_wait` 内部原子地释放 mutex 并把线程挂到等待队列上睡眠，醒来后重新获取 mutex。必须用 while 的三个原因：① 虚假唤醒——内核实现可能在没有 signal 的情况下唤醒线程；② broadcast 后多个线程同时醒来，只有先拿到 mutex 的那个能消费，其余必须重新检查；③ 被唤醒到重新拿锁之间有时间窗口，另一个线程可能已经消费了数据使 predicate 回到 false。"
         },
         {
           "question": "mutex 和 semaphore 的本质区别是什么？",
-          "answer": "mutex 是互斥和所有权语义：谁加锁通常谁解锁，用来保护一个临界区。semaphore 是计数许可：P/wait 获取许可，V/post 释放许可，可以表达最多 N 个并发资源，也可以由不同线程释放许可。二值信号量看起来像 mutex，但语义不同；用错会导致所有权不清、重复 release 或许可泄漏。"
+          "answer": "mutex 是互斥和所有权语义：谁加锁谁解锁，加锁者必须是解锁者，违反时实现可以报错或死锁检测。semaphore 是计数许可：wait 获取计数、post 释放计数，不要求谁获取谁释放，任意线程都可以 post。二值信号量（计数器 = 1）看起来像 mutex，但缺少所有权约束，用它模拟互斥会导致重复 release 或忘记 release 而无法检测。正确区分：保护临界区用 mutex，限制 N 个并发资源用 semaphore。"
         },
         {
           "question": "为什么说用户态 mutex 无竞争时很快？",
-          "answer": "常见 Linux pthread_mutex 采用快慢路径：锁空闲时，只用用户态原子 CAS 把状态从未持有改为持有，不需要系统调用；只有竞争时，等待线程才通过 futex 进入内核睡眠，释放锁的一方再 futex wake。这避免了每次加解锁都陷入内核，所以轻度竞争下 mutex 成本很低。"
+          "answer": "glibc 的 pthread_mutex（基于 NPTL + futex）采用快慢路径：锁空闲时，只需一条用户态原子 CAS 把状态从 0 改为 1（或 tid），全程不进内核；只有 CAS 失败且乐观自旋也不成功时，才通过 futex 系统调用进入内核挂起睡眠，释放锁的一方再通过 futex(FUTEX_WAKE) 唤醒。这避免了每次加解锁都陷入内核的开销，所以轻度竞争下 mutex 成本接近一次原子操作（纳秒级）。"
+        },
+        {
+          "question": "rwlock 在什么情况下反而比 mutex 更慢？",
+          "answer": "三个场景：① 写者饥饿——大量读者持续持有读锁，写者长时间无法获取，写延迟不可控，业务表现为偶发超长尾延迟；② 读侧缓存行争用——rwlock 的读计数器通常在同一个缓存行上，多个核同时递增导致缓存行反复失效（bouncing），高频短读场景下 rwlock 可能比 mutex 更慢；③ 锁升级死锁——持有读锁的线程尝试升级为写锁，如果其他读者也在等写锁，可能死锁。优化方向：读写分离、per-CPU 计数、不可变快照 + 偶尔写时复制。"
+        },
+        {
+          "question": "CAS 的 ABA 问题是什么？怎么解决？",
+          "answer": "CAS 操作比较当前值是否等于预期值，相等则替换。ABA 问题：值从 A 变为 B 再变回 A，CAS 认为没变过，但中间状态（B）可能已导致数据结构不一致。典型场景是无锁栈的 pop：线程 1 读到栈顶 A（next=B），准备 CAS 把栈顶改为 B；此时线程 2 pop A、pop B、push C、push A，栈顶又变回 A 但链表已变。线程 1 的 CAS 成功但 next 指向已释放的节点。解决方案：① double-width CAS 加版本号（每次修改版本号递增）；② hazard pointer 或 epoch-based reclamation 延迟释放节点。"
         }
       ]
     },
@@ -98,11 +136,11 @@
       "items": [
         "能用共享不变量解释为什么需要同步，而不是只背原语名称",
         "能区分 mutex、spinlock、rwlock 的等待方式、适用条件和失败模式",
-        "能说明 Linux 用户态 mutex 的 futex 快慢路径",
-        "能写出 condition variable 的 while-predicate-wait 正确模式，并解释丢唤醒和虚假唤醒",
-        "能区分 semaphore 的计数许可语义和 mutex 的所有权语义",
-        "能说明 atomic/CAS 适合的范围，以及 ABA、内存序和伪共享风险",
-        "能用 TSAN、锁等待、上下文切换、futex 延迟、P99 和吞吐验证同步设计"
+        "能说明 Linux 用户态 mutex 的 futex 快慢路径（无竞争用户态 CAS，竞争后 futex 睡眠/唤醒）",
+        "能写出 condition variable 的 while-predicate-wait 正确模式，并解释虚假唤醒、broadcast 惊群和丢唤醒",
+        "能区分 semaphore 的计数许可语义和 mutex 的所有权语义，解释为什么二值信号量不等同 mutex",
+        "能说明 atomic/CAS 的 ABA、内存序（x86 TSO vs ARM 弱序）、伪共享和复杂不变量维护成本",
+        "能用 TSAN、perf lock、futex wait/wake 延迟、上下文切换率、P99 和吞吐验证同步设计"
       ]
     }
   ],
@@ -127,6 +165,20 @@
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 4
+    },
+    {
+      "id": "os.process-thread.topic-thread-sync.recall.4",
+      "prompt": "mutex 和 semaphore 的本质区别是什么？二值信号量能替代 mutex 吗？为什么？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "os.process-thread.topic-thread-sync.recall.5",
+      "prompt": "CAS 的 ABA 问题是什么？给出一个无锁栈的场景说明 ABA 如何导致数据结构破坏，以及怎么解决。",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
     }
   ],
   "rubric": {
@@ -137,8 +189,8 @@
       "能说明 mutex/futex 快慢路径，以及 spinlock 单核或持锁者被抢占时的风险"
     ],
     "goodToHave": [
-      "能区分 semaphore 计数许可和 mutex 所有权语义",
-      "能说明 rwlock 写饥饿、锁升级死锁和读侧缓存争用",
+      "能区分 semaphore 计数许可和 mutex 所有权语义，解释二值信号量不等同 mutex",
+      "能说明 rwlock 写饥饿、锁升级死锁和读侧缓存行争用",
       "能解释 CAS 的 ABA、内存序、伪共享和复杂不变量维护成本",
       "能用 TSAN、perf lock、eBPF/futex 延迟、上下文切换、P99 等验证同步问题"
     ],
@@ -156,11 +208,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-23",
   "status": "production",
   "prerequisites": [
     "os.process-thread.topic-process-vs-thread"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「线程同步机制」从共享不变量出发选型，讲清 mutex/futex 快慢路径、spinlock 忙等边界、rwlock 饥饿、condition variable 的 while-predicate-wait、semaphore 计数许可、CAS/ABA/内存序，并能用 TSAN、锁等待、futex 延迟、上下文切换和 P99 做工程验证。"
+  "interviewerFocus": "考察是否能围绕「线程同步机制」从共享不变量出发选型，讲清 mutex/futex 快慢路径、spinlock 忙等边界、rwlock 饥饿与缓存行争用、condition variable 的 while-predicate-wait、semaphore 计数许可与所有权区别、CAS/ABA/内存序，并能用 TSAN、锁等待、futex 延迟、上下文切换和 P99 做工程验证。"
 }

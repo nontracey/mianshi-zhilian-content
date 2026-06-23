@@ -4,7 +4,7 @@
   "category": "container-k8s",
   "group": "container-k8s",
   "title": "Docker 镜像分层与体积优化",
-  "summary": "讲清 OverlayFS 分层与写时复制、Dockerfile 缓存命中规则、多阶段构建与 distroless/scratch 的减肥手段，以及镜像安全扫描的关键约束。",
+  "summary": "讲清 OverlayFS 的 lowerdir/upperdir/merged 联合挂载与写时复制语义、Dockerfile 层缓存的命中与失效规则、多阶段构建配合 distroless/scratch 的瘦身梯度、以及镜像扫描在 OS 包与应用依赖之间的覆盖差异和敏感数据泄漏补救。",
   "tags": [
     "DevOps",
     "Docker",
@@ -13,23 +13,33 @@
     "镜像安全"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 31,
   "order": 40,
   "recommendWeight": 85,
   "status": "draft",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "镜像分层与 OverlayFS 写时复制原理、Dockerfile 缓存失效规则、多阶段构建与最小基础镜像选择、镜像扫描与瘦身的工程权衡。",
+  "interviewerFocus": "镜像分层与 OverlayFS 文件级写时复制原理、Dockerfile 层缓存的命中与失效规则、多阶段构建与最小基础镜像选择（含 libc 兼容性）、镜像安全扫描的覆盖盲区与敏感数据泄漏补救。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "镜像分层与 OverlayFS 写时复制怎么跑",
-      "content": "Docker 镜像本质是一组只读层 (lowerdir) + 一个容器可写层 (upperdir)，由 OverlayFS 联合挂载成一个统一视图 (merged)。Dockerfile 里的 RUN/COPY/ADD 每条指令都会生成一层 tar，按 SHA256 摘要寻址，多个镜像可以共享相同的层 (例如同一个 ubuntu:22.04 base)。\n\n关键机制：\n1. 容器启动时，runtime 把 N 个只读层叠在下面、新建一个空 upperdir 当可写层，再 mount -t overlay 出 merged 目录作为容器根。\n2. 写时复制 (CoW)：容器修改 /etc/hosts 这种已存在文件时，OverlayFS 会先把整个文件从 lowerdir 复制到 upperdir 再改，因此首次写大文件 (如 1GB 数据库文件) 会触发整文件复制，IO 抖动明显。\n3. 删除文件不会真正缩小镜像：upperdir 只是写一个 whiteout 标记 (字符设备 0/0)，下层文件仍占空间。所以 RUN apt-get install ... && apt-get clean 必须写在同一条 RUN 里，否则 clean 只在新一层加 whiteout，旧层 deb 缓存依然存在。\n4. 层数有上限：OverlayFS 的 lowerdir 在 5.x 内核上一般支持到 128 层，超过会 mount 失败。这就是为什么不能把 RUN 拆得过细。"
+      "title": "OverlayFS 分层结构与写时复制的真正代价",
+      "content": "Docker 镜像由一组只读层 (lowerdir) 组成，每层是一个 tar 包，内容按 SHA256 摘要寻址。多个镜像共享完全相同的层（如同一个 ubuntu:22.04 base），registry 和本地存储只存一份。容器启动时，容器运行时把 N 个只读层自底向上叠放，再新建一个空的可写层 (upperdir)，通过 OverlayFS 的 mount -t overlay 把 lowerdir 和 upperdir 联合成一个 merged 目录作为容器根文件系统。\n\n写时复制 (CoW) 的行为影响比表面理解更大：当容器修改一个已存在于 lowerdir 的文件（哪怕是改一个字节），OverlayFS 会先把**整个文件**从 lowerdir 复制到 upperdir，然后在 upperdir 的副本上修改。这意味着修改一个 500MB 的 SQLite 数据库文件会触发 500MB 的 IO 复制，容器首次写大文件时 IO 延迟抖动明显。这是 OverlayFS 的设计约束——它没有块级 CoW，只有文件级 CoW。因此对写密集的大文件场景（数据库、日志），通常把数据目录挂载到 volume (bind mount 或 Docker volume)，绕过 OverlayFS 的文件级 CoW。\n\n删除文件不释放空间：OverlayFS 不会修改 lowerdir，而是在 upperdir 写一个 whiteout 条目（特殊字符设备 0/0），遮住下层同路径文件。被遮住的文件仍然占下层空间。这就是为什么 `RUN apt-get install X && rm -rf /var/lib/apt/lists/*` 必须写在同一条 RUN 里——只有这样，lists 文件从未进入任何只读层，不会占空间。如果拆成两条 RUN，第一条 RUN 产生的层已经把 lists 写入只读层，第二条 rm 只在新层加 whiteout 标记，镜像总大小反而增加。\n\n层数上限方面，OverlayFS 在 Linux 5.x 内核上 lowerdir 数量一般限制在 128 层左右（具体取决于内核版本和挂载参数），超过会 mount 失败。实际镜像很少触达这个上限，但层越多意味着 overlayfs 需要合并的目录树越深，lookup 和 readdir 性能下降，所以 RUN 指令既要避免无意义碎片化，也不必为省层数强行合并不相关的逻辑。"
     },
     {
       "type": "explain",
-      "title": "构建缓存命中规则与多阶段瘦身的取舍",
-      "content": "Dockerfile 缓存按指令顺序逐层匹配：当前指令的字符串 + 上一层的镜像 ID + (对 COPY/ADD) 文件内容哈希一致才算命中。一旦某一层 miss，后面所有层都要重建。这条规则决定了三个生产实践：\n\n1. 把变化频率低的指令前置：先 COPY package.json 跑 npm ci，再 COPY . . 跑 build。颠倒顺序会让每次改业务代码都重装依赖，构建从 30s 涨到 5min。\n2. 多阶段构建 (FROM ... AS builder + 第二个 FROM) 是当前的标准减肥手段：第一阶段用 golang:1.22 (约 800MB) 编译，第二阶段用 gcr.io/distroless/static (约 2MB) 只 COPY --from=builder /app/bin。最终镜像只有二进制 + 必要的 CA 证书，不含 shell、apt、busybox。\n3. 基础镜像选择有梯度：alpine (5MB，musl libc，可能与 glibc 程序不兼容) → distroless (无 shell，无法 docker exec 调试，但攻击面最小) → scratch (空镜像，仅适合纯静态二进制如 Go)。Java/Python 这类需要运行时的语言通常用 eclipse-temurin:21-jre-alpine 或 python:3.12-slim，不能直接 scratch。\n4. 安全扫描 (Trivy / Grype / Snyk) 扫的是层里的包元数据 (dpkg/apk/pip 数据库)。distroless 没有包管理器数据库，扫描器只能识别 COPY 进来的应用依赖，OS 层 CVE 自然为 0，但也意味着应用层依赖必须自己管。"
+      "title": "缓存命中三要素与构建时序设计",
+      "content": "Dockerfile 的层缓存匹配规则是：当前指令的文本内容 + 上一层的镜像 ID（即上层的 diffID），对于 COPY/ADD 还要加上文件内容的 SHA256 哈希——三者都一致才算缓存命中。一旦某一层 miss，该层及之后的所有层都必须重建。这个规则不是「按文件时间戳」判断的，所以 touch 文件不会触发重建，真正改变文件内容才会。\n\n这条规则直接决定了 Dockerfile 的指令排序策略：变化频率最低的指令放最前面，变化频率最高的放最后面。对一个 Node.js 服务来说，正确的顺序是：\n1. `COPY package.json package-lock.json ./`（只在依赖变更时改变）\n2. `RUN npm ci`（依赖层缓存，一次构建后长期命中）\n3. `COPY . .`（业务代码每次提交都变，只重建这一层之后）\n\n如果把 `COPY . .` 放在 `RUN npm ci` 前面，每次改一个 JavaScript 文件都会导致 npm ci 重新执行，构建时间从十几秒涨到几分钟。这个原理对所有语言通用：Go 是 go.mod/go.sum 先拷，Java 是 pom.xml 或 gradle 先拷，Python 是 requirements.txt 先拷。\n\nBuildKit 还提供了 `--mount=type=cache` 能力，可以把 Go 的 module cache、build cache 或 npm 的缓存目录挂载到跨构建复用的缓存卷上，即使层缓存 miss（如 go.sum 变了），也不需要重新从网络下载所有模块。这对 CI 环境特别有价值，能将依赖下载时间从分钟级降到秒级。"
+    },
+    {
+      "type": "explain",
+      "title": "多阶段构建的分层减肥与镜像选型梯度",
+      "content": "多阶段构建 (multi-stage build) 的核心思路是：编译和运行需要的工具链完全不同，只把运行产物带入最终镜像。Dockerfile 里写多个 FROM 指令，每个阶段有自己的上下文，`COPY --from=builder /output /app` 只复制需要的文件，builder 阶段的 gcc、node_modules、Go SDK 全部被丢弃。\n\n以一个 Go 服务为例：builder 阶段用 golang:1.22-alpine（约 300MB），编译出静态二进制后，runtime 阶段用 gcr.io/distroless/static-debian12（约 2MB），最终镜像只有二进制 + CA 证书 + tzdata，从 300MB+ 缩到 10MB 以下。`CGO_ENABLED=0` 是关键——禁用 CGO 后 Go 编译出纯静态链接二进制，不依赖任何 libc，才能跑在 scratch 或 distroless static 上。如果二进制依赖了 glibc（比如用了 cgo 调用 sqlite），就必须用 alpine 或 debian-slim 作为 runtime 基础镜像。\n\n`-ldflags='-s -w'` 去掉 Go 二进制的调试符号和 DWARF 信息，能再省约 30% 体积。`-trimpath` 去掉编译路径信息，不泄露构建机器的目录结构。这三个参数组合是 Go 生产镜像的标准做法。\n\n基础镜像选型有明确梯度，每级都有工程取舍：\n- **ubuntu:22.04**（~77MB）：apt/bash 完整，调试方便，但 CVE 面大，只适合开发和调试期\n- **debian:12-slim**（~30MB）：保留 glibc 和 apt，比 ubuntu 小一半，需要 glibc 的服务推荐用它\n- **alpine:3.19**（~7MB）：apk 包管理 + busybox shell，体积最小的「完整」系统，但用 musl libc 而非 glibc\n- **distroless**（2MB~180MB，按语言变体）：无 shell、无包管理器、攻击面最小，生产推荐\n- **scratch**（0MB）：空镜像，仅适合纯静态二进制，需自己 COPY ca-certificates 和 tzdata"
+    },
+    {
+      "type": "explain",
+      "title": "安全扫描的覆盖盲区与敏感数据泄漏",
+      "content": "镜像安全扫描工具（Trivy、Grype、Snyk Container）的原理是解析镜像层里的包管理数据库——dpkg 的 /var/lib/dpkg/status、apk 的 /lib/apk/db/installed、pip 的 metadata 等——然后与 CVE 数据库比对。这意味着扫描覆盖取决于「层里有没有包元数据」。\n\ndistroless 的设计故意去掉了包管理器和其数据库，所以 Trivy 扫 OS 层会报 0 CVE，但这不代表安全——如果应用依赖的 Java/Python/Node 库有漏洞（比如 log4j），而 Trivy 只扫了 OS 层，就会漏报。补全扫描链路需要两步：(1) 在 CI 里用 Trivy 的 `--scanners vuln` 扫描镜像，同时用 `trivy fs` 或语言专用工具（如 `mvn dependency:tree`、`npm audit`、`pip-audit`）单独扫描应用依赖；(2) 生成 SBOM（Software Bill of Materials，用 Syft 或 Trivy 的 `--format spdx-json`），把 OS 包和应用依赖统一纳入供应链管理。\n\n另一个高频安全问题是敏感数据泄漏到镜像层：如果 Dockerfile 里 `COPY id_rsa /root/.ssh/` 然后 `RUN rm /root/.ssh/id_rsa`，私钥仍然留在 COPY 那一层，`docker history --no-trunc` 和 `docker save` 都能提取出来。补救方式有三种：(1) 多阶段构建，敏感文件只存在于 builder 阶段；(2) BuildKit 的 `RUN --mount=type=secret,id=ssh_key,target=/root/.ssh/id_rsa` 把密钥以临时文件形式挂载，不进入任何层；(3) 已经发布的镜像必须吊销泄漏的密钥，用新密钥重建并推送。\n\n非 root 用户也是安全基线的一部分：`USER nonroot:nonroot` 可以限制容器内进程的 UID，配合 K8s 的 PodSecurity restricted profile（runAsNonRoot: true）形成纵深防御。distroless 的 nonroot 变体默认 UID 65532，不需要额外创建用户。"
     },
     {
       "type": "diagram",
@@ -52,56 +62,13 @@
     {
       "type": "compareTable",
       "title": "最小基础镜像选型对照",
-      "columns": [
-        "基础镜像",
-        "典型体积",
-        "含 shell/包管理",
-        "适用场景",
-        "主要坑"
-      ],
-      "rows": [
-        [
-          "ubuntu:22.04",
-          "约 77MB",
-          "bash + apt",
-          "需要复杂依赖或调试期",
-          "CVE 多, 镜像大, 启动慢"
-        ],
-        [
-          "alpine:3.19",
-          "约 7MB",
-          "ash + apk",
-          "Go/Node/Python 通用瘦身",
-          "musl libc 与 glibc 二进制不兼容, DNS 行为差异"
-        ],
-        [
-          "debian:12-slim",
-          "约 30MB",
-          "bash + apt",
-          "需要 glibc 又想瘦身",
-          "比 alpine 大, CVE 仍需扫描"
-        ],
-        [
-          "distroless/java21",
-          "约 180MB",
-          "无 shell, 无包管理",
-          "生产 Java/Go/Python 服务",
-          "无法 docker exec 进容器调试, 需要 sidecar 或 ephemeral container"
-        ],
-        [
-          "scratch",
-          "0",
-          "无任何东西",
-          "纯静态 Go 二进制",
-          "需自带 CA 证书 + tzdata, 无 nsswitch"
-        ]
-      ]
+      "content": "| 基础镜像 | 典型体积 | 含 shell/包管理 | 适用场景 | 主要坑 |\n| --- | --- | --- | --- | --- |\n| ubuntu:22.04 | ~77MB | bash + apt | 需要复杂依赖或调试期 | CVE 多，镜像大，启动慢 |\n| debian:12-slim | ~30MB | bash + apt | 需要 glibc 又想瘦身 | 比 alpine 大，CVE 仍需扫描 |\n| alpine:3.19 | ~7MB | ash + apk | Go/Node/Python 通用瘦身 | musl libc 与 glibc 二进制不兼容，DNS 行为差异（默认 ndots:0 vs ndots:5） |\n| distroless/java21 | ~180MB | 无 shell，无包管理 | 生产 Java/Go/Python 服务 | 无法 docker exec 进容器调试，需 K8s ephemeral container 或 :debug 变体 |\n| scratch | 0 | 无任何东西 | 纯静态 Go 二进制 | 需自带 CA 证书 + tzdata + nsswitch.conf，无任何调试工具 |\n\n| 优化手段 | 作用 | 适用阶段 | 典型收益 |\n| --- | --- | --- | --- |\n| 多阶段构建 | 隔离编译工具链与运行产物 | 构建 | Go 服务从 800MB 降到 <10MB |\n| `-ldflags='-s -w'` | 去调试符号和 DWARF | 编译 | Go 二进制缩小约 30% |\n| `CGO_ENABLED=0` | 纯静态链接，脱离 libc | 编译 | 可跑在 scratch/distroless static 上 |\n| `--mount=type=cache` | BuildKit 跨构建缓存 | 依赖下载 | Go module/npm 缓存复用，CI 分钟级→秒级 |\n| `--mount=type=secret` | 密钥不入层 | 构建 | 防止 docker history 泄漏私钥 |\n| `.dockerignore` | 排除无关文件 | COPY | 减小 build context 和层数 |\n| 非 root USER | 容器进程限权 | 运行时 | 配合 K8s restricted profile 纵深防御 |"
     },
     {
       "type": "code",
-      "title": "多阶段构建 + 缓存友好的 Go 服务 Dockerfile",
+      "title": "多阶段构建 + BuildKit 缓存的 Go 服务 Dockerfile",
       "language": "dockerfile",
-      "content": "# syntax=docker/dockerfile:1.7\nFROM golang:1.22-alpine AS builder\nWORKDIR /src\n\n# 1. 先拷依赖描述, 单独成层, 改业务代码不会失效这一层\nCOPY go.mod go.sum ./\nRUN --mount=type=cache,target=/root/.cache/go-build \\\n    --mount=type=cache,target=/go/pkg/mod \\\n    go mod download\n\n# 2. 再拷源码, 业务代码变动只重建这一层之后\nCOPY . .\nRUN --mount=type=cache,target=/root/.cache/go-build \\\n    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/app ./cmd/server\n\n# 3. 运行阶段: distroless static, 仅含 CA 证书与 tzdata\nFROM gcr.io/distroless/static-debian12:nonroot\nCOPY --from=builder /out/app /app\nUSER nonroot:nonroot\nEXPOSE 8080\nENTRYPOINT [\"/app\"]",
+      "content": "# syntax=docker/dockerfile:1.7\nFROM golang:1.22-alpine AS builder\nWORKDIR /src\n\n# 1. 先拷依赖描述, 单独成层, 改业务代码不会让这一层失效\nCOPY go.mod go.sum ./\nRUN --mount=type=cache,target=/root/.cache/go-build \\\n    --mount=type=cache,target=/go/pkg/mod \\\n    go mod download\n\n# 2. 再拷源码, 业务代码变动只重建这一层之后\nCOPY . .\nRUN --mount=type=cache,target=/root/.cache/go-build \\\n    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/app ./cmd/server\n\n# 3. 运行阶段: distroless static, 仅含 CA 证书与 tzdata\nFROM gcr.io/distroless/static-debian12:nonroot\nCOPY --from=builder /out/app /app\nUSER nonroot:nonroot\nEXPOSE 8080\nENTRYPOINT [\"/app\"]",
       "highlights": [
         {
           "line": 1,
@@ -113,7 +80,7 @@
         },
         {
           "line": 13,
-          "note": "-trimpath -ldflags='-s -w' 去掉调试符号, 二进制可缩小约 30%, CGO_ENABLED=0 是为了能跑在 distroless static 上"
+          "note": "-trimpath 去掉编译路径防泄漏, -ldflags='-s -w' 去调试符号缩小约 30%, CGO_ENABLED=0 纯静态链接才能跑在 distroless static 上"
         },
         {
           "line": 17,
@@ -123,40 +90,41 @@
     },
     {
       "type": "interviewAnswer",
-      "title": "面试回答：Docker 镜像分层与瘦身怎么讲",
-      "content": "30 秒结论：Docker 镜像是一组按内容寻址的只读层，容器运行时再叠一层可写层，OverlayFS 联合挂载成一个根视图；写时复制和 whiteout 决定了清理必须和安装写在同一条 RUN，多阶段构建配合 distroless 是当前主流瘦身方案。\n\n机制主线：\n1. 分层与寻址：每条 Dockerfile 指令产生一层 tar，SHA256 内容寻址，跨镜像可复用。\n2. OverlayFS 运行时：N 个 lowerdir + 1 个 upperdir 挂成 merged，写时把整文件从下层复制到 upperdir，删除写 whiteout 不真正释放空间。\n3. 构建缓存：按指令字符串 + 上层 ID + 文件哈希命中，依赖描述前置、源码后置是关键技巧。\n4. 体积控制：多阶段构建把 builder 阶段的工具链丢掉，运行阶段选 alpine / distroless / scratch；安全扫描用 Trivy 检 OS 包 + 应用依赖 CVE。\n\n边界与坑：alpine 的 musl 与 glibc 不兼容会导致 Java native 库挂掉；distroless 无 shell，调试要靠 K8s ephemeral container 或 debug sidecar；scratch 必须自己 COPY ca-certificates 和 tzdata 否则 HTTPS 和时区都会出问题。",
+      "title": "面试回答：Docker 镜像分层与体积优化",
+      "content": "**30 秒结论**\nDocker 镜像是一组按内容寻址 (SHA256) 的只读层，OverlayFS 联合挂载成容器根视图；写时复制按文件粒度整文件复制，whiteout 只遮不删；多阶段构建丢弃编译工具链、配合 distroless/scratch 把运行时压到最小是当前主流方案。\n\n**机制主线**\n1. **分层与寻址**：Dockerfile 每条指令生成一层 tar，SHA256 内容寻址，相同层跨镜像共享\n2. **OverlayFS 运行时**：N 个 lowerdir + 1 个 upperdir 挂成 merged；写时把整个文件从 lowerdir 复制到 upperdir 再改（文件级 CoW，非块级）；删除写 whiteout 不真正释放空间\n3. **缓存命中规则**：指令文本 + 上层 ID + 文件哈希，三者匹配才命中，miss 后面全部重建；依赖描述前置、源码后置\n4. **多阶段构建**：builder 阶段编译，runtime 阶段只 COPY 产物；Go 服务 CGO_ENABLED=0 + -ldflags='-s -w' + -trimpath 编译纯静态二进制，配合 distroless static 从 800MB 压到 <10MB\n5. **镜像选型梯度**：ubuntu(77MB) → debian-slim(30MB) → alpine(7MB, musl libc) → distroless(无 shell) → scratch(纯静态)\n\n**边界与坑**\n- alpine 的 musl 与 glibc 不兼容：JNI 库、grpc-java 的 netty-tcnative、某些 Python C 扩展会直接 segfault 或 not found\n- distroless 无 shell：调试靠 K8s 1.25+ ephemeral container 或 :debug 变体\n- scratch 必须自己 COPY ca-certificates 和 tzdata，否则 HTTPS 和时区都出问题\n- 敏感数据 COPY 再 rm 不安全：docker history --no-trunc 能取到原文件，必须用多阶段隔离或 BuildKit secret mount\n- Trivy 扫 OS 包数据库：distroless 无包管理数据库所以报 0 CVE，应用层依赖需要单独用语言工具扫描 + SBOM",
       "followUpQuestions": [
         {
           "question": "Dockerfile 里 RUN apt-get install 之后单独写一条 RUN apt-get clean，镜像为什么不会变小？",
-          "answer": "因为镜像层是只读且按指令分层的：apt-get install 那一层已经把 deb 缓存写入了，clean 只在新一层用 whiteout 标记把 /var/cache/apt 删掉，但下面那一层的 deb 文件仍在占空间，最终镜像还是把两层都打包。正确做法是 RUN apt-get update && apt-get install -y --no-install-recommends pkg && rm -rf /var/lib/apt/lists/* 写在同一条 RUN 里，让缓存从未进入任何只读层。"
+          "answer": "镜像层是只读的：apt-get install 那一层已经把 deb 缓存写入了只读层，clean 在新一层只写一个 whiteout 标记遮住 /var/cache/apt，下层文件仍在占空间，镜像总大小反而增加。正确做法是 `RUN apt-get update && apt-get install -y --no-install-recommends pkg && rm -rf /var/lib/apt/lists/*` 写在同一条 RUN 里，让缓存从未进入任何只读层。"
         },
         {
           "question": "为什么生产推荐 distroless 而不是 alpine？distroless 怎么调试？",
-          "answer": "distroless 不含 shell 和包管理器，攻击面更小，CVE 扫描通常只剩应用依赖；alpine 用 musl libc，跟 glibc 编译的 JNI/native 库 (例如某些 JDK 加密库、grpc-java 的 netty-tcnative) 不兼容，还有 DNS 解析行为差异。代价是 distroless 没有 sh，无法 docker exec -it sh 调试。生产上靠两种方式：一是用 :debug 变种镜像 (gcr.io/distroless/...:debug 自带 busybox)，二是 K8s 1.25+ 的 kubectl debug 启动 ephemeral container，把 busybox 镜像挂到目标 Pod 的 PID namespace。"
+          "answer": "distroless 不含 shell 和包管理器，攻击面更小；alpine 用 musl libc，跟 glibc 编译的 JNI/native 库不兼容，还有 DNS 解析行为差异（默认 ndots:0 vs ndots:5 导致搜索域不生效）。调试方式：(1) 用 :debug 变种镜像（自带 busybox）替换临时 Pod；(2) K8s 1.25+ kubectl debug 启动 ephemeral container 挂到目标 Pod 的 PID namespace。"
         },
         {
-          "question": "镜像里不小心 COPY 进了私钥然后再 RUN rm 删除，安全吗？",
-          "answer": "不安全。COPY 那一层已经把私钥写入了不可变的只读层，docker history 和 docker save 都能拿到原文件，rm 只是在新一层加 whiteout。补救方式：(1) 用多阶段构建，把私钥只 COPY 到 builder 阶段，最终阶段不 COPY 过去；(2) BuildKit 的 RUN --mount=type=secret 把密钥挂载成临时文件，构建完不进任何层；(3) 已经发布到 registry 的镜像必须吊销该密钥，并重建镜像，docker history --no-trunc 能验证私钥是否还残留。"
+          "question": "镜像里不小心 COPY 进了私钥再 RUN rm 删除，安全吗？怎么补救？",
+          "answer": "不安全。COPY 那一层已经把私钥写入不可变的只读层，docker history --no-trunc 和 docker save 都能提取原文件。补救：(1) 多阶段构建，私钥只 COPY 到 builder 阶段，最终阶段不带；(2) BuildKit `RUN --mount=type=secret` 把密钥挂载成临时文件不入层；(3) 已发布的镜像必须吊销该密钥，重建并推送，用 docker history --no-trunc 验证是否还残留。"
         }
       ]
     },
     {
       "type": "checklist",
-      "title": "复述检查：能讲清这 6 条就算掌握",
+      "title": "复述检查：能讲清这 7 条就算掌握",
       "items": [
-        "能画出 lowerdir + upperdir + merged 的 OverlayFS 结构, 并解释 CoW 触发条件",
-        "能说清 whiteout 机制以及为什么 install/clean 必须在同一条 RUN",
-        "能讲 Dockerfile 缓存命中规则 (指令字符串 + 上层 ID + 文件哈希) 和依赖前置技巧",
-        "能对比 ubuntu / alpine / debian-slim / distroless / scratch 的体积、调试性和坑",
-        "能写出多阶段 + BuildKit cache mount 的 Dockerfile, 说明 -ldflags='-s -w' 与 CGO_ENABLED=0 的作用",
-        "能说明 Trivy/Grype 扫描对 distroless 的影响, 以及私钥泄漏到镜像层的补救方式"
+        "能画出 lowerdir + upperdir + merged 的 OverlayFS 结构，并解释文件级 CoW 的触发条件和 IO 代价",
+        "能说清 whiteout 机制以及为什么 install + clean 必须在同一条 RUN 里",
+        "能讲 Dockerfile 缓存命中三要素（指令文本 + 上层 ID + 文件哈希）和依赖前置、源码后置的写法",
+        "能对比 ubuntu / debian-slim / alpine / distroless / scratch 的体积、libc、调试性和适用场景",
+        "能写出多阶段 + BuildKit cache mount 的 Go Dockerfile，说明 -ldflags='-s -w'、-trimpath 和 CGO_ENABLED=0 各自的作用",
+        "能说明 Trivy/Grype 扫描原理（解析层内包管理数据库）以及 distroless 的覆盖盲区",
+        "能说清 COPY 敏感数据到镜像层的泄漏风险和三种补救方式"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "devops.container-k8s.docker-image.recall.1",
-      "prompt": "请讲一下 OverlayFS 是怎么把多层镜像挂成容器视图的？写时复制和 whiteout 分别在什么时候触发？",
+      "prompt": "请讲一下 OverlayFS 是怎么把多层镜像挂成容器视图的？写时复制和 whiteout 分别在什么时候触发？文件级 CoW 对大文件场景有什么影响？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -174,27 +142,35 @@
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
+    },
+    {
+      "id": "devops.container-k8s.docker-image.recall.4",
+      "prompt": "Dockerfile 里 COPY 私钥再 RUN rm 真的安全吗？请讲清原理和补救方式。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "OverlayFS 的 lowerdir/upperdir/merged 三层结构与写时复制流程",
+      "OverlayFS 的 lowerdir/upperdir/merged 三层结构与文件级写时复制流程",
       "whiteout 机制以及 install + clean 必须同一条 RUN 的原因",
       "Dockerfile 缓存命中三要素与依赖前置、源码后置的写法",
-      "多阶段构建配合 distroless/scratch/alpine 的选型差异"
+      "多阶段构建配合 distroless/scratch/alpine 的选型差异与 libc 兼容性"
     ],
     "goodToHave": [
-      "BuildKit 的 --mount=type=cache 与 --mount=type=secret 用法",
-      "alpine musl 与 glibc 不兼容、scratch 缺 CA 证书 / tzdata 的具体表现",
-      "Trivy/Grype 对 OS 层和应用依赖层的扫描差异",
+      "BuildKit 的 --mount=type=cache 与 --mount=type=secret 的工程用法",
+      "alpine musl 与 glibc 不兼容的具体表现（JNI、DNS 行为差异）",
+      "Trivy/Grype 对 OS 层和应用依赖层的扫描覆盖差异与 SBOM 补全",
       "docker history --no-trunc 验证敏感数据是否泄漏到镜像层"
     ],
     "commonMistakes": [
-      "认为 RUN rm 或 docker rmi 中间层就能让镜像变小, 忽略 whiteout 不释放下层空间",
-      "把 RUN apt-get install 和 RUN apt-get clean 写成两条, 导致 deb 缓存永远留在镜像里",
-      "把 COPY . . 写在 COPY package.json 之前, 每次改代码都重装依赖, 构建时间暴涨",
-      "对纯 Java 服务直接套 scratch, 忽略 JRE 依赖；或用 alpine 跑 glibc 编译的二进制导致 not found 错误",
-      "把私钥 COPY 进镜像再 RUN rm, 误以为这样就安全, 实际上 docker history 仍能取到原文件"
+      "认为 RUN rm 或 docker rmi 中间层就能让镜像变小，忽略 whiteout 不释放下层空间",
+      "把 RUN apt-get install 和 RUN apt-get clean 写成两条 RUN，导致 deb 缓存永远留在镜像里",
+      "把 COPY . . 写在 COPY package.json 之前，每次改代码都重装依赖，构建时间暴涨",
+      "对纯 Java 服务直接套 scratch，忽略 JRE 依赖；或用 alpine 跑 glibc 编译的二进制导致 not found 错误",
+      "把私钥 COPY 进镜像再 RUN rm，误以为这样就安全，实际 docker history 仍能取到原文件",
+      "以为 distroless 报 0 CVE 就是安全的，忽略应用依赖层的漏洞扫描"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -203,5 +179,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

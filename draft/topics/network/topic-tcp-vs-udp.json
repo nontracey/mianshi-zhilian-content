@@ -4,7 +4,7 @@
   "category": "tcp-udp",
   "group": "tcp-udp",
   "title": "TCP 与 UDP 的区别",
-  "summary": "从连接性、可靠性、消息边界、头部开销和典型场景五个维度对比 TCP 与 UDP，并说明 QUIC 为何选择基于 UDP 实现。",
+  "summary": "从连接状态、可靠性、有序性、消息边界、头部开销、拥塞控制和部署语义对比 TCP 与 UDP，并说明 QUIC/HTTP/3 为什么在 UDP 外壳上重做可靠多流传输。",
   "tags": [
     "网络",
     "TCP",
@@ -13,124 +13,91 @@
     "QUIC"
   ],
   "difficulty": 2,
-  "estimatedMinutes": 15,
+  "estimatedMinutes": 28,
   "order": 10,
   "recommendWeight": 88,
   "learningCards": [
     {
       "type": "explain",
-      "title": "TCP 可靠字节流 vs UDP 无连接数据报：五维差异与选型",
-      "content": "TCP 通过三次握手建立连接。它用 32 位序号、ACK、超时重传、滑动窗口（接收端通告可用缓冲区大小，发送端据此控制发送量）、拥塞控制（Reno/Cubic/BBR，根据网络拥塞程度动态调节发送速率）实现可靠、按序、面向字节流的传输。TCP 首部最小 20 字节，含端口、序号、ACK 号、窗口、校验和、6 个标志位（SYN/ACK/FIN/RST/PSH/URG）。\n\nUDP 没有连接和状态，发送即走。首部固定 8 字节，含源端口、目的端口、长度、校验和。UDP 保留消息边界，每个 sendto 对应一次 recvfrom。丢包、乱序、重复都不管。\n\n关键区别落到 5 个点：连接（握手 vs 无）、可靠性（ACK+重传 vs 不保证）、顺序（按序 vs 不保证）、边界（字节流粘包 vs 数据报保边界）、开销（20 字节起 + 内核连接表 vs 8 字节）。一对多能力上 UDP 支持广播/组播，TCP 只能点对点。\n\n判断顺序分四步：\n\n① **是否必须可靠有序**——HTTP/1.1、SSH、MySQL、Redis、SMTP、FTP 必须可靠，选 TCP。\n② **是否强实时容忍丢包**——RTC 音视频、网游同步、直播 RTP 选 UDP。丢一帧比卡顿强。\n③ **是否一次请求一次响应、报文很小**——DNS（512 字节内走 UDP，超过或区域传送切 TCP）、SNMP、NTP、DHCP 选 UDP。\n④ **是否需要应用层自定义可靠性**——QUIC、KCP、HTTP/3 在 UDP 上自己做序号、ACK、重传、拥塞。\n\nQUIC 选 UDP 的真实原因有四个：\n\n- **TCP 队头阻塞**。TCP 一个段丢了，后续段必须等重传完成才能交付应用层。HTTP/2 多路复用也救不回来，因为所有 stream 共享一条 TCP 连接。QUIC 用独立 stream + UDP 各自重传，一个 stream 丢包不阻塞其他 stream。\n- **握手慢**。TCP+TLS 1.2 要 3 RTT（TCP 握手 1 RTT + TLS 握手 2 RTT）。QUIC 把传输握手和 TLS 1.3 合并成 1-RTT 甚至 0-RTT（利用之前会话的预共享密钥）。\n- **协议栈固化**。TCP 在操作系统内核中实现，升级拥塞控制算法或修复协议缺陷要等操作系统发版。QUIC 在用户态库（如 quiche、msquic、Go 的 quic-go）中实现，随应用迭代发版。\n- **连接迁移**。TCP 用四元组（源 IP + 源端口 + 目的 IP + 目的端口）标识连接，手机切 WiFi/4G 时 IP 变了连接就断。QUIC 用 64 位 Connection ID 标识连接，IP 变了连接还在。"
+      "title": "TCP 可靠字节流 vs UDP 数据报：差异不只是“可靠/不可靠”",
+      "content": "TCP 和 UDP 都是传输层协议，但它们承诺的服务契约完全不同，这决定了上层应用的设计方式。\n\n**TCP 承诺的是「可靠、按序、面向连接的字节流」。** 两个端点通过三次握手（SYN → SYN-ACK → ACK）建立连接后，内核为每条连接维护一个 TCB（传输控制块），其中保存序号、确认号、接收窗口、拥塞窗口、重传定时器等状态。数据在 TCP 连接上以字节流的形式流动——发送端调用 `write()` 写入的字节被 TCP 分段打包成段（segment），每个段带有序号，接收端用 ACK 确认；如果超时未收到 ACK（RTO），或收到 3 个重复 ACK（快速重传），发送端会重传。TCP 首部最小 20 字节，如果带 SACK、时间戳等选项可扩展到 60 字节，里面包含源/目的端口、32 位序号、确认号、数据偏移、标志位（SYN/ACK/FIN/RST 等）、窗口大小、校验和、紧急指针。\n\n**UDP 承诺的是「尽力交付的数据报」。** 无连接，发送端直接调用 `sendto()` 把一个 datagram 交给网络层，不需要握手、不需要维护连接状态。UDP 首部固定 8 字节——源端口、目的端口、长度、校验和，就这四个字段。UDP 保留 datagram 边界：一次 `sendto()` 产生一个 datagram，接收端一次 `recvfrom()` 取一个完整 datagram。但这个边界保证不是无限的：如果接收缓冲区太小会截断，如果 datagram 超过 MTU 导致 IP 分片，丢一片就等于整个 datagram 失败。\n\n把差异落到具体维度：\n\n- **连接状态**：TCP 有三次握手/四次挥手，内核维护 TCB；UDP 无连接状态。\n- **可靠性**：TCP 内建序号+ACK+超时重传+快速重传；UDP 只有校验和，不保证送达、重传或去重。\n- **顺序**：TCP 接收端按序号重排，交付给应用的是有序字节流；UDP 不保证顺序，按到达顺序交付。\n- **消息边界**：TCP 是字节流不保留 `write()` 边界，应用需自行分帧；UDP 保留 datagram 边界。\n- **头部开销**：TCP 20-60 字节 vs UDP 固定 8 字节。\n- **流控/拥塞**：TCP 内建接收窗口（流控）和拥塞控制（CUBIC/BBR/Reno 等）；UDP 无内建流控或拥塞控制。\n- **通信模式**：TCP 每条连接是两个端点之间的字节流；UDP 支持单播、广播和组播。\n\n选型不是背「可靠选 TCP、实时选 UDP」，而是问四个问题：\n\n① 是否需要可靠按序字节流，且能接受 TCP 的连接级队头阻塞（HOL blocking）——HTTP/1.1、HTTP/2、SSH、数据库协议通常选 TCP。\n② 是否实时优先且能容忍丢失/乱序——RTP 音视频、部分网游状态同步常用 UDP，由上层加 jitter buffer、FEC 或选择性重传。\n③ 是否短请求/响应或需要广播组播——DNS、NTP、DHCP、服务发现等适合 UDP；DNS 还要考虑 EDNS(0) 扩大 UDP payload、TC 置位重试 TCP、区域传送用 TCP。\n④ 是否既要可靠安全又不想受 TCP 内核协议栈和连接级 HOL 限制——QUIC/HTTP/3 走 UDP 外壳，用户态实现可靠传输、拥塞控制、TLS 1.3、多 stream 和连接迁移。"
     },
     {
       "type": "compareTable",
       "title": "TCP vs UDP 关键维度对比",
-      "columns": [
-        "维度",
-        "TCP",
-        "UDP"
-      ],
-      "rows": [
-        [
-          "连接",
-          "三次握手建立、四次挥手关闭，内核维护 TCB（传输控制块，保存连接状态、序号、窗口等）",
-          "无连接，sendto 直接发包"
-        ],
-        [
-          "可靠性",
-          "序号 + ACK + 超时重传 + 快速重传",
-          "不保证，丢包/乱序/重复全交应用层"
-        ],
-        [
-          "顺序",
-          "按序交付（接收缓冲区重排）",
-          "不保证顺序，按到达顺序交付"
-        ],
-        [
-          "消息边界",
-          "字节流，存在粘包/拆包，需自定义分隔或长度前缀",
-          "数据报，保边界，1 次 send 对应 1 次 recv"
-        ],
-        [
-          "首部开销",
-          "20 字节起，最大 60 字节（含选项如 SACK、时间戳）",
-          "固定 8 字节"
-        ],
-        [
-          "流控/拥塞",
-          "滑动窗口 + Cubic/BBR + 慢启动",
-          "无，应用层需自行限速或加 FEC"
-        ],
-        [
-          "通信模式",
-          "仅点对点（unicast）",
-          "支持单播、广播、组播"
-        ],
-        [
-          "典型应用",
-          "HTTP/1.1、HTTP/2、SSH、MySQL、Redis、SMTP、Git",
-          "DNS、DHCP、NTP、SNMP、RTP/RTCP、QUIC（HTTP/3）、网游、直播"
-        ]
-      ]
+      "content": "| 维度 | TCP | UDP |\n| --- | --- | --- |\n| 连接 | 三次握手建立、四次挥手关闭，内核维护 TCB（传输控制块，保存序号、窗口、重传状态） | 无连接，sendto/sendmsg 直接发 datagram |\n| 可靠性 | 序号 + ACK + RTO/快速重传 + 校验和；持续失败会报错而不是无限保证送达 | 只有校验和和端口复用，不保证送达、重传、去重或有序 |\n| 顺序 | 按序交付（接收缓冲区重排） | 不保证顺序，按到达顺序交付 |\n| 消息边界 | 字节流，存在粘包/拆包，需应用层自定义分帧 | 数据报，保留 datagram 边界；接收缓冲过小会截断，IP 分片丢一片整个 datagram 失败 |\n| 首部开销 | 最小 20 字节，可带选项扩到 60 字节（SACK、时间戳等） | 固定 8 字节 |\n| 流控/拥塞 | 接收窗口（流控）+ 拥塞控制（CUBIC/BBR/Reno）+ 慢启动/快恢复 | 无内建流控/拥塞控制；应用或上层需自行限速、FEC、重传 |\n| 通信模式 | 每条连接是两个端点之间的可靠字节流 | 支持单播，也可用于广播/组播 |\n| 典型应用 | HTTP/1.1、HTTP/2、SSH、MySQL、Redis、SMTP、Git | DNS、DHCP、NTP、SNMP、RTP/RTCP、QUIC/HTTP/3、网游、直播 |"
     },
     {
       "type": "diagram",
       "title": "TCP/UDP 选型决策流",
-      "format": "mermaid",
-      "content": "flowchart TD\n  START[需要传输数据] --> RELIABLE{必须可靠且按序?}\n  RELIABLE -->|是| TOLERATE{是否能容忍 TCP 队头阻塞和握手延迟?}\n  TOLERATE -->|能| TCP[TCP: HTTP/SSH/DB]\n  TOLERATE -->|不能| QUIC[QUIC/HTTP3 基于 UDP 自实现可靠]\n  RELIABLE -->|否| REALTIME{是否强实时, 丢包优于卡顿?}\n  REALTIME -->|是| RTP[UDP + RTP: 音视频/网游/直播]\n  REALTIME -->|否| SHORT{是否短报文一问一答?}\n  SHORT -->|是| DNS[UDP: DNS/NTP/DHCP]\n  SHORT -->|否| BROADCAST{需要广播/组播?}\n  BROADCAST -->|是| MULTI[UDP 组播]\n  BROADCAST -->|否| TCP",
-      "caption": "选型先看可靠性，再看时延和队头阻塞，最后看通信模式；QUIC 是为绕开 TCP 局限才退回 UDP 重做。",
-      "fallback": "可靠有序选 TCP；强实时容忍丢包、短报文一问一答、需要广播/组播或要绕开 TCP 队头阻塞与内核协议栈升级慢，选 UDP（含 QUIC）。",
+      "format": "svg",
+      "content": "assets/diagrams/network-tcp-udp-quic-choice.svg",
+      "caption": "从传输服务契约出发选型：TCP 是可靠有序字节流，UDP 是数据报外壳，QUIC 在 UDP 上重做可靠多流与连接迁移。",
+      "fallback": "TCP 提供可靠有序字节流但无消息边界；UDP 提供无连接数据报，保留 datagram 边界但不内建可靠/顺序/拥塞；QUIC/HTTP/3 在 UDP 上实现可靠多流、TLS 1.3、拥塞控制与 Connection ID 连接迁移。选型先问可靠按序和 HOL，再问实时、短报文、组播和部署迭代。",
       "sources": [
         {
+          "kind": "svg",
+          "path": "assets/diagrams/network-tcp-udp-quic-choice.svg"
+        },
+        {
           "kind": "mermaid",
-          "content": "flowchart TD\n  START[需要传输数据] --> RELIABLE{必须可靠且按序?}\n  RELIABLE -->|是| TOLERATE{是否能容忍 TCP 队头阻塞和握手延迟?}\n  TOLERATE -->|能| TCP[TCP: HTTP/SSH/DB]\n  TOLERATE -->|不能| QUIC[QUIC/HTTP3 基于 UDP 自实现可靠]\n  RELIABLE -->|否| REALTIME{是否强实时, 丢包优于卡顿?}\n  REALTIME -->|是| RTP[UDP + RTP: 音视频/网游/直播]\n  REALTIME -->|否| SHORT{是否短报文一问一答?}\n  SHORT -->|是| DNS[UDP: DNS/NTP/DHCP]\n  SHORT -->|否| BROADCAST{需要广播/组播?}\n  BROADCAST -->|是| MULTI[UDP 组播]\n  BROADCAST -->|否| TCP"
+          "content": "flowchart TD\n  START[需要传输数据] --> RELIABLE{必须可靠且按序?}\n  RELIABLE -->|是| TOLERATE{是否能容忍 TCP 队头阻塞和握手延迟?}\n  TOLERATE -->|能| TCP[TCP: HTTP/SSH/DB]\n  TOLERATE -->|不能| QUIC[QUIC/HTTP/3 基于 UDP 自实现可靠]\n  RELIABLE -->|否| REALTIME{是否强实时, 丢包优于卡顿?}\n  REALTIME -->|是| RTP[UDP + RTP: 音视频/网游/直播]\n  REALTIME -->|否| SHORT{是否短报文一问一答?}\n  SHORT -->|是| DNS[UDP: DNS/NTP/DHCP]\n  SHORT -->|否| BROADCAST{需要广播/组播?}\n  BROADCAST -->|是| MULTI[UDP 组播]\n  BROADCAST -->|否| TCP"
         },
         {
           "kind": "text",
-          "content": "可靠有序选 TCP；强实时容忍丢包、短报文一问一答、需要广播/组播或要绕开 TCP 队头阻塞与内核协议栈升级慢，选 UDP（含 QUIC）。"
+          "content": "TCP 提供可靠有序字节流但无消息边界；UDP 提供无连接数据报，保留 datagram 边界但不内建可靠/顺序/拥塞；QUIC/HTTP/3 在 UDP 上实现可靠多流、TLS 1.3、拥塞控制与 Connection ID 迁移。选型先问可靠按序和 HOL，再问实时、短报文、组播和部署迭代。"
         }
       ]
     },
     {
+      "type": "explain",
+      "title": "QUIC 为什么基于 UDP 而不是改 TCP",
+      "content": "QUIC 在 UDP 外壳上重新实现了可靠传输、拥塞控制和加密，听起来像绕远路。但选择 UDP 而不是修改 TCP 是工程现实驱动的决策，核心有四个原因。\n\n**① TCP 的连接级队头阻塞（HOL blocking）。** HTTP/2 在一条 TCP 连接上多路复用多个 stream，但 TCP 层不理解 stream 的概念——它只看到一条字节流。一个 TCP 段丢失后，后续所有数据必须等重传完成才能交付给应用层，即使后面的数据属于完全不同的 HTTP stream。这在一个丢包率稍高的网络上（比如移动网络 1-3% 丢包）会把所有 stream 的延迟都拉高。QUIC 在传输层就管理多个独立 stream，每个 stream 有自己的可靠交付和有序性，一个 stream 的缺口只阻塞该 stream，不影响其他 stream 的数据交付。\n\n**② 传输握手与 TLS 1.3 集成。** TCP + TLS 1.3 的握手需要两个往返：TCP 三次握手消耗 1-RTT，然后 TLS 1.3 握手再 1-RTT，总共 2-RTT。QUIC 把传输握手和 TLS 1.3 密钥交换合并在同一个握手过程中，新连接只需 1-RTT。恢复已有连接可以用 0-RTT（客户端在握手包里就带上应用数据），但要注意 0-RTT 数据有重放攻击风险，需要应用层评估幂等性。\n\n**③ 用户态迭代与部署穿透。** TCP 是内核实现的，改 TCP 意味着改操作系统内核、等发行版更新、过中间设备（NAT、防火墙、负载均衡器）的协议检查。UDP 流量在现有网络中基本透明，防火墙和 NAT 通常只看端口和首部，不深度检查载荷。这让 QUIC 的拥塞控制、丢包恢复等逻辑可以随应用（比如 Chrome、Nginx）快速迭代发布，不需要等内核升级。\n\n**④ 连接迁移（Connection Migration）。** TCP 连接由四元组（源 IP、源端口、目的 IP、目的端口）标识。移动端从 Wi-Fi 切到 4G，IP 地址变了，四元组不匹配，连接就断了，应用必须重建连接和 TLS。QUIC 用 Connection ID 标识连接——只要 Connection ID 不变，即使 IP/端口变了，客户端和服务端仍然能把包关联到同一个连接，实现无缝迁移。"
+    },
+    {
       "type": "code",
-      "title": "TCP 与 UDP 的 socket 写法差异",
+      "title": "可运行对照：TCP 字节流分帧 vs UDP 数据报边界",
       "language": "python",
-      "content": "import socket\n\n# TCP: 面向连接, 字节流, 必须 listen/accept/connect\ndef tcp_server():\n    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n    s.bind(('127.0.0.1', 9001))\n    s.listen(128)\n    conn, addr = s.accept()           # 阻塞直到 3 次握手完成\n    buf = b''\n    while True:\n        chunk = conn.recv(1024)        # 字节流: 一次 recv 可能拿到半条或多条消息\n        if not chunk: break\n        buf += chunk\n    conn.close(); s.close()\n\n# UDP: 无连接, 数据报, 直接 sendto/recvfrom\ndef udp_server():\n    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n    s.bind(('127.0.0.1', 9002))\n    while True:\n        data, addr = s.recvfrom(65507) # 一次 recvfrom 恰好一个数据报, 保边界\n        s.sendto(b'ack:' + data, addr) # 想要可靠就在这里加序号/ACK/重传",
+      "content": "import socket\nimport struct\nimport threading\n\n\ndef encode_frame(body: bytes) -> bytes:\n    \"\"\"长度前缀分帧：4 字节大端序长度 + body\"\"\"\n    return struct.pack(\"!I\", len(body)) + body\n\n\ndef decode_frames(buffer: bytearray):\n    \"\"\"从字节流缓冲区中解码完整帧\"\"\"\n    out = []\n    while len(buffer) >= 4:\n        length = struct.unpack(\"!I\", buffer[:4])[0]\n        if len(buffer) < 4 + length:\n            break  # body 没到齐，等下次读取\n        out.append(bytes(buffer[4:4 + length]))\n        del buffer[:4 + length]\n    return out\n\n\ndef tcp_demo():\n    ready = threading.Event()\n    result = {}\n\n    def server():\n        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:\n            srv.bind((\"127.0.0.1\", 0))\n            srv.listen(1)\n            result[\"port\"] = srv.getsockname()[1]\n            ready.set()\n            conn, _ = srv.accept()\n            with conn:\n                buffer = bytearray()\n                frames = []\n                while True:\n                    chunk = conn.recv(3)  # 故意小块读取，模拟半个 header/body\n                    if not chunk:\n                        break\n                    buffer.extend(chunk)\n                    frames.extend(decode_frames(buffer))\n                result[\"tcp_frames\"] = frames\n                result[\"tcp_leftover\"] = bytes(buffer)\n\n    t = threading.Thread(target=server)\n    t.start()\n    ready.wait()\n    with socket.create_connection((\"127.0.0.1\", result[\"port\"])) as cli:\n        cli.sendall(encode_frame(b\"one\") + encode_frame(b\"two\"))\n    t.join()\n    return result[\"tcp_frames\"], result[\"tcp_leftover\"]\n\n\ndef udp_demo():\n    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as srv:\n        srv.bind((\"127.0.0.1\", 0))\n        port = srv.getsockname()[1]\n        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as cli:\n            cli.sendto(b\"one\", (\"127.0.0.1\", port))\n            cli.sendto(b\"two\", (\"127.0.0.1\", port))\n        first, _ = srv.recvfrom(1024)\n        second, _ = srv.recvfrom(1024)\n        return [first, second]\n\n\nif __name__ == \"__main__\":\n    frames, leftover = tcp_demo()\n    print(\"tcp decoded frames:\", frames, \"leftover:\", leftover)\n    print(\"udp datagrams:\", udp_demo())",
       "highlights": [
         {
-          "line": 4,
-          "note": "SOCK_STREAM 是 TCP，内核会维护 TCB（传输控制块，含连接状态、序号、窗口等）、重传定时器和滑动窗口。"
+          "line": 8,
+          "note": "TCP 是字节流，不保留 write 边界；必须用长度前缀、分隔符或定长在应用层自定义分帧。"
         },
         {
-          "line": 12,
-          "note": "TCP recv 读到的是字节流，应用层必须用长度前缀或分隔符切消息，否则就会粘包。"
+          "line": 36,
+          "note": "recv(3) 故意小块读取——TCP 一次 read 可能拿到半个 header、半个 body 或多个 frame 的片段，这就是粘包的本质。"
         },
         {
-          "line": 19,
-          "note": "SOCK_DGRAM 是 UDP，没有 listen/accept，单 socket 即可服务多个对端。"
+          "line": 54,
+          "note": "UDP 不需要 listen/accept；sendto 直接发 datagram，服务端 recvfrom 一次取一个完整 datagram。"
         },
         {
-          "line": 22,
-          "note": "recvfrom 一次取一个完整数据报；如果应用发的报文超过 MTU，会在 IP 层分片，任一分片丢失整个数据报报废。"
+          "line": 60,
+          "note": "两次 recvfrom 分别得到 b'one' 和 b'two'，体现 UDP 保留 datagram 边界；但如果接收缓冲区过小会截断。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试标准回答",
-      "content": "30 秒结论：TCP 和 UDP 都是传输层协议。TCP 面向连接、可靠、按序、字节流，首部 20 字节起，适合 HTTP、SSH、数据库这种必须可靠的场景；UDP 无连接、不保证可靠和顺序、保留消息边界，首部 8 字节，适合 DNS、音视频、网游这种实时或短报文场景。\n\n核心机制分五个维度：\n\n1. **连接**\n   - TCP 三次握手建连、四次挥手关闭，内核维护 TCB（传输控制块，保存连接状态、序号、窗口等）。\n   - UDP 没有连接状态。\n2. **可靠性**\n   - TCP 用序号、ACK、超时重传、快速重传、滑动窗口、拥塞控制（Cubic/BBR）保证不丢不乱。\n   - UDP 默认不管，需要应用层自己加。\n3. **消息边界**\n   - TCP 字节流会粘包，必须用长度前缀或分隔符。\n   - UDP 一发一收，边界保留。\n4. **头部开销**\n   - TCP 最小 20 字节，可达 60 字节。\n   - UDP 固定 8 字节。\n5. **通信模式**\n   - TCP 只能点对点。\n   - UDP 支持广播组播。\n\n边界要会答 QUIC 为什么基于 UDP。不是嫌 TCP 可靠，而是 TCP 在用户场景里有四个绕不开的痛点：\n\n- 队头阻塞导致 HTTP/2 多路复用退化。\n- TCP+TLS1.2 握手要 2-3 个 RTT。\n- 协议栈在内核升级慢。\n- 四元组绑死连接导致移动端切网就断。\n\nQUIC 在 UDP 上重做了多 stream 独立重传、TLS 1.3 集成 1-RTT/0-RTT、用户态迭代和 64 位 Connection ID 连接迁移。这才是它退回 UDP 的真正原因。",
+      "content": "**30 秒结论**\nTCP 和 UDP 都是传输层协议，但服务契约不同。TCP 面向连接、可靠、按序、字节流，首部 20 字节起，适合 HTTP/SSH/数据库这类需要可靠字节流的场景。UDP 无连接、保留 datagram 边界，首部 8 字节，不内建可靠/顺序/拥塞，适合 DNS/NTP/RTP/实时音视频/组播，以及 QUIC 这类在上层自定义可靠性的协议。\n\n**核心机制（7 个维度）**\n- **连接状态**：TCP 三次握手建连、四次挥手关闭，内核维护 TCB；UDP 无连接状态，sendto 直接发 datagram\n- **可靠性**：TCP 用序号+ACK+RTO/快速重传提供可靠交付；UDP 只有校验和，不保证送达、重传或去重\n- **顺序**：TCP 接收端按序号重排交付有序字节流；UDP 不保证顺序\n- **消息边界**：TCP 是字节流不保留 write 边界，应用需用长度前缀/分隔符/定长分帧；UDP 保留 datagram 边界，但接收缓冲过小会截断，IP 分片丢一片整个 datagram 失败\n- **头部开销**：TCP 最小 20 字节可扩到 60 字节 vs UDP 固定 8 字节\n- **流控/拥塞**：TCP 内建接收窗口（流控）和拥塞控制（CUBIC/BBR/Reno）；UDP 无内建，应用自行管理\n- **通信模式**：TCP 每条连接是两端点间字节流；UDP 支持单播、广播、组播\n\n**边界：QUIC 为什么基于 UDP**\n不是嫌 TCP 不可靠，而是 TCP 在 Web/移动场景有四个绕不开的限制：\n1. **连接级队头阻塞**：HTTP/2 多 stream 共享一条 TCP 连接，一个丢失段阻塞所有 stream；QUIC 让 stream 独立恢复\n2. **TLS 分层握手**：TCP+TLS 需 2-RTT，QUIC 把传输和 TLS 1.3 集成，新连接 1-RTT，恢复 0-RTT\n3. **用户态迭代**：QUIC 库可随应用升级，不必等内核和中间设备\n4. **连接迁移**：TCP 绑定四元组，换 IP 就断；QUIC 用 Connection ID 支持无缝迁移\n\n注意 QUIC 仍有拥塞控制和丢包恢复，不是「直接丢了更快」。",
       "followUpQuestions": [
         {
-          "question": "TCP 为什么会粘包，UDP 为什么不会？应用层一般怎么处理 TCP 粘包？",
-          "answer": "TCP 是字节流，发送端 Nagle 算法（将多个小包合并为一个大包发送以减少网络开销）或 send 缓冲区会把多次写合并，接收端 recv 也按字节读，因此存在粘包/拆包；UDP 是数据报，每次 sendto 对应一个 IP 报文，内核按报文交付，天然保边界。处理 TCP 粘包通常三种做法：固定长度、分隔符（如 HTTP 用空行作为头与体的分隔）、长度前缀（如 Redis RESP、Dubbo 的 16 字节头里写 body 长度），其中长度前缀最常用。"
+          "question": "TCP 为什么会粘包，UDP 为什么不会？应用层一般怎么处理？",
+          "answer": "TCP 粘包的根因是字节流不保留应用 write 边界。Nagle、MSS/PMTU、send/recv 缓冲区和读取时机只影响字节被合并或拆开的具体表现，但不是根因。UDP 是 datagram 语义，内核按 datagram 交付所以保留边界；但接收缓冲太小会截断，IP 分片丢一片整个 datagram 失败。TCP 分帧最常用三种方式：定长消息、分隔符（如 HTTP 的 \\r\\n）、长度前缀（二进制协议首选，4 字节大端序长度 + body）。"
         },
         {
-          "question": "DNS 为什么默认走 UDP，什么时候会切 TCP？",
-          "answer": "DNS 查询通常报文很小（< 512 字节）、一问一答、对延迟敏感，UDP 8 字节头 + 无握手最划算，丢了重发一次也比 TCP 三次握手快。两种情况会切 TCP：一是响应超过 512 字节（EDNS0 扩展前的限制）或 truncated 标志置位时客户端会重试 TCP；二是区域传送（AXFR/IXFR）数据量大、必须可靠有序，强制走 TCP 53。DoT、DoH 因为要 TLS 也走 TCP。"
+          "question": "DNS 为什么默认走 UDP？什么时候会切 TCP？",
+          "answer": "DNS 传统查询一问一答、报文通常小、对延迟敏感，所以默认 UDP。但现代 DNS 不能死背 512 字节限制：EDNS(0) 允许客户端声明更大的 UDP payload（RFC 6891）。切 TCP 的典型场景：①UDP 响应 TC 置位（被截断），客户端重试 TCP；②区域传送 AXFR/IXFR 必须 TCP；③响应过大即使 EDNS(0) 也装不下；④DoT/DoH 基于 TLS/HTTP 本身走 TCP。RFC 7766/9210 强调 DNS 实现必须支持 TCP。"
         },
         {
-          "question": "QUIC 既然要可靠，为什么不直接改 TCP 而是基于 UDP？",
-          "answer": "四个原因：① TCP 队头阻塞——TCP 一个段丢了后续都得等，HTTP/2 在 TCP 上多路复用反而被这一点拖累，QUIC 让每个 stream 独立重传；② 握手延迟——TCP+TLS1.2 要 2-3 RTT，QUIC 把传输握手和 TLS 1.3 合并到 1-RTT 甚至 0-RTT；③ 协议栈固化——TCP 在内核升级要等系统更新，QUIC 在用户态库（quiche、msquic、Go 的 quic-go）随应用发版；④ 连接迁移——TCP 用 src/dst IP+port 四元组绑连接，手机切网就断，QUIC 用 64 位 Connection ID，IP 变了连接还在，对移动端体验提升明显。"
+          "question": "QUIC 既然要可靠传输，为什么不直接改 TCP 而是基于 UDP？",
+          "answer": "四个原因：①TCP 连接级队头阻塞，QUIC 在传输层让 stream 独立恢复；②QUIC 把传输握手和 TLS 1.3 集成，新连接 1-RTT，恢复 0-RTT；③用户态迭代，拥塞控制和丢包恢复可随应用升级，不必等内核；④Connection ID 支持连接迁移，移动端换网后仍可保持连接。核心不是 UDP 更快，而是 UDP 在现有网络中基本透明，方便用户态重做协议栈。"
+        },
+        {
+          "question": "UDP 怎么做到可靠传输？QUIC 和 KCP 有什么区别？",
+          "answer": "UDP 本身不提供可靠性，但上层可以实现。QUIC 在 UDP 上实现了完整的可靠传输（序号、ACK、丢包恢复、拥塞控制）、流多路复用、TLS 1.3 加密和连接迁移，是面向 Web 的生产级协议。KCP 是一个更轻量的可靠传输库，核心是 ARQ（自动重传请求），特点是更激进的重传策略（更低延迟但更高带宽消耗），适合游戏等低延迟场景，但没有内置加密、拥塞控制（需要外部算法）和流多路复用。"
         }
       ]
     },
@@ -138,33 +105,47 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能从连接、可靠性、顺序、消息边界、头部开销 5 个维度报出 TCP 和 UDP 的差异，并给出 20 字节 / 8 字节这种具体数字",
+        "能从连接、可靠性、顺序、消息边界、头部开销、流控/拥塞、通信模式 7 个维度对比 TCP 和 UDP",
         "能列出 TCP 可靠性的具体机制：序号、ACK、超时重传、快速重传、滑动窗口、拥塞控制",
-        "能解释 TCP 粘包的成因和长度前缀/分隔符两种主流处理方式",
-        "能说出 DNS 默认走 UDP 的理由以及切 TCP 的两种触发条件",
-        "能讲清 QUIC 基于 UDP 的四个原因：队头阻塞、握手延迟、内核协议栈升级慢、连接迁移",
-        "能区分 UDP 不可靠和不能可靠：可靠性可以由应用层（QUIC/KCP）补上"
+        "能解释 TCP 粘包的根因是字节流不保留消息边界，并能给出定长/分隔符/长度前缀三种分帧方案",
+        "能说出 DNS 默认适合 UDP 的理由，并知道 EDNS(0)、TC 置位、区域传送和 DoT/DoH 与 TCP 的关系",
+        "能讲清 QUIC 基于 UDP 的四个原因：连接级 HOL、握手/TLS 集成、用户态迭代、连接迁移",
+        "能区分 UDP 不可靠和不能可靠——可靠性可以由应用层（QUIC/KCP）补上"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "network.tcp-udp.topic-tcp-vs-udp.recall.1",
-      "prompt": "请从连接、可靠性、有序性、消息边界、头部开销、通信模式六个维度对比 TCP 与 UDP，并各举两个典型应用。",
+      "prompt": "请从连接、可靠性、有序性、消息边界、头部开销、流控/拥塞、通信模式 7 个维度对比 TCP 和 UDP，每个维度各举一个具体例子。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 2
     },
     {
       "id": "network.tcp-udp.topic-tcp-vs-udp.recall.2",
-      "prompt": "线上一个基于 TCP 的服务出现粘包，客户端解析失败。说说 TCP 粘包是怎么产生的，以及你会怎么在协议层修复。",
+      "prompt": "线上一个基于 TCP 的服务出现粘包/拆包，客户端解析失败。说说根因为什么不是 Nagle 本身，以及你会怎么在协议层修复。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 2
     },
     {
       "id": "network.tcp-udp.topic-tcp-vs-udp.recall.3",
-      "prompt": "QUIC 已经能做到可靠传输，为什么不直接改 TCP，而是退回到 UDP 上自己实现？请从队头阻塞、握手、协议栈和连接迁移四个角度说明。",
+      "prompt": "QUIC 已经能做到可靠传输，为什么不直接改 TCP，而是在 UDP 外壳上实现？请从连接级 HOL、TLS 集成、用户态迭代和连接迁移四个角度说明。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "network.tcp-udp.topic-tcp-vs-udp.recall.4",
+      "prompt": "DNS 默认走 UDP，但现代 DNS 不能只考虑 UDP 512 字节限制。说说 EDNS(0)、TC 置位重试 TCP、区域传送和 DoT/DoH 分别是什么场景。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 2
+    },
+    {
+      "id": "network.tcp-udp.topic-tcp-vs-udp.recall.5",
+      "prompt": "UDP 本身不可靠，但 QUIC 和 KCP 都基于 UDP 实现了可靠传输。它们的核心区别是什么？分别适合什么场景？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
@@ -172,23 +153,25 @@
   ],
   "rubric": {
     "mustHave": [
-      "TCP 面向连接 + 三次握手；UDP 无连接，sendto 直接发包",
-      "TCP 可靠性由序号、ACK、超时重传、滑动窗口、拥塞控制组成，UDP 默认不保证",
-      "TCP 字节流会粘包、UDP 数据报保边界",
-      "TCP 头部 20 字节起 vs UDP 固定 8 字节",
+      "TCP 面向连接+三次握手建立+四次挥手关闭，内核维护 TCB；UDP 无连接，sendto/sendmsg 直接发 datagram",
+      "TCP 可靠性由序号、ACK、RTO/快速重传、接收窗口、拥塞控制组成；UDP 不内建这些能力",
+      "TCP 是无消息边界的字节流，应用需自行分帧；UDP 保留 datagram 边界但可能截断、IP 分片丢一片整个 datagram 失败",
+      "TCP 头部 20 字节起（可到 60）vs UDP 固定 8 字节",
       "能给出典型场景：TCP 用于 HTTP/SSH/数据库，UDP 用于 DNS/音视频/QUIC"
     ],
     "goodToHave": [
-      "能讲长度前缀、分隔符两种 TCP 粘包处理方案，并举例 Dubbo/Redis RESP",
-      "能解释 DNS 何时从 UDP 切到 TCP（截断 512 字节、区域传送 AXFR）",
-      "能说出 QUIC 选 UDP 的四个理由：队头阻塞、握手延迟、内核协议栈固化、连接迁移",
-      "能区分 UDP 单播/广播/组播以及 TCP 仅支持点对点"
+      "能讲定长、分隔符、长度前缀三种 TCP 分帧方案，并说明长度前缀在二进制协议里的优势",
+      "能解释 DNS 何时从 UDP 切到 TCP：TC 置位、响应过大、区域传送，以及 EDNS(0) 不再局限于 512 字节",
+      "能说出 QUIC 选 UDP 的四个理由：连接级 HOL、TLS 1.3 集成、用户态迭代、Connection ID 连接迁移",
+      "能区分 UDP 单播/广播/组播以及 TCP 每条连接是两端之间的可靠字节流",
+      "能区分 UDP 不可靠 vs 不能可靠，知道 QUIC/KCP 等应用层方案可以在 UDP 上实现可靠性"
     ],
     "commonMistakes": [
-      "把 UDP 描述成不能实现可靠传输（忽略 QUIC、KCP 等应用层方案）",
+      "把 UDP 描述成不能实现可靠传输，忽略 QUIC、KCP 等应用层方案",
       "只记 20 vs 8 字节，但说不出 TCP 头里的序号、ACK、窗口、标志位有什么作用",
-      "答 TCP 粘包时只说要拆包，不能说出长度前缀或分隔符的具体做法",
-      "认为 QUIC 基于 UDP 是为了更快丢包，没意识到核心是绕开 TCP 队头阻塞和内核协议栈升级慢"
+      "答 TCP 粘包时把 Nagle 当根因，没说出字节流不保留消息边界才是本质",
+      "仍然死背 DNS UDP 512 字节限制，不知道 EDNS(0)、TC 置位和 DNS over TCP 的现代要求",
+      "认为 QUIC 基于 UDP 是为了更快丢包或更轻量，没意识到核心是连接级 HOL、TLS 集成、用户态迭代和连接迁移"
     ],
     "scoreWeights": {
       "coverage": 35,
@@ -197,9 +180,9 @@
       "depth": 15
     }
   },
-  "updatedAt": "2026-06-17",
+  "updatedAt": "2026-06-22",
   "status": "draft",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "重点考察能否准确报出 TCP/UDP 五维差异和具体头部字节数，能否解释 TCP 可靠性的组成机制，能否说清 TCP 粘包的成因与处理，以及能否把 QUIC 基于 UDP 的真实原因（队头阻塞、握手、协议栈、连接迁移）讲到工程层面。"
+  "interviewerFocus": "重点考察能否把 TCP/UDP 差异讲成传输服务契约，而不是只背可靠/不可靠；能否说清 TCP 可靠字节流的具体机制、UDP datagram 边界和截断/分片风险、DNS 的 EDNS(0)/TCP 边界，以及 QUIC 基于 UDP 的四个真实原因（连接级 HOL、TLS 集成、用户态迭代、连接迁移）。"
 }

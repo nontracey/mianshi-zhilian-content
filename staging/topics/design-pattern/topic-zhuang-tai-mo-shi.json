@@ -2,21 +2,31 @@
   "category": "behavioral",
   "difficulty": 3,
   "domain": "design-pattern",
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 42,
   "group": "behavioral",
   "id": "design-pattern.behavioral.topic-zhuang-tai-mo-shi",
   "interviewFrequency": "low",
-  "interviewerFocus": "能否说清状态模式 Context/State/ConcreteState 三角色及请求委托链；能否指出状态模式与策略模式在控制权（外部选 vs 内部转）与类间关系（平行 vs 有向图）上的本质差异；能否在订单或工作流场景下判断该用 State-Driven 还是 Table-Driven 转换归属；能否识别状态对象无状态单例化下的反向引用内存坑与 Spring StateMachine 单例复用下的事件串台风险。",
+  "interviewerFocus": "能否说清 Context/State/ConcreteState 三角色及请求委托链；能否从控制权（外部选 vs 内部转）和类间关系（平行 vs 有向图）两个角度区分状态模式与策略模式；能否判断 State-Driven 与 Table-Driven 转换归属的适用场景；能否识别状态对象无状态单例化下的反向引用内存坑和 Spring StateMachine 单例复用下的事件串台风险。",
   "learningCards": [
     {
       "type": "explain",
       "title": "把 if(state) 分支拆成状态类",
-      "content": "状态模式把\"**对象内部状态变了，对应行为也跟着变**\"这件事封装成可替换的状态类，外观上像同一个对象被换成了不同类。\n\n**触发条件**：业务方法被调用时，Context 不在方法内部用 `if/switch(当前状态)` 分支判断，而是把请求**委托**给当前持有的 State 对象，State 对象执行完毕后决定是否把 Context 的 `state` 字段换成另一个 State 实例。\n\n**三个角色**：\n- `Context`：业务实体（如 `Order`、`TcpConnection`），持有 `private State currentState`，对外只暴露业务方法 `pay()/ship()`。\n- `State` 接口：声明本业务所有受状态影响的方法（如 `pay(Order o)`、`ship(Order o)`、`complete(Order o)`），并暴露 `String name()` 供外部状态机按名查表。\n- `ConcreteStateX`：实现接口，在自己负责的方法里要么完成动作并 `context.setState(new NextState())`，要么对非法事件抛 `IllegalStateException`。\n\n**关键指标**：状态类数量 N、状态转换边数 E、每个状态类的平均方法数 M。N>5 且 E>10 时，状态类之间互相引用形成的依赖图会显著增加维护成本，需要在 Context 中引入 `Map<Event, State>` 转换表或迁移到 Spring StateMachine 这种独立框架统一管理。\n\n**失败路径**：客户端在 `UnpaidState` 上调用 `ship()` 时，具体状态类直接 `throw new IllegalStateException(\"UNPAID 不允许发货\")`，调用栈最浅、定位最快；这种\"非法状态由具体状态类抛错\"的约定让错误处理集中在一处，不会散落到业务方法里。\n\n**工程取舍**：状态类通常做成**无状态单例**（`static final UnpaidState INSTANCE = new UnpaidState()`），所有 Context 共享同一实例节省堆内存；但 State 不能反向持有 Context 专属字段（如当前订单 ID、用户上下文），否则要么用 ThreadLocal、要么把 Context 作为参数透传——这正是状态模式与策略模式的关键差异点，策略对象虽然也无状态，但是由调用方主动选择注入。"
+      "content": "状态模式解决的核心问题是：对象行为随内部状态变化，但用 if/switch 写状态分支会让方法膨胀、改一处漏一处、新人不敢碰。状态模式把每个状态下\"能响应哪些事件、执行什么动作、去往哪个状态\"封装进独立的状态类，Context 把请求委托给当前 State，切换状态 = 替换 State 实例。\n\n三个角色的职责边界：\n- **Context**（如 `Order`、`TcpConnection`）：持有 `private State currentState`，对外暴露业务方法 `pay()/ship()/cancel()`，内部把调用转发给 `state.pay(this)`。Context 不知道有哪些具体状态类、不写任何状态分支逻辑。\n- **State 接口**：声明本业务所有受状态影响的方法（如 `pay(Context c)`、`ship(Context c)`），通常还暴露 `String name()` 供 Table-Driven 状态机按名查表。\n- **ConcreteStateX**：实现接口，在自己负责的方法里完成业务动作并调用 `context.setState(new NextState())`，对非法事件抛 `IllegalStateException` 或拒绝操作。\n\n请求委托链：客户端调用 `order.pay()` → Context 转发给 `currentState.pay(this)` → 当前是 UnpaidState 就执行扣款并 `setState(PaidState)`，当前是 PaidState 就直接抛重复支付异常。错误路径最浅——客户端看到的异常栈直接指向具体状态类，不用去翻 Context 里哪条 if 分支漏了。\n\n关键度量：状态数 N、转换边数 E、每状态平均方法数 M。N≥4 且 E≥8 时，状态类之间形成的有向图开始显著增加维护成本，需要考虑引入转换表或迁移状态机框架。"
     },
     {
       "type": "explain",
-      "title": "转换放哪、与策略的区别和工程边界",
-      "content": "**状态转换逻辑放哪**——两种典型做法：\n\n1. **放在状态类里**（State-Driven）：`UnpaidState.pay()` 内调用 `order.setState(new PaidState())`。新增状态时改动集中在状态类内部，扩展灵活；但状态类之间互相引用形成有向图，整体流转图散落在各类里，要看清全局必须读代码。\n2. **放在 Context/独立状态机里**（Table-Driven）：维护 `Map<StateEnum, Map<EventEnum, State>>` 转换表，状态类只负责\"这个状态下做什么\"，不关心下一个状态。Spring StateMachine（`org.springframework.statemachine.StateMachine`）的 `StateMachineTransition` 就是这种实现，转换表还能挂 `Guard` 守卫（如\"金额>0才允许支付\"）和 `Action` 副作用（如支付成功发 MQ），新增状态只改配置不改代码，可视化和审计友好。\n\n**和策略模式的区别（高频必考）**：两者类图几乎一样（Context + 接口 + 多个实现），但意图相反：\n- **策略模式**：多个算法**彼此独立**，由**外部（客户端/配置）主动选**用哪个，策略之间互不知道对方——典型是 `PaymentStrategy` 选支付宝还是微信，Context 构造时一次性注入后基本不换。\n- **状态模式**：多个状态之间有明确**转换关系**，由**对象内部根据当前状态和事件自动流转**到下一个，状态往往知道自己的下一个状态——典型是 `OrderState` 从 `Unpaid` 自动转 `Paid`，Context 的 `state` 字段会被 `setState` 多次替换。\n\n**典型应用**：订单/支付状态流转、TCP 连接 `LISTEN → SYN_RCVD → ESTABLISHED`、工作流引擎（Activiti/Camunda 的 Token）、游戏角色 `Idle → Run → Attack → Dead`、Spring StateMachine 实现的审批流。\n\n**工程边界与陷阱**：\n- **状态少（≤3）且转换简单**：直接用 `enum` 状态字段 + `switch` 更轻量，引入模式是过度设计；阈值经验值 N≥4 且每个状态事件数≥2 时收益才明显。\n- **状态对象单例化的内存陷阱**：如果 State 类持有 Context 引用（违反无状态约定），而 Context 又被某个长生命周期容器（Spring 单例 Bean、静态 `HashMap` 缓存）强引用，Context 永远不会被 GC——典型坑是状态机里 `states.put(state, transitions)` 强引用 state，state 又反向引用 Context。\n- **线程安全**：Context 一般每个业务对象一个、不是线程共享的；但状态机对象如果配成 Spring 单例 Bean（`@Scope(\"singleton\")`），多线程并发 `fire(event)` 会导致事件串台，必须用 `StateMachineFactory` 每次新建或 `@Scope(\"prototype\")`。\n- **状态爆炸**：用 if/switch 写订单状态，5 个状态 × 4 个事件 = 20 个分支，维护时改一处忘一处；上状态模式后每状态只关心自己合法的事件，剩下的交给运行时异常兜底，错误定位从全表扫描缩到单类。"
+      "title": "转换放哪：State-Driven vs Table-Driven",
+      "content": "状态转换逻辑（\"从哪到哪\"）是状态模式工程实现里最关键的设计决策，两种主流做法各有边界：\n\n**State-Driven（转换放在状态类内部）**：每个 ConcreteState 在自己的方法里直接 `context.setState(new XxxState())`。优点是新增状态时改动集中在一个类里，不用动其他状态类；缺点是状态类之间互相引用形成有向图，全局流转图散落在 N 个类里，要看清全貌必须读完所有代码或反向画依赖图。适合状态数少（≤5）、流转稳定、不需要频繁审计的场景。\n\n**Table-Driven（转换集中在外）**：维护 `Map<StateEnum, Map<EventEnum, StateEnum>>` 转换表，状态类只负责\"这个状态下做什么动作\"，不关心下一状态。Context 或独立状态机的 `fire(event)` 方法查表决定目标状态，然后委托给目标状态对象执行动作。优点是转换关系一目了然、可配置化、可审计、可挂 Guard 守卫和 Action 副作用；缺点是新增状态要回到转换表里改配置。Spring StateMachine 就是 Table-Driven 的工业实现。\n\n**什么时候该迁移状态机框架**：当转换表本身有 Guard 条件（如\"金额>0 才允许支付\"）、Action 副作用（如\"支付成功后发 MQ\"）、需要持久化和恢复（如进程重启后从 DB 恢复状态）、需要可视化状态图（Spring StateMachine 的 UML 图导出）——这些需求超出纯状态模式的能力范围，该用 Spring StateMachine、Activiti/Camunda 工作流引擎等框架。"
+    },
+    {
+      "type": "explain",
+      "title": "与策略模式的本质差异",
+      "content": "状态模式和策略模式的类图几乎一样（Context + 接口 + 多个实现），但设计意图和控制权方向相反，面试高频考点：\n\n**控制权方向**：策略模式由**外部**（客户端/配置中心/工厂方法）在 Context 构造时主动选择哪个策略，策略之间互不知道对方的存在，Context 组合好后基本不换。状态模式由**内部**根据当前状态和收到的事件自动流转到下一个状态，状态类往往知道自己的下一个状态是谁，Context 的 state 字段会随业务推进被 `setState` 多次替换。\n\n**类间关系**：策略类之间是平行的，没有转换边；状态类之间是有向图，有明确的 next 关系。\n\n**一句话记忆**：策略是\"外部选算法\"，状态是\"内部转状态\"。\n\n**工程落地差异**：策略模式的典型是支付渠道选择——构造 Order 时注入 AlipayStrategy 或 WechatPayStrategy，付完款后不会再换策略。状态模式的典型是订单流转——Order 从 UnpaidState 开始，pay() 后变成 PaidState，ship() 后变成 ShippedState，state 字段在生命周期里被替换多次。\n\n**混淆的典型错误**：把策略模式用在有状态转换关系的场景——比如写一个 OrderStrategy 接口，UnpaidStrategy 实现里调 `order.setStrategy(new PaidStrategy())`，这本质就是在用状态模式的思路但用了策略的命名，类图一样但命名混乱会给后续维护者制造认知障碍。"
+    },
+    {
+      "type": "explain",
+      "title": "工程边界：何时用、何时不用、内存坑",
+      "content": "**何时用状态模式**：状态数 N≥4 且每个状态至少响应 2 种以上事件，if/switch 分支开始膨胀（5 状态 × 4 事件 = 20 分支，改一处忘一处）。上状态模式后非法事件由具体状态类兜底抛错，错误定位从全表扫描缩到单类。\n\n**何时不用**：状态数 ≤3 且转换简单时，用 `enum` 状态字段 + `switch` 更轻量，引入模式是过度设计。阈值经验值：N≥4 且事件分支 ≥2 时收益才明显。\n\n**状态对象单例化**：State 通常设计成无状态单例（`static final UnpaidState INSTANCE = new UnpaidState()`），所有 Context 共享同一组 State 实例，节省堆内存和 GC 压力。约束是 State 类不能持有 Context 专属字段（订单 ID、用户上下文等），否则要么用 `ThreadLocal`、要么把 Context 作为方法参数透传——State 方法签名里的 `Context c` 参数就是这么来的。\n\n**内存泄漏坑**：如果 State 反向持有 Context 引用，而 Context 又被长生命周期容器（Spring 单例 Bean、静态 HashMap 缓存）强引用，GC root 链路不断，Context 永远无法回收。最常见的坑是状态机内部 `Map<State, Transitions>` 的 Transition 对象里存了 Context，或者 State 内部用 `ThreadLocal<Context>` 但没在状态切换时清理。防御：State 用枚举实现天然防反射和反序列化多实例、构造时仅做无状态初始化、Transition 表不存 Context 引用、ThreadLocal 用完即 remove。\n\n**线程安全**：Context 一般是每业务对象一个、不跨线程共享。但状态机对象如果配成 Spring 单例 Bean（`@Scope(\"singleton\")`），多线程并发 `fire(event)` 会导致事件串台——线程 A 执行到一半，线程 B 的事件把 current 改了。必须用 `StateMachineFactory` 每次新建或 `@Scope(\"prototype\")`。"
     },
     {
       "type": "diagram",
@@ -45,57 +55,61 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | 状态模式 | 策略模式 | 有限状态机 |\n| ------ | ---------- | ---------- | -------- |\n| 意图 | 内部状态驱动行为自动变化 | 外部主动选用算法 | 状态+事件+转换的集中描述 |\n| 转换关系 | 状态间有明确 next 边，State 自己或转换表决定 | 算法间无任何关系，平行 | 由 `Map<State, Map<Event, State>>` 转换表集中管理 |\n| 客户端感知 | 不知道当前/下一个状态 | 主动选具体策略 | 由配置/状态机驱动，客户端只发事件 |\n| 控制权 | 内部按事件自动流转 | 外部一次性选择 | 内部按事件触发，可挂 Guard/Action |\n| 实现方式 | Context 组合 State | Context 组合 Strategy | 状态机对象 + 转换表 + Guard/Action |\n| 扩展方式 | 新增 ConcreteState 类 | 新增 Strategy 实现类 | 新增 State + 转换表条目 |\n| 线程模型 | Context 多例、State 单例共享 | Strategy 单例或新建 | StateMachine 需 prototype 或 ThreadLocal 避免事件串台 |\n| 典型应用 | 订单状态流转、TCP 状态 | 支付渠道选择、压缩算法 | Spring StateMachine、Activiti 工作流 |\n| 复杂度 | 中（状态多时类数膨胀） | 低（平行类） | 高（转换表爆炸、需 Guard 防非法迁移） |"
+      "title": "状态模式 vs 策略模式 vs 状态机框架",
+      "content": "| 维度 | 状态模式 | 策略模式 | 有限状态机框架 |\n| ------ | -------- | -------- | ------------- |\n| 意图 | 对象行为随内部状态自动变化 | 外部主动选用算法 | 状态+事件+转换集中描述 |\n| 转换关系 | 状态间有 next 边，State 自己或转换表决定 | 算法间无关系、平行 | `Map<State, Map<Event, State>>` 集中管理 |\n| 控制权 | 内部按事件自动流转 | 外部一次性选择后不换 | 内部按事件触发，可挂 Guard/Action |\n| 客户端感知 | 不知道当前/下一个状态 | 主动选具体策略 | 只发事件，状态机内部处理 |\n| State/Strategy 生命周期 | Context 的 state 字段被多次替换 | Context 构造时注入后基本不换 | 状态机可持久化和恢复 |\n| 实现方式 | Context 组合 State 接口 | Context 组合 Strategy 接口 | 状态机对象 + 转换表 + Guard + Action |\n| 扩展方式 | 新增 ConcreteState 类 | 新增 Strategy 实现类 | 新增状态/事件 + 转换表配置 |\n| 线程模型 | Context 多例、State 单例共享 | Strategy 单例或新建 | StateMachine 需 prototype 或每次新建 |\n| 典型应用 | 订单状态、TCP 连接、游戏角色 | 支付渠道、压缩算法、排序策略 | Spring StateMachine、Activiti 工作流 |\n| 复杂度拐点 | N≥4、E≥8 时维护成本上升 | 策略数多少都不影响结构 | 需要 Guard/持久化/可视化时才引入 |"
     },
     {
       "type": "code",
-      "title": "代码示例：状态接口 + 订单流转 + 转换表驱动的状态机",
-      "content": "// 1. 状态接口与上下文\npublic interface OrderState {\n    String name();\n    void pay(Order order);\n    void ship(Order order);\n    void complete(Order order);\n}\npublic class Order {\n    private OrderState state;\n    public Order(OrderState initial) { this.state = initial; }\n    public void setState(OrderState s) { this.state = s; }\n    public OrderState getState() { return state; }\n    public void pay() { state.pay(this); }\n    public void ship() { state.ship(this); }\n    public void complete() { state.complete(this); }\n}\n\n// 2. 具体状态类：每个状态自己决定下一个状态 + 兜底非法事件\npublic class UnpaidState implements OrderState {\n    public String name() { return \"UNPAID\"; }\n    public void pay(Order o) {\n        System.out.println(\"扣款成功\");\n        o.setState(new PaidState());\n    }\n    public void ship(Order o) {\n        throw new IllegalStateException(\"UNPAID 不允许发货\");\n    }\n    public void complete(Order o) {\n        throw new IllegalStateException(\"UNPAID 不允许完成\");\n    }\n}\npublic class PaidState implements OrderState {\n    public String name() { return \"PAID\"; }\n    public void pay(Order o) { throw new IllegalStateException(\"PAID 重复支付\"); }\n    public void ship(Order o) {\n        System.out.println(\"已发货\");\n        o.setState(new ShippedState());\n    }\n    public void complete(Order o) { throw new IllegalStateException(\"PAID 未发货不能完成\"); }\n}\npublic class ShippedState implements OrderState {\n    public String name() { return \"SHIPPED\"; }\n    public void pay(Order o) { throw new IllegalStateException(\"SHIPPED 已发货\"); }\n    public void ship(Order o) { throw new IllegalStateException(\"SHIPPED 重复发货\"); }\n    public void complete(Order o) {\n        System.out.println(\"订单完成\");\n        o.setState(new CompletedState());\n    }\n}\n\n// 3. 转换表驱动的有限状态机（Table-Driven FSM）\npublic class OrderStateMachine {\n    private final Map<String, Map<String, OrderState>> table = new HashMap<>();\n    private final Map<String, OrderState> states = new HashMap<>();\n    private OrderState current;\n    public OrderStateMachine(OrderState initial) {\n        register(initial);\n        this.current = initial;\n    }\n    public void register(OrderState s) { states.put(s.name(), s); }\n    public void addTransition(String from, String event, String to) {\n        OrderState toState = states.get(to);\n        if (toState == null) {\n            throw new IllegalArgumentException(\"未注册目标状态: \" + to);\n        }\n        table.computeIfAbsent(from, k -> new HashMap<>()).put(event, toState);\n    }\n    public void fire(String event) {\n        Map<String, OrderState> row = table.get(current.name());\n        OrderState next = (row == null) ? null : row.get(event);\n        if (next == null) {\n            throw new IllegalStateException(\n                current.name() + \" 上无事件 \" + event + \" 的合法转换\");\n        }\n        this.current = next;\n    }\n    public OrderState current() { return current; }\n}",
+      "title": "状态接口 + 订单流转 + Table-Driven 状态机",
+      "content": "import java.util.HashMap;\nimport java.util.Map;\n\n// 1. 状态接口\npublic interface OrderState {\n    String name();\n    void pay(Order order);\n    void ship(Order order);\n    void complete(Order order);\n}\n\n// 2. Context：持有可替换的 State，对外暴露业务方法\npublic class Order {\n    private OrderState state;\n    public Order(OrderState initial) { this.state = initial; }\n    public void setState(OrderState s) { this.state = s; }\n    public OrderState getState() { return state; }\n    public void pay()     { state.pay(this); }\n    public void ship()    { state.ship(this); }\n    public void complete(){ state.complete(this); }\n}\n\n// 3. 具体状态类：每个状态决定合法事件的下一步，非法事件抛错\npublic class UnpaidState implements OrderState {\n    public String name() { return \"UNPAID\"; }\n    public void pay(Order o) {\n        System.out.println(\"扣款成功\");\n        o.setState(new PaidState()); // 状态转换发生在状态类内部\n    }\n    public void ship(Order o) {\n        throw new IllegalStateException(\"UNPAID 不允许发货\");\n    }\n    public void complete(Order o) {\n        throw new IllegalStateException(\"UNPAID 不允许完成\");\n    }\n}\n\npublic class PaidState implements OrderState {\n    public String name() { return \"PAID\"; }\n    public void pay(Order o) { throw new IllegalStateException(\"PAID 重复支付\"); }\n    public void ship(Order o) {\n        System.out.println(\"已发货\");\n        o.setState(new ShippedState());\n    }\n    public void complete(Order o) { throw new IllegalStateException(\"PAID 未发货不能完成\"); }\n}\n\npublic class ShippedState implements OrderState {\n    public String name() { return \"SHIPPED\"; }\n    public void pay(Order o)     { throw new IllegalStateException(\"SHIPPED 已发货\"); }\n    public void ship(Order o)    { throw new IllegalStateException(\"SHIPPED 重复发货\"); }\n    public void complete(Order o) {\n        System.out.println(\"订单完成\");\n        o.setState(new CompletedState());\n    }\n}\n\npublic class CompletedState implements OrderState {\n    public String name() { return \"COMPLETED\"; }\n    public void pay(Order o)     { throw new IllegalStateException(\"COMPLETED 已完成\"); }\n    public void ship(Order o)    { throw new IllegalStateException(\"COMPLETED 已完成\"); }\n    public void complete(Order o){ throw new IllegalStateException(\"COMPLETED 重复完成\"); }\n}\n\n// 4. Table-Driven 状态机：转换关系集中管理，可配置、可审计\npublic class OrderStateMachine {\n    private final Map<String, Map<String, OrderState>> table = new HashMap<>();\n    private final Map<String, OrderState> states = new HashMap<>();\n    private OrderState current;\n\n    public OrderStateMachine(OrderState initial) {\n        register(initial);\n        this.current = initial;\n    }\n\n    public void register(OrderState s) { states.put(s.name(), s); }\n\n    public void addTransition(String from, String event, String to) {\n        OrderState toState = states.get(to);\n        if (toState == null) throw new IllegalArgumentException(\"未注册状态: \" + to);\n        table.computeIfAbsent(from, k -> new HashMap<>()).put(event, toState);\n    }\n\n    public void fire(String event) {\n        Map<String, OrderState> row = table.get(current.name());\n        OrderState next = (row == null) ? null : row.get(event);\n        if (next == null) {\n            throw new IllegalStateException(\n                current.name() + \" 上无事件 \" + event + \" 的合法转换\");\n        }\n        this.current = next;\n    }\n\n    public OrderState current() { return current; }\n}\n\n// 5. 使用示例\npublic class Main {\n    public static void main(String[] args) {\n        // State-Driven 用法\n        Order order = new Order(new UnpaidState());\n        order.pay();     // UNPAID -> PAID\n        order.ship();    // PAID -> SHIPPED\n        order.complete();// SHIPPED -> COMPLETED\n\n        // Table-Driven 用法\n        UnpaidState unpaid = new UnpaidState();\n        PaidState paid = new PaidState();\n        ShippedState shipped = new ShippedState();\n        CompletedState completed = new CompletedState();\n\n        OrderStateMachine sm = new OrderStateMachine(unpaid);\n        sm.register(paid);\n        sm.register(shipped);\n        sm.register(completed);\n        sm.addTransition(\"UNPAID\",    \"pay\",     \"PAID\");\n        sm.addTransition(\"PAID\",      \"ship\",    \"SHIPPED\");\n        sm.addTransition(\"SHIPPED\",   \"complete\",\"COMPLETED\");\n\n        sm.fire(\"pay\");      // current -> PAID\n        sm.fire(\"ship\");     // current -> SHIPPED\n        sm.fire(\"complete\");// current -> COMPLETED\n        System.out.println(\"FSM current: \" + sm.current().name());\n    }\n}",
       "language": "java",
       "highlights": [
         {
-          "line": 4,
-          "note": "OrderState 接口统一声明受状态影响的方法，name() 让状态机能按字符串查表，避免反射与硬编码 Class 引用"
+          "line": 30,
+          "note": "Context 把 pay/ship/complete 转发给当前 state，内部没有任何状态分支判断"
         },
         {
-          "line": 11,
-          "note": "Order 持有一个可变 state 字段，每次 setState 替换为下一个状态对象，对外方法直接转发给当前 state，体现 Context 委托而非内部分支"
+          "line": 40,
+          "note": "UnpaidState.pay 成功后 setState(PaidState)，状态转换由当前状态类自己决定"
         },
         {
-          "line": 22,
-          "note": "UnpaidState.pay 成功后主动 new PaidState() 并回写给 Order，把\"下一步去哪\"的决定权放在当前状态类内部，是 State-Driven 风格的核心"
+          "line": 43,
+          "note": "非法事件由具体状态类直接抛 IllegalStateException，错误栈最浅、定位最快"
         },
         {
-          "line": 25,
-          "note": "未支付就发货由具体状态类抛 IllegalStateException，错误定位只在状态类内，不会扩散到业务方法或上游拦截器"
+          "line": 73,
+          "note": "Table-Driven 状态机用二维 Map 查表决定下一状态，新增状态只改表不改代码"
         },
         {
-          "line": 50,
-          "note": "状态机维护 states 注册表，addTransition 用 to 名字查表拿到 OrderState 实例，杜绝凭空 new 出未注册的状态对象"
-        },
-        {
-          "line": 59,
-          "note": "fire(event) 用 current.name() + event 二维查表，未命中时抛异常，转换规则完全由表驱动，新增状态只改表/配置不改业务代码，是 Table-Driven 风格的典型实现"
+          "line": 86,
+          "note": "fire(event) 查 current.name()+event 未命中时抛异常，转换规则完全由表驱动"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**30 秒结论**：状态模式把\"对象在不同状态下行为不同\"这件事从 `if/switch` 分支里抽出来，让 Context 持有一个可替换的 State 对象，状态切换 = 换 State 实例，从而让行为的变化看起来像是换了一个类——这是 GOF《设计模式》对 State Pattern 的原话。\n\n**机制要点**：\n- **三个角色**：`Context` 持 `private State currentState` 并把请求转发给 state；`State` 接口声明所有受状态影响的方法；`ConcreteStateX` 实现具体行为并在动作完成后 `context.setState(new NextState())`，对非法事件抛 `IllegalStateException`。\n- **转换归属两种风格**：State-Driven（`UnpaidState` 内 `new PaidState()`，扩展灵活但类间互相引用）和 Table-Driven（`Map<State, Map<Event, State>>` 转换表集中描述，Spring StateMachine、Activiti 工作流都这么做，全局流转可视化、能挂 Guard/Action）。\n- **与策略模式的关键差异**：策略模式多个算法平行、由外部主动选；状态模式多个状态有明确 next 边、由内部按事件自动流转。一句话：策略是\"外部选算法\"，状态是\"内部转状态\"——落地时策略 Context 构造时一次性注入后基本不换，状态 Context 的 state 字段会被 `setState` 多次替换。\n- **工程取舍**：状态数 ≤3 时直接用 `enum + switch` 更轻量；状态对象做无状态单例共享（`static final INSTANCE`），但禁止反向持有 Context 引用以免被 `HashMap` 强引用链泄漏。\n\n**边界与追问应对**：\n- 追问\"为什么不用枚举/if\"：状态数 ≥4 且每个状态下要校验多种事件合法性时，枚举里塞方法会膨胀成巨型 switch，新人改一处忘一处；上状态模式后非法事件被具体状态类兜底抛错，错误集中、定位最快，从\"全表扫描找哪条 if 漏了\"缩到\"看异常栈定位到那个 State 类\"。\n- 追问\"状态对象怎么复用\"：通常做成 `static final` 单例（State 不持有 Context 字段），所有 Order 实例共享同一组 State；如果业务要求 State 记录每单的处理进度（如超时计时器），则必须 Per-Order 新建，放弃单例化。\n- 追问\"Spring StateMachine 怎么落地\"：用 `StateMachineBuilder` 构建 `StateMachine<S, E>`，`configureStates().withStates().initial(S0).end(S_END)`、`configureTransitions().withExternal().source(from).event(E_PAY).target(PAID).guard(guardBean).action(actionBean, ...)`；状态机 Bean 配 `@Scope(\"prototype\")` 避免多线程复用同一实例导致事件串台，或者每次业务请求从 `StateMachineFactory` 现取一个。",
+      "content": "**结论**：状态模式把\"对象在不同状态下行为不同\"从 if/switch 分支里抽出来，让 Context 持有一个可替换的 State 对象，状态切换 = 换 State 实例，行为变化看起来像是换了一个类。\n\n**三角色与委托链**\n- Context 持有 `private State currentState`，对外暴露业务方法，内部转发给 `state.pay(this)`\n- State 接口声明所有受状态影响的方法\n- ConcreteState 实现具体行为，完成动作后 `context.setState(new NextState())`，对非法事件抛 IllegalStateException\n- 请求链：`order.pay()` → `currentState.pay(this)` → UnpaidState 执行扣款 → setState(PaidState)\n\n**转换归属两种风格**\n- **State-Driven**：状态类内部决定下一状态，扩展灵活但类间互相引用、全局图散落\n- **Table-Driven**：Map<State, Map<Event, State>> 转换表集中描述，可配置、可审计、可挂 Guard/Action\n- 状态数多、需要可视化和审计时用 Table-Driven 或状态机框架\n\n**与策略模式的本质差异**\n- 策略：外部选算法，策略间平行、互不知道对方，Context 构造时注入后基本不换\n- 状态：内部转状态，状态间有 next 边形成有向图，Context 的 state 字段被多次替换\n- 一句话：策略是\"外部选算法\"，状态是\"内部转状态\"\n\n**工程取舍与边界**\n- 状态数 ≤3 时 enum + switch 更轻量；N≥4 且事件分支 ≥2 时上状态模式\n- State 做无状态单例（static final INSTANCE），但禁止反向持有 Context 引用以免内存泄漏\n- Spring StateMachine Bean 必须配 `@Scope(\"prototype\")` 或每次从工厂新建，避免多线程事件串台\n\n**典型应用**：订单/支付状态流转、TCP 连接 LISTEN→SYN_RCVD→ESTABLISHED、工作流引擎（Activiti/Camunda）、游戏角色状态",
       "followUpQuestions": [
         {
-          "question": "状态模式和策略模式类图几乎一样，怎么区分？",
-          "answer": "看意图和控制权。策略的多个算法彼此独立、由外部（客户端或配置）主动选用哪一个，目的是替换算法，策略之间互不知道对方；状态的多个状态之间有明确的转换关系、由对象内部根据当前状态和事件自动流转到下一个，目的是把状态机的分支逻辑分散到各状态类，状态往往知道自己的下一个状态。落地差异：策略模式 Context 构造时一次性注入 Strategy 后基本不换，状态模式 Context 的 state 字段会随业务推进被 setState 多次替换。一句话：策略是\"外部选算法\"，状态是\"内部转状态\"。"
+          "question": "状态模式和策略模式类图几乎一样，怎么一句话区分？",
+          "answer": "看控制权方向。策略是\"外部选算法\"——客户端或配置在构造时主动注入，策略间平行互不知道；状态是\"内部转状态\"——对象根据当前状态和事件自动流转到下一个，状态间有明确 next 边。落地差异：策略 Context 构造后基本不换 Strategy，状态 Context 的 state 字段随业务推进被 setState 多次替换。"
         },
         {
-          "question": "订单状态用状态模式实现时，转换逻辑该放状态类里还是放上下文里？各有什么取舍？",
-          "answer": "放状态类里：每个状态自己决定下一个去哪，新增状态时改动集中、扩展灵活，但状态类之间会互相引用、耦合上升，整体流转图散落在各类里不直观，审计时要画时序图才能看清。放上下文或独立状态机里：用 Map<StateEnum, Map<EventEnum, State>> 转换表集中描述所有流转，一眼能看清整个状态机、便于审计和配置化，代价是新增状态要回到这张表里改。Spring StateMachine 就是这种 Table-Driven 风格，转换表还能配 Guard 守卫（如\"金额>0才允许支付\"）和 Action 副作用（如支付成功发 MQ）。订单、工作流这类流转规则会变、需要可视化和审计的场景通常更适合集中式状态机；流转简单且稳定时放状态类里也够用。"
+          "question": "状态转换逻辑放状态类里还是放转换表里？各有什么取舍？",
+          "answer": "放状态类里（State-Driven）：新增状态改动集中在一个类里、扩展灵活，但状态类互相引用形成有向图，全局流转图散落在各类里不直观。放转换表里（Table-Driven）：Map<StateEnum, Map<EventEnum, StateEnum>> 集中描述所有流转，一眼看清全貌、便于配置化和审计，Spring StateMachine 还能挂 Guard 守卫和 Action 副作用。订单、工作流等流转规则会变、需要审计的场景更适合 Table-Driven；流转简单稳定时 State-Driven 足够。"
         },
         {
-          "question": "状态对象在生产里一般怎么设计成单例？有什么内存坑？",
-          "answer": "状态对象通常是 static final INSTANCE = new UnpaidState() 这种无状态单例，所有 Order 实例共享同一组 State，节省堆内存。关键约束是 State 类不能反向持有 Context 引用——一旦 State 持有 Order，而 Order 又被某个长生命周期的容器（如 Spring 单例 Bean、静态 HashMap 缓存）强引用，Order 永远不会被 GC。生产里最常见的坑是状态机内部维护 Map<State, Transitions> 时误把 Order 作为 value 放进去，或者 State 内部用 ThreadLocal<Order> 但没在切换状态时清理，导致老 Order 实例常驻堆。建议：State 实现 Serializable、构造时仅做无状态初始化、单例通过枚举（enum UnpaidState implements OrderState）天然防反射攻击和反序列化多实例。"
+          "question": "状态对象做单例有什么内存坑？怎么防？",
+          "answer": "State 通常是 static final 无状态单例，所有 Context 共享。关键是 State 不能反向持有 Context 引用——如果 State 持有 Order，Order 又被长生命周期容器（Spring 单例 Bean、静态 HashMap）强引用，GC root 链路不断，Order 永远无法回收。最常见坑是 Transition 表里存了 Context、或 State 用 ThreadLocal 但没 remove。防御：State 用枚举实现天然防多实例、不存 Context 字段、ThreadLocal 用完即清理。"
+        },
+        {
+          "question": "状态模式和 switch 状态机怎么判断该用哪个？",
+          "answer": "状态数 ≤3 且事件分支少时用 enum + switch 更轻量，引入模式是过度设计。阈值经验值是 N≥4 且每个状态至少响应 2 种以上事件（5 状态 × 4 事件 = 20 分支，改一处忘一处）。上状态模式后非法事件由具体状态类兜底抛错，错误定位从全表扫描缩到单类。"
+        },
+        {
+          "question": "Spring StateMachine 在生产里怎么避免线程安全问题？",
+          "answer": "StateMachine Bean 不能用默认的 @Scope(\"singleton\")——多线程并发 fire(event) 会导致事件串台，线程 A 执行到一半线程 B 把 current 改了。解决方案：配 @Scope(\"prototype\") 每次注入新建实例，或用 StateMachineFactory.getStateMachine() 每次取一个新实例，用完后调 stop/release。"
         }
       ]
     },
@@ -103,12 +117,13 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "状态模式 Context/State/ConcreteState 三个角色的职责与请求委托链",
-        "状态模式与策略模式在\"控制权（外部选 vs 内部转）\"和\"类间关系（平行 vs 有向图）\"上的本质差异",
-        "State-Driven 与 Table-Driven 两种转换归属的取舍，以及 Spring StateMachine StateMachineBuilder/Guard/Action 的落地接口",
-        "状态对象无状态单例化的约束（禁止反向持有 Context）及对应的内存泄漏防御手段（注册表、枚举单例、ThreadLocal 清理）",
-        "状态数 ≤3 用枚举+switch、状态数 ≥4 且事件多分支时上状态模式的判断标准与阈值经验值",
-        "IllegalStateException 在状态类内兜底非法事件的好处与替代方案（Guard/Action 守卫与副作用）"
+        "能画出 Context/State/ConcreteState 三角色的委托链：客户端→Context→State→setState/抛异常",
+        "能一句话区分状态模式（内部转状态、状态间有 next 边）和策略模式（外部选算法、策略间平行）",
+        "能说明 State-Driven（转换在状态类内）与 Table-Driven（转换表集中描述）的取舍与适用场景",
+        "能解释状态对象无状态单例化的约束（禁止反向持有 Context）和内存泄漏防御手段",
+        "能判断 N≤3 用 enum+switch、N≥4 且事件多时上状态模式的阈值",
+        "能说明 Spring StateMachine 的 prototype 作用域需求和避免事件串台的方案",
+        "能解释非法事件由具体状态类抛 IllegalStateException 的错误定位收益"
       ]
     }
   ],
@@ -119,21 +134,35 @@
   "recallPrompts": [
     {
       "id": "design-pattern.behavioral.topic-zhuang-tai-mo-shi.recall.1",
-      "prompt": "面试官问你：状态模式和策略模式有什么区别？在什么场景下使用状态模式？",
+      "prompt": "状态模式和策略模式有什么区别？请从控制权、类间关系和生命周期三个角度对比。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "design-pattern.behavioral.topic-zhuang-tai-mo-shi.recall.2",
-      "prompt": "假设你需要设计一个订单系统，支持待支付、已支付、已发货、已完成、已取消等状态，你会如何使用状态模式？",
+      "prompt": "设计一个订单系统，支持待支付、已支付、已发货、已完成四个状态，你会用状态模式还是 enum + switch？为什么？如果用状态模式，转换逻辑放哪里？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "design-pattern.behavioral.topic-zhuang-tai-mo-shi.recall.3",
+      "prompt": "状态对象做单例时，反向持有 Context 引用会导致什么问题？请画出 GC root 引用链并说明防御手段。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
-      "id": "design-pattern.behavioral.topic-zhuang-tai-mo-shi.recall.3",
-      "prompt": "状态模式 和相邻概念或常见替代方案有什么关键区别？",
+      "id": "design-pattern.behavioral.topic-zhuang-tai-mo-shi.recall.4",
+      "prompt": "State-Driven 和 Table-Driven 两种转换归属分别适合什么场景？Spring StateMachine 的 Guard 和 Action 机制解决了什么问题？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "design-pattern.behavioral.topic-zhuang-tai-mo-shi.recall.5",
+      "prompt": "Spring StateMachine 的状态机 Bean 为什么不能配成 singleton？多线程复用会出什么问题？怎么解决？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -142,36 +171,37 @@
   "recommendWeight": 70,
   "rubric": {
     "mustHave": [
-      "Context/State/ConcreteState 三角色职责与请求委托链",
-      "状态模式与策略模式的本质差异（外部选算法 vs 内部转状态、平行 vs 有向图）",
-      "State-Driven 与 Table-Driven 两种状态转换归属及取舍",
-      "状态对象无状态单例化约束及反向引用导致的内存泄漏防御"
+      "能说清 Context/State/ConcreteState 三角色职责与请求委托链",
+      "能区分状态模式（内部转状态、状态间有 next 边形成有向图）和策略模式（外部选算法、策略间平行）",
+      "能说明 State-Driven 与 Table-Driven 两种状态转换归属的取舍与适用场景",
+      "能解释状态对象无状态单例化的约束（禁止反向持有 Context 引用）和内存泄漏防御手段"
     ],
     "goodToHave": [
-      "Spring StateMachine StateMachineBuilder/Guard/Action 的落地配置与 prototype 作用域",
-      "订单/TCP/工作流引擎中的具体应用与转换表可视化",
-      "状态类内 IllegalStateException 兜底非法事件的设计动机与错误定位收益"
+      "能说明 Spring StateMachine 的 StateMachineBuilder/Guard/Action 落地配置和 prototype 作用域需求",
+      "能说出状态数 ≤3 用 enum+switch、N≥4 且事件多时上状态模式的阈值判断",
+      "能解释非法事件由具体状态类抛 IllegalStateException 的错误定位收益",
+      "能说出订单、TCP 连接、工作流引擎等典型应用场景"
     ],
     "commonMistakes": [
-      "把状态模式和策略模式混为一谈，说不出控制权与类间关系的差异",
+      "把状态模式和策略模式混为一谈，说不出控制权方向（外部选 vs 内部转）和类间关系（平行 vs 有向图）的差异",
       "状态类反向持有 Context 引用导致长生命周期容器下 Context 无法被 GC",
-      "所有 if/switch 都硬上状态模式，状态数 ≤3 时反而增加类数无收益",
-      "把 Spring StateMachine 当单例 Bean 用，多线程触发事件时状态串台"
+      "状态数 ≤3 时硬上状态模式，增加类数但无结构收益",
+      "把 Spring StateMachine 当单例 Bean 用，多线程并发 fire(event) 导致状态串台"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
   "status": "staging",
-  "summary": "允许对象在内部状态改变时改变它的行为，对象看起来好像修改了它的类。",
+  "summary": "把 if(state) 分支拆成可替换的状态类，让 Context 持有 State 并按事件自动流转——覆盖三角色委托链、State-Driven 与 Table-Driven 转换归属、与策略模式的本质差异、无状态单例的内存坑和 Spring StateMachine 的落地边界。",
   "tags": [
     "设计模式",
     "行为型模式",
     "状态模式"
   ],
   "title": "状态模式",
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

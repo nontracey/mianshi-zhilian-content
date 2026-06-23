@@ -4,7 +4,7 @@
   "category": "advanced",
   "group": "advanced",
   "title": "性能调优与诊断",
-  "summary": "讲清 .NET 性能诊断工具链（dotnet-counters/trace/dump/gcdump）和方法论，以及线程池饥饿、GC 压力等常见问题的定位。",
+  "summary": "讲清 .NET 性能诊断工具链（dotnet-counters/trace/dump/gcdump）和「先 counters 定方向、再下钻」的方法论，以及线程池饥饿（async 代码同步阻塞）、GC 压力（Gen2/LOH 分配）等常见问题的定位套路和 BenchmarkDotNet 基准测试的正确使用方式。",
   "tags": [
     ".NET",
     "性能优化",
@@ -13,25 +13,40 @@
     "PerfView"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 45,
+  "estimatedMinutes": 49,
   "order": 30,
   "recommendWeight": 85,
   "status": "production",
   "learningCards": [
     {
       "type": "explain",
-      "title": "BenchmarkDotNet 基准测试",
-      "content": "性能调优是高级 .NET 开发的重要技能，需要使用专业工具进行分析和优化。\n## BenchmarkDotNet\n\nBenchmarkDotNet 是 .NET 的基准测试框架：\n```csharp\nusing BenchmarkDotNet.Attributes;\nusing BenchmarkDotNet.Running;\n\n[MemoryDiagnoser]\npublic class StringBenchmarks\n{\n    private readonly string _text = \"Hello, World!\";\n\n    [Benchmark]\n    public string StringConcat()\n    {\n        var result = \"\";\n        for (int i = 0; i < 100; i++)\n        {\n            result += i.ToString();\n        }\n        return result;\n    }\n[Benchmark]\n    public string StringBuilder()\n    {\n        var sb = new System.Text.StringBuilder();\n        for (int i = 0; i < 100; i++)\n        {\n            sb.Append(i);\n        }\n        return sb.ToString();\n    }\n\n    [Benchmark(Baseline = true)]\n    public string StringCreate()\n    {\n        return string.Create(100, 0, (span, state) =>\n        {\n            for (int i = 0; i < 100; i++)\n            {\n                i.TryFormat(span.Slice(i * 2), out _);\n            }\n        });\n    }\n}\n\n// 运行基准测试\nBenchmarkRunner.Run<StringBenchmarks>();\n```\n\n**输出示例**：\n```\n| Method         | Mean     | Error    | StdDev   | Allocated |\n|--------------- |---------:|---------:|---------:|----------:|\n| StringConcat   | 4.235 us | 0.083 us | 0.078 us |   2.41 KB |\n| StringBuilder  | 1.023 us | 0.020 us | 0.019 us |   1.17 KB |\n| StringCreate   | 0.856 us | 0.017 us | 0.015 us |   1.02 KB |\n```"
+      "title": "BenchmarkDotNet 基准测试的正确姿势与输出解读",
+      "content": "BenchmarkDotNet 是 .NET 唯一值得信赖的微基准测试框架——它会自动做预热（JIT 编译）、多次迭代统计（中位数、标准差、置信区间），避免你手写 Stopwatch 被 JIT 优化、GC 抖动、CPU 降频等因素干扰结论。\n\n使用步骤：\n1. NuGet 安装 `BenchmarkDotNet` 包\n2. 写 benchmark 类，方法用 `[Benchmark]` 标记，需要对比基线时加 `[Benchmark(Baseline = true)]`\n3. 加 `[MemoryDiagnoser]` 让输出包含 GC 分配量——这对 .NET 性能调优至关重要，因为很多优化的核心是减少分配而非减少 CPU 指令\n4. Release 配置运行（`dotnet run -c Release`），Debug 模式结果完全不可信\n\n输出解读要点：\n- **Mean**：去掉最高最低后的平均耗时，是最常用的指标\n- **Error / StdDev**：如果 StdDev 占 Mean 超过 10%，说明结果不稳定，需要排查环境干扰（后台 GC、CPU 热管理、其他进程抢占）\n- **Allocated**：单次调用的托管堆分配量。零分配（`-`）是很多热路径优化的目标\n- **Ratio**：当有 Baseline 时，其他方法相对于基线的倍数\n\n常见陷阱：\n- 方法里用了 `Console.WriteLine` 或日志——IO 开销淹没真实性能差异\n- 没有 `[MemoryDiagnoser]`——你以为优化了 CPU 实际上多分配了内存触发更多 GC\n- 在 Debug 配置运行——JIT 不做优化，结果完全反直觉\n- 测试数据量太小——几纳秒的差异被测量误差淹没\n- 循环里做了常量折叠——编译器把整个循环优化掉，需要确保每次迭代有实际副作用\n\nBenchmarkDotNet 本身不适合做端到端延迟测试（那是 load test 工具的事），它只测方法级微基准。"
     },
     {
       "type": "explain",
-      "title": "dotnet-counters",
-      "content": "## dotnet-counters\n\ndotnet-counters 是实时性能监控工具：\n```bash\n# 列出可用计数器\ndotnet-counters list -p 1234\n\n# 监控计数器\ndotnet-counters monitor -p 1234 --counters System.Runtime\n\n# 监控自定义计数器\ndotnet-counters monitor -p 1234 --counters MyApp.Requests\n\n# 输出到文件\ndotnet-counters collect -p 1234 --counters System.Runtime -o metrics.json\n```\n\n**常用计数器**：\n- `cpu-usage`：CPU 使用率\n- `working-set`：工作集内存\n- `gc-heap-size`：GC 堆大小\n- `gen-0-gc-count`：Gen 0 GC 次数\n- `exception-count`：异常数量\n- `requests-per-second`：每秒请求数\n\n## PerfView\n\nPerfView 是 Windows 性能分析工具：\n```bash\n# 收集 ETW 事件\nPerfView.exe collect\n\n# 分析 CPU 采样\nPerfView.exe view\n\n# 分析 GC 事件\nPerfView.exe /GCCollectOnly collect\n```\n\n**PerfView 功能**：\n- CPU 采样分析\n- GC 事件分析\n- 内存快照\n- 事件跟踪\n- 火焰图\n\n## 自定义计数器\n\n```csharp\nusing System.Diagnostics.Metrics;\n\npublic class RequestMetrics\n{\n    private static readonly Meter Meter = new(\"MyApp\", \"1.0\");\n    private static readonly Counter<long> RequestCounter =\n        Meter.CreateCounter<long>(\"requests\", \"requests\", \"Total requests\");\n    private static readonly Histogram<double> RequestDuration =\n        Meter.CreateHistogram<double>(\"request.duration\", \"ms\", \"Request duration\");\n    private static readonly UpDownCounter<long> ActiveRequests =\n        Meter.CreateUpDownCounter<long>(\"active.requests\", \"requests\", \"Active requests\");\n\n    public void RecordRequest(string endpoint, double durationMs)\n    {\n        RequestCounter.Add(1, new KeyValuePair<string, object>(\"endpoint\", endpoint));\n        RequestDuration.Record(durationMs, new KeyValuePair<string, object>(\"endpoint\", endpoint));\n    }\n\n    public void IncrementActiveRequests() => ActiveRequests.Add(1);\n    public void DecrementActiveRequests() => ActiveRequests.Add(-1);\n}\n\n// 使用中间件\npublic class MetricsMiddleware\n{\n    private readonly RequestDelegate _next;\n    private readonly RequestMetrics _metrics;\n\n    public MetricsMiddleware(RequestDelegate next, RequestMetrics metrics)\n    {\n        _next = next;\n        _metrics = metrics;\n    }\n\n    public async Task InvokeAsync(HttpContext context)\n    {\n        var stopwatch = Stopwatch.StartNew();\n        _metrics.IncrementActiveRequests();\n\n        try\n        {\n            await _next(context);\n        }\n        finally\n        {\n            stopwatch.Stop();\n            _metrics.DecrementActiveRequests();\n            _metrics.RecordRequest(\n                context.Request.Path,\n                stopwatch.Elapsed.TotalMilliseconds);\n        }\n    }\n}\n```"
+      "title": "dotnet-counters：生产可常驻的实时仪表盘",
+      "content": "dotnet-counters 是 .NET 诊断工具链的第一步——它通过 EventCounter 和 Meter 协议从运行中的进程实时采样指标，几乎零开销（< 0.1% CPU），生产环境可以常驻运行。\n\n核心命令：\n```bash\n# 附加到进程，监控 .NET 运行时计数器\ndotnet-counters monitor -p <PID> --counters System.Runtime\n\n# 监控自定义 Meter 计数器\ndotnet-counters monitor -p <PID> --counters MyApp\n\n# 采集到文件供后续分析\ndotnet-counters collect -p <PID> -o metrics.json --counters System.Runtime\n\n# 列出进程暴露的所有计数器\ndotnet-counters list -p <PID>\n```\n\n**System.Runtime 关键计数器与诊断含义**：\n- `cpu-usage`：> 80% 说明 CPU 是瓶颈，下步用 dotnet-trace 抓火焰图\n- `working-set`：工作集内存，持续增长可能有泄漏\n- `gc-heap-size`：GC 管理的堆大小，配合 `gen-0/1/2-gc-count` 看回收频率\n- `gen-2-gc-count`：Gen2 回收是 Full GC，频繁说明大对象或长生命周期对象分配过多\n- `gc-heap-size` 配合 `time-in-gc`：`time-in-gc` > 10% 说明 GC 暂停影响应用延迟\n- `threadpool-queue-length`：> 0 且持续增长 = 线程池饥饿（下一篇重点讲）\n- `threadpool-thread-count`：缓慢增长配合 queue-length 堆积 = 线程池在补线程但不够\n- `exception-count`：异常率突增说明有代码问题，异常构造开销（堆栈收集）在 .NET 中很昂贵\n- `monitor-lock-contention-count`：锁竞争计数高 → 用 dotnet-trace 看 contention 事件找热点锁\n\n**诊断决策树**：看到哪个计数器异常 → 决定下一步用什么工具。这是整个性能诊断方法论的核心。"
     },
     {
       "type": "explain",
-      "title": "性能调优与诊断 的边界与易错点",
-      "content": "## 内存分析\n\n**GC 事件监控**：\n```csharp\n// 监控 GC 事件\nGC.GCCollect();\nConsole.WriteLine($\"Gen 0: {GC.CollectionCount(0)}\");\nConsole.WriteLine($\"Gen 1: {GC.CollectionCount(1)}\");\nConsole.WriteLine($\"Gen 2: {GC.CollectionCount(2)}\");\nConsole.WriteLine($\"总内存: {GC.GetTotalMemory(false)}\");\n```\n\n**dotnet-dump**：\n```bash\n# 收集转储文件\ndotnet-dump collect -p 1234\n\n# 分析转储文件\ndotnet-dump analyze core_20230101_000000\n\n# 常用命令\n> dumpheap -stat          # 堆统计\n> dumpheap -type String   # 特定类型\n> gcroot <address>        # GC 根\n> syncblk                # 同步块\n```\n\n**dotnet-trace**：\n```bash\n# 收集跟踪\ndotnet-trace collect -p 1234 --providers Microsoft-Windows-DotNETRuntime\n\n# 收集 CPU 采样\ndotnet-trace collect -p 1234 --profile cpu-sampling\n\n# 收集 GC 事件\ndotnet-trace collect -p 1234 --providers Microsoft-Windows-DotNETRuntime:0x1:4\n```\n\n## 日志分析\n\n**结构化日志**：\n```csharp\n// 使用 Serilog\nLog.Logger = new LoggerConfiguration()\n    .WriteTo.Seq(\"http://localhost:5341\")\n    .CreateLogger();\n\nLog.Information(\"处理请求 {RequestId}，耗时 {Duration}ms\", requestId, duration);\n```\n\n**Application Insights 自定义遥测埋点**：\n```csharp\nbuilder.Services.AddApplicationInsightsTelemetry();\n\n// 自定义遥测\nvar telemetryClient = app.Services.GetRequiredService<TelemetryClient>();\ntelemetryClient.TrackEvent(\"OrderCreated\", new Dictionary<string, string>\n{\n    { \"OrderId\", orderId.ToString() },\n    { \"CustomerId\", customerId }\n});\n```\n\n## 性能优化清单\n\n1. **减少分配**：使用 Span<T>、对象池\n2. **避免锁竞争**：使用 ConcurrentDictionary、AsyncLock\n3. **使用异步 I/O**：避免同步阻塞\n4. **缓存策略**：合理使用缓存\n5. **批量操作**：减少数据库调用\n6. **压缩**：启用响应压缩\n7. **连接池**：使用 HttpClientFactory\n8. **预编译**：使用 AOT 或预编译查询\n\n## 方法论与验证\n诊断的方法论是「先 counters 定大方向，再 trace/dump 下钻」：dotnet-counters 几乎零开销、生产可常驻，先看是 CPU 高、GC 频、线程池堆积还是异常率高；锁定方向后再用 dotnet-trace 抓 CPU 火焰图找热点方法、用 dotnet-dump 加 SOS 分析对象找泄漏、用 dotnet-gcdump 看堆对象分布。.NET 最高频的坑是线程池饥饿——counters 里看到 ThreadPool 队列持续堆积、请求延迟飙升，根因几乎都是在 async 代码里用了 .Result 或 .Wait() 同步阻塞，把线程池线程占住了。注意生产抓 dump 会短暂暂停进程，要评估影响、最好在副本上做。"
+      "title": "线程池饥饿：.NET 最高频的性能陷阱",
+      "content": "线程池饥饿（ThreadPool Starvation）是 .NET 服务端应用最常见的性能问题，表现为：CPU 不高（可能只有 20-30%）、但请求延迟持续飙升、线程池队列长度 > 0 且持续增长。\n\n**根因**：在 async 方法中同步阻塞（`.Result`、`.Wait()`、`GetAwaiter().GetResult()`），导致线程池线程被占住不释放。.NET 线程池用 hill-climbing 算法动态调线程数，但补线程速度默认约每秒 1-2 个，远跟不上请求到达速率。\n\n**典型场景**：\n```csharp\n// 罪魁祸首：async 代码同步阻塞\npublic IActionResult GetData()\n{\n    var result = _httpClient.GetStringAsync(url).Result; // 阻塞线程池线程\n    return Ok(result);\n}\n\n// 正确做法\npublic async Task<IActionResult> GetData()\n{\n    var result = await _httpClient.GetStringAsync(url); // 释放线程\n    return Ok(result);\n}\n```\n\n**为什么 CPU 不高但延迟高**：线程池线程全在 `.Result` 上阻塞等待 IO 完成，CPU 实际在空转。新请求排在 ThreadPool Queue 里等线程释放，队列越积越长，延迟越来越高。\n\n**定位步骤**：\n1. dotnet-counters 看 `threadpool-queue-length` 持续 > 0，`threadpool-thread-count` 缓慢增长\n2. dotnet-dump 抓 dump → `threads` 命令看线程栈 → 大量线程停在 `Monitor.Wait` 或 `.Result` 上\n3. 顺着栈帧找到同步阻塞的代码行，改成 async/await\n\n**.NET 线程池与 Java 线程池的区别**：.NET 线程池没有你主动设的 corePoolSize/maximumPoolSize（.NET 用 hill-climbing 自适应），也不能自定义队列和拒绝策略。饥饿的表现是排队而非拒绝——请求一直等，不会被快速失败。这其实是更危险的故障模式。"
+    },
+    {
+      "type": "explain",
+      "title": "GC 压力与内存泄漏的定位",
+      "content": ".NET GC 采用分代算法（Gen0/1/2）加 LOH（Large Object Heap，>= 85KB 的对象直接进 Gen2/LOH）。GC 压力的本质是分配速率过高或长生命周期对象过多，导致 Gen2 Full GC 频繁触发。\n\n**GC 压力的征兆**：\n- `gen-2-gc-count` 快速增长\n- `time-in-gc` > 10%（GC 暂停占比高）\n- `gc-heap-size` 在 Gen2 回收后仍然持续增长（有泄漏）\n\n**常见根因**：\n- 高频分配短生命周期大对象（> 85KB）→ 直接进 LOH → LOH 只在 Full GC 时回收 → 碎片化\n- 缓存没有过期策略 → 对象一直被引用不回收\n- 事件订阅没有取消 → source 对象被 subscriber 引用无法回收\n- `ArrayPool` / `ObjectPool` 没用 → 热路径反复分配 byte[] / 消息对象\n\n**工具链**：\n1. `dotnet-counters` 先看 GC 各代次数和堆大小趋势\n2. `dotnet-gcdump` 抓 GC 堆快照（比 dump 轻量），看哪些类型实例数量多、占内存大\n3. `dotnet-dump` 抓完整 dump → SOS 扩展分析：\n   - `dumpheap -stat` 看堆上各类对象的数量和总大小\n   - `dumpheap -type <TypeName>` 列出特定类型的所有实例\n   - `gcroot <address>` 追踪谁持有引用（找泄漏的引用链）\n   - `finalizequeue` 看终结器队列——如果队列积压说明 Finalizer 线程被阻塞\n\n**关键区别**：内存泄漏（heap 持续增长、GC 后不降）和 GC 压力（分配速率高但能回收）是两个问题。前者要找引用链，后者要减少分配。两者可能同时存在。"
+    },
+    {
+      "type": "explain",
+      "title": "dotnet-trace 与 PerfView：CPU 热点与事件分析",
+      "content": "**dotnet-trace** 是跨平台的 EventPipe 采集工具，类似 Linux 的 perf。核心用法：\n```bash\n# CPU 采样（默认 1ms 间隔）\ndotnet-trace collect -p <PID> --profile cpu-sampling\n\n# GC 事件采集\ndotnet-trace collect -p <PID> --providers Microsoft-Windows-DotNETRuntime:0x1:4\n\n# 自定义 provider 组合\ndotnet-trace collect -p <PID> --providers Microsoft-Windows-DotNETRuntime:0xF000000000004:4\n```\n\n生成的 `.nettrace` 文件用 PerfView 或 Visual Studio 打开，能看到：\n- **火焰图 / 调用树**：每个方法的 CPU 占比，找到热点方法\n- **GC 事件时间线**：看到每次 GC 的代际、暂停时间、触发原因\n- **Contention 事件**：锁竞争的等待时间和调用栈\n\n**PerfView** 是 Windows 专属的深度分析工具，基于 ETW，功能远超 dotnet-trace：\n- 内存分配采样（AllocTick 事件）：看哪些代码在分配内存\n- JIT 编译事件：看哪些方法被频繁 JIT\n- 线程时间分析：每个线程在做什么、等什么\n- 支持火焰图、调用树、diff 两个 dump\n\n但 PerfView 学习曲线陡峭，Windows only。生产环境用 dotnet-trace 采集、VS 或 PerfView 分析是更通用的方案。"
+    },
+    {
+      "type": "explain",
+      "title": ".NET System.Diagnostics.Metrics 自定义计数器",
+      "content": ".NET 5+ 引入 `System.Diagnostics.Metrics` API，取代旧的 `EventCounter`。它通过 `Meter` + 具体指标类型暴露业务指标，可以用 dotnet-counters 或 OpenTelemetry 采集。\n\n四种指标类型：\n- **Counter\\<T\\>**：单调递增值，如请求总数、错误总数。只增不减\n- **UpDownCounter\\<T\\>**：可增可减，如活跃连接数、队列长度\n- **Histogram\\<T\\>**：记录值的分布，如请求延迟（会被自动计算 P50/P90/P99）\n- **ObservableCounter / ObservableGauge**：回调式，每次采集时调用，适合瞬时值如 CPU 使用率、队列长度\n\n使用方式：\n```csharp\nprivate static readonly Meter Meter = new(\"MyApp\", \"1.0\");\nprivate static readonly Counter<long> Requests = Meter.CreateCounter<long>(\"http.requests\");\nprivate static readonly Histogram<double> Duration = Meter.CreateHistogram<double>(\"http.duration\", \"ms\");\n\n// 带 Tag 记录\nRequests.Add(1, new KeyValuePair<string,object>(\"method\", \"GET\"));\nDuration.Record(42.5, new KeyValuePair<string,object>(\"path\", \"/api/users\"));\n```\n\n配合 OpenTelemetry SDK，这些指标可以导出到 Prometheus、Grafana、Azure Monitor 等后端。`AddMeter(\"MyApp\")` 就是把自定义 Meter 注册到 OTel 采集管道。"
     },
     {
       "type": "diagram",
@@ -53,55 +68,79 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | BenchmarkDotNet | dotnet-counters |\n| --- | --- | --- |\n| 用途 | 基准测试 | 实时监控 |\n| 执行方式 | 独立运行 | 附加到进程 |\n| 精度 | 高（统计分析） | 实时（采样） |\n| 适用场景 | 代码优化验证 | 生产监控 |\n| 输出 | 报告、表格 | 实时数据 |\n| 开销 | 大（多次运行） | 小（采样） |"
+      "title": "诊断工具链对比",
+      "content": "| 工具 | 用途 | 开销 | 平台 | 生产可用 | 输出形式 |\n| --- | --- | --- | --- | --- | --- |\n| dotnet-counters | 实时指标监控（CPU、GC、线程池、异常率） | 极低（< 0.1% CPU） | 跨平台 | ✅ 常驻 | 终端实时表格 / JSON 文件 |\n| dotnet-trace | CPU 采样 + 事件采集 | 低-中（采样间隔决定） | 跨平台 | ✅ 限时采集 | .nettrace 文件 |\n| dotnet-dump | 进程内存快照 + SOS 分析 | 抓取时短暂暂停进程 | 跨平台 | ⚠️ 谨慎使用 | core dump 文件 |\n| dotnet-gcdump | GC 堆快照（仅托管对象） | 低 | 跨平台 | ✅ 可用 | .gcdump 文件 |\n| PerfView | ETW 全量事件分析（CPU/内存/JIT/GC） | 中 | Windows only | ⚠️ 开发/测试 | 火焰图、调用树、统计 |\n| BenchmarkDotNet | 方法级微基准测试 | 高（多次迭代） | 跨平台 | ❌ 仅开发 | Markdown 表格报告 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | PerfView | dotnet-trace |\n| --- | --- | --- |\n| 平台 | Windows | 跨平台 |\n| 功能 | 全面（CPU、内存、事件） | 基础（跟踪、采样） |\n| 输出 | 火焰图、统计 | nettrace 文件 |\n| 学习曲线 | 陡峭 | 平缓 |\n| 适用场景 | 深度分析 | 快速诊断 |"
+      "title": "四种 Metrics 类型对比",
+      "content": "| 类型 | 值特性 | 典型场景 | 示例 |\n| --- | --- | --- | --- |\n| Counter\\<T\\> | 单调递增（只增不减） | 请求总数、错误总数、发送字节数 | `requests.Add(1)` |\n| UpDownCounter\\<T\\> | 可增可减 | 活跃连接数、队列长度、缓存条目数 | `active.Add(-1)` |\n| Histogram\\<T\\> | 记录值分布 | 请求延迟、响应大小、数据库查询耗时 | `duration.Record(42.5)` |\n| ObservableGauge | 瞬时快照（回调式） | CPU 使用率、内存使用量、线程数 | 注册回调函数 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | 计数器类型 | 使用场景 |\n| --- | --- | --- |\n| Counter | 累加值（请求数） | 总量统计 |\n| Histogram | 分布（延迟） | 性能分布 |\n| UpDownCounter | 可增可减（活跃连接） | 当前值 |\n| Gauge | 瞬时值（CPU使用率） | 快照 |"
+      "title": "线程池饥饿 vs GC 压力 vs CPU 热点",
+      "content": "| 维度 | 线程池饥饿 | GC 压力 | CPU 热点 |\n| --- | --- | --- | --- |\n| 核心征兆 | CPU 不高、延迟高、queue-length > 0 | time-in-gc > 10%、gen2 频繁 | cpu-usage > 80% |\n| 根因 | async 代码同步阻塞 | 分配速率高或长生命周期对象多 | 算法低效、正则回溯、序列化 |\n| 首要工具 | dotnet-counters → dotnet-dump 线程栈 | dotnet-counters → dotnet-gcdump | dotnet-counters → dotnet-trace 火焰图 |\n| 修复方向 | 全程 async/await，禁止 .Result | ArrayPool/ObjectPool、减少大对象 | 算法优化、缓存、并行化 |\n| .NET 特有坑 | hill-climbing 补线程慢（1-2/秒） | LOH 碎片化（85KB 直接进 Gen2） | JIT 第一次调用慢（可用 ReadyToRun） |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Diagnostics;\nusing System.Diagnostics.Metrics;\nusing System.Threading.Tasks;\nusing BenchmarkDotNet.Attributes;\nusing BenchmarkDotNet.Running;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\n\nnamespace PerformanceDiagnosticsDemo\n{\n    // BenchmarkDotNet 示例\n    [MemoryDiagnoser]\n    [SimpleJob(BenchmarkDotNet.Jobs.RuntimeMoniker.Net80)]\n    public class CollectionBenchmarks\n    {\n        private const int N = 10000;\n\n        [Benchmark]\n        public void ListAdd()\n        {\n            var list = new System.Collections.Generic.List<int>();\n            for (int i = 0; i < N; i++)\n            {\n                list.Add(i);\n            }\n        }\n\n        [Benchmark]\n        public void LinkedListAdd()\n        {\n            var list = new System.Collections.Generic.LinkedList<int>();\n            for (int i = 0; i < N; i++)\n            {\n                list.AddLast(i);\n            }\n        }\n\n        [Benchmark]\n        public void HashSetAdd()\n        {\n            var set = new System.Collections.Generic.HashSet<int>();\n            for (int i = 0; i < N; i++)\n            {\n                set.Add(i);\n            }\n        }\n    }\n\n    [MemoryDiagnoser]\n    public class StringBenchmarks\n    {\n        private const int N = 1000;\n\n        [Benchmark]\n        public string Concat()\n        {\n            var result = \"\";\n            for (int i = 0; i < N; i++)\n            {\n                result += i.ToString();\n            }\n            return result;\n        }\n\n        [Benchmark]\n        public string Builder()\n        {\n            var sb = new System.Text.StringBuilder();\n            for (int i = 0; i < N; i++)\n            {\n                sb.Append(i);\n            }\n            return sb.ToString();\n        }\n\n        [Benchmark(Baseline = true)]\n        public string Create()\n        {\n            return string.Create(N * 4, 0, (span, _) =>\n            {\n                for (int i = 0; i < N; i++)\n                {\n                    i.TryFormat(span, out var written);\n                    span = span.Slice(written);\n                }\n            });\n        }\n    }\n\n    // 自定义计数器\n    public class AppMetrics\n    {\n        private static readonly Meter Meter = new(\"MyApp\", \"1.0\");\n        private static readonly Counter<long> RequestCounter =\n            Meter.CreateCounter<long>(\"requests.total\");\n        private static readonly Histogram<double> RequestDuration =\n            Meter.CreateHistogram<double>(\"requests.duration\", \"ms\");\n        private static readonly UpDownCounter<long> ActiveRequests =\n            Meter.CreateUpDownCounter<long>(\"requests.active\");\n        private static readonly Counter<long> ErrorCounter =\n            Meter.CreateCounter<long>(\"errors.total\");\n\n        public void RecordRequest(string endpoint, double durationMs, bool success)\n        {\n            var tags = new TagList\n            {\n                { \"endpoint\", endpoint },\n                { \"success\", success.ToString() }\n            };\n\n            RequestCounter.Add(1, tags);\n            RequestDuration.Record(durationMs, tags);\n\n            if (!success)\n            {\n                ErrorCounter.Add(1, tags);\n            }\n        }\n\n        public void RequestStarted() => ActiveRequests.Add(1);\n        public void RequestCompleted() => ActiveRequests.Add(-1);\n    }\n\n    // 性能中间件\n    public class PerformanceMiddleware\n    {\n        private readonly RequestDelegate _next;\n        private readonly AppMetrics _metrics;\n        private readonly ILogger<PerformanceMiddleware> _logger;\n\n        public PerformanceMiddleware(\n            RequestDelegate next,\n            AppMetrics metrics,\n            ILogger<PerformanceMiddleware> logger)\n        {\n            _next = next;\n            _metrics = metrics;\n            _logger = logger;\n        }\n\n        public async Task InvokeAsync(HttpContext context)\n        {\n            var stopwatch = Stopwatch.StartNew();\n            _metrics.RequestStarted();\n\n            try\n            {\n                await _next(context);\n                _metrics.RecordRequest(\n                    context.Request.Path,\n                    stopwatch.Elapsed.TotalMilliseconds,\n                    context.Response.StatusCode < 400);\n            }\n            catch (Exception ex)\n            {\n                _metrics.RecordRequest(\n                    context.Request.Path,\n                    stopwatch.Elapsed.TotalMilliseconds,\n                    false);\n                throw;\n            }\n            finally\n            {\n                _metrics.RequestCompleted();\n\n                if (stopwatch.ElapsedMilliseconds > 1000)\n                {\n                    _logger.LogWarning(\n                        \"请求 {Path} 耗时 {Duration}ms\",\n                        context.Request.Path,\n                        stopwatch.ElapsedMilliseconds);\n                }\n            }\n        }\n    }\n\n    // GC 监控\n    public class GCMonitor\n    {\n        private readonly ILogger<GCMonitor> _logger;\n\n        public GCMonitor(ILogger<GCMonitor> logger)\n        {\n            _logger = logger;\n        }\n\n        public void LogGCStats()\n        {\n            _logger.LogInformation(\n                \"GC 统计: Gen0={Gen0}, Gen1={Gen1}, Gen2={Gen2}, 内存={Memory:N0} bytes\",\n                GC.CollectionCount(0),\n                GC.CollectionCount(1),\n                GC.CollectionCount(2),\n                GC.GetTotalMemory(false));\n        }\n    }\n\n    // 配置服务\n    public static class PerformanceServiceCollectionExtensions\n    {\n        public static IServiceCollection AddPerformanceMonitoring(this IServiceCollection services)\n        {\n            services.AddSingleton<AppMetrics>();\n            services.AddSingleton<GCMonitor>();\n\n            // 配置 OpenTelemetry\n            services.AddOpenTelemetry()\n                .WithMetrics(builder => builder\n                    .AddMeter(\"MyApp\")\n                    .AddAspNetCoreInstrumentation()\n                    .AddHttpClientInstrumentation()\n                    .AddPrometheusExporter());\n\n            return services;\n        }\n    }\n\n    // 应用配置\n    public static class PerformanceAppExtensions\n    {\n        public static IApplicationBuilder UsePerformanceMonitoring(this IApplicationBuilder app)\n        {\n            app.UseMiddleware<PerformanceMiddleware>();\n            return app;\n        }\n\n        public static WebApplication MapMetrics(this WebApplication app)\n        {\n            app.MapPrometheusScrapingEndpoint();\n            return app;\n        }\n    }\n}",
+      "title": "完整示例：BenchmarkDotNet + 自定义计数器 + 性能中间件",
       "language": "csharp",
+      "content": "using System;\nusing System.Diagnostics;\nusing System.Diagnostics.Metrics;\nusing System.Threading.Tasks;\nusing BenchmarkDotNet.Attributes;\nusing BenchmarkDotNet.Configs;\nusing BenchmarkDotNet.Running;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\nusing OpenTelemetry.Metrics;\n\n// ========== 1. BenchmarkDotNet 微基准测试 ==========\n[MemoryDiagnoser] // 必须加，否则看不到分配量\n[SimpleJob(RuntimeMoniker.Net80)]\npublic class StringBenchmarks\n{\n    private const int N = 1000;\n\n    [Benchmark]\n    public string Concat()\n    {\n        var result = \"\";\n        for (int i = 0; i < N; i++)\n            result += i.ToString();\n        return result;\n    }\n\n    [Benchmark]\n    public string Builder()\n    {\n        var sb = new System.Text.StringBuilder();\n        for (int i = 0; i < N; i++)\n            sb.Append(i);\n        return sb.ToString();\n    }\n\n    [Benchmark(Baseline = true)]\n    public string Create()\n    {\n        return string.Create(N * 4, 0, (span, _) =>\n        {\n            for (int i = 0; i < N; i++)\n            {\n                i.TryFormat(span, out var written);\n                span = span.Slice(written);\n            }\n        });\n    }\n}\n\n// ========== 2. 自定义业务计数器 ==========\npublic class AppMetrics\n{\n    private static readonly Meter Meter = new(\"MyApp\", \"1.0\");\n    private static readonly Counter<long> Requests =\n        Meter.CreateCounter<long>(\"http.requests.total\");\n    private static readonly Histogram<double> Duration =\n        Meter.CreateHistogram<double>(\"http.requests.duration\", \"ms\");\n    private static readonly UpDownCounter<long> Active =\n        Meter.CreateUpDownCounter<long>(\"http.requests.active\");\n    private static readonly Counter<long> Errors =\n        Meter.CreateCounter<long>(\"http.errors.total\");\n\n    public void Record(string path, double ms, int status)\n    {\n        var tags = new TagList\n        {\n            { \"path\", path },\n            { \"status\", status.ToString() }\n        };\n        Requests.Add(1, tags);\n        Duration.Record(ms, tags);\n        if (status >= 500) Errors.Add(1, tags);\n    }\n    public void Started() => Active.Add(1);\n    public void Completed() => Active.Add(-1);\n}\n\n// ========== 3. 性能中间件 ==========\npublic class PerfMiddleware\n{\n    private readonly RequestDelegate _next;\n    private readonly AppMetrics _metrics;\n\n    public PerfMiddleware(RequestDelegate next, AppMetrics metrics)\n    {\n        _next = next;\n        _metrics = metrics;\n    }\n\n    public async Task InvokeAsync(HttpContext ctx)\n    {\n        var sw = Stopwatch.StartNew();\n        _metrics.Started();\n        try\n        {\n            await _next(ctx);\n        }\n        finally\n        {\n            sw.Stop();\n            _metrics.Completed();\n            _metrics.Record(ctx.Request.Path, sw.Elapsed.TotalMilliseconds, ctx.Response.StatusCode);\n        }\n    }\n}\n\n// ========== 4. 注册 ==========\npublic static class Di\n{\n    public static IServiceCollection AddPerf(this IServiceCollection s)\n    {\n        s.AddSingleton<AppMetrics>();\n        s.AddOpenTelemetry().WithMetrics(b => b\n            .AddMeter(\"MyApp\")\n            .AddAspNetCoreInstrumentation()\n            .AddPrometheusExporter());\n        return s;\n    }\n}\n\n// 运行 Benchmark: dotnet run -c Release -- --filter \"*StringBenchmarks*\"",
       "highlights": [
         {
-          "line": 16,
-          "note": "`public class CollectionBenchmarks` 定义了 性能调优与诊断 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 5,
+          "note": "`[MemoryDiagnoser]` 是 BenchmarkDotNet 必加属性——没有它看不到分配量，而 .NET 性能优化的核心往往在减少分配而非减少指令。"
         },
         {
-          "line": 24,
-          "note": "`for (int i = 0; i < N; i++)` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+          "line": 12,
+          "note": "`Concat()` 的 `result += i.ToString()` 每次拼接都分配新字符串，是经典的 O(n²) 分配模式。"
         },
         {
-          "line": 116,
-          "note": "`if (!success)` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 29,
+          "note": "`[Benchmark(Baseline = true)]` 标记基线方法，其他方法会自动计算相对比率（Ratio 列）。"
         },
         {
-          "line": 21,
-          "note": "`public void ListAdd()` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "line": 47,
+          "note": "`Counter<long>` 是单调递增计数器，适合请求总数这类只增不减的指标。"
+        },
+        {
+          "line": 52,
+          "note": "`UpDownCounter<long>` 可增可减，适合活跃请求数这种需要跟踪当前值的场景。"
+        },
+        {
+          "line": 98,
+          "note": "`finally` 块确保无论成功失败都记录指标和活跃数——指标不丢失是监控的基本要求。"
+        },
+        {
+          "line": 109,
+          "note": "`AddMeter(\"MyApp\")` 把自定义 Meter 注册到 OpenTelemetry 采集管道，才能被 Prometheus 等后端采集。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：.NET 性能诊断的核心是一套跨平台工具链（dotnet-counters、trace、dump、gcdump）加方法论：先用 counters 看实时指标定位是 CPU、GC、线程池还是锁的问题，再用 trace 或 dump 下钻。\n\n诊断工具箱：\n\n1. dotnet-counters：实时看 CPU、GC（各代回收、堆大小）、线程池队列长度、异常率，第一步用它定位大方向，几乎零开销。\n2. dotnet-trace：采样 CPU 火焰图，找热点方法（类似 perf）。\n3. dotnet-dump：抓内存 dump，用 SOS 分析对象、找泄漏（类似 jmap 加 MAT）。\n4. dotnet-gcdump：专门抓 GC 堆快照看对象分布。\n5. PerfView 或 Visual Studio Profiler：可视化分析。\n\n常见问题套路：\n\n1. CPU 高：dotnet-trace 抓火焰图，看是死循环、序列化还是正则。\n2. 内存涨或泄漏：dotnet-gcdump 或 dump 看哪类对象一直增长、谁持有引用。\n3. 线程池饥饿：counters 看 ThreadPool 队列堆积——常因在 async 代码里同步阻塞（.Result、.Wait）。\n4. GC 压力：看 Gen2 和 LOH 分配，减少大对象和高频分配。\n\n边界和原则。① 先 counters 定大方向再深挖，别一上来抓 dump。② 线程池饥饿是 .NET 高频坑，根因常是同步阻塞异步。③ 生产抓 dump 会暂停进程，注意影响。",
+      "content": "**一句话结论**\n.NET 性能诊断的核心方法论是「先 dotnet-counters 定大方向，再 trace/dump 下钻」——counters 几乎零开销、生产可常驻，能第一时间区分是 CPU 高、GC 频、线程池饥饿还是内存泄漏。\n\n**工具箱（按使用顺序）**\n1. **dotnet-counters**：实时看 CPU、GC 各代次数和堆大小、线程池队列长度、异常率、锁竞争。第一步用它定位大方向\n2. **dotnet-trace**：CPU 高时抓火焰图，找热点方法（序列化、正则、循环）\n3. **dotnet-gcdump**：GC 频繁或内存涨时抓堆快照，看哪些类型实例多、占内存大\n4. **dotnet-dump**：内存泄漏时抓完整 dump，用 SOS 的 `dumpheap -stat` / `gcroot` 追踪引用链\n5. **BenchmarkDotNet**：优化前后跑基准对比，确认效果。必须 `[MemoryDiagnoser]`、Release 配置\n\n**高频问题定位套路**\n\n**线程池饥饿**（.NET 最高频坑）：\n- 征兆：CPU 不高、但请求延迟飙升、ThreadPool Queue Length > 0 且持续增长\n- 根因：async 代码里用了 `.Result` / `.Wait()` 同步阻塞，线程池线程被占住。.NET 线程池 hill-climbing 补线程约 1-2 个/秒，远不够\n- 定位：counters 看 queue-length → dump 看线程栈 → 找 `.Result` 行 → 改成 await\n\n**GC 压力**：\n- 征兆：`gen-2-gc-count` 频繁、`time-in-gc` > 10%\n- 根因：大量短生命周期大对象（> 85KB 直接进 LOH/Gen2）、缓存无过期、事件未取消订阅\n- 定位：counters 看 GC 趋势 → gcdump 看对象分布 → dump + `gcroot` 找引用链\n\n**自定义指标**\n用 `System.Diagnostics.Metrics` 的 Meter + Counter/Histogram/UpDownCounter 暴露业务指标，配合 OpenTelemetry 导出到 Prometheus/Grafana。\n\n**边界和原则**\n- 先 counters 定方向再深挖，别一上来抓 dump\n- 生产抓 dump 会短暂暂停进程，要在副本上做\n- BenchmarkDotNet 必须 Release 配置 + `[MemoryDiagnoser]`，否则结果不可信\n- 线程池饥饿在 .NET 比 Java 更隐蔽——没有拒绝策略，请求只会一直排队不快速失败",
       "followUpQuestions": [
         {
-          "question": "线上 ASP.NET 应用请求延迟突然飙升但 CPU 不高，最可能是什么？怎么定位？",
-          "answer": "最可能是线程池饥饿。表现就是「CPU 不高但请求排队、延迟飙升」——因为请求处理线程被同步阻塞占住了，新请求在线程池队列里排队。用 dotnet-counters 看 ThreadPool Queue Length 是不是持续堆积、Thread Count 是不是在缓慢增长（线程池在慢慢补线程）。根因几乎都是在 async 链路里用了 .Result、.Wait()、或同步 IO，把本该让出的线程占死了。定位到后改成全程 async/await，必要时抓 dump 看阻塞的线程栈停在哪个 .Result。"
+          "question": "线上 ASP.NET 应用请求延迟飙升但 CPU 只有 20%，最可能是什么？怎么定位和修复？",
+          "answer": "最可能是线程池饥饿。CPU 不高但延迟高是典型特征——线程池线程全在 `.Result` 或 `.Wait()` 上阻塞等 IO，CPU 空转但线程不释放。定位：① dotnet-counters 看 `threadpool-queue-length` 是否持续 > 0、`threadpool-thread-count` 是否缓慢增长；② dotnet-dump 抓 dump → `threads` 看线程栈，大量线程停在 `Monitor.Wait` 或 `Task.Result`；③ 沿栈帧找到同步阻塞代码，改成 `async/await`。修复后队列长度应归零，延迟恢复。"
         },
         {
-          "question": "dotnet-counters、dotnet-trace、dotnet-dump 各用在什么场景？",
-          "answer": "dotnet-counters 是「仪表盘」——实时、低开销，看 CPU、GC 各代、堆大小、线程池队列、异常率、请求速率，生产可以常驻，用来第一时间判断问题大方向。dotnet-trace 是「采样剖析器」——抓一段时间的 CPU 调用栈生成火焰图，定位哪个方法吃 CPU，适合 CPU 高的场景。dotnet-dump 是「内存快照」——抓进程完整内存 dump，配 SOS 扩展分析对象数量、引用链、找内存泄漏和死锁，适合内存涨或 hang 的场景（但抓时会暂停进程）。套路是 counters 定方向、trace 查 CPU、dump 查内存和阻塞。"
+          "question": "GC 压力大、time-in-gc > 15%，怎么排查根因？",
+          "answer": "分三步：① dotnet-counters 看 `gen-2-gc-count` 和 `gc-heap-size` 趋势——如果 Gen2 频繁且回收后堆不降，有泄漏；如果回收后堆能降下来，是分配速率过高；② dotnet-gcdump 抓堆快照，看哪些类型实例数量和大小排前列——常见是 byte[]、string、自定义 DTO；③ 如果怀疑泄漏，dotnet-dump → `dumpheap -stat` 找实例数异常的类型 → `gcroot <address>` 追踪引用链，常见是缓存没有过期、事件订阅没取消、静态集合持续增长。高频分配场景用 `ArrayPool<byte>.Shared`、`ObjectPool<T>`、`stackalloc` 减少 GC 压力。"
+        },
+        {
+          "question": "dotnet-counters 和 Application Insights / Prometheus 有什么区别？",
+          "answer": "dotnet-counters 是命令行诊断工具——附加到进程实时看计数器，零配置、零开销，适合出问题时第一时间看现场、本地调试。Application Insights / Prometheus 是监控平台——需要提前配置采集器和导出器，做长期趋势、告警、关联分析。两者配合使用：dotnet-counters 用于应急诊断，Prometheus/AppInsights 用于日常监控。自定义 Metrics API（System.Diagnostics.Metrics）是连接两者的桥梁——同一个 Meter 既能让 dotnet-counters 看到，也能通过 OpenTelemetry SDK 导出到 Prometheus。"
+        },
+        {
+          "question": "BenchmarkDotNet 测试结果 StdDev 很大（超过 Mean 的 20%），可能是什么原因？",
+          "answer": "说明测试结果不稳定，常见原因：① 没有 Release 配置运行（Debug 模式 JIT 不优化，结果随机）；② 测试机器有后台进程抢占 CPU（需要设置进程亲和性和优先级）；③ GC 干扰——方法里有分配但没有 GC 隔离（`[IterationSetup]` 里强制 GC）；④ 测试方法本身不稳定（有 IO、网络、随机数等非确定性因素）；⑤ CPU 热管理降频（笔记本常见，需要 BIOS 关闭节能模式）。BenchmarkDotNet 默认会在分析阶段剔除受 GC 影响的迭代，但如果方法本身有外部依赖，需要排除这些因素后再跑。"
+        },
+        {
+          "question": ".NET 的线程池饥饿和 Java 的线程池满载（reject）有什么本质区别？",
+          "answer": ".NET 线程池没有用户可配置的队列容量和拒绝策略——任务提交后就排队，不会拒绝。这意味着：① 故障模式是延迟无限增长而非快速失败——客户端不会收到明确错误，只会超时；② 没有 backpressure 机制——上游不知道下游已经过载，继续提交任务；③ 线程池用 hill-climbing 算法自适应调整线程数，但补线程速度约 1-2 个/秒，远不够应对突发。Java 线程池可以通过有界队列 + 拒绝策略实现快速失败和背压。.NET 应用需要自己用 Semaphore、Channel 或中间件限流来实现背压。"
         }
       ]
     },
@@ -109,54 +148,71 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "BenchmarkDotNet 的使用方法和输出解读",
-        "dotnet-counters 的常用计数器和监控方式",
-        "PerfView 的主要功能和使用场景",
-        "自定义计数器的实现方式",
-        "内存分析工具（dotnet-dump、dotnet-trace）",
-        "性能优化的常见策略"
+        "BenchmarkDotNet 为什么必须加 `[MemoryDiagnoser]`、用 Release 配置运行，输出中 Mean/Error/Allocated 分别看什么",
+        "dotnet-counters 能监控哪些 System.Runtime 计数器，每个异常值意味着什么下一步操作",
+        "线程池饥饿的征兆（CPU 不高但延迟高、queue-length > 0）、根因（async 代码同步阻塞）和定位步骤",
+        "GC 压力和内存泄漏的区别，各自用什么工具和 SOS 命令定位",
+        "dotnet-trace 和 PerfView 各用在什么场景，输出什么格式的文件",
+        "System.Diagnostics.Metrics 四种指标类型（Counter/UpDownCounter/Histogram/ObservableGauge）各自适合什么场景",
+        "「先 counters 定方向、再 trace/dump 下钻」的完整诊断流程"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "dotnet.advanced.performance-diagnostics.recall.1",
-      "prompt": "请说明 性能调优与诊断 的核心机制、典型使用场景和常见坑。",
+      "prompt": "线上 ASP.NET 应用延迟飙升但 CPU 不高，你会怎么排查？请讲清从 counters 到 dump 的完整定位过程。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
       "id": "dotnet.advanced.performance-diagnostics.recall.2",
-      "prompt": "dotnet-counters 可以监控哪些计数器？如何实现自定义计数器？",
+      "prompt": "dotnet-counters、dotnet-trace、dotnet-dump、dotnet-gcdump 各用在什么场景？请按诊断顺序讲。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
       "id": "dotnet.advanced.performance-diagnostics.recall.3",
-      "prompt": "性能调优与诊断 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "GC 压力大、time-in-gc > 15%，怎么排查根因？如何区分是分配速率高还是内存泄漏？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
+    },
+    {
+      "id": "dotnet.advanced.performance-diagnostics.recall.4",
+      "prompt": "请说明 .NET System.Diagnostics.Metrics 四种指标类型的区别，以及如何配合 OpenTelemetry 使用。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.advanced.performance-diagnostics.recall.5",
+      "prompt": "BenchmarkDotNet 的输出怎么解读？StdDev 很大说明什么？`[MemoryDiagnoser]` 加不加有什么区别？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出 dotnet-counters/trace/dump/gcdump 各自用途",
-      "能用「先 counters 定方向再下钻」的方法论",
-      "能定位线程池饥饿（同步阻塞 async）",
-      "能定位内存泄漏和 GC 压力"
+      "能用「先 counters 定方向、再 trace/dump 下钻」的诊断方法论，说清每步看什么指标、选什么工具",
+      "能定位线程池饥饿：征兆（CPU 不高延迟高、queue-length > 0）、根因（async 代码同步阻塞 .Result/.Wait()）、定位步骤",
+      "能定位 GC 压力：看 gen-2-gc-count 和 time-in-gc，区分分配速率高和内存泄漏，用 gcdump/dump + SOS 分析",
+      "能区分 dotnet-counters/trace/dump/gcdump 各自用途和使用场景"
     ],
     "goodToHave": [
-      "能解释线程池饥饿表现为 CPU 不高但延迟飙升",
-      "能用 SOS 分析 dump",
-      "能说明生产抓 dump 会暂停进程"
+      "能解释 .NET 线程池 hill-climbing 算法补线程慢（1-2 个/秒）导致饥饿更隐蔽",
+      "能用 SOS 命令（dumpheap -stat、gcroot、finalizequeue）分析 dump",
+      "能说明生产抓 dump 会短暂暂停进程，要在副本上做",
+      "能解释 BenchmarkDotNet 必须 Release + `[MemoryDiagnoser]` 的原因"
     ],
     "commonMistakes": [
-      "一上来就抓 dump 而不先用 counters 定方向",
-      "忽略线程池饥饿（误以为是 CPU 或 DB 问题）",
-      "在 async 链路里同步阻塞导致线程池耗尽"
+      "一上来抓 dump 而不先用 counters 定方向（不知道查什么）",
+      "忽略线程池饥饿——误以为是 CPU 或数据库问题（CPU 不高但延迟高是典型信号）",
+      "在 async 链路里用 .Result / .Wait() 同步阻塞导致线程池耗尽",
+      "BenchmarkDotNet 用 Debug 配置运行或不加 `[MemoryDiagnoser]`，结果不可信"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -166,6 +222,6 @@
     }
   },
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察能否用 dotnet-counters 先定方向、再用 trace/dump 下钻，并定位线程池饥饿、内存泄漏、GC 压力等问题。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察能否用 dotnet-counters 先定方向、再用 trace/dump 下钻的完整方法论，并精准定位线程池饥饿（CPU 不高延迟高、queue-length > 0、根因是 async 同步阻塞）、GC 压力和内存泄漏等高频问题。",
+  "updatedAt": "2026-06-23"
 }

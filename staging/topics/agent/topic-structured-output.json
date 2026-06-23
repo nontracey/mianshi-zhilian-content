@@ -4,7 +4,7 @@
   "category": "tool-agent",
   "group": "tool-agent",
   "title": "结构化输出与约束解码",
-  "summary": "对比 prompt 约束、function calling 与约束解码，理解如何保证模型输出严格符合 JSON Schema。",
+  "summary": "对比 prompt 约束、function calling 与约束解码三种方式，讲清 constrained decoding 的状态机与 token 级屏蔽原理、厂商 API strict 模式实现、格式合法 vs 语义正确的边界，以及工程兜底（schema 校验 + 拒答/截断 + 重试 + 指标观测）。",
   "tags": [
     "Agent",
     "结构化输出",
@@ -12,19 +12,54 @@
     "约束解码"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 23,
   "order": 15,
   "recommendWeight": 85,
   "learningCards": [
     {
       "type": "explain",
-      "title": "为什么要结构化输出，三种方式",
-      "content": "## 为什么需要\nAgent/工具链要把模型输出**程序化消费**（解析字段、触发函数、写库）。自由文本难解析、易出错，必须让输出严格符合预期结构（如 JSON Schema）。\n\n## 三种方式（可靠性递增）\n1. **Prompt 约束**：在提示里要求“只输出 JSON”。最简单但**不可靠**——模型可能加解释、漏字段、格式错。\n2. **Function/Tool Calling**：把目标结构定义成函数参数 schema，模型按 schema 产出参数。主流且可靠，是工具调用的基础。\n3. **结构化输出 / 约束解码**：`response_format` 指定 JSON Schema（strict 模式）或在解码层强制约束，在正常完成路径上强约束 schema 合法。\n\n## 关系\nFunction calling 解决“调用哪个工具、传什么参数”；结构化输出解决“最终答案是某个固定结构”。二者可结合：用工具 schema 约束参数，用结构化输出约束最终结果。"
+      "title": "为什么需要结构化输出：程序化消费的刚需",
+      "content": "Agent、工具链和自动化管线要把模型输出**直接喂给下游代码**——解析字段、触发函数调用、写数据库、填充表格。自由文本天然不可靠：模型可能加一段解释、漏掉必填字段、JSON 里多写一个逗号，甚至输出 Markdown 包裹的代码块而非裸 JSON。任何一次解析失败都会导致工具链中断或脏数据入库，代价比模型答错一句话高得多。\n\n所以核心诉求是：模型的最终回答必须**严格符合预定义结构**（通常是 JSON Schema），而且这个保证不能靠模型「自觉」，要靠系统层面的机制。三种方式的可靠性差异本质上来自「约束在哪一层生效」——prompt 在生成前的语言层，function calling 在参数提交层，constrained decoding 在逐 token 的解码层。越靠近底层，绕过的概率越低。"
     },
     {
       "type": "explain",
-      "title": "约束解码（constrained decoding）原理",
-      "content": "## 原理\n在**逐 token 解码**时，根据目标语法/JSON Schema 构造一个状态机，**屏蔽掉所有会破坏结构的 token**（把它们的概率置零），只允许采样合法 token。于是模型在正常解码路径上只能选择符合语法/schema 的 token，而不是只靠提示词自觉。\n\n## 实现\n- 语法约束：GBNF 语法、`Outlines`、`XGrammar`、llama.cpp grammar、vLLM 的 guided decoding。\n- 厂商 API 的 strict JSON Schema（如 OpenAI structured outputs）底层即约束解码。\n\n## 可靠性与代价\n- 优点：显著降低格式错误，减少解析重试。\n- 代价：构建/维护语法状态机有开销；过强约束可能轻微影响内容质量；复杂嵌套 schema 编译成本上升。\n- 工程兜底：即便用约束解码，仍要做 schema 校验 + 失败重试，处理语义（而非格式）错误。"
+      "title": "约束解码原理：语法状态机 + token 级屏蔽",
+      "content": "Constrained decoding 的核心思路是：在模型逐 token 解码时，根据目标 JSON Schema（或正则、CFG 语法）实时构造一个**有限状态机**，状态机跟踪当前位于 JSON 的哪个位置（对象 key、value、嵌套层级、数组索引），然后计算出当前位置**哪些 token 是合法的**，把不合法 token 的 logit 置为 -∞（或概率置零），只从合法集合中采样。\n\n具体步骤：① 将 JSON Schema 编译成确定性有限自动机（DFA）或下推自动机（PDA，处理嵌套）；② 解码第 n 个 token 时，状态机处于某个状态，映射到合法 token 集合；③ 对模型输出的 logits 做 mask——合法 token 保留原始概率，非法 token 概率归零；④ softmax 后从合法集合中采样；⑤ 状态机根据采出的 token 转移到下一个状态。\n\n这套机制的直接效果：只要模型正常完成（不被截断、不拒答），输出就**一定是合法的 JSON 且严格匹配 schema**。概率是 100%，不是「大概率」。代价是：① schema 编译有开销，嵌套越深、枚举越大，状态机越复杂；② 每步解码多一次 mask 计算，增加延迟；③ 约束过强时模型被迫选次优 token，可能轻微影响内容质量；④ 不同实现对 \\$ref、oneOf、patternProperties 等高级 schema 关键字支持程度不一。"
+    },
+    {
+      "type": "explain",
+      "title": "主流实现与厂商 API",
+      "content": "开源领域：**Outlines**（基于正则/JSON Schema 构造 FSM，支持多种后端）、**XGrammar**（llm-compiler 社区的高性能方案，被 vLLM 集成）、**llama.cpp grammar**（用 GBNF 语法约束本地推理）、**vLLM guided decoding**（通过 logit_processor 实现 schema/正则约束，支持 Outlines 和 XGrammar 后端）。它们的共同思路都是「编译 schema → 解码时 mask logits」，区别在于状态机实现效率和对 schema 子集的支持范围。\n\n厂商 API：**OpenAI structured outputs**（`response_format` 设为 `json_schema` + `strict: true`，底层即约束解码，2024 年 8 月推出）保证正常完成路径上输出严格匹配 schema；**Anthropic** 通过 tool_use 的参数 schema 约束工具调用参数；**Google Gemini** 提供 controlled generation / response schema。注意：厂商 API 的「strict」语义各不同——有的是真约束解码（100% 格式合法），有的只是强提示 + 后处理校验（仍可能失败），选型时需验证。"
+    },
+    {
+      "type": "compareTable",
+      "title": "三种结构化方式对比",
+      "content": "| 对比维度 | Prompt 约束 | Function/Tool Calling | Constrained Decoding |\n| --- | --- | --- | --- |\n| 约束生效层 | 生成前提示词 | 参数 schema 运行时 | 逐 token 解码层 mask |\n| 格式可靠性 | 低，靠模型遵循 | 高，工具参数按 schema | 正常完成时 100% 合法 |\n| 适用场景 | 简单原型、快速验证 | 选择工具 + 约束参数 | 固定结构的最终结果 |\n| 仍可能失败 | 漏字段、多解释、格式错 | 参数语义仍可能错 | 截断、拒答、安全中止 |\n| 实现成本 | 零，写提示即可 | API 级，厂商支持 | 需 schema 编译 + mask 基础设施 |\n| 仍需校验 | JSON parse + schema + 业务 | schema + 业务权限 | schema + 业务语义 + 状态 |\n| 延迟影响 | 无 | 轻微（多一次结构化输出） | mask 计算 + schema 编译 |"
+    },
+    {
+      "type": "code",
+      "title": "代码示例：OpenAI strict schema + 工程兜底",
+      "language": "python",
+      "content": "import json\nimport jsonschema\nfrom openai import OpenAI\n\nclient = OpenAI()\n\n# 1. 定义目标结构\nschema = {\n    \"type\": \"object\",\n    \"properties\": {\n        \"city\": {\"type\": \"string\"},\n        \"temperature\": {\"type\": \"number\"},\n        \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]},\n        \"forecast\": {\n            \"type\": \"array\",\n            \"items\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"day\": {\"type\": \"string\"},\n                    \"high\": {\"type\": \"number\"},\n                    \"low\": {\"type\": \"number\"}\n                },\n                \"required\": [\"day\", \"high\", \"low\"],\n                \"additionalProperties\": False\n            }\n        }\n    },\n    \"required\": [\"city\", \"temperature\", \"unit\", \"forecast\"],\n    \"additionalProperties\": False\n}\n\n# 2. 调用 API（strict=True 时底层用约束解码）\nresponse = client.chat.completions.create(\n    model=\"gpt-4o-2024-08-06\",\n    messages=[{\"role\": \"user\", \"content\": \"北京未来 3 天天气，返回结构化数据\"}],\n    response_format={\n        \"type\": \"json_schema\",\n        \"json_schema\": {\"name\": \"weather\", \"schema\": schema, \"strict\": True}\n    }\n)\nraw_text = response.choices[0].message.content\n\n# 3. 工程兜底：约束解码保证可解析 + schema 校验 + 业务语义检查\ntry:\n    obj = json.loads(raw_text)                # 约束解码保证这步不会失败\n    jsonschema.validate(obj, schema)          # 再验 schema（防御性）\n    # 业务语义校验：schema 无法约束的\n    if obj[\"unit\"] == \"celsius\" and obj[\"temperature\"] > 60:\n        raise ValueError(\"温度异常：摄氏度超 60\")\n    if len(obj[\"forecast\"]) != 3:\n        raise ValueError(f\"预期 3 天预报，实际 {len(obj['forecast'])} 条\")\nexcept (json.JSONDecodeError, jsonschema.ValidationError, ValueError) as e:\n    # 重试、降级或人工兜底\n    print(f\"校验失败: {e}\")",
+      "highlights": [
+        {
+          "line": 33,
+          "note": "strict=True 开启约束解码，正常完成时 json.loads 不会失败。"
+        },
+        {
+          "line": 40,
+          "note": "schema 校验是防御性措施，约束解码下理论上已保证。"
+        },
+        {
+          "line": 42,
+          "note": "业务语义校验（单位、范围、条数）是 schema 无法覆盖的，必须额外检查。"
+        }
+      ]
+    },
+    {
+      "type": "explain",
+      "title": "格式合法 ≠ 语义正确：约束解码的真正边界",
+      "content": "约束解码能做到的是：输出一定是合法的 JSON，且字段名、类型、必填项、枚举值都严格匹配 schema。但它**管不了字段里的具体内容是否正确**。比如 `temperature` 字段类型是 number，schema 保证它是个数字，但不能保证这个数字是真实的天气温度；`unit` 是枚举约束 `celsius/fahrenheit`，但模型可能该选摄氏却选了华氏；`forecast` 数组长度约束在 schema 层面通常只能写 `minItems/maxItems`，无法动态约束「必须等于查询的天数」。\n\n另一个边界是**完成状态**：constrained decoding 只在正常完成路径上有效。如果模型因 max_tokens 被截断、触发安全策略拒答、或遇到系统错误中止，输出可能不完整或为空，此时约束解码不生效。工程上必须检查 `finish_reason`，对非 `stop` 的情况做重试或降级。\n\n所以正确的工程模式是：约束解码保证格式 → schema 校验做防御性检查 → 业务语义校验检查字段含义 → 重试或兜底处理失败。四层缺一不可。"
     },
     {
       "type": "diagram",
@@ -45,26 +80,7 @@
       ]
     },
     {
-      "type": "compareTable",
-      "title": "三种结构化方式对比",
-      "content": "| 对比项 | Prompt 约束 | Function Calling | 约束解码/strict schema |\n| --- | --- | --- | --- |\n| 格式稳定性 | 弱，靠模型遵循 | 强，参数按 schema | 正常完成路径上由解码约束保证 |\n| 适合用途 | 简单原型 | 工具选择和参数 | 固定结构最终结果 |\n| 异常路径 | 多解释、漏字段、解析失败 | 参数语义仍可能错 | 拒答、截断、安全中止仍要处理 |\n| 仍需校验 | JSON parse + schema | schema + 业务权限 | schema + 业务语义 + 状态检查 |"
-    },
-    {
-      "type": "code",
-      "title": "代码示例",
-      "content": "# OpenAI 风格 structured outputs（strict JSON Schema）\nschema = {\n    \"type\": \"object\",\n    \"properties\": {\n        \"name\": {\"type\": \"string\"},\n        \"age\": {\"type\": \"integer\"},\n        \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}\n    },\n    \"required\": [\"name\", \"age\"],\n    \"additionalProperties\": False\n}\n# response_format={\"type\": \"json_schema\",\n#                  \"json_schema\": {\"name\": \"person\", \"schema\": schema, \"strict\": True}}\n# strict=True 时底层用约束解码，保证输出严格匹配 schema\n\n# 工程兜底：即便如此也要校验 + 重试语义错误\nimport json, jsonschema\ndef parse_safe(text):\n    obj = json.loads(text)            # 约束解码保证可解析\n    jsonschema.validate(obj, schema)  # 再校验业务约束\n    return obj",
-      "language": "python",
-      "highlights": [
-        {
-          "line": 21,
-          "note": "返回前已经过 JSON 解析与 schema 校验；这正是结构化输出区别于普通文本后处理的可靠性边界。"
-        }
-      ]
-    },
-    {
       "type": "interviewAnswer",
-      "title": "面试回答思路",
-      "content": "30 秒结论：结构化输出解决的是“模型回答能被程序稳定消费”的问题。prompt 约束只能提高概率，function calling/JSON schema 能把输出空间收窄，约束解码进一步在生成时屏蔽非法 token，但格式合法不等于语义正确。\n\n机制要点：\n- 我会按三层讲：第一层是 prompt 要求 JSON，成本低但最不可靠；第二层是 function calling 或 response schema，把字段、类型、必填项交给模型和运行时约束；第三层是 constrained decoding，根据 JSON Schema、正则或语法在 token 级限制生成，能显著提高格式合法率。\n- 边界上，格式合法也可能字段含义错、单位错、枚举选错、拒答或因长度截断失败，所以还要做业务校验、重试、拒答和人工兜底。验证时看 schema 合法率、字段准确率、业务校验失败率、重试率和下游解析异常。",
       "followUpQuestions": [
         {
           "question": "约束解码能不能保证答案正确？",
@@ -78,38 +94,48 @@
           "question": "结构化输出上线看什么指标？",
           "answer": "看 schema 合法率、字段准确率、业务校验失败率、重试率、解析异常、人工修正率和延迟成本。只看 JSON parse 成功是不够的。"
         }
-      ]
+      ],
+      "title": "面试回答思路",
+      "content": "**30 秒结论**：结构化输出解决的是「模型回答能被程序稳定消费」的问题。三种方式可靠性递增——prompt 约束靠自觉，function calling 在参数层约束，constrained decoding 在解码层用状态机屏蔽非法 token，正常完成时 100% schema 合法。但格式合法不等于语义正确，截断和拒答仍需工程兜底。\n\n**机制主线**\n- **Prompt 约束**：提示词要求输出 JSON，成本最低但不可靠——模型可能加解释、漏字段、格式错。\n- **Function/Tool Calling**：把参数结构显式交给模型运行时，是工具调用的基础；但约束的是工具参数，最终答案格式不一定受约束。\n- **Constrained Decoding**：将 JSON Schema 编译成状态机（DFA/PDA），解码时实时计算合法 token 集，mask 掉非法 token 的 logit，模型只能从合法集合中采样。主流实现包括 Outlines、XGrammar、vLLM guided decoding、llama.cpp grammar；厂商 API（OpenAI strict、Gemini response schema）底层也是这套机制。\n- **边界**：截断/拒答/安全中止时约束不生效，必须检查 finish_reason；字段语义、业务规则（单位、范围、枚举含义、权限）仍需额外校验；嵌套深/枚举大的 schema 编译成本上升。\n\n**指标观测**：schema 合法率、字段准确率、业务校验失败率、重试率、解析异常数、人工修正率、延迟增量。\n\n**followUpQuestions 答案要点**\n- 约束解码保证格式但不保证内容正确——温度是数字但可能是幻觉值，枚举选对但含义错。靠评估集 + 业务校验 + 下游验证。\n- Function calling vs JSON prompt：前者在运行时约束参数结构，后者只靠语言暗示，漏字段和格式错概率高得多。function calling 也更容易做字段级重试。\n- 线上看什么：schema 合法率（约束解码下应接近 100%）、字段准确率（需人工标注或规则校验）、业务校验失败率、重试率、解析异常数。只看 JSON parse 成功是不够的，语义错误解析不出来。"
     },
     {
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说出 prompt 约束/function calling/约束解码三种方式及可靠性差异",
-        "能解释约束解码如何在解码层屏蔽非法 token 保证合法",
-        "能区分 function calling 与结构化输出的定位",
-        "能说明约束解码的代价和适用边界",
-        "能说清结构化输出保证格式但不保证语义，仍需校验重试"
+        "能说出 prompt 约束、function calling、constrained decoding 三层约束方式及可靠性差异",
+        "能解释 constrained decoding 的状态机 + token mask 机制，为什么正常完成时 100% schema 合法",
+        "能区分 function calling（约束工具参数）与 structured output（约束最终结果）的定位",
+        "能指出 constrained decoding 的代价：schema 编译开销、延迟增加、高级 schema 关键字支持差异、内容质量轻微影响",
+        "能说清格式合法 ≠ 语义正确，必须有业务校验、截断/拒答处理和重试兜底",
+        "能列举线上观测指标：schema 合法率、字段准确率、业务校验失败率、重试率、解析异常"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "agent.tool-agent.topic-structured-output.recall.1",
-      "prompt": "对比 prompt 约束、function calling、约束解码三种结构化输出方式的可靠性与实现成本。",
+      "prompt": "对比 prompt 约束、function calling、constrained decoding 三种结构化输出方式，讲清各自约束生效的位置、可靠性差异和适用场景。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "agent.tool-agent.topic-structured-output.recall.2",
-      "prompt": "约束解码为什么能 100% 保证输出符合 JSON Schema？它有哪些代价和边界？",
+      "prompt": "约束解码是怎么在逐 token 解码时保证输出 100% 符合 JSON Schema 的？请讲清楚状态机和 logit mask 的工作流程。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "agent.tool-agent.topic-structured-output.recall.3",
-      "prompt": "约束解码是怎么在正常生成路径上约束输出符合 JSON Schema 的？和在提示词里要求输出 JSON 有什么本质区别？",
+      "prompt": "结构化输出能保证格式合法，为什么不能保证语义正确？请举具体例子说明哪些错误是约束解码无法拦截的。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.tool-agent.topic-structured-output.recall.4",
+      "prompt": "上线一个使用约束解码的结构化输出功能，你会看哪些指标来验证效果？为什么只看 JSON parse 成功率是不够的？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -117,32 +143,34 @@
   ],
   "rubric": {
     "mustHave": [
-      "能区分 prompt 约束、function calling/schema 和约束解码的可靠性差异",
-      "能说明约束解码如何在 token 级屏蔽非法输出",
-      "能指出格式合法不等于语义正确，仍需业务校验",
-      "能用 schema 合法率、字段准确率、业务校验失败率和解析异常验证效果"
+      "能区分 prompt 约束、function calling 和 constrained decoding 的约束生效层与可靠性递增关系",
+      "能解释 constrained decoding 的状态机 + token logit mask 机制，正常完成时 100% schema 合法",
+      "能指出格式合法 ≠ 语义正确：字段含义、单位、枚举选择、业务规则仍需额外校验",
+      "能说明截断/拒答/安全中止是约束解码的边界，需检查 finish_reason 并做重试兜底"
     ],
     "goodToHave": [
-      "Outlines/XGrammar/vLLM guided decoding",
-      "strict JSON Schema",
-      "校验+重试兜底"
+      "能说出 Outlines/XGrammar/vLLM guided decoding 等主流实现",
+      "能区分 function calling（约束工具参数）与 structured output（约束最终结果）的定位差异",
+      "能列举线上指标：schema 合法率、字段准确率、业务校验失败率、重试率、解析异常",
+      "能说明 schema 编译开销、延迟影响、高级 schema 关键字支持差异等工程代价"
     ],
     "commonMistakes": [
-      "只靠 prompt 要求 JSON 就认为可靠",
-      "以为结构化输出能保证语义正确",
-      "混淆 function calling 与结构化输出"
+      "只靠 prompt 要求 JSON 就认为输出可靠，不做 parse 和校验",
+      "以为 constrained decoding 保证了格式就能保证语义正确，不做业务校验",
+      "混淆 function calling（约束工具参数）与 structured output（约束最终结果）",
+      "忽略截断和拒答场景，不检查 finish_reason 就直接 json.loads"
     ],
     "scoreWeights": {
-      "coverage": 30,
+      "coverage": 25,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 20
+      "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "staging",
   "interviewFrequency": "high",
-  "interviewerFocus": "考察结构化输出三种方式的取舍与约束解码原理，以及格式保证与语义校验的边界。",
+  "interviewerFocus": "考察三层结构化方式的取舍、constrained decoding 的状态机与 token mask 原理、格式合法 vs 语义正确的边界、以及工程兜底与指标观测。",
   "prerequisites": [
     "agent.tool-agent.topic-087-81c07ef4"
   ]

@@ -4,83 +4,113 @@
   "category": "concurrency",
   "group": "concurrency",
   "title": "ReentrantLock",
-  "summary": "讲清 ReentrantLock 基于 AQS 的可中断/超时/公平/多条件能力、unlock 必须 finally、公平与非公平、Condition 精确唤醒，以及与 synchronized 的选型。",
+  "summary": "讲清 ReentrantLock 如何用 AQS 独占模式管理 state 重入计数和 exclusiveOwnerThread、公平与非公平在 tryAcquire 入口的差异、lock/lockInterruptibly/tryLock/tryLock(timeout) 四种获取路径的等待语义、Condition 如何从条件队列转移到同步队列重新竞争并恢复重入层数，以及与 synchronized 的选型边界和线上诊断方法。",
   "tags": [
     "Java",
     "并发编程",
     "ReentrantLock"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 35,
+  "estimatedMinutes": 40,
   "order": 50,
   "recommendWeight": 82,
   "learningCards": [
     {
       "type": "explain",
-      "title": "可重入互斥锁用法",
-      "content": "# ReentrantLock\n\n## 1. ReentrantLock的使用\nReentrantLock 是 `java.util.concurrent.locks` 包中的可重入互斥锁，基于 AQS 实现，功能比 synchronized 更丰富。"
+      "title": "ReentrantLock 的 AQS 骨架：state、owner 和重入",
+      "content": "ReentrantLock 的内部类 Sync 继承 AQS，用独占模式管理锁。AQS 的 `state` 是 volatile int：`0` 表示无人持有，`>0` 表示当前 owner 的重入层数；`exclusiveOwnerThread` 记录持有者线程。\n\n获取路径（以非公平为例）：线程调用 `lock()` 时先尝试 `compareAndSetState(0, 1)`，成功则设置 owner 并返回；失败后检查 owner 是否是自己——是则 `state++` 表示重入；否则进入 AQS 同步队列 `acquireQueued` 挂起。释放路径：`unlock()` 把 `state--`，减到 0 时清除 owner 并调用 `unparkSuccessor` 唤醒队列中的后继节点。其他线程在 state 非 0 且 owner 不是自己时获取失败，进入队列等待。\n\n这个设计的关键优势是重入语义内建在 state 计数里，不需要额外结构；同一线程多次 lock 对应多次 unlock，层数必须匹配，否则要么锁泄漏（少 unlock）要么抛 IllegalMonitorStateException（多 unlock）。JDK 1.6 之前 AQS 的公平/非公平实现已有，但 ReentrantLock 本身从 JDK 5 引入；JDK 6 后对 AQS 做了大量优化（自旋、队列跳过取消节点等），性能与 synchronized 重量级锁相当。"
     },
     {
       "type": "explain",
-      "title": "公平锁与非公平锁",
-      "content": "### 1.1 基本用法：lock/unlock\n```java\nimport java.util.concurrent.locks.ReentrantLock;\npublic class ReentrantLockBasicDemo {\n    private final ReentrantLock lock = new ReentrantLock();\n    private int count = 0;\n    public void increment() {\n        lock.lock(); // 获取锁\n        try {\n            count++;\n        } finally {\n            lock.unlock(); // 必须在 finally 中释放锁！\n        }\n}\npublic int getCount() {\n    lock.lock();\n    try {\n        return count;\n    } finally {\n        lock.unlock();\n    }\n}\n}\n```\n\n### 1.2 可重入性\n```java\n/**\n* ReentrantLock 是可重入锁：同一线程可以多次获取同一把锁\n*/\npublic class ReentrantDemo {\n    private final ReentrantLock lock = new ReentrantLock();\n    public void methodA() {\n        lock.lock();\n        try {\n            System.out.println(\"methodA, holdCount = \" + lock.getHoldCount());\n            methodB(); // 同一线程再次获取锁\n        } finally {\n            lock.unlock();\n        }\n}\npublic void methodB() {\n    lock.lock();\n    try {\n        System.out.println(\"methodB, holdCount = \" + lock.getHoldCount());\n    } finally {\n        lock.unlock();\n    }\n}\n// 输出：\n// methodA, holdCount = 1\n// methodB, holdCount = 2\n}\n```\n\n### 1.3 tryLock — 非阻塞获取锁\n```java\n/**\n* tryLock：尝试获取锁，无论成功失败都立即返回\n*/\npublic class TryLockDemo {\n    private final ReentrantLock lock = new ReentrantLock();\n    public void tryDoSomething() {\n        if (lock.tryLock()) {\n            try {\n                System.out.println(Thread.currentThread().getName() + \" 获取到锁\");\n                // 执行业务逻辑\n            } finally {\n                lock.unlock();\n            }\n    } else {\n        System.out.println(Thread.currentThread().getName() + \" 未获取到锁，执行其他逻辑\");\n        // 获取锁失败，可以做其他事情\n    }\n}\n}\n```\n\n### 1.4 tryLock 带超时\n```java\n/**\n* tryLock(timeout, unit)：在指定时间内等待获取锁\n*/\npublic class TryLockTimeoutDemo {\n    private final ReentrantLock lock = new ReentrantLock();\n    public void doWithTimeout() throws InterruptedException {\n        // 尝试在 5 秒内获取锁\n        if (lock.tryLock(5, TimeUnit.SECONDS)) {\n            try {\n                System.out.println(\"获取到锁，执行业务逻辑\");\n            } finally {\n                lock.unlock();\n            }\n    } else {\n        System.out.println(\"等待超时，未获取到锁\");\n    }\n}\n}\n```\n\n### 要点\n- `lock()`：阻塞获取锁，不可中断\n- `lockInterruptibly()`：阻塞获取锁，可中断\n- `tryLock()`：非阻塞，立即返回 true/false\n- `tryLock(time, unit)`：带超时的阻塞获取\n- `unlock()`：释放锁，**必须在 finally 中调用**\n\n## 2. 公平锁与非公平锁\n```java\n// 非公平锁（默认）\nReentrantLock unfairLock = new ReentrantLock(); // 等价于 new ReentrantLock(false)\n// 公平锁\nReentrantLock fairLock = new ReentrantLock(true);\n```\n\n### 2.1 非公平锁\n```java\n/**\n* 非公平锁：新来的线程可以直接\"插队\"尝试获取锁\n* 优点：减少线程切换开销，吞吐量大\n* 缺点：可能导致某些线程长时间等待（饥饿）\n*/\npublic class UnfairLockDemo {\n    private final ReentrantLock lock = new ReentrantLock(false); // 非公平\n    public void access() {\n        lock.lock();\n        try {\n            System.out.println(Thread.currentThread().getName() + \" 获取到锁\");\n            Thread.sleep(100);\n        } catch (InterruptedException e) {\n            e.printStackTrace();\n        } finally {\n            lock.unlock();\n        }\n}\n}\n```\n\n### 2.2 公平锁\n```java\n/**\n* 公平锁：按照等待时间的先后顺序获取锁（FIFO）\n* 优点：不会饥饿\n* 缺点：需要维护队列顺序，吞吐量较低\n*/\npublic class FairLockDemo {\n    private final ReentrantLock lock = new ReentrantLock(true); // 公平\n    public void access() {\n        lock.lock();\n        try {\n            System.out.println(Thread.currentThread().getName() + \" 获取到锁\");\n            Thread.sleep(100);\n        } catch (InterruptedException e) {\n            e.printStackTrace();\n        } finally {\n            lock.unlock();\n        }\n}\n}\n```\n\n### 2.3 公平锁与非公平锁的源码差异\n```java\n// 非公平锁的 tryAcquire\nprotected final boolean tryAcquire(int acquires) {\n    return nonfairTryAcquire(acquires);\n}\nfinal boolean nonfairTryAcquire(int acquires) {\n    final Thread current = Thread.currentThread();\n    int c = getState();\n    if (c == 0) {\n        // 直接 CAS 尝试获取锁，不管队列中有没有等待的线程\n        if (compareAndSetState(0, acquires)) {\n            setExclusiveOwnerThread(current);\n            return true;\n        }\n}\n// ... 可重入逻辑\n}\n// 公平锁的 tryAcquire\nprotected final boolean tryAcquire(int acquires) {\n    final Thread current = Thread.currentThread();\n    int c = getState();\n    if (c == 0) {\n        // 先检查队列中是否有等待的线程（hasQueuedPredecessors）\n        if (!hasQueuedPredecessors() && compareAndSetState(0, acquires)) {\n            setExclusiveOwnerThread(current);\n            return true;\n        }\n    return false;\n}\n// ... 可重入逻辑\n}\n```\n\n### 要点\n- **非公平锁**：新线程直接尝试 CAS 获取锁，失败才入队。吞吐量高，但可能饥饿\n- **公平锁**：先检查队列中有没有等待的线程，有则入队。保证 FIFO，但性能较低\n- 默认使用非公平锁，绝大多数场景推荐使用非公平锁"
+      "title": "公平锁与非公平锁：差在 tryAcquire 入口是否排队",
+      "content": "非公平锁（默认 `new ReentrantLock()`）在 `lock()` 入口直接 CAS 抢占空闲 state，不看队列——即使队列中已有等待者，刚来的线程也可能插队成功。这个策略减少了一次「唤醒队首 → 上下文切换 → 队首再竞争」的开销，在锁持有时间短、并发不高时吞吐更好；代价是等待时间方差大，长期持锁或高竞争下可能有线程长时间抢不到。\n\n公平锁 `new ReentrantLock(true)` 的 `tryAcquire` 在 state 为 0 时先检查 `hasQueuedPredecessors()`：如果同步队列前面有等待者，当前线程不 CAS、直接进队排队。这让获取顺序严格 FIFO，降低饥饿风险，适合业务要求等待顺序可解释（如金融限价单排队）或监管要求公平的场景；代价是每次获取都多一次队列遍历和更多的上下文切换，吞吐通常比非公平低 10%-20%（Doug Lea 的 Javadoc 和 JMH 测试数据）。\n\n一个常被忽略的细节：无参 `tryLock()` 在公平锁上也会立即尝试获取可用 state，不检查 `hasQueuedPredecessors()`——这是设计意图，因为 `tryLock` 语义本身就是「试一下，不行就走」，强制排队会改变它的超时/降级语义。如果需要「公平排队的尝试获取」，应使用 `tryLock(0, NANOSECONDS)`。"
     },
     {
       "type": "explain",
-      "title": "可中断锁与超时锁",
-      "content": "## 4. 可中断锁与超时锁\n\n### 4.1 可中断锁 lockInterruptibly\n```java\n/**\n* 可中断锁：等待锁的过程中可以响应中断\n* 应用场景：避免死锁\n*/\npublic class InterruptibleLockDemo {\n    private static final ReentrantLock lock = new ReentrantLock();\n    public static void main(String[] args) throws InterruptedException {\n        Thread t1 = new Thread(() -> {\n            lock.lock();\n            try {\n                System.out.println(\"T1 获取到锁\");\n                Thread.sleep(5000); // 持有锁 5 秒\n            } catch (InterruptedException e) {\n                System.out.println(\"T1 被中断\");\n            } finally {\n                lock.unlock();\n            }\n    });\nThread t2 = new Thread(() -> {\n    try {\n        System.out.println(\"T2 尝试获取锁（可中断）\");\n        lock.lockInterruptibly(); // 可以被中断\n        try {\n            System.out.println(\"T2 获取到锁\");\n        } finally {\n            lock.unlock();\n        }\n} catch (InterruptedException e) {\n    System.out.println(\"T2 等待锁的过程中被中断，可以做其他处理\");\n}\n});\nt1.start();\nThread.sleep(100);\nt2.start();\nThread.sleep(1000);\n// 主线程中断 t2\nt2.interrupt();\nSystem.out.println(\"主线程中断了 T2\");\n}\n}\n```\n\n### 4.2 使用 tryLock 避免死锁\n```java\n/**\n* 使用 tryLock + 超时避免死锁\n*/\npublic class DeadlockAvoidanceDemo {\n    private static final ReentrantLock lockA = new ReentrantLock();\n    private static final ReentrantLock lockB = new ReentrantLock();\n    public static void main(String[] args) {\n        // 线程1：先锁A，再锁B\n        Thread t1 = new Thread(() -> {\n            try {\n                if (lockA.tryLock(1, TimeUnit.SECONDS)) {\n                    try {\n                        System.out.println(\"T1 获取到 lockA\");\n                        Thread.sleep(100);\n                        if (lockB.tryLock(1, TimeUnit.SECONDS)) {\n                            try {\n                                System.out.println(\"T1 获取到 lockB\");\n                            } finally {\n                                lockB.unlock();\n                            }\n                    } else {\n                        System.out.println(\"T1 获取 lockB 超时，释放 lockA\");\n                    }\n            } finally {\n                lockA.unlock();\n            }\n    }\n} catch (InterruptedException e) {\n    e.printStackTrace();\n}\n});\n// 线程2：先锁B，再锁A（与T1相反，容易死锁）\nThread t2 = new Thread(() -> {\n    try {\n        if (lockB.tryLock(1, TimeUnit.SECONDS)) {\n            try {\n                System.out.println(\"T2 获取到 lockB\");\n                Thread.sleep(100);\n                if (lockA.tryLock(1, TimeUnit.SECONDS)) {\n                    try {\n                        System.out.println(\"T2 获取到 lockA\");\n                    } finally {\n                        lockA.unlock();\n                    }\n            } else {\n                System.out.println(\"T2 获取 lockA 超时，释放 lockB\");\n            }\n    } finally {\n        lockB.unlock();\n    }\n}\n} catch (InterruptedException e) {\n    e.printStackTrace();\n}\n});\nt1.start();\nt2.start();\n}\n}\n```\n\n## 5. Condition条件变量\nCondition 是 ReentrantLock 的配套条件变量，替代 wait/notify，支持多个等待队列。\n### 5.1 基本用法\n```java\n/**\n* Condition 实现生产者-消费者模式\n*/\npublic class ProducerConsumerDemo {\n    private final ReentrantLock lock = new ReentrantLock();\n    private final Condition notFull = lock.newCondition();   // 缓冲区不满\n    private final Condition notEmpty = lock.newCondition();  // 缓冲区不空\n    private final Queue<Integer> queue = new LinkedList<>();\n    private final int capacity = 10;\n    // 生产者\n    public void produce(int item) throws InterruptedException {\n        lock.lock();\n        try {\n            while (queue.size() == capacity) {\n                System.out.println(\"缓冲区已满，生产者等待...\");\n                notFull.await(); // 等待\"不满\"条件\n            }\n        queue.offer(item);\n        System.out.println(\"生产: \" + item + \", 队列大小: \" + queue.size());\n        notEmpty.signal(); // 通知消费者\n    } finally {\n        lock.unlock();\n    }\n}\n// 消费者\npublic int consume() throws InterruptedException {\n    lock.lock();\n    try {\n        while (queue.isEmpty()) {\n            System.out.println(\"缓冲区为空，消费者等待...\");\n            notEmpty.await(); // 等待\"不空\"条件\n        }\n    int item = queue.poll();\n    System.out.println(\"消费: \" + item + \", 队列大小: \" + queue.size());\n    notFull.signal(); // 通知生产者\n    return item;\n} finally {\n    lock.unlock();\n}\n}\n}\n```\n\n### 5.2 多条件精确唤醒\n```java\n/**\n* 使用多个 Condition 实现精确唤醒\n* 场景：三个线程按顺序打印 A、B、C\n*/\npublic class ABCPrintDemo {\n    private final ReentrantLock lock = new ReentrantLock();\n    private final Condition condA = lock.newCondition();\n    private final Condition condB = lock.newCondition();\n    private final Condition condC = lock.newCondition();\n    private volatile int state = 0; // 0=A轮次, 1=B轮次, 2=C轮次\n    public void printA() {\n        lock.lock();\n        try {\n            while (state != 0) condA.await();\n            System.out.print(\"A \");\n            state = 1;\n            condB.signal(); // 精确唤醒 B\n        } catch (InterruptedException e) {\n            e.printStackTrace();\n        } finally {\n            lock.unlock();\n        }\n}\npublic void printB() {\n    lock.lock();\n    try {\n        while (state != 1) condB.await();\n        System.out.print(\"B \");\n        state = 2;\n        condC.signal(); // 精确唤醒 C\n    } catch (InterruptedException e) {\n        e.printStackTrace();\n    } finally {\n        lock.unlock();\n    }\n}\npublic void printC() {\n    lock.lock();\n    try {\n        while (state != 2) condC.await();\n        System.out.print(\"C \");\n        state = 0;\n        condA.signal(); // 精确唤醒 A\n    } catch (InterruptedException e) {\n        e.printStackTrace();\n    } finally {\n        lock.unlock();\n    }\n}\n}\n```\n\n### 要点\n- `await()` 对应 `wait()`，`signal()` 对应 `notify()`，`signalAll()` 对应 `notifyAll()`\n- Condition 必须在 lock/unlock 之间使用\n- 多个 Condition 可以实现精确唤醒，比 synchronized 的 notifyAll 更高效\n- await 前必须在 while 循环中检查条件（防止虚假唤醒）\n\n## 6. 面试高频问题\n\n### Q1: ReentrantLock和synchronized怎么选？\n**答**：简单同步场景优先 synchronized，JVM 已做大量优化且不用担心忘记释放锁。需要公平锁、可中断锁、超时获取、多 Condition 等高级功能时使用 ReentrantLock。JDK6 后两者性能差距不大。\n### Q2: 公平锁和非公平锁的区别？各自适用场景？\n**答**：公平锁按照 FIFO 顺序获取锁，不会饥饿，但需要维护队列顺序，吞吐量低。非公平锁新线程可以直接插队尝试获取，吞吐量高，但可能饥饿。大多数场景推荐非公平锁（默认），对公平性有严格要求时（如交易系统）使用公平锁。\n### Q3: ReentrantLock的可重入是如何实现的？\n**答**：AQS 的 state 变量记录重入次数。首次获取锁时 state 设为 1，同一线程再次获取时 state+1，释放时 state-1，减到 0 时完全释放。通过 exclusiveOwnerThread 记录持有锁的线程，判断是否为同一线程的重入。\n### Q4: Condition和wait/notify有什么区别？\n**答**：(1) Condition 必须配合 Lock 使用，wait/notify 必须配合 synchronized 使用；(2) 一个 Lock 可以创建多个 Condition，实现精确唤醒，而 synchronized 只有一个等待队列，notifyAll 唤醒所有线程；(3) Condition 支持不可中断等待（awaitUninterruptibly）和超时等待（awaitNanos）。\n### Q5: 如何用ReentrantLock避免死锁？\n**答**：使用 `tryLock(time, unit)` 设置超时时间。当一个线程获取锁超时后，释放已持有的锁并重试（或执行其他逻辑），避免无限等待。这比 synchronized 的无限等待更灵活，是避免死锁的有效手段。"
+      "title": "四种获取路径：lock、lockInterruptibly、tryLock、tryLock(timeout)",
+      "content": "`lock()` 是最常用的获取方式。等待期间线程被中断不会抛异常——它只是在获取锁成功后恢复中断标记（`Thread.currentThread().interrupt()`），适合临界区短、调用方不需要取消等待的场景。\n\n`lockInterruptibly()` 在等待期间响应中断，捕获 `InterruptedException` 后说明没有拿到锁，不需要 unlock。典型场景：请求取消（网关超时）、服务停止（shutdown 时中断等待线程）、双锁规避死锁（两个线程各拿一把后尝试 interruptibly 获取另一把，失败则释放已持有的锁并重试）。使用时 catch 到 InterruptedException 要么恢复中断标记、要么把取消语义向上传递。\n\n`tryLock()` 立即尝试，拿到返回 true、拿不到返回 false，不进队列、不等待。适合快速失败、降级或跳过非关键工作。`tryLock(timeout, unit)` 在时间预算内等待，超时返回 false。它不能自动消除死锁——只是给线程一个撤退窗口，因此还需要配合锁顺序约定、失败补偿和指标监控。这两种路径的共同要点：返回 false 时没有拿到锁，绝对不能 unlock。"
+    },
+    {
+      "type": "explain",
+      "title": "Condition：独立条件队列、await 释放和 signal 转移",
+      "content": "Condition 不是 wait/notify 的语法糖。每个 `lock.newCondition()` 都在 AQS 上创建一个独立的条件队列（ConditionObject 内部的单链表）。调用 `await()` 的前提是当前线程已持有这把锁；await 的完整过程是：保存当前重入层数 → 完全释放锁（state 归零、清除 owner）→ 把节点放入条件队列 → `LockSupport.park`。\n\n`signal()` 把条件队列的头节点转移到 AQS 同步队列——注意这一步只是转移，不是唤醒。被转移的线程仍然需要等 signal 方释放锁后才有机会竞争；竞争成功后在 `acquireQueued` 中恢复之前保存的重入层数。因此 signal 不保证被唤醒的线程立刻执行，也不保证业务条件已成立。\n\n两个实践规则。第一，等待条件必须写成 `while (!condition) await()`，因为虚假唤醒、超时、中断或被其他线程抢先修改状态后条件可能不成立。第二，多个 Condition 的价值在于精确路由：有界缓冲区用 `notFull` 唤醒生产者、`notEmpty` 唤醒消费者，避免 notifyAll 叫醒所有线程后大部分发现条件不成立又重新睡回去。signal 前要先修改共享状态再唤醒，否则被唤醒线程醒来后条件仍不满足，白白浪费一次切换。"
+    },
+    {
+      "type": "explain",
+      "title": "与 synchronized 的选型和线上诊断",
+      "content": "synchronized 由 JVM 管理加解锁，异常路径不会漏释放；JDK 6+ 引入偏向锁→轻量级锁→重量级锁的升级路径，简单互斥场景下性能与 ReentrantLock 相当。但 synchronized 没有 tryLock、没有超时、没有可中断等待、没有公平策略、没有多条件队列——这些是 ReentrantLock 的核心选型理由。\n\n选型建议：简单互斥、作用域清晰、不需要取消/超时/公平/多条件时，优先 synchronized（代码更安全、JVM 有锁消除/粗化优化空间）；需要等待控制精细（中断、超时撤退、降级）或业务逻辑要求公平排队或多条件精确唤醒时，用 ReentrantLock。两者都不能替代分布式锁或跨进程协调。\n\n线上 ReentrantLock 问题的典型诊断路径：线程 dump 中看到 `LockSupport.park` + `AbstractQueuedSynchronizer.acquire` + `ReentrantLock.lock` → 线程在 AQS 同步队列等锁；重点排查持有者线程在临界区内做了什么（IO？RPC？长计算？）。如果等待者大量堆积，先缩小临界区或减少锁持有时间；如果等待时间抖动大，考虑切换公平策略或拆分锁粒度。盲目把非公平改公平通常不是正确方向——它降低吞吐但不解决持锁慢的根本问题。"
     },
     {
       "type": "diagram",
-      "format": "mermaid",
-      "title": "ReentrantLock 基于 AQS 的获取、重入与 Condition 流程",
-      "content": "flowchart TD\nCall[lock/tryLock/lockInterruptibly] --> Try{state == 0?}\nTry -->|CAS 成功| Owner[设置 owner\nstate=1]\nTry -->|同一线程| Reenter[state++\n可重入]\nTry -->|失败| Queue[加入 AQS 同步队列]\nQueue --> Park[park 等待\n可中断/可超时按 API 处理]\nPark --> Wake[前驱释放后 unpark]\nWake --> Try\nOwner --> Work[临界区]\nReenter --> Work\nWork --> Finally[finally unlock]\nFinally --> Release[state--]\nRelease -->|state==0| Unpark[清 owner\n唤醒后继]\nCondition[Condition.await] --> CondQ[释放锁并进条件队列]\nCondQ --> Signal[signal 转移到同步队列]\nSignal --> Queue",
-      "caption": "ReentrantLock 的核心不是“比 synchronized 快”，而是 AQS 队列、可中断/超时、公平策略和多个 Condition 带来的控制能力。",
-      "fallback": "ReentrantLock 获取失败会进入 AQS 同步队列，释放时唤醒后继；同一线程重入只增加 state。Condition.await 会释放锁进入条件队列，signal 后再回同步队列竞争。",
+      "format": "svg",
+      "title": "ReentrantLock 获取、重入与 Condition 路径",
+      "content": "assets/diagrams/java-reentrantlock-aqs-condition.svg",
+      "caption": "图中把 state 重入计数、exclusiveOwnerThread、公平/非公平 tryAcquire 入口、Condition await 释放锁进条件队列、signal 转移到 AQS 同步队列重新竞争的完整路径放在一起。",
+      "fallback": "ReentrantLock 基于 AQS 独占模式（Doug Lea 于 JDK 5 引入）。state 是 volatile int：0 未持有，>0 为 owner 重入层数；exclusiveOwnerThread 记录持有者。第一次获取 CAS 0→1，同线程重入只递增 state，unlock 逐层递减到 0 才清 owner 唤醒后继。非公平锁（默认）入口先 CAS 抢 state；公平锁 new ReentrantLock(true) 先检查 hasQueuedPredecessors()。lockInterruptibly 等待期响应中断；tryLock(timeout) 给时间预算。Condition.await 保存重入层数、释放锁、进条件队列；signal 转移到同步队列，等 signal 方释放锁后重新竞争并恢复持有层数。synchronized 在 JDK 6 引入锁升级（偏向锁 JDK 15 废弃→轻量锁→重量锁），简单互斥优先 synchronized。",
       "sources": [
         {
-          "kind": "mermaid",
-          "content": "flowchart TD\nCall[lock/tryLock/lockInterruptibly] --> Try{state == 0?}\nTry -->|CAS 成功| Owner[设置 owner\nstate=1]\nTry -->|同一线程| Reenter[state++\n可重入]\nTry -->|失败| Queue[加入 AQS 同步队列]\nQueue --> Park[park 等待\n可中断/可超时按 API 处理]\nPark --> Wake[前驱释放后 unpark]\nWake --> Try\nOwner --> Work[临界区]\nReenter --> Work\nWork --> Finally[finally unlock]\nFinally --> Release[state--]\nRelease -->|state==0| Unpark[清 owner\n唤醒后继]\nCondition[Condition.await] --> CondQ[释放锁并进条件队列]\nCondQ --> Signal[signal 转移到同步队列]\nSignal --> Queue"
+          "kind": "svg",
+          "path": "assets/diagrams/java-reentrantlock-aqs-condition.svg"
         },
         {
           "kind": "text",
-          "content": "ReentrantLock 获取失败会进入 AQS 同步队列，释放时唤醒后继；同一线程重入只增加 state。Condition.await 会释放锁进入条件队列，signal 后再回同步队列竞争。"
+          "content": "ReentrantLock 路径：state(volatile int, 0=未持有, >0=重入层数) + exclusiveOwnerThread。获取：非公平先 CAS 抢 state / 公平先 hasQueuedPredecessors()。重入：同 owner 递增 state。释放：unlock 递减到 0 清 owner 唤醒后继。Condition：await 保存重入层数→释放锁→进条件队列；signal 转移到同步队列→重新竞争→恢复持有层数。API：lock(不响应中断) / lockInterruptibly(响应中断) / tryLock(立即) / tryLock(timeout)(时间预算)。"
         }
       ]
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | 公平锁 | 非公平锁 |\n| --- | --- | --- |\n| 获取顺序 | 严格按队列顺序 | 允许插队 |\n| 性能 | 较差(线程切换多) | 较好 |\n| 实现原理 | 检查队列等待线程 | 直接CAS尝试 |\n| 创建方式 | new ReentrantLock(true) | new ReentrantLock(false) |\n| 适用场景 | 需要保证顺序 | 大多数场景 |\n| 优点 | 公平性好 | 吞吐量高 |\n| 缺点 | 性能差 | 可能饥饿 |"
+      "title": "API 语义与 synchronized 选型对比",
+      "content": "| 获取方式 | 等待行为 | 中断响应 | 未获取时能否 unlock | 典型场景 |\n| --- | --- | --- | --- | --- |\n| `lock()` | 阻塞直到获取 | 不响应，获取后恢复标记 | 不可 | 临界区短、不需要取消 |\n| `lockInterruptibly()` | 阻塞直到获取或中断 | 响应，抛 InterruptedException | 不可 | 请求取消、服务停止、双锁撤退 |\n| `tryLock()` | 不等待，立即返回 | 不涉及 | 不可 | 快速失败、降级 |\n| `tryLock(timeout)` | 在时间预算内等待 | 响应中断 + 超时返回 false | 不可 | 有等待预算、需撤退路径 |\n| `Condition.await()` | 释放锁，进条件队列 | 响应中断 | 已释放，无需 unlock | 多条件精确唤醒 |\n\n| 对比维度 | ReentrantLock | synchronized |\n| --- | --- | --- |\n| 加解锁控制 | 显式 lock/unlock，finally 保护 | JVM 自动，异常不漏释放 |\n| 可中断等待 | lockInterruptibly 支持 | 不支持 |\n| 超时获取 | tryLock(timeout) 支持 | 不支持 |\n| 公平性 | 可选公平/非公平 | 无公平概念 |\n| 多条件队列 | lock.newCondition() 多个独立队列 | wait/notify 只有一个等待集 |\n| 锁实现 | AQS 独占模式 | JVM 内部锁（偏向→轻量→重量） |\n| 性能 | JDK 6+ 与 synchronized 相当 | 简单场景有锁消除/粗化优化 |\n| 选型建议 | 需要取消/超时/公平/多条件时 | 简单互斥、作用域清晰时优先 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "import java.util.concurrent.locks.ReentrantLock;\n\npublic class ReentrantLockBasicDemo {\n    private final ReentrantLock lock = new ReentrantLock();\n    private int count = 0;\n\n    public void increment() {\n        lock.lock(); // 获取锁\n        try {\n            count++;\n        } finally {\n            lock.unlock(); // 必须在 finally 中释放锁！\n        }\n    }\n\n    public int getCount() {\n        lock.lock();\n        try {\n            return count;\n        } finally {\n            lock.unlock();\n        }\n    }\n}",
+      "title": "可运行代码：重入、超时、中断和 Condition",
       "language": "java",
+      "content": "import java.util.ArrayDeque;\nimport java.util.Queue;\nimport java.util.concurrent.CountDownLatch;\nimport java.util.concurrent.TimeUnit;\nimport java.util.concurrent.locks.Condition;\nimport java.util.concurrent.locks.ReentrantLock;\n\npublic class Main {\n    // 1) 可重入：同一 owner 多次 lock 递增 state，逐层 unlock\n    static final class SafeCounter {\n        private final ReentrantLock lock = new ReentrantLock();\n        private int value;\n\n        void incrementTwice() {\n            lock.lock();\n            try {\n                value++;\n                nestedIncrement(); // 重入：同一 owner 递增 state\n            } finally {\n                lock.unlock();\n            }\n        }\n\n        private void nestedIncrement() {\n            lock.lock();\n            try {\n                assert lock.getHoldCount() == 2 : \"重入后层数应为 2\";\n                value++;\n            } finally {\n                lock.unlock();\n            }\n        }\n\n        int get() {\n            lock.lock();\n            try {\n                return value;\n            } finally {\n                lock.unlock();\n            }\n        }\n    }\n\n    // 2) Condition 多条件队列：notFull 唤醒生产者，notEmpty 唤醒消费者\n    static final class BoundedBox {\n        private final ReentrantLock lock = new ReentrantLock();\n        private final Condition notFull = lock.newCondition();\n        private final Condition notEmpty = lock.newCondition();\n        private final Queue<Integer> queue = new ArrayDeque<>();\n        private final int capacity;\n\n        BoundedBox(int capacity) { this.capacity = capacity; }\n\n        void put(int value) throws InterruptedException {\n            lock.lockInterruptibly();\n            try {\n                while (queue.size() == capacity) {\n                    notFull.await(); // 释放锁，进 notFull 条件队列\n                }\n                queue.add(value);\n                notEmpty.signal(); // 唤醒一个消费者\n            } finally {\n                lock.unlock();\n            }\n        }\n\n        int take() throws InterruptedException {\n            lock.lockInterruptibly();\n            try {\n                while (queue.isEmpty()) {\n                    notEmpty.await(); // 释放锁，进 notEmpty 条件队列\n                }\n                int value = queue.remove();\n                notFull.signal(); // 唤醒一个生产者\n                return value;\n            } finally {\n                lock.unlock();\n            }\n        }\n    }\n\n    public static void main(String[] args) throws Exception {\n        // --- 重入验证 ---\n        SafeCounter counter = new SafeCounter();\n        int threads = 4, rounds = 10_000;\n        CountDownLatch done = new CountDownLatch(threads);\n        for (int i = 0; i < threads; i++) {\n            new Thread(() -> {\n                for (int j = 0; j < rounds; j++) counter.incrementTwice();\n                done.countDown();\n            }, \"counter-\" + i).start();\n        }\n        done.await();\n        assert counter.get() == threads * rounds * 2 : \"重入计数错误\";\n        System.out.println(\"重入验证: counter=\" + counter.get());\n\n        // --- tryLock 超时：持锁线程 sleep 180ms，等待方只给 80ms 预算 ---\n        ReentrantLock busy = new ReentrantLock();\n        CountDownLatch locked = new CountDownLatch(1);\n        Thread holder = new Thread(() -> {\n            busy.lock();\n            try {\n                locked.countDown();\n                Thread.sleep(180);\n            } catch (InterruptedException e) {\n                Thread.currentThread().interrupt();\n            } finally {\n                busy.unlock();\n            }\n        }, \"busy-holder\");\n        holder.start();\n        locked.await();\n        boolean acquired = busy.tryLock(80, TimeUnit.MILLISECONDS);\n        System.out.println(\"tryLock 超时: acquired=\" + acquired);\n        assert !acquired : \"80ms 预算内拿不到锁\";\n        if (acquired) busy.unlock();\n        holder.join();\n\n        // --- lockInterruptibly：等待期间被中断 ---\n        ReentrantLock interruptible = new ReentrantLock();\n        CountDownLatch waiting = new CountDownLatch(1);\n        interruptible.lock();\n        Thread waiter = new Thread(() -> {\n            try {\n                waiting.countDown();\n                interruptible.lockInterruptibly(); // 等待期间可响应中断\n                throw new AssertionError(\"不应到达这里\");\n            } catch (InterruptedException expected) {\n                System.out.println(\"lockInterruptibly: 被中断，未拿到锁\");\n                Thread.currentThread().interrupt();\n            }\n        }, \"interruptible-waiter\");\n        waiter.start();\n        waiting.await();\n        Thread.sleep(50);\n        waiter.interrupt();\n        waiter.join();\n        interruptible.unlock();\n\n        // --- Condition 有界队列 ---\n        BoundedBox box = new BoundedBox(1);\n        Thread consumer = new Thread(() -> {\n            try {\n                System.out.println(\"Condition take=\" + box.take());\n            } catch (InterruptedException e) {\n                Thread.currentThread().interrupt();\n            }\n        }, \"box-consumer\");\n        consumer.start();\n        Thread.sleep(50);\n        box.put(42);\n        consumer.join();\n    }\n}",
       "highlights": [
         {
-          "line": 19,
-          "note": "读 count 前必须先拿同一把锁，才能与写入侧形成一致的可见性；否则返回值可能不是最新状态。"
+          "line": 16,
+          "note": "外层 lock 后内层再 lock：同一 owner 只递增 state，实现重入。"
+        },
+        {
+          "line": 56,
+          "note": "while 循环等待条件成立，防止虚假唤醒或被其他线程抢先。"
+        },
+        {
+          "line": 87,
+          "note": "tryLock 返回 false 说明没拿到锁，此分支绝对不能 unlock。"
+        },
+        {
+          "line": 100,
+          "note": "lockInterruptibly 等待期间被中断会抛异常，catch 后恢复中断标记。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：ReentrantLock 是基于 AQS 的可重入互斥锁，比 synchronized 多了可中断、可超时、公平锁和多个 Condition，代价是必须手动 unlock。\n\n核心能力：\n\n1. 基本用法：lock 后必须在 finally 里 unlock，否则异常路径会永久占锁。\n2. 可重入：同一线程再次获取锁时 state 递增，释放时递减，减到 0 才真正唤醒后继。\n3. 公平与非公平：默认非公平，锁空闲时新线程可直接 CAS 抢锁，吞吐高但可能饥饿；公平锁会先看 hasQueuedPredecessors，顺序更稳但上下文切换更多。\n4. 可中断/超时：lockInterruptibly 和 tryLock(timeout) 能让等待锁的线程退出等待，常用于避免死锁或实现降级。\n5. Condition：一个 Lock 可以有多个条件队列，await 释放锁并挂起，signal 把节点转移回同步队列，适合精确唤醒。\n\n选型：简单互斥优先 synchronized；需要中断、超时、公平、多条件时再用 ReentrantLock。虚拟线程场景要看 JDK 版本：JDK 21-23 synchronized 阻塞可能 pin carrier，JDK 24 的 JEP 491 已改善，不能再把“虚拟线程一定要换 ReentrantLock”当成固定结论。",
+      "content": "**结论先行**\nReentrantLock 是基于 AQS 独占模式的可重入锁，比 synchronized 多四个能力：可中断等待、超时获取、公平排队、多个 Condition 条件队列；代价是显式 unlock 需要 try/finally 保护。\n\n**AQS 重入机制**\n- state 为 volatile int：0 表示无人持有，>0 表示 owner 重入层数\n- exclusiveOwnerThread 记录持有者\n- 获取：state 从 0→1（CAS）或同 owner 递增 state\n- 释放：递减 state 到 0 才清 owner 并唤醒后继\n\n**公平与非公平**\n- 非公平（默认）：入口先 CAS 抢空闲 state，不看队列；吞吐好但等待抖动\n- 公平：先检查 `hasQueuedPredecessors()`，有人就排队；FIFO 但吞吐更低\n- 无参 `tryLock()` 在公平锁上也不排队（设计意图）\n\n**四种获取路径**\n- `lock()`：阻塞不响应中断，获取后恢复中断标记\n- `lockInterruptibly()`：阻塞响应中断，抛 InterruptedException（未获取不需要 unlock）\n- `tryLock()`：不等待，返回 boolean\n- `tryLock(timeout)`：时间预算内等待，超时返回 false\n- 关键：只有获取成功后才能 unlock，返回 false 的分支不能 unlock\n\n**Condition 多条件队列**\n- 每个 Condition 有独立条件队列\n- await：保存重入层数 → 完全释放锁 → 进条件队列 park\n- signal：转移节点到同步队列（不是直接唤醒）→ 等 signal 方释放锁后重新竞争 → 恢复重入层数\n- 必须用 while 检查条件，signal 前先改共享状态\n\n**与 synchronized 选型**\n- 简单互斥优先 synchronized（自动释放、锁消除/粗化）\n- 需要取消/超时/公平/多条件时用 ReentrantLock\n- 都不能替代分布式锁\n\n**线上诊断**\n- 线程 dump 看到 `LockSupport.park` + `acquire` → 在 AQS 队列等锁\n- 先查持有者临界区是否有慢 IO/RPC\n- 盲目改公平策略通常不是正确方向",
       "followUpQuestions": [
         {
-          "question": "ReentrantLock 和 synchronized 在底层和能力上有什么区别？怎么选？",
-          "answer": "底层：synchronized 是 JVM 内置、靠对象头 Monitor 和锁升级，加解锁由 JVM 自动管理；ReentrantLock 是 JDK 类库、基于 AQS 用 state 加 CLH 队列实现，加解锁要手动。能力：ReentrantLock 多了可中断（lockInterruptibly）、超时（tryLock）、公平锁、多个 Condition，更灵活。选型：简单互斥优先 synchronized——JVM 优化到位、且不会忘记释放；只有确实需要可中断、超时获取、公平、或多条件精确唤醒时才用 ReentrantLock，并记得 unlock 放 finally。"
+          "question": "ReentrantLock 的可重入是如何实现的？",
+          "answer": "AQS 的 state 记录重入层数，exclusiveOwnerThread 记录持有者。state 为 0 时 CAS 获取并成为 owner；同一 owner 再次 lock 只递增 state；unlock 逐层递减，减到 0 才清 owner 并唤醒同步队列后继。其他线程在 state 非 0 且 owner 不是自己时进入队列等待。"
         },
         {
-          "question": "ReentrantLock 的公平锁一定比非公平锁好吗？为什么默认非公平？",
-          "answer": "不是。公平锁严格按等待队列 FIFO 发锁、不会饿死线程，但每次都要检查队列、唤醒队首线程，线程切换开销大、吞吐低。非公平锁允许新来的线程直接 CAS 抢锁——如果刚好锁空闲就直接拿到，省了一次入队再被唤醒的上下文切换，所以吞吐明显更高，缺点是可能让排队的线程长期抢不到（饥饿）。绝大多数场景吞吐比绝对公平更重要，所以默认非公平；只有对公平性有硬要求、不能饿死的场景才显式用公平锁。"
+          "question": "公平锁和非公平锁的核心差异是什么？为什么默认非公平？",
+          "answer": "非公平锁在 lock 入口先 CAS 抢空闲 state，即使队列中已有等待者也可能直接拿到——减少了一次「唤醒队首→上下文切换→队首再竞争」的开销，吞吐更好。公平锁先检查 hasQueuedPredecessors()，有人就排队，保证 FIFO 但切换更多。默认非公平是因为大多数场景吞吐比顺序更重要。"
         },
         {
-          "question": "用 ReentrantLock 写生产者-消费者，为什么要用两个 Condition？await 为什么放在 while 里？",
-          "answer": "用两个 Condition（notFull、notEmpty）是为了精确唤醒：生产者放完数据只唤醒消费者（notEmpty.signal），消费者取完只唤醒生产者（notFull.signal），避免 synchronized 的 notifyAll 把同类线程也唤醒、白白竞争。await 放在 while 而不是 if 里，是因为存在虚假唤醒，以及被唤醒后到真正拿到锁之间条件可能又被别的线程改变，所以醒来必须重新检查条件、不满足继续 await，这是并发编程的固定范式。"
+          "question": "Condition 的 signal 和 Object.notify 有什么本质区别？",
+          "answer": "ReentrantLock 可以创建多个 Condition，每个有独立等待队列，可以精确唤醒生产者或消费者，避免 notifyAll 叫醒所有线程。signal 只是把节点从条件队列转移到 AQS 同步队列，被唤醒者仍需等锁释放后重新竞争——不是直接执行。notify 把节点从 monitor 等待集移到 EntryList，同一 monitor 只有一个等待集。"
+        },
+        {
+          "question": "tryLock 失败后为什么不能 unlock？",
+          "answer": "tryLock 返回 false 说明当前线程没有获得锁、state 没有被修改、owner 不是自己。此时调用 unlock 会抛 IllegalMonitorStateException，因为 unlock 内部会检查 exclusiveOwnerThread。正确做法是只在 tryLock 返回 true 的分支中配对 unlock。"
+        },
+        {
+          "question": "线上看到大量线程堆栈卡在 ReentrantLock.lock → LockSupport.park，怎么排查？",
+          "answer": "首先看同步队列最前面的线程（head.next）的堆栈，确认它在临界区内做什么——大概率是慢 IO、RPC 或长计算。其次看队列长度和等待线程数，判断锁竞争程度。排查方向：缩小临界区、减少锁持有时间、考虑读写锁分离、或用 tryLock+降级避免无限等待。盲目从非公平改公平只会降低吞吐，不解决持锁慢的根本问题。"
         }
       ]
     },
@@ -88,13 +118,14 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说出ReentrantLock的基本使用方式",
-        "能解释公平锁和非公平锁的区别",
-        "能说明ReentrantLock的可重入性原理",
-        "能解释可中断获取锁的实现",
-        "能说明Condition的作用和使用方式",
-        "能比较ReentrantLock和synchronized的区别",
-        "能描述ReentrantLock的使用场景"
+        "能说明 state 是重入层数、exclusiveOwnerThread 是持有者、重入只递增 state、释放到 0 才唤醒后继",
+        "能区分 lock/lockInterruptibly/tryLock/tryLock(timeout) 的等待行为和中断响应",
+        "能解释公平锁的 hasQueuedPredecessors() 检查和非公平锁的入口 CAS 抢占差异",
+        "能说明 unlock 只在获取成功后执行并放入 finally，tryLock 失败不能 unlock",
+        "能画出 Condition.await 从条件队列到同步队列的转移路径，并解释 signal 不等于直接执行",
+        "能用 while 循环检查 await 条件，理解虚假唤醒和状态抢先",
+        "能给出 ReentrantLock 与 synchronized 的选型建议：简单互斥优先 synchronized，需要取消/超时/公平/多条件时用 ReentrantLock",
+        "能结合线程 dump 诊断 AQS 队列等待问题，判断持锁时长和临界区是否包含慢操作"
       ]
     }
   ],
@@ -133,38 +164,47 @@
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 4
+    },
+    {
+      "id": "java.concurrency.topic-018-01ac6cc3.recall.6",
+      "prompt": "线上大量线程堆栈卡在 ReentrantLock.lock → LockSupport.park，等待队列很长，你怎么排查和优化？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出 ReentrantLock 基于 AQS、比 synchronized 多可中断/超时/公平/多条件",
-      "能说明 unlock 必须放 finally",
-      "能区分公平锁与非公平锁",
-      "能说明 Condition 替代 wait/notify 做精确唤醒"
+      "能说出 ReentrantLock 基于 AQS 独占模式，state 表示重入层数，exclusiveOwnerThread 记录持有者",
+      "能说明 unlock 只在获取成功后放入 finally，tryLock 失败不能 unlock",
+      "能区分公平锁 hasQueuedPredecessors() 检查与非公平锁入口 CAS 抢占差异",
+      "能说明 Condition.await 保存重入层数、释放锁、进条件队列，signal 转移到同步队列重新竞争"
     ],
     "goodToHave": [
-      "能用 tryLock 超时避免死锁",
-      "能说明 await 要放 while 防虚假唤醒",
-      "能给出 ReentrantLock 与 synchronized 的选型"
+      "能区分 lock/lockInterruptibly/tryLock/tryLock(timeout) 四种获取路径的等待和中断语义",
+      "能用 while 循环检查 await 条件并解释虚假唤醒",
+      "能给出 ReentrantLock 与 synchronized 的选型边界和工程理由",
+      "能结合线程 dump 判断 AQS 队列等待并定位持锁慢操作"
     ],
     "commonMistakes": [
-      "忘记在 finally 里 unlock 导致死锁",
-      "以为默认是公平锁",
-      "Condition 的 await/signal 不在锁内调用"
+      "忘记在 finally 里 unlock 导致锁泄漏",
+      "tryLock 失败后仍然 unlock 抛 IllegalMonitorStateException",
+      "以为默认构造是公平锁",
+      "把 Condition.signal 理解成被唤醒线程立刻执行（实际只是转移到同步队列等锁）"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 25,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "staging",
   "prerequisites": [
     "java.concurrency.topic-017-df4531b1",
     "java.concurrency.topic-013-cc70cb0e"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察能否说清 ReentrantLock 相比 synchronized 的额外能力、unlock 的 finally 要求、公平非公平、Condition 精确唤醒和选型。"
+  "interviewerFocus": "考察能否完整讲清 AQS 重入机制（state+owner）、公平与非公平 tryAcquire 差异、四种获取路径的等待语义、Condition 条件队列转移同步队列的完整流程、与 synchronized 的选型边界、以及线程 dump 诊断 AQS 等待问题的方法。"
 }

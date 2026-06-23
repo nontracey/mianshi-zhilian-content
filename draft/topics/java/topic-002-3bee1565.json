@@ -4,87 +4,96 @@
   "category": "jvm",
   "group": "jvm",
   "title": "堆内存详解",
-  "summary": "堆是JVM管理的最大一块内存，所有对象实例都在这里分配。",
+  "summary": "堆内存要讲清对象实际分配路径（逃逸分析→TLAB→Eden/Humongous）、Young GC 存活复制与晋升条件、不同收集器的堆布局与大对象差异、以及如何用 GC 日志/heap dump 区分分配速率过高、晋升过快和真实内存泄漏四条主线。",
   "tags": [
     "Java",
     "JVM",
-    "堆内存详解"
+    "堆内存",
+    "GC"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 27,
   "order": 20,
   "recommendWeight": 98,
   "learningCards": [
     {
       "type": "explain",
-      "title": "堆内存详解：堆的组成、对象分配策略",
-      "content": "## 一、堆的组成\n堆是JVM管理的最大一块内存，所有对象实例都在这里分配。\n### 1.1 新生代（Young Generation）\n```\n新生代 (1/3堆内存)\n├── Eden区 (80%)     - 对象优先在这里分配\n├── Survivor0区 (10%) - From区\n└── Survivor1区 (10%) - To区\n```\n**对象分配过程**：\n1. 新对象先在Eden区分配\n2. Eden满时触发Minor GC\n3. 存活对象复制到Survivor区\n4. 达到 MaxTenuringThreshold、动态年龄判断或 Survivor 空间不足时晋升老年代\n### 1.2 老年代（Old Generation）\n- 存放长期存活的对象\n- 大对象可能直接进入老年代；PretenureSizeThreshold 主要影响 Serial/ParNew 等传统收集器，G1 会按 Humongous 对象进入 Humongous Region\n- 老年代空间不足时触发Major GC\n### 1.3 分代比例\n```bash\n-XX:NewRatio=2      # 老年代:新生代 = 2:1\n-XX:SurvivorRatio=8 # Eden:S0:S1 = 8:1:1\n```\n\n## 二、对象分配策略\n### 2.1 TLAB（Thread Local Allocation Buffer）\n```bash\n-XX:+UseTLAB        # 启用TLAB（默认开启）\n-XX:TLABSize=256k   # TLAB大小\n```\n**作用**：每个线程在Eden区预先分配一小块内存，避免多线程分配时的竞争\n### 2.2 分配规则\n```\n对象分配流程：\n1. 尝试在TLAB分配 → 失败\n2. 尝试在Eden区分配 → 空间不足\n3. 触发Minor GC → GC后仍不足\n4. 老年代担保 → 老年代也不足\n5. 触发Full GC → 仍不足\n6. 抛出OutOfMemoryError\n```\n\n## 三、GC类型\n### Full GC触发条件：\n1. 老年代空间不足\n2. 方法区空间不足\n3. 调用System.gc()\n4. 老年代连续空间不足（分配担保失败）\n\n## 四、重要JVM参数\n```bash\n# 堆内存设置\n-Xms256m              # 初始堆大小\n-Xmx1024m             # 最大堆大小\n-Xmn256m              # 新生代大小\n# 分代比例\n-XX:NewRatio=2        # 老年代:新生代\n-XX:SurvivorRatio=8   # Eden:S0:S1\n# 晋升阈值\n-XX:MaxTenuringThreshold=15  # 晋升年龄上限之一，实际还受动态年龄和 Survivor 空间影响\n# 大对象\n-XX:PretenureSizeThreshold=3145728  # 传统收集器中可影响大对象；G1 按 Humongous Region 处理\n```"
+      "title": "对象分配路径：逃逸分析、TLAB 与 Eden",
+      "content": "JVM 规范说「堆是对象实例和数组的共享运行时数据区」，但 HotSpot 实际分配路径远比「new 进 Eden」复杂。编译器会先做逃逸分析：如果对象不逃出当前线程或方法，可能被标量替换——把字段拆成局部变量，连堆分配都省掉；如果逃逸分析证明对象只在栈帧内使用，也可能直接栈上分配。只有真正逃逸、且无法标量替换的对象才走堆分配。\n\n落到堆上，小对象优先走 Thread Local Allocation Buffer（TLAB）。TLAB 是每个线程独占的一块 Eden 空间，分配时只需移动指针（bump-the-pointer），不需要加锁；TLAB 用完才申请新的 TLAB 或直接分配到 Eden。这个设计把多线程并发分配的竞争从全局锁降为「TLAB 耗尽时的 CAS 申请」，是 HotSpot 分配吞吐高的关键原因。\n\n大对象（传统分代下 `-XX:PretenureSizeThreshold` 配置的阈值以上）在 Serial/ParNew 等收集器中可能直接分配到老年代，避免在 Eden 和 Survivor 之间来回复制。G1 中超过半个 region 大小的对象会被分配为 Humongous 对象，占用连续 region，回收节奏与普通对象不同。"
     },
     {
       "type": "explain",
-      "title": "堆内存详解：实战案例、面试高频问题",
-      "content": "## 五、实战案例\n```java\npublic class HeapDemo {\n    public static void main(String[] args) {\n        // 对象在Eden区分配\n        byte[] edenObj = new byte[1024 * 1024]; // 1MB\n        // 传统收集器的大对象可能进老年代；G1 按 Humongous 对象处理\n        byte[] bigObj = new byte[4 * 1024 * 1024]; // 4MB\n        // 长期存活的对象晋升老年代\n        for (int i = 0; i < 20; i++) {\n            byte[] temp = new byte[1024 * 1024];\n        }\n}\n}\n```\n\n## 六、面试高频问题\n### Q1: 为什么需要分代？\n**答**：因为大部分对象生命周期很短，分代可以针对不同生命周期的对象采用不同的回收策略，提高GC效率。\n### Q2: 新生代为什么要有两个Survivor区？\n**答**：为了实现复制算法。一个From，一个To，GC时将存活对象从From复制到To，然后交换角色，避免内存碎片。\n### Q3: 什么情况下对象会直接进入老年代？\n**答**：\n1. 大对象：传统收集器可受 PretenureSizeThreshold 影响；G1 中超过半个 Region 的对象按 Humongous 处理\n2. 长期存活对象（年龄超过MaxTenuringThreshold）\n3. 动态年龄判断（Survivor中相同年龄对象总大小超过一半）\n\n## 七、参考资料\n- 《深入理解Java虚拟机》第3章\n- 美团技术团队：Java内存分配策略\n- https://javaguide.cn/java/jvm/memory-allocation"
+      "title": "Young GC、Survivor 复制与晋升条件",
+      "content": "Eden（或 G1 young region）空间不足时触发 Young GC（也叫 Minor GC）。GC 从 Roots 出发标记可达对象，把存活对象复制到 Survivor 空间（或 G1 的 Survivor region），对象年龄 +1；不可达对象被回收。Survivor 分 From 和 To 两个区域，每次 Young GC 后角色互换，保证始终有一个 Survivor 是空的用于下次复制。\n\n对象晋升到老年代（或 G1 old region）的常见路径：\n\n1. **年龄阈值**：对象年龄达到 `-XX:MaxTenuringThreshold`（默认 15，G1 默认 15）。这是上限，不是唯一条件。\n2. **动态年龄判断**：HotSpot 会统计 Survivor 中同年龄及更小年龄对象的总大小，如果超过 Survivor 空间一半，则年龄大于等于该年龄的对象直接晋升。这比硬阈值更常见——对象可能在年龄为 2 或 3 时就晋升。\n3. **Survivor 放不下**：Young GC 后存活对象总大小超过 Survivor 容量，超出部分直接进入老年代（分配担保失败）。\n4. **大对象策略**：传统分代下超大对象直接分配到老年代；G1 下 Humongous 对象占用连续 old region。\n\n频繁晋升会加速老年代占用，触发 Mixed GC（G1）或 Full GC（传统分代），最终表现为暂停时间变长或吞吐下降。"
+    },
+    {
+      "type": "explain",
+      "title": "收集器差异：传统分代 vs G1 region 化布局",
+      "content": "传统分代收集器（Serial、Parallel、ParNew+CMS）的堆是一整块连续内存，由 JVM 启动参数决定 Eden/Survivor/Old 的比例：`-XX:NewRatio`（老/新比例，默认 2）、`-XX:SurvivorRatio`（Eden/Survivor 比例，默认 8，即 Eden:Survivor=8:1）、`-Xmn`（固定新生代大小）。这些参数一旦设定，young 和 old 的边界基本固定。\n\nG1 把堆切成大量等大 region（默认每个 1MB~32MB，由 `-XX:G1HeapRegionSize` 控制，必须是 2 的幂），每个 region 可以动态承担 Eden、Survivor、Old 或 Humongous 角色。G1 不依赖 `NewRatio`，young region 的数量由暂停时间目标 `-XX:MaxGCPauseMillis` 和回收代价预测动态决定。所以用 G1 时，`-Xmn`、`-XX:NewRatio` 通常不起作用或影响很小，硬套传统参数会困惑。\n\nHumongous 对象是 G1 特有概念：对象大小超过半个 region 时分配到连续的 Humongous region，这些 region 属于 old 代的一部分。Humongous 分配和回收代价高——分配时可能触发并发标记提前回收；复制成本高；碎片化严重时可能触发 Full GC。大量 Humongous 对象是 G1 调优的常见痛点。\n\nZGC 和 Shenandoah 进一步把 region 机制推向并发标记和并发转移，停顿通常在亚毫秒到个位数毫秒级别，适合超大堆低延迟场景，但吞吐可能低于 Parallel。选收集器不是「越新越好」，而是看暂停目标、堆大小、对象分配速率和吞吐需求的平衡。"
     },
     {
       "type": "diagram",
-      "title": "对象从 Eden 到老年代的晋升路径",
-      "format": "mermaid",
-      "content": "flowchart TD\nNew[新对象分配] --> TLAB{能进入 TLAB/Eden 吗}\nTLAB -->|能| Eden[Eden 快速指针碰撞]\nTLAB -->|大对象或 Eden 放不下| OldDirect[传统收集器可能进老年代<br/>G1 按 Humongous 处理]\nEden --> Minor[Minor GC]\nMinor --> Live{对象仍可达吗}\nLive -->|否| Reclaim[回收]\nLive -->|是| Survivor[复制到 Survivor<br/>年龄加一]\nSurvivor --> Age{达到晋升条件}\nAge -->|年龄阈值/动态年龄/Survivor 放不下| Old[晋升老年代]\nAge -->|未达到| Back[留在 Survivor]\nOld --> Pressure{老年代压力}\nPressure -->|回收后仍高| FullGC[Full GC 或 OOM<br/>导 dump 分析引用链]",
-      "caption": "堆内存不是只背 Eden/S0/S1/Old，更要能说明对象什么时候留在新生代、什么时候晋升、什么时候该导 dump。",
-      "fallback": "图示展示对象优先在 Eden 分配，Minor GC 后存活对象复制到 Survivor 并增加年龄，满足年龄阈值、动态年龄或 Survivor 空间不足时进入老年代，老年代压力持续升高时进入 Full GC/OOM 排查。",
-      "items": [
-        "堆内存总体结构：新生代(1/3) + 老年代(2/3)",
-        "新生代细分：Eden(80%) + S0(10%) + S1(10%)",
-        "对象分配流程：Eden → S0/S1 → 老年代",
-        "GC触发条件：Eden满触发Minor GC，老年代满触发Full GC",
-        "大对象处理：超过阈值直接进入老年代",
-        "年龄晋升机制：MaxTenuringThreshold、动态年龄判断和 Survivor 空间共同决定",
-        "空间担保机制：Minor GC前检查老年代可用空间"
-      ],
+      "title": "堆对象分配、晋升与 OOM 诊断路径",
+      "content": "assets/diagrams/java-jvm-heap-allocation-gc-path.svg",
+      "caption": "图中把 new 对象、逃逸分析、TLAB/Eden、Young GC、Survivor 年龄、晋升、G1 Humongous 和 heap OOM 诊断入口串成一条路径。",
+      "fallback": "对象语义上从堆分配，但 HotSpot JIT 可能通过逃逸分析和标量替换消除实际分配。实际分配通常先走 TLAB，再进入 Eden 或 young region。Young GC 后存活对象复制到 Survivor 并增加年龄，满足年龄阈值、动态年龄、Survivor 空间不足或大对象策略时进入老年代/old region。堆问题排查要看分配速率、晋升速率、Full/Old GC 后 live set、Humongous 对象和 heap dump 引用链。",
+      "format": "svg",
       "sources": [
         {
-          "kind": "mermaid",
-          "content": "flowchart TD\nNew[新对象分配] --> TLAB{能进入 TLAB/Eden 吗}\nTLAB -->|能| Eden[Eden 快速指针碰撞]\nTLAB -->|大对象或 Eden 放不下| OldDirect[传统收集器可能进老年代<br/>G1 按 Humongous 处理]\nEden --> Minor[Minor GC]\nMinor --> Live{对象仍可达吗}\nLive -->|否| Reclaim[回收]\nLive -->|是| Survivor[复制到 Survivor<br/>年龄加一]\nSurvivor --> Age{达到晋升条件}\nAge -->|年龄阈值/动态年龄/Survivor 放不下| Old[晋升老年代]\nAge -->|未达到| Back[留在 Survivor]\nOld --> Pressure{老年代压力}\nPressure -->|回收后仍高| FullGC[Full GC 或 OOM<br/>导 dump 分析引用链]"
+          "kind": "svg",
+          "path": "assets/diagrams/java-jvm-heap-allocation-gc-path.svg"
         },
         {
           "kind": "text",
-          "content": "图示展示对象优先在 Eden 分配，Minor GC 后存活对象复制到 Survivor 并增加年龄，满足年龄阈值、动态年龄或 Survivor 空间不足时进入老年代，老年代压力持续升高时进入 Full GC/OOM 排查。"
+          "content": "对象语义上从堆分配，但 HotSpot JIT 可能通过逃逸分析和标量替换消除实际分配。实际分配通常先走 TLAB，再进入 Eden 或 young region。Young GC 后存活对象复制到 Survivor 并增加年龄，满足年龄阈值、动态年龄、Survivor 空间不足或大对象策略时进入老年代/old region。堆问题排查要看分配速率、晋升速率、Full/Old GC 后 live set、Humongous 对象和 heap dump 引用链。"
         }
       ]
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | 新生代 | 老年代 |\n| --- | --- | --- |\n| 存储对象 | 新创建的对象 | 长期存活的对象 |\n| 内存占比 | 堆的1/3(默认) | 堆的2/3(默认) |\n| GC类型 | Minor GC(频繁) | Major GC/Full GC(较少) |\n| GC算法 | 复制算法 | 标记-清除/标记-整理 |\n| 调优参数 | -Xmn、-XX:SurvivorRatio | -XX:NewRatio |\n| 异常表现 | 频繁Minor GC | Full GC时间长 |"
+      "title": "传统分代与 G1 的堆布局和大对象差异",
+      "content": "| 维度 | 传统分代（Serial/Parallel/ParNew+CMS） | G1 | 面试一句话 |\n| --- | --- | --- | --- |\n| 堆布局 | 一整块连续内存，Eden/S0/S1/Old 边界固定 | 切成大量等大 region，角色可动态变化 | 不要把 Eden:S0:S1=8:1:1 当 JVM 规范，那是默认值 |\n| Young 大小 | 由 `-Xmn`、`-XX:NewRatio` 决定 | 由暂停目标和回收代价预测动态决定 | G1 下 `NewRatio`/`-Xmn` 影响很小或不生效 |\n| 大对象 | `PretenureSizeThreshold` 对 Serial/ParNew 有效，直接进 Old | 超半个 region 分配为 Humongous，占连续 old region | 大对象路径必须分收集器讲 |\n| 晋升 | 年龄阈值 + 动态年龄 + Survivor 放不下 | 相同机制，但 Mixed GC 可选择性回收部分 old region | 关注晋升速率而非只看阈值 |\n| GC 事件类型 | Minor GC / Major GC / Full GC | Young GC / Mixed GC / Full GC | 读 GC 日志时对号入座，别混淆术语 |\n| 碎片与压缩 | CMS 不压缩有碎片问题，Serial/Parallel Full GC 时压缩 | Mixed GC 阶段复制存活对象，Full GC 时也会压缩 | 碎片触发的 Full GC 是老问题，G1 Humongous 也会碎片化 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "public class HeapDemo {\n    public static void main(String[] args) {\n        // 对象在Eden区分配\n        byte[] edenObj = new byte[1024 * 1024]; // 1MB\n        // 传统收集器的大对象可能进老年代；G1 按 Humongous 对象处理\n        byte[] bigObj = new byte[4 * 1024 * 1024]; // 4MB\n        // 长期存活的对象晋升老年代\n        for (int i = 0; i < 20; i++) {\n            byte[] temp = new byte[1024 * 1024];\n        }\n    }\n}",
+      "title": "Java 可运行：观察堆池名称、分配与 GC 触发",
+      "content": "import java.lang.management.ManagementFactory;\nimport java.lang.management.MemoryPoolMXBean;\nimport java.lang.management.GarbageCollectorMXBean;\nimport java.util.ArrayList;\nimport java.util.List;\nimport java.util.Set;\nimport java.util.stream.Collectors;\n\npublic class Main {\n    public static void main(String[] args) {\n        // 1. 打印当前收集器的堆池名称\n        Set<String> pools = ManagementFactory.getMemoryPoolMXBeans().stream()\n            .map(MemoryPoolMXBean::getName)\n            .collect(Collectors.toSet());\n        System.out.println(\"heap pools: \" + pools);\n\n        // 2. 打印 GC 收集器名称和已收集次数\n        List<GarbageCollectorMXBean> gcs = ManagementFactory.getGarbageCollectorMXBeans();\n        for (GarbageCollectorMXBean gc : gcs) {\n            System.out.println(\"gc: \" + gc.getName() + \", count=\" + gc.getCollectionCount()\n                + \", time=\" + gc.getCollectionTime() + \"ms\");\n        }\n\n        // 3. 分配并持有引用，观察堆使用量变化\n        long before = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();\n        List<byte[]> live = new ArrayList<>();\n        for (int i = 0; i < 16; i++) {\n            live.add(new byte[512 * 1024]); // 每个 512KB\n        }\n        long after = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();\n\n        System.out.println(\"used: \" + before + \" -> \" + after + \" bytes\");\n        System.out.println(\"kept: \" + live.size() + \" arrays, total \" + live.stream().mapToInt(a -> a.length).sum() + \" bytes\");\n\n        // 4. 验证不同收集器池名称差异\n        boolean hasYoungPool = pools.stream().anyMatch(n -> n.contains(\"Eden\") || n.contains(\"Survivor\") || n.contains(\"Young\"));\n        boolean hasOldPool = pools.stream().anyMatch(n -> n.contains(\"Old\") || n.contains(\"Tenured\"));\n        assert hasYoungPool : \"expect a young gen pool\";\n        assert hasOldPool : \"expect an old gen pool\";\n        assert after > before : \"used memory should increase\";\n        assert live.size() == 16;\n    }\n}",
       "language": "java",
       "highlights": [
         {
-          "line": 8,
-          "note": "「for (int i = 0; i < 20; i++) {」 是这段示例的主遍历；它决定处理顺序和成本上界，说明「堆内存详解」时要补上每轮维护的状态。"
+          "line": 10,
+          "note": "MemoryPoolMXBean 的池名是收集器实现相关的：G1 会显示 G1 Eden Space 等，Parallel 会显示 PS Eden Space 等。"
+        },
+        {
+          "line": 15,
+          "note": "GarbageCollectorMXBean 可以看到当前堆用了什么收集器以及 GC 次数和累计耗时。"
+        },
+        {
+          "line": 23,
+          "note": "持有引用防止数组立即被 GC，用于观察分配后的堆使用量变化。"
+        },
+        {
+          "line": 30,
+          "note": "按池名称子串兼容判断 Young/Old，不硬编码某个收集器的固定名称。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
-      "title": "面试回答思路",
-      "content": "**高频问题1：请介绍一下Java堆内存的结构**\n\nJava堆是JVM管理的最大一块内存区域，所有线程共享。从分代角度，堆分为新生代和老年代。新生代又分为Eden区和两个Survivor区(S0和S1)，默认比例是8:1:1。新对象优先在Eden区分配，经过Minor GC后存活的对象进入Survivor区，经过多次GC后存活的对象进入老年代。堆内存通过-Xms和-Xmx参数设置初始大小和最大大小。\n**高频问题2：什么情况下对象会进入老年代？**\n\n对象进入老年代主要看年龄阈值、动态年龄、Survivor 空间和收集器实现，常见情况有：\n\n1. 年龄达到阈值：对象在 Survivor 区每经历一次 GC 年龄加 1，达到 MaxTenuringThreshold 后可晋升；实际还会受动态年龄判断影响\n2. 大对象处理：PretenureSizeThreshold 对 Serial/ParNew 等传统收集器更典型；G1 使用 Humongous Region 处理超过半个 Region 的大对象\n3. 动态年龄判断：Survivor区中相同年龄对象大小总和大于Survivor空间的一半，年龄大于等于该年龄的对象直接进入老年代\n4. 空间分配担保：Minor GC后Survivor区放不下，通过担保机制进入老年代。\n**高频问题3：如何排查堆内存溢出问题？**\n\n排查堆内存溢出(OOM)的步骤：\n\n1. 首先添加JVM参数-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/path/to/dump，让JVM在OOM时自动生成堆转储文件\n2. 使用MAT(Memory Analyzer Tool)或VisualVM分析堆转储，查看大对象和泄漏嫌疑对象\n3. 检查代码中是否存在内存泄漏，如未关闭的资源、静态集合类持有对象引用等\n4. 根据分析结果调整堆大小(-Xmx)或修复代码问题。",
+      "title": "面试回答抓手",
+      "content": "堆内存先讲分配路径，再讲晋升机制，然后收集器差异，最后排查方法。\n\n**对象分配路径**\n- 对象语义上从堆分配，但 HotSpot JIT 可能通过逃逸分析和标量替换消除实际分配\n- 真实分配先走 TLAB（Thread Local Allocation Buffer）：每线程独占一块 Eden 空间，bump-pointer 分配，不加锁；TLAB 耗尽才申请新 TLAB 或全局分配\n- TLAB 用完后进入 Eden / G1 young region\n- 传统分代下超大对象可直接分配到老年代（`PretenureSizeThreshold`）；G1 下超半个 region 的对象分配为 Humongous\n\n**Young GC 与晋升条件**\n- Eden 满触发 Young GC：从 GC Roots 标记可达 → 存活对象复制到 Survivor（年龄+1）→ 不可达回收\n- 晋升老年代：年龄达到 `MaxTenuringThreshold`；动态年龄判断（同龄及以下累计 > Survivor/2）；Survivor 放不下；大对象直接进老年代\n- 频繁晋升 → 老年代快满 → Mixed GC / Full GC 压力上升\n\n**收集器差异（关键边界）**\n- 传统分代：Eden/S0/S1/Old 边界固定，`NewRatio`/`SurvivorRatio`/`-Xmn` 控制比例\n- G1：region 化堆，角色可变，young 大小由暂停目标动态调整；`NewRatio`/`-Xmn` 影响很小\n- G1 Humongous：分配/回收代价高，碎片化严重时触发 Full GC\n- ZGC/Shenandoah：region + 并发标记/转移，停顿亚毫秒级\n\n**排查（四种情况分清）**\n- **分配速率高**：Young GC 频繁，Old/Full GC 后老年代占用能回落\n- **晋升过快**：Young GC 频繁 + 老年代快速上升，看 Survivor 年龄分布和动态年龄\n- **泄漏/live set 过大**：Old/Full GC 后占用仍高甚至持续上升\n- **Humongous 压力**（G1）：GC 日志中有大量 Humongous Alloc 事件\n- heap OOM：导 dump → MAT 看 dominator tree 和 retained size → Path to GC Roots 找为什么没被回收\n- 不能只增大堆：缓存无界、集合累积、ThreadLocal 泄漏、监听器未注销，增大堆只推迟 OOM 并拉长停顿",
       "followUpQuestions": [
         {
-          "question": "能结合实际项目说说堆内存详解的调优经验吗？遇到过什么问题，怎么定位和解决的？",
-          "answer": "项目里遇到堆内存问题时，我会先用 GC 日志判断是分配速率过高、老年代回收不掉还是大对象触发 Full GC，再结合 heap dump 看 retained size 和 GC Roots。比如本地缓存没有上限时，老年代 Full GC 后仍然下降不明显，MAT 会看到缓存 Map 占用最高；修复通常是加容量/TTL、拆分大对象、减少临时对象分配，并用压测验证 GC 频率和停顿是否回到目标范围。"
+          "question": "对象什么时候会进入老年代？",
+          "answer": "四条路径：年龄达到 MaxTenuringThreshold；动态年龄判断（Survivor 中同龄及更小年龄对象累计超过一半 Survivor 空间，该年龄及以上对象直接晋升）；Survivor 放不下（Young GC 后存活总量超 Survivor 容量）；大对象策略（传统分代的 PretenureSizeThreshold 或 G1 的 Humongous）。动态年龄判断比硬阈值更常触发。"
         },
         {
-          "question": "堆内存 的核心机制在 JDK 不同版本之间有什么变化？这些变化对调优策略有什么影响？",
-          "answer": "JDK 版本演进对 堆内存 有显著影响。比如 JDK 8 用元空间替代永久代，JDK 11 引入 ZGC，JDK 17 优化了 G1不同版本的调优参数和策略需要相应调整。"
+          "question": "为什么不能只靠增大堆解决 OOM？",
+          "answer": "如果根因是缓存无界、集合只增不删、ThreadLocal 泄漏或监听器未注销，增大堆只是推迟 OOM 时间，并且更大的堆意味着更长的 GC 停顿（尤其传统分代的 Full GC）。正确做法是看 Full GC 后 live set 是否回落——不回落说明有不可回收的泄漏点，需要 heap dump 找 retained size 最大的对象和 GC Roots 路径。"
         },
         {
-          "question": "如果线上出现与 堆内存 相关的 OOM 或性能问题，你会从哪些指标和日志入手排查？",
-          "answer": "堆内存问题先看 OOM 类型是否为 `Java heap space`，再结合 GC 日志判断是分配速率过高、老年代回收不掉，还是大对象/缓存泄漏。指标上关注 Eden 分配速率、晋升速率、老年代 Full GC 后占用、p95/p99 停顿和对象年龄分布。落地排查会开启 heap dump，用 MAT 看 dominator tree、retained size 和 GC Roots 路径，重点检查本地缓存、集合累积、ThreadLocal、监听器和未关闭资源。"
+          "question": "G1 的 Humongous 对象为什么是调优痛点？",
+          "answer": "Humongous 对象需要占用连续 region，分配时可能触发额外的并发标记提前回收空 Humongous region；复制和清理成本高；碎片化严重时找不到连续 region 会直接触发 Full GC。大量 Humongous 对象说明有大数组、大字符串、批量反序列化或消息聚合，需要从业务侧拆分或调大 region size（`-XX:G1HeapRegionSize`）。"
         }
       ]
     },
@@ -92,68 +101,87 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能画出堆内存的分代结构图",
-        "能解释新生代和老年代的默认比例",
-        "能说出对象进入老年代的四种情况",
-        "能解释Minor GC和Full GC的区别",
-        "能说明复制算法在新生代的应用",
-        "能说出堆内存调优的关键参数",
-        "能描述排查OOM问题的完整流程"
+        "能解释逃逸分析和标量替换为什么会消除实际堆分配",
+        "能说明 TLAB 的作用：每线程独占 Eden 缓冲、bump-pointer 分配、无锁并发",
+        "能列举对象晋升到老年代的四条路径（年龄阈值、动态年龄、放不下、大对象）",
+        "能解释动态年龄判断的触发条件（同龄及以下累计 > Survivor/2）",
+        "能区分传统分代和 G1 在堆布局、Young 大小、大对象和 GC 事件上的差异",
+        "能说明 G1 Humongous 对象的分配、回收和碎片化问题",
+        "能用 GC 日志区分分配速率高、晋升过快和真实内存泄漏",
+        "能用 heap dump + MAT 找 retained size 最大的对象和 GC Roots 路径"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "java.jvm.topic-002-3bee1565.recall.1",
-      "prompt": "请解释堆内存中新生代、老年代、Eden、Survivor 的关系，以及对象晋升的典型条件。",
+      "prompt": "请解释堆内存中对象从 TLAB/Eden 到 Survivor/Old 的分配与晋升路径，哪些条件会触发提前晋升？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "java.jvm.topic-002-3bee1565.recall.2",
-      "prompt": "一次 Minor GC 和 Full GC 分别会影响哪些对象？如何从 GC 日志判断晋升失败、分配失败或内存泄漏？",
+      "prompt": "传统分代收集器和 G1 在堆布局、young 大小、大对象处理和日志表达上有什么差异？",
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 3
     },
     {
       "id": "java.jvm.topic-002-3bee1565.recall.3",
-      "prompt": "堆相关参数 Xms、Xmx、Xmn、SurvivorRatio、MaxTenuringThreshold 分别影响什么，线上调优时如何取舍？",
+      "prompt": "线上堆 OOM 或频繁 Full GC，你会如何排查是泄漏、容量不足还是分配速率过高？",
       "mode": "text",
       "expectedMinutes": 5,
+      "difficulty": 3
+    },
+    {
+      "id": "java.jvm.topic-002-3bee1565.recall.4",
+      "prompt": "G1 的 Humongous 对象是什么？为什么大量 Humongous 对象会导致 Full GC？从业务和 JVM 参数两个层面怎么优化？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "java.jvm.topic-002-3bee1565.recall.5",
+      "prompt": "动态年龄判断是怎么工作的？它和 MaxTenuringThreshold 的关系是什么？",
+      "mode": "text",
+      "expectedMinutes": 3,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能讲清堆内存的线程共享属性、新生代/老年代/Survivor 的分工和对象分配主路径",
-      "能说明 Minor GC、晋升、动态年龄判断、空间担保和 Full GC/OOM 之间的因果关系",
-      "能区分传统分代收集器与 G1 对大对象、晋升阈值和新生代大小的处理差异",
-      "能画出堆内存的分代结构图"
+      "能讲清对象分配的完整路径：逃逸分析→TLAB→Eden/young region",
+      "能解释 Young GC 的触发、存活复制和四条晋升路径",
+      "能区分传统分代与 G1 在堆布局、Young 大小和大对象处理上的差异",
+      "能用 GC 日志区分分配速率过高、晋升过快和真实内存泄漏",
+      "能指出增大堆不是解决泄漏的根本方法"
     ],
     "goodToHave": [
-      "能结合 GC 日志、堆转储和对象引用链判断是容量不足、晋升过快还是泄漏",
-      "能解释 Xms/Xmx/Xmn/SurvivorRatio/MaxTenuringThreshold 的适用边界",
-      "能用压测或线上监控验证堆参数调整是否真的改善停顿和吞吐"
+      "能解释逃逸分析和标量替换消除堆分配的机制",
+      "能说明动态年龄判断的触发条件和比硬阈值更常见的原因",
+      "能解释 G1 Humongous 对象的分配、回收代价和碎片化问题",
+      "能用 heap dump + MAT 的 dominator tree、retained size、Path to GC Roots 做诊断"
     ],
     "commonMistakes": [
-      "混淆新生代和老年代的GC算法差异",
-      "不清楚Eden和Survivor的比例关系（默认8:1:1）",
-      "以为增大堆内存就能解决所有OOM问题"
+      "把 Eden:S0:S1=8:1:1 当成 JVM 规范而不是默认值",
+      "在 G1 上配置 NewRatio/-Xmn 却不生效，不理解原因",
+      "忽略 G1 Humongous 对象的特殊路径和碎片化风险",
+      "只看 GC 次数不看 Full GC 后 live set 是否下降",
+      "不区分分配速率高、晋升过快和真实内存泄漏三种不同根因"
     ],
     "scoreWeights": {
-      "coverage": 25,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 25
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "draft",
   "prerequisites": [
     "java.jvm.topic-001-ebcc71cb"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能围绕「堆内存详解」说清能准确解释堆的组成的核心概念、作用和适用边界、说清1.1 新生代（Young Generation）和1.2 老年代（Old Generation）的关键机制，并放到Java 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "重点考察候选人能否从对象分配路径（逃逸分析→TLAB→Eden）、Young GC 与晋升条件（动态年龄判断）、收集器差异（传统分代 vs G1 region + Humongous）、GC 日志和 heap dump 诊断四个层次完整讲清堆内存，而不是只背固定分代比例。"
 }

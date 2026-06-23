@@ -4,14 +4,14 @@
   "category": "mysql-core",
   "group": "mysql-core",
   "title": "慢 SQL 排查与容量拆分",
-  "summary": "掌握线上慢 SQL 从发现、定位、优化到容量拆分的完整路径。",
+  "summary": "掌握线上慢 SQL 从发现、定位、优化到容量拆分的完整路径：慢日志采集聚合找到值得优化的 SQL，EXPLAIN 确认瓶颈在扫描、排序还是锁等待，优先做索引和 SQL 改写；只有单表容量、写入吞吐和维护窗口长期逼近边界时才进入分库分表——拆分会带来全局 ID、跨片查询、事务一致性和扩容迁移等新问题，路由键选择是核心决策。",
   "tags": [
     "数据库",
     "慢",
     "mysql-core"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 33,
   "order": 60,
   "recommendWeight": 90,
   "status": "staging",
@@ -25,12 +25,17 @@
     {
       "type": "explain",
       "title": "慢 SQL 排查要先定位真实瓶颈",
-      "content": "慢 SQL 不一定都是缺索引，也可能是扫描行数过大、排序临时表溢出到磁盘、锁等待、返回数据太多、连接池耗尽或数据量增长突破原设计。容量拆分则是在单表、单库或单实例压力接近边界时的结构性治理。\n\n**慢日志采集与汇总**\n- MySQL 通过 `long_query_time`（默认 10s，生产建议调到 0.1s 或更低）控制慢日志阈值，`slow_query_log=ON` 开启，`slow_query_log_file` 指定路径。\n- `log_queries_not_using_indexes=ON` 可额外记录未走索引的 SQL，但会产生大量噪音，适合短期排查时开启。\n- 生产环境用 `pt-query-digest` 对慢日志做聚合：按指纹（fingerprint）归类相似 SQL，输出每类 SQL 的调用次数、累计耗时、P95、行扫描均值等指标。面试常问「如何从百万条慢日志里找到最值得优化的 SQL」——答案是按「总耗时 = 次数 × 单次耗时」排序，而非只看单次最慢。\n- 如果用云数据库（如 RDS），可直接用 CloudWatch / 阿里云 DAS 的慢 SQL 分析面板，省去手动采集。\n\n**EXPLAIN 关键字段速查**\n- `type`：访问类型，从好到差依次为 `const > eq_ref > ref > range > index > ALL`。`ALL` 是全表扫描，`index` 是全索引扫描，两者在大表上都是危险信号。\n- `key`：实际选用的索引。如果为 NULL 说明没走索引；`possible_keys` 有值但 `key` 为 NULL，可能是优化器认为全表扫描成本更低（统计信息过期或索引选择率太低）。\n- `rows`：优化器估算的扫描行数，是判断慢 SQL 的核心指标。`rows` 远大于实际返回行数说明选择率低。\n- `Extra`：`Using filesort` 表示需要额外排序（可能落盘），`Using temporary` 表示需要临时表，`Using index` 表示覆盖索引免回表。这三个值直接决定是否需要加索引或改写 SQL。\n- `EXPLAIN ANALYZE`（MySQL 8.0.18+）会实际执行 SQL 并返回每步真实耗时和行数，能暴露优化器估算与实际执行的偏差。\n\n**容易答错的边界**\n- 一看到慢 SQL 就分库分表会把复杂度提前引入，很多慢 SQL 只是缺联合索引或深分页\n- 只看平均耗时不看 P95/P99 和高频 SQL，会漏掉用户感知问题\n- 容量拆分前不定义路由键和查询模式，后续跨分片查询会很痛苦"
+      "content": "慢 SQL 不一定都是缺索引，也可能是扫描行数过大、排序临时表溢出到磁盘、锁等待、返回数据太多、连接池耗尽或数据量增长突破原设计。容量拆分则是在单表、单库或单实例压力接近边界时的结构性治理。排查的目的是区分「这条 SQL 本身可以优化」和「整个数据规模需要重新组织」两类不同性质的问题。\n\n**慢日志采集与汇总**\n- MySQL 通过 `long_query_time`（默认 10s，生产建议调到 0.1s 或更低）控制慢日志阈值，`slow_query_log=ON` 开启，`slow_query_log_file` 指定路径。\n- `log_queries_not_using_indexes=ON` 可额外记录未走索引的 SQL，但会产生大量噪音，适合短期排查时开启。排查完务必关掉，否则日志膨胀会影响 IO。\n- 生产环境用 `pt-query-digest` 对慢日志做聚合：按指纹（fingerprint）归类相似 SQL，输出每类 SQL 的调用次数、累计耗时、P95、行扫描均值等指标。排序方式选 `--order-by Query_time:sum`，按「总耗时 = 次数 × 单次耗时」排序，而非只看单次最慢——一条 200ms 但每秒 500 次的 SQL，对系统整体影响远大于一条 2s 但每天 10 次的 SQL。\n- 如果用云数据库（如 RDS），可直接用 CloudWatch / 阿里云 DAS 的慢 SQL 分析面板，省去手动采集和聚合。\n\n**EXPLAIN 关键字段速查**\n- `type`：访问类型，从好到差依次为 `system > const > eq_ref > ref > range > index > ALL`。`ALL` 是全表扫描，`index` 是全索引扫描，两者在大表上都是危险信号。\n- `key`：实际选用的索引。如果为 NULL 说明没走索引；`possible_keys` 有值但 `key` 为 NULL，可能是优化器认为全表扫描成本更低（统计信息过期或索引选择率太低），可以用 `ANALYZE TABLE` 刷新统计信息。\n- `rows`：优化器估算的扫描行数，是判断慢 SQL 的核心指标。`rows` 远大于实际返回行数说明选择率低，需要更好的索引或更精确的查询条件。\n- `Extra`：`Using filesort` 表示需要额外排序（可能落盘），`Using temporary` 表示需要临时表（可能落盘），`Using index` 表示覆盖索引免回表，`Using index condition` 表示索引下推（ICP）。这三个值直接决定是否需要加索引或改写 SQL。\n- `EXPLAIN ANALYZE`（MySQL 8.0.18+）会实际执行 SQL 并返回每步真实耗时和行数，能暴露优化器估算与实际执行的偏差——估算 rows 差 10 倍以上说明统计信息需要刷新。\n\n**容易答错的边界**\n- 一看到慢 SQL 就分库分表会把复杂度提前引入，很多慢 SQL 只是缺联合索引或深分页\n- 只看平均耗时不看 P95/P99 和高频 SQL，会漏掉用户感知问题\n- 容量拆分前不定义路由键和查询模式，后续跨分片查询会很痛苦"
     },
     {
       "type": "explain",
       "title": "容量治理要区分优化、归档和拆分",
-      "content": "排查慢 SQL 的顺序应当保守：先定位 SQL，再确认执行计划和锁等待，然后优化索引和 SQL；如果问题来自历史数据膨胀，优先考虑冷热归档、分区表或数据生命周期管理；只有当单表容量、写入吞吐、存储或维护窗口确实成为长期瓶颈时，才进入分库分表。\n\n**判断「该优化还是该拆分」的量化标准**\n- 单表行数超过 1000 万且 B+ 树层级从 3 层涨到 4 层，磁盘 IO 和缓冲池命中率明显下降\n- 单库写入 QPS 持续超过 5000（InnoDB 行锁竞争和 redo log 刷盘成为瓶颈）\n- 单表数据文件超过 50GB，DDL 变更（如加索引）窗口超过业务可容忍时间\n- 备份恢复时间超过 RTO 指标\n\n**路由键选择的核心矛盾**\n容量拆分最重要的是路由键。订单表按 `user_id` 拆，用户维度查询方便，但商家维度或全局时间范围查询会变复杂，需要异构索引或宽表补偿；按时间拆适合归档和范围查询，但热点时间段写入可能集中到单个分片。面试回答要说清拆分后带来的全局唯一 ID（Snowflake / 号段模式）、跨分片事务（Saga / TCC / 最终一致）、分页排序（各分片取 Top-N 再归并）、扩容迁移（一致性哈希 vs 固定分片倍扩）和数据一致性问题。"
+      "content": "排查慢 SQL 的顺序应当保守：先定位 SQL，再确认执行计划和锁等待，然后优化索引和 SQL；如果问题来自历史数据膨胀，优先考虑冷热归档、分区表或数据生命周期管理；只有当单表容量、写入吞吐、存储或维护窗口确实成为长期瓶颈时，才进入分库分表。这个顺序不能跳过——跳过优化和归档直接拆分，等于用工程复杂度掩盖 SQL 质量问题。\n\n**判断「该优化还是该拆分」的量化标准**\n- 单表行数超过 1000 万且 B+ 树层级从 3 层涨到 4 层，磁盘 IO 和缓冲池命中率明显下降\n- 单库写入 QPS 持续超过 5000（InnoDB 行锁竞争和 redo log 刷盘成为瓶颈）\n- 单表数据文件超过 50GB，DDL 变更（如加索引）窗口超过业务可容忍时间——MySQL 8.0 之前 Online DDL 需要 copy，8.0 支持 Instant DDL 但仍有锁等待\n- 备份恢复时间超过 RTO 指标\n- 这些指标要结合趋势看，不能只看瞬时值\n\n**路由键选择的核心矛盾**\n容量拆分最重要的是路由键。订单表按 `user_id` 拆，用户维度查询方便，但商家维度或全局时间范围查询会变复杂，需要异构索引或宽表补偿；按时间拆适合归档和范围查询，但热点时间段写入可能集中到单个分片。路由键要覆盖 80% 以上主查询模式，否则拆完跨片查询比例过高，性能反而下降。\n\n面试回答要说清拆分后带来的全局唯一 ID（Snowflake / 号段模式）、跨分片事务（Saga / TCC / 最终一致）、分页排序（各分片取 Top-N 再归并）、扩容迁移（一致性哈希 vs 固定分片倍扩）和数据一致性问题。每一步都不是免费的，所以拆分是最后手段。"
+    },
+    {
+      "type": "explain",
+      "title": "深分页、IN 子句和排序是常见可优化场景",
+      "content": "很多慢 SQL 不需要拆分，改写 SQL 就能解决。几个高频场景：\n\n**深分页**：`LIMIT 100000, 10` 虽然只返回 10 行，但 MySQL 需要先扫描并丢弃前 100000 行。两种改写方式：游标分页 `WHERE id > last_id ORDER BY id LIMIT 10` 要求有连续递增的游标字段，适合无限滚动；延迟关联 `SELECT t.* FROM orders t INNER JOIN (SELECT id FROM orders ORDER BY id LIMIT 100000, 10) tmp ON t.id = tmp.id` 让子查询走覆盖索引，只回表 10 行。\n\n**大 IN 子句**：`WHERE id IN (1, 2, ..., 10000)` 在 MySQL 8.0.20 之前用 index merge 优化，之后改用 range scan；但 IN 列表过长仍会导致优化器估算偏差和执行计划不稳定。拆成多批（每批 500-1000）或用临时表 JOIN 替代。\n\n**ORDER BY 与 GROUP BY**：联合索引的列顺序要匹配查询的 ORDER BY/GROUP BY 字段方向，否则 `Using filesort`。如果排序字段和 WHERE 条件字段不同，需要把等值条件列放最左、排序列放后面（等值查询 + 范围/排序的经典索引顺序）。\n\n**大结果集返回**：`SELECT *` 在宽表上会返回大量列，网络传输和客户端内存都是瓶颈。只查需要的列，必要时用覆盖索引。"
     },
     {
       "type": "diagram",
@@ -53,79 +58,80 @@
     {
       "type": "compareTable",
       "title": "慢 SQL 治理手段对比",
-      "columns": [
-        "考点",
-        "机制含义",
-        "面试要点",
-        "常见误区"
-      ],
-      "rows": [
-        [
-          "索引优化",
-          "通过联合索引减少扫描行数和回表次数，覆盖索引可免回表",
-          "区分等值查询放最左、范围查询放最右；评估写入成本增幅",
-          "盲目加单列索引导致索引合并效率低且写入变慢"
-        ],
-        [
-          "SQL 改写",
-          "消除 filesort 和 temporary，深分页用游标或延迟关联",
-          "LIMIT 100000,10 改为 WHERE id > last_id LIMIT 10",
-          "改写后语义变化，如 OR 改 UNION ALL 后去重逻辑丢失"
-        ],
-        [
-          "冷热归档",
-          "将历史数据迁移到冷表或对象存储，降低热表 B+ 树深度",
-          "归档口径要明确（如 90 天前已完成订单），归档后查询走异步或跨库",
-          "归档不彻底导致热表仍膨胀，或归档后业务查询频繁回查冷表"
-        ],
-        [
-          "分库分表",
-          "按路由键水平拆分，突破单库单表容量和写入瓶颈",
-          "路由键要覆盖 80% 以上主查询；全局 ID 用 Snowflake 或号段",
-          "路由键选错导致大量跨片查询；扩容时一致性哈希 vs 倍扩方案未提前规划"
-        ]
-      ]
+      "content": "| 治理手段 | 机制 | 适用场景 | 风险与代价 | 判断标准 |\n| --- | --- | --- | --- | --- |\n| 索引优化 | 联合索引减少扫描行数，覆盖索引免回表 | 缺索引或索引选择率低 | 写入成本增加，索引过多影响写入吞吐 | type=ALL/ref，rows 远大于返回行数 |\n| SQL 改写 | 游标分页、延迟关联、IN 拆批、消除 filesort | 深分页、大 IN、排序溢出 | 改写后语义变化需验证 | Extra 含 Using filesort/temporary |\n| 冷热归档 | 历史数据迁移到冷表/归档库，热表只保留近期数据 | 90% 以上查询集中在近期，但表里有大量历史数据 | 归档口径需明确，跨库查询需补偿 | 单表行数持续增长且查询有明显的时间局部性 |\n| 分库分表 | 按路由键水平拆分，突破单库单表容量和写入瓶颈 | 单表/单库容量和写入 QPS 长期逼近边界 | 全局 ID、跨片查询、事务一致性、扩容迁移、运维复杂度 | 行数千万级+写入 QPS 超 5000+DDL 窗口超容忍 |\n\n| 深分页方案 | 机制 | 性能 | 适用场景 |\n| --- | --- | --- | --- |\n| LIMIT offset, n | 扫描并丢弃前 offset 行 | offset 越大越慢，O(offset+n) | offset < 1000 的浅分页 |\n| 游标分页 WHERE id > last_id | 利用主键索引直接定位 | O(n)，恒定 | 无限滚动，不支持跳页 |\n| 延迟关联 | 子查询走覆盖索引取 ID，主表只回表 n 行 | O(offset+n) 但回表只有 n 行 | 需要跳页的深分页 |"
     },
     {
       "type": "code",
       "title": "慢日志配置与执行计划分析",
       "language": "sql",
-      "content": "-- 1. 开启慢日志并设置阈值（生产排查时临时调低）\nSET GLOBAL slow_query_log = ON;\nSET GLOBAL long_query_time = 0.1;\nSET GLOBAL log_queries_not_using_indexes = ON;\n\n-- 2. 用 pt-query-digest 聚合慢日志（在 shell 中执行）\n-- pt-query-digest /var/lib/mysql/slow.log --order-by Query_time:sum\n\n-- 3. 找到高耗时 SQL 后看执行路径\nEXPLAIN ANALYZE SELECT *\nFROM orders\nWHERE user_id = 7\nORDER BY created_at DESC\nLIMIT 20;\n\n-- 4. 如果 type=ALL 且 Extra=Using filesort，加联合索引\n-- CREATE INDEX idx_uid_created ON orders(user_id, created_at);",
+      "content": "-- 1. 开启慢日志并设置阈值（生产排查时临时调低，排查完调回）\nSET GLOBAL slow_query_log = ON;\nSET GLOBAL long_query_time = 0.1;\nSET GLOBAL log_queries_not_using_indexes = ON;\n\n-- 2. 用 pt-query-digest 聚合慢日志（在 shell 中执行）\n-- pt-query-digest /var/lib/mysql/slow.log --order-by Query_time:sum\n\n-- 3. 找到高耗时 SQL 后看执行路径\nEXPLAIN ANALYZE SELECT *\nFROM orders\nWHERE user_id = 7\nORDER BY created_at DESC\nLIMIT 20;\n\n-- 4. 如果 type=ALL 且 Extra=Using filesort，加联合索引\nCREATE INDEX idx_uid_created ON orders(user_id, created_at);\n\n-- 5. 深分页改写：游标分页\n-- 慢：SELECT * FROM orders ORDER BY id LIMIT 100000, 10;\n-- 快：SELECT * FROM orders WHERE id > 100000 ORDER BY id LIMIT 10;\n\n-- 6. 深分页改写：延迟关联\nSELECT t.* FROM orders t\nINNER JOIN (\n    SELECT id FROM orders ORDER BY id LIMIT 100000, 10\n) tmp ON t.id = tmp.id;\n\n-- 7. 刷新统计信息（优化器估算偏差大时）\nANALYZE TABLE orders;",
       "highlights": [
         {
           "line": 2,
           "note": "long_query_time 设为 0.1s 能捕获更多边界慢 SQL，但日志量会增大，排查完应调回原值。"
         },
         {
-          "line": 6,
+          "line": 7,
           "note": "pt-query-digest 按 SQL 指纹聚合，--order-by Query_time:sum 按「总耗时」排序，优先优化总耗时最高的 SQL 而非单次最慢的。"
         },
         {
-          "line": 10,
+          "line": 11,
           "note": "EXPLAIN ANALYZE 在 MySQL 8.0.18+ 可用，会实际执行并返回每步真实耗时和行数，能暴露优化器估算偏差。"
         },
         {
-          "line": 15,
+          "line": 16,
           "note": "联合索引 (user_id, created_at) 让等值查询走最左前缀、范围排序走第二列，同时消除 filesort。"
+        },
+        {
+          "line": 25,
+          "note": "延迟关联让子查询走覆盖索引（只扫 id），主表只回表 10 行，避免扫描并丢弃 10 万行。"
+        }
+      ]
+    },
+    {
+      "type": "code",
+      "title": "分库分表关键机制代码示例",
+      "language": "java",
+      "content": "import java.util.ArrayList;\nimport java.util.List;\nimport java.util.concurrent.ThreadLocalRandom;\n\n/**\n * 演示分库分表后三个核心问题：路由、全局 ID、跨分片查询归并\n */\npublic class ShardingDemo {\n\n    /** 路由：按 user_id 取模确定分片 */\n    static int routeToShard(long userId, int shardCount) {\n        return (int) (Math.abs(userId) % shardCount);\n    }\n\n    /** Snowflake 全局 ID（简化版，41 位时间戳 + 10 位机器 + 12 位序列） */\n    static class Snowflake {\n        private final long epoch = 1700000000000L;\n        private final long machineId;\n        private long sequence = 0;\n        private long lastTimestamp = -1;\n\n        Snowflake(long machineId) {\n            this.machineId = machineId & 0x3FF; // 10 bit\n        }\n\n        synchronized long nextId() {\n            long ts = System.currentTimeMillis() - epoch;\n            if (ts == lastTimestamp) {\n                sequence = (sequence + 1) & 0xFFF; // 12 bit\n                if (sequence == 0) {\n                    while (ts <= lastTimestamp) ts = System.currentTimeMillis() - epoch;\n                }\n            } else {\n                sequence = 0;\n            }\n            lastTimestamp = ts;\n            return (ts << 22) | (machineId << 12) | sequence;\n        }\n    }\n\n    /** 跨分片 Top-N 归并：各分片取 Top-N 后在应用层合并排序 */\n    static <T extends Comparable<T>> List<T> mergeTopN(List<List<T>> shardResults, int n) {\n        List<T> merged = new ArrayList<>();\n        for (List<T> shard : shardResults) {\n            merged.addAll(shard);\n        }\n        merged.sort(null);\n        return merged.subList(0, Math.min(n, merged.size()));\n    }\n\n    public static void main(String[] args) {\n        // 路由示例\n        System.out.println(\"user 12345 -> shard \" + routeToShard(12345, 4)); // shard 1\n\n        // 全局 ID 示例\n        Snowflake snowflake = new Snowflake(1);\n        System.out.println(\"snowflake id: \" + snowflake.nextId());\n\n        // 跨分片归并示例\n        List<List<Integer>> results = List.of(\n            List.of(1, 3, 5, 7, 9),\n            List.of(2, 4, 6, 8, 10)\n        );\n        System.out.println(\"top 3: \" + mergeTopN(results, 3)); // [1, 2, 3]\n    }\n}",
+      "highlights": [
+        {
+          "line": 11,
+          "note": "路由公式简单但重要：按 user_id 取模确定数据落在哪个分片，查询条件必须带 user_id 才能精确定位分片。"
+        },
+        {
+          "line": 21,
+          "note": "Snowflake 用 64 位长整型编码时间戳 + 机器 ID + 序列号，保证分布式环境下的全局唯一且趋势递增。"
+        },
+        {
+          "line": 40,
+          "note": "跨分片分页不能用 LIMIT offset,n（各分片 offset 语义不一致），需要各分片取 Top-N 后在应用层归并排序。"
+        },
+        {
+          "line": 47,
+          "note": "归并排序的时间复杂度是 O(k * n log n)，其中 k 是分片数，n 是每个分片返回的行数。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "慢 SQL 和容量拆分我会按「先诊断、再治理、最后拆分」的顺序回答。\n\n**30 秒结论**：慢 SQL 排查要先采集和聚合慢日志，用 EXPLAIN 确认瓶颈在扫描、排序、回表还是锁等待，优先做索引和 SQL 优化；只有当数据量和写入压力长期逼近单库边界时，才进入分库分表。\n\n**机制要点**：\n1. 用 `pt-query-digest` 按总耗时（次数 × 单次耗时）聚合慢日志，结合 APM 的 P95/P99 和调用频率找到真正影响用户的 SQL，而不是只看单次最慢。\n2. 通过 `EXPLAIN ANALYZE` 看 `type`（访问类型）、`rows`（估算扫描行数）、`Extra`（是否 filesort/temporary/Using index）判断慢在访问路径、排序、回表还是锁竞争。\n3. 第一阶段优先做联合索引设计、深分页改写（游标分页或延迟关联）、大 IN 拆批、冷热归档，并观察写入成本和线上风险。\n4. 当单表行数超过千万级且 B+ 树层级加深、写入 QPS 持续超 5000、DDL 窗口超容忍时，再设计分库分表路由键、全局 ID、迁移校验和灰度双写方案。\n\n**边界与追问应对**：分库分表不是慢 SQL 的第一反应。它能突破单库单表容量，但会把全局唯一 ID、跨片查询、事务一致性、扩容迁移和运维复杂度一起带进来。路由键要覆盖 80% 以上主查询模式，否则拆完跨片查询比例过高，性能反而下降。",
+      "content": "慢 SQL 和容量拆分我会按「先诊断、再治理、最后拆分」的顺序回答。\n\n**30 秒结论**：慢 SQL 排查要先采集和聚合慢日志，用 EXPLAIN 确认瓶颈在扫描、排序、回表还是锁等待，优先做索引和 SQL 优化；只有当数据量和写入压力长期逼近单库边界时，才进入分库分表。\n\n**机制主线**：\n1. **采集聚合**：用 `pt-query-digest` 按总耗时（次数 × 单次耗时）聚合慢日志，结合 APM 的 P95/P99 和调用频率找到真正影响系统的 SQL，而不是只看单次最慢。\n2. **定位瓶颈**：通过 `EXPLAIN` 看 `type`（访问类型）、`rows`（估算扫描行数）、`Extra`（是否 filesort/temporary/Using index）判断慢在访问路径、排序、回表还是锁竞争。`EXPLAIN ANALYZE`（8.0.18+）能暴露优化器估算偏差。\n3. **分级治理**：索引优化（联合索引最左前缀 + 排序列顺序）→ SQL 改写（游标分页、延迟关联、IN 拆批）→ 冷热归档（按时间或状态归档历史数据降低热表深度）→ 分库分表（最后手段）。\n4. **拆分决策**：量化边界（单表千万级、写入 QPS 超 5000、DDL 窗口超容忍、备份恢复超 RTO）；路由键覆盖 80% 以上主查询；全局 ID 用 Snowflake 或号段模式；跨片分页用各分片 Top-N 归并或游标分页；跨片事务用 Saga/TCC 做最终一致。\n\n**边界与追问应对**：\n- 分库分表不是慢 SQL 的第一反应。它能突破单库单表容量，但会把全局唯一 ID、跨片查询、事务一致性、扩容迁移和运维复杂度一起带进来。\n- 路由键选错是拆分后最大的坑——拆完跨片查询比例过高，性能反而下降。\n- 冷热归档要明确归档口径（如 90 天前已完成订单），归档后高频查询如果仍需回查冷表，收益就打折扣。",
       "followUpQuestions": [
         {
           "question": "慢 SQL 排查为什么不能只看平均耗时？pt-query-digest 聚合时按什么排序最合理？",
           "answer": "平均值会掩盖尾延迟和高频小慢 SQL。pt-query-digest 默认按 Query_time:sum（总耗时 = 次数 × 单次耗时）排序，这样能找到「对系统整体影响最大」的 SQL。一条执行 2s 但每天只跑 10 次的 SQL，优先级低于一条执行 200ms 但每秒跑 500 次的 SQL。同时要看 P95/P99 和调用频率，结合业务链路判断用户感知影响。"
         },
         {
-          "question": "线上订单表到 8 亿行后，列表查询 P99 升高，你如何决定是优化 SQL、归档还是分库分表？",
-          "answer": "我会先看 EXPLAIN 的 type 和 rows：如果 type=ALL 说明全表扫描，先加联合索引；如果 type=ref 但 rows 仍然大，说明选择率低，可能需要调整索引列顺序或加覆盖索引。然后看历史数据占比：如果 90% 以上查询集中在最近 30 天，但表里有 3 年数据，优先冷热归档或按时间分区，把热表从 8 亿降到几千万。只有当热数据本身写入和查询都接近单库瓶颈（如写入 QPS 持续超 5000、行锁竞争频繁、DDL 加索引超过 1 小时），才评估按 user_id 或 order_id 的路由键拆分，并提前设计跨片查询方案（如异构索引表）、数据校验和回滚。"
+          "question": "EXPLAIN 里 possible_keys 有值但 key 是 NULL，可能是什么原因？",
+          "answer": "优化器认为全表扫描的成本低于使用索引。常见原因：（1）统计信息过期，可以用 ANALALYZE TABLE 刷新；（2）索引选择率太低（如 gender 这种只有两个值的列），走索引回表的 IO 反而更多；（3）查询条件涉及大量 OR 或函数转换，索引无法直接使用。排查时先 EXPLAIN ANALYZE 看真实行数和耗时，再决定是刷新统计信息、加联合索引还是改写 SQL。"
+        },
+        {
+          "question": "深分页 LIMIT 100000, 10 为什么慢？除了游标分页还有什么改写方式？",
+          "answer": "MySQL 需要先扫描并丢弃前 100000 行，再返回 10 行，IO 成本是 O(offset+n)。游标分页（WHERE id > last_id）适合无限滚动但不支持跳页；延迟关联（子查询走覆盖索引取 ID，主表只回表 n 行）支持跳页且大幅减少回表次数。延迟关联的写法是 SELECT t.* FROM orders t INNER JOIN (SELECT id FROM orders ORDER BY id LIMIT 100000, 10) tmp ON t.id = tmp.id，子查询只扫 id 列走覆盖索引。"
         },
         {
           "question": "分库分表后全局唯一 ID 和跨分片分页排序怎么解决？",
-          "answer": "全局 ID 常用 Snowflake（时间戳 + 机器 ID + 序列号，64bit）或号段模式（数据库分配一段 ID 区间给应用缓存）。跨分片分页排序不能直接 LIMIT offset, n，因为各分片 offset 语义不一致。常见做法是各分片取 Top-N 再在应用层归并排序，但深分页时性能差；更优方案是用游标分页（WHERE create_time < last_time ORDER BY create_time DESC LIMIT n）配合各分片并行查询，或者用 Elasticsearch/宽表做二级查询补偿。跨分片事务一般不用 2PC（性能差），而是用 Saga 或 TCC 做最终一致。"
+          "answer": "全局 ID 常用 Snowflake（时间戳 + 机器 ID + 序列号，64bit，趋势递增）或号段模式（数据库分配一段 ID 区间给应用缓存）。跨分片分页排序不能直接 LIMIT offset, n，因为各分片 offset 语义不一致。常见做法是各分片取 Top-N 再在应用层归并排序，但深分页时性能差；更优方案是用游标分页（WHERE create_time < last_time ORDER BY create_time DESC LIMIT n）配合各分片并行查询，或者用 Elasticsearch/宽表做二级查询补偿。跨分片事务一般不用 2PC（性能差、可用性低），而是用 Saga（补偿事务）或 TCC（Try-Confirm-Cancel）做最终一致。"
         }
       ]
     },
@@ -133,12 +139,13 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能用 slow_query_log + long_query_time + pt-query-digest 采集和聚合慢 SQL",
+        "能用 slow_query_log + long_query_time + pt-query-digest 采集和聚合慢 SQL，知道按总耗时排序而非单次最慢",
         "能解读 EXPLAIN 的 type / key / rows / Extra 四个核心字段并判断瓶颈位置",
-        "能区分索引优化、SQL 改写、冷热归档和分库分表四种治理手段的适用场景",
+        "能区分索引优化、SQL 改写、冷热归档和分库分表四种治理手段的适用场景和优先级",
         "能给出深分页改写（游标分页 / 延迟关联）和联合索引设计的具体方案",
         "能量化判断容量边界（单表行数、写入 QPS、DDL 窗口、备份恢复时间）",
-        "能说明分库分表引入的全局 ID、跨片查询、事务一致性和扩容迁移问题"
+        "能说明分库分表引入的全局 ID（Snowflake/号段）、跨片查询（归并/ES 补偿）、事务一致性（Saga/TCC）和扩容迁移问题",
+        "能解释 EXPLAIN ANALYZE 与 EXPLAIN 的区别以及何时需要 ANALYZE TABLE 刷新统计信息"
       ]
     }
   ],
@@ -152,21 +159,35 @@
     },
     {
       "id": "database.mysql-core.slow-sql-capacity.recall.2",
-      "prompt": "什么时候该归档，什么时候才该分库分表？",
+      "prompt": "什么时候该归档，什么时候才该分库分表？请给出量化判断标准。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "database.mysql-core.slow-sql-capacity.recall.3",
-      "prompt": "分库分表会引入哪些新问题，并说明关键机制和边界条件。",
+      "prompt": "分库分表会引入哪些新问题？请说明路由键选择、全局 ID、跨片分页和事务一致性的关键机制。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "database.mysql-core.slow-sql-capacity.recall.4",
+      "prompt": "深分页 LIMIT 100000, 10 为什么慢？给出至少两种改写方案并比较性能差异。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
-      "id": "database.mysql-core.slow-sql-capacity.recall.scenario",
-      "prompt": "生产环境里 慢 SQL 排查与容量拆分 出现异常或效果不达预期时，你会如何定位原因、选择修复方案并验证结果？",
+      "id": "database.mysql-core.slow-sql-capacity.recall.5",
+      "prompt": "线上订单表到 8 亿行后，列表查询 P99 从 200ms 升到 2s，你会如何排查瓶颈、选择治理方案并验证效果？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 3
+    },
+    {
+      "id": "database.mysql-core.slow-sql-capacity.recall.6",
+      "prompt": "EXPLAIN 里 possible_keys 有值但 key 是 NULL，rows 很大，Extra 有 Using filesort。怎么定位原因并给出优化方案？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
@@ -176,20 +197,21 @@
     "mustHave": [
       "慢日志采集配置（long_query_time / slow_query_log）与 pt-query-digest 按总耗时聚合",
       "EXPLAIN 核心字段 type / key / rows / Extra 的解读与瓶颈定位",
-      "索引优化、SQL 改写（深分页游标分页）、冷热归档优先于分库分表的治理顺序",
+      "索引优化、SQL 改写（深分页游标分页/延迟关联）、冷热归档优先于分库分表的治理顺序",
       "分库分表前需确认路由键覆盖主查询模式、全局 ID 方案、跨片查询补偿和迁移回滚"
     ],
     "goodToHave": [
-      "EXPLAIN ANALYZE 对比优化器估算与实际执行的偏差",
+      "EXPLAIN ANALYZE 对比优化器估算与实际执行的偏差，ANALYZE TABLE 刷新统计信息",
       "量化容量边界判断（单表行数 / 写入 QPS / DDL 窗口 / 备份恢复时间）",
       "Snowflake / 号段模式全局 ID 与 Saga / TCC 跨片事务最终一致方案",
-      "双写校验、灰度迁移和容量水位监控"
+      "深分页三种改写方案（游标分页/延迟关联/覆盖索引子查询）的性能对比"
     ],
     "commonMistakes": [
       "一看到慢 SQL 就直接分库分表，跳过执行计划分析和数据生命周期治理",
       "只看平均耗时或单次最慢，不用 pt-query-digest 按总耗时聚合排序",
       "拆分前不分析主查询模式导致路由键选错，跨片查询比例过高",
-      "深分页直接 LIMIT offset, n 而非游标分页，offset 越大扫描行数越多"
+      "深分页直接 LIMIT offset, n 而非游标分页或延迟关联，offset 越大扫描行数越多",
+      "看到 Using filesort 就加索引，不考虑联合索引列顺序是否匹配 ORDER BY 方向"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -198,5 +220,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-17"
+  "updatedAt": "2026-06-22"
 }

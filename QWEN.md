@@ -60,7 +60,6 @@
 │   ├── content-format.md
 │   ├── knowledge-content-standard.md
 │   ├── knowledge-directory.md
-│   ├── content-improvement-plan.md
 │   └── nine-dimension-scoring.md
 └── .github/workflows/
     ├── validate.yml         # PR/push 校验 + contentVersion 自动管理 + 触发下游

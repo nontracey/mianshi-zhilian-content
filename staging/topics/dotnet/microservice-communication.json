@@ -4,7 +4,7 @@
   "category": "microservice-dotnet",
   "group": "microservice-dotnet",
   "title": "微服务通信",
-  "summary": "讲清微服务通信的服务发现、同步/异步通信、Polly 弹性（重试/熔断/降级）、Ocelot 网关和服务网格，以及同步雪崩和重试幂等等取舍。",
+  "summary": "讲清 .NET 微服务通信的服务发现（Consul/IHttpClientFactory 集成）、同步与异步通信的取舍、Polly 弹性策略（重试指数退避+幂等要求/熔断半开恢复/舱壁隔离/降级兜底）、Ocelot 网关路由限流聚合，以及同步调用链雪崩风险、重试幂等和网格边界。",
   "tags": [
     ".NET",
     "微服务",
@@ -14,20 +14,30 @@
     "API网关"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 40,
+  "estimatedMinutes": 45,
   "order": 30,
   "recommendWeight": 85,
   "status": "staging",
   "learningCards": [
     {
       "type": "explain",
-      "title": "微服务通信：服务发现与调用、服务发现",
-      "content": "微服务之间的通信是分布式系统的核心挑战，需要考虑服务发现、负载均衡、弹性策略等。\n\n## 服务发现\n\n**Consul**：\n```csharp\n// 安装 NuGet 包\n// Consul\n\nbuilder.Services.AddSingleton<IConsulClient>(sp =>\n    new ConsulClient(c => c.Address = new Uri(\"http://localhost:8500\")));\n// 注册服务\napp.Lifetime.ApplicationStarted.Register(async () =>\n{\n    var client = app.Services.GetRequiredService<IConsulClient>();\n    await client.Agent.ServiceRegister(new AgentServiceRegistration\n    {\n        ID = \"user-service-1\",\n        Name = \"user-service\",\n        Address = \"localhost\",\n        Port = 5001,\n        Check = new AgentServiceCheck\n        {\n            HTTP = \"http://localhost:5001/health\",\n            Interval = TimeSpan.FromSeconds(10)\n        }\n    });\n});\n\n// 发现服务\nvar services = await client.Health.Service(\"user-service\", null, true);\nvar service = services.Response.First();\nvar baseUrl = $\"http://{service.Service.Address}:{service.Service.Port}\";\n```\n\n**HttpClient 服务发现**：\n```csharp\nbuilder.Services.AddHttpClient(\"user-service\", (sp, client) =>\n{\n    var consul = sp.GetRequiredService<IConsulClient>();\n    var services = consul.Health.Service(\"user-service\").Result.Response;\n    var service = services.First();\n    client.BaseAddress = new Uri($\"http://{service.Service.Address}:{service.Service.Port}\");\n});\n```\n\n## Polly 弹性策略\n\nPolly 是 .NET 的弹性和瞬态故障处理库：\n\n**重试策略**：\n```csharp\nvar retryPolicy = Policy\n    .Handle<HttpRequestException>()\n    .WaitAndRetryAsync(3, retryAttempt =>\n        TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)));\n\nawait retryPolicy.ExecuteAsync(async () =>\n{\n    await httpClient.GetAsync(\"/api/users\");\n});\n```\n\n**熔断器**：\n```csharp\nvar circuitBreakerPolicy = Policy\n    .Handle<HttpRequestException>()\n    .CircuitBreakerAsync(\n        exceptionsAllowedBeforeBreaking: 5,\n        durationOfBreak: TimeSpan.FromSeconds(30));\n\nawait circuitBreakerPolicy.ExecuteAsync(async () =>\n{\n    await httpClient.GetAsync(\"/api/users\");\n});\n```\n\n**超时策略**：\n```csharp\nvar timeoutPolicy = Policy\n    .TimeoutAsync(TimeSpan.FromSeconds(10));\n\nawait timeoutPolicy.ExecuteAsync(async () =>\n{\n    await httpClient.GetAsync(\"/api/users\");\n});\n```\n\n**组合策略**：\n```csharp\nvar policy = Policy.WrapAsync(retryPolicy, circuitBreakerPolicy, timeoutPolicy);\n```\n\n**与 HttpClient 集成**：\n```csharp\nbuilder.Services.AddHttpClient(\"user-service\")\n    .AddPolicyHandler(GetRetryPolicy())\n    .AddPolicyHandler(GetCircuitBreakerPolicy());\n\nstatic IAsyncPolicy<HttpResponseMessage> GetRetryPolicy()\n{\n    return HttpPolicyExtensions\n        .HandleTransientHttpError()\n        .WaitAndRetryAsync(3, retryAttempt =>\n            TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)));\n}\n\nstatic IAsyncPolicy<HttpResponseMessage> GetCircuitBreakerPolicy()\n{\n    return HttpPolicyExtensions\n        .HandleTransientHttpError()\n        .CircuitBreakerAsync(5, TimeSpan.FromSeconds(30));\n}\n```"
+      "title": "服务发现：从硬编码地址到动态注册",
+      "content": "微服务实例会因扩缩容、故障转移而不断变化 IP 和端口。服务发现的核心是让调用方不硬编码目标地址，而是按服务名查到可用实例列表并做负载均衡。\n\n**Consul 注册与发现**：Consul 提供 KV、服务注册和健康检查。服务启动时调用 `Agent.ServiceRegister` 注册自己的名称、地址、端口和健康检查端点；Consul agent 每隔一段时间（默认 10s）调用该端点，不健康实例从返回列表中移除。调用方用 `Health.Service` 查询时只拿到 healthy 实例，天然实现了故障摘除。\n\n**IHttpClientFactory 集成**：生产代码不应该在业务方法里 new HttpClient。`IHttpClientFactory` 管理 HttpClient 生命周期（避免 socket 耗尽）并支持命名客户端。配合 Consul 时，常见做法是定义 `IServiceDiscovery` 接口封装查询和负载均衡逻辑，然后在 HttpClient 配置中通过 DelegatingHandler 动态解析 BaseAddress。这样每次请求都能拿到最新可用实例。\n\n**边界**：Consul 是 CP 还是 AP 取决于模式（默认 Raft 共识，服务注册是 AP）。如果注册中心本身挂了，已有客户端通常能靠本地缓存撑一段时间，但新服务无法注册。Consul 还支持多数据中心（WAN Gossip），适合跨地域部署。"
     },
     {
       "type": "explain",
-      "title": "微服务通信：Ocelot API 网关、负载均衡",
-      "content": "## Ocelot API 网关\n\nOcelot 是 .NET 的 API 网关：\n```json\n// ocelot.json\n{\n  \"Routes\": [\n    {\n      \"UpstreamPathTemplate\": \"/api/users/{everything}\",\n      \"UpstreamHttpMethod\": [ \"GET\", \"POST\", \"PUT\", \"DELETE\" ],\n      \"DownstreamPathTemplate\": \"/api/users/{everything}\",\n      \"DownstreamScheme\": \"http\",\n      \"DownstreamHostAndPorts\": [\n        {\n          \"Host\": \"user-service\",\n          \"Port\": 5001\n        }\n      ],\n      \"LoadBalancerOptions\": {\n        \"Type\": \"LeastConnection\"\n      }\n    }\n  ],\n  \"GlobalConfiguration\": {\n    \"BaseUrl\": \"http://localhost:5000\"\n  }\n}\n```\n\n```csharp\n// 配置 Ocelot\nbuilder.Configuration.AddJsonFile(\"ocelot.json\", optional: false, reloadOnChange: true);\nbuilder.Services.AddOcelot();\n\napp.UseOcelot().Wait();\n```\n\n## 负载均衡\n\nOcelot 支持多种负载均衡策略：\n- **LeastConnection**：最少连接\n- **RoundRobin**：轮询\n- **NoLoadBalancer**：不负载均衡\n\n## 限流\n\n```json\n{\n  \"RateLimitOptions\": {\n    \"ClientWhitelist\": [],\n    \"EnableRateLimiting\": true,\n    \"Period\": \"1m\",\n    \"PeriodTimespan\": 60,\n    \"Limit\": 100\n  }\n}\n```\n\n## 身份验证\n\n```json\n{\n  \"AuthenticationProviderKey\": \"Bearer\",\n  \"RouteClaimsRequirement\": {\n    \"Role\": \"Admin\"\n  }\n}\n```\n\n```csharp\nbuilder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)\n    .AddJwtBearer(options =>\n    {\n        options.TokenValidationParameters = new TokenValidationParameters\n        {\n            ValidateIssuer = true,\n            ValidateAudience = true,\n            ValidateLifetime = true,\n            ValidateIssuerSigningKey = true,\n            ValidIssuer = \"your-issuer\",\n            ValidAudience = \"your-audience\",\n            IssuerSigningKey = new SymmetricSecurityKey(\n                Encoding.UTF8.GetBytes(\"your-secret-key\"))\n        };\n    });\n```\n\n## 聚合\n\n```json\n{\n  \"Aggregates\": [\n    {\n      \"RouteKeys\": [\"user\", \"orders\"],\n      \"UpstreamPathTemplate\": \"/api/user-with-orders/{userId}\",\n      \"Aggregator\": \"UserWithOrdersAggregator\"\n    }\n  ]\n}\n```\n\n## 服务网格\n\n对于更复杂的场景，可以考虑服务网格（如 Istio、Linkerd）：\n- 自动服务发现\n- 负载均衡\n- 故障恢复\n- 金丝雀发布\n- 遥测和监控\n\n## 取舍与验证\n通信方式的核心取舍是同步对异步：同步（HTTP、gRPC）简单直观、实时拿结果，但调用链一长，下游一慢一挂就层层放大、容易雪崩，所以关键路径必须配超时、熔断、降级；异步（消息队列）天然解耦、能削峰、容错好，但是最终一致、调试链路更绕。弹性策略里重试最危险——非幂等操作重试会产生重复数据，所以重试必须配合幂等键。服务网格（Istio）把这些能力下沉到 sidecar、对业务零侵入、可观测性强，但运维复杂、每个 pod 多一跳 sidecar 有性能和资源开销，中小规模用 Polly 加 Ocelot 网关就够、不必上 mesh。验证弹性是否生效：用故障注入（让下游返回 500 或延迟）看熔断器是否打开、降级是否兜底、重试次数是否符合预期。"
+      "title": "Polly 弹性策略：重试、熔断、超时、舱壁和降级",
+      "content": "Polly 是 .NET 生态的瞬态故障处理库，通过声明策略链把重试、熔断、超时、舱壁隔离和降级组合到 HttpClient 调用上。\n\n**重试（Retry/WaitAndRetry）**：解决偶发网络抖动和短暂不可用。关键细节：指数退避（2^n 秒）加随机抖动避免「惊群重试」；重试次数要有限（通常 2-3 次）；只对瞬态错误重试（HTTP 5xx、超时、网络异常），4xx 业务错误不应重试。`onRetry` 回调可以打日志方便排查。\n\n**熔断器（CircuitBreaker/AdvancedCircuitBreaker）**：下游持续失败时，熔断器在阈值后进入 Open 状态直接快速失败，不再浪费资源等待；经过 `durationOfBreak` 后进入 HalfOpen 状态放少量请求探测；探测成功恢复 Closed。这防止了调用方线程被慢接口占满导致雪崩。`AdvancedCircuitBreaker` 还可以按故障率（而非固定次数）触发，适合吞吐量不稳定的场景。\n\n**超时（Timeout）**：分为乐观超时（基于 CancellationToken，不中止线程）和悲观超时（强制中止线程，慎用）。超时是弹性策略链的外层——先超时再重试再熔断，否则重试会叠加每次的长等待。\n\n**舱壁隔离（Bulkhead）**：限制对某个下游的最大并发请求数和排队数，防止一个慢下游吃光所有线程。被隔离拒绝的请求可以快速失败或降级。语义类似线程池限流但粒度在单个依赖。\n\n**降级（Fallback）**：上述策略都失败时返回缓存值、默认值或友好错误，保证用户体验不崩。降级是兜底，不是万能——需要提前设计好降级内容。\n\n**策略组合顺序**：`Policy.WrapAsync(outerTimeout, retry, innerCircuitBreaker, bulkhead)`——外层超时保证整体不超时，重试在熔断之前（熔断打开后重试直接失败），舱壁在最内层保护下游并发。顺序反了效果大打折扣。"
+    },
+    {
+      "type": "explain",
+      "title": "Ocelot API 网关：路由、限流、聚合与鉴权",
+      "content": "Ocelot 是 .NET 生态的轻量 API 网关，通过 JSON 配置声明路由规则，把外部请求转发到下游微服务，适合中小规模场景。\n\n**路由与负载均衡**：`Routes` 配置上游路径模板到下游路径模板的映射，支持 `{everything}` 通配。`DownstreamHostAndPorts` 可配置多个实例，`LoadBalancerOptions` 支持 LeastConnection（最少连接）、RoundRobin（轮询）和 NoLoadBalancer。这使网关成为统一入口并隐藏后端拓扑。\n\n**限流**：`RateLimitOptions` 按客户端 IP 或 header 分组，配置 Period（时间窗口）和 Limit（请求数），超限返回 429。`ClientWhitelist` 可放行特定客户端。注意限流是网关层全局策略，粒度比下游服务自身限流粗。\n\n**身份验证**：通过 `AuthenticationProviderKey` 关联 JWT Bearer 配置，`RouteClaimsRequirement` 按路由要求特定 claim（如 Role=Admin）。网关统一鉴权后下游服务可以信任网关转发的 header。\n\n**聚合**：`Aggregates` 把多个下游路由的结果合并成一个响应，减少客户端多次请求。比如 `/api/user-with-orders/{id}` 同时查 user 服务和 order 服务并返回合并结果。自定义 Aggregator 实现 `IDefinedAggregator` 接口控制合并逻辑。\n\n**网关的代价**：单点——必须高可用部署（多实例 + 负载均衡）；增加一跳延迟；配置复杂度随路由增长；限流策略不如专业 API Gateway（如 Azure API Management、Kong）丰富。"
+    },
+    {
+      "type": "explain",
+      "title": "同步雪崩、重试幂等和网格边界",
+      "content": "同步调用链是微服务最大的故障放大器。假设 A→B→C，C 慢了 5 秒，B 也要等 5 秒，A 可能也要等 5 秒——级联阻塞。如果 A 还对 B 重试，B 的压力翻倍，C 更慢，恶性循环直到全线程池耗尽。对策：每一跳都配超时（外短内长）、熔断快速失败、舱壁隔离下游并发、降级兜底。\n\n**重试必须幂等**：这是面试高频追问。非幂等操作（创建订单、扣款、发消息）重试会产生重复数据。解决方案：业务侧生成幂等键（UUID 或业务唯一键），下游服务用唯一约束或 Redis SETNX 去重；第一次处理成功后后续带相同幂等键的请求直接返回成功。\n\n**服务网格（Istio/Linkerd）**：把服务发现、负载均衡、熔断、重试、mTLS、可观测（指标/tracing）下沉到 sidecar proxy（Envoy），业务代码零感知。好处是跨语言统一治理、策略可动态下发不重启；代价是每 pod 多一个 sidecar 进程（CPU/内存开销约 50-100m/64Mi）、运维复杂度高、排障链路更长。中小规模（几十个服务）用 Polly + Ocelot 库级方案够用；大规模（数百服务、多团队多语言）才值得上 mesh。\n\n**验证弹性**：用故障注入（Chaos Engineering）验证策略是否生效——手动让下游返回 500、延迟 3 秒、直接断连，观察熔断器是否打开、降级是否兜底、重试日志是否正确。不验证的弹性策略约等于没有。"
     },
     {
       "type": "diagram",
@@ -50,55 +60,71 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | 服务发现 | 静态配置 |\n| --- | --- | --- |\n| 动态性 | 动态 | 静态 |\n| 健康检查 | 支持 | 不支持 |\n| 负载均衡 | 支持 | 手动 |\n| 适用场景 | 微服务 | 单体应用 |\n| 复杂度 | 高 | 低 |"
+      "title": "服务发现 vs 静态配置",
+      "content": "| 维度 | 服务发现（Consul） | 静态配置 |\n| --- | --- | --- |\n| 实例地址 | 运行时动态解析 | 配置文件硬编码 |\n| 健康检查 | 自动摘除不健康实例 | 需人工介入或外部探活 |\n| 负载均衡 | 客户端侧或网关侧自动分配 | 手动写多个地址或 DNS 轮询 |\n| 扩缩容适应 | 新实例自动注册可被发现 | 改配置重启调用方 |\n| 复杂度 | 需要部署和维护注册中心 | 零额外依赖 |\n| 适用场景 | 实例频繁变动的微服务 | 实例固定的小型服务或开发环境 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | 重试 | 熔断器 | 超时 |\n| --- | --- | --- | --- |\n| 目的 | 处理瞬态故障 | 防止级联故障 | 避免长时间等待 |\n| 触发条件 | 失败 | 失败次数达到阈值 | 超过时间限制 |\n| 恢复机制 | 自动重试 | 定时恢复 | 立即失败 |\n| 适用场景 | 网络波动 | 服务不可用 | 慢服务 |"
+      "title": "Polly 弹性策略对比",
+      "content": "| 策略 | 解决什么 | 触发条件 | 关键配置 | 注意事项 |\n| --- | --- | --- | --- | --- |\n| 重试 | 偶发瞬态故障 | 请求失败（5xx/超时/网络异常） | 次数、指数退避+抖动、只匹配瞬态错误 | 非幂等操作必须配幂等键；无脑重试会加重下游 |\n| 熔断器 | 持续故障防雪崩 | 失败次数/比率超阈值 | 阈值、持续时长、半开放探测 | 打开后直接快速失败，不浪费线程；AdvancedCircuitBreaker 按比率触发更灵活 |\n| 超时 | 慢接口阻塞线程 | 请求耗时超限 | 乐观（CancellationToken）/悲观（强制中止） | 超时应在策略链最外层；悲观超时慎用 |\n| 舱壁隔离 | 一个慢下游吃光并发 | 并发请求数达上限 | 最大并发数、最大排队数 | 被拒绝的请求快速失败或降级；粒度是单个依赖 |\n| 降级 | 策略全失败后兜底 | 所有策略都未成功 | 返回缓存/默认值/友好错误 | 降级内容需提前设计，不是万能 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | API 网关 | 服务网格 |\n| --- | --- | --- |\n| 部署方式 | 集中 | 分布式（sidecar） |\n| 功能 | 路由、限流、认证 | 流量管理、安全、可观测 |\n| 复杂度 | 中 | 高 |\n| 适用场景 | 中小规模 | 大规模、复杂 |"
+      "title": "API 网关 vs 服务网格",
+      "content": "| 维度 | API 网关（Ocelot） | 服务网格（Istio） |\n| --- | --- | --- |\n| 部署形态 | 集中式入口进程 | 每 pod 一个 sidecar proxy（Envoy） |\n| 策略注入 | 业务网关配置文件 | 控制面下发，业务代码零感知 |\n| 功能范围 | 路由、限流、鉴权、聚合 | 路由、熔断、重试、mTLS、金丝雀、可观测 |\n| 语言无关性 | 限于 .NET 生态 | 完全语言无关（sidecar 代理） |\n| 运维复杂度 | 低——一个可执行文件+JSON | 高——Kubernetes、CRD、控制面组件 |\n| 性能开销 | 请求多一跳网关延迟 | 每请求经过两个 sidecar（+~1ms） |\n| 适用规模 | 中小规模（几十个服务） | 大规模（数百服务、多团队多语言） |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Net.Http;\nusing System.Threading.Tasks;\nusing Consul;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Logging;\nusing Polly;\nusing Polly.CircuitBreaker;\nusing Polly.Extensions.Http;\nusing Polly.Timeout;\n\nnamespace MicroserviceCommunicationDemo\n{\n    // 服务发现\n    public interface IServiceDiscovery\n    {\n        Task<string> GetServiceUrlAsync(string serviceName);\n    }\n\n    public class ConsulServiceDiscovery : IServiceDiscovery\n    {\n        private readonly IConsulClient _consulClient;\n        private readonly ILogger<ConsulServiceDiscovery> _logger;\n\n        public ConsulServiceDiscovery(IConsulClient consulClient, ILogger<ConsulServiceDiscovery> logger)\n        {\n            _consulClient = consulClient;\n            _logger = logger;\n        }\n\n        public async Task<string> GetServiceUrlAsync(string serviceName)\n        {\n            var services = await _consulClient.Health.Service(serviceName, null, true);\n            if (services.Response.Length == 0)\n            {\n                _logger.LogWarning($\"服务 {serviceName} 未找到\");\n                return null;\n            }\n\n            // 简单轮询\n            var service = services.Response[new Random().Next(services.Response.Length)];\n            return $\"http://{service.Service.Address}:{service.Service.Port}\";\n        }\n    }\n\n    // 弹性策略\n    public static class ResiliencePolicies\n    {\n        public static IAsyncPolicy<HttpResponseMessage> GetRetryPolicy(ILogger logger)\n        {\n            return HttpPolicyExtensions\n                .HandleTransientHttpError()\n                .Or<TimeoutRejectedException>()\n                .WaitAndRetryAsync(3,\n                    retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),\n                    onRetry: (outcome, timespan, retryAttempt, context) =>\n                    {\n                        logger.LogWarning($\"第 {retryAttempt} 次重试，等待 {timespan.TotalSeconds} 秒\");\n                    });\n        }\n\n        public static IAsyncPolicy<HttpResponseMessage> GetCircuitBreakerPolicy(ILogger logger)\n        {\n            return HttpPolicyExtensions\n                .HandleTransientHttpError()\n                .CircuitBreakerAsync(\n                    handledEventsAllowedBeforeBreaking: 5,\n                    durationOfBreak: TimeSpan.FromSeconds(30),\n                    onBreak: (outcome, timespan) =>\n                    {\n                        logger.LogWarning($\"熔断器打开，持续 {timespan.TotalSeconds} 秒\");\n                    },\n                    onReset: () =>\n                    {\n                        logger.LogInformation(\"熔断器关闭\");\n                    });\n        }\n\n        public static IAsyncPolicy<HttpResponseMessage> GetTimeoutPolicy()\n        {\n            return Policy.TimeoutAsync<HttpResponseMessage>(TimeSpan.FromSeconds(10));\n        }\n\n        public static IAsyncPolicy<HttpResponseMessage> GetBulkheadPolicy(ILogger logger)\n        {\n            return Policy.BulkheadAsync<HttpResponseMessage>(\n                maxParallelization: 10,\n                maxQueuingActions: 25,\n                onBulkheadRejectedAsync: context =>\n                {\n                    logger.LogWarning(\"请求被隔离策略拒绝\");\n                    return Task.CompletedTask;\n                });\n        }\n    }\n\n    // HttpClient 服务\n    public class UserServiceClient\n    {\n        private readonly HttpClient _httpClient;\n        private readonly ILogger<UserServiceClient> _logger;\n\n        public UserServiceClient(HttpClient httpClient, ILogger<UserServiceClient> logger)\n        {\n            _httpClient = httpClient;\n            _logger = logger;\n        }\n\n        public async Task<User> GetUserAsync(int id)\n        {\n            try\n            {\n                var response = await _httpClient.GetAsync($\"/api/users/{id}\");\n                response.EnsureSuccessStatusCode();\n                return await response.Content.ReadFromJsonAsync<User>();\n            }\n            catch (BrokenCircuitException)\n            {\n                _logger.LogError(\"熔断器已打开，无法获取用户\");\n                throw;\n            }\n        }\n    }\n\n    public class User\n    {\n        public int Id { get; set; }\n        public string Name { get; set; }\n        public string Email { get; set; }\n    }\n\n    // API 网关配置\n    public static class ApiGatewayExtensions\n    {\n        public static IServiceCollection AddApiGatewayServices(this IServiceCollection services)\n        {\n            // Consul 服务发现\n            services.AddSingleton<IConsulClient>(sp =>\n                new ConsulClient(c => c.Address = new Uri(\"http://localhost:8500\")));\n            services.AddSingleton<IServiceDiscovery, ConsulServiceDiscovery>();\n\n            // HttpClient with Polly\n            services.AddHttpClient<UserServiceClient>(\"user-service\")\n                .AddPolicyHandler((sp, request) =>\n                {\n                    var logger = sp.GetRequiredService<ILogger<UserServiceClient>>();\n                    return ResiliencePolicies.GetRetryPolicy(logger);\n                })\n                .AddPolicyHandler((sp, request) =>\n                {\n                    var logger = sp.GetRequiredService<ILogger<UserServiceClient>>();\n                    return ResiliencePolicies.GetCircuitBreakerPolicy(logger);\n                })\n                .AddPolicyHandler(ResiliencePolicies.GetTimeoutPolicy());\n\n            return services;\n        }\n\n        public static async Task RegisterServiceAsync(\n            this IApplicationBuilder app,\n            string serviceName,\n            string serviceId,\n            string address,\n            int port,\n            string healthCheckUrl)\n        {\n            var consulClient = app.ApplicationServices.GetRequiredService<IConsulClient>();\n\n            await consulClient.Agent.ServiceRegister(new AgentServiceRegistration\n            {\n                ID = serviceId,\n                Name = serviceName,\n                Address = address,\n                Port = port,\n                Check = new AgentServiceCheck\n                {\n                    HTTP = healthCheckUrl,\n                    Interval = TimeSpan.FromSeconds(10),\n                    Timeout = TimeSpan.FromSeconds(5)\n                }\n            });\n        }\n\n        public static async Task DeregisterServiceAsync(this IApplicationBuilder app, string serviceId)\n        {\n            var consulClient = app.ApplicationServices.GetRequiredService<IConsulClient>();\n            await consulClient.Agent.ServiceDeregister(serviceId);\n        }\n    }\n\n    // 使用示例\n    public class OrderService\n    {\n        private readonly UserServiceClient _userClient;\n        private readonly ILogger<OrderService> _logger;\n\n        public OrderService(UserServiceClient userClient, ILogger<OrderService> logger)\n        {\n            _userClient = userClient;\n            _logger = logger;\n        }\n\n        public async Task CreateOrderAsync(int userId, OrderItem[] items)\n        {\n            // 获取用户信息（带弹性策略）\n            var user = await _userClient.GetUserAsync(userId);\n            _logger.LogInformation($\"为用户 {user.Name} 创建订单\");\n\n            // 创建订单逻辑\n        }\n    }\n\n    public class OrderItem\n    {\n        public string ProductId { get; set; }\n        public int Quantity { get; set; }\n        public decimal Price { get; set; }\n    }\n\n    // 服务注册扩展\n    public static class ServiceCollectionExtensions\n    {\n        public static IServiceCollection AddMicroserviceServices(this IServiceCollection services)\n        {\n            services.AddApiGatewayServices();\n            services.AddScoped<OrderService>();\n            return services;\n        }\n    }\n}",
+      "title": "完整示例：服务发现 + Polly 策略链 + HttpClient 集成",
+      "content": "using System;\nusing System.Net.Http;\nusing System.Threading.Tasks;\nusing Consul;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Logging;\nusing Polly;\nusing Polly.CircuitBreaker;\nusing Polly.Extensions.Http;\nusing Polly.Timeout;\n\nnamespace MicroserviceCommunicationDemo\n{\n    // 服务发现抽象\n    public interface IServiceDiscovery\n    {\n        Task<string> GetServiceUrlAsync(string serviceName);\n    }\n\n    public class ConsulServiceDiscovery : IServiceDiscovery\n    {\n        private readonly IConsulClient _consulClient;\n        private readonly ILogger<ConsulServiceDiscovery> _logger;\n\n        public ConsulServiceDiscovery(IConsulClient consulClient, ILogger<ConsulServiceDiscovery> logger)\n        {\n            _consulClient = consulClient;\n            _logger = logger;\n        }\n\n        public async Task<string> GetServiceUrlAsync(string serviceName)\n        {\n            // 只查 healthy 实例\n            var services = await _consulClient.Health.Service(serviceName, null, true);\n            if (services.Response.Length == 0)\n            {\n                _logger.LogWarning(\"服务 {Service} 无健康实例\", serviceName);\n                return null;\n            }\n\n            // 简单随机负载均衡\n            var idx = new Random().Next(services.Response.Length);\n            var svc = services.Response[idx].Service;\n            return $\"http://{svc.Address}:{svc.Port}\";\n        }\n    }\n\n    // Polly 策略工厂\n    public static class ResiliencePolicies\n    {\n        // 重试：指数退避 + 抖动，只重试瞬态错误\n        public static IAsyncPolicy<HttpResponseMessage> GetRetryPolicy(ILogger logger)\n        {\n            return HttpPolicyExtensions\n                .HandleTransientHttpError()        // 5xx + HttpRequestException\n                .Or<TimeoutRejectedException>()\n                .WaitAndRetryAsync(\n                    retryCount: 3,\n                    sleepDurationProvider: retry => TimeSpan.FromSeconds(Math.Pow(2, retry))\n                        + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 1000)),\n                    onRetry: (outcome, delay, attempt, ctx) =>\n                        logger.LogWarning(\"重试第 {Attempt} 次，等待 {Delay}s\", attempt, delay.TotalSeconds));\n        }\n\n        // 熔断器：5 次失败后打开 30 秒\n        public static IAsyncPolicy<HttpResponseMessage> GetCircuitBreakerPolicy(ILogger logger)\n        {\n            return HttpPolicyExtensions\n                .HandleTransientHttpError()\n                .CircuitBreakerAsync(\n                    handledEventsAllowedBeforeBreaking: 5,\n                    durationOfBreak: TimeSpan.FromSeconds(30),\n                    onBreak: (_, duration) => logger.LogWarning(\"熔断器打开 {Duration}s\", duration.TotalSeconds),\n                    onReset: () => logger.LogInformation(\"熔断器关闭\"),\n                    onHalfOpen: () => logger.LogInformation(\"熔断器半开放探测\"));\n        }\n\n        // 超时：乐观模式，10 秒\n        public static IAsyncPolicy<HttpResponseMessage> GetTimeoutPolicy()\n        {\n            return Policy.TimeoutAsync<HttpResponseMessage>(TimeSpan.FromSeconds(10));\n        }\n\n        // 舱壁隔离：最多 10 并发 + 25 排队\n        public static IAsyncPolicy<HttpResponseMessage> GetBulkheadPolicy(ILogger logger)\n        {\n            return Policy.BulkheadAsync<HttpResponseMessage>(\n                maxParallelization: 10,\n                maxQueuingActions: 25,\n                onBulkheadRejectedAsync: _ =>\n                {\n                    logger.LogWarning(\"请求被舱壁策略拒绝\");\n                    return Task.CompletedTask;\n                });\n        }\n    }\n\n    // 用户服务客户端\n    public class UserServiceClient\n    {\n        private readonly HttpClient _httpClient;\n        private readonly ILogger<UserServiceClient> _logger;\n\n        public UserServiceClient(HttpClient httpClient, ILogger<UserServiceClient> logger)\n        {\n            _httpClient = httpClient;\n            _logger = logger;\n        }\n\n        public async Task<User?> GetUserAsync(int id)\n        {\n            try\n            {\n                var response = await _httpClient.GetAsync($\"/api/users/{id}\");\n                response.EnsureSuccessStatusCode();\n                return await response.Content.ReadFromJsonAsync<User>();\n            }\n            catch (BrokenCircuitException)\n            {\n                _logger.LogError(\"熔断器已打开，降级返回 null\");\n                return null; // 降级\n            }\n            catch (BulkheadRejectedException)\n            {\n                _logger.LogError(\"舱壁已满，降级返回 null\");\n                return null;\n            }\n        }\n    }\n\n    public record User(int Id, string Name, string Email);\n\n    // DI 注册扩展\n    public static class ServiceCollectionExtensions\n    {\n        public static IServiceCollection AddMicroserviceCommunication(this IServiceCollection services)\n        {\n            // Consul 客户端\n            services.AddSingleton<IConsulClient>(sp =>\n                new ConsulClient(c => c.Address = new Uri(\"http://localhost:8500\")));\n            services.AddSingleton<IServiceDiscovery, ConsulServiceDiscovery>();\n\n            // HttpClient + Polly 策略链（顺序：超时→重试→熔断→舱壁）\n            services.AddHttpClient<UserServiceClient>(\"user-service\")\n                .AddPolicyHandler((sp, _) =>\n                {\n                    var logger = sp.GetRequiredService<ILogger<UserServiceClient>>();\n                    return ResiliencePolicies.GetTimeoutPolicy(); // 最外层\n                })\n                .AddPolicyHandler((sp, _) =>\n                {\n                    var logger = sp.GetRequiredService<ILogger<UserServiceClient>>();\n                    return ResiliencePolicies.GetRetryPolicy(logger);\n                })\n                .AddPolicyHandler((sp, _) =>\n                {\n                    var logger = sp.GetRequiredService<ILogger<UserServiceClient>>();\n                    return ResiliencePolicies.GetCircuitBreakerPolicy(logger);\n                })\n                .AddPolicyHandler((sp, _) =>\n                {\n                    var logger = sp.GetRequiredService<ILogger<UserServiceClient>>();\n                    return ResiliencePolicies.GetBulkheadPolicy(logger);\n                });\n\n            return services;\n        }\n\n        // 服务注册/注销\n        public static async Task RegisterServiceAsync(\n            this IApplicationBuilder app, string name, string id,\n            string address, int port, string healthUrl)\n        {\n            var client = app.ApplicationServices.GetRequiredService<IConsulClient>();\n            await client.Agent.ServiceRegister(new AgentServiceRegistration\n            {\n                ID = id, Name = name, Address = address, Port = port,\n                Check = new AgentServiceCheck\n                {\n                    HTTP = healthUrl,\n                    Interval = TimeSpan.FromSeconds(10),\n                    Timeout = TimeSpan.FromSeconds(5)\n                }\n            });\n        }\n\n        public static async Task DeregisterServiceAsync(this IApplicationBuilder app, string id)\n        {\n            var client = app.ApplicationServices.GetRequiredService<IConsulClient>();\n            await client.Agent.ServiceDeregister(id);\n        }\n    }\n}",
       "language": "csharp",
       "highlights": [
         {
-          "line": 16,
-          "note": "`public interface IServiceDiscovery` 定义了 微服务通信 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 26,
+          "note": "Health.Service 第二个参数 null 表示不过滤 tag，第三个参数 true 表示只返回 passing 健康实例。"
         },
         {
-          "line": 35,
-          "note": "`if (services.Response.Length == 0)` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 72,
+          "note": "重试策略只匹配 HandleTransientHttpError（5xx）和 TimeoutRejectedException，4xx 业务错误不重试。"
         },
         {
-          "line": 8,
-          "note": "`using Polly;` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "line": 74,
+          "note": "指数退避加随机抖动，避免多个客户端同一时刻惊群重试压垮下游。"
         },
         {
-          "line": 3,
-          "note": "`using System.Threading.Tasks;` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+          "line": 91,
+          "note": "熔断器三个回调覆盖 Open→HalfOpen→Closed 状态转换，便于打日志监控。"
+        },
+        {
+          "line": 139,
+          "note": "BrokenCircuitException 捕获后返回 null 降级，而不是向上抛异常导致调用方崩溃。"
+        },
+        {
+          "line": 161,
+          "note": "策略链顺序：超时（最外层）→ 重试 → 熔断 → 舱壁（最内层）。顺序反了效果大打折扣。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：微服务通信要解决三件事——服务发现（找到对方）、通信方式（同步 RPC/HTTP 还是异步消息）、弹性（对方挂了或慢了怎么办）。.NET 生态用 Consul 服务发现加 HttpClient/gRPC 加 Polly 弹性加 Ocelot 网关这套。\n\n要点：\n\n1. 服务发现：服务注册到注册中心（Consul），调用方按服务名查地址、做负载均衡，避免硬编码 IP。\n2. 通信方式：同步（HTTP REST、gRPC）适合实时请求-响应；异步（消息队列）适合解耦、削峰、最终一致。\n3. 弹性（Polly）：重试（瞬时故障）、熔断（故障依赖快速失败防雪崩）、超时、降级、舱壁隔离，和 HttpClientFactory 集成。\n4. API 网关（Ocelot）：统一入口，做路由、负载均衡、限流、鉴权、聚合。\n5. 服务网格（Istio/Linkerd）：把服务发现、负载均衡、弹性、遥测下沉到 sidecar，对业务无侵入，适合大规模。\n\n边界和取舍。① 同步调用链长会放大故障和延迟，关键路径要熔断加超时加降级，非实时的尽量异步化。② 重试要幂等——非幂等操作（创建订单）重试会重复，要配幂等键。③ 网关是单点，要高可用部署。④ 服务网格功能强但运维复杂、有 sidecar 性能开销，中小规模用库（Polly）加网关就够，不必上 mesh。",
+      "content": "结论：微服务通信要解决三件事——服务发现（找到对方）、通信方式（同步/异步怎么选）、弹性（对方挂了或慢了怎么办）。\n\n**服务发现**\n- Consul 注册中心：服务启动时注册名称+地址+端口+健康检查端点\n- 调用方按服务名查询 healthy 实例列表，客户端侧负载均衡\n- IHttpClientFactory 管理连接池避免 socket 耗尽，命名客户端+DelegatingHandler 动态解析地址\n\n**通信方式选择**\n- 同步（HTTP REST/gRPC）：调用方需要实时结果、简单直观，但调用链长时下游慢会级联阻塞\n- 异步（消息队列）：不需要实时结果、解耦削峰、天然容错，但最终一致、调试链路更长\n- 实践原则：核心实时路径用同步但必须配超时+熔断+降级；能异步的尽量异步化\n\n**Polly 弹性策略**\n- 重试：指数退避+抖动，只对瞬态错误（5xx/超时/网络异常）重试，4xx 不重试\n- 熔断器：失败次数或比率超阈值后 Open 直接快速失败；超时后 HalfOpen 探测；成功则 Closed\n- 超时：乐观（CancellationToken）/悲观（强制中止），在策略链最外层\n- 舱壁隔离：限制单个下游最大并发数，防一个慢下游吃光线程\n- 降级：所有策略失败后返回缓存/默认值/友好错误\n- 策略链顺序：超时→重试→熔断→舱壁（由外到内）\n- HttpClientFactory 集成：`.AddPolicyHandler()` 链式配置\n\n**API 网关（Ocelot）**\n- 统一入口：路由、负载均衡（LeastConnection/RoundRobin）、限流、JWT 鉴权、多路由聚合\n- 代价：单点需高可用部署、增加一跳延迟\n\n**同步调用链雪崩防护**\n- 每一跳都配超时（外短内长）+熔断快速失败+舱壁隔离下游并发+降级兜底\n- 重试必须幂等：非幂等操作（创建订单/扣款）重试产生重复，需配幂等键（UUID/业务唯一键）+下游去重\n\n**服务网格边界**\n- Istio/Linkerd 把发现、负载均衡、熔断、mTLS、可观测下沉到 sidecar proxy\n- 业务代码零感知、跨语言统一治理\n- 代价：每 pod 多一个 sidecar（50-100m CPU/64Mi 内存）、运维复杂\n- 选型：中小规模用 Polly+Ocelot 足够；大规模多语言才上 mesh",
       "followUpQuestions": [
         {
           "question": "微服务之间该用同步调用还是异步消息？怎么权衡？",
-          "answer": "看「要不要实时拿结果」和「能不能容忍最终一致」。同步（HTTP/gRPC）适合调用方必须立刻拿到结果才能继续的实时查询，简单直观，但强耦合、调用链一长下游慢就层层阻塞、故障沿链放大、容易雪崩。异步消息适合不需要立刻知道结果、要解耦、要削峰的场景，比如下单后发通知、库存扣减，天然容错、能缓冲流量，代价是最终一致、链路调试更绕。实践原则：核心实时路径用同步但必须配超时加熔断加降级；能异步的尽量异步化降低耦合；强一致跨服务操作用 Saga 等分布式事务方案而不是硬同步。"
+          "answer": "看两个维度：「调用方需不需要实时拿到结果」和「业务能不能容忍最终一致」。同步（HTTP/gRPC）适合实时查询——调用方必须立刻拿到结果才能继续，简单直观，但强耦合、调用链一长下游慢就层层阻塞、故障沿链放大容易雪崩。异步消息适合不需要立刻知道结果、要解耦削峰的场景——比如下单后发通知、库存扣减，天然容错能缓冲流量，代价是最终一致、链路调试更绕。实践原则：核心实时路径用同步但必须配超时+熔断+降级；能异步的尽量异步化降低耦合。"
         },
         {
-          "question": "Polly 的重试、熔断、降级分别解决什么？为什么重试要小心？",
-          "answer": "重试解决瞬时故障——网络抖动、偶发超时，自动重试几次往往就成功，常配指数退避避免加重下游压力。熔断解决持续故障——下游一直挂或慢时，熔断器打开直接快速失败、不再傻等，防止线程被占满引发雪崩，过一会半开放少量试探恢复。降级是兜底——失败时返回缓存、默认值或友好提示，保证体验不崩。重试要小心是因为：① 非幂等操作（创建订单、扣款）重试会产生重复数据，必须配幂等键；② 无脑重试会在下游已经过载时火上浇油，所以要配退避和熔断，下游熔断了就别再重试。"
+          "question": "Polly 的重试、熔断、降级分别解决什么？策略链顺序为什么重要？",
+          "answer": "重试解决偶发瞬态故障——网络抖动、偶发超时，自动重试几次往往成功，配指数退避+抖动避免加重下游压力。熔断解决持续故障——下游一直挂或慢时熔断器打开直接快速失败不浪费线程，防止雪崩；超时后半开放探测，成功就恢复。降级是兜底——失败时返回缓存、默认值或友好提示保证体验不崩。策略链顺序：超时（最外层保证整体不超时）→ 重试（在熔断之前，否则熔断打开后重试直接失败）→ 熔断 → 舱壁（最内层保护下游并发）。顺序反了比如重试在外层超时在内层，3次重试每次10秒就30秒，调用方早就超时了。"
+        },
+        {
+          "question": "重试为什么要小心？",
+          "answer": "两个风险：① 非幂等操作（创建订单、扣款、发消息）重试会产生重复数据，必须配幂等键——业务生成唯一键，下游用唯一约束或 Redis SETNX 去重，第一次成功后后续相同键直接返回成功。② 无脑重试在下游已经过载时火上浇油——下游慢时重试翻倍压力，恶性循环直到全线程池耗尽，所以重试要配指数退避+只对瞬态错误重试+熔断器兜底，下游熔断了就不再重试。"
+        },
+        {
+          "question": "Ocelot 网关和 Istio 服务网格怎么选？",
+          "answer": "Ocelot 是集中式 API 网关——一个进程做路由、限流、鉴权、聚合，部署简单，适合中小规模（几十个服务、.NET 生态），代价是单点需高可用部署、增加一跳延迟。Istio 是分布式服务网格——每 pod 一个 sidecar proxy（Envoy），把负载均衡、熔断、重试、mTLS、金丝雀发布、可观测都下沉到 sidecar，业务零感知、跨语言统一治理，适合大规模（数百服务、多团队多语言），代价是每 pod 多一个容器（~50m CPU/64Mi 内存）、运维复杂（Kubernetes+CRD+控制面）。选型：几十个 .NET 服务用 Polly+Ocelot 足够；上了规模多语言多团队再上 mesh。"
         }
       ]
     },
@@ -106,54 +132,72 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "服务发现的概念和 Consul 的使用",
-        "Polly 的各种弹性策略（重试、熔断、超时）",
-        "Ocelot API 网关的配置和使用",
-        "负载均衡的策略",
-        "限流和身份验证的实现",
-        "微服务通信的最佳实践"
+        "能解释服务发现解决什么问题、Consul 注册与健康检查机制",
+        "能区分同步（HTTP/gRPC）和异步（消息队列）通信的适用场景和取舍",
+        "能说明 Polly 五种弹性策略各自解决什么、策略链顺序为什么重要",
+        "能说明熔断器的三个状态（Closed/Open/HalfOpen）和恢复机制",
+        "能解释重试幂等为什么重要以及如何实现",
+        "能说明 Ocelot 网关的功能和代价、与服务网格的适用边界",
+        "能描述同步调用链雪崩的成因和防护策略",
+        "能说出策略链正确顺序：超时→重试→熔断→舱壁"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "dotnet.microservice-dotnet.communication.recall.1",
-      "prompt": "请说明 微服务通信 的核心机制、典型使用场景和常见坑。",
+      "prompt": "请完整说明 .NET 微服务通信中服务发现、通信方式选择和弹性策略三件事。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "dotnet.microservice-dotnet.communication.recall.2",
-      "prompt": "Polly 支持哪些弹性策略？重试和熔断器有什么区别？",
+      "prompt": "Polly 支持哪些弹性策略？策略链的正确顺序是什么？为什么顺序很重要？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "dotnet.microservice-dotnet.communication.recall.3",
-      "prompt": "微服务通信 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "同步调用链为什么容易雪崩？怎么防护？重试要注意什么？",
       "mode": "text",
       "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.microservice-dotnet.communication.recall.4",
+      "prompt": "Ocelot API 网关和服务网格（Istio）分别适合什么场景？怎么选？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.microservice-dotnet.communication.recall.5",
+      "prompt": "场景题：订单服务调用用户服务，用户服务偶发超时。请设计完整的弹性方案，包括 Polly 策略链配置、幂等处理和降级方案。",
+      "mode": "text",
+      "expectedMinutes": 5,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
       "能说出微服务通信要解决服务发现、通信方式、弹性三件事",
-      "能区分同步（HTTP/gRPC）和异步（消息）通信及适用",
-      "能说明 Polly 的重试/熔断/超时/降级",
-      "能说明 API 网关的作用"
+      "能区分同步（HTTP/gRPC）和异步（消息）通信及各自适用场景",
+      "能说明 Polly 的重试/熔断/超时/舱壁/降级五种策略及其组合顺序",
+      "能解释重试必须幂等并说明实现方式"
     ],
     "goodToHave": [
-      "能说明服务网格下沉能力但运维复杂",
-      "能指出重试要幂等",
-      "能说明同步调用链放大故障要熔断"
+      "能说明熔断器三个状态（Closed/Open/HalfOpen）和恢复机制",
+      "能说明策略链正确顺序（超时→重试→熔断→舱壁）及顺序错误的影响",
+      "能说明 Ocelot 网关的功能和单点代价",
+      "能说明服务网格下沉能力但运维复杂、中小规模不必上 mesh"
     ],
     "commonMistakes": [
-      "关键路径只同步调用不配熔断超时",
-      "非幂等操作重试导致重复",
-      "小规模强上服务网格增加复杂度"
+      "关键路径只同步调用不配熔断超时，导致下游慢时级联雪崩",
+      "非幂等操作不配幂等键就重试，产生重复数据",
+      "Polly 策略链顺序搞反（比如重试在外层超时在内层），导致重试耗时远超超时",
+      "小规模强上 Istio 服务网格，增加运维复杂度却没充分利用能力"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -164,6 +208,6 @@
   },
   "prerequisites": [],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察能否说清服务发现/通信方式/弹性三件事、区分同步异步、说明 Polly 弹性策略，并知道重试要幂等、何时上服务网格。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察能否说清服务发现/通信方式/弹性三件事、Polly 五种策略及策略链顺序、重试幂等要求、同步链雪崩防护、Ocelot 与服务网格的适用边界。",
+  "updatedAt": "2026-06-22"
 }

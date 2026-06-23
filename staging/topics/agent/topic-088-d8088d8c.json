@@ -4,26 +4,41 @@
   "category": "embedding-retrieval",
   "group": "rag",
   "title": "向量数据库索引与检索",
-  "summary": "讲清向量数据库不是“存向量”，而是在 HNSW、IVF、PQ/量化、metadata filter 与混合检索之间平衡召回率、延迟、内存和构建成本。",
+  "summary": "讲清向量数据库不是「存向量」，而是在 HNSW、IVF、PQ/量化、metadata filter 与混合检索之间平衡召回率、延迟、内存和构建成本；能解释每种索引的内部机制、参数如何影响召回/延迟、过滤与 ANN 的顺序冲突、以及 RAG 场景下如何用多路召回 + rerank + 离线评估兜底。",
   "tags": [
     "Agent",
     "LLM 基础",
     "向量数据库深度"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 28,
   "order": 10,
   "recommendWeight": 85,
   "learningCards": [
     {
       "type": "explain",
-      "title": "向量数据库索引与检索：主流索引算法、相似度度量",
-      "content": "## 一、向量数据库解决什么问题\n向量数据库负责在大规模 embedding 中做近邻检索。精确 KNN 要逐个算距离，数据量大时成本高；ANN 用索引结构换取可控近似，在召回率、延迟、内存和构建时间之间做权衡。\n\n## 二、主流索引\n- **Flat**：暴力搜索，适合小规模、评估基线或必须最高召回的场景。\n- **IVF**：先聚类分桶，查询时只扫部分桶；`nlist` 决定桶数量，`nprobe` 决定查多少桶。桶划分和 nprobe 会影响召回与延迟。\n- **HNSW**：分层近邻图，查询从高层快速导航到底层邻域；`M`、`efConstruction`、`efSearch` 影响内存、构建时间和召回。\n- **PQ/量化**：压缩向量降低内存和带宽，代价是距离估计误差，通常用于更大规模或成本敏感场景。\n\n## 三、相似度与过滤\ncosine、inner product、L2 必须和 embedding 归一化及索引配置一致。metadata filter 要特别小心：先过滤可能候选太少，后过滤可能 TopK 被过滤空，需要按租户/权限/时间/业务线设计索引或分区。"
+      "title": "ANN 索引为什么存在：精确 KNN 的代价",
+      "content": "精确 KNN 对每个查询向量都要和全库向量逐一算距离。十亿级 768 维向量全量扫描在在线场景下完全不可接受——仅距离计算的浮点运算量就会把 P99 延迟推到秒级甚至更高，内存带宽也撑不住。\n\n近似最近邻（ANN）的核心思想是：用索引结构跳过大部分明显不相关的向量，只在可能命中的子集上精算距离。代价是召回率从 100% 降到 95%～99% 量级，换到的是延迟下降数个数量级。选择哪种索引结构，本质是在召回率、查询延迟、内存占用、索引构建时间和增量更新能力这五个维度之间做工程取舍。\n\n相似度度量必须和 embedding 模型的训练目标一致：L2 距离适合原始空间最近邻；余弦相似度等价于对归一化向量算内积，适合只关心方向不关心模长的场景；内积（IP）适合模型训练时以 inner product 作为损失函数的情况。选错度量或混用不同模型/不同维度的向量会导致检索结果完全不可用。"
     },
     {
       "type": "explain",
-      "title": "向量数据库索引与检索：性能调优、面试高频问题",
-      "content": "## 四、调优与评估\n不要背固定“某索引召回率多少”。不同数据分布、维度、过滤条件、硬件和参数都会改变结果。评估要固定查询集和标准相关文档，比较 Recall@K、nDCG、P95/P99、内存、索引构建时间、增量写入延迟和过滤后空结果率。\n\n## 五、混合检索\n生产 RAG 常把向量召回与 BM25/全文检索融合。向量适合语义相似，BM25 适合错误码、编号、专有名词、代码符号。融合方式可以是加权分数、RRF 或先多路召回再 rerank。\n\n## 六、容灾与运维\n向量库也要看数据持久化、元数据一致性、索引重建、备份恢复、冷热分层、版本回滚和权限隔离。索引参数变更不能直接上线，要灰度重建、双写或离线评估后切流。"
+      "title": "HNSW：多层近邻图的构建与查询机制",
+      "content": "HNSW（Hierarchical Navigable Small World）是目前在线向量检索最常用的索引。它把向量组织成多层近邻图：最底层（layer 0）包含所有向量，每一层是下一层的稀疏子集。插入新向量时，先随机决定该向量出现在哪一层及以上（概率随层数指数衰减，参数 `M` 控制每层最大邻居数），然后在每一层找到最近邻并建立双向边，`efConstruction` 控制构建时的候选集大小——越大图质量越好但构建越慢。\n\n查询从最高层的入口点开始，在当前层贪心跳到最近邻，到底层后在 `efSearch` 大小的候选集中做精排。`efSearch` 越大召回越高但延迟越高；`M` 越大每个节点的邻居越多，图连通性更好但内存开销线性增长。典型配置：M=16、efConstruction=200、efSearch=64~200，实际值取决于数据分布和延迟预算。\n\nHNSW 的优势是查询延迟低（O(log N) 量级跳转）、召回率高（95%+ 常见）、天然支持增量插入。劣势是内存开销大（每个向量需要存储邻居列表和层信息，通常是原始向量大小的 1.5~3 倍）、不擅长批量重建、删除需要 tombstone 或定期 compact。"
+    },
+    {
+      "type": "explain",
+      "title": "IVF 与 PQ：大规模和内存敏感场景的索引策略",
+      "content": "IVF（Inverted File Index）用 k-means 把向量空间分成 `nlist` 个簇，每个向量归入最近的簇。查询时先算 query 和所有簇中心的距离，选最近的 `nprobe` 个簇，只在这些簇内做精确距离计算。nprobe 越大扫描越全、召回越高但延迟越高；nlist 越大簇越细、每个簇内向量越少，但需要更多簇中心和更大的 nprobe 才能达到同等召回。IVF 构建需要跑聚类，增量插入新向量时只做归属不重建聚类，时间久了簇分布会漂移，需要周期性重建。\n\nPQ（Product Quantization）把高维向量切成 m 个子空间，每个子空间独立做 k-means 聚类（通常 256 个中心），用 1 字节编码替代原始浮点数。一个 768 维 float32 向量（3072 字节）可以压缩到 m 字节（m=96 时 96 字节，压缩 32 倍）。距离计算用预计算的查表加速（ADC）。代价是量化误差导致召回损失，通常需要配合更大的候选集（oversampling）再用原始向量 rerank。\n\nIVF+PQ 组合是大规模检索的经典方案：IVF 缩小扫描范围，PQ 压缩内存和带宽。典型参数：nlist=sqrt(N)~4*sqrt(N)，nprobe=10~100，m=64~96。内存极度敏感场景还可以用 SQ（Scalar Quantization，float32→int8，4 倍压缩）或 Binary Quantization（1-bit，32 倍压缩但仅限特定模型）。"
+    },
+    {
+      "type": "explain",
+      "title": "metadata filter 与 ANN 的顺序冲突",
+      "content": "向量检索几乎总会伴随业务过滤：租户隔离、权限控制、时间范围、文档类型。问题在于 ANN 索引和过滤的执行顺序会产生根本冲突。\n\n**先过滤后 ANN**：先把不满足条件的向量排除，在剩余子集上建索引或搜索。优点是结果严格满足过滤条件；缺点是过滤后子集可能极小（小租户可能只有几十条），ANN 索引质量退化甚至无法构建，召回率大幅下降。\n\n**先 ANN 后过滤**：先用全库索引召回 TopK 候选，再对候选做 metadata 过滤。优点是 ANN 索引质量不受影响；缺点是 TopK 中可能大量候选被过滤掉，实际返回不足 K 条甚至为空（空结果率）。扩大候选集（如召回 Top 5K 再过滤取 Top 100）可以缓解但增加计算量。\n\n工程上的常用策略：(1) 用分区索引——按租户或业务线建独立索引，查询时路由到对应分区；(2) 维护 metadata 的倒排索引或 bitmap，查询时先取满足条件的 ID 集合，在 ANN 搜索中只考虑该集合内的向量；(3) 多层漏斗——先用粗粒度过滤缩小范围，再做 ANN，再做细粒度过滤。Milvus、Qdrant、Weaviate 等主流向量库都在不同程度上支持这些策略，但具体实现和性能表现差异较大，选型时必须用真实数据和过滤条件做 benchmark。"
+    },
+    {
+      "type": "explain",
+      "title": "混合检索与 RAG 评估链路",
+      "content": "纯向量检索在关键词精确匹配场景（错误码、文档编号、函数名、产品型号）上表现较差，因为语义相似不等于字面匹配。生产 RAG 通常采用混合检索：向量召回（语义相似）+ BM25/全文召回（关键词匹配），两路结果融合后交给 reranker 精排。\n\n融合方式：(1) 加权分数融合——把两路的归一化分数加权求和，权重需要调优；(2) Reciprocal Rank Fusion（RRF）——基于排名倒数求和，不需要分数归一化，对不同尺度的分数更鲁棒；(3) 先多路各召回 TopN，合并去重后统一 rerank。reranker 通常用 cross-encoder（如 bge-reranker、Cohere rerank），对 query-document pair 做精排，延迟高于向量检索但精度显著提升。\n\n评估不能只说「感觉还行」。必须有固定评估集（人工标注 query-document 相关性或用 LLM 辅助标注），衡量指标包括：Recall@K（前 K 个结果中有多少是相关的）、nDCG@K（排名质量）、MRR（第一个正确结果的位置）、过滤后空结果率、端到端延迟 P95/P99、重排前后 nDCG 提升幅度。评估结果应驱动索引参数和融合权重的选择，而不是凭直觉调参。"
     },
     {
       "type": "diagram",
@@ -45,37 +60,49 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | 向量数据库 | 传统数据库 | 搜索引擎 |\n| --- | --- | --- | --- |\n| 核心能力 | 语义近邻、ANN、metadata filter | 事务、精确匹配、范围查询 | 倒排索引、BM25、全文检索 |\n| 索引结构 | HNSW/IVF/PQ/Flat | B+Tree/LSM 等 | 倒排索引、列式/向量扩展 |\n| 强项 | RAG 召回、推荐、相似检索 | 业务主数据一致性 | 关键词、日志、文档全文 |\n| 弱项 | 事务和复杂 join 不是核心 | 语义相似弱 | 语义相似需额外向量能力 |\n| 工程关注 | 召回率、P99、内存、索引构建、过滤后空结果 | ACID、锁、执行计划 | 分词、相关性、倒排合并 |"
+      "title": "主流索引参数、机制与取舍",
+      "content": "| 索引类型 | 内部机制 | 核心参数 | 内存开销 | 召回率 | 查询延迟 | 构建时间 | 增量更新 |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n| Flat | 全量暴力扫描 | 无 | 原始向量大小 | 100% | O(N·d)，极慢 | 无需构建 | 直接追加 |\n| HNSW | 多层近邻图，贪心导航 | M, efConstruction, efSearch | 原始向量 ×1.5~3 | 95%~99% | O(log N) 级 | 中等 | 插入快，删除需 compact |\n| IVF | k-means 聚类分桶，扫描部分桶 | nlist, nprobe | 原始向量 + 簇中心 | 90%~98%（依赖 nprobe） | 中等 | 需跑聚类，较慢 | 追加快，漂移需重建 |\n| IVF+PQ | IVF 分桶 + PQ 压缩向量 | nlist, nprobe, m | m 字节/向量 + 簇中心 | 85%~95%（依赖 m 和 nprobe） | 较低 | 慢（聚类+量化训练） | 追加快，漂移需重建 |\n| SQ/BQ | 标量/二值量化 | bits_per_element | 原始 ×0.25~0.03 | 80%~95% | 低 | 快 | 直接追加 |\n\n| 对比维度 | 向量数据库 | 传统数据库 | 搜索引擎 |\n| --- | --- | --- | --- |\n| 核心查询 | ANN 近邻检索 | 精确匹配、范围、join | BM25 全文检索 |\n| 索引结构 | HNSW/IVF/PQ | B+Tree/LSM-Tree | 倒排索引 |\n| 强项 | 语义相似、embedding 检索 | 事务一致性、复杂查询 | 关键词、日志、全文 |\n| 弱项 | 事务、join、精确匹配 | 语义相似弱 | 语义相似需额外向量扩展 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "# 索引选择的伪代码思路\nif dataset_size_is_small or need_ground_truth_baseline:\n    index = \"FLAT\"\nelif memory_is_tight and can_accept_recall_tradeoff:\n    index = \"IVF 或 IVF_PQ\"      # 调 nlist/nprobe\nelif online_latency_and_recall_are_both_important:\n    index = \"HNSW\"              # 调 M/efConstruction/efSearch\nelse:\n    index = \"benchmark multiple indexes\"\n\n# 上线前固定评估集，比较：\n# Recall@K, nDCG, P95/P99, memory, build_time, update_lag, filtered_empty_rate",
-      "language": "markdown",
+      "title": "索引选型与评估的工程伪代码",
+      "language": "python",
+      "content": "import numpy as np\n\ndef choose_index(dataset_size: int, memory_budget_mb: float,\n                 latency_budget_ms: float, need_exact: bool) -> str:\n    \"\"\"索引选型的工程决策逻辑。\"\"\"\n    if need_exact or dataset_size < 10_000:\n        return \"FLAT\"\n    # 内存预算反推可容纳的向量数\n    bytes_per_vector = 768 * 4  # 768-dim float32\n    max_flat_vectors = memory_budget_mb * 1024 * 1024 / bytes_per_vector\n    if dataset_size <= max_flat_vectors and latency_budget_ms > 50:\n        return \"FLAT\"\n    if latency_budget_ms < 10:\n        # 低延迟要求，HNSW 优先，但要评估内存\n        hnsw_memory_factor = 2.0  # HNSW 约 2x 原始向量\n        hnsw_mb = dataset_size * bytes_per_vector * hnsw_memory_factor / (1024**2)\n        if hnsw_mb <= memory_budget_mb:\n            return \"HNSW\"\n        return \"IVF_PQ\"  # 内存不够 HNSW，降级到 IVF+PQ\n    # 大规模 + 内存敏感\n    if dataset_size > 1_000_000 and memory_budget_mb < dataset_size * bytes_per_vector / (1024**2):\n        return \"IVF_PQ\"\n    return \"HNSW\"  # 默认首选\n\ndef evaluate_retrieval(queries, ground_truth, search_fn, k: int = 10):\n    \"\"\"固定评估集计算 Recall@K 和 MRR。\"\"\"\n    recalls, mrrs = [], []\n    for q, gt_ids in zip(queries, ground_truth):\n        results = search_fn(q, top_k=k)\n        result_ids = set(r.id for r in results)\n        hits = len(result_ids & set(gt_ids))\n        recalls.append(hits / len(gt_ids) if gt_ids else 1.0)\n        # MRR: 第一个正确结果的倒数排名\n        mrr = 0.0\n        for rank, r in enumerate(results, 1):\n            if r.id in set(gt_ids):\n                mrr = 1.0 / rank\n                break\n        mrrs.append(mrr)\n    return {\"Recall@K\": np.mean(recalls), \"MRR\": np.mean(mrrs)}",
       "highlights": [
         {
-          "line": 1,
-          "note": "「精确搜索（KNN）：」 把「向量数据库索引与检索」的讨论入口先固定住；后面需要沿着输入、处理、输出和风险点展开，而不是只背概念。"
+          "line": 4,
+          "note": "索引选型应从数据量、内存预算和延迟预算出发，而不是背公式。"
+        },
+        {
+          "line": 17,
+          "note": "HNSW 内存约 2x 原始向量，内存不够时降级到 IVF+PQ。"
+        },
+        {
+          "line": 26,
+          "note": "评估必须用固定查询集和标注数据，算 Recall@K 和 MRR，不能凭感觉。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "30 秒结论：向量数据库的核心不是“存向量”，而是在召回率、延迟、内存和过滤条件之间做 ANN 索引取舍。面试要能讲清 HNSW、IVF、PQ 的适用边界，并把它们放回 RAG 的召回、重排和评估链路里。\n\n机制要点：\n- HNSW 用多层近邻图做搜索，召回高、延迟低，适合在线检索，但内存开销较大；IVF 先用聚类把向量分桶，查询时只扫部分桶，适合大规模数据但依赖聚类质量和 nprobe；PQ/量化用压缩向量降低内存，代价是精度损失。过滤条件也很关键：先过滤再 ANN 可能召回不足，先 ANN 再过滤可能返回不够，需要结合 metadata index、分区或混合策略。\n- 验证时我会看 Recall@K、P95/P99 延迟、QPS、内存占用、索引构建时间、过滤后空结果率和重排前后 nDCG。只说“用了 HNSW 所以快”是不够的。",
+      "content": "**30 秒结论**：向量数据库的核心不是「存向量」，而是在 ANN 索引选型、metadata filter 顺序、混合检索融合和离线评估之间做工程取舍，目标是在召回率、延迟、内存和成本之间找到最优平衡点。\n\n**机制主线**\n- **ANN 索引选型**：Flat 适合小规模或必须精确；HNSW 用多层近邻图，查询 O(log N) 跳转，召回 95%+，内存开销大（~2x 原始向量）；IVF 用聚类分桶缩小扫描范围，通过 nprobe 控制速度-召回权衡；PQ 把高维向量压缩到每个子空间 1 字节，内存大幅下降但有量化误差，通常需要 oversampling + rerank 补偿。\n- **参数调优**：HNSW 的 M 控制邻居数（内存），efConstruction 控制图质量（构建时间），efSearch 控制查询候选集（延迟/召回）；IVF 的 nlist 控制簇数，nprobe 控制扫描范围。这些参数不能背固定值，要用真实数据 benchmark。\n- **过滤策略**：先 ANN 后过滤可能 TopK 被过滤空（空结果率高）；先过滤后 ANN 可能子集太小召回不足。工程方案包括分区索引、metadata bitmap、扩大候选集、多层漏斗。\n- **混合检索**：向量召回（语义相似）+ BM25（关键词精确匹配），融合方式有加权分数、RRF、多路召回 + reranker（cross-encoder）。\n- **评估指标**：Recall@K、nDCG@K、MRR、P95/P99 延迟、内存占用、索引构建时间、过滤后空结果率、重排前后 nDCG 提升。评估驱动选型，不能凭直觉。\n\n**边界与取舍**\n- cosine / IP / L2 必须和模型训练目标一致，混用会导致检索结果不可用\n- HNSW 不擅长删除（需要 tombstone + compact），IVF 有聚类漂移问题需要周期重建\n- 大规模 + 内存敏感场景用 IVF+PQ，但要评估量化损失是否可接受\n- 权限隔离最好在索引层做分区，不要只在应用层后过滤",
       "followUpQuestions": [
         {
-          "question": "HNSW 和 IVF 怎么选？",
-          "answer": "HNSW 适合低延迟、高召回的在线检索，内存成本较高；IVF 适合更大规模和可接受调参的场景，通过 nlist/nprobe 控制速度和召回。最终要用 Recall@K、P95 延迟和内存成本压测。"
+          "question": "HNSW 和 IVF 在什么场景下分别更合适？",
+          "answer": "HNSW 适合在线低延迟、高召回场景（如 RAG 实时检索），但内存开销大（~2x 原始向量）。IVF 适合大规模数据 + 可调参场景，通过 nprobe 控制速度-召回权衡，内存更可控。如果数据量极大且内存有限，IVF+PQ 组合更合适。最终必须用 Recall@K、P99 延迟和内存成本在真实数据上压测。"
         },
         {
-          "question": "向量检索加权限过滤为什么容易出问题？",
-          "answer": "如果先 ANN 后过滤，候选可能被权限过滤掉导致结果不足；如果先过滤后 ANN，小租户数据量太小会影响召回。需要用 metadata index、租户分区、扩大候选集或分层检索处理。"
+          "question": "先 ANN 后过滤 vs 先过滤后 ANN，实际怎么选？",
+          "answer": "先 ANN 后过滤是常见默认方案（扩大候选集如 Top 5K 再过滤），但要监控空结果率。如果过滤条件非常严格（如小租户只有几十条数据），应该用分区索引或 metadata bitmap 缩小搜索范围后再做 ANN，否则召回率会严重下降。混合方案（粗粒度过滤 → ANN → 细粒度过滤）是常见的工程实践。"
         },
         {
-          "question": "PQ 量化会带来什么代价？",
-          "answer": "PQ 降低内存和 IO，但会引入近似误差，可能降低召回率。通常要配合原向量 rerank 或提高候选集，并用 Recall@K/nDCG 验证质量损失是否可接受。"
+          "question": "PQ 量化压缩 32 倍，召回率损失多少？怎么补偿？",
+          "answer": "PQ 的召回损失取决于子空间数 m 和原始数据分布。m 越大（如 96）损失越小，但内存也越高。典型损失在 5%~15%（Recall@100 从 99% 降到 85%~94%）。补偿方式：(1) 增大 nprobe/efSearch 搜索更多候选（oversampling）；(2) 用原始向量对候选 rerank 精排；(3) 结合 SQ（float32→int8）做 residual 量化进一步提高精度。"
+        },
+        {
+          "question": "向量数据库和 Elasticsearch 的向量检索扩展有什么区别？",
+          "answer": "Elasticsearch 8.x 引入了 HNSW 向量索引（基于 Lucene），可以在倒排索引旁附加向量检索，适合已有 ES 基础设施的团队做混合检索。专用向量数据库（Milvus、Qdrant、Weaviate）通常在向量检索的参数控制、过滤策略、索引类型多样性（IVF+PQ、多租户分区）和大规模性能上更灵活。选型取决于团队基础设施、数据规模和混合检索需求。"
         }
       ]
     },
@@ -83,54 +110,73 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说清 Flat、IVF、HNSW、PQ/量化的机制和取舍",
-        "能解释 nprobe、efSearch、TopK、过滤条件对召回和延迟的影响",
-        "能说明 cosine/IP/L2 与归一化、模型维度的关系",
-        "能把向量库放回 RAG 的多路召回、metadata filter、rerank 和评估链路",
-        "能用 Recall@K、nDCG、P99、内存、索引构建时间和空结果率验证选型"
+        "能解释 Flat、HNSW、IVF、PQ/量化的内部机制、核心参数和适用场景",
+        "能说明 HNSW 的 M/efConstruction/efSearch 如何影响内存、构建时间和查询召回/延迟",
+        "能解释 IVF 的 nlist/nprobe 和 PQ 的 m 如何控制扫描范围和压缩精度",
+        "能对比先 ANN 后过滤 vs 先过滤后 ANN 的问题和工程缓解方案",
+        "能设计向量 + BM25 混合检索 + reranker 的融合策略",
+        "能用 Recall@K、nDCG、MRR、P95/P99、内存、空结果率做完整评估",
+        "能区分向量数据库与传统数据库/搜索引擎的核心差异",
+        "能说明 cosine/IP/L2 与模型训练目标的一致性要求"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "agent.embedding-retrieval.topic-088-d8088d8c.recall.1",
-      "prompt": "请讲一下 向量数据库索引与检索 的核心机制、适用场景和常见误区。",
+      "prompt": "请完整讲一下 HNSW 索引的构建过程、查询过程和关键参数。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "agent.embedding-retrieval.topic-088-d8088d8c.recall.2",
-      "prompt": "向量数据库索引与检索 在大规模数据场景下如何优化性能和成本？",
+      "prompt": "HNSW 和 IVF 的检索原理分别是什么？在召回率、构建成本和内存占用上怎么取舍？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "agent.embedding-retrieval.topic-088-d8088d8c.recall.3",
-      "prompt": "HNSW 和 IVF 的检索原理分别是什么？在召回率、构建成本和内存占用上怎么取舍？",
+      "prompt": "向量检索加 metadata 过滤（如租户隔离、时间范围）为什么容易出问题？你会怎么设计？",
       "mode": "text",
       "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.embedding-retrieval.topic-088-d8088d8c.recall.4",
+      "prompt": "RAG 场景下如何做混合检索（向量 + BM25）？融合方式有哪些？怎么评估效果？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.embedding-retrieval.topic-088-d8088d8c.recall.5",
+      "prompt": "你负责的向量检索服务 Recall@10 只有 85%，P99 延迟 200ms，要求提到 95% 以上且 P99 < 50ms。你怎么排查和优化？",
+      "mode": "text",
+      "expectedMinutes": 5,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能解释 HNSW、IVF、PQ/量化的基本机制和取舍",
-      "能说明 efSearch、nprobe、TopK 和过滤条件对召回率与延迟的权衡",
-      "能把向量索引放回 RAG 的召回、重排、metadata filter 和评估链路",
-      "能用 Recall@K、P95/P99、QPS、内存占用和过滤后空结果率验证效果"
+      "能解释 HNSW 的多层近邻图构建和查询机制，以及 M/efConstruction/efSearch 参数含义",
+      "能解释 IVF 的聚类分桶和 PQ 的子空间量化压缩机制",
+      "能对比先 ANN 后过滤 vs 先过滤后 ANN 的问题，并给出工程缓解方案",
+      "能把向量索引放回 RAG 的召回、重排、metadata filter 和评估链路"
     ],
     "goodToHave": [
-      "能设计 hybrid retrieval 和 rerank 融合策略",
-      "能说明索引重建、备份恢复、增量更新和灰度切流",
-      "能按数据规模、维度、过滤条件和硬件做基准测试"
+      "能设计向量 + BM25 混合检索的融合策略（加权分数、RRF、多路召回 + rerank）",
+      "能说明索引重建、增量更新、聚类漂移和灰度切流",
+      "能按数据规模、维度、内存预算和延迟预算做索引选型基准测试",
+      "能区分向量数据库与 ES 向量扩展的适用场景"
     ],
     "commonMistakes": [
-      "背固定召回率/复杂度，不做业务数据评估",
-      "不清楚 HNSW、IVF、PQ 的取舍",
-      "忽略 metadata filter 导致召回为空或越权",
-      "混用不同模型/维度/相似度配置"
+      "背固定召回率/参数值（如「HNSW 召回率 99%」），不做业务数据评估",
+      "不清楚 HNSW/IVF/PQ 的内存开销和适用边界，选型时只看论文不看工程",
+      "忽略 metadata filter 与 ANN 的顺序冲突，导致召回为空或越权",
+      "混用不同 embedding 模型、不同维度或不同相似度度量，导致检索结果不可用",
+      "以为 PQ 压缩没有代价，不评估量化损失是否可接受"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -139,11 +185,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "prerequisites": [
     "agent.embedding-retrieval.topic-121-15a0b1b4"
   ],
   "status": "staging",
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能围绕「向量数据库索引与检索」说清能说明向量数据库与传统数据库在数据模型和查询方式上的区别、能解释 ANN 检索的召回率、延迟与索引参数取舍，并放到Agent/RAG/LLM 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察是否能围绕「向量数据库索引与检索」说清 HNSW/IVF/PQ 的内部机制和参数调优、metadata filter 与 ANN 的顺序冲突及缓解方案、混合检索与 RAG 评估链路，并能在场景题中给出可落地的排查和优化思路。"
 }

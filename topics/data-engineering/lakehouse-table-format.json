@@ -4,7 +4,7 @@
   "category": "platform",
   "group": "platform",
   "title": "湖仓表格式 Iceberg/Hudi/Delta",
-  "summary": "对象存储之上靠元数据层做 ACID、Schema 演进、Time Travel 和小文件合并，三家在 upsert、快照、生态上有清晰分工。",
+  "summary": "对象存储之上靠元数据层做 ACID、Schema 演进、Time Travel 和小文件合并；Iceberg 强在开放生态与隐藏分区，Hudi 强在 record 级 upsert 与近实时，Delta 深绑 Databricks/Spark；选型要看写入模式、引擎覆盖和运维能力。",
   "tags": [
     "数据工程",
     "Lakehouse",
@@ -13,28 +13,28 @@
     "Delta"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 32,
   "order": 130,
   "recommendWeight": 82,
   "status": "production",
   "prerequisites": [],
   "interviewFrequency": "medium",
-  "interviewerFocus": "重点考察候选人能否说清三家表格式的元数据机制差异、ACID 提交协议、Schema/分区演进的代价，以及 compaction 和 expire snapshot 的运维选择。",
+  "interviewerFocus": "重点考察候选人能否说清三家表格式的元数据机制差异、ACID 提交协议、Schema/分区演进的代价，以及 compaction 和 expire snapshot 的运维编排。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "为什么 Hive 表撑不起湖仓：元数据层解决的 4 个硬伤",
-      "content": "传统 Hive 表把表语义放在 Hive Metastore（库/表/分区列表）+ HDFS 目录里，分区是物理目录、文件列表靠 list 目录获取。这套模型在对象存储（S3/OSS/GCS）上有四个硬伤：\n\n1. 提交语义依赖目录和文件操作。传统 Hive 表常把“哪些文件属于表”隐含在目录结构里，遇到并发写、任务失败、跨引擎提交或对象存储 rename/list 成本时，读者可能看到不完整文件集或规划很慢。现代 S3 已提供强一致 LIST，但目录枚举仍不是可靠的表版本管理方式。\n2. 分区即目录。分区字段必须出现在过滤条件里才能 partition pruning，改分区策略要重写整张表。\n3. 没有版本概念。要回滚只能拷贝旧目录或重跑作业；CDC/补数不可重放。\n4. 目录枚举成本高。大表靠递归列目录发现文件，会把查询规划时间、对象存储 API 成本和小文件问题放大。\n\nIceberg/Hudi/Delta 的共同思路是把“表由哪些文件组成”从 list 目录变成读一份元数据：Iceberg 用 metadata.json + manifest list + manifest，Delta 用 _delta_log 下的 JSON commit + 周期性 checkpoint，Hudi 用 .hoodie 时间线（instant + commit/deltacommit）。每次写入先落数据文件，再原子追加一条新 commit 指向新的文件集，读者按 commit/snapshot 取一致视图——这就是 ACID、Time Travel、Schema 演进、隐藏分区都能做出来的根。"
+      "title": "Hive 表在对象存储上的四个硬伤",
+      "content": "Hive 表把「哪些文件属于这张表」的语义拆成两层：Hive Metastore 存库/表/分区元信息，分区就是物理目录，文件列表靠 list 目录获取。在 HDFS 上勉强可用，搬到 S3/OSS/GCS 后暴露四个硬伤。\n\n**无原子提交。** 传统写入先往目录写文件、再往 Metastore 注册分区。两个并发 writer 可能同时完成写入，读者看到不完整的文件集；任务中途失败时残留的 partial 文件也会被 list 出来。S3 的 rename 是 copy+delete，不是原子操作，所以连「先写临时再 rename」的保障也没了。\n\n**分区即目录。** 分区策略写死在目录结构里。想从日分区改成小时分区，必须重写整张表；分区字段不出现在 WHERE 条件里就无法 prune，扫描成本和目录级 API 开销一起上。\n\n**没有版本概念。** 回滚只能重跑作业或手动拷贝旧目录。数据出错无法像数据库那样 ROLLBACK，CDC 补数也无法重放。\n\n**目录枚举成本高。** 大表递归 list 可能返回数十万条结果，查询规划时间长，S3 LIST API 本身也收费。小文件越多，这个成本越放大。\n\n表格式的共同思路就是把「表由哪些文件组成」从目录枚举变成读一份独立的元数据日志：Iceberg 用 metadata.json → manifest list → manifest，Delta 用 _delta_log 的 JSON commit + checkpoint，Hudi 用 .hoodie 时间线（instant 文件）。每次写入先落数据文件，再原子追加一条 commit 指向新的文件集合，读者按 snapshot 取一致视图——这是 ACID、Time Travel、Schema 演进、隐藏分区的共同根。"
     },
     {
       "type": "explain",
       "title": "三家分工：Iceberg 强读，Hudi 强写，Delta 绑生态",
-      "content": "三家都做湖仓表格式，但优化目标不一样，选型时要看主流场景。\n\n- Iceberg（Netflix 起源，Apache 顶级项目）：核心是 snapshot + manifest 两层元数据，分区是隐藏的（partition transform 写在元数据里），改分区策略不用重写数据；ACID 靠原子替换 metadata.json 指针（HDFS 用 rename，S3 要 catalog 提供 CAS，比如 Glue/Nessie/JDBC catalog）；强项是开放表格式、隐藏分区、引擎中立（Trino/Spark/Flink/Snowflake/StarRocks 都接），弱项是 upsert 性能不如 Hudi，需要 v2 spec 的 position/equality delete。\n- Hudi（Uber 起源）：为 CDC/upsert 而生，提供 COW（Copy-On-Write，写时合并，读快写慢）和 MOR（Merge-On-Read，写 delta log，读时合并，写快读稍慢）两种表，自带 timeline、record-level index、increment query、自动 clustering 与 cleaner，最适合 binlog 入湖、近实时数仓；弱项是表参数复杂（precombine、index type、表类型一旦选错代价高），跨引擎成熟度不如 Iceberg。\n- Delta Lake（Databricks 起源）：以 _delta_log 为单一事实源，OPTIMIZE/Z-ORDER/VACUUM 工具链成熟，与 Spark/Databricks Photon 深度协同；OSS Delta 在非 Spark 引擎（Trino/Flink）的覆盖度和功能完整度不如 Iceberg，跨引擎选它要确认 Delta Universal Format（UniForm）或 connector 是否够用。\n\n一句话选型：开放生态、读多写少、改分区频繁选 Iceberg；CDC、upsert、近实时选 Hudi；已经在 Databricks/Spark 上选 Delta。"
+      "content": "三家都做开放表格式，但优化目标不同，选型要看主场景。\n\n**Iceberg**（Netflix 起源，Apache 顶级项目）。核心是 snapshot + manifest 两层元数据。分区是隐藏的：partition transform 写在元数据里，`ADD PARTITION FIELD days(ts)` 只改 partition spec，老快照仍按旧 spec 解读、新快照按新 spec 写，不用重写历史数据。ACID 靠原子替换 metadata 指针：HDFS 用 rename，S3 要 catalog 提供 CAS（Glue UpdateTable 的 `IfMatch`、JDBC catalog 的唯一索引、Nessie/REST catalog）。强项是开放表格式、隐藏分区、引擎中立（Trino/Spark/Flink/Snowflake/StarRocks 都有完整 connector），弱项是 upsert 性能不如 Hudi——v2 spec 靠 position delete 和 equality delete 标记删除行，没有 record-level 索引，大批量 upsert 需要走 merge-on-read 的 delete 文件，写放大和查询成本比 Hudi MOR 高。\n\n**Hudi**（Uber 起源）。为 CDC/upsert 而生。提供 COW（Copy-On-Write，每次 upsert 命中的 base parquet 整文件重写，读快写慢）和 MOR（Merge-On-Read，upsert 只追加 .log.* delta 文件，读时与 base 合并，写快读稍慢）两种表类型。自带 timeline、record-level index（BLOOM / HBASE / BUCKET）、increment query、自动 clustering 与 cleaner，最适合 binlog 入湖、近实时数仓。弱项是表参数多（precombine field、index type、table type 一旦选错代价高），跨引擎成熟度不如 Iceberg。\n\n**Delta Lake**（Databricks 起源）。以 _delta_log 为单一事实源，OPTIMIZE / Z-ORDER / VACUUM 工具链成熟，与 Spark/Databricks Photon 深度协同。OSS Delta 在非 Spark 引擎（Trino/Flink）的功能完整度和 connector 成熟度不如 Iceberg，跨引擎场景要确认 Delta Universal Format（UniForm）或 connector 是否够用。\n\n一句话选型：开放生态、读多写少、分区策略常变选 Iceberg；CDC、record 级 upsert、近实时选 Hudi MOR；已在 Databricks/Spark 主栈选 Delta。"
     },
     {
       "type": "explain",
       "title": "事务、Schema 演进、Time Travel 怎么落地",
-      "content": "1) 原子提交。Iceberg 的提交=把 catalog 中 metadata pointer 从 v123.metadata.json 原子替换到 v124.metadata.json，靠 catalog 的 CAS（HDFS rename / Glue UpdateTable IfMatch / JDBC 唯一索引）实现 serializable 隔离；并发写冲突时第二个 commit 要 retry 并重新 validate（比如检查它写入的分区有没有被并发删除）。Delta 用 _delta_log/00000000000000000123.json 文件名作为版本号，靠对象存储的 put-if-absent 抢锁（S3 通过 DynamoDB LogStore，HDFS 用 rename）。Hudi 在 .hoodie/ 下用 .inflight -> .commit 的状态机，配合 OCC 或锁服务（ZK/HMS lock provider）做并发控制。\n\n2) Schema 演进。Iceberg 给每列分配稳定 field-id，重命名/调换顺序/删除列只改元数据不动数据文件，类型提升受控（int->long、float->double、decimal 精度上调）；这是它和 Parquet 直接读的最大差异——Parquet 按列名读，rename 列等于丢数。Delta 默认按列名匹配，需要 columnMapping 模式才能稳妥 rename。Hudi 在 0.11+ 支持 schema evolution，但和表类型、index 强相关。\n\n3) Time Travel 与回滚。三家都按 snapshot/commit/instant 提供 AS OF VERSION/TIMESTAMP 读，回滚就是把 metadata pointer 指回老版本（Iceberg rollback_to_snapshot、Delta RESTORE TABLE、Hudi savepoint+restore）；但前提是数据文件还没被 expire/clean——Iceberg expireSnapshots、Delta VACUUM、Hudi Cleaner 都会按保留期删孤儿文件，过期后回滚就只能从备份恢复。生产经验：保留期至少覆盖业务能容忍的回滚窗口（常见 7-30 天），并把 expire/vacuum 单独编排，不要在写任务里顺手做。"
+      "content": "**原子提交。** Iceberg 的提交 = 把 catalog 中 metadata pointer 从 v123.metadata.json 原子替换到 v124.metadata.json，靠 catalog 的 CAS 实现 serializable 隔离。并发写冲突时第二个 writer 要重新 load metadata、validate 自己的写入是否与已提交快照冲突（比如分区是否被并发删除），再 retry。HDFS 上用 rename 的原子性即可；S3 上 HadoopCatalog 没有 CAS，并发写会 lost update，必须用 Glue catalog（UpdateTable 乐观并发带 ETag 校验）、JDBC catalog（唯一索引约束）、Nessie/REST catalog 或 S3FileIO + DynamoDB lock。Delta 用 _delta_log/00000000000000000123.json 文件名编号，靠对象存储的 put-if-absent 抢锁（S3 配 DynamoDB LogStore，HDFS 用 rename）。Hudi 在 .hoodie/ 下用 .requested → .inflight → .commit 的状态机，配合 OCC 或锁服务（ZK / HMS lock provider / DynamoDB）做并发控制。\n\n**Schema 演进。** Iceberg 给每列分配稳定 field-id，重命名、调换顺序、删除列只改元数据不动数据文件；类型提升受控（int→long、float→double、decimal 精度上调）。这是它和 Parquet 直接读的最大差异——Parquet 按列名匹配，rename 列等于丢数据。Delta 默认按列名匹配，需要开启 `columnMapping` 模式才能稳妥 rename，且 UniForm 场景下有兼容限制。Hudi 在 0.11+ 支持 schema evolution，但与表类型和 index 类型强相关，升级前需测试验证。\n\n**Time Travel 与回滚。** 三家都按 snapshot / commit / instant 提供 `AS OF VERSION` / `TIMESTAMP` 读。回滚就是把 metadata pointer 指回老版本（Iceberg `rollback_to_snapshot`、Delta `RESTORE TABLE`、Hudi savepoint + restore）。前提是数据文件还没被 expire / clean。Iceberg `expireSnapshots`、Delta `VACUUM`、Hudi Cleaner 都会按保留期删「不再被任何有效快照引用」的数据文件。生产经验：保留期至少覆盖业务回滚窗口（常见 7–30 天），expire / vacuum 单独编排，不要和写任务串在一起——写失败导致文件被提前清理是常见事故。"
     },
     {
       "type": "compareTable",
@@ -49,7 +49,7 @@
       "rows": [
         [
           "元数据载体",
-          "metadata.json + manifest list + manifest",
+          "metadata.json → manifest list → manifest",
           ".hoodie timeline（instant 文件）",
           "_delta_log JSON commit + checkpoint",
           "Hive Metastore + 目录 list"
@@ -57,23 +57,23 @@
         [
           "ACID 提交",
           "catalog CAS 替换 metadata 指针",
-          "OCC + 锁服务（ZK/HMS/DynamoDB）",
+          "OCC + 锁服务（ZK / HMS / DynamoDB）",
           "put-if-absent + DynamoDB LogStore",
           "无原子提交，rename 不可靠"
         ],
         [
-          "Upsert/Delete",
-          "v2 spec position/equality delete",
-          "原生 upsert（COW/MOR + 索引）",
+          "Upsert / Delete",
+          "v2 spec position / equality delete（无 record index）",
+          "原生 upsert + record-level index（BLOOM/HBASE/BUCKET）",
           "MERGE INTO + deletion vector",
-          "需要重写整个分区"
+          "需重写整个分区"
         ],
         [
           "分区演进",
-          "隐藏分区 + 分区 spec 演进，无需重写",
+          "隐藏分区 + spec 演进，无需重写",
           "支持但和表类型耦合",
-          "需要 columnMapping，改动有限",
-          "改分区=重建表"
+          "需 columnMapping，改动有限",
+          "改分区 = 重建表"
         ],
         [
           "Time Travel",
@@ -81,6 +81,13 @@
           "instant time / savepoint",
           "VERSION AS OF / TIMESTAMP AS OF",
           "无"
+        ],
+        [
+          "小文件治理",
+          "rewrite_data_files（可不停写）",
+          "clustering / compaction（inline/async）",
+          "OPTIMIZE + Z-ORDER",
+          "Hive 无原生能力"
         ],
         [
           "典型生态",
@@ -97,6 +104,39 @@
           "纯历史归档（不建议新建）"
         ]
       ]
+    },
+    {
+      "type": "code",
+      "title": "Spark 上对三家做相同操作的写法",
+      "language": "sql",
+      "content": "-- ===== Iceberg：分区演进无需重写数据 =====\n-- 只改 partition spec，老快照按旧 spec 解读，新快照按新 spec 写\nALTER TABLE catalog.db.events ADD PARTITION FIELD days(event_time);\n\n-- 读历史快照\nSELECT * FROM catalog.db.events VERSION AS OF 8473928479283;\n\n-- 合并小文件（可不停写）+ 过期快照\nCALL catalog.system.rewrite_data_files(\n  table => 'db.events',\n  options => map('target-file-size-bytes', '536870912')\n);\nCALL catalog.system.expire_snapshots(\n  table => 'db.events',\n  older_than => TIMESTAMP '2026-06-01 00:00:00',\n  retain_last => 5  -- 兜底：至少保留最近 5 个快照\n);\n\n-- ===== Hudi：MOR 表 upsert（CDC 入湖典型用法） =====\n-- 表参数：hoodie.datasource.write.table.type=MERGE_ON_READ\n--         precombine.field=ts, recordkey.field=id, partitionpath.field=dt\nMERGE INTO hudi_orders t USING cdc_stream s ON t.id = s.id\n  WHEN MATCHED AND s._op = 'D' THEN DELETE\n  WHEN MATCHED THEN UPDATE SET *\n  WHEN NOT MATCHED THEN INSERT *;\n\n-- ===== Delta：MERGE + 时间旅行 + OPTIMIZE + VACUUM =====\nMERGE INTO delta.`/lake/orders` t USING updates s ON t.id = s.id\n  WHEN MATCHED THEN UPDATE SET *\n  WHEN NOT MATCHED THEN INSERT *;\n\nSELECT * FROM delta.`/lake/orders` VERSION AS OF 42;\n\nOPTIMIZE delta.`/lake/orders` ZORDER BY (user_id);\n\n-- VACUUM 保留期不能低于默认 7 天，否则破坏 Time Travel\nVACUUM delta.`/lake/orders` RETAIN 168 HOURS;",
+      "highlights": [
+        {
+          "line": 3,
+          "note": "Iceberg ADD PARTITION FIELD 只改 partition spec，不重写历史数据。老快照仍按旧 spec 解读，新快照按新 spec 写。"
+        },
+        {
+          "line": 12,
+          "note": "rewrite_data_files 把同分区小文件合并到 target-file-size-bytes（默认 512MB），可在不停写的情况下做 compaction。"
+        },
+        {
+          "line": 16,
+          "note": "expire_snapshots 按 older_than 删除快照，被删除快照独占引用的数据文件才会真正释放。retain_last 是兜底保护。"
+        },
+        {
+          "line": 22,
+          "note": "Hudi MOR 写入只追加 .log.* delta 文件，读时和 base parquet 合并。必须配 inline 或 async compaction 把 delta 合回 base，否则读延迟持续增长。"
+        },
+        {
+          "line": 33,
+          "note": "OPTIMIZE + ZORDER 做多列高基数的 multi-dim clustering，提升点查过滤效率。VACUUM RETAIN 不能低于 delta.logRetentionDuration（默认 7 天）。"
+        }
+      ]
+    },
+    {
+      "type": "explain",
+      "title": "小文件、compaction 和 expire 的运维编排",
+      "content": "小文件常见于流式写入（commit 间隔太短）、分区太细、或 MOR 表 delta log 积累。治理三步要串起来。\n\n**写入侧：控制文件产出。** 调大 commit 间隔（Iceberg 的 `write.target-file-size-bytes` 默认 512MB，Delta 的 `delta.targetFileSize`，Hudi 的 `parquet.max.file.size`），让每次 commit 尽量产出接近目标大小的文件。流式场景还可以在 writer 侧做 micro-batch 聚合再写入。\n\n**定期 compaction：合并小文件。** Iceberg `rewrite_data_files` 支持在不停写的情况下把同分区小文件合并到目标大小；Delta `OPTIMIZE` 支持 `ZORDER BY` 做 multi-dim clustering，但 OPTIMIZE 期间写入仍然可以继续，只是 compaction 的 commit 需要和其他 writer 竞争；Hudi clustering / compaction 可以 inline（每次写入时触发）或 async（独立 Flink/Spark 任务），MOR 表建议至少用 async compaction，否则 delta log 越积越多读延迟暴涨。Hudi COW 表的小文件问题来自 upsert 命中分散时整文件重写，靠 `hoodie.parquet.small.file.limit` 控制合并阈值。\n\n**expire / vacuum / cleaner：释放存储。** compaction 合并后新快照引用合并后的大文件，但旧快照仍引用原始小文件。只有当旧快照被 expire 且小文件不再被任何有效快照引用时，文件才会被真正删除。Iceberg `expire_snapshots` 的 `retain_last` 是兜底，`older_than` 是主控制；Delta `VACUUM` 的 `RETAIN` 不能低于 `delta.logRetentionDuration`（默认 7 天），否则破坏 Time Travel；Hudi Cleaner 按 `hoodie.cleaner.commits.retained` 控制。生产经验：保留期至少覆盖业务回滚窗口（7–30 天），且 expire/vacuum 和写任务分开编排，避免写失败时文件被提前清理。"
     },
     {
       "type": "diagram",
@@ -117,49 +157,21 @@
       ]
     },
     {
-      "type": "code",
-      "title": "Spark 上对三家做相同操作的写法",
-      "language": "sql",
-      "content": "-- Iceberg：分区演进无需重写数据\nALTER TABLE catalog.db.events ADD PARTITION FIELD days(event_time);\n-- 读历史快照\nSELECT * FROM catalog.db.events VERSION AS OF 8473928479283;\n-- 合并小文件 + 过期快照\nCALL catalog.system.rewrite_data_files(table => 'db.events', options => map('target-file-size-bytes','536870912'));\nCALL catalog.system.expire_snapshots(table => 'db.events', older_than => TIMESTAMP '2026-06-01 00:00:00', retain_last => 5);\n\n-- Hudi：MOR 表 upsert（CDC 入湖典型用法）\n-- 关键参数：hoodie.datasource.write.table.type=MERGE_ON_READ\n-- precombine.field=ts, recordkey.field=id, partitionpath.field=dt\nMERGE INTO hudi_orders t USING cdc_stream s ON t.id = s.id\nWHEN MATCHED AND s._op = 'D' THEN DELETE\nWHEN MATCHED THEN UPDATE SET *\nWHEN NOT MATCHED THEN INSERT *;\n\n-- Delta：MERGE + 时间旅行 + OPTIMIZE\nMERGE INTO delta.`/lake/orders` t USING updates s ON t.id = s.id\nWHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *;\nSELECT * FROM delta.`/lake/orders` VERSION AS OF 42;\nOPTIMIZE delta.`/lake/orders` ZORDER BY (user_id);\nVACUUM delta.`/lake/orders` RETAIN 168 HOURS;",
-      "highlights": [
-        {
-          "line": 2,
-          "note": "Iceberg 的 ADD PARTITION FIELD 只改 partition spec，不重写历史数据；老快照仍按旧 spec 解读，新快照按新 spec 写。"
-        },
-        {
-          "line": 6,
-          "note": "rewrite_data_files 把同分区下小文件合并到 target-file-size-bytes（默认 512MB），Iceberg 允许在不停写的情况下做 compaction。"
-        },
-        {
-          "line": 7,
-          "note": "expire_snapshots 之后，被它独占引用的旧数据文件才会真正被清理；retain_last 是兜底，避免误删最近版本。"
-        },
-        {
-          "line": 12,
-          "note": "Hudi MOR 写入只追加 .log.* delta 文件，读时和 base parquet 合并；适合高频 upsert，但要靠 compaction 把 delta 合回 parquet 来稳住读延迟。"
-        },
-        {
-          "line": 21,
-          "note": "Delta 的 OPTIMIZE + ZORDER 把多列高基数过滤的小文件做 multi-dim clustering，VACUUM 的 RETAIN 不能小于 delta 默认 7 天限制，否则会破坏 Time Travel。"
-        }
-      ]
-    },
-    {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "30 秒结论：Iceberg/Hudi/Delta 是建在对象存储之上的表格式，靠一份独立的元数据层（manifest / timeline / _delta_log）把无序的数据文件组织成有 ACID、Schema 演进、Time Travel、隐藏分区能力的表，解决 Hive 在 S3 上没有原子提交、改分区要重写、回滚靠拷贝的硬伤。\n\n机制要点：\n- 机制主线我会按写入-提交-演进-治理串：写入端先把 Parquet 落到对象存储，再以一次原子提交（Iceberg 是 catalog CAS 替换 metadata.json 指针，Delta 是 _delta_log 的 put-if-absent，Hudi 是 timeline 的 inflight->commit）让新 snapshot 对读者可见；Schema 演进靠稳定的 field-id 或 column mapping 改元数据不动数据；Time Travel 就是按 snapshot/version/instant 读老版本；运维端要管 compaction（Iceberg rewrite_data_files、Delta OPTIMIZE、Hudi clustering）和过期清理（expire snapshot / VACUUM / Cleaner），保留期要覆盖业务回滚窗口。\n- 选型上我会按场景分：开放生态、读多写少、分区策略经常变就 Iceberg；CDC、record 级 upsert、近实时入湖就 Hudi 的 MOR；已经在 Databricks/Spark 主栈选 Delta。常见坑包括：没配 catalog CAS 直接在 S3 上跑 Iceberg 导致并发提交丢数；把 Hudi MOR 的 compaction 关掉读越来越慢；Delta VACUUM 保留期设太短破坏 Time Travel；以及 expireSnapshots 和回滚窗口对不齐导致需要回滚时数据文件已被清理。",
+      "content": "30 秒结论：Iceberg/Hudi/Delta 是建在对象存储之上的表格式，靠一份独立的元数据层（manifest / timeline / _delta_log）把无序的数据文件组织成有 ACID、Schema 演进、Time Travel、隐藏分区能力的表，解决 Hive 在 S3 上没有原子提交、改分区要重写、回滚靠拷贝的硬伤。\n\n**机制主线（写入→提交→演进→治理）**\n- 写入端先把 Parquet 落到对象存储，再以一次原子提交让新 snapshot 对读者可见\n- Iceberg 是 catalog CAS 替换 metadata.json 指针；Delta 是 _delta_log 的 put-if-absent；Hudi 是 timeline 的 inflight→commit + 锁服务\n- Schema 演进靠稳定的 field-id（Iceberg）或 column mapping（Delta）改元数据不动数据\n- Time Travel 就是按 snapshot / version / instant 读老版本，回滚把 pointer 指回老版本\n- 运维端管 compaction（rewrite_data_files / OPTIMIZE / clustering）和过期清理（expire snapshot / VACUUM / Cleaner），保留期要覆盖业务回滚窗口\n\n**选型口诀**\n- 开放生态、读多写少、分区策略常变 → Iceberg\n- CDC、record 级 upsert、近实时入湖 → Hudi MOR\n- 已在 Databricks/Spark 主栈 → Delta\n\n**高频坑**\n- Iceberg 在 S3 上用 HadoopCatalog 不做 CAS → 并发写 lost update\n- Hudi MOR 把 compaction 关掉 → delta log 积累、读越来越慢\n- Delta VACUUM 保留期设太短 → Time Travel 窗口被破坏、回滚时文件没了\n- expireSnapshots 和回滚窗口没对齐 → 需要回滚时数据文件已被清理",
       "followUpQuestions": [
         {
-          "question": "Iceberg 在 S3 上怎么实现原子提交？为什么直接用 S3 PutObject 不行？",
-          "answer": "Iceberg 的提交就是 catalog 里 metadata pointer 从 v123 替换成 v124，需要 catalog 提供 CAS。HDFS 靠 rename 原子性；S3 PutObject 没有 if-match，HadoopCatalog 在 S3 上不安全，并发写会 lost update。生产用 Glue catalog（UpdateTable 乐观并发）、JDBC catalog（唯一索引）、Nessie/REST catalog 做 CAS；Iceberg 1.x S3FileIO + DynamoDB lock 也是常见方案。验证是看冲突时第二个 writer 是 retry 还是直接覆盖。"
+          "question": "Iceberg 在 S3 上怎么实现原子提交？为什么直接用 HadoopCatalog + PutObject 不行？",
+          "answer": "Iceberg 的提交是把 catalog 中 metadata pointer 从 v123 替换成 v124，需要 catalog 提供 CAS。HDFS 靠 rename 原子性；S3 PutObject 是幂等覆盖，没有 if-match 语义，并发写直接 lost update。HadoopCatalog 在 S3 上不安全。生产方案：Glue catalog（UpdateTable 带 ETag 做乐观并发）、JDBC catalog（唯一索引约束）、Nessie/REST catalog 提供 CAS、或 S3FileIO + DynamoDB lock。验证方式是并发提交时看第二个 writer 是 retry 还是直接覆盖。"
         },
         {
-          "question": "Hudi 的 COW 和 MOR 怎么选？分别在什么场景下读写性能会出问题？",
-          "answer": "COW 每次 upsert 把命中的 base parquet 整文件重写，读快写贵；适合写少读多的批量 upsert（如 T+1 维度表）。MOR upsert 只追加 .log.* delta，读时和 base 合并，写快读稍慢；适合 CDC 高频写。MOR 必须配 inline 或 async compaction 把 delta 合回 base，否则 log 越积越多读延迟暴涨；COW 的坑是更新分布太散会重写大量 parquet，写放大严重。判断看 upsert TPS、单批命中文件数、读延迟 SLA 三个指标。"
+          "question": "Hudi 的 COW 和 MOR 怎么选？分别在什么场景下会出问题？",
+          "answer": "COW 每次 upsert 把命中的 base parquet 整文件重写，读快写贵。适合写少读多的批量 upsert（如 T+1 维度表同步）。坑：更新分布太散时写放大严重，单次 upsert 可能重写大量 parquet 文件。MOR upsert 只追加 .log.* delta 文件，读时和 base 合并，写快读稍慢。适合 CDC 高频写入。坑：必须配 inline 或 async compaction 把 delta 合回 base，否则 log 越积越多读延迟暴涨。选型看三个指标：upsert TPS、单批命中文件数、读延迟 SLA。"
         },
         {
           "question": "湖仓表小文件多了怎么治理？compaction 和 expire snapshot 要怎么编排？",
-          "answer": "小文件常见于流式写入 commit 间隔小、分区太细。治理三步：写入侧调大 commit 间隔、设 target-file-size-bytes（Iceberg 512MB / Delta delta.targetFileSize）；定期跑 compaction（Iceberg rewrite_data_files、Delta OPTIMIZE、Hudi clustering）；compaction 后 expire/vacuum 才能真正释放成本——但保留期必须长于回滚窗口（7-30 天），且等下游所有读任务看不到老 snapshot 才删。常见坑：把 expire 和写任务串在一起跑，写失败导致数据被清；保留期太短需要回滚时文件没了。"
+          "answer": "小文件常见于流式写入 commit 间隔小、分区太细、MOR delta log 积累。治理三步：①写入侧调大 commit 间隔和 target file size；②定期跑 compaction（Iceberg rewrite_data_files / Delta OPTIMIZE / Hudi clustering）把小文件合并；③compaction 完成后 expire / vacuum 才能释放旧文件。关键：保留期必须长于回滚窗口（7–30 天），且等下游读任务不再引用老 snapshot 才删。常见坑：把 expire 和写任务串在一起跑，写失败导致文件被提前清理；保留期设太短，需要回滚时文件已被清理。"
         }
       ]
     },
@@ -167,12 +179,12 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能从 Hive 在 S3 上的四个硬伤（无原子提交/分区即目录/无版本/list 贵）讲清为什么需要表格式",
-        "能画出 Iceberg 三层元数据（metadata.json + manifest list + manifest）和 catalog CAS 提交路径",
+        "能从 Hive 在 S3 上的四个硬伤（无原子提交 / 分区即目录 / 无版本 / list 贵）讲清为什么需要表格式",
+        "能画出 Iceberg 三层元数据（metadata.json → manifest list → manifest）和 catalog CAS 提交路径",
         "能解释三家 ACID 提交差异：Iceberg catalog CAS、Delta _delta_log put-if-absent、Hudi timeline + 锁服务",
         "能区分 Hudi COW 与 MOR 的读写代价，并能说出选型条件和必须配 compaction 的原因",
         "能说明 Schema 演进为什么要 field-id（Iceberg）或 column mapping（Delta），以及类型提升的允许范围",
-        "能设计 compaction（rewrite_data_files / OPTIMIZE / clustering）+ expire/vacuum 的运维节奏",
+        "能设计 compaction（rewrite_data_files / OPTIMIZE / clustering）+ expire / vacuum 的运维节奏和保留期策略",
         "面对面试官能直接给出三家选型口诀：开放生态选 Iceberg、CDC upsert 选 Hudi、Databricks 主栈选 Delta"
       ]
     }
@@ -180,7 +192,7 @@
   "recallPrompts": [
     {
       "id": "data-engineering.platform.lakehouse-table-format.recall.1",
-      "prompt": "对比 Iceberg、Hudi、Delta 三家的元数据机制和 ACID 提交方式，并说一个你会选 Iceberg、一个会选 Hudi 的场景。",
+      "prompt": "对比 Iceberg、Hudi、Delta 三家的元数据机制和 ACID 提交方式，并各说一个典型适用场景。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
@@ -194,7 +206,7 @@
     },
     {
       "id": "data-engineering.platform.lakehouse-table-format.recall.3",
-      "prompt": "Hudi MOR 表上线后查询越来越慢，怎么定位是 compaction 没跑还是其他问题？",
+      "prompt": "Hudi MOR 表上线后查询越来越慢，怎么定位是 compaction 没跑还是其他问题？给出排查思路和解法。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -205,14 +217,21 @@
       "mode": "text",
       "expectedMinutes": 2,
       "difficulty": 3
+    },
+    {
+      "id": "data-engineering.platform.lakehouse-table-format.recall.5",
+      "prompt": "湖仓表小文件治理：compaction 和 expire snapshot 应该怎么编排？保留期和回滚窗口怎么对齐？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
       "讲清表格式相对 Hive 的核心增量：原子提交、Schema 演进、Time Travel、隐藏分区",
-      "能描述 Iceberg metadata.json + manifest list + manifest 三层元数据与 catalog CAS 提交流程",
-      "区分 Hudi COW 与 MOR 的读写代价以及必须配套 compaction",
-      "知道 Delta 用 _delta_log + put-if-absent，并理解 OPTIMIZE/VACUUM 与 Time Travel 的耦合",
+      "能描述 Iceberg metadata.json → manifest list → manifest 三层元数据与 catalog CAS 提交流程",
+      "区分 Hudi COW 与 MOR 的读写代价以及必须配套 compaction 的原因",
+      "知道 Delta 用 _delta_log + put-if-absent，并理解 OPTIMIZE / VACUUM 与 Time Travel 的耦合",
       "给出三家在生态、upsert、分区演进上的选型口诀"
     ],
     "goodToHave": [
@@ -221,9 +240,9 @@
       "能说明 Iceberg snapshot expire 之后，仍被有效 snapshot 引用的数据文件不会被清理"
     ],
     "commonMistakes": [
-      "把表格式等同于 Parquet/ORC 文件格式",
-      "只讲 ACID，不讲元数据快照和并发提交机制",
-      "忽略小文件和 compaction 导致查询性能劣化",
+      "把表格式等同于 Parquet/ORC 文件格式——文件格式是存储层，表格式是元数据层",
+      "只讲 ACID，不讲元数据快照和并发提交机制（catalog CAS / put-if-absent / 锁）",
+      "忽略小文件和 compaction 导致查询性能劣化，尤其是 Hudi MOR 不配 compaction",
       "Delta VACUUM 保留期设太短破坏 Time Travel 回滚能力",
       "Iceberg 在 S3 上用 HadoopCatalog 不做 CAS 导致并发写覆盖"
     ],
@@ -234,5 +253,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

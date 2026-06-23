@@ -4,7 +4,7 @@
   "category": "observability-sre",
   "group": "observability-sre",
   "title": "告警设计与降噪",
-  "summary": "围绕 SLO 设计症状告警，用 Alertmanager 路由分组抑制做降噪，并通过 P0-P3 分级和 On-Call 排班把告警接到可执行的处置动作上。",
+  "summary": "围绕 SLO 设计症状告警，用 burn rate 多窗口取代固定阈值减少误报，通过 Alertmanager 的 route 树、group_by、inhibit_rules 和 silence 做降噪聚合，再用 P0-P3 分级和 On-Call 排班把告警接到可执行的处置动作上；核心判据是可行动、可归属、可验证。",
   "tags": [
     "DevOps",
     "告警",
@@ -13,23 +13,38 @@
     "SRE"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 31,
   "order": 90,
   "recommendWeight": 82,
   "status": "production",
   "prerequisites": [],
   "interviewFrequency": "medium",
-  "interviewerFocus": "面试官想看你能不能把告警从 SLO 倒推到 Prometheus 规则、Alertmanager 路由和 On-Call 排班，并用一条「这条告警接到后我能做什么」的判据做降噪。",
+  "interviewerFocus": "面试官想看你能不能把告警从 SLO 倒推到 burn rate 规则、Alertmanager 路由降噪和 On-Call 排班，并用「这条告警接到后我能做什么」的判据做噪声淘汰。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "告警的判据：可行动、可归属、可验证",
-      "content": "告警不是把所有指标做成阈值，而是在 SLO 受影响时把责任人叫起来。判断一条告警是否该存在，就看三件事：On-Call 拿到这条告警有没有可执行的动作；如果有动作，这个动作归属哪个团队是不是清楚；处置完之后能不能用一个观测指标确认问题已解决。三者任何一个回答不出来，这条告警都属于噪声，应该删掉或合并，而不是把阈值调高。\n\n以电商下单链路为例：「下单 5xx 错误率 5 分钟内 > 1%」是症状告警，On-Call 看到要立刻判断是否回滚最近发布、是否限流。「MySQL 主库 CPU > 90% 持续 10 分钟」是原因告警，要看是否慢查询打满、是否扩容只读库。两类都可以发，但必须先发症状告警拉群止血，再用原因告警辅助根因分析。反过来如果只发 CPU 告警、不发错误率告警，On-Call 容易在用户已经下不了单的时候还在看监控面板。\n\n常见踩坑：把 Pod CPU > 80%、JVM Old GC 次数、磁盘 inode 这类「可能没用户影响」的指标全部 P1 推 On-Call，结果 80% 是误报，真正的下单错误率告警淹没在 IM 群里。这就是 alert fatigue 的典型来源。"
+      "title": "告警判据：可行动、可归属、可验证",
+      "content": "告警不是把所有指标做成阈值，而是在 SLO 受影响时把责任人叫起来。判断一条告警是否该存在，就看三件事：On-Call 拿到这条告警有没有可执行的动作；如果有动作，这个动作归属哪个团队是不是清楚；处置完之后能不能用一个观测指标确认问题已解决。三者任何一个回答不出来，这条告警都属于噪声，应该删掉或合并，而不是把阈值调高。\n\n以电商下单链路为例：「下单 5xx 错误率 5 分钟内 > 1%」是症状告警，On-Call 看到要立刻判断是否回滚最近发布、是否限流。「MySQL 主库 CPU > 90% 持续 10 分钟」是原因告警，要看是否慢查询打满、是否扩容只读库。两类都可以发，但必须先发症状告警拉群止血，再用原因告警辅助根因分析。反过来如果只发 CPU 告警、不发错误率告警，On-Call 容易在用户已经下不了单的时候还在看监控面板。\n\n常见踩坑：把 Pod CPU > 80%、JVM Old GC 次数、磁盘 inode 这类「可能没用户影响」的指标全部 P1 推 On-Call，结果 80% 是误报，真正的下单错误率告警淹没在 IM 群里。这就是 alert fatigue 的典型来源——On-Call 被噪声训练成「告警来了先不看，等自己恢复」，真出事时反而漏掉。"
     },
     {
       "type": "explain",
-      "title": "P0-P3 分级与 Alertmanager 路由怎么对应",
-      "content": "分级不是文档里写写而已，要落到 Alertmanager 的 route 树上才有效。常见做法是在 Prometheus 规则里给 alert 打 severity 标签（critical/warning/info），同时打 team、service 标签，Alertmanager 按这三个标签做 route 匹配。\n\n- P0（critical + 用户大面积受损）：电话 + 短信 + IM @所有人，5 分钟内必须有人 ack，没人 ack 就 escalation 到二线。对应 Alertmanager 的 group_wait: 0s、repeat_interval: 5m，receiver 走 PagerDuty/电话网关。\n- P1（critical + 局部受损或趋势恶化）：IM @On-Call + 短信，15 分钟 ack。group_wait: 30s 让同批告警合并发送，repeat_interval: 30m。\n- P2（warning + 容量/趋势类）：只进 IM 工单频道和工单系统，不打扰人。repeat_interval: 4h，下班时间静默。\n- P3（info + 仅做记录）：只写日志或工单，不发通知，主要给事后分析用。\n\n抑制（inhibit_rules）的关键场景：当 P0 的「整集群 API 不可用」触发时，要把同集群下所有 P1/P2 的下游告警抑制掉，否则 IM 会被刷屏。分组（group_by）的关键是按 alertname + cluster + service 分组，让一次发布引起的几十个 Pod 重启合并成一条通知。静默（silence）只在变更窗口用，必须有过期时间，禁止永久 silence。"
+      "title": "症状告警守 SLO，原因告警做辅助根因",
+      "content": "症状告警和原因告警的职责完全不同，混在一起就会出事。症状告警从 SLO/SLI 出发（错误率、P99 延迟、可用性），回答的是「用户现在是不是受损了」；原因告警从资源层出发（CPU、内存、磁盘、队列堆积、GC），回答的是「哪里可能要崩」。\n\n设计原则是：症状告警必须存在，它是 SLO 的守门员，默认 P0/P1 直接拉 On-Call；原因告警默认 P2/P3，进工单或趋势看板，不单独叫醒人。原因是：\n\n1. 症状告警的误报代价远低于漏报——一次误报让 On-Call 多看一眼，一次漏报就是用户大面积受损。原因告警反过来，CPU 90% 但用户没感知时叫人起来没有意义。\n\n2. 症状告警的处置动作明确（回滚、限流、切流、降级），原因告警的处置往往需要先定位根因（是慢查询还是打满了连接池），不适合直接 page。\n\n3. 两者配合方式：症状告警触发后 On-Call 打开 Grafana 看 SLI 面板，同时看原因告警和最近变更记录找根因。原因告警的价值是缩短 MTTR，但它不能替代症状告警作为第一触发信号。"
+    },
+    {
+      "type": "explain",
+      "title": "Burn rate：多窗口燃烧率比固定阈值更聪明",
+      "content": "固定阈值（错误率 > 1% 持续 5 分钟）有两个问题：突发事故反应太慢（要等 5 分钟），轻微波动又太敏感（阈值设得紧就误报多）。Google SRE 实践提出 burn rate 来解决这个问题：用实际消耗错误预算的速度来触发告警，而不是用绝对值。\n\nBurn rate = 实际错误率 / 允许错误率。比如 SLO 是 99%，允许错误率是 1%；如果实际错误率是 5%，burn rate = 5。burn rate 越高，错误预算消耗越快，需要越快响应。\n\n关键设计是多窗口：短窗口检测突发，长窗口确认不是瞬时抖动。常见搭配：\n\n- 1h 窗口 burn rate > 14.4：1 小时内预算全部耗尽，P0，5 分钟内响应\n- 6h 窗口 burn rate > 6：6 小时内预算耗尽，P1，30 分钟内响应\n- 3d 窗口 burn rate > 1：错误预算按天消耗，P2，工作时间处理\n\nPrometheus 实现示例（1h burn rate > 14.4）：`sum(rate(http_requests_total{code=~\"5..\"}[1h])) / sum(rate(http_requests_total[1h])) > 14.4 * (1 - 0.99)`。这里 `14.4 * 0.01 = 0.144`，意味着 1 小时内错误率持续在 14.4% 才触发——对 99% SLO 来说这是极端情况。短窗口 `for: 2m` 配合长窗口 `[1h]`，既快又准。"
+    },
+    {
+      "type": "explain",
+      "title": "Alertmanager 四大降噪机制",
+      "content": "Alertmanager 不是简单地把告警转发到 IM，它有四个机制协同解决噪声问题：\n\n**路由（route 树）**：severity 标签驱动 route 匹配，critical 走 PagerDuty 电话+短信，warning 走 IM 工单频道，info 只写日志。路由的关键是 matchers 表达式要精确，避免告警掉到默认 receiver 被静默吞掉。\n\n**分组（group_by）**：按 alertname + cluster + service 分组，group_wait 30s 让同批告警合并成一条通知。典型场景：一次发布导致 30 个 Pod 重启，group_by 让 On-Call 只收到 1 条「PodRestart x30」而不是 30 条单独告警。group_wait 设 0s 只用于 P0 critical，其他级别用 30s-1m 让合并生效。\n\n**抑制（inhibit_rules）**：上游 critical 触发时自动抑制下游 warning。典型场景：API 网关挂了，下游所有服务的 5xx 告警会涌出来，但 On-Call 已经在处理网关了，这些下游告警是噪声。inhibit_rules 用 source_matchers（上游）、target_matchers（下游）、equal（相同集群/服务）三段配置。注意：写错抑制规则会把真告警吃掉，必须在测试环境验证。\n\n**静默（silence）**：变更窗口临时屏蔽告警，必须设 expire_at。典型场景：回滚过程中 Pod 重启会触发告警，加 30 分钟 silence 给 deploy=checkout 标签。silence 绝不能永久化——如果一条告警需要永久 silence，说明它本身就是噪声，应该删掉规则而不是 silence。"
+    },
+    {
+      "type": "explain",
+      "title": "P0-P3 分级落到 route 和 SLA",
+      "content": "分级不是文档里写写而已，要落到 Alertmanager 的 route 树上才有效。做法是在 Prometheus 规则里给 alert 打 severity 标签（critical/warning/info），同时打 team、service 标签，Alertmanager 按标签做 route 匹配。\n\n- **P0（用户大面积受损）**：下单全站不可用、核心 SLI 大幅跌破。通知渠道：电话 + 短信 + IM @所有人。响应 SLA：5 分钟内 ack，无人 ack 则 escalation 到二线。Alertmanager 配置：group_wait: 0s、repeat_interval: 5m、receiver: PagerDuty。\n- **P1（局部受损或 burn rate 高）**：单个服务错误率飙升、SLO 快速烧。通知渠道：IM @On-Call + 短信。响应 SLA：15 分钟 ack。Alertmanager 配置：group_wait: 30s、repeat_interval: 30m。\n- **P2（容量/趋势预警）**：磁盘 70%、连接池接近上限、GC 频率上升。通知渠道：只进 IM 工单频道和工单系统。响应 SLA：工作时间 4 小时内看。Alertmanager 配置：repeat_interval: 4h，下班时间静默。\n- **P3（信息记录）**：异常重试计数、慢查询趋势。不发通知，只写日志或入工单系统供事后分析。\n\n每升一级都要有明确触发条件和 SLA，不允许凭感觉打 severity 标签。常见反模式：团队文档里写了 P0-P3，但 Prometheus 规则全是 severity=critical，Alertmanager 只有一条 route，分级形同虚设。"
     },
     {
       "type": "diagram",
@@ -51,89 +66,81 @@
     },
     {
       "type": "compareTable",
-      "title": "症状告警 vs 原因告警怎么搭配",
-      "columns": [
-        "维度",
-        "症状告警",
-        "原因告警"
-      ],
-      "rows": [
-        [
-          "信号来源",
-          "SLO/SLI：错误率、P99 延迟、可用性",
-          "资源层：CPU、内存、磁盘、队列堆积、GC"
-        ],
-        [
-          "回答的问题",
-          "用户现在是不是受损了",
-          "可能哪里要崩或正在崩"
-        ],
-        [
-          "默认分级",
-          "通常 P0/P1，直接拉 On-Call",
-          "通常 P2/P3，进工单或趋势看板"
-        ],
-        [
-          "处置动作",
-          "回滚、限流、切流、降级",
-          "扩容、清理、重启、调参"
-        ],
-        [
-          "误报代价",
-          "误报会让 On-Call 疲劳，但漏报代价更大",
-          "漏报通常没事，误报多了反而成噪声"
-        ],
-        [
-          "推荐组合",
-          "必须有，作为 SLO 守门员",
-          "作为辅助根因，不单独叫醒人"
-        ]
+      "title": "症状告警 vs 原因告警：职责、分级和处置差异",
+      "content": "| 维度 | 症状告警 | 原因告警 |\n| --- | --- | --- |\n| 信号来源 | SLO/SLI：错误率、P99 延迟、可用性 | 资源层：CPU、内存、磁盘、队列堆积、GC |\n| 回答的问题 | 用户现在是不是受损了 | 哪里可能要崩或正在崩 |\n| 默认分级 | P0/P1，直接拉 On-Call | P2/P3，进工单或趋势看板 |\n| 处置动作 | 回滚、限流、切流、降级 | 扩容、清理、重启、调参 |\n| 误报代价 | 误报让 On-Call 疲劳，但漏报代价更大 | 漏报通常没事，误报多了反而成噪声 |\n| 推荐组合 | 必须有，作为 SLO 守门员 | 作为辅助根因，不单独叫醒人 |"
+    },
+    {
+      "type": "code",
+      "title": "Prometheus 告警规则与 Alertmanager 路由配置",
+      "language": "yaml",
+      "content": "# prometheus rules: 下单接口 SLO 症状告警 (burn rate)\ngroups:\n- name: checkout-slo\n  rules:\n  # P0: 1h burn rate > 14.4 → 1小时内预算全部耗尽\n  - alert: CheckoutBurnRateCritical\n    expr: |\n      sum(rate(http_requests_total{job=\"checkout\",code=~\"5..\"}[1h]))\n        /\n      sum(rate(http_requests_total{job=\"checkout\"}[1h]))\n      > 14.4 * (1 - 0.99)\n    for: 2m\n    labels:\n      severity: critical\n      team: checkout\n      slo: checkout-availability\n    annotations:\n      summary: \"下单 5xx 1h burn rate > 14.4，预算即将耗尽\"\n      runbook: \"https://wiki/runbooks/checkout-burn-rate\"\n\n  # P1: 6h burn rate > 6 → 6小时内预算耗尽\n  - alert: CheckoutBurnRateWarning\n    expr: |\n      sum(rate(http_requests_total{job=\"checkout\",code=~\"5..\"}[6h]))\n        /\n      sum(rate(http_requests_total{job=\"checkout\"}[6h]))\n      > 6 * (1 - 0.99)\n    for: 5m\n    labels:\n      severity: warning\n      team: checkout\n      slo: checkout-availability\n    annotations:\n      summary: \"下单 5xx 6h burn rate > 6，错误预算快速消耗\"\n      runbook: \"https://wiki/runbooks/checkout-burn-rate\"\n\n# alertmanager.yml: 路由 + 抑制 + 分组\nroute:\n  group_by: [alertname, cluster, service]\n  group_wait: 30s\n  group_interval: 5m\n  repeat_interval: 30m\n  receiver: default-im\n  routes:\n    - matchers: [severity=\"critical\"]\n      group_wait: 0s\n      repeat_interval: 5m\n      receiver: pagerduty-oncall\n    - matchers: [severity=\"warning\"]\n      receiver: ticket-only\n\ninhibit_rules:\n  # 整集群 API 不可用时，抑制同集群下游 warning\n  - source_matchers: [alertname=\"ApiGatewayDown\", severity=\"critical\"]\n    target_matchers: [severity=\"warning\"]\n    equal: [cluster]\n",
+      "highlights": [
+        {
+          "line": 5,
+          "note": "1h 窗口检测突发：burn rate > 14.4 意味着 1 小时内全部错误预算耗尽，对应 P0。"
+        },
+        {
+          "line": 17,
+          "note": "6h 窗口确认不是瞬时抖动：burn rate > 6 意味着 6 小时内预算耗尽，对应 P1。"
+        },
+        {
+          "line": 8,
+          "note": "`14.4 * (1 - 0.99) = 0.144`，即 1 小时内错误率持续在 14.4% 才触发，过滤掉小波动。"
+        },
+        {
+          "line": 10,
+          "note": "for: 2m 短窗口配合长窗口 [1h]，既快（2 分钟确认）又准（1 小时数据量）。"
+        },
+        {
+          "line": 37,
+          "note": "group_by 按 alertname+cluster+service 分组，一次发布 30 个 Pod 重启合并成 1 条通知。"
+        },
+        {
+          "line": 49,
+          "note": "inhibit_rules 上游 critical 抑制下游 warning，避免网关挂了刷屏几十条下游告警。"
+        }
       ]
     },
     {
       "type": "code",
-      "title": "Prometheus 告警规则与 Alertmanager 路由示例",
-      "language": "yaml",
-      "content": "# prometheus rules: 下单接口 SLO 症状告警\ngroups:\n- name: checkout-slo\n  rules:\n  - alert: CheckoutErrorRateHigh\n    expr: |\n      sum(rate(http_requests_total{job=\"checkout\",code=~\"5..\"}[5m]))\n        /\n      sum(rate(http_requests_total{job=\"checkout\"}[5m])) > 0.01\n    for: 2m\n    labels:\n      severity: critical\n      team: checkout\n      slo: checkout-availability\n    annotations:\n      summary: \"下单 5xx 错误率 > 1% 持续 2m\"\n      runbook: \"https://wiki/runbooks/checkout-5xx\"\n\n# alertmanager.yml: 路由 + 抑制 + 分组\nroute:\n  group_by: [alertname, cluster, service]\n  group_wait: 30s\n  group_interval: 5m\n  repeat_interval: 30m\n  receiver: default-im\n  routes:\n    - matchers: [severity=\"critical\"]\n      group_wait: 0s\n      repeat_interval: 5m\n      receiver: pagerduty-oncall\n    - matchers: [severity=\"warning\"]\n      receiver: ticket-only\n\ninhibit_rules:\n  # 整集群 API 不可用时，抑制同集群下游 warning\n  - source_matchers: [alertname=\"ApiGatewayDown\", severity=\"critical\"]\n    target_matchers: [severity=\"warning\"]\n    equal: [cluster]\n",
+      "title": "告警噪声审计：用 PromQL 找出该淘汰的规则",
+      "language": "promql",
+      "content": "# 1. 最近 7 天每条告警规则的触发次数\nALERTS{alertstate=\"firing\", severity=\"critical\"}\n  * on(alertname) group_left()\n  count_over_time(ALERTS{alertstate=\"firing\"}[7d])\n\n# 2. 误报率估算：触发次数 / 实际需要人介入的次数\n# （需要外部系统记录 ack 和处置动作，PromQL 只能算触发次数）\n\n# 3. 通知疲劳指标：连续 7 天每天触发 > 3 次的规则\ncount_over_time(ALERTS{alertstate=\"firing\"}[7d]) > 21\n\n# 4. 静默中但未过期的 silence（违反 TTL 原则）\n# 通过 Alertmanager API: GET /api/v2/silences?active=true\n# 筛选没有 expire_at 或 expire_at > 7天 的 silence",
       "highlights": [
         {
-          "line": 5,
-          "note": "expr 用 rate 5m 错误数除以总数，避免低流量时分母为 0。阈值 1% 对应 SLO 99% 可用性的预警。"
+          "line": 1,
+          "note": "用 ALERTS 元指标统计每条规则 7 天内的触发次数，频率过高说明是噪声。"
         },
         {
-          "line": 8,
-          "note": "for: 2m 是关键，让瞬时抖动不会立刻 page，但又不会拖到用户大量受损才发出来。"
+          "line": 9,
+          "note": "连续 7 天每天 > 3 次触发的规则必须审查：要么调整阈值/窗口，要么降级到 P3，要么直接删。"
         },
         {
-          "line": 11,
-          "note": "annotations.runbook 是降噪的另一面：On-Call 收到告警必须点进去就能看到处置步骤，否则等于没分级。"
-        },
-        {
-          "line": 19,
-          "note": "group_by 决定一次发布几十个 Pod 出问题时合并成一条还是刷屏几十条。包含 cluster/service 才能跨集群聚合。"
-        },
-        {
-          "line": 31,
-          "note": "inhibit_rules 用 source/target/equal 三段配置，最常用的就是「上游挂了抑制下游」，避免一次故障产生几十条干扰告警。"
+          "line": 12,
+          "note": "silence 审计必须查 Alertmanager API，PromQL 无法覆盖，要纳入周复盘流程。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**30 秒结论**\n\n告警设计的核心是把 SLO 翻译成可行动的告警，再用 Alertmanager 的路由、分组、抑制和 On-Call 排班把它接到对的人对的动作上。判断一条告警该不该存在，我会问三个问题——能不能行动、归属是否清楚、能不能验证修复。\n\n**机制主线**\n\n1. **规则设计**：用症状告警守 SLO（错误率、P99、可用性），用原因告警做辅助根因，原因告警默认不 page 人。阈值用 burn rate 而不是固定值，比如 1h burn rate > 14.4 或 6h > 6 才报 P0，这样既快又少误报。\n2. **Alertmanager**：severity 标签驱动 route 树分到 P0-P3 不同 receiver，group_by 按 alertname+cluster+service 合并同批告警，inhibit_rules 让上游 critical 抑制下游 warning，silence 只用于变更窗口且必须有过期时间。\n3. **On-Call**：主备双人 + 移交流程 + runbook，每条 P0/P1 告警必须配 runbook 链接，事后用 MTTA、MTTR、误报率做周复盘，把误报 > 30% 的规则要么调整阈值要么删掉。\n\n**边界**\n\n- silence 滥用会变成永久屏蔽（要强制 TTL）。\n- 抑制规则写错会把真告警吃掉（要在测试环境验证）。\n- On-Call 没有备份会单点（要主备 + 自动 escalation）。",
+      "content": "**30 秒结论**\n\n告警设计的核心是把 SLO 翻译成可行动的告警，用 burn rate 多窗口取代固定阈值减少误报，再用 Alertmanager 的路由、分组、抑制和 silence 做降噪，最后通过 P0-P3 分级和 On-Call 排班接到对的人对的动作上。判断一条告警该不该存在，我会问三个问题——能不能行动、归属是否清楚、能不能验证修复。\n\n**机制主线**\n\n1. **规则设计**：用症状告警守 SLO（错误率、P99、可用性），用原因告警做辅助根因，原因告警默认不 page 人。阈值用 burn rate 而不是固定值：1h burn rate > 14.4 报 P0（1 小时内预算全部耗尽），6h burn rate > 6 报 P1，3d burn rate > 1 报 P2。短窗口检测突发，长窗口确认不是抖动。\n2. **Alertmanager 降噪**：severity 标签驱动 route 树分到 P0-P3 不同 receiver，group_by 按 alertname+cluster+service 合并同批告警，inhibit_rules 让上游 critical 抑制下游 warning，silence 只用于变更窗口且必须有过期时间。\n3. **On-Call 与复盘**：主备双人 + 移交流程 + runbook，每条 P0/P1 告警必须配 runbook 链接。事后用 MTTA、MTTR、误报率做周复盘，触发 > 21 次/周的规则要么调阈值要么降级，误报率 > 30% 的直接删。\n\n**边界**\n\n- burn rate 阈值要根据实际 SLO 和业务容忍度调整，不能照搬 Google 的 14.4/6/1。\n- silence 滥用会变成永久屏蔽（要强制 TTL，周复盘时审计所有 active silence）。\n- 抑制规则写错会把真告警吃掉（要在测试环境验证，上线前检查 source/target/equal 三段配置）。\n- On-Call 没有备份会单点（要主备 + 自动 escalation，无人 ack 时升级到二线）。",
       "followUpQuestions": [
         {
           "question": "怎么判断一条告警是噪声，要不要删？",
-          "answer": "看三件事：最近 30 天有多少次触发、其中多少次 On-Call 真的做了处置动作、动作是不是必须人来做。如果 30 天触发 50 次但只有 2 次需要人介入（比如剩下 48 次都是自愈或自动扩容了），就把它降级到 P3 只记录、或者改成自动化处置。再看「能否行动」：磁盘 80% 这类如果有自动清理就不用 page 人。误报率持续 > 30% 的规则我会直接删，宁可漏一次也不让 On-Call 疲劳到忽略真告警。"
+          "answer": "看三件事：最近 7 天有多少次触发、其中多少次 On-Call 真的做了处置动作、动作是不是必须人来做。如果 7 天触发 21 次但只有 2 次需要人介入（剩下都是自愈或自动扩容），就把它降级到 P3 只记录、或者改成自动化处置。再看「能否行动」：磁盘 80% 这类如果有自动清理就不用 page 人。误报率持续 > 30% 的规则我会直接删，宁可漏一次也不让 On-Call 疲劳到忽略真告警。"
         },
         {
-          "question": "Alertmanager 的 group_by、inhibit、silence 你怎么搭配，举个真实例子？",
-          "answer": "举一次发布事故：新版本 checkout 服务 OOM，30 个 Pod 在 2 分钟内陆续重启。group_by [alertname, cluster, service] 把 30 条 PodRestart 合并成 1 条。同时 CheckoutErrorRateHigh 这条 critical 触发，inhibit_rules 把同集群同 service 的 warning（比如 PodMemoryHigh）抑制掉，On-Call IM 只收到 2 条核心告警。回滚开始前在 Alertmanager 加 30 分钟 silence 给 deploy=checkout 标签，避免回滚过程中 Pod 重启再刷一波告警。silence 必须设 expire_at，到点自动失效，避免人忘记关。"
+          "question": "为什么用 burn rate 而不是固定阈值？",
+          "answer": "固定阈值（错误率 > 1% 持续 5 分钟）有两个问题：突发事故反应太慢（要等 5 分钟确认），轻微波动又太敏感（阈值紧就误报多）。burn rate 用实际消耗错误预算的速度触发告警：SLO 99% 时 1h burn rate > 14.4 意味着 1 小时内预算全部耗尽，这是极端情况所以误报少；但因为短窗口只有 2 分钟确认，所以响应很快。多窗口搭配（1h + 6h + 3d）既检测突发又过滤抖动。"
         },
         {
-          "question": "P0-P3 分级具体怎么落地，标准是什么？",
-          "answer": "我用「用户影响 + 时间敏感度」两轴划分。P0 = 大面积用户受损（比如下单全站不可用）+ 5 分钟内必须响应，电话 + PagerDuty escalation。P1 = 局部受损或 SLO 在快速烧（burn rate 高）+ 15 分钟响应，IM + 短信。P2 = 容量/趋势预警（磁盘 70%、连接池接近上限）+ 工作时间响应，只进工单频道。P3 = 信息记录（异常重试、慢查询计数）+ 不通知，仅入工单系统供事后分析。每升一级都要有明确触发条件和 SLA，不允许凭感觉打 severity 标签。"
+          "question": "Alertmanager 的 group_by、inhibit、silence 你怎么搭配，举个发布事故里的例子？",
+          "answer": "新版本 checkout 服务 OOM，30 个 Pod 在 2 分钟内陆续重启。group_by [alertname, cluster, service] 把 30 条 PodRestart 合并成 1 条通知。同时 CheckoutBurnRateCritical 这条 critical 触发，inhibit_rules 把同集群同 service 的 warning（PodMemoryHigh、ContainerOOMKilled）抑制掉，On-Call IM 只收到 2 条核心告警。回滚开始前加 30 分钟 silence 给 deploy=checkout 标签，避免回滚过程中 Pod 重启再刷一波。silence 设 expire_at，到点自动失效。"
+        },
+        {
+          "question": "burn rate 的 14.4/6/1 这三个数字怎么来的？",
+          "answer": "14.4 = 1/错误预算消耗比例 × 时间窗口倍数。SLO 99% 错误预算是 1%，如果 1 小时内预算全部耗尽，实际错误率 = 14.4 × 1% = 14.4%。同理 6h burn rate > 6 意味着 6 小时内预算耗尽，错误率 = 6 × 1% = 6%。3d burn rate > 1 意味着按天消耗，错误率刚好 = 1% = SLO 边界。这些数字不是固定的，要根据业务对错误预算的消耗容忍度和响应 SLA 来调。"
         }
       ]
     },
@@ -142,10 +149,11 @@
       "title": "学完后应能说清楚",
       "items": [
         "能用「可行动、可归属、可验证」三条判据决定一条告警是否该存在",
-        "能把 SLO 翻译成基于 burn rate 的 Prometheus 告警规则，并写出 expr/for/labels/annotations",
-        "能解释 Alertmanager 的 route/group_by/inhibit_rules/silence 各自解决什么问题",
-        "能把 P0-P3 分级映射到具体的通知渠道、响应 SLA 和 escalation 策略",
-        "能用 MTTA、MTTR、误报率、On-Call 工时做周复盘，知道什么样的规则该删"
+        "能解释症状告警和原因告警的职责差异及搭配方式",
+        "能把 SLO 翻译成基于 burn rate 的 Prometheus 告警规则，并解释为什么用 burn rate 而不是固定阈值",
+        "能解释 Alertmanager 的 group_by、inhibit_rules、silence 各自解决什么问题以及常见配置陷阱",
+        "能把 P0-P3 分级映射到 Alertmanager 的 severity 标签、route 树、通知渠道和响应 SLA",
+        "能用 MTTA、MTTR、误报率做周复盘，知道触发频率过高或误报率 > 30% 的规则该淘汰"
       ]
     }
   ],
@@ -170,25 +178,42 @@
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
+    },
+    {
+      "id": "devops.observability-sre.alerting.recall.4",
+      "prompt": "你们团队的告警规则误报率持续 > 30%，On-Call 工时每周超过 8 小时。你会怎么排查和改进？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "devops.observability-sre.alerting.recall.5",
+      "prompt": "P0-P3 分级具体怎么落地？怎么确保分级不是文档里写写、实际 Alertmanager 里没有生效？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
       "可行动 + 可归属 + 可验证 三条告警判据",
-      "症状告警守 SLO、原因告警做根因辅助 的搭配关系",
-      "Alertmanager route/group_by/inhibit_rules/silence 的职责区别",
-      "P0-P3 分级与通知渠道、响应 SLA 的对应方式"
+      "症状告警守 SLO、原因告警做根因辅助的搭配关系",
+      "burn rate 多窗口燃烧率替代固定阈值的原理和常见数值",
+      "Alertmanager route/group_by/inhibit_rules/silence 的职责区别和配置要点",
+      "P0-P3 分级与 severity 标签、route 树、通知渠道、响应 SLA 的对应方式"
     ],
     "goodToHave": [
-      "用 burn rate（多窗口多燃烧率）替代固定阈值的写法",
+      "PromQL 统计告警触发频率和误报率的方法",
       "runbook 与告警绑定、On-Call 主备 + escalation 流程",
-      "用 MTTA、MTTR、误报率做周复盘并淘汰噪声规则的经验"
+      "用 MTTA、MTTR、误报率做周复盘并淘汰噪声规则的经验",
+      "silence 审计：查 Alertmanager API 找出永久 silence 的方法"
     ],
     "commonMistakes": [
       "只调高阈值不删告警，导致 alert fatigue 把真告警淹没",
       "把 CPU、内存这类原因告警直接 P0 page 人，没有先发症状告警",
       "silence 不设 TTL 变成永久屏蔽，或者 inhibit_rules 写错把真告警吃掉",
-      "P0-P3 只在文档里写，没落到 Alertmanager 的 severity 标签和 route 树上"
+      "P0-P3 只在文档里写，没落到 Alertmanager 的 severity 标签和 route 树上",
+      "burn rate 只用单窗口，突发事故反应慢且轻微波动误报多"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -197,5 +222,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

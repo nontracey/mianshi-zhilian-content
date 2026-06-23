@@ -4,7 +4,7 @@
   "category": "aspnet",
   "group": "aspnet",
   "title": "ASP.NET 性能优化",
-  "summary": "讲清 ASP.NET Core 性能优化的缓存/压缩/异步/减少分配/AOT 等方向，以及先测量定位再优化和 AOT 反射受限的取舍。",
+  "summary": "讲清 ASP.NET Core 性能优化的多层手段——响应缓存/压缩/最小 API/Native AOT/减少分配/异步 IO，核心方法论是先用 Application Insights、dotnet-trace、BenchmarkDotNet 定位真实瓶颈再动手；缓存区分单机与分布式的一致性和失效边界，AOT 要验证整条依赖链反射兼容性，性能慢的根因通常是数据库 N+1 或同步阻塞而非框架本身。",
   "tags": [
     ".NET",
     "ASP.NET",
@@ -14,25 +14,45 @@
     "AOT"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 45,
+  "estimatedMinutes": 49,
   "order": 50,
   "recommendWeight": 85,
   "status": "draft",
   "learningCards": [
     {
       "type": "explain",
-      "title": "ASP.NET 性能优化：响应缓存、响应压缩",
-      "content": "ASP.NET Core 提供了多种性能优化技术，从响应缓存到编译优化，可以显著提升应用性能。\n## 响应缓存\n\n**内存缓存（IMemoryCache）**：\n```csharp\nbuilder.Services.AddMemoryCache();\n\npublic class ProductService\n{\n    private readonly IMemoryCache _cache;\n\n    public ProductService(IMemoryCache cache)\n    {\n        _cache = cache;\n    }\n\n    public Product GetProduct(int id)\n    {\n        return _cache.GetOrCreate($\"product_{id}\", entry =>\n        {\n            entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10);\n            return _repository.GetById(id);\n        });\n    }\n}\n```\n\n**分布式缓存（IDistributedCache）**：\n```csharp\n// Redis 缓存\nbuilder.Services.AddStackExchangeRedisCache(options =>\n{\n    options.Configuration = \"localhost:6379\";\n    options.InstanceName = \"myapp_\";\n});\n\n// 使用\npublic class CacheService\n{\n    private readonly IDistributedCache _cache;\n\n    public async Task<string> GetValueAsync(string key)\n    {\n        var value = await _cache.GetStringAsync(key);\n        if (value == null)\n        {\n            value = await GetValueFromDbAsync();\n            await _cache.SetStringAsync(key, value,\n                new DistributedCacheEntryOptions\n                {\n                    AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(1)\n                });\n        }\n        return value;\n    }\n}\n```\n\n**响应缓存中间件**：\n```csharp\nbuilder.Services.AddResponseCaching();\n\napp.UseResponseCaching();\n\n[ResponseCache(Duration = 60, VaryByQueryKeys = new[] { \"page\" })]\npublic IActionResult GetProducts(int page)\n{\n    // 响应会被缓存 60 秒\n}\n```\n\n## 响应压缩\n\n```csharp\nbuilder.Services.AddResponseCompression(options =>\n{\n    options.EnableForHttps = true;\n    options.Providers.Add<BrotliCompressionProvider>();\n    options.Providers.Add<GzipCompressionProvider>();\n});\n\napp.UseResponseCompression();\n```"
+      "title": "先测量再优化：瓶颈定位方法论",
+      "content": "ASP.NET Core 性能优化的第一步不是加缓存或换编译模式，而是用工具定位真正的瓶颈在哪一层。大多数线上接口慢的根因是数据库 N+1 查询、同步阻塞 IO 把线程池占满、或者根本没加缓存——不是框架本身。\n\n常用定位工具链：\n- **Application Insights / OpenTelemetry**：看请求端到端耗时瀑布，定位卡在数据库、外部 HTTP 还是应用内部。Application Insights 配置只需一行 `AddApplicationInsightsTelemetry()`，自动采集依赖调用、异常和自定义指标。\n- **dotnet-trace**：抓 CPU 采样和事件（GC、ThreadPool、Lock Contention），定位热点方法和线程池饥饿。`dotnet-trace collect -p <pid> --profile gc-collect` 可以快速看到 Gen2 频率和 LOH 分配。\n- **dotnet-counters**：实时看 GC、线程池线程数、请求队列长度、每秒请求数等运行时计数器。线程池饥饿（ThreadPool Starvation）的一个经典表现是 Queue Length 持续上升但 CPU 不高——通常是某个地方用了同步阻塞 `.Result` 或 `.Wait()`。\n- **BenchmarkDotNet**：对热点方法做微基准测试，`[MemoryDiagnoser]` 标注可以看每次调用的分配量，避免凭直觉判断谁快谁慢。\n\n优化顺序应该是：定位瓶颈 → 验证假设 → 改动 → 回归对比。跳过定位直接改代码，大概率改错方向。"
     },
     {
       "type": "explain",
-      "title": "ASP.NET 性能优化：最小 API、AOT 编译",
-      "content": "## 最小 API\n\n.NET 6 引入的轻量级 API 开发方式：\n```csharp\nvar app = builder.Build();\n\napp.MapGet(\"/\", () => \"Hello World!\");\n\napp.MapGet(\"/users/{id}\", async (int id, IUserService service) =>\n{\n    var user = await service.GetById(id);\n    return user is not null ? Results.Ok(user) : Results.NotFound();\n});\n\napp.MapPost(\"/users\", async (User user, IUserService service) =>\n{\n    await service.Create(user);\n    return Results.Created($\"/users/{user.Id}\", user);\n});\n```\n\n**参数绑定**：\n```csharp\napp.MapGet(\"/search\", (string keyword, int page = 1) =>\n{\n    return Results.Ok(new { keyword, page });\n});\n\napp.MapPost(\"/upload\", async (IFormFile file) =>\n{\n    // 文件上传\n});\n```\n\n**过滤器**：\n```csharp\napp.MapGet(\"/protected\", () => \"Secret\")\n    .RequireAuthorization();\n\napp.MapGet(\"/cached\", () => \"Cached\")\n    .WithMetadata(new ResponseCacheAttribute(Duration = 60));\n```\n\n## Native AOT 编译\n\nASP.NET Core 从 .NET 8 起支持 Native AOT 的部分 Web 场景，普通 .NET 应用也可以用 Native AOT 发布。它把 IL 在发布时编译成本机代码，运行时不依赖 JIT，但需要提前检查反射、动态加载、序列化源生成和第三方库兼容性：\n```xml\n<PropertyGroup>\n    <PublishAot>true</PublishAot>\n</PropertyGroup>\n```\n\n**AOT 优点**：\n- 启动时间快\n- 内存占用小\n- 无需安装运行时\n- 运行时依赖更少；安全收益取决于裁剪结果和依赖面，不能只靠 AOT 保证\n\n**AOT 限制**：\n- 动态加载和运行时反射受限\n- MVC、运行时发现 Controller、部分序列化/验证库需要兼容性验证\n- 文件体积可能较大\n- 编译时间长\n\n## 性能优化取舍清单\n\n**1. 数据库优化**：\n```csharp\n// 使用 AsNoTracking\nvar users = await _context.Users\n    .AsNoTracking()\n    .Where(u => u.IsActive)\n    .ToListAsync();\n\n// 使用投影\nvar userDtos = await _context.Users\n    .Select(u => new UserDto { Id = u.Id, Name = u.Name })\n    .ToListAsync();\n```\n\n**2. 异步编程**：\n```csharp\n// 避免阻塞\npublic async Task<IActionResult> GetData()\n{\n    var data = await _service.GetDataAsync(); // 异步\n    return Ok(data);\n}\n```\n\n**3. HTTP 外呼复用**：\n```csharp\nbuilder.Services.AddHttpClient(\"github\", client =>\n{\n    client.BaseAddress = new Uri(\"https://api.github.com/\");\n    client.Timeout = TimeSpan.FromSeconds(3);\n});\n\npublic class GitHubClient(IHttpClientFactory factory)\n{\n    public Task<HttpResponseMessage> GetAsync(string path)\n    {\n        var client = factory.CreateClient(\"github\");\n        return client.GetAsync(path);\n    }\n}\n```\nIHttpClientFactory 统一管理逻辑客户端、连接复用、日志和配置；不要用对象池手动池化 HttpClient。\n\n**4. 预编译查询**：\n```csharp\nprivate static readonly Func<MyDbContext, int, User> GetUserById =\n    EF.CompileQuery((MyDbContext context, int id) =>\n        context.Users.FirstOrDefault(u => u.Id == id));\n```\n\n**5. 使用 ValueTask**：\n```csharp\npublic ValueTask<int> GetCachedValueAsync(int key)\n{\n    if (_cache.TryGetValue(key, out var value))\n        return new ValueTask<int>(value);\n    \n    return new ValueTask<int>(GetValueFromDbAsync(key));\n}\n```"
+      "title": "内存缓存 vs 分布式缓存：场景、一致性和失效策略",
+      "content": "缓存是 ASP.NET 性能优化中收益最明显的手段，但选错缓存类型或忽略一致性设计反而会引入 bug。\n\n**IMemoryCache（单机内存缓存）**：数据存在当前进程内存中，访问零网络开销，适合单实例部署或不跨节点共享的数据（如配置、字典表、计算结果）。使用 `GetOrCreate` / `GetOrCreateAsync` 可以避免缓存击穿——同一个 key 只会有一个线程执行 factory，其他线程等待结果。但要注意：\n- 进程重启数据丢失\n- 多实例部署时各节点缓存不一致\n- 默认没有容量限制，需通过 `SizeLimit` 和 `size` 参数控制内存占用，否则大量缓存条目可能撑爆内存\n\n**IDistributedCache（分布式缓存，通常用 Redis）**：数据存在外部存储，所有实例共享，适合需要跨节点一致的场景。`AddStackExchangeRedisCache` 一行配置接入 Redis，但需要注意：\n- 每次访问都有网络往返（微秒级 vs 毫秒级）\n- 序列化/反序列化有 CPU 和 GC 开销，大对象尤其明显\n- Redis 连接池配置不当（`connectTimeout`、`syncTimeout`、`abortOnConnectFail`）会导致请求阻塞\n\n**缓存失效的三种模式**：\n- `AbsoluteExpirationRelativeToNow`：固定过期时间，简单可控\n- `SlidingExpiration`：最后一次访问后滑动过期，热数据不淘汰但冷数据不能及时清除\n- 手动失效：数据更新时主动 `Remove`，适合写操作触发缓存刷新\n\n**缓存一致性边界**：分布式缓存不等于强一致性。写入 Redis 后其他节点能读到新值，但「读取 → 过期 → 重新加载」这个窗口内可能短暂脏读。对一致性要求高的业务（如余额、库存），缓存只做加速层，真正一致性靠数据库或分布式锁保证。"
     },
     {
       "type": "explain",
-      "title": "ASP.NET 性能优化：性能监控、基准测试",
-      "content": "## 性能监控\n\n**接入 Application Insights 采集请求耗时与依赖调用**：\n```csharp\nbuilder.Services.AddApplicationInsightsTelemetry();\n```\n\n**自定义计时**：\n```csharp\napp.Use(async (context, next) =>\n{\n    var stopwatch = Stopwatch.StartNew();\n    await next();\n    stopwatch.Stop();\n    \n    context.Response.Headers.Add(\"X-Response-Time\",\n        $\"{stopwatch.ElapsedMilliseconds}ms\");\n});\n```\n\n## 基准测试\n\n使用 BenchmarkDotNet：\n```csharp\n[MemoryDiagnoser]\npublic class Benchmarks\n{\n    [Benchmark]\n    public void StringConcat()\n    {\n        var s = \"\";\n        for (int i = 0; i < 1000; i++)\n            s += i;\n    }\n\n    [Benchmark]\n    public void StringBuilder()\n    {\n        var sb = new StringBuilder();\n        for (int i = 0; i < 1000; i++)\n            sb.Append(i);\n        var s = sb.ToString();\n    }\n}\n```\n\n## 取舍与验证\n性能优化的铁律是「先测量再优化」：用 Application Insights 或 OpenTelemetry 看线上端到端耗时分布、用 dotnet-trace 和 dotnet-counters 看 GC、线程池、锁争用，用 BenchmarkDotNet 对热点方法做微基准。常见误区是凭感觉优化——大多数 ASP.NET 的「慢」其实是数据库 N+1、同步阻塞 IO 占满线程池、或没加缓存，而不是框架本身。AOT 和最小 API 的取舍要清楚：AOT 启动从几百毫秒降到几十毫秒、内存大幅下降，特别适合 Serverless 和容器密集部署，但反射和动态代码生成受限，很多依赖反射的库不兼容，上 AOT 前要先验证整条依赖链 publish 通过。"
+      "title": "响应缓存与响应压缩：HTTP 层优化",
+      "content": "**响应缓存中间件（Response Caching）** 把整个 HTTP 响应（状态码、头、Body）缓存在内存中，同一 URL 和 VaryBy 参数的后续请求直接返回缓存响应，不进应用代码。配置 `AddResponseCaching()` + `UseResponseCaching()` 后，通过 `[ResponseCache]` 特性或 `CacheOutput` 控制策略。\n\n注意点：\n- 响应缓存基于标准 HTTP 缓存头（Cache-Control），CDN 和浏览器也能利用\n- 默认不缓存 Set-Cookie 头的响应，避免缓存会话信息\n- `VaryByQueryKeys` 必须显式声明，否则 `/api/products?page=1` 和 `?page=2` 共用同一份缓存\n- `VaryByHeader` 可以按 Accept-Encoding 区分压缩和非压缩版本\n\n**响应压缩**：减少传输字节数，对 JSON 和文本效果明显。`AddResponseCompression` 配置 Gzip 和 Brotli 提供者，`UseResponseCompression()` 中间件放在路由之前。Brotli 压缩率比 Gzip 高 15-25%，但 CPU 开销更大；`CompressionLevel.Fastest` 适合动态内容，`Optimal` 适合静态文件预压缩。\n\nHTTPS 环境下需要显式 `options.EnableForHttps = true`，因为 HTTPS 流量默认不压缩（BREACH 攻击风险）。生产环境如果用了反向代理（Nginx、YARP），通常在代理层压缩更高效。"
+    },
+    {
+      "type": "explain",
+      "title": "异步 IO 和减少分配：CLR 级优化",
+      "content": "**异步编程（async/await）**：ASP.NET Core 的 Kestrel 处理模型基于 `Synchronous` = false 的异步管线。每个同步阻塞（`.Result`、`.Wait()`、`Task.Run` 包裹 sync 代码）都会占用一个线程池线程等待 IO 完成，线程池有限（默认 minThreads 由 CPU 核数决定），阻塞多了就出现线程池饥饿——请求排队但 CPU 闲置。所有 IO 操作（数据库、HTTP 外呼、文件读写）必须全程 async/await，不给线程池制造阻塞。\n\n**减少分配的手段**：\n- **ObjectPool<T>**：复用大对象或创建成本高的对象（如 StringBuilder、byte[]），避免反复 GC。`ObjectPoolProvider.Create<T>()` 获取池实例，`Get()` 取对象，`Return()` 归还。\n- **ArrayPool<T>.Shared**：复用大数组，`Rent(length)` 取、`Return(array)` 还，LOH（大于 85,000 字节）分配减少后 Gen2 GC 频率显著下降。\n- **Span<T> / Memory<T>**：栈上切片或租借的数组切片，零分配操作字符串和字节。`string.Create` 可以在不创建中间字符串的情况下格式化。\n- **ValueTask<T>**：高频调用且经常同步完成（命中缓存）的异步方法，用 `ValueTask` 避免分配 `Task` 对象。但注意：`ValueTask` 不能多次 await、不能在未 await 时 Dispose，滥用反而增加复杂度。\n- **预编译 EF 查询（EF.CompileQuery）**：跳过表达式树编译开销，适合高频查询。.NET 7+ 的 EF Core 查询缓存已经做得很好，CompileQuery 的收益主要在极热路径。"
+    },
+    {
+      "type": "explain",
+      "title": "最小 API 与 Native AOT：框架层和编译层选择",
+      "content": "**最小 API（.NET 6+）**：用 `MapGet`/`MapPost` 等方法直接在 `WebApplication` 上定义端点，不依赖 Controller 类和 `[ApiController]` 约定。路由参数自动绑定（query、route、header、body、DI 服务），代码量少、启动快（路由元数据构建更轻）。适合微服务、BFF、简单 CRUD 和 Serverless 函数。但过滤器支持有限（没有完整的 `ActionFilter` 管线），复杂业务验证、多步骤管道、大规模 API 组织还是 Controller 更清晰。\n\n**Native AOT（ASP.NET Core .NET 8+ 支持部分 Web 场景）**：`<PublishAot>true</PublishAot>` 发布时把 IL 编译成原生机器码，运行时不依赖 JIT。优势：\n- 冷启动从几百毫秒降到几十毫秒\n- 内存占用大幅下降（无 JIT 元数据、无动态加载开销）\n- 不需要在目标机器安装完整运行时\n- Serverless（AWS Lambda、Azure Functions）和容器密集部署场景收益最大\n\n但 AOT 有硬限制：\n- **反射受限**：运行时动态发现类型、方法的能力大幅裁剪，依赖反射的 ORM（EF Core 需要 source generator）、序列化库（System.Text.Json 需要 `[JsonSerializable]` source generator）、DI 容器需要 AOT 兼容版本\n- **不支持 Emit / 动态代码生成**：Castle、Moq、动态代理等库完全不兼容\n- **MVC / Razor Pages 受限**：Controller 发现依赖反射，.NET 8 最小 API 部分支持，MVC 全量支持尚不完整\n- **编译时间长、产物可能偏大**：一次 publish 可能需要几分钟到十几分钟\n\n**上 AOT 前的检查清单**：跑 `dotnet publish` 确认零裁剪警告，验证所有 NuGet 包有 AOT 兼容声明，测试序列化/反序列化端到端，确认 DI 注册无运行时反射。不要盲目上 AOT——如果应用启动不敏感、依赖链有大量不兼容库，JIT 仍然是更安全的选择。"
+    },
+    {
+      "type": "explain",
+      "title": "数据库优化：EF Core 层面的性能手段",
+      "content": "EF Core 是 ASP.NET Core 最常用的数据访问层，也是最容易产生性能问题的地方：\n\n**AsNoTracking()**：只读查询加上这个方法，EF Core 不会为每行创建 ChangeTracker 快照，内存和 CPU 开销下降。大多数 API 的 GET 请求都是只读场景，应该默认加 `AsNoTracking()`。\n\n**投影（Select）**：只查需要的列，不把整行实体加载到内存。`Select(u => new UserDto { Id = u.Id, Name = u.Name })` 生成的 SQL 只 SELECT 两列，减少数据库 IO 和 EF Core 的 Materialization 开销。\n\n**批量操作**：EF Core 7+ 支持 `ExecuteUpdate` / `ExecuteDelete`，直接在数据库执行 UPDATE/DELETE，不加载实体到内存再逐条保存。\n\n**索引**：查询条件字段、排序字段、关联字段加数据库索引。EF Core 迁移可以通过 `[Index]` 特性或 Fluent API 声明。\n\n**预编译查询**：`EF.CompileQuery` 编译表达式树一次，后续调用跳过编译。EF Core 7+ 有全局查询缓存，CompileQuery 主要用于极端热路径。\n\n**N+1 问题**：导航属性惰性加载导致主查询后对每行执行子查询。解决方案是 `Include` / `ThenInclude` 预加载，或用投影直接查 DTO。Application Insights 的依赖调用日志可以快速发现 N+1——如果一个请求触发了几十条相似 SQL，就是典型的 N+1。"
+    },
+    {
+      "type": "explain",
+      "title": "HTTP 外呼和连接管理",
+      "content": "ASP.NET Core 应用经常需要调用外部 API。直接 `new HttpClient()` 会有两个问题：\n- **Socket 耗尽**：HttpClient 底层的 TCP 连接在 Dispose 后进入 TIME_WAIT 状态（Linux 默认 60 秒），高并发下端口被耗尽\n- **DNS 缓存**：HttpClient 实例内的连接不会自动刷新 DNS 解析，目标 IP 变更后会连接失败\n\n**IHttpClientFactory** 解决这两个问题：\n- 逻辑客户端和物理连接分离，底层 `HttpMessageHandler` 池化复用，连接按 `PooledConnectionLifetime` 定期回收\n- 支持命名客户端（`AddHttpClient(\"github\", ...)`）和类型化客户端（`AddHttpClient<GitHubClient>(...)`），集中配置 BaseAddress、Timeout、DefaultRequestHeaders、Polly 策略\n- 集成日志和 DiagnosticSource，每个请求自动采集耗时和状态码\n\n不要用对象池手动池化 HttpClient，IHttpClientFactory 已经是标准方案。如果用 YARP 做反向代理，它也使用 SocketsHttpHandler 池化连接。"
     },
     {
       "type": "diagram",
@@ -54,55 +74,67 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | 内存缓存 | 分布式缓存 |\n| --- | --- | --- |\n| 存储位置 | 应用内存 | 外部存储（Redis等） |\n| 多机共享 | 不支持 | 支持 |\n| 性能 | 最快（内存访问） | 较快（网络访问） |\n| 持久化 | 不持久化 | 可持久化 |\n| 适用场景 | 单机应用 | 多机部署、微服务 |\n| 复杂度 | 低 | 中 |"
+      "title": "缓存类型对比",
+      "content": "| 维度 | IMemoryCache | IDistributedCache (Redis) |\n| --- | --- | --- |\n| 存储位置 | 当前进程内存 | 外部进程（Redis 等） |\n| 网络开销 | 无 | 每次访问有网络往返 |\n| 多实例共享 | 不共享 | 所有实例共享 |\n| 进程重启 | 数据丢失 | 数据持久化 |\n| 容量控制 | SizeLimit + size 参数 | Redis maxmemory 策略 |\n| 序列化成本 | 无（对象引用） | 有（JSON/Protobuf 等） |\n| 典型场景 | 单实例配置、热数据 | 多实例 session、共享缓存 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | 最小 API | 传统控制器 |\n| --- | --- | --- |\n| 代码量 | 少（无控制器类） | 多（需要控制器） |\n| 组织方式 | 端点级别 | 控制器级别 |\n| 过滤器支持 | 有限 | 完整 |\n| 适用场景 | 简单 API、微服务 | 复杂应用、MVC |\n| 可测试性 | 中 | 高 |\n| 学习曲线 | 低 | 中 |"
+      "title": "最小 API vs Controller 对比",
+      "content": "| 维度 | 最小 API | Controller |\n| --- | --- | --- |\n| 代码组织 | 端点级别，直接在 app 上定义 | 控制器类级别，按资源分组 |\n| 过滤器支持 | 有限（Endpoint Filter，.NET 7+） | 完整（ActionFilter/ResultFilter 等） |\n| 参数绑定 | 自动绑定 route/query/header/body/DI | ModelBinder 体系，支持复杂验证 |\n| 启动开销 | 轻（无 Controller 发现） | 较重（反射扫描 Controller） |\n| 适用场景 | 微服务、BFF、Serverless、简单 CRUD | 复杂业务逻辑、MVC、大型 API |\n| AOT 兼容性 | 较好（.NET 8 部分支持） | 受限（依赖反射发现 Controller） |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | JIT 编译 | AOT 编译 |\n| --- | --- | --- |\n| 编译时机 | 运行时 | 发布时 |\n| 启动时间 | 较慢 | 快 |\n| 内存占用 | 较高 | 低 |\n| 动态特性 | 完全支持 | 受限 |\n| 文件大小 | 小（需要运行时） | 大（包含本机代码） |\n| 适用场景 | 通用 | 启动敏感、嵌入式 |"
+      "title": "JIT vs AOT 编译对比",
+      "content": "| 维度 | JIT | Native AOT |\n| --- | --- | --- |\n| 编译时机 | 运行时逐方法编译 | 发布时全量编译 |\n| 冷启动 | 慢（首次请求触发 JIT） | 快（几十毫秒级） |\n| 内存占用 | 高（JIT 元数据 + 动态加载） | 低（无 JIT、无动态加载） |\n| 反射/动态代码 | 完全支持 | 受限，需 source generator |\n| 依赖兼容性 | 几乎所有 NuGet 包 | 需验证 AOT 兼容性声明 |\n| 产物体积 | 小（IL + 运行时） | 大（包含原生代码） |\n| 适用场景 | 通用业务应用 | Serverless、CLI、容器密集部署 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Diagnostics;\nusing System.IO.Compression;\nusing System.Text;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.AspNetCore.ResponseCompression;\nusing Microsoft.Extensions.Caching.Distributed;\nusing Microsoft.Extensions.Caching.Memory;\nusing Microsoft.Extensions.DependencyInjection;\n\nnamespace PerformanceOptimizationDemo\n{\n    // 内存缓存服务\n    public class CachedProductService\n    {\n        private readonly IMemoryCache _cache;\n        private readonly IProductRepository _repository;\n\n        public CachedProductService(IMemoryCache cache, IProductRepository repository)\n        {\n            _cache = cache;\n            _repository = repository;\n        }\n\n        public async Task<Product> GetProductAsync(int id)\n        {\n            var cacheKey = $\"product_{id}\";\n\n            return await _cache.GetOrCreateAsync(cacheKey, async entry =>\n            {\n                entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10);\n                entry.SlidingExpiration = TimeSpan.FromMinutes(2);\n                return await _repository.GetByIdAsync(id);\n            });\n        }\n\n        public void InvalidateCache(int id)\n        {\n            _cache.Remove($\"product_{id}\");\n        }\n    }\n\n    // 分布式缓存服务\n    public class DistributedCacheService\n    {\n        private readonly IDistributedCache _cache;\n\n        public DistributedCacheService(IDistributedCache cache)\n        {\n            _cache = cache;\n        }\n\n        public async Task<T> GetOrSetAsync<T>(string key, Func<Task<T>> factory,\n            TimeSpan? expiration = null)\n        {\n            var cached = await _cache.GetStringAsync(key);\n            if (cached != null)\n            {\n                return System.Text.Json.JsonSerializer.Deserialize<T>(cached);\n            }\n\n            var value = await factory();\n            var json = System.Text.Json.JsonSerializer.Serialize(value);\n\n            await _cache.SetStringAsync(key, json, new DistributedCacheEntryOptions\n            {\n                AbsoluteExpirationRelativeToNow = expiration ?? TimeSpan.FromHours(1)\n            });\n\n            return value;\n        }\n    }\n\n    public class Product\n    {\n        public int Id { get; set; }\n        public string Name { get; set; }\n        public decimal Price { get; set; }\n    }\n\n    public interface IProductRepository\n    {\n        Task<Product> GetByIdAsync(int id);\n    }\n\n    // 最小 API 示例\n    public static class MinimalApiExamples\n    {\n        public static WebApplication CreateMinimalApi()\n        {\n            var builder = WebApplication.CreateBuilder();\n\n            // 配置服务\n            builder.Services.AddMemoryCache();\n            builder.Services.AddResponseCompression(options =>\n            {\n                options.EnableForHttps = true;\n                options.Providers.Add<BrotliCompressionProvider>();\n                options.Providers.Add<GzipCompressionProvider>();\n            });\n\n            var app = builder.Build();\n\n            // 中间件\n            app.UseResponseCompression();\n\n            // 性能监控中间件\n            app.Use(async (context, next) =>\n            {\n                var stopwatch = Stopwatch.StartNew();\n                await next();\n                stopwatch.Stop();\n\n                context.Response.Headers.Add(\"X-Response-Time\",\n                    $\"{stopwatch.ElapsedMilliseconds}ms\");\n            });\n\n            // 最小 API 端点\n            app.MapGet(\"/\", () => \"Hello World!\");\n\n            app.MapGet(\"/products/{id}\", async (int id, IMemoryCache cache) =>\n            {\n                var cacheKey = $\"product_{id}\";\n                var product = await cache.GetOrCreateAsync(cacheKey, async entry =>\n                {\n                    entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5);\n                    return new Product { Id = id, Name = $\"Product {id}\", Price = 9.99m };\n                });\n\n                return Results.Ok(product);\n            });\n\n            app.MapPost(\"/products\", async (Product product) =>\n            {\n                // 创建产品\n                return Results.Created($\"/products/{product.Id}\", product);\n            });\n\n            // 带过滤器的端点\n            app.MapGet(\"/admin\", () => \"Admin Area\")\n                .RequireAuthorization(\"AdminOnly\");\n\n            app.MapGet(\"/cached\", () => \"Cached Response\")\n                .CacheOutput(x => x.Expire(TimeSpan.FromMinutes(1)));\n\n            return app;\n        }\n    }\n\n    // 基准测试示例\n    public class StringBenchmarks\n    {\n        public string ConcatString(int iterations)\n        {\n            var s = \"\";\n            for (int i = 0; i < iterations; i++)\n            {\n                s += i.ToString();\n            }\n            return s;\n        }\n\n        public string UseStringBuilder(int iterations)\n        {\n            var sb = new StringBuilder();\n            for (int i = 0; i < iterations; i++)\n            {\n                sb.Append(i);\n            }\n            return sb.ToString();\n        }\n\n        public string UseStringCreate(int iterations)\n        {\n            return string.Create(iterations.ToString().Length * iterations, iterations,\n                (span, state) =>\n                {\n                    var index = 0;\n                    for (int i = 0; i < state; i++)\n                    {\n                        var num = i.ToString();\n                        num.AsSpan().CopyTo(span.Slice(index));\n                        index += num.Length;\n                    }\n                });\n        }\n    }\n\n    // 性能优化配置\n    public static class PerformanceServiceCollectionExtensions\n    {\n        public static IServiceCollection AddPerformanceOptimizations(\n            this IServiceCollection services)\n        {\n            // 内存缓存\n            services.AddMemoryCache(options =>\n            {\n                options.SizeLimit = 1024;\n            });\n\n            // 响应压缩\n            services.AddResponseCompression(options =>\n            {\n                options.EnableForHttps = true;\n                options.Providers.Add<BrotliCompressionProvider>();\n                options.Providers.Add<GzipCompressionProvider>();\n                options.MimeTypes = ResponseCompressionDefaults.MimeTypes.Concat(\n                    new[] { \"application/json\", \"text/plain\" });\n            });\n\n            // 配置 Brotli 压缩级别\n            services.Configure<BrotliCompressionProviderOptions>(options =>\n            {\n                options.Level = CompressionLevel.Fastest;\n            });\n\n            return services;\n        }\n    }\n}",
+      "title": "可运行示例：缓存、压缩、异步、减少分配和性能监控",
       "language": "csharp",
+      "content": "using System.Buffers;\nusing System.Diagnostics;\nusing System.IO.Compression;\nusing System.Text.Json;\nusing System.Text.Json.Serialization;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.AspNetCore.ResponseCompression;\nusing Microsoft.Extensions.Caching.Distributed;\nusing Microsoft.Extensions.Caching.Memory;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.ObjectPool;\n\nvar builder = WebApplication.CreateBuilder(args);\n\n// ---- 缓存 ----\nbuilder.Services.AddMemoryCache(options =>\n{\n    options.SizeLimit = 1024; // 限制缓存条目数\n});\nbuilder.Services.AddStackExchangeRedisCache(options =>\n{\n    options.Configuration = \"localhost:6379\";\n    options.InstanceName = \"demo_\";\n});\n\n// ---- 响应压缩 ----\nbuilder.Services.AddResponseCompression(options =>\n{\n    options.EnableForHttps = true;\n    options.Providers.Add<BrotliCompressionProvider>();\n    options.Providers.Add<GzipCompressionProvider>();\n});\nbuilder.Services.Configure<BrotliCompressionProviderOptions>(options =>\n{\n    options.Level = CompressionLevel.Fastest; // 动态内容用 Fastest\n});\n\n// ---- 对象池 ----\nbuilder.Services.AddSingleton<ObjectPoolProvider, DefaultObjectPoolProvider>();\n\nvar app = builder.Build();\napp.UseResponseCompression();\n\n// ---- 性能监控中间件 ----\napp.Use(async (context, next) =>\n{\n    var sw = Stopwatch.StartNew();\n    await next(context);\n    sw.Stop();\n    context.Response.Headers[\"X-Response-Time\"] = $\"{sw.ElapsedMilliseconds}ms\";\n});\n\n// ---- 内存缓存示例 ----\napp.MapGet(\"/product/{id:int}\", async (int id, IMemoryCache cache, IProductRepository repo) =>\n{\n    var cacheKey = $\"product_{id}\";\n    var product = await cache.GetOrCreateAsync(cacheKey, async entry =>\n    {\n        entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10);\n        entry.Size = 1;\n        return await repo.GetByIdAsync(id);\n    });\n    return product is not null ? Results.Ok(product) : Results.NotFound();\n});\n\n// ---- 分布式缓存示例 ----\napp.MapGet(\"/distributed/{key}\", async (string key, IDistributedCache distCache) =>\n{\n    var cached = await distCache.GetStringAsync(key);\n    if (cached is not null)\n        return Results.Ok(JsonSerializer.Deserialize<CachedPayload>(cached));\n\n    var payload = new CachedPayload(key, DateTime.UtcNow);\n    await distCache.SetStringAsync(key, JsonSerializer.Serialize(payload),\n        new DistributedCacheEntryOptions\n        {\n            AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(1)\n        });\n    return Results.Ok(payload);\n});\n\n// ---- ArrayPool 减少 LOH 分配 ----\napp.MapGet(\"/process/{size:int}\", (int size) =>\n{\n    var pool = ArrayPool<byte>.Shared;\n    var buffer = pool.Rent(size);\n    try\n    {\n        // 模拟处理\n        for (int i = 0; i < size && i < buffer.Length; i++)\n            buffer[i] = (byte)(i % 256);\n        return Results.Ok(new { processed = size });\n    }\n    finally\n    {\n        pool.Return(buffer); // 归还到池，避免 GC\n    }\n});\n\n// ---- ValueTask 高频缓存命中路径 ----\napp.MapGet(\"/cached-or-db/{id:int}\", async (int id, IMemoryCache cache) =>\n{\n    var result = await GetCachedOrDbAsync(cache, id);\n    return Results.Ok(result);\n});\n\napp.Run();\n\n// ---- ValueTask 示例方法 ----\nstatic ValueTask<string> GetCachedOrDbAsync(IMemoryCache cache, int id)\n{\n    if (cache.TryGetValue($\"v_{id}\", out string? cached))\n        return new ValueTask<string>(cached!); // 同步完成，零 Task 分配\n\n    return new ValueTask<string>(LoadFromDbAsync(cache, id));\n}\n\nstatic async Task<string> LoadFromDbAsync(IMemoryCache cache, int id)\n{\n    await Task.Delay(10); // 模拟 DB\n    var value = $\"db_value_{id}\";\n    cache.Set($\"v_{id}\", value, TimeSpan.FromMinutes(5));\n    return value;\n}\n\n// ---- 类型定义 ----\npublic record CachedPayload(string Key, DateTime CreatedAt);\n\npublic class Product { public int Id { get; set; } public string Name { get; set; } = \"\"; }\n\npublic interface IProductRepository\n{\n    Task<Product?> GetByIdAsync(int id);\n}",
       "highlights": [
         {
-          "line": 15,
-          "note": "`public class CachedProductService` 定义了 ASP.NET 性能优化 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 21,
+          "note": "SizeLimit 配置内存缓存容量上限，防止无限增长撑爆内存。"
         },
         {
-          "line": 157,
-          "note": "`for (int i = 0; i < iterations; i++)` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+          "line": 35,
+          "note": "CompressionLevel.Fastest 适合动态内容，牺牲少量压缩率换取 CPU 降低。"
         },
         {
           "line": 55,
-          "note": "`TimeSpan? expiration = null)` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "note": "GetOrCreateAsync 保证同一 key 只有一个线程执行 factory，避免缓存击穿。"
         },
         {
-          "line": 40,
-          "note": "`_cache.Remove($\"product_{id}\");` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "line": 76,
+          "note": "ArrayPool.Rent / Return 复用大数组，减少 LOH 分配和 Gen2 GC。"
+        },
+        {
+          "line": 95,
+          "note": "缓存命中时返回 ValueTask<string>（同步完成路径），避免分配 Task 对象。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：ASP.NET Core 性能优化分几层：缓存（响应、内存、分布式）、压缩、异步、减少分配、以及 .NET 新特性（最小 API、AOT）。核心方法论和 JVM 一样——先用工具定位瓶颈（Application Insights、dotnet-trace、BenchmarkDotNet），再针对性优化。\n\n要点：\n\n1. 缓存：IMemoryCache（单机内存）、IDistributedCache（Redis 等分布式）、响应缓存中间件（缓存整个响应）。缓存通常收益明显，但前提是命中率、失效策略和一致性边界可控。\n2. 响应压缩：Gzip 或 Brotli 压缩响应体，减少传输。\n3. 异步：IO 操作全程 async/await，避免阻塞线程、提升吞吐。\n4. 减少分配：对象池（ObjectPool、ArrayPool）、Span<T>、ValueTask（可能同步完成的高频路径）。\n5. .NET 新特性：最小 API（.NET 6，轻量、启动快）、Native AOT（ASP.NET Core 从 .NET 8 起支持部分 Web 场景，提前编译、启动快、内存小，但反射、动态加载、MVC 和部分库兼容性要验证）。\n\n边界和取舍。① AOT 启动快、内存小，但反射和动态加载受限，依赖大量反射的库（一些 ORM、序列化）可能不兼容，要权衡。② 缓存要处理一致性和失效（和缓存架构的穿透、击穿、雪崩一样）。③ 优化前先 BenchmarkDotNet 或 Application Insights 定位，别凭感觉——很多「慢」其实是数据库 N+1 或同步阻塞，不是框架本身。",
+      "content": "ASP.NET Core 性能优化是多层手段的组合，核心方法论是先定位再优化。\n\n**方法论**\n- 用 Application Insights / OpenTelemetry 看请求端到端耗时瀑布，定位瓶颈在数据库、外部调用还是应用本身\n- 用 dotnet-trace 看 CPU 热点和 GC，用 dotnet-counters 实时看线程池和 GC 计数器\n- 用 BenchmarkDotNet 对热点方法做微基准，带 `[MemoryDiagnoser]` 看分配\n- 典型陷阱：线程池饥饿（同步阻塞 `.Result` / `.Wait()`）、N+1 查询、没加缓存——不是框架本身慢\n\n**缓存层**\n- IMemoryCache：单机进程内存，零网络开销，适合不跨实例共享的数据\n- IDistributedCache（Redis）：跨实例共享，有网络和序列化开销\n- 缓存一致性边界：缓存是加速层，强一致性靠数据库/分布式锁\n- 缓存击穿：`GetOrCreateAsync` 保证单线程加载\n\n**HTTP 层**\n- 响应缓存中间件：整个响应缓存，CDN 可利用，`VaryByQueryKeys` 必须声明\n- 响应压缩：Brotli 压缩率高 15-25%，动态内容用 `Fastest` 级别\n\n**CLR / 运行时层**\n- async/await 全链路异步，避免线程池饥饿\n- ObjectPool / ArrayPool 复用对象和数组，减少 GC\n- Span<T> / Memory<T> 零分配切片\n- ValueTask 用于高频且经常同步完成的路径\n\n**框架层**\n- 最小 API（.NET 6+）：轻量、启动快、适合微服务/Serverless\n- EF Core：AsNoTracking、投影、批量操作、消除 N+1\n- IHttpClientFactory：连接池化复用，避免 Socket 耗尽和 DNS 缓存\n\n**编译层**\n- Native AOT（ASP.NET Core .NET 8+ 部分支持）：冷启动几十毫秒、内存大幅下降，适合 Serverless 和容器密集部署\n- 硬限制：反射受限、不支持 Emit/动态代理、MVC 受限、依赖链需逐个验证\n- 上 AOT 前跑 `dotnet publish` 确认零裁剪警告",
       "followUpQuestions": [
         {
-          "question": "ASP.NET 接口变慢，你怎么定位是哪一层的问题？",
-          "answer": "先用 Application Insights 或 OpenTelemetry 看这个请求的端到端瀑布：卡在数据库、外部调用、还是应用本身。① 数据库慢——看 SQL 是不是 N+1、缺索引、没用 AsNoTracking；② 外部调用慢——加超时和熔断；③ 应用 CPU 高——用 dotnet-trace 抓采样、dotnet-counters 看 GC 和线程池（线程池饥饿常因为同步阻塞 async）；④ 内存或 GC 压力大——看 Gen2 和 LOH 分配。定位顺序是从外到内、靠数据而非猜测，最后对热点方法用 BenchmarkDotNet 验证优化效果。"
+          "question": "ASP.NET 接口突然变慢，你的排查思路是什么？",
+          "answer": "先用 Application Insights 看这个请求的依赖瀑布：卡在数据库（看 SQL 条数和耗时）、外部 HTTP（看超时和重试）还是应用内部。如果是数据库，检查是不是 N+1（一个请求触发几十条相似 SQL）、缺索引、没加 AsNoTracking。如果应用 CPU 不高但请求排队，大概率是线程池饥饿——用 dotnet-counters 看 ThreadPool Queue Length，同步阻塞 `.Result` / `.Wait()` 是常见原因。如果 GC 压力大，用 dotnet-trace 看 Gen2 频率和 LOH 分配。最后对怀疑的热点方法用 BenchmarkDotNet 验证。"
         },
         {
-          "question": "Native AOT 适合什么场景？有什么限制要注意？",
-          "answer": "AOT 把 IL 提前编译成原生机器码，优点是启动从几百毫秒降到几十毫秒、内存占用大幅降低、不用装运行时、还更难被反编译，特别适合 Serverless（冷启动敏感）、容器密集部署、CLI 工具。限制：① 不支持运行时动态加载程序集、Emit 生成代码；② 反射受限（要靠 source generator 或显式 trimming 配置保留），大量依赖反射的库可能不兼容；③ 编译时间长、产物体积可能偏大。所以上 AOT 前必须把整条依赖链跑一遍 publish 验证，确认没有运行时报找不到类型或方法。"
+          "question": "Native AOT 适合什么场景？上之前要做什么检查？",
+          "answer": "适合冷启动敏感的场景：Serverless（Lambda、Azure Functions）、CLI 工具、容器密集部署（Pod 频繁重建）。检查清单：① 跑 `dotnet publish` 确认零裁剪警告；② 验证所有 NuGet 包声明了 AOT 兼容或有 source generator 替代；③ 测试序列化端到端（System.Text.Json 需要 `[JsonSerializable]` source generator）；④ 确认 DI 注册不依赖运行时反射扫描。不适合：依赖大量反射的 ORM、需要动态代理的框架、MVC 全量 Controller 发现。"
+        },
+        {
+          "question": "IMemoryCache 和 Redis 缓存怎么选？",
+          "answer": "单实例部署或数据不需要跨实例共享时用 IMemoryCache——零网络开销、零序列化成本。多实例部署、需要 session 共享、或数据必须在所有节点一致时用 Redis——有网络往返和序列化开销但保证共享。两者不矛盾，常见架构是 IMemoryCache 做 L1（进程内热缓存）+ Redis 做 L2（跨实例共享），查询时先读 L1、miss 再读 L2、miss 才查数据库，写入时同时失效两级缓存。"
+        },
+        {
+          "question": "ValueTask 什么时候该用？滥用会有什么问题？",
+          "answer": "高频调用且经常同步完成（缓存命中）的异步方法适合 ValueTask——同步路径返回 `new ValueTask<T>(value)`，零 Task 对象分配。滥用问题：① 不能多次 await 同一个 ValueTask；② 不能在未 await 的情况下访问 `.Result`；③ 如果调用方需要存起来稍后 await，必须先 `.AsTask()` 转成 Task。所以只有在性能分析证明 Task 分配是瓶颈时才值得用 ValueTask，普通场景直接用 Task 更安全。"
         }
       ]
     },
@@ -110,54 +142,83 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "内存缓存和分布式缓存的使用场景",
-        "响应压缩的配置和压缩算法选择",
-        "最小 API 的定义和使用方式",
-        "AOT 编译的优点和限制",
-        "EF Core 性能优化技巧",
-        "异步编程和对象池的使用"
+        "能说出先用 Application Insights / dotnet-trace / BenchmarkDotNet 定位瓶颈的方法论",
+        "能区分 IMemoryCache 和 IDistributedCache 的场景、一致性边界和容量控制",
+        "能解释响应缓存中间件和响应压缩的配置要点与 HTTPS 下的 BREACH 注意事项",
+        "能说明 async/await 全链路异步为什么必要以及线程池饥饿的表现",
+        "能列举减少分配的手段：ObjectPool、ArrayPool、Span、ValueTask 及其适用条件",
+        "能对比最小 API 和 Controller 的差异与适用场景",
+        "能说明 Native AOT 的优势、反射限制和上线前的验证清单",
+        "能描述 EF Core 的 AsNoTracking、投影、批量操作和 N+1 消除方法",
+        "能解释 IHttpClientFactory 解决 Socket 耗尽和 DNS 缓存问题的原理"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "dotnet.aspnet.performance-optimization.recall.1",
-      "prompt": "请说明 ASP.NET 性能优化 的核心机制、典型使用场景和常见坑。",
+      "prompt": "ASP.NET Core 接口响应变慢，你从哪里开始排查？请给出完整的排查路径和每一步用的工具。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "dotnet.aspnet.performance-optimization.recall.2",
-      "prompt": "什么是最小 API？它与传统控制器有什么区别？在什么场景下应该使用最小 API？",
+      "prompt": "IMemoryCache 和 Redis 分布式缓存各自的适用场景是什么？两者可以组合使用吗？缓存一致性怎么保证？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
       "id": "dotnet.aspnet.performance-optimization.recall.3",
-      "prompt": "ASP.NET 性能优化 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "Native AOT 有哪些优势和硬限制？上线前需要做哪些验证？什么场景下不应该用 AOT？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
+      "id": "dotnet.aspnet.performance-optimization.recall.4",
+      "prompt": "什么是线程池饥饿？在 ASP.NET Core 中怎么发现和解决？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
+      "id": "dotnet.aspnet.performance-optimization.recall.5",
+      "prompt": "如何用 ObjectPool、ArrayPool、Span 和 ValueTask 减少 ASP.NET Core 应用的 GC 压力？各自适用什么场景？",
       "mode": "text",
       "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "dotnet.aspnet.performance-optimization.recall.6",
+      "prompt": "最小 API 和传统 Controller 有什么区别？选型时考虑哪些因素？和 AOT 兼容性有什么关系？",
+      "mode": "text",
+      "expectedMinutes": 3,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出缓存、压缩、异步、减少分配等优化方向",
-      "能区分内存缓存和分布式缓存",
-      "能说明 AOT 的优点和反射受限的限制",
-      "能说明先测量定位再优化"
+      "能说出先定位再优化的方法论，能提到 Application Insights、dotnet-trace、BenchmarkDotNet",
+      "能区分 IMemoryCache 和 IDistributedCache 的场景、一致性和容量控制",
+      "能说明 Native AOT 的优势、反射限制和上线前验证清单",
+      "能解释线程池饥饿的原因（同步阻塞）和排查手段（dotnet-counters Queue Length）"
     ],
     "goodToHave": [
-      "能用对象池/Span/ValueTask 减少分配",
-      "能用 BenchmarkDotNet/Application Insights 定位",
-      "能说明最小 API 的轻量"
+      "能说明 async/await 全链路异步的必要性和 .Result / .Wait() 的危害",
+      "能列举 ObjectPool / ArrayPool / Span / ValueTask 的适用条件和注意事项",
+      "能对比最小 API 和 Controller 的差异与选型依据",
+      "能解释 IHttpClientFactory 解决 Socket 耗尽和 DNS 缓存的原理",
+      "能描述 EF Core AsNoTracking、投影、批量操作和 N+1 消除"
     ],
     "commonMistakes": [
-      "凭感觉优化、不先测量定位",
-      "以为慢都是框架问题（多是 N+1 或阻塞）",
-      "盲目上 AOT 不验证反射依赖兼容性"
+      "凭感觉优化，不先用工具定位瓶颈，盲目加缓存或换编译模式",
+      "把慢归因于框架本身，实际是 N+1 查询或同步阻塞线程池",
+      "盲目上 AOT 不跑 publish 验证裁剪警告，生产环境运行时报找不到类型",
+      "以为 IMemoryCache 多实例部署时数据会自动同步",
+      "用 new HttpClient() 手动创建，导致 Socket 耗尽和 DNS 缓存问题",
+      "ValueTask 滥用——多次 await 同一个 ValueTask 或存起来稍后使用"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -170,6 +231,6 @@
     "dotnet.aspnet.web-api-design"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察能否说出多层优化手段、区分内存与分布式缓存、说明 AOT 限制，并强调先测量定位、知道慢多在 N+1/阻塞。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察能否说出完整的多层优化手段（缓存/压缩/异步/减少分配/AOT/最小 API/数据库），强调先测量定位再优化的方法论，能区分内存缓存和分布式缓存，能说明 AOT 的反射限制和验证清单，能解释线程池饥饿和 N+1 这类典型陷阱。",
+  "updatedAt": "2026-06-22"
 }

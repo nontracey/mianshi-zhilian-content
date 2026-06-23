@@ -4,14 +4,14 @@
   "category": "mysql-core",
   "group": "mysql-core",
   "title": "EXPLAIN 与 SQL 优化",
-  "summary": "掌握执行计划关键列、索引命中判断、回表成本和 SQL 改写思路。",
+  "summary": "掌握 EXPLAIN 各列的机制含义、索引命中与回表成本判断、联合索引设计与 SQL 改写思路，以及如何用执行计划闭环验证优化收益。",
   "tags": [
     "数据库",
     "EXPLAIN",
     "mysql-core"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 27,
   "order": 50,
   "recommendWeight": 90,
   "status": "draft",
@@ -20,17 +20,62 @@
     "database.mysql-core.mysql-lock"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能读懂 EXPLAIN 的访问类型、key、rows、Extra，并能把执行计划转成 SQL 和索引优化动作。",
+  "interviewerFocus": "考察是否能读懂 EXPLAIN 的 type/key/rows/Extra/key_len 并将其转化为索引设计、联合索引列顺序、回表优化和深分页改写的具体动作。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "EXPLAIN 是把 SQL 变慢原因显性化",
-      "content": "EXPLAIN 展示优化器选择的访问路径：从哪张表开始、使用哪个索引、预计扫描多少行、是否回表、是否排序和临时表。它不是答案本身，而是定位 SQL 问题的证据。\n先抓住这些机制：\n- type 反映访问方式，const/ref/range/index/ALL 大致从好到差\n- possible_keys 是候选索引，key 是最终选择的索引\n- rows 和 filtered 反映优化器估算的数据量和过滤比例\n- Extra 中 Using filesort、Using temporary、Using index 都是重要线索\n\n容易答错的边界：\n- 看到 Using filesort 不一定必然很差，要结合数据量和排序方式\n- 优化器估算可能因为统计信息陈旧而不准\n- 只看有没有用索引，不看扫描行数和回表成本，会误判"
+      "title": "EXPLAIN 把优化器决策显性化",
+      "content": "EXPLAIN 不是告诉你 SQL 哪里慢，而是展示优化器选择的访问路径：从哪张表开始（id 列）、以什么方式读（type）、用了哪个索引（key）、预计扫多少行（rows）、过滤比例（filtered）、是否有额外排序或临时表（Extra）。它是定位慢 SQL 问题的证据，不是答案本身。\n\n理解 EXPLAIN 的关键是把它当成本估算表：type 决定存储引擎走了哪条路径，key 是实际选择的索引（区别于 possible_keys 的候选列表），rows × filtered 估算出引擎返回给 Server 层的行数，Extra 标记排序、临时表和覆盖索引等额外操作。优化器基于统计信息做决策，统计信息陈旧时估算可能偏差很大，所以 EXPLAIN 的 rows 是估算值而非实际值。"
     },
     {
       "type": "explain",
-      "title": "优化动作要从数据量、索引顺序和返回列下手",
-      "content": "SQL 优化常见路径是：先确认慢 SQL 的真实执行时间和频率，再 EXPLAIN 看访问路径；如果 type 是 ALL 或 rows 很大，优先看 where 条件和索引；如果排序或分组很慢，看联合索引能否同时满足过滤和排序；如果回表很多，看是否能减少返回列或做覆盖索引。\n还要注意优化不是只改 SQL。可能需要更新统计信息、拆分大查询、分页改成基于游标、把低选择性字段放到联合索引后面，或者调整表结构。面试回答最好能从“证据 -> 原因 -> 修改 -> 验证”闭环讲，而不是直接说加索引。"
+      "title": "type 列反映访问路径的代价层级",
+      "content": "type 列是 EXPLAIN 最核心的列之一，它描述优化器为这张表选择的访问方式，从快到慢大致为：\n\n- **system/const**：表最多一行或通过主键/唯一索引精确匹配一行，直接取值，代价极低。\n- **eq_ref**：JOIN 中被驱动表用主键或唯一索引关联，每次匹配一行。\n- **ref**：用普通索引做等值匹配，可能返回多行（如非唯一索引匹配同一个值）。\n- **range**：索引范围扫描（BETWEEN、>、<、IN 等），只扫索引的一个范围段。\n- **index**：全索引扫描，比 ALL 好在只读索引树不回表，但仍然遍历整个索引。\n- **ALL**：全表扫描，逐行读取，数据量大时性能最差。\n\n但不能机械地按等级判断好坏。ref 在低选择性字段上可能返回大量行，range 在大范围上扫描行数可能逼近 ALL。关键看 rows 和 filtered 的乘积——即优化器估算需要处理多少行数据。type = ALL 但 rows = 100 的小表，未必比 type = range 但 rows = 500000 的查询慢。"
+    },
+    {
+      "type": "explain",
+      "title": "索引命中的真实判断标准",
+      "content": "很多人看到 key 非空就觉得用了索引，但判断索引是否真正有效要看三个维度：\n\n**1. possible_keys vs key**：possible_keys 是优化器认为可能用到的候选索引，key 是最终选择的索引。key 为空说明优化器认为所有候选都不划算（选择性太差、统计信息不准、或全表扫描更快）。key 有值但 rows 很大，说明索引命中了但扫描范围很宽。\n\n**2. 回表成本**：二级索引（非聚簇索引）命中的行都需要回表到聚簇索引取完整行数据。rows = 10000 意味着可能 10000 次回表随机 IO，这比全表扫描 10000 行更慢——因为全表扫描是顺序 IO。这就是为什么高选择性的索引才值得建：选择性低时回表代价可能比全表扫描还高，优化器会主动放弃索引。\n\n**3. 覆盖索引**：如果查询的列全部在索引中（Using index），不需要回表，这是最理想的索引利用方式。Extra 中出现 Using index 表示覆盖索引生效。Using where 表示 Server 层还需要额外过滤（存储引擎返回的行不满足所有条件）。两者可以同时出现：覆盖索引 + Server 层过滤。"
+    },
+    {
+      "type": "explain",
+      "title": "Extra 列是额外成本的信号灯",
+      "content": "Extra 列告诉你查询除了读数据之外还做了什么额外操作，这几个出现频率最高：\n\n**Using index（覆盖索引）**：查询所需列全部在索引中，不需要回表。这是好事，但要注意覆盖索引会让索引更宽，写入成本更高。\n\n**Using where**：存储引擎返回的行不完全满足 WHERE 条件，Server 层需要再过滤一次。通常发生在索引只能部分过滤的场景。\n\n**Using filesort**：ORDER BY 无法利用索引有序性，需要额外排序操作。不一定很差——小数据集（几百行）的 filesort 在内存中瞬间完成，几百万行的 filesort 才是真正的问题。判断标准是排序数据量和 sort_buffer_size 是否够用。\n\n**Using temporary**：GROUP BY 或 DISTINCT 需要临时表来去重或聚合。临时表可能在内存（tmp_table_size 内）或磁盘（超限后落盘），磁盘临时表性能很差。\n\n**Using index condition（索引条件下推/ICP）**：MySQL 5.6+ 的优化，把部分 WHERE 条件下推到存储引擎层在索引上过滤，减少回表次数。这是好信号，说明索引的前缀列已经定位了范围，剩余条件在索引层就过滤了。"
+    },
+    {
+      "type": "explain",
+      "title": "联合索引设计要同时考虑过滤、排序和覆盖",
+      "content": "联合索引的列顺序不是随意排的，核心原则是：**等值过滤列在前、范围过滤列在后、排序列最后**。这是因为 B+ 树按索引列从左到右有序：等值条件精确匹配前缀列后，后面的列才能利用有序性做范围扫描或排序。\n\n比如 `WHERE user_id = 7 AND status = 'PAID' ORDER BY created_at DESC`，理想索引是 `(user_id, status, created_at)`。user_id 等值 → status 等值 → created_at 排序，三个操作都在索引层完成，无需 filesort 和回表（如果只查索引中的列）。\n\n如果改成 `WHERE user_id > 100 AND status = 'PAID'`，索引 `(user_id, status)` 中 user_id 是范围查询，status 无法利用索引有序性做等值过滤——范围之后的列在 B+ 树中不再有序。这时候 status 只能在 Server 层 Using where 过滤。\n\n另一个常犯错误是把低选择性列（如 status 只有 3 个值）放在联合索引最前面。低选择性列筛选效果差，B+ 树前缀区分度低，后续列和回表效率都不会好。"
+    },
+    {
+      "type": "compareTable",
+      "title": "EXPLAIN 关键字段的机制、价值与易错点",
+      "content": "| 字段 | 机制含义 | 优化判断价值 | 常见误区 |\n| --- | --- | --- | --- |\n| type | 访问方式（const → eq_ref → ref → range → index → ALL） | 判断是否全表扫描或索引范围扫描 | 机械按等级排序，忽略 rows 实际扫描量 |\n| possible_keys | 优化器认为可用的候选索引列表 | 帮助理解为什么没选某个索引 | 当作实际使用的索引 |\n| key | 优化器最终选择的索引 | 确认索引是否符合预期 | key 非空就认为优化到位，忽略 rows 和回表 |\n| rows | 优化器估算的扫描行数 | 估算优化收益大小（× filtered） | 当作精确值，忽略统计信息陈旧偏差 |\n| filtered | 按 WHERE 条件过滤后保留的行百分比 | rows × filtered = 返回给 Server 层的估算行数 | 只看 rows 不看 filtered |\n| Extra | 额外操作信号（filesort/temporary/Using index/Using where/ICP） | 定位排序、临时表、覆盖索引等额外成本 | 看到 Using filesort 就恐慌，不结合数据量判断 |\n| key_len | 使用索引的字节长度 | 判断联合索引前缀被用了几列 | 不理解字符集和 NULLABLE 对长度的影响 |"
+    },
+    {
+      "type": "code",
+      "title": "EXPLAIN 实战：联合索引与回表分析",
+      "language": "sql",
+      "content": "-- 场景：订单表，假设索引有 (user_id), (user_id, status, created_at)\n-- 目标查询\nEXPLAIN SELECT id, user_id, status, created_at\nFROM orders\nWHERE user_id = 7 AND status = 'PAID'\nORDER BY created_at DESC\nLIMIT 20;\n\n-- 如果 EXPLAIN 显示 type=ref, key=(user_id, status, created_at),\n-- Extra=Using index → 覆盖索引生效，无需回表，无 filesort\n-- 这是最理想的情况\n\n-- 对比：只用 (user_id) 索引\nEXPLAIN SELECT id, user_id, status, created_at\nFROM orders\nWHERE user_id = 7 AND status = 'PAID'\nORDER BY created_at DESC\nLIMIT 20;\n-- type=ref, key=(user_id), Extra 可能出现 Using where; Using filesort\n-- 因为 (user_id) 索引只过滤了 user_id，status 在 Server 层过滤，\n-- created_at 排序无法利用索引有序性，需要 filesort\n\n-- key_len 判断联合索引用了几列\n-- 假设 user_id BIGINT(8) NOT NULL, status VARCHAR(20) utf8mb4 NULL\n-- key_len = 8 → 只用了 user_id\n-- key_len = 8 + 20*4+1+2 = 89 → 用了 user_id + status\n-- key_len 中 +1 是 NULL 标记，+2 是 VARCHAR 长度前缀",
+      "highlights": [
+        {
+          "line": 5,
+          "note": "联合索引 (user_id, status, created_at) 能同时覆盖 WHERE 等值过滤和 ORDER BY 排序。"
+        },
+        {
+          "line": 14,
+          "note": "只用 (user_id) 索引时，status 无法利用索引，created_at 排序走 filesort。"
+        },
+        {
+          "line": 21,
+          "note": "key_len 是判断联合索引实际被利用了几列的关键指标。"
+        }
+      ]
+    },
+    {
+      "type": "explain",
+      "title": "索引失效的隐式陷阱和改写技巧",
+      "content": "有索引但不走索引，最常见的原因是隐式类型转换和函数包裹。WHERE 条件中对索引列做函数调用（如 `WHERE DATE(created_at) = '2024-01-01'`）或隐式类型转换（如 varchar 列用数字查询 `WHERE phone = 13800138000`），会导致索引失效，因为索引树的有序性建立在原始值上，函数或转换后的值无法在索引树上定位。\n\n改写方式：把函数移到常量侧。`WHERE DATE(created_at) = '2024-01-01'` → `WHERE created_at >= '2024-01-01 00:00:00' AND created_at < '2024-01-02 00:00:00'`，这样 created_at 索引可以做 range 扫描。\n\n另一个常见问题是深分页。`LIMIT 1000000, 20` 会扫描前 1000020 行再丢弃前 100 万行，即使走了索引也极慢。改写方式：延迟关联（先用覆盖索引查出 id，再用 id 回表取完整行）或游标分页（`WHERE id > last_id LIMIT 20`）。"
     },
     {
       "type": "diagram",
@@ -51,69 +96,25 @@
       ]
     },
     {
-      "type": "compareTable",
-      "title": "EXPLAIN 关键字段",
-      "columns": [
-        "考点",
-        "机制含义",
-        "面试要点",
-        "常见误区"
-      ],
-      "rows": [
-        [
-          "type",
-          "访问方式",
-          "是否全表扫描或范围扫描",
-          "只按等级绝对判断"
-        ],
-        [
-          "key",
-          "实际使用索引",
-          "索引是否符合预期",
-          "只看 possible_keys"
-        ],
-        [
-          "rows",
-          "预计扫描行数",
-          "优化收益大小",
-          "忽略统计误差"
-        ],
-        [
-          "Extra",
-          "排序/临时表/覆盖",
-          "定位额外成本",
-          "看到 filesort 就恐慌"
-        ]
-      ]
-    },
-    {
-      "type": "code",
-      "title": "EXPLAIN 分析入口",
-      "language": "sql",
-      "content": "EXPLAIN SELECT id, user_id, created_at\nFROM orders\nWHERE user_id = 7 AND status = 'PAID'\nORDER BY created_at DESC\nLIMIT 20;",
-      "highlights": [
-        {
-          "line": 1,
-          "note": "EXPLAIN 用来观察访问类型、使用索引、扫描行数和是否出现 filesort/temporary。"
-        }
-      ]
-    },
-    {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "EXPLAIN 优化我会按“慢日志取证、执行计划解释、索引或 SQL 调整、复测验证”来讲。\n\n我会按这条线展开：\n1. 先从慢日志确认耗时、频率、扫描行数、返回行数和调用链路，避免只优化偶发 SQL。\n2. 再读 EXPLAIN 的 type、key、rows、filtered、Extra：type 看访问方式，key 看实际索引，rows/filtered 看估算数据量，Extra 看回表、排序、临时表和覆盖索引。\n3. 如果 where 条件没有走到合适索引，要检查联合索引最左前缀、隐式类型转换、函数包裹字段、选择性和统计信息。\n4. 修改后必须复测同一 SQL 的执行计划、耗时、扫描行数和业务指标；新增索引还要评估写入成本和索引维护成本。\n\n最后补一句边界：不要把“用了索引”等同于“已经优化”。低选择性索引、大量回表、深分页、排序临时表或统计信息偏差，都可能让看似命中的索引仍然很慢。",
+      "content": "EXPLAIN 优化我会按「慢日志取证 → 执行计划解读 → 索引/SQL 调整 → 复测验证」的闭环来讲：\n\n**1. 慢日志取证**\n- 先确认慢 SQL 的真实耗时、执行频率、扫描行数和返回行数，排除偶发问题和锁等待干扰\n- 记录 SQL 文本、调用方和业务上下文\n\n**2. 执行计划解读**\n- **type**：看访问方式，ALL 是全表扫描，range/ref 看索引利用程度\n- **key**：确认实际选中的索引是否符合预期（区别于 possible_keys 的候选列表）\n- **rows × filtered**：估算实际需要处理的数据量，这是成本的核心指标\n- **Extra**：Using filesort（排序没走索引）、Using temporary（临时表）、Using index（覆盖索引）、Using where（Server 层过滤）、Using index condition（ICP）\n- **key_len**：判断联合索引被利用了几列\n\n**3. 针对性调整**\n- type=ALL 且 rows 大 → 检查 WHERE 条件、补联合索引、修复隐式转换/函数包裹\n- 回表多（Using where 无 Using index）→ 覆盖索引或减少 SELECT 列\n- Using filesort → 让 ORDER BY 列加入联合索引\n- 深分页 → 延迟关联或游标分页\n- 联合索引顺序：等值列在前、范围列在后、排序列最后\n\n**4. 复测验证**\n- 对比优化前后的 EXPLAIN（type/key/rows/Extra 变化）\n- 线上慢日志扫描行数和执行时间对比\n- 新增索引评估写入成本、存储空间和变更窗口\n\n**关键边界**：「用了索引」≠「已经优化」。低选择性索引回表代价可能比全表扫描更高，优化器会主动放弃；统计信息陈旧可能导致执行计划偏差；Using filesort 在小数据量下不是问题。",
       "followUpQuestions": [
         {
-          "question": "possible_keys 有索引但 key 为空说明什么？",
-          "answer": "说明优化器认为候选索引不划算或条件无法有效使用索引，可能是选择性差、函数/隐式转换、统计信息问题或返回数据比例太高。"
+          "question": "possible_keys 有索引但 key 为空，说明什么？",
+          "answer": "优化器认为所有候选索引都不划算，可能原因包括：字段选择性太低（如 status 只有 3 个值）、WHERE 条件有隐式类型转换或函数包裹导致无法使用索引、统计信息陈旧导致成本估算偏差、或者返回数据占表的比例很高（通常超过 20-30%），此时全表扫描反而比回表更快。"
         },
         {
           "question": "Using index 和 Using where 有什么区别？",
-          "answer": "Using index 通常表示覆盖索引即可返回所需列；Using where 表示还需要在存储引擎返回后做条件过滤，两者关注点不同。"
+          "answer": "Using index 表示覆盖索引，查询所需列全部在索引中，不需要回表取聚簇索引的完整行。Using where 表示存储引擎返回的行不完全满足 WHERE 条件，Server 层需要再过滤一次。两者可以同时出现：索引覆盖了 SELECT 列但部分 WHERE 条件在索引层无法完全过滤。"
         },
         {
-          "question": "一个订单查询走了 user_id 索引但仍然很慢，你会怎么判断是不是索引设计问题？",
-          "answer": "我会先看 rows、filtered 和 Extra，确认扫描量、回表量、排序和临时表；再检查 where user_id/status 与 order by created_at 是否能由同一个联合索引覆盖。若查询只取少量列，可以评估 (user_id, status, created_at) 联合索引或覆盖索引；如果返回比例很高，索引未必划算，还要看数据分布和统计信息。"
+          "question": "走了 user_id 索引但查询仍然慢，怎么判断是不是索引设计问题？",
+          "answer": "先看 rows 和 filtered：rows 大说明 user_id 匹配的行很多（选择性差或数据分布偏斜），rows × filtered = 实际处理量。再看 Extra：是否出现 Using filesort（排序没走索引）和 Using where（回表后过滤）。然后检查 key_len 确认联合索引前缀用了几列。如果查询是 `WHERE user_id = 7 AND status = 'PAID' ORDER BY created_at DESC`，`(user_id)` 索引只能过滤 user_id，status 和排序都在 Server 层做。改为联合索引 `(user_id, status, created_at)` 可以在索引层完成过滤+排序+覆盖，消除 filesort 和回表。"
+        },
+        {
+          "question": "深分页 LIMIT 1000000, 20 怎么优化？",
+          "answer": "两种改写方式：(1) 延迟关联——先用覆盖索引查出 id：`SELECT id FROM orders WHERE user_id = 7 ORDER BY created_at DESC LIMIT 1000000, 20`，再用 id 回表取完整行，覆盖索引扫描比回表快得多；(2) 游标分页——`WHERE id > last_seen_id AND user_id = 7 ORDER BY created_at DESC LIMIT 20`，利用上一页最后一条记录的 id 做条件，避免跳过大量行。"
         }
       ]
     },
@@ -121,32 +122,49 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能读 type/key/rows/Extra",
-        "能识别全表扫描",
-        "能解释 filesort/temporary",
-        "能设计联合索引",
-        "能复测优化效果"
+        "能读 type/key/rows/filtered/Extra/key_len 各列并解释其优化判断价值",
+        "能区分 possible_keys（候选）和 key（实际选择）的含义差异",
+        "能识别全表扫描（type=ALL）、回表过多和 Using filesort 的优化信号",
+        "能根据 WHERE/ORDER BY/GROUP BY 设计联合索引并说明列顺序原则",
+        "能解释隐式类型转换、函数包裹、统计信息陈旧导致索引失效的机制",
+        "能说明 Using index/Using where/Using filesort/Using temporary/ICP 的区别",
+        "能用延迟关联或游标分页优化深分页问题",
+        "能用 EXPLAIN 对比 + 慢日志 + 业务延迟闭环验证优化收益"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "database.mysql-core.sql-explain-optimization.recall.1",
-      "prompt": "请说明 EXPLAIN 中 type、key、rows、Extra 分别怎么看。",
+      "prompt": "请说明 EXPLAIN 中 type、key、rows、filtered、Extra 分别怎么看，以及 key_len 的作用。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "database.mysql-core.sql-explain-optimization.recall.2",
-      "prompt": "一个慢 SQL 你会如何从慢日志定位到索引优化？",
+      "prompt": "一个慢 SQL 从慢日志定位到索引优化的完整流程是什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "database.mysql-core.sql-explain-optimization.recall.3",
-      "prompt": "为什么“用了索引”仍然可能很慢，并说明关键机制和边界条件。",
+      "prompt": "为什么「用了索引」仍然可能很慢？请从回表成本、选择性和统计信息三个角度说明。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "database.mysql-core.sql-explain-optimization.recall.4",
+      "prompt": "联合索引 (user_id, status, created_at) 对应的查询是 `WHERE user_id = 7 AND status = 'PAID' ORDER BY created_at DESC`。如果只建了 (user_id) 索引，EXPLAIN 会显示什么？改为联合索引后会怎么变？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "database.mysql-core.sql-explain-optimization.recall.5",
+      "prompt": "LIMIT 1000000, 20 的深分页为什么慢？你会怎么改写？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -154,20 +172,22 @@
   ],
   "rubric": {
     "mustHave": [
-      "能解释 type、key、rows、filtered、Extra 各自对应的优化证据",
-      "能根据 where、order by、limit 和返回列判断联合索引顺序",
-      "能区分 possible_keys、key、Using index、Using where、Using filesort 的含义",
-      "能用复测执行计划、慢日志、扫描行数和业务延迟验证优化收益"
+      "能解释 type 各级别（const/eq_ref/ref/range/index/ALL）的访问路径含义和适用场景",
+      "能根据 WHERE/ORDER BY/GROUP BY 设计联合索引并说明等值在前、范围在后、排序最后的列顺序原则",
+      "能区分 possible_keys（候选）和 key（实际选择）、Using index（覆盖）和 Using where（Server 层过滤）的含义差异",
+      "能用 EXPLAIN 对比 + 慢日志扫描行数 + 业务延迟指标闭环验证优化收益"
     ],
     "goodToHave": [
-      "能识别隐式转换、函数包裹字段、统计信息陈旧导致的索引失效",
-      "能说明覆盖索引、游标分页、查询拆分和更新统计信息的适用边界",
-      "能评估新增索引对写入、存储和线上变更窗口的影响"
+      "能识别隐式类型转换、函数包裹字段导致索引失效的机制和改写方式",
+      "能说明覆盖索引、延迟关联、游标分页的适用场景和边界",
+      "能用 key_len 判断联合索引被利用了几列，并理解 NULLABLE 和字符集对长度的影响",
+      "能评估新增索引对写入性能、存储空间和变更窗口的影响"
     ],
     "commonMistakes": [
-      "只看 key 非空就认为 SQL 已经优化",
-      "看到 Using filesort 就直接判定索引错误，不结合数据量和排序方式",
-      "只说加索引，不说明联合索引顺序、回表成本和复测指标"
+      "看到 key 非空就认为索引命中且优化到位，忽略 rows 大、回表多和选择性差的问题",
+      "看到 Using filesort 就判定索引设计错误，不结合数据量判断（小数据集 filesort 可忽略）",
+      "只说「加索引」，不说明联合索引列顺序、回表成本和写入影响",
+      "把 possible_keys 当作实际使用的索引，分不清候选和实际选择的区别"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -176,5 +196,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

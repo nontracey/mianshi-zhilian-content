@@ -4,7 +4,7 @@
   "category": "js-fundamentals",
   "group": "js-fundamentals",
   "title": "浏览器渲染流程",
-  "summary": "讲清浏览器渲染流水线、重排/重绘/合成的触发与性能差异、transform 动画为何流畅，以及布局抖动等性能坑。",
+  "summary": "讲清浏览器渲染流水线七步（DOM→CSSOM→渲染树→布局→分层→绘制→合成）的因果关系、CSS 阻塞渲染和同步 script 阻塞解析的原因、重排/重绘/合成三级回退机制的性能差异、transform/opacity 动画只走合成线程不卡的原因、布局抖动（强制同步布局）的触发条件和修复手段、will-change 滥用导致层爆炸的风险，以及如何用 Performance/Layers 面板定位渲染性能问题。",
   "tags": [
     "浏览器",
     "渲染",
@@ -13,19 +13,39 @@
     "性能"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 34,
   "order": 35,
   "recommendWeight": 85,
   "learningCards": [
     {
       "type": "explain",
-      "title": "浏览器渲染流程：渲染流水线",
-      "content": "从字节流到像素上屏的完整流水线：\n1. 解析 HTML → DOM 树。解析是流式的，遇到同步 `<script>` 会暂停（JS 可能改 DOM），这是 defer/async 存在的原因。\n2. 解析 CSS → CSSOM 树。CSSOM 不完整就无法确定任何节点的最终样式，所以 CSS 会阻塞渲染（但不阻塞 DOM 解析）。\n3. DOM + CSSOM → 渲染树（Render Tree）：只包含可见节点，`display: none` 的子树不进渲染树（而 `visibility: hidden` 占位、仍在树中）。\n4. 布局（Layout/Reflow）：从渲染树根节点递归计算每个节点的几何信息（位置、尺寸）。任何影响几何的改动都会让这一步重跑。\n5. 分层（Layer）：transform 3D、will-change、video 等会提升为独立合成层，层之间互不连累。\n6. 绘制（Paint）：把每层的视觉效果转成绘制指令列表，由光栅化线程生成位图。\n7. 合成（Composite）：合成线程把各层位图按层级、变换拼装后交给 GPU 上屏——这一步不经过主线程。"
+      "title": "渲染流水线：从字节流到像素上屏的七步因果链",
+      "content": "浏览器把 HTML 字节流变成屏幕像素，是一条不可跳跃的流水线，每一步的输入都依赖上一步的输出：\n\n**1. 解析 HTML → DOM 树**\nHTML 是流式解析：边下载边构建。但遇到同步 `<script>` 会暂停——因为 JS 可能调用 `document.write` 修改尚未构建完的 DOM，浏览器必须等 JS 下载并执行完再继续。`defer` 让脚本在 DOM 解析完后按顺序执行；`async` 在下载完就执行（不等 DOM，不保顺序）。\n\n**2. 解析 CSS → CSSOM 树**\nCSS 不阻塞 DOM 解析（DOM 可以继续建），但阻塞渲染——因为浏览器必须知道所有样式才能确定哪些节点可见、样式是什么，才能构建渲染树。CSS 还阻塞后续 JS 执行：如果 `<script>` 前面有未加载完的 CSS，JS 也要等（因为 JS 可能读 `getComputedStyle`）。这就是为什么 CSS 放 `<head>` 尽早加载，避免 FOUC（无样式闪烁）。\n\n**3. DOM + CSSOM → 渲染树（Render Tree）**\n只包含「要画出来」的节点：`display: none` 整棵子树不进渲染树；`visibility: hidden` 仍在树中（占位，只是不画）；`opacity: 0` 也在树中（可交互、占位）。伪元素 `::before` / `::after` 作为渲染树节点存在但没有对应的 DOM 节点。\n\n**4. 布局（Layout / Reflow）**\n从渲染树根节点递归计算每个节点的几何信息：位置（x, y）、尺寸（width, height）、margin/padding/border。CSS 盒模型的具体值在这一步确定。任何影响几何属性的改动都会让这一步重跑。\n\n**5. 分层（Layer Promotion）**\\�ntransform: translateZ(0) 或 translate3d、`will-change: transform`、`<video>`、`<canvas>`、`position: fixed`、有 CSS 滤镜的元素等会提升为独立的合成层。层的好处是层内重绘不影响其他层；坏处是每层都占显存，过多层（层爆炸）反而增加合成开销。\n\n**6. 绘制（Paint）**\n把每层的视觉效果转成绘制指令列表（display list），然后由光栅化线程（compositor tile worker）把指令转成位图（tiles），存入 GPU 纹理。主线程生成指令，光栅化可以并行在多个 worker 上进行。\n\n**7. 合成（Composite）**\n合成线程（compositor thread，不在主线程上）把各层的位图 tiles 按 z-index、transform、opacity 拼装，交给 GPU 上屏。这一步完全不经过主线程，所以即使主线程被 JS 长任务占住，合成动画也能继续。"
     },
     {
       "type": "explain",
-      "title": "为什么 transform/opacity 动画不卡",
-      "content": "关键在「这次改动从流水线的哪一级开始重跑」。改 width/position 等几何属性从布局开始重跑（重排，代价最高）；改 color/background 跳过布局、从绘制开始（重绘）；而 transform 和 opacity 只改合成参数——主线程不需要重新布局也不需要重新绘制。由合成线程直接在已有位图上做矩阵变换/透明度混合，所以即使主线程被 JS 长任务占住，这类动画也能保持流畅。两个常见坑：一是「布局抖动」——在循环里交替读（offsetHeight 等强制同步布局的属性）和写样式，会把本应批量的布局打散成 N 次同步重排；二是滥用 will-change 把过多元素提升为合成层，层爆炸反而吃显存、增加合成开销。\n\n举个具体例子：做一个元素移动动画，用 left: 0 到 left: 300px 会每帧触发重排、主线程忙时明显掉帧；改成 transform: translateX(300px) 就只走合成线程、丝滑。验证手段：打开 DevTools 的 Performance 面板录制，重排会看到紫色的 Layout 长条、重绘是绿色 Paint，合成动画则几乎没有主线程活动；还能在 Rendering 面板开 Paint flashing 看哪些区域在重绘、用 Layers 面板看合成层数量是否爆炸。"
+      "title": "三级回退机制：重排、重绘、合成的性能差异",
+      "content": "修改 DOM/CSS 属性时，浏览器不需要每次都跑完七步流水线，而是从「受影响的最早一级」开始重跑。这形成了三级回退：\n\n**重排（Reflow / Layout）：代价最高**\n改 width、height、margin、padding、position、display、float、font-size 等几何属性 → 渲染树可能变化 → 从布局开始重跑 → 后续绘制、合成全部重来。重排的代价不仅是当前元素：浏览器需要检查哪些节点受影响（脏节点标记），然后递归重新计算。在某些情况下，一个元素的位置变化会导致其父节点和兄弟节点全部重新布局（比如 flexbox 容器中一个子元素宽度变化）。\n\n**重绘（Repaint / Paint）：跳过布局**\n改 color、background-color、box-shadow、visibility、border-radius 等外观属性但不影响几何 → 跳过布局，从绘制开始重跑 → 仍走主线程生成绘制指令 + 光栅化。重绘的区域越大（比如一个遮罩全屏的元素颜色变化），代价越高。\n\n**合成（Composite）：代价最低**\n改 transform（位移、旋转、缩放）和 opacity → 布局和绘制都不重跑，只更新合成参数 → 由合成线程在已有位图上做矩阵变换和透明度混合 → 不经过主线程。这就是为什么 CSS 动画优先用 transform/opacity。\n\n实际触发比表格复杂：`getComputedStyle().width` 会强制同步布局（后面详说）；`offsetWidth`、`scrollTop` 等属性也会；连续写样式后立刻读几何属性，浏览器可能被迫打断批量写入先做一次布局。"
+    },
+    {
+      "type": "explain",
+      "title": "transform/opacity 动画为什么不卡：合成线程独立于主线程",
+      "content": "关键区别在于改动作用在流水线的哪一级。\n\n用 `left: 0px` → `left: 300px` 做动画：每一帧都改几何属性 → 每一帧都触发重排 → 主线程每帧都做布局+绘制 → 主线程被 JS 长任务占住时排队等 → 掉帧。\n\n用 `transform: translateX(0)` → `transform: translateX(300px)` 做动画：transform 只是合成层上的变换矩阵参数 → 合成线程每帧更新矩阵值 → 主线程什么也不用做 → 即使主线程在执行 5 秒的 JS，动画仍流畅。\n\nopacity 同理：它只是每个合成层像素的透明度参数，合成线程直接混合。要注意 opacity: 0 → 1 会触发 paint（绘制层内容），但之后的帧只改透明度参数。\n\n验证方法：DevTools → Performance 面板录制，`left` 动画会看到每帧紫色 Layout + 绿色 Paint 长条；`transform` 动画几乎没有主线程活动。Rendering 面板 → Paint flashing 开启后，重绘区域会闪绿光。Layers 面板可以查看合成层数量和每层显存占用。"
+    },
+    {
+      "type": "explain",
+      "title": "布局抖动：交替读写引发的强制同步布局",
+      "content": "浏览器会把连续的样式写入批量处理（异步布局），在 JS 执行栈清空或 `requestAnimationFrame` 回调结束时统一做一次布局。但如果你在写样式之后立刻读几何属性，浏览器被迫中断批量、同步执行一次布局来返回正确值——这就是「强制同步布局」（Forced Synchronous Layout / Layout Thrashing）。\n\n典型场景：\n```javascript\n// 布局抖动：N 次同步布局\nfor (const el of elements) {\n    const height = el.offsetHeight;  // 读 → 强制同步布局\n    el.style.width = height * 2 + 'px';  // 写 → 标记脏\n}\n```\n每个循环迭代：写标记脏 → 读迫使浏览器先算出最新布局 → 下次迭代写又标记脏 → 读又迫使布局 → N 次循环 = N 次布局。\n\n修复——读写分离：\n```javascript\n// 先读所有高度（一次布局）\nconst heights = elements.map(el => el.offsetHeight);\n// 再写所有宽度（标记脏，最终批量布局一次）\nelements.forEach((el, i) => { el.style.width = heights[i] * 2 + 'px'; });\n```\n一次读 + 一次写 = 最多 2 次布局。\n\n常见会强制同步布局的属性：`offsetWidth/Height/Top/Left`、`scrollWidth/Height/Top/Left`、`clientWidth/Height/Top/Left`、`getComputedStyle()`、`getBoundingClientRect()`。布局抖动在循环中危害最大——100 个元素就能产生 100 次布局。用 FastDOM 或 `requestAnimationFrame` 批量处理可以缓解。"
+    },
+    {
+      "type": "explain",
+      "title": "will-change 与层爆炸：分层的收益和代价",
+      "content": "`will-change: transform` 告诉浏览器「这个元素马上要改 transform」→ 浏览器提前把它提升为独立合成层 → 后续 transform 动画只走合成线程。好处是动画流畅；代价是每层都需要独立的位图纹理存入 GPU 显存。\n\n一个 1000×1000 的 RGBA 层占 4MB 显存。如果页面上有 50 个这样的层，就是 200MB。Chrome 的 Layers 面板（More tools → Layers）可以看到每个层的尺寸和显存占用。层过多（「层爆炸」）会：\n- 吃光 GPU 显存，导致纹理上传失败或降级到 CPU 光栅化\n- 增加合成开销：合成线程每帧要拼合所有层，层越多越慢\n- 增加光栅化工作量：每层独立光栅化\n\n滥用的典型表现：给列表中每个 item 加 `will-change: transform`（几百个 item → 几百个层）。正确做法：只在动画即将开始时设置 `will-change`，动画结束后移除；或者用 JS 在 animationstart 时添加、animationend 时移除。\n\n`transform: translateZ(0)` 也会强制创建层（「hack 层提升」），同样有层爆炸风险。不要无差别地给元素加这个 hack。"
+    },
+    {
+      "type": "explain",
+      "title": "分层详解：什么元素会成为独立合成层",
+      "content": "除了显式设置 `will-change: transform` 或 `transform: translateZ(0)`，以下条件也会触发层提升：\n\n- 3D transform：`transform: translate3d(...)`、`rotate3d(...)`、`scale3d(...)` 等\n- `<video>`、`<canvas>`、`<iframe>` 元素\n- `position: fixed` 元素（需要独立于滚动容器）\n- CSS 滤镜：`filter`、`backdrop-filter`（非 none 值）\n- 有 CSS 动画/过渡的 `opacity` 或 `transform`（动画运行期间临时提升，结束后降回）\n- 元素的层叠上下文中有合成层（被拉入）\n\n浏览器的层合并优化（Layer Squashing）：为了减少层数，浏览器会把重叠的普通元素合并到同一个层中。但如果某个元素被合成层穿插（比如中间夹了一个 `position: fixed`），穿插区域的普通元素会被迫单独提升，形成「层提升连坐」。这是理解层爆炸的更深层原因。\n\n用 Layers 面板看层树，关注：层数、每层尺寸、是否有意外的层提升。"
     },
     {
       "type": "diagram",
@@ -47,21 +67,53 @@
     },
     {
       "type": "compareTable",
-      "title": "重排 vs 重绘",
-      "content": "| 操作 | 触发条件 | 性能影响 | 优化建议 |\n| --- | --- | --- | --- |\n| 重排(Reflow) | 改变布局属性(width/height/position) | 高（重新计算布局） | 批量读写、使用 transform |\n| 重绘(Repaint) | 改变外观(color/visibility) | 中（跳过布局） | 减少绘制区域 |\n| 合成(Composite) | 改变 transform/opacity | 低（GPU 加速） | 优先使用 |"
+      "title": "重排 vs 重绘 vs 合成：触发、代价与优化",
+      "content": "| 维度 | 重排 (Reflow) | 重绘 (Repaint) | 合成 (Composite) |\n| --- | --- | --- | --- |\n| 触发属性 | width/height/margin/padding/position/display/font-size/flex | color/background/box-shadow/visibility/border-radius | transform/opacity |\n| 重跑起点 | 布局（Layout） | 绘制（Paint） | 合成（Composite） |\n| 是否经过主线程 | 是（布局+绘制都在主线程） | 是（绘制在主线程） | 否（合成线程独立） |\n| 影响范围 | 可能波及兄弟/父节点 | 当前层的绘制区域 | 只改合成参数 |\n| 优化建议 | 批量读写、读写分离、用 transform 替代 top/left | 减少绘制区域、用 contain 限制影响范围 | 优先用于动画、控制合成层数量 |"
+    },
+    {
+      "type": "code",
+      "title": "布局抖动的演示与修复",
+      "language": "javascript",
+      "content": "// === 布局抖动（反面）：N 次强制同步布局 ===\nfunction badLayoutThrashing(elements) {\n    for (const el of elements) {\n        // 读 offsetHeight → 浏览器被迫同步布局，返回最新值\n        const height = el.offsetHeight;\n        // 写 style.width → 标记该元素为脏\n        el.style.width = (height * 2) + 'px';\n        // 下次循环又读 offsetHeight → 又一次同步布局\n    }\n    // N 个元素 = N 次布局\n}\n\n// === 读写分离（正面）：最多 2 次布局 ===\nfunction goodBatchReadWrite(elements) {\n    // 批量读（第一次布局就拿到所有值）\n    const heights = elements.map(el => el.offsetHeight);\n    // 批量写（标记脏，最终在 rAF 或微任务结束时统一布局一次）\n    elements.forEach((el, i) => {\n        el.style.width = (heights[i] * 2) + 'px';\n    });\n    // 1 次读布局 + 1 次写后布局 = 最多 2 次\n}\n\n// === 用 FastDOM 库自动读写分离 ===\n// import fastdom from 'fastdom';\n// fastdom.measure(() => {\n//     const h = el.offsetHeight;\n//     fastdom.mutate(() => { el.style.width = h * 2 + 'px'; });\n// });",
+      "highlights": [
+        {
+          "line": 5,
+          "note": "offsetHeight 触发强制同步布局——浏览器必须先完成所有待处理的布局才能返回正确值"
+        },
+        {
+          "line": 14,
+          "note": "先读所有高度，触发一次布局后值被缓存"
+        },
+        {
+          "line": 18,
+          "note": "所有写操作标记脏，浏览器在 rAF 结束时统一做一次布局"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：浏览器把字节流变成屏幕像素是一条流水线：HTML 到 DOM、CSS 到 CSSOM，合成渲染树，再 布局、分层、绘制、合成。理解性能优化的关键是知道「一次改动从流水线哪一级开始重跑」。\n\n流水线：\n\n1. 解析 HTML 建 DOM（流式，遇同步 script 暂停，所以有 defer/async）。\n2. 解析 CSS 建 CSSOM（CSS 阻塞渲染、不阻塞 DOM 解析）。\n3. DOM 加 CSSOM 合成渲染树（只含可见节点，display:none 不进，visibility:hidden 占位仍在）。\n4. 布局 Layout/Reflow：算每个节点的位置尺寸。\n5. 分层：transform 3D、will-change 等提升为独立合成层。\n6. 绘制 Paint：转成绘制指令、光栅化成位图。\n7. 合成 Composite：合成线程拼装各层位图交 GPU 上屏，不经主线程。\n\n重排/重绘/合成（必考）：改 width、position 等几何属性从布局开始重跑（重排，最贵）；改 color、background 跳过布局从绘制开始（重绘）；改 transform、opacity 只改合成参数，由合成线程直接做，主线程被 JS 占住也不卡——这就是为什么动画优先用 transform/opacity。\n\n两个坑。① 布局抖动：循环里交替读 offsetHeight（强制同步布局）和写样式，把批量布局打散成 N 次重排，要读写分离。② 滥用 will-change 导致层爆炸、吃显存。",
+      "content": "**一句话结论**\n浏览器渲染是七步流水线：DOM+CSSOM → 样式计算 → 渲染树 → 布局 → 分层 → 绘制 → 合成。性能优化的核心是理解「一次属性修改从流水线哪一级开始重跑」：几何属性从布局（重排，最贵），外观属性从绘制（重绘），transform/opacity 只改合成参数（最便宜）。\n\n**流水线七步（按因果顺序）**\n1. 解析 HTML → DOM 树（流式；同步 script 暂停，所以用 defer/async）\n2. 解析 CSS → CSSOM 树（不阻塞 DOM 解析，但阻塞渲染；还阻塞后续 JS 执行）\n3. DOM + CSSOM → 样式计算 → 渲染树（只含可见节点；display:none 不进树，visibility:hidden 仍占位）\n4. 布局（Layout/Reflow）：递归计算每个节点的位置和尺寸\n5. 分层：transform 3D、will-change、video、canvas、position:fixed 等提升为独立合成层\n6. 绘制（Paint）：生成绘制指令列表 → 光栅化成位图\n7. 合成（Composite）：合成线程拼装各层位图交给 GPU——不经过主线程\n\n**三级回退（必讲）**\n- 改几何属性（width/height/position）→ 从布局重跑 → 可能波及兄弟/父节点 → 代价最高\n- 改外观属性（color/background）→ 跳过布局从绘制开始 → 代价中等\n- 改 transform/opacity → 只更新合成参数 → 不经主线程 → 代价最低\n\n**transform 动画为什么流畅**\n用 left/top 做动画 → 每帧重排 → 主线程忙时掉帧。用 transform: translateX() → 合成线程直接更新矩阵 → 主线程被 JS 占住也不卡。opacity 同理。\n\n**两个性能坑**\n1. 布局抖动：循环中交替读 offsetHeight（强制同步布局）和写样式，N 个元素 = N 次布局。修复：读写分离——先批量读再批量写。\n2. will-change 滥用：给过多元素加 will-change 导致层爆炸，每层占显存、增加合成开销。正确做法：动画开始前设置，结束后移除。\n\n**验证手段**\n- Performance 面板：看 Layout（紫色）和 Paint（绿色）的频率和耗时\n- Rendering → Paint flashing：重绘区域闪绿光\n- Layers 面板：看合成层数量、每层显存、是否有意外层提升",
       "followUpQuestions": [
         {
-          "question": "回流和重绘有什么区别，哪个代价更高？",
-          "answer": "回流会重新计算布局，通常会触发布局树变化；重绘只更新视觉样式。回流影响范围更大，代价通常更高，应减少频繁读写布局。"
+          "question": "CSS 会阻塞 DOM 解析吗？JS 会阻塞渲染吗？各自的阻塞关系是什么？",
+          "answer": "CSS 不阻塞 DOM 解析（DOM 可以继续构建），但阻塞渲染（必须等 CSSOM 完整才能建渲染树）。CSS 还会阻塞后续 JS 执行——因为 JS 可能读 getComputedStyle，浏览器必须保证样式已计算完。同步 JS 既阻塞 DOM 解析（可能改 DOM）也阻塞渲染。async JS 不阻塞解析也不阻塞渲染（但执行时可能阻塞）。defer JS 不阻塞解析、在 DOM 解析完后执行。"
         },
         {
-          "question": "你如何定位一个页面滚动卡顿问题？",
-          "answer": "先用 Performance 面板看长任务、布局和绘制耗时，再检查滚动监听、同步布局读取、大量 DOM、图片解码和合成层。优化时减少主线程阻塞并控制重排。"
+          "question": "什么情况下一个元素改宽度会导致其他元素重排？",
+          "answer": "在 flexbox 容器中，一个子元素的 flex-basis 变化会导致其他子元素重新分配空间；在 BFC 中，一个浮动元素宽度变化会影响后续元素的环绕布局；在 grid 容器中，改变一个格子的内容可能导致行高/列宽变化影响整行/整列。浏览器通过脏节点标记和影响范围计算来尽量缩小重排范围，但无法完全避免传播。"
+        },
+        {
+          "question": "requestAnimationFrame 和 requestIdleCallback 在渲染流水线中分别什么时机执行？",
+          "answer": "requestAnimationFrame 回调在每帧渲染开始前执行——此时布局已完成但绘制尚未开始，适合做 DOM 读写（可以和浏览器的布局同步）。requestIdleCallback 在帧的空闲时间执行——当一帧的渲染和 JS 任务完成后还有剩余时间才执行，适合低优先级任务。rAF 保证每帧执行（可能跨帧延迟），rIdle 不保证及时执行（可能等待多帧）。"
+        },
+        {
+          "question": "如何用 Performance 面板诊断一个动画掉帧问题？",
+          "answer": "打开 DevTools → Performance → 点击录制 → 操作动画 → 停止录制。看 Main 面板的火焰图：如果有长的紫色 Layout 条或绿色 Paint 条，说明动画触发了重排/重绘。看 Frames 面板：红色帧表示掉帧（超过 16.6ms）。如果是合成动画但仍掉帧，看 Layers 面板是否有层爆炸（过多层导致合成线程忙）。用 Rendering → Paint flashing 确认哪些区域在重绘。"
+        },
+        {
+          "question": "visibility:hidden 和 display:none 在渲染树中有什么区别？",
+          "answer": "display:none 的元素不进渲染树——浏览器跳过它及其所有子节点，不占布局空间。visibility:hidden 的元素仍在渲染树中，占据布局空间（位置和尺寸被计算），只是绘制时不画出来。因为 visibility:hidden 仍在渲染树中，改 visibility 会触发重绘但不触发重排（布局已经算好了），而改 display 会触发重排（节点进出渲染树）。"
         }
       ]
     },
@@ -69,62 +121,89 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "DOM 和 CSSOM 的构建过程",
-        "渲染树、布局、分层、绘制的流水线",
-        "重排、重绘、合成的触发条件和性能差异",
-        "关键渲染路径的优化策略"
+        "渲染流水线七步：DOM → CSSOM → 样式计算 → 渲染树 → 布局 → 分层 → 绘制 → 合成，每步的输入输出",
+        "CSS 阻塞渲染但不阻塞 DOM 解析；同步 script 阻塞 DOM 解析；CSS 阻塞后续 JS 执行的原因",
+        "display:none vs visibility:hidden vs opacity:0 在渲染树中的差异",
+        "重排（几何属性）vs 重绘（外观属性）vs 合成（transform/opacity）的触发条件和代价",
+        "transform 动画为什么流畅：只走合成线程，不经过主线程",
+        "布局抖动（强制同步布局）的触发条件：写后立刻读 offsetWidth 等属性，以及读写分离修复",
+        "will-change 的正确用法：动画前设置、结束后移除，避免层爆炸",
+        "能用 Performance/Layers/Paint flashing 面板定位渲染性能问题"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "frontend.js-fundamentals.browser-rendering.recall.1",
-      "prompt": "关键渲染路径（Critical Rendering Path）是什么？如何优化首屏渲染速度？",
+      "prompt": "请完整讲一下浏览器从 HTML 字节流到屏幕像素的渲染流水线，每一步做什么、输入输出是什么。",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
     },
     {
       "id": "frontend.js-fundamentals.browser-rendering.recall.2",
-      "prompt": "什么属性变化会触发重排、重绘和合成？如何用 transform 代替 top/left 优化动画？",
+      "prompt": "什么属性变化会触发重排、重绘和合成？为什么用 transform 做动画比用 left/top 流畅？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
     },
     {
       "id": "frontend.js-fundamentals.browser-rendering.recall.3",
-      "prompt": "requestAnimationFrame 和 requestIdleCallback 在渲染流程中分别在什么时机执行？",
+      "prompt": "什么是布局抖动（Layout Thrashing）？请举一个代码例子说明它为什么会发生、怎么修复。",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 2
+      "difficulty": 3
+    },
+    {
+      "id": "frontend.js-fundamentals.browser-rendering.recall.4",
+      "prompt": "requestAnimationFrame 和 requestIdleCallback 在渲染流水线中分别什么时机执行？各自适合什么场景？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "frontend.js-fundamentals.browser-rendering.recall.5",
+      "prompt": "CSS 会阻塞 DOM 解析吗？JS 会阻塞渲染吗？请理清 CSS、同步 script、defer、async 之间的阻塞关系。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "frontend.js-fundamentals.browser-rendering.recall.6",
+      "prompt": "线上页面有一个列表滚动卡顿，你怎么用 DevTools 定位是重排、重绘还是合成层的问题？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出渲染流水线 DOM/CSSOM 到渲染树到布局到分层绘制合成",
-      "能区分重排、重绘、合成的触发和性能差异",
-      "能解释为什么 transform/opacity 动画不卡（只走合成线程）",
-      "能说明 CSS 阻塞渲染、同步 script 阻塞解析"
+      "能说出渲染流水线七步：DOM → CSSOM → 样式计算 → 渲染树 → 布局 → 分层 → 绘制 → 合成",
+      "能区分重排（几何属性，从布局重跑）、重绘（外观属性，从绘制重跑）、合成（transform/opacity，只改合成参数）的触发和代价",
+      "能解释 transform/opacity 动画不卡的原因：只走合成线程，不经过主线程",
+      "能解释 CSS 阻塞渲染但不阻塞 DOM 解析，同步 script 阻塞 DOM 解析的原因"
     ],
     "goodToHave": [
-      "能解释布局抖动（强制同步布局）及读写分离",
-      "能指出 will-change 滥用导致层爆炸",
-      "能区分 display:none 与 visibility:hidden 在渲染树中的差异"
+      "能解释布局抖动（强制同步布局）的触发条件和读写分离修复",
+      "能说明 will-change 的正确用法和滥用导致层爆炸的风险",
+      "能区分 display:none vs visibility:hidden vs opacity:0 在渲染树中的差异",
+      "能用 Performance/Layers/Paint flashing 面板定位渲染性能问题"
     ],
     "commonMistakes": [
-      "用 left/top 做动画引发重排卡顿",
-      "循环里交替读 offset 和写样式造成布局抖动",
-      "滥用 will-change 提升过多合成层"
+      "用 left/top 做动画触发每帧重排，不知道用 transform 替代",
+      "循环中交替读 offsetHeight 和写样式，导致 N 次强制同步布局",
+      "给列表中每个 item 加 will-change: transform，导致层爆炸吃显存",
+      "混淆 CSS 阻塞关系：以为 CSS 也阻塞 DOM 解析，或以为 async script 等 DOM 解析完才执行"
     ],
     "scoreWeights": {
-      "coverage": 40,
-      "accuracy": 25,
+      "coverage": 25,
+      "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-23",
   "interviewFrequency": "high",
   "status": "production",
-  "interviewerFocus": "考察能否完整说出渲染流水线、区分重排重绘合成、解释 transform 动画走合成线程，并知道布局抖动和 will-change 滥用。"
+  "interviewerFocus": "考察能否按因果顺序完整说出渲染流水线七步、区分三级回退机制（重排/重绘/合成）的触发和代价、解释 transform 动画走合成线程不卡的原因、理清 CSS 和 script 的阻塞关系、识别布局抖动和 will-change 滥用，并能用 DevTools 面板定位渲染性能问题。"
 }

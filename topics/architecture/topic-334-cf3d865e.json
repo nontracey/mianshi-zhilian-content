@@ -4,27 +4,42 @@
   "category": "microservice",
   "group": "microservice",
   "title": "幂等性设计",
-  "summary": "保证同一请求多次执行结果一致，是分布式系统的基础能力",
+  "summary": "保证同一请求多次执行结果一致，核心是幂等键 + 去重判定 + 原子执行三层设计，需根据插入/更新/状态流转选不同方案，高并发下要解决幂等校验与业务操作的原子性问题。",
   "tags": [
     "架构设计",
     "微服务设计",
     "幂等性"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 26,
   "order": 70,
   "recommendWeight": 95,
   "status": "production",
   "learningCards": [
     {
       "type": "explain",
-      "title": "幂等性设计：什么是幂等性、为什么需要幂等性",
-      "content": "## 一、什么是幂等性\n\n幂等性是指同一个请求执行一次和执行多次的效果完全相同。在分布式系统中，网络超时、重试、消息重复投递等场景下，幂等性是保证数据一致性的基础。\n\n## 二、为什么需要幂等性\n\n- **网络超时重试**：请求发出后超时，客户端重试，服务端可能已执行\n- **消息重复消费**：MQ可能重复投递消息\n- **用户重复提交**：用户快速点击按钮多次\n- **分布式事务回滚重试**：TCC等模式的重试机制\n\n## 三、幂等性实现方案\n\n### 3.1 Token机制\n```\n1. 客户端先获取唯一token\n2. 提交请求时携带token\n3. 服务端校验token存在则执行，执行后删除token\n4. 重复请求时token已不存在，直接返回成功\n```"
+      "title": "幂等性是什么、为什么分布式系统离不开它",
+      "content": "幂等性指同一操作执行一次和执行多次的最终效果相同。注意是最终效果相同——第一次可能返回成功，后续重复返回已有结果，但系统状态不会因为重复执行而多变。\n\n分布式系统中重复几乎不可避免：网络超时后客户端不知道服务端是否已执行，只能重试；MQ 为了 at-least-once 投递语义会重复发消息；用户快速双击按钮会提交两次；TCC 等分布式事务模式的补偿和重试本身就意味着同一个操作可能被执行多次。\n\n如果不做幂等，最直接的后果就是重复扣款、重复下单、库存多扣、积分多加。这些问题在单体系统里通过数据库事务就能避免，但分布式系统中请求链路跨多个服务，本地事务保护不了端到端的一致性，所以幂等成了基础设施级能力。\n\n设计幂等的核心思路分两步：第一，识别哪次请求是重复的（幂等键）；第二，保证重复请求不会产生新的副作用（去重判定 + 原子执行）。这两步缺一不可——光有幂等键不去重没用，去重和业务操作不原子也会出问题。"
     },
     {
       "type": "explain",
-      "title": "幂等性设计：唯一索引、状态机",
-      "content": "### 3.2 唯一索引\n利用数据库唯一索引约束，重复插入会报错。\n```sql\n-- 订单表：用户+商品+时间戳 唯一索引\nCREATE UNIQUE INDEX idx_order_unique \nON orders(user_id, product_id, create_time);\n```\n\n### 3.3 状态机\n业务状态只能单向流转，重复操作不会改变状态。\n```java\n// 订单状态：待支付 → 已支付 → 已发货\n// 重复支付时检查状态已是\"已支付\"，直接返回\nif (order.getStatus() == OrderStatus.PAID) {\n    return \"already paid\";\n}\n```\n\n### 3.4 乐观锁\n```sql\nUPDATE stock SET count = count - 1, version = version + 1 \nWHERE product_id = ? AND version = ?;\n```\n\n### 3.5 去重表\n```sql\n-- 请求去重表\nCREATE TABLE request_dedup (\n    request_id VARCHAR(64) PRIMARY KEY,\n    result TEXT,\n    created_at TIMESTAMP\n);\n-- 先查去重表，存在则返回缓存结果\n```"
+      "title": "幂等键的选择与生命周期",
+      "content": "幂等键是识别重复请求的唯一标识，选错了整个方案就废了。常见选择有：\n\n- 业务唯一键：如订单号 `orderNo`、交易流水号 `transId`、支付单号。优点是天然唯一、业务可理解；缺点是同一个业务键可能对应多次合法请求（比如同一订单退款两次，退款操作本身需要一个额外的请求 ID）。\n- 请求级唯一 ID：如 `requestId`（UUID 或雪花算法生成），每次请求一个。优点是粒度最细；缺点是生成和传递链路要规范，漏传或不一致会导致去重失败。\n- 消息 ID：MQ 的 `messageId`，用于消费幂等。注意有些 MQ（如 RocketMQ）支持 Exactly-Once 投递，但大多数场景仍需消费端做幂等。\n\n幂等键的生命周期决定去重窗口：Token 机制里 token 用完即删；去重表里记录可以设 TTL 保留一段时间；状态机里的终态是永久的。窗口太短，长链路重试可能过期后重复执行；窗口太长，存储膨胀。实践中支付场景的去重记录通常保留 7-30 天，和账单对账周期对齐。\n\n幂等键的传递也要端到端保证：前端生成的 requestId 要在网关、服务间调用、MQ 消息中完整透传，任何一个环节丢失都会导致幂等失效。所以在 API 规范里要显式定义幂等键字段，并在网关层统一校验。"
+    },
+    {
+      "type": "explain",
+      "title": "五种实现方案的机制与适用边界",
+      "content": "**Token 机制**：客户端先请求服务端获取一个一次性 token（存入 Redis，设 TTL），提交业务时带上 token，服务端用 Redis 的 `DELETE` 或 Lua 脚本做 check-and-delete，删除成功才执行业务。适合表单防重、前端按钮防重复提交。局限是需要额外的 token 获取请求，token 有效期管理有成本，分布式环境下 Redis 和业务 DB 之间不是天然一致——token 删了但业务执行失败，需要补偿或 token 回退。\n\n**唯一索引**：在数据库建唯一索引，重复插入时抛 `DuplicateKeyException`，catch 后返回已有结果即可。这是最简单可靠的方案，适合插入类操作。局限是只适用于 INSERT，不适用于 UPDATE；重复时只能返回\"已存在\"，不能返回之前的结果（除非再查一次）；唯一索引列选择要谨慎，复合索引的列组合必须真正唯一。\n\n**状态机**：业务状态只允许单向流转（如待支付 → 已支付 → 已发货），重复操作时先检查当前状态，已经是目标状态就直接返回。适合有明确生命周期的业务实体。局限是需要业务有清晰的状态定义；状态检查和状态更新必须原子（通常用 `UPDATE ... WHERE status = ?` 的方式实现行级乐观锁）。\n\n**乐观锁**：用 version 字段做 `UPDATE ... WHERE id = ? AND version = ?`，version 不匹配则更新 0 行，说明已被其他请求修改。适合更新类操作。局限是冲突率高时重试频繁，影响吞吐；只能保证不重复更新，不保证\"返回相同结果\"——如果业务需要返回上次结果，还要额外查询。\n\n**去重表**：建一张以请求 ID 为主键的表，业务执行前先 INSERT 去重记录（利用主键唯一性），成功才执行业务，结果也写入去重记录。重复请求直接查去重表返回缓存结果。这是最通用的方案，适合各种操作。局限是去重表本身要和业务在同一个事务中，否则可能出现去重记录写入但业务失败，或业务成功但去重记录未写入。"
+    },
+    {
+      "type": "explain",
+      "title": "并发场景下的原子性问题",
+      "content": "幂等设计最容易出 bug 的地方不是方案选择，而是幂等校验和业务操作之间的原子性。考虑这个时序：\n\n1. 请求 A 查去重表，发现没有记录\n2. 请求 B 查去重表，发现没有记录（A 还没写入）\n3. 请求 A 执行业务，写入去重记录\n4. 请求 B 执行业务，写入去重记录——重复执行了\n\n解决方案有三种：\n\n**数据库唯一索引兜底**：去重表用请求 ID 做主键，业务表用唯一索引。即使并发请求都通过了去重检查，INSERT 时一定只有一个成功，其余抛 DuplicateKeyException。这是最可靠的兜底。\n\n**分布式锁**：用 Redis SETNX 或 ZooKeeper 对幂等键加锁，锁住后查去重、执行业务、写去重记录，整个过程串行化。缺点是引入锁的性能开销和死锁风险，适合冲突率不高的场景。\n\n**数据库行锁**：用 `SELECT ... FOR UPDATE` 锁住去重记录或业务记录，在事务内完成检查和更新。适合单库场景，分布式场景下需要保证幂等表和业务表在同一个数据库。\n\n实践中通常组合使用：用唯一索引作为最终兜底（物理约束不可绕过），用 Redis 做前置快速去重（减少到达数据库的重复请求），两者配合效果最好。"
+    },
+    {
+      "type": "explain",
+      "title": "支付场景的幂等设计实战",
+      "content": "支付是幂等性要求最高的场景之一，因为涉及真金白银。典型问题：支付网关回调通知可能重复发送（支付宝/微信支付文档明确说会重试），用户可能重复点击支付按钮，网络超时后客户端可能重试支付请求。\n\n幂等键选择：支付请求用 `payOrderId`（业务侧生成的支付单号），回调通知用 `outTradeNo + tradeStatus`。为什么不用网关返回的交易号？因为网关回调时你要先用业务单号查自己的订单，用业务单号做幂等键更自然。\n\n实现方案组合：\n1. 支付单表建唯一索引 `(payOrderId)`，防重复创建支付单\n2. 支付回调用状态机：订单状态 `待支付 → 支付中 → 已支付`，`UPDATE orders SET status = 'PAID' WHERE order_id = ? AND status = 'PAYING'`，如果 affected rows = 0 说明已处理过，直接返回成功\n3. 回调结果写入 `payment_callback_log` 去重表（主键是 `outTradeNo + notifyId`），重复回调查表返回\n\n关键细节：回调处理必须返回成功（HTTP 200 + 业务码 success），否则支付网关会继续重试。即使重复通知，幂等逻辑要保证返回的是\"处理成功\"而不是\"重复了所以返回失败\"——网关不理解你的业务语义，它只看返回码决定是否重试。"
     },
     {
       "type": "diagram",
@@ -46,49 +61,49 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | Token机制 | 唯一索引 | 状态机 | 乐观锁 | 去重表 |\n| --- | --- | --- | --- | --- | --- |\n| 适用场景 | 表单防重 | 插入操作 | 状态流转 | 更新操作 | 通用 |\n| 实现复杂度 | 中 | 低 | 低 | 低 | 中 |\n| 性能影响 | Redis读写 | 数据库约束 | 无额外开销 | 版本字段 | 数据库查询 |\n| 局限性 | 需要预获取token | 仅限插入 | 需有明确状态 | 仅限更新 | 需要唯一请求ID |\n| 推荐度 | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ |"
+      "title": "五种方案适用场景与关键约束",
+      "content": "| 方案 | 核心机制 | 最佳场景 | 原子性保证 | 关键局限 |\n| --- | --- | --- | --- | --- |\n| Token | Redis check-and-delete | 表单防重、按钮防重复 | Redis DELETE 原子性 | token 删了但业务失败需补偿；需额外获取请求 |\n| 唯一索引 | DB 唯一约束拒绝重复 INSERT | 插入类操作（创建订单、记录流水） | 数据库约束天然原子 | 仅适用 INSERT；重复时不能直接返回上次结果 |\n| 状态机 | WHERE status = 源状态 UPDATE | 有明确生命周期的业务（订单、退款） | 行级条件更新原子 | 需业务有清晰状态定义；并发冲突需重试 |\n| 乐观锁 | version 字段条件更新 | 更新类操作（扣库存、改余额） | 行级条件更新原子 | 高冲突时吞吐下降；需额外查询返回结果 |\n| 去重表 | 请求 ID 主键 + 结果缓存 | 通用（MQ 消费、跨服务调用） | 与业务同事务 | 去重表膨胀需 TTL 清理；分布式事务下事务边界要设计"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// Token机制实现\n@RestController\npublic class OrderController {\n    @Autowired\n    private RedisTemplate<String, String> redisTemplate;\n    \n    @GetMapping(\"/token\")\n    public String getToken() {\n        String token = UUID.randomUUID().toString();\n        redisTemplate.opsForValue().set(\"idempotent:\" + token, \"1\", 5, TimeUnit.MINUTES);\n        return token;\n    }\n    \n    @PostMapping(\"/order\")\n    public String createOrder(@RequestParam String token, @RequestBody OrderDTO dto) {\n        String key = \"idempotent:\" + token;\n        Boolean exists = redisTemplate.delete(key);\n        if (!exists) {\n            return \"请勿重复提交\";\n        }\n        // 创建订单\n        return orderService.create(dto);\n    }\n}\n\n// 唯一索引方案\n@Service\npublic class PaymentService {\n    @Transactional\n    public void pay(PaymentDTO dto) {\n        try {\n            PaymentRecord record = new PaymentRecord();\n            record.setOrderId(dto.getOrderId());\n            record.setTransId(dto.getTransId()); // 唯一交易号\n            paymentMapper.insert(record);\n        } catch (DuplicateKeyException e) {\n            // 重复支付，直接返回成功\n            log.info(\"重复支付: {}\", dto.getOrderId());\n        }\n    }\n}",
+      "title": "支付回调幂等：状态机 + 去重表组合实现",
       "language": "java",
+      "content": "@Service\npublic class PaymentCallbackService {\n\n    @Autowired\n    private OrderMapper orderMapper;\n    @Autowired\n    private CallbackLogMapper callbackLogMapper;\n\n    /**\n     * 处理支付网关回调\n     * @param payOrderId 业务支付单号（幂等键）\n     * @param gatewayTradeNo 网关交易号\n     * @param notifyId 网关通知ID（用于去重）\n     */\n    @Transactional\n    public CallbackResult handleCallback(String payOrderId, String gatewayTradeNo, String notifyId) {\n        // 第一步：去重表 check-and-insert，利用主键唯一性防并发\n        CallbackLog log = new CallbackLog();\n        log.setPayOrderId(payOrderId);\n        log.setNotifyId(notifyId);\n        log.setGatewayTradeNo(gatewayTradeNo);\n        log.setProcessedAt(LocalDateTime.now());\n        try {\n            callbackLogMapper.insert(log); // 主键 (payOrderId, notifyId)\n        } catch (DuplicateKeyException e) {\n            // 已处理过，直接返回成功（支付网关要求返回成功码）\n            return CallbackResult.success(\"duplicate callback, already processed\");\n        }\n\n        // 第二步：状态机更新，只有 PAYING 状态才能转为 PAID\n        int affected = orderMapper.updateStatus(\n                payOrderId,\n                OrderStatus.PAYING,   // 期望的当前状态\n                OrderStatus.PAID      // 目标状态\n        );\n        // 对应 SQL: UPDATE orders SET status = 'PAID', gateway_trade_no = ?\n        //           WHERE pay_order_id = ? AND status = 'PAYING'\n\n        if (affected == 0) {\n            // 状态已经是 PAID 或其他终态，幂等返回成功\n            return CallbackResult.success(\"order already in terminal state\");\n        }\n\n        // 第三步：执行后续业务（发消息、更新积分等）\n        orderService.onPaymentSuccess(payOrderId, gatewayTradeNo);\n\n        return CallbackResult.success(\"payment confirmed\");\n    }\n}",
       "highlights": [
         {
-          "line": 3,
-          "note": "`public class OrderController {` 定义了 幂等性设计 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 23,
+          "note": "去重表 INSERT 利用主键唯一性，重复回调抛 DuplicateKeyException 后直接返回成功——注意是返回成功，不是返回\"重复\"，因为支付网关只看返回码决定是否重试。"
         },
         {
-          "line": 18,
-          "note": "`if (!exists) {` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 34,
+          "note": "状态机更新用 WHERE status = 'PAYING' 做行级乐观锁，affected = 0 说明状态已流转过，幂等返回。两层防护：去重表防重复处理，状态机防并发状态冲突。"
         },
         {
-          "line": 10,
-          "note": "`redisTemplate.opsForValue().set(\"idempotent:\" + token, \"1\", 5, TimeUnit.MINUTES);` 更新核心数据结构，是解释状态如何推进的抓手。"
-        },
-        {
-          "line": 11,
-          "note": "`return token;` 对应最终输出，检查这里可以确认边界值是否和题意一致。"
+          "line": 39,
+          "note": "后续业务放在状态机更新成功之后，保证只有真正状态变更时才触发副作用。如果后续业务失败抛异常，整个事务回滚，去重记录也回滚，网关会重试。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "面试官：如何保证接口幂等性？\n\n我会从三个层面回答：\n\n**第一，为什么需要幂等？** 分布式环境下网络超时重试、消息重复消费、用户重复提交都会导致同一操作被执行多次，如果不做幂等处理，可能导致重复扣款、重复下单等问题。\n\n**第二，有哪些实现方案？** 我常用的有5种：\n1. Token机制：适合表单提交防重复\n2. 唯一索引：适合插入操作\n3. 状态机：适合有明确状态流转的业务\n4. 乐观锁：适合更新操作\n5. 去重表：通用方案\n\n**第三，我的实际经验。** 在支付场景中，我用\"唯一交易号+唯一索引\"方案，配合状态机保证支付状态只能单向流转。对于MQ消费场景，我用消息ID做去重表校验。核心思路是：先判断是否重复，再执行业务，两步要在同一个事务中。",
+      "content": "**结论**：幂等性保证同一操作执行多次结果相同，核心是幂等键 + 去重判定 + 原子执行三层设计。\n\n**为什么需要**\n- 网络超时重试、MQ 重复投递、用户重复提交、分布式事务补偿重试都会导致重复\n- 不做幂等的后果：重复扣款、重复下单、库存多扣\n\n**实现方案（按场景选择）**\n- Token 机制：表单防重，Redis 一次性 token\n- 唯一索引：插入操作，DB 约束天然防重\n- 状态机：有明确状态流转的业务，条件 UPDATE 保证单向\n- 乐观锁：更新操作，version 字段防并发\n- 去重表：通用方案，请求 ID 主键 + 结果缓存\n\n**关键难点：原子性**\n- 幂等校验和业务操作之间有时间窗口，并发请求可能都通过检查后重复执行\n- 解决：唯一索引兜底（物理约束不可绕过）+ Redis 前置快速去重\n- 去重表和业务必须在同一个事务中\n\n**支付场景实战**\n- 幂等键：业务支付单号 payOrderId + 网关通知 ID\n- 组合方案：去重表（主键防并发）+ 状态机（条件更新防状态冲突）\n- 关键细节：回调必须返回成功码，网关只看返回码决定是否重试",
       "followUpQuestions": [
         {
-          "question": "在你的项目中，幂等性设计是怎么落地的？遇到了什么权衡取舍？",
-          "answer": "幂等性核心：同一个操作执行多次，结果和执行一次相同。实现方案：唯一请求ID+去重表、Token机制（提交前获取token，提交时验证）、数据库唯一索引、乐观锁（version字段）。场景：支付回调、消息重试、表单重复提交。"
+          "question": "幂等校验和业务操作不在同一个事务里会出什么问题？",
+          "answer": "假设先查去重表发现没有记录，再执行业务，再写去重表，三步不在同一事务中：1）去重记录写入成功但业务事务回滚，后续请求被误判为已处理，实际业务未执行；2）业务成功但去重记录写入失败，后续请求会重复执行。两种情况都会导致数据不一致。解决方式是把去重表和业务放在同一个数据库事务中，或者用唯一索引做最终兜底。"
         },
         {
-          "question": "幂等性 在高并发（万级 QPS）和数据一致性要求高的场景下，有哪些关键设计决策？",
-          "answer": "幂等性设计 在高并发场景下要先识别核心约束，再拆成容量、延迟、一致性、故障隔离和可观测性几个维度设计。回答 幂等性设计 时，要说明 架构设计、微服务设计 的关键瓶颈、可异步或降级的链路、必须一致的数据以及积压或超时时的恢复方式。"
+          "question": "Redis 做前置去重，和数据库去重表怎么配合？",
+          "answer": "Redis 用于第一层快速拦截：用 SETNX 或 Lua 脚本对幂等键加锁/标记，重复请求在 Redis 层就被拦住，不打到数据库。数据库去重表做第二层兜底：即使 Redis 标记过期或 Redis 故障，数据库唯一索引仍然保证不会重复执行。这个两层架构在高并发场景下很常见——Redis 扛住大部分重复请求的 QPS，数据库做最终一致性保证。"
         },
         {
-          "question": "如果现有系统需要引入 幂等性，你会怎么评估改造风险和制定迁移计划？",
-          "answer": "引入 幂等性 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。引入 幂等性设计 时建议分阶段推进：先选择 架构设计、微服务设计、幂等性 中风险较低的链路试点，验证 降级策略 后再推广。幂等性设计 迁移时要先灰度小流量，再绑定回滚条件、监控指标和业务验收口径。"
+          "question": "去重表的记录什么时候清理？清理后还能防重吗？",
+          "answer": "去重记录的 TTL 取决于业务重试窗口。支付场景保留 7-30 天（和对账周期对齐）；MQ 消费保留到消费者确认后的安全窗口（如 24-72 小时）。清理后就无法防重了，所以要确保清理时所有可能的重试都已经结束。如果清理后仍有重试风险，可以在业务层做终态检查（如订单已是终态就不处理），作为第三层兜底。"
+        },
+        {
+          "question": "幂等和防重有什么区别？",
+          "answer": "防重是阻止重复请求到达业务层（如前端按钮 disabled、网关层 request ID 去重），关注的是\"不让重复请求进来\"。幂等是保证即使重复请求到达了业务层，执行多次结果也相同，关注的是\"重复执行了也没关系\"。防重是第一道防线，幂等是最后一道保障。实际系统中两者要配合：前端防重 + 网关防重 + 服务端幂等，纵深防御。"
         }
       ]
     },
@@ -96,34 +111,48 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "幂等性的定义和为什么需要",
-        "5种实现方案的适用场景和优缺点",
-        "Token机制的完整流程",
-        "状态机方案的代码实现",
-        "MQ消费幂等的处理方式",
-        "支付场景的幂等设计",
-        "幂等性与防重的区别"
+        "幂等性的定义：同一操作执行一次和多次的最终效果相同，不是返回值相同",
+        "为什么分布式系统必须做幂等：超时重试、MQ 重复投递、用户重复提交、事务补偿",
+        "五种方案各自的核心机制、最佳场景和关键局限",
+        "幂等校验与业务操作的原子性问题及解决方式（唯一索引兜底 + Redis 前置去重）",
+        "支付回调幂等的完整设计：去重表 + 状态机组合，回调必须返回成功码",
+        "幂等键的选择原则：业务唯一键 vs 请求级 ID vs 消息 ID，传递链路要端到端",
+        "幂等与防重的区别：防重是不让重复进来，幂等是重复执行也没关系"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "architecture.microservice.topic-idempotent-design.recall.1",
-      "prompt": "幂等性设计 解决了什么架构问题？有哪些适用和不适用的场景？",
+      "prompt": "什么是幂等性？为什么分布式系统必须做幂等？举三个会导致重复执行的典型场景。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 2,
       "difficulty": 3
     },
     {
       "id": "architecture.microservice.topic-idempotent-design.recall.2",
-      "prompt": "在支付场景中如何保证幂等性？如果MQ重复消费怎么处理？",
+      "prompt": "支付网关回调通知会重复发送，如何设计幂等保证不会重复确认支付？请说清幂等键选择、去重方案和状态流转。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "architecture.microservice.topic-idempotent-design.recall.3",
-      "prompt": "支付回调重复通知的幂等怎么做？说说幂等键的选择和并发重复请求的处理。",
+      "prompt": "幂等校验和业务操作不在同一个事务中会出什么问题？如何保证原子性？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "architecture.microservice.topic-idempotent-design.recall.4",
+      "prompt": "在高并发（万级 QPS）场景下，用 Redis 做前置去重 + 数据库唯一索引做兜底的方案怎么设计？Redis 和 DB 的一致性怎么保证？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "architecture.microservice.topic-idempotent-design.recall.5",
+      "prompt": "对比 Token 机制、唯一索引、状态机、乐观锁、去重表五种幂等方案，各自的适用场景、原子性保证和关键局限是什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -131,32 +160,34 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说明「幂等性定义」在「幂等性设计」里的作用和判断标准",
-      "5种实现方案",
-      "Token机制流程",
-      "能说明「状态机实现」在「幂等性设计」里的作用和判断标准"
+      "能准确定义幂等性：同一操作执行一次和多次的最终效果相同",
+      "能说明五种实现方案的核心机制、适用场景和局限",
+      "能解释幂等校验与业务操作之间的原子性问题及解决方式",
+      "能设计支付回调幂等的完整方案：幂等键选择 + 去重表 + 状态机"
     ],
     "goodToHave": [
-      "支付场景实战",
-      "幂等与防重区别",
-      "分布式事务中的幂等"
+      "能区分幂等与防重：防重是拦截重复请求，幂等是保证重复执行无副作用",
+      "能说明 Redis 前置去重 + DB 唯一索引兜底的两层架构",
+      "能解释去重表记录的生命周期管理（TTL 选择、清理后兜底）",
+      "能说明 MQ 消费幂等的设计要点"
     ],
     "commonMistakes": [
-      "幂等性实现方案选择不当",
-      "唯一请求ID的生成和传递方式不完善",
-      "并发场景下幂等校验和业务操作不是原子的"
+      "幂等校验和业务操作不原子：查完去重表后并发请求都能通过检查，导致重复执行",
+      "回调处理返回\"重复\"而非\"成功\"，导致支付网关继续重试陷入死循环",
+      "去重表与业务表不在同一事务中，一方成功一方失败导致数据不一致",
+      "幂等键选择不当：用不唯一的字段做幂等键，或幂等键在传递链路中丢失"
     ],
     "scoreWeights": {
       "coverage": 25,
-      "accuracy": 25,
+      "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 30
+      "depth": 25
     }
   },
   "prerequisites": [
     "architecture.microservice.topic-split-principles"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能围绕「幂等性设计」说清幂等性定义、5种实现方案，并放到架构设计场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察是否能围绕幂等性设计说清定义、五种方案的机制与适用边界、原子性问题及支付场景的完整实战设计，能区分幂等与防重，能处理高并发下的去重一致性。",
+  "updatedAt": "2026-06-22"
 }

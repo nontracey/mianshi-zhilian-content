@@ -4,7 +4,7 @@
   "category": "web-python",
   "group": "web-python",
   "title": "Flask 与 FastAPI",
-  "summary": "讲清 Flask（WSGI 同步）与 FastAPI（ASGI 异步）的本质区别、FastAPI 的 Pydantic/Depends/自动文档，以及选型和 async 路由的坑。",
+  "summary": "讲清 Flask（WSGI 同步）与 FastAPI（ASGI 异步）的协议差异、Flask 上下文和蓝图机制、FastAPI 的 Pydantic 校验/Depends 依赖注入/自动文档/SyncToThread 行为、async 路由调阻塞函数的坑、以及基于 IO 模型和团队情况的选型。",
   "tags": [
     "Python",
     "Flask",
@@ -14,19 +14,34 @@
     "Pydantic"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 31,
   "order": 190,
   "recommendWeight": 85,
   "learningCards": [
     {
       "type": "explain",
-      "title": "Flask 与 FastAPI：WSGI vs ASGI、Flask 核心机制",
-      "content": "## 一、WSGI vs ASGI\n\n| 协议 | 说明 | 框架 |\n| --- | --- | --- |\n| WSGI | 同步 Web 网关接口（标准） | Flask、Django |\n| ASGI | 异步 Web 网关接口（Python 3.5+） | FastAPI、Starlette |\n\nASGI 支持 WebSocket、SSE、HTTP/2 等长连接，WSGI 只能处理 HTTP 请求-响应。\n\n## 二、Flask 核心机制\n\n### 路由与视图\n```python\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\n@app.route(\"/api/users/<int:user_id>\", methods=[\"GET\"])\ndef get_user(user_id):\n    return jsonify({\"id\": user_id, \"name\": \"Alice\"})\n```\n\n### 请求上下文\nFlask 通过上下文（Context）实现线程安全的全局访问：\n- `request`：当前请求对象\n- `current_app`：当前应用实例\n- `g`：请求级别的全局变量\n- `session`：用户会话\n\n### 蓝图（Blueprint）\n模块化路由组织：\n```python\nfrom flask import Blueprint\nuser_bp = Blueprint(\"user\", __name__)\n\n@user_bp.route(\"/users\")\ndef list_users():\n    ...\n\napp.register_blueprint(user_bp, url_prefix=\"/api\")\n```"
+      "title": "WSGI 同步 vs ASGI 异步——协议层才是分水岭",
+      "content": "Flask 基于 WSGI（PEP 3333），请求生命周期是同步的：一个 worker 线程/进程从接收请求、执行视图到返回响应，全程独占该线程。gunicorn 或 uWSGI 负责进程管理，每个请求占用一个线程/进程，阻塞 IO（数据库查询、HTTP 调用）期间 worker 不能处理其他请求。\n\nFastAPI 基于 ASGI（通过 Starlette），底层是事件循环（uvicorn 使用 uvloop 或 asyncio 默认循环）。一个事件循环线程可以同时处理成千上万的连接，前提是代码里不能有阻塞调用——IO 等待时协程让出控制权，事件循环去执行其他就绪协程。\n\nASGI 原生支持 WebSocket、SSE 和 HTTP/2 Server Push 等长连接协议，因为连接的生命周期不再限于一个请求-响应周期。WSGI 只能在 HTTP 请求-响应结束后释放连接，要实现 WebSocket 需要用 gevent-websocket 之类的 hack。\n\n但 ASGI 的性能优势建立在「大量 IO 等待、少量 CPU 计算」的前提。纯 CPU 密集场景（如图像处理、大量正则匹配），async 反而可能因为事件循环单线程而比多进程 WSGI 更慢。理解这个前提才能做合理选型。"
     },
     {
       "type": "explain",
-      "title": "Flask 与 FastAPI：自动 API 文档、Pydantic 模型",
-      "content": "### 自动 API 文档\nFastAPI 基于 OpenAPI 规范，自动生成 Swagger UI 和 ReDoc 文档。\n\n### Pydantic 模型\n```python\nfrom fastapi import FastAPI\nfrom pydantic import BaseModel\n\nclass UserCreate(BaseModel):\n    name: str\n    email: str\n    age: int | None = None\n\napp = FastAPI()\n\n@app.post(\"/users\")\nasync def create_user(user: UserCreate):\n    # 自动验证请求体\n    return {\"id\": 1, **user.model_dump()}\n```\n\n### 依赖注入\n```python\nfrom fastapi import Depends, HTTPException\n\ndef get_current_user(token: str = Header(...)):\n    user = verify_token(token)\n    if user is None:\n        raise HTTPException(status_code=401)\n    return user\n\n@app.get(\"/profile\")\nasync def profile(user: User = Depends(get_current_user)):\n    return user\n```\n\n### 异步原生\nFastAPI 基于 Starlette，原生支持 async/await，但同步函数也能正常工作（在独立线程池中运行）。\n\n## 四、性能对比\n\n| 对比项 | Flask | FastAPI |\n| --- | --- | --- |\n| 协议 | WSGI（同步） | ASGI（异步） |\n| 自动文档 | 需安装 flasgger | ✅ 内置 Swagger/ReDoc |\n| 请求验证 | 手动 marshmallow | ✅ Pydantic 自动验证 |\n| 依赖注入 | 不支持 | ✅ 内置 Depends |\n| WebSocket | 需安装扩展 | ✅ 原生支持 |\n| 性能 | 中 | 高（Uvicorn 异步） |\n| 学习曲线 | 低 | 中 |\n| 适用场景 | 传统 Web 应用 | API 服务、高并发 |"
+      "title": "Flask 的上下文栈与蓝图——线程安全的全局访问",
+      "content": "Flask 最精巧的设计是上下文栈。`request`、`current_app`、`g`、`session` 不是真正全局变量，而是通过 `LocalStack`（底层用 threading.local 或 greenlet）按当前线程/协程隔离的代理对象。请求到来时 Flask 把 app context 和 request context 压栈，视图结束后弹栈，保证并发时每个线程看到自己的请求。\n\n`g` 是请求级别的临时变量，常用于在同一请求内不同函数间传递数据库连接、当前用户等，请求结束后自动清理。`session` 底层是签名 cookie，也可以用 Redis 等后端替换。\n\n上下文机制带来的限制：在请求生命周期外（如后台线程、CLI 命令、单元测试）直接访问 `request` 会抛 `Working outside of request context`。测试时需要 `with app.test_request_context()` 手动推送上下文。\n\nBlueprint 是 Flask 的模块化路由机制。它不存储应用状态，只记录路由、错误处理器、静态文件等的注册函数，在 `app.register_blueprint()` 时绑定到应用。Blueprint 支持 `url_prefix`、`subdomain` 和嵌套，适合按业务域拆分路由。`Flask(__name__)` 里传的 `__name__` 用于确定模板和静态文件路径，不是应用名称。"
+    },
+    {
+      "type": "explain",
+      "title": "FastAPI 的 Pydantic + Depends + 自动文档——类型即契约",
+      "content": "FastAPI 把 Python 类型注解从「文档装饰」变成「运行时校验和序列化」。请求到达时，FastAPI 按路径参数、查询参数、请求头、请求体分别提取数据，用 Pydantic 模型做类型强制转换和验证；校验失败自动返回 422 和详细错误，不需要手写 if-else。\n\nPydantic v2（FastAPI 0.100+ 默认使用）用 Rust 实现校验核心，比 v1 快 5-50 倍。模型定义即接口契约——`response_model` 参数让 FastAPI 自动过滤多余字段、做输出校验和 OpenAPI schema 生成。`model_dump()`（v2）替代 v1 的 `.dict()`。\n\n依赖注入是 FastAPI 的第二个核心。`Depends` 声明一个依赖函数，FastAPI 自动解析它的参数（支持嵌套依赖），按需调用并注入结果。依赖可以是普通函数或 `yield` 生成器（用于数据库连接等需要清理的资源）。`app.dependency_overrides[original_dep] = fake_dep` 可以在测试时全局替换依赖，不需要 mock 上下文。\n\n自动生成的 OpenAPI 文档来自路径声明、Pydantic 模型和 `response_model` 的组合。`/docs` 提供 Swagger UI 交互式测试，`/redoc` 提供 ReDoc 可读文档。这不只是开发便利——它是真正的 API 契约，前后端可以基于 OpenAPI schema 做契约测试和代码生成。"
+    },
+    {
+      "type": "explain",
+      "title": "async 路由与同步阻塞——最容易踩的坑",
+      "content": "FastAPI 对视图函数有两条执行路径。`async def` 路由直接在事件循环中执行，如果里面有阻塞调用（`time.sleep()`、同步 `requests.get()`、同步 SQLAlchemy 查询），整个事件循环被卡住，其他所有请求全部等待——比 Flask 的多 worker 模型更惨。\n\n`def`（普通同步函数）路由会被 FastAPI 自动丢到线程池（`anyio` 的线程池执行器）中执行，阻塞不会影响事件循环。所以如果你的视图函数里必须调同步库，写成 `def` 而不是 `async def`，性能反而更好。\n\n判断标准：函数体内有没有 `await` 调用。有 → 写 `async def`，全部 IO 必须用异步库（httpx 替代 requests、asyncpg/aiomysql 替代同步驱动、`async with` 连接池）。没有 → 写 `def`，让 FastAPI 帮你跑在线程池里。\n\n数据库是最常见的坑。FastAPI 常见搭配是 SQLAlchemy 2.0+ 的 `AsyncSession`（用 `asyncpg` 驱动）配合 `Depends(get_db)` 注入会话。如果用老版同步 SQLAlchemy，要么路由写 `def`，要么用 `run_in_executor` 包装。"
+    },
+    {
+      "type": "explain",
+      "title": "部署与性能——单 worker 要认清",
+      "content": "Flask 生产部署通常用 gunicorn + 多 worker（`gunicorn -w 4 app:app`），每个 worker 是独立进程，worker 数一般设为 CPU 核心数 × 2 + 1。用 gunicorn 的 `gevent` worker 类可以模拟异步，但不如原生 ASGI 干净。\n\nFastAPI 的 ASGI 服务器是 uvicorn，单进程单事件循环。生产环境需要 gunicorn 管理多个 uvicorn worker：`gunicorn -k uvicorn.workers.UvicornWorker -w 4 main:app`。这样每个 worker 是一个独立的 uvicorn 事件循环进程，既利用多核又保持异步优势。\n\n两个框架的「性能」差异不能只看 TechEmpower 基准测试。真实瓶颈通常在数据库和下游服务，不在框架本身。FastAPI + Pydantic v2 的请求解析比 Flask + marshmallow 快不少，但这 1-2ms 的差距在实际业务中占比很小。选型更应看 IO 模型、团队经验和生态适配。"
     },
     {
       "type": "diagram",
@@ -47,41 +62,54 @@
       ]
     },
     {
+      "type": "compareTable",
+      "title": "Flask 与 FastAPI 对比",
+      "content": "| 维度 | Flask | FastAPI |\n| --- | --- | --- |\n| 底层协议 | WSGI（PEP 3333，同步） | ASGI（Starlette，异步） |\n| 请求模型 | 一个请求占一个线程/进程 | 事件循环协程，IO 等待不阻塞 |\n| 路由注册 | `@app.route` + Blueprint | `@app.get/post`，无 Blueprint（用 APIRouter） |\n| 请求校验 | 手动或用 marshmallow/webargs | Pydantic 模型自动校验 + 422 错误 |\n| 依赖注入 | 不内置，用装饰器或手动 | `Depends()` 原生支持嵌套和 yield |\n| 自动文档 | 需装 flasgger/apispec | 内置 Swagger UI `/docs` + ReDoc `/redoc` |\n| WebSocket | 需要 flask-socketio 或扩展 | ASGI 原生支持 |\n| 同步路由 | 唯一方式，正常工作 | 写 `def` 自动丢线程池，不影响事件循环 |\n| 测试依赖替换 | `test_request_context` + mock | `dependency_overrides` 直接替换 |\n| 生产部署 | gunicorn 多 worker | gunicorn + UvicornWorker 多 worker |\n| 成熟度 | 2010 年至今，生态庞大 | 2018 年至今，生态快速成长 |\n| 学习曲线 | 低 | 中（Pydantic/类型注解有门槛） |"
+    },
+    {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "# 1. FastAPI CRUD 示例\nfrom fastapi import FastAPI, HTTPException, Depends\nfrom pydantic import BaseModel\nfrom typing import List\n\napp = FastAPI(title=\"User API\")\n\ndb: List[dict] = []\n\nclass UserCreate(BaseModel):\n    name: str\n    email: str\n\nclass UserResponse(BaseModel):\n    id: int\n    name: str\n    email: str\n\n@app.get(\"/users\", response_model=List[UserResponse])\nasync def list_users():\n    return db\n\n@app.post(\"/users\", response_model=UserResponse, status_code=201)\nasync def create_user(user: UserCreate):\n    new_user = {\"id\": len(db) + 1, **user.model_dump()}\n    db.append(new_user)\n    return new_user\n\n@app.get(\"/users/{user_id}\", response_model=UserResponse)\nasync def get_user(user_id: int):\n    for user in db:\n        if user[\"id\"] == user_id:\n            return user\n    raise HTTPException(status_code=404)\n\n# 2. Flask 蓝图示例\nfrom flask import Flask, Blueprint, jsonify\n\napp = Flask(__name__)\napi = Blueprint(\"api\", __name__, url_prefix=\"/api\")\n\n@api.route(\"/health\")\ndef health():\n    return jsonify({\"status\": \"ok\"})\n\napp.register_blueprint(api)\n\n# 3. FastAPI 依赖注入 + 数据库会话\nfrom sqlalchemy.ext.asyncio import create_async_engine\n\nasync def get_db():\n    async with async_session() as session:\n        yield session\n\n@app.get(\"/items\")\nasync def get_items(db=Depends(get_db)):\n    result = await db.execute(...)\n    return result.scalars().all()",
+      "title": "Flask 蓝图 vs FastAPI CRUD + 依赖注入 + DB 会话",
       "language": "python",
+      "content": "# ---- FastAPI: CRUD + Pydantic + Depends + async DB ----\nfrom fastapi import FastAPI, HTTPException, Depends\nfrom pydantic import BaseModel, EmailStr\nfrom typing import List\nfrom sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker\n\nengine = create_async_engine(\"postgresql+asyncpg://user:pass@localhost/db\")\nasync_session = async_sessionmaker(engine, expire_on_commit=False)\n\nasync def get_db():\n    \"\"\"yield 依赖：请求结束自动关闭会话\"\"\"\n    async with async_session() as session:\n        yield session\n\nclass UserCreate(BaseModel):\n    name: str\n    email: EmailStr  # Pydantic 自动校验邮箱格式\n    age: int | None = None\n\nclass UserResponse(BaseModel):\n    id: int\n    name: str\n    email: str\n\napp = FastAPI(title=\"User API\")\n\n@app.post(\"/users\", response_model=UserResponse, status_code=201)\nasync def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):\n    \"\"\"async def 路由：全部 IO 必须是异步的\"\"\"\n    # db.add(User(**user.model_dump()))\n    # await db.commit()\n    return {\"id\": 1, \"name\": user.name, \"email\": user.email}\n\n@app.get(\"/users\", response_model=List[UserResponse])\nasync def list_users(db: AsyncSession = Depends(get_db)):\n    # result = await db.execute(select(User))\n    # return result.scalars().all()\n    return []\n\n# ---- Flask: Blueprint + 上下文 ----\nfrom flask import Flask, Blueprint, jsonify, g, request\nimport sqlite3\n\nflask_app = Flask(__name__)\napi_bp = Blueprint(\"api\", __name__, url_prefix=\"/api\")\n\ndef get_db_conn():\n    \"\"\"请求级数据库连接，存在 g 中复用\"\"\"\n    if \"db\" not in g:\n        g.db = sqlite3.connect(\"app.db\")\n    return g.db\n\n@flask_app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop(\"db\", None)\n    if db is not None:\n        db.close()\n\n@api_bp.route(\"/users\")\ndef list_users():\n    db = get_db_conn()\n    rows = db.execute(\"SELECT * FROM users\").fetchall()\n    return jsonify(rows)\n\nflask_app.register_blueprint(api_bp)",
       "highlights": [
         {
-          "line": 10,
-          "note": "`class UserCreate(BaseModel):` 定义了 Flask 与 FastAPI 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 8,
+          "note": "yield 依赖：async_session 在请求结束后自动关闭，不需要手动管理连接生命周期。"
         },
         {
-          "line": 31,
-          "note": "`for user in db:` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+          "line": 16,
+          "note": "EmailStr 让 Pydantic 在请求校验阶段就拒绝无效邮箱，返回 422 而不是存入数据库后报错。"
         },
         {
-          "line": 32,
-          "note": "`if user[\"id\"] == user_id:` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 22,
+          "note": "async def 路由里所有 IO 必须异步：db.execute 要用 AsyncSession，否则会卡事件循环。"
         },
         {
-          "line": 26,
-          "note": "`db.append(new_user)` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "line": 39,
+          "note": "Flask 的 g 是请求级变量，通过 teardown_appcontext 在请求结束时清理资源，实现连接复用。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：Flask 和 FastAPI 最本质的区别是底层协议——Flask 是 WSGI（同步），FastAPI 是 ASGI（异步、原生 async/await）。FastAPI 还自带 Pydantic 数据校验、依赖注入和自动 OpenAPI 文档，更适合做现代 API；Flask 轻量灵活，适合传统 Web 应用和小项目。\n\n讲清几点：\n\n1. WSGI vs ASGI：WSGI 只能处理同步的请求-响应；ASGI 支持 async、WebSocket、SSE、长连接，这是 FastAPI 高并发能力的根。\n2. Flask 核心：用上下文（request、current_app、g、session）实现线程内的全局访问，用蓝图 Blueprint 做模块化路由。\n3. FastAPI 核心：基于 Starlette 加 Pydantic，类型注解直接用于请求校验和序列化，Depends 做依赖注入，自动生成 Swagger 和 ReDoc 文档。\n\n边界和坑。① FastAPI 里写了 async def 路由就不能在里面调阻塞函数（同步 DB、requests），否则卡住事件循环，要么用异步库、要么把路由写成普通 def（FastAPI 会丢到线程池跑）。② Flask 默认单线程同步，高并发靠 gunicorn 多 worker；FastAPI 配 uvicorn 异步 worker。③ 选型：重 IO、高并发、要自动文档和校验选 FastAPI；生态成熟、团队熟悉、偏传统渲染选 Flask。",
+      "content": "**结论**：Flask 和 FastAPI 最本质的差异在协议层——Flask 是 WSGI 同步，FastAPI 是 ASGI 异步。FastAPI 额外提供 Pydantic 校验、Depends 依赖注入和自动 OpenAPI 文档，更适合做现代 API 服务。\n\n**WSGI vs ASGI**\n- WSGI（PEP 3333）：一个请求一个线程/进程，同步阻塞期间 worker 不能处理其他请求\n- ASGI：事件循环 + 协程，IO 等待时让出控制权，单线程可处理大量并发连接\n- ASGI 原生支持 WebSocket、SSE、HTTP/2 等长连接，WSGI 做不到\n- 前提：ASGI 的性能优势建立在「IO 密集、非 CPU 密集」之上\n\n**Flask 核心机制**\n- 上下文栈（LocalStack）：`request`、`g`、`session`、`current_app` 按线程隔离，请求级生命周期\n- Blueprint：模块化路由，注册时绑定到应用，支持 url_prefix 和嵌套\n- 生产部署：gunicorn 多 worker 进程\n\n**FastAPI 核心机制**\n- Pydantic：类型注解 = 运行时校验 + 序列化 + OpenAPI schema 生成\n- Depends：声明式依赖注入，支持嵌套和 yield 资源管理，测试时 `dependency_overrides` 直接替换\n- 自动文档：`/docs` Swagger UI、`/redoc` ReDoc，基于 OpenAPI 规范\n\n**async 路由的坑（高频追问）**\n- `async def` 路由在事件循环直接执行，里面调阻塞函数（同步 requests、time.sleep、同步 DB）会卡住所有请求\n- `def` 路由自动丢到线程池执行，阻塞不影响事件循环\n- 判断标准：有没有 `await` 调用 → 有就 `async def` 全部异步化，没有就写 `def`\n\n**部署**\n- Flask：`gunicorn -w 4 app:app`\n- FastAPI：`gunicorn -k uvicorn.workers.UvicornWorker -w 4 main:app`（多 uvicorn 事件循环 worker）\n- 两个框架的真实瓶颈通常在数据库和下游，不在框架本身",
       "followUpQuestions": [
         {
-          "question": "Flask 的请求上下文（request context）和 FastAPI 的依赖注入在测试时有什么不同？",
-          "answer": "Flask 测试需要 `with app.test_request_context()` 手动推送上下文，否则 request 对象不可用。FastAPI 使用 Depends，可以用 `app.dependency_overrides` 直接替换所有依赖，不需要模拟上下文。这使得 FastAPI 的测试更加直接和可预测。"
+          "question": "FastAPI 的 `def` 路由和 `async def` 路由分别跑在哪里？选错了会怎样？",
+          "answer": "`async def` 直接在 uvicorn 的事件循环线程中执行；`def` 被 FastAPI 用 anyio 的线程池执行器丢到后台线程执行。选错的后果：`async def` 里调同步阻塞 IO → 事件循环被卡住，所有并发请求等待，吞吐暴跌。正确做法：有 `await` 调用就用 `async def`，没有就用 `def`，FastAPI 帮你在线程池里跑。"
         },
         {
-          "question": "FastAPI 性能瓶颈通常在哪里？怎么优化？",
-          "answer": "常见瓶颈：1) CPU 密集型处理（任务会阻塞事件循环——用 BackgroundTasks 或 Celery 分流）；2) 数据库查询慢（加索引、用连接池）；3) 序列化开销大（用 `response_model` 让 FastAPI 优化序列化）。可以用 `gunicorn -k uvicorn.workers.UvicornWorker` 多 worker 提升吞吐。"
+          "question": "Flask 的 `g` 对象和 FastAPI 的 `Depends` 在测试时怎么处理？",
+          "answer": "Flask 测试需要 `with app.test_request_context()` 手动推送请求上下文才能访问 `g` 和 `request`，否则抛 `Working outside of request context`。FastAPI 可以用 `app.dependency_overrides[get_db] = fake_get_db` 直接替换依赖，不需要模拟任何上下文，测试更直接。"
+        },
+        {
+          "question": "FastAPI 的性能优势主要体现在哪里？Pydantic v2 有什么变化？",
+          "answer": "FastAPI 的性能来自 ASGI 协议层：IO 等待时协程让出控制权，单事件循环线程可处理大量并发请求。Pydantic v2（FastAPI 0.100+ 默认）用 Rust 实现校验核心，比 v1 快 5-50 倍，让请求解析和序列化开销大幅降低。但真实业务瓶颈通常在数据库和下游服务，框架本身的 1-2ms 差异占比很小。"
+        },
+        {
+          "question": "FastAPI 自动文档的价值仅仅是开发方便吗？",
+          "answer": "不只是方便。OpenAPI schema 是真正的 API 契约——前后端可以基于它做契约测试、自动客户端代码生成（openapi-generator）、API 网关配置和监控。它让接口规范从文档变成可执行的约束。"
         }
       ]
     },
@@ -89,13 +117,14 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释 WSGI 和 ASGI 的区别",
-        "能写出 Flask 蓝图的基本用法",
-        "能写出 FastAPI 路由和 Pydantic 模型",
-        "能使用 FastAPI 依赖注入处理认证和数据库",
-        "能利用 FastAPI 自动文档调试 API",
-        "能对比 Flask 和 FastAPI 的适用场景",
-        "能理解 FastAPI 同步/异步路由的处理差异"
+        "能解释 WSGI（同步，一个请求一个 worker）和 ASGI（异步，事件循环 + 协程）的区别及各自适用场景",
+        "能说明 Flask 上下文栈（LocalStack）如何实现 request/g/session 的线程隔离和请求级生命周期",
+        "能写出 Flask Blueprint 的模块化路由组织方式",
+        "能写 FastAPI 路由、Pydantic 模型、response_model 和自动文档的关系",
+        "能用 Depends 实现认证或数据库会话注入，知道 yield 依赖的资源清理机制",
+        "能区分 async def 和 def 路由的执行位置，知道 async 路由里调阻塞 IO 的后果",
+        "能说明 gunicorn + UvicornWorker 的生产部署方式",
+        "能基于 IO 模型、团队经验和生态需求做框架选型"
       ]
     }
   ],
@@ -109,14 +138,28 @@
     },
     {
       "id": "python.web-python.flask-fastapi.recall.2",
-      "prompt": "用 FastAPI 实现一个简单的用户 CRUD API，包括请求验证和自动文档。",
+      "prompt": "用 FastAPI 实现一个用户 CRUD API，包含 Pydantic 请求校验、Depends 数据库会话注入和自动文档。",
       "mode": "code",
-      "expectedMinutes": 8,
+      "expectedMinutes": 10,
       "difficulty": 3
     },
     {
       "id": "python.web-python.flask-fastapi.recall.3",
-      "prompt": "FastAPI 的高性能来自哪里？Pydantic 在请求校验链路里扮演什么角色？",
+      "prompt": "FastAPI 的 async def 路由里调了同步 requests.get，会发生什么？怎么修复？def 路由呢？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "python.web-python.flask-fastapi.recall.4",
+      "prompt": "Flask 的请求上下文（request context）是怎么工作的？g、request、session 分别是什么生命周期？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "python.web-python.flask-fastapi.recall.5",
+      "prompt": "FastAPI 的 Depends 依赖注入有什么好处？和 Flask 手动传参比，测试时有什么优势？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -124,20 +167,22 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说出 Flask=WSGI 同步、FastAPI=ASGI 异步的本质区别",
-      "能讲清 FastAPI 的 Pydantic 校验、Depends 依赖注入、自动文档",
-      "能说明 Flask 的上下文（request/g）和蓝图",
-      "能给出两者的选型场景"
+      "能说出 Flask=WSGI 同步、FastAPI=ASGI 异步的本质区别及对并发模型的影响",
+      "能讲清 FastAPI 的 Pydantic 校验链路（类型注解→运行时验证→422错误→OpenAPI schema）",
+      "能解释 Depends 依赖注入机制，包括 yield 依赖的资源清理",
+      "能说明 async def 路由里调阻塞 IO 会卡事件循环，以及 def 路由自动丢线程池的机制"
     ],
     "goodToHave": [
-      "能说明 ASGI 支持 WebSocket/SSE 等长连接",
-      "能指出 async 路由里调阻塞函数会卡事件循环",
-      "能说出 gunicorn/uvicorn 的部署差异"
+      "能说明 Flask 上下文栈（LocalStack）的线程隔离机制和 g/request 的生命周期",
+      "能说出 gunicorn + UvicornWorker 的生产部署方式",
+      "能说明 ASGI 原生支持 WebSocket/SSE 等长连接而 WSGI 做不到",
+      "能基于 Pydantic v2 的 Rust 核心说明 FastAPI 的序列化性能优势"
     ],
     "commonMistakes": [
-      "在 FastAPI 的 async 路由里调用同步阻塞 IO",
-      "以为 Flask 也能原生处理 WebSocket",
-      "只比性能、忽略生态和团队熟悉度"
+      "在 FastAPI 的 async def 路由里调用同步阻塞 IO（requests、time.sleep、同步 DB），卡住事件循环",
+      "以为 FastAPI 性能全面碾压 Flask，忽略 CPU 密集场景下多进程 WSGI 可能更优",
+      "只看框架性能数字，忽略真实瓶颈在数据库和下游服务",
+      "以为 Flask 也能原生支持 WebSocket，不知道需要 flask-socketio 等扩展"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -148,8 +193,8 @@
   },
   "status": "staging",
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否从 WSGI/ASGI 讲到两者核心能力差异、说清 FastAPI 的校验和依赖注入、给出选型，并知道 async 路由调阻塞 IO 的坑。",
-  "updatedAt": "2026-06-18",
+  "interviewerFocus": "考察能否从 WSGI/ASGI 协议差异讲到并发模型，说清 FastAPI 的 Pydantic/Depends/自动文档三大能力，给出合理选型，并知道 async 路由调阻塞 IO 的坑及 def vs async def 的执行位置差异。",
+  "updatedAt": "2026-06-22",
   "prerequisites": [
     "python.engineering-python.memory-gc"
   ]

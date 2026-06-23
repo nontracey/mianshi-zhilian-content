@@ -4,31 +4,46 @@
   "category": "spring",
   "group": "spring",
   "title": "AOP 原理",
-  "summary": "讲清 Spring AOP 代理语义、Advisor 通知链、JDK/CGLIB 选择、自调用边界和 AspectJ 取舍。",
+  "summary": "讲清 Spring AOP 代理语义、AutoProxyCreator 与 Advisor 通知链、JDK/CGLIB 选择条件与暴露类型、自调用与 private/final/非容器对象失效边界、AspectJ 织入取舍，以及 Spring Boot 默认配置和版本演进。",
   "tags": [
     "Java",
     "Spring生态",
     "AOP 原理"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 35,
   "order": 40,
   "recommendWeight": 96,
   "learningCards": [
     {
       "type": "explain",
-      "title": "核心模型：只代理 Spring Bean 的方法执行",
-      "content": "Spring AOP 的第一层结论是：它是基于代理的运行时 AOP，主要服务于容器内 Bean 的方法执行连接点。切面不是把代码塞进原类，而是把匹配到的 Advisor 组织成拦截器链。调用先进入代理，再进入目标对象。\n\n回答时先把术语和运行对象对齐。Aspect 是横切关注点的模块化；Pointcut 选择哪些方法执行要被增强；Advice 是增强动作；Advisor 可以理解成 Pointcut 加 Advice。Proxy 是容器暴露给调用方的对象，Target 才是真实业务对象。\n\n`@Transactional`、`@Cacheable`、权限校验、审计日志这类能力都依赖同一条代理语义：调用入口必须经过 proxy。排查时不要只看注解，要看调用方拿到的是不是代理对象。\n\n这也是 Spring AOP 和 AspectJ 的关键差异。Spring AOP 默认不改字节码，配置成本低，适合大多数业务横切能力。AspectJ 通过编译期或类加载期织入，能覆盖构造器、字段访问、非 Spring 对象和自调用场景，但会带来构建、调试和织入边界成本。"
+      "title": "代理语义：调用必须经过 Proxy 才有 AOP 效果",
+      "content": "Spring AOP 是基于代理的运行时 AOP，不修改原类字节码，而是在容器内为匹配的 Bean 创建代理对象。调用方拿到的其实是 proxy，不是原始 target；只有调用先进入 proxy，才会按通知链依次执行 advice，最后才进入目标方法。\n\n术语放一条运行链里最容易记住：Aspect 是横切关注点的模块化；Pointcut 用表达式选择哪些方法执行要被增强；Advice 是增强动作（`@Before`、`@After`、`@Around` 等）；Advisor = Pointcut + Advice，Spring 把它作为最小可复用单元查找和排序；Proxy 是容器对外暴露的对象，Target 是真实业务对象。\n\n`@Transactional`、`@Cacheable`、`@Async`、权限校验、审计日志等都依赖同一前提：入口必须经过 proxy。排查时不要只看注解在不在，要先确认调用方拿到的是不是代理、调用路径有没有跳过代理。"
     },
     {
       "type": "explain",
-      "title": "代理创建：AutoProxyCreator、Advisor 与代理类型",
-      "content": "Spring 在 Bean 生命周期后段由 `AbstractAutoProxyCreator` 一类 BeanPostProcessor 参与代理创建。目标对象完成依赖注入和初始化后，框架查找候选 Advisor，再判断 Pointcut 是否匹配当前 Bean 的方法。匹配成功时，AOP proxy factory 创建代理，并把代理对象作为容器中对外可见的 Bean 返回。\n\n循环依赖中的 early proxy 是特殊路径。它提前暴露引用，但目标仍是保证外部 Bean 注入到同一个代理引用。\n\n代理类型由配置和目标类型共同决定。核心 Spring Framework 倾向在目标有接口时使用 JDK 动态代理，无接口时使用 CGLIB；`proxyTargetClass=true` 会强制类代理。Spring Boot 官方 application properties 中，`spring.aop.proxy-target-class` 默认值为 `true`，所以业务项目里经常看到 CGLIB 代理。\n\n版本事实要说准：Spring Framework 7.0 文档补充了统一 auto-proxy creator 与 `@Proxyable` 的 Bean 级代理类型控制。代码层面，JDK 代理依赖 `java.lang.reflect.Proxy`，本 topic 的最小复现在 JDK 17 下可编译运行。\n\nJDK 代理只暴露接口方法，注入实现类类型可能出现类型不匹配。CGLIB 通过生成子类覆盖方法，不能增强 final 类、final 方法、private 方法，以及跨包不可见的父类包私有方法。不要用“谁更快”作为主结论，工程排查时更重要的是代理暴露类型、方法可见性、final 限制和调用是否经过代理。"
+      "title": "代理创建：AutoProxyCreator、Advisor 扫描与 early proxy",
+      "content": "Spring 在 Bean 生命周期后段通过 `AbstractAutoProxyCreator` 这类 `BeanPostProcessor` 参与代理创建。流程是：目标对象完成依赖注入和初始化回调后，后处理器扫描容器中的 Advisor，用 Pointcut 判断当前 Bean 的方法是否有匹配；匹配成功时由 `ProxyFactory` 创建 JDK 或 CGLIB 代理，替换容器中的 Bean 实例或引用，保证后续注入拿到的是代理对象。\n\n循环依赖场景有 early proxy 路径。三级缓存提前暴露 ObjectFactory，必要时提前创建代理引用，目的是保证外部 Bean 拿到同一个代理实例，而不是在代理创建前拿到裸 target 再也无法替换。\n\n这也是为什么说 AOP 是 Bean 生命周期后段的行为：它发生在依赖注入之后，确保容器对外可见的 Bean 已经是 proxy。如果 Bean 创建流程本身报错（比如构造器异常），proxy 还没机会创建。"
     },
     {
       "type": "explain",
-      "title": "通知链执行与失效边界",
-      "content": "一次外部方法调用进入代理后，会被包装成类似 `MethodInvocation` 的调用上下文，并按顺序经过多个拦截器。`@Around` 能包住目标方法，调用 `proceed()` 才会继续向下执行。`@Before` 在目标前执行；`@AfterReturning` 只处理正常返回；`@AfterThrowing` 只处理异常退出；`@After` 类似 finally，在正常和异常路径都会运行。\n\n多切面排序依赖 `@Order` 或 `Ordered`。高优先级先进入，返回路径上后退出。排查执行顺序时，建议打开 trace 日志或用一个最小 advice 记录调用顺序，先确认链路进入了哪个 proxy。\n\n失效问题几乎都能落回代理语义。`this.foo()` 是目标对象内部直接调用，不会再回到 proxy，所以 `foo` 上的事务、缓存、异步、权限增强不会触发。private/final 方法不能被 CGLIB 覆盖；对象不是 Spring 容器创建的，就没有经过代理创建链；切点表达式没有匹配到目标方法，也不会生成对应 Advisor。\n\n解决顺序要克制：优先拆分职责，让调用从另一个 Bean 进入；其次注入自身代理或使用 ObjectProvider 延迟取代理。`AopContext.currentProxy()` 需要开启 exposeProxy，并会让业务代码感知 Spring AOP，只适合作为少数遗留场景的兜底。如果必须覆盖自调用、构造器或字段访问，再评估 AspectJ 织入。"
+      "title": "JDK 代理 vs CGLIB：选择条件、暴露类型与真正的工程限制",
+      "content": "代理类型由目标类型和配置共同决定。核心 Spring Framework 在目标实现了接口且未强制类代理时，可使用 JDK 动态代理（`java.lang.reflect.Proxy`）；无接口或强制类代理时使用 CGLIB，通过生成目标类的子类覆盖可继承方法来拦截调用。\n\nSpring Boot 从 2.0 起 `spring.aop.proxy-target-class` 默认为 `true`，所以 Boot 项目中 CGLIB 代理是常态。版本事实要说准：Spring Framework 6.x/7.0 统一了 `@EnableAspectJAutoProxy` 的默认行为讨论，并在文档和配置中明确 proxyTargetClass 的优先级；`proxyTargetClass=true` 在 Boot 场景下几乎总是打开。\n\n选型时最该关心的不是\"谁更快\"——两者的性能差异在正常业务开销中不显著——而是暴露类型和方法限制：JDK 代理暴露的是接口类型，如果注入时声明为实现类会类型不匹配；CGLIB 生成的是子类，不能增强 final 类、final 方法、private 方法和同包子类不可见的父类包私有方法。排查时先看注入类型是接口还是类、目标方法是否有 final/private 限制，而不是先猜性能。"
+    },
+    {
+      "type": "explain",
+      "title": "通知链执行模型与五种 Advice 的真实语义",
+      "content": "外部调用进入 proxy 后，会包装成类似 `MethodInvocation` 的调用上下文，然后按顺序经过多个 `MethodInterceptor`。核心模型是拦截器链（interceptor chain），每个 interceptor 选择执行、跳过或延迟调用 `proceed()`。\n\n`@Around` 包裹目标方法，只有它调用 `proceed()` 才会继续往下走；如果 `@Around` 忘了 `proceed()`，目标方法和后续 advice 都不会执行。`@Before` 在目标方法前执行，失败会阻止目标执行。`@AfterReturning` 只在正常返回时执行，拿不到原始参数但能改返回值。`@AfterThrowing` 只在抛异常时执行，可以捕获并替换异常或继续抛出。`@After` 类似 finally，正常和异常路径都执行，但它拿不到返回值、也不能阻止异常传播。\n\n多切面排序由 `@Order` 或实现 `Ordered` 接口控制：值越小优先级越高，先进入的切面后退出（类似栈）。排查顺序时，先加日志或断点确认链路进入的是哪个 proxy，再看各个 advisor 的 order。"
+    },
+    {
+      "type": "explain",
+      "title": "失效的六个根因和修复取舍",
+      "content": "AOP 失效几乎都能落回代理语义。第一个根因是自调用：`this.foo()` 是目标对象内部直接调用，不再回到 proxy，所以 `foo` 上的事务、缓存、异步、权限增强都不会触发。第二个是 private/final 方法：CGLIB 通过子类覆盖，private 方法不可见、final 方法不可覆盖，JDK 代理只代理接口方法。第三个是非容器对象：没有经过 Spring 创建流程，就不会有 AutoProxyCreator 创建代理。第四个是切点表达式没匹配到：即使注解在，Pointcut 不匹配也不会生成 Advisor。第五个是注入类型问题：JDK 代理下注入实现类类型会拿不到代理。第六个是 Boot 与 Framework 配置差异：如果手动 `@EnableAspectJAutoProxy(proxyTargetClass=false)` 且目标有接口，会退回 JDK 代理。\n\n修复优先级要克制：优先拆 Bean 让调用从外部进入 proxy；其次注入自身代理或用 `ObjectProvider` 延迟获取；`AopContext.currentProxy()` 需要 `exposeProxy=true` 且让业务代码感知 AOP 框架，只适合遗留场景兜底。如果确实需要切自调用、构造器、字段访问或非容器对象，再评估 AspectJ 编译期或类加载期织入。"
+    },
+    {
+      "type": "explain",
+      "title": "AspectJ 织入：能力更强但成本也更高",
+      "content": "AspectJ 通过编译期（ajc 编译器）、编译后（post-compile weaving）或类加载期（load-time weaving, LTW）修改字节码，把 advice 直接织入目标类。它能覆盖构造器执行、字段 get/set、静态初始化块、非 Spring 对象以及自调用场景，不受代理语义的 `this` 绕过限制。\n\n但 AspectJ 的工程成本更高：需要引入 AspectJ 编译器或 LTW agent，构建流程和调试链路更复杂，字节码修改后的栈帧可能更难读，团队需要额外学习成本。在纯 Spring Boot 业务项目中，大多数横切需求（事务、缓存、异步、权限、日志）用 Spring AOP 代理就够了。只有当需求确实超出\"Bean 方法执行\"这个连接点范围时，才需要评估 AspectJ。"
     },
     {
       "type": "diagram",
@@ -50,8 +65,8 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与选型边界",
-      "content": "| 对比项 | Spring AOP JDK 代理 | Spring AOP CGLIB 代理 | AspectJ 织入 |\n| --- | --- | --- | --- |\n| 实现方式 | JDK `Proxy` 生成接口代理 | 生成目标类子类 | 编译期或类加载期修改字节码 |\n| 暴露类型 | 主要暴露接口 | 可暴露目标类子类型 | 原类字节码被织入 |\n| 适用前提 | 目标有接口，且调用方按接口注入 | 类和方法不能被 final/private 限制 | 构建或运行时启用 weaver |\n| 可切范围 | Spring Bean 的接口方法执行 | Spring Bean 的可覆盖方法执行 | 方法、构造器、字段访问等更多连接点 |\n| 自调用 | 绕过代理 | 绕过代理 | 字节码内织入，不受普通代理自调用限制 |\n| 工程取舍 | 类型边界清楚，适合接口化服务 | Boot 项目常见，少遇到实现类注入问题 | 能力强，但构建、调试和可观测成本更高 |"
+      "title": "JDK 代理、CGLIB 与 AspectJ 对比",
+      "content": "| 对比维度 | JDK 动态代理 | CGLIB 代理 | AspectJ 织入 |\n| --- | --- | --- | --- |\n| 实现原理 | `java.lang.reflect.Proxy` 生成接口代理类 | 生成目标类的子类覆盖方法 | 编译期/编译后/类加载期修改目标类字节码 |\n| 暴露类型 | 接口类型 | 目标类的子类型 | 原类字节码已修改 |\n| 适用前提 | 目标实现了接口，调用方按接口注入 | 类和方法不能 final/private，Boot 默认开启 | 需引入 ajc 编译器或 LTW agent |\n| 可增强连接点 | 接口方法执行 | 可继承方法执行 | 方法、构造器、字段访问、静态初始化等 |\n| 自调用 | 绕过代理 | 绕过代理 | 字节码内织入，不受代理自调用限制 |\n| 代表场景 | 接口化服务层 | Boot 默认业务 Bean | 需要切非容器对象/字段/构造器的高级场景 |"
     },
     {
       "type": "code",
@@ -61,38 +76,38 @@
       "highlights": [
         {
           "line": 18,
-          "note": "`this.pay(id)` 直接进入目标对象，不会重新触发代理中的事务和指标 advice。"
+          "note": "`this.pay(id)` 直接进入目标对象，不经过代理的事务和指标 advice。"
         },
         {
           "line": 21,
-          "note": "把代理作为 self 传入后，内部调用重新进入 proxy，因此 `pay` 的 advice 会执行。"
+          "note": "把代理作为 self 传入后，内部调用重新进入 proxy，advice 会执行。"
         },
         {
           "line": 44,
-          "note": "这里的 `Chain` 对应 Spring AOP 中方法调用被多个 MethodInterceptor 包裹的核心模型。"
+          "note": "Chain 对应 Spring AOP 中 MethodInvocation 按拦截器链执行的核心模型。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "可以这样回答：Spring AOP 本质是运行时代理。容器在 Bean 初始化后由 AutoProxyCreator 查找匹配的 Advisor。Pointcut 匹配当前 Bean 的方法后，框架创建代理对象并暴露给其他 Bean。\n\n- 先讲调用链：外部调用进入 proxy，被组织成通知链；`@Around` 调用 `proceed()` 后进入目标方法；随后按正常返回或异常路径执行后置通知。\n- 再讲代理类型：核心 Spring 有接口时可用 JDK 动态代理，无接口或强制类代理时用 CGLIB。Boot 常见默认配置会启用 CGLIB。\n- 补充版本锚点：Spring Framework 7.0 文档提到统一 auto-proxy creator 和 `@Proxyable`；本 topic 代码用 JDK 17 的 `Proxy` 复现同一条代理语义。\n- 说清边界：JDK 代理主要暴露接口方法；CGLIB 不能增强 final 类、final 方法、private 方法。性能不是选型核心，类型暴露、方法可见性和调用入口更重要。\n- 最后讲失效：`this.method()` 是目标对象内部直接调用，不经过 proxy，所以事务、缓存、异步、权限等增强不会触发。非 Spring 管理对象没有代理，切点没匹配也不会增强。\n\n修复顺序也要说出取舍：优先拆 Bean 或让调用从外部 Bean 进入，其次注入自身代理或延迟获取代理。`AopContext.currentProxy()` 需要 exposeProxy，耦合较重。只有确实需要切自调用、字段、构造器或非容器对象时，再考虑 AspectJ 编译期或类加载期织入。",
+      "content": "**结论先行**：Spring AOP 是运行时代理，不改原类字节码；容器在 Bean 初始化后段由 AutoProxyCreator 创建代理，调用必须经过 proxy 才有 AOP 效果。\n\n**代理创建链路**\n- Bean 完成依赖注入和初始化后，AbstractAutoProxyCreator 扫描候选 Advisor\n- Pointcut 判断 Bean 的方法是否有匹配\n- 匹配时由 ProxyFactory 创建 JDK 或 CGLIB 代理，替换容器中的 Bean\n- 循环依赖场景通过三级缓存提前暴露 early proxy，保证注入同一代理引用\n\n**代理类型选择**\n- 目标有接口 + 未强制类代理：可使用 JDK 动态代理，暴露接口类型\n- 无接口 / `proxyTargetClass=true` / Boot 默认：CGLIB，生成子类\n- 关键限制：JDK 代理注入实现类类型会不匹配；CGLIB 不能增强 final 类/final 方法/private 方法\n- Spring Boot 默认 `spring.aop.proxy-target-class=true`，所以 Boot 项目常见 CGLIB\n\n**通知链执行**\n- `@Around` 包裹目标方法，调 `proceed()` 才继续；忘 proceed 则目标和后续 advice 都不执行\n- `@Before` 目标前、`@AfterReturning` 正常返回、`@AfterThrowing` 异常、`@After` finally\n- 多切面由 `@Order` 排序，值小先进入、后退出\n\n**失效六根因**\n- 自调用 `this.method()`：不回 proxy\n- private/final 方法：CGLIB 不可覆盖\n- 非容器对象：没经过代理创建\n- 切点不匹配：Pointcut 表达式没选到\n- 注入类型错误：JDK 代理下注入实现类\n- 配置差异：手动关闭 proxyTargetClass 退回 JDK 代理\n\n**修复取舍**\n- 优先拆 Bean，让调用从外部进入 proxy\n- 其次注入自身代理或 ObjectProvider 延迟获取\n- `AopContext.currentProxy()` 需 exposeProxy，耦合重，只适合遗留兜底\n- 确需切自调用/构造器/字段/非容器对象 → 评估 AspectJ\n\n**AspectJ 边界**\n- 编译期或类加载期织入，能力覆盖构造器、字段、非 Spring 对象、自调用\n- 代价：引入 ajc 或 LTW agent，构建调试更复杂",
       "followUpQuestions": [
         {
-          "question": "Spring AOP 的实现流程是什么？",
-          "answer": "Bean 初始化后，AutoProxyCreator 查找候选 Advisor，使用 Pointcut 判断方法是否匹配；需要增强时创建 JDK 或 CGLIB 代理并暴露给容器。调用进入代理后按 MethodInterceptor 链执行，最后由反射或子类调用进入目标对象。"
+          "question": "Spring AOP 从 Bean 初始化到外部调用执行通知链，中间经历了哪些关键对象和步骤？",
+          "answer": "Bean 完成依赖注入和初始化回调后，AbstractAutoProxyCreator 作为 BeanPostProcessor 查找候选 Advisor，Pointcut 判断方法匹配，匹配则 ProxyFactory 创建代理并替换 Bean。外部调用进入 proxy 后包装成 MethodInvocation，按 MethodInterceptor 链依次执行（如 @Around 调 proceed），最终由反射或子类方法进入 target。"
         },
         {
-          "question": "JDK 动态代理和 CGLIB 怎么选？",
-          "answer": "核心 Spring 在目标有接口时可使用 JDK 代理，无接口时使用 CGLIB；`proxyTargetClass=true` 会强制类代理，Boot 项目常见默认是 class-based proxy。JDK 代理关注接口暴露，CGLIB 关注 final/private/可见性限制。"
+          "question": "JDK 代理和 CGLIB 到底怎么选？什么情况下会出问题？",
+          "answer": "目标有接口且未强制类代理时可用 JDK 代理；无接口或 Boot 默认 proxyTargetClass=true 时用 CGLIB。JDK 代理暴露接口类型，注入实现类类型会类型不匹配。CGLIB 生成子类，final 类、final 方法、private 方法无法增强。性能差异在正常业务中不显著，选型更应关注类型暴露和方法可见性。"
         },
         {
-          "question": "为什么同类自调用会让 @Transactional 失效？",
-          "answer": "事务是代理上的 advice。外部调用 `proxy.a()` 会进事务拦截器，但目标对象内部的 `this.b()` 是直接调当前对象，不会再次回到 proxy，所以 `b` 上的事务 advice 没机会执行。"
+          "question": "为什么 this 自调用会让 @Transactional 失效？怎么修？",
+          "answer": "事务 advice 挂在 proxy 上。`this.method()` 是目标对象内部直接调用，不经过 proxy，事务拦截器没机会执行。修复优先拆 Bean 让调用从外部进入，其次注入自身代理或用 ObjectProvider；AopContext.currentProxy() 需要 exposeProxy=true 且耦合框架，只适合遗留兜底。"
         },
         {
-          "question": "Spring AOP 和 AspectJ 的核心区别是什么？",
-          "answer": "Spring AOP 是运行时代理，轻量且主要覆盖 Spring Bean 的方法执行；AspectJ 是编译期或类加载期织入，能覆盖更多连接点，也没有普通代理自调用限制，但会增加构建、调试和运行时织入复杂度。"
+          "question": "Spring AOP 和 AspectJ 核心区别是什么？什么时候必须用 AspectJ？",
+          "answer": "Spring AOP 是运行时代理，只覆盖 Spring Bean 的方法执行连接点，轻量够用。AspectJ 在编译期或类加载期织入字节码，能覆盖构造器、字段访问、静态初始化、非容器对象、自调用，但需要引入 ajc 编译器或 LTW agent，构建调试成本更高。只有需求超出 Bean 方法执行范围时才需要评估 AspectJ。"
         }
       ]
     },
@@ -101,28 +116,30 @@
       "title": "学完后应能说清楚",
       "items": [
         "能把 Aspect、Pointcut、Advice、Advisor、Proxy、Target 放到同一条调用链里解释",
-        "能说明 AutoProxyCreator 在 Bean 生命周期后段创建代理的原因和时机",
-        "能区分 JDK 代理、CGLIB 代理、AspectJ 织入的能力边界",
-        "能解释 @Around、@Before、@AfterReturning、@AfterThrowing、@After 的执行语义",
-        "能用代理语义解释自调用、private、final、非容器对象、切点不匹配导致的失效",
-        "能给出工程排查顺序：代理类型、注入类型、切点表达式、调用入口、方法可见性"
+        "能说明 AutoProxyCreator 在 Bean 生命周期后段创建代理的原因和触发时机",
+        "能区分 JDK 代理、CGLIB 代理、AspectJ 织入的能力边界和适用条件",
+        "能解释 @Around proceed 的核心作用，以及五种 Advice 在正常/异常路径上的执行语义",
+        "能用代理语义解释自调用、private、final、非容器对象、切点不匹配、注入类型导致的失效",
+        "能给出修复优先级：拆 Bean > 注入自身代理 > ObjectProvider > AopContext > AspectJ",
+        "能说明 Spring Boot 默认 proxyTargetClass=true 对代理类型的实际影响",
+        "能说出循环依赖场景中 early proxy 的存在目的"
       ]
     }
   ],
   "recallPrompts": [
     {
+      "id": "java.spring.topic-044-d91e99aa.recall.1",
       "prompt": "Spring AOP 从 Bean 初始化到外部调用执行通知链，中间经历了哪些关键对象和步骤？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 4,
-      "id": "java.spring.topic-044-d91e99aa.recall.1"
+      "difficulty": 4
     },
     {
+      "id": "java.spring.topic-044-d91e99aa.recall.2",
       "prompt": "JDK 代理、CGLIB 代理、AspectJ 织入分别适合什么场景，边界是什么？",
       "mode": "text",
       "expectedMinutes": 3,
-      "difficulty": 4,
-      "id": "java.spring.topic-044-d91e99aa.recall.2"
+      "difficulty": 4
     },
     {
       "id": "java.spring.topic-044-d91e99aa.recall.3",
@@ -130,25 +147,40 @@
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
+    },
+    {
+      "id": "java.spring.topic-044-d91e99aa.recall.4",
+      "prompt": "一个 @Transactional 方法被同类中另一个方法 this 调用后事务失效，你会怎么排查和修复？请给出优先级顺序。",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "java.spring.topic-044-d91e99aa.recall.5",
+      "prompt": "Spring Boot 默认 proxyTargetClass=true 意味着什么？在什么场景下会回到 JDK 代理？注入类型不匹配通常出在哪个代理模式下？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出 Spring AOP 是基于代理的运行时 AOP，主要增强容器内 Bean 的方法执行",
-      "能解释 AutoProxyCreator、Advisor、Pointcut、MethodInterceptor 通知链的关系",
-      "能区分 JDK 动态代理和 CGLIB 的选择条件、暴露类型和 final/private 边界",
+      "能说出 Spring AOP 是基于代理的运行时 AOP，不改原类字节码，调用必须经过 proxy",
+      "能解释 AutoProxyCreator、Advisor、Pointcut、MethodInterceptor 通知链的创建和执行关系",
+      "能区分 JDK 动态代理和 CGLIB 的选择条件、暴露类型差异和 final/private 边界",
       "能用代理语义解释自调用导致 @Transactional、@Cacheable、@Async 等增强失效"
     ],
     "goodToHave": [
-      "能说明 Spring Boot `spring.aop.proxy-target-class=true` 对代理类型的影响",
-      "能说清 @Around 的 proceed、返回值替换和异常路径语义",
-      "能对比 Spring AOP 与 AspectJ 的织入范围、成本和选型取舍"
+      "能说明 Spring Boot 默认 proxyTargetClass=true 对代理类型选择和项目习惯的影响",
+      "能说清 @Around proceed 的必要性以及五种 Advice 在正常/异常路径的完整语义",
+      "能对比 Spring AOP 与 AspectJ 的织入范围、工程成本和选型边界",
+      "能解释循环依赖中 early proxy 的存在目的"
     ],
     "commonMistakes": [
-      "把 AOP 理解成直接改原类方法，忽略容器暴露的是代理对象",
-      "以为注解存在就会生效，没有检查调用是否经过 proxy",
-      "把 JDK/CGLIB 选择背成性能差异，却说不清接口暴露、final/private 和注入类型",
-      "用 AopContext 作为默认方案，忽略拆 Bean 和职责重构更稳妥"
+      "把 AOP 理解成直接修改原类方法，忽略容器暴露的是代理对象",
+      "以为注解存在就等于生效，没有检查调用是否经过 proxy",
+      "把 JDK/CGLIB 选择背成性能差异，说不清接口暴露、final/private 限制和注入类型",
+      "用 AopContext.currentProxy() 作为默认方案，忽略拆 Bean 和职责重构更稳妥"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -157,11 +189,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "java.spring.topic-043-d09a2ea2"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否解释 AOP 的代理织入本质、区分 JDK 与 CGLIB 代理、说清通知链和 @Around proceed，并能定位自调用、private/final 导致的 AOP 失效。"
+  "interviewerFocus": "考察能否解释 AOP 的代理织入本质、代理创建时机与通知链执行、区分 JDK 与 CGLIB 代理的条件与限制、定位自调用/private/final/非容器对象导致的 AOP 失效，并能给出修复优先级和 AspectJ 边界。"
 }

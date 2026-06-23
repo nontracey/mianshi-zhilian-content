@@ -11,24 +11,29 @@
     "JVM 参数与调优"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 31,
   "order": 70,
   "recommendWeight": 88,
   "learningCards": [
     {
       "type": "explain",
       "title": "调优先闭环，不先背参数",
-      "content": "JVM 调优的第一步不是改 `-Xmx`，而是把目标和证据钉住：业务 SLO 是吞吐、P99/P999、启动时间还是成本？服务运行在物理机还是容器？JDK 版本、CPU 核数、容器 limit、对象分配速率、线程数和堆外内存分别是多少？没有这些上下文，参数调整很容易变成猜。\n\n参数可以分三类：标准参数如 `-version`、`-cp`，属于 Java 启动接口；`-X` 是非标准但常用的扩展参数，如 `-Xms`、`-Xmx`、`-Xss`；`-XX` 是 HotSpot 高级参数，包括布尔型 `-XX:+UseG1GC`、数值型 `-XX:MaxRAMPercentage=75`、诊断型 `-XX:+HeapDumpOnOutOfMemoryError`。调优时必须打印实际 flags，因为默认值会受 JDK 版本、发行版、容器识别和显式参数影响。\n\n一个合格闭环是：定目标 -> 采集 GC 日志/监控/JFR/heap dump/thread dump -> 建立瓶颈假设 -> 一次只改一个变量 -> 用相同负载复测 -> 灰度观察 -> 指标恶化时回滚。没有前后指标对比的改参，只能算经验尝试。"
+      "content": "JVM 调优的第一步不是改 `-Xmx`，而是把目标和证据钉住：业务 SLO 是吞吐、P99/P999、启动时间还是成本？服务运行在物理机还是容器？JDK 版本、CPU 核数、容器 limit、对象分配速率、线程数和堆外内存分别是多少？没有这些上下文，参数调整很容易变成猜。\n\n参数可以分三类：标准参数如 `-version`、`-cp`，属于 Java 启动接口，所有 JVM 实现必须支持；`-X` 是非标准但常用的扩展参数，如 `-Xms`、`-Xmx`、`-Xss`，HotSpot 支持但不保证其他实现兼容；`-XX` 是 HotSpot 高级参数，包括布尔型 `-XX:+UseG1GC`、数值型 `-XX:MaxRAMPercentage=75`、诊断型 `-XX:+HeapDumpOnOutOfMemoryError`。调优时必须打印实际 flags（`-XX:+PrintCommandLineFlags`、`-XX:+PrintFlagsFinal`），因为默认值会受 JDK 版本、发行版、容器识别（`UseContainerSupport`）和显式参数影响——同一个参数在 JDK 8 和 JDK 17 上的默认值可能不同，同一版本在容器外和容器内也可能不同。\n\n一个合格闭环是：定目标 → 采集 GC 日志/监控/JFR/heap dump/thread dump/NMT → 建立瓶颈假设 → 一次只改一个变量 → 用相同负载复测 → 灰度观察 → 指标恶化时回滚。没有前后指标对比的改参，只能算经验尝试。"
     },
     {
       "type": "explain",
       "title": "内存参数要算全进程账",
-      "content": "堆参数不应该固定套“物理内存某个比例”。Java 进程的 RSS 还包括 Metaspace、Compressed Class Space、Code Cache、Direct Memory、线程栈、JIT/GC 线程开销、JNI/native 库、mmap、page cache 竞争等。容器里还要给系统和 sidecar 留余量，否则 JVM 没 OOM，容器也可能先被 kill。\n\n`-Xms` 是初始堆，`-Xmx` 是最大堆。延迟敏感且负载稳定的服务常把两者设得接近，减少运行时扩缩容带来的抖动；弹性环境也可以用 `InitialRAMPercentage`、`MaxRAMPercentage` 等百分比参数，但要用压测确认 RSS、GC pause 和启动时内存占用。`-Xmn`、`NewRatio`、`SurvivorRatio` 更偏传统分代收集器语境；G1 下通常让 young 区按暂停目标自适应，不要先手工固定。\n\n非堆边界也要纳入：`MaxMetaspaceSize` 控制类元数据上限，但更重要的是排查 ClassLoader 泄漏；`MaxDirectMemorySize` 影响 NIO/Netty 直接内存；`-Xss` 影响单线程栈大小和最大线程数。堆 OOM、Metaspace OOM、Direct buffer memory、unable to create native thread 的处理入口不同。"
+      "content": "堆参数不应该固定套「物理内存某个比例」。Java 进程的 RSS（Resident Set Size）是一个组合值：Java heap + Metaspace + Compressed Class Space + Code Cache + Direct Memory + 线程栈（线程数 × `-Xss`）+ JIT compiler 线程 + GC 线程 + JNI/native 库分配 + mmap 映射 + page cache 竞争。容器里还要给系统进程、sidecar 和内核缓冲留余量，否则 JVM 没 OOM，容器也可能因为 RSS 超限被 OOM Killer 杀掉（dmesg 里看到 `oom-kill` 而不是 Java OOM exception）。\n\n`-Xms` 是初始堆，`-Xmx` 是最大堆。延迟敏感且负载稳定的服务常把两者设得接近（或相等），减少运行时扩缩堆带来的 GC 抖动和内存重分配开销；弹性环境可以用百分比参数 `InitialRAMPercentage`、`MaxRAMPercentage`（JDK 10+引入，JDK 8u191+ backport），但要用压测确认实际 RSS、GC pause 和启动时内存占用。`-Xmn`、`NewRatio`、`SurvivorRatio` 更偏传统分代收集器（Serial/Parallel/CMS）语境；G1 下 young 区大小按暂停目标和启发式自适应，手工固定 young 反而可能干扰收集器的 region 调度。\n\n非堆边界也要纳入调优预算：`MaxMetaspaceSize` 控制类元数据上限，默认无上限（受限于 native memory），但更重要的是排查 ClassLoader 泄漏——Metaspace OOM 的根因通常是泄漏而不是参数设小；`MaxDirectMemorySize` 影响 NIO/Netty 直接内存，默认等于 `-Xmx`（由 `sun.misc.VM` 初始化，可通过 NMT 的 `Internal` 段观测）；`-Xss` 影响单线程栈大小（默认通常 512KB–1MB，平台和版本相关），直接决定 `最大线程数 ≈ 可用内存 / Xss`。堆 OOM、Metaspace OOM、Direct buffer memory、unable to create native thread 的错误信息不同，排查入口也完全不同。"
     },
     {
       "type": "explain",
       "title": "GC 参数围绕目标和日志调",
-      "content": "GC 相关参数先按收集器目标分类。吞吐优先看 Parallel 的吞吐目标和并行线程；常规在线服务以 G1 为基线，看 `MaxGCPauseMillis`、Region、Mixed GC、IHOP、Humongous、to-space exhausted；极低停顿或大堆再压测 ZGC/Shenandoah，同时观察 CPU、RSS 和 allocation stall。不要把 G1 的 `MaxGCPauseMillis` 理解成硬 SLA，它是调度目标，收集器可能因为 live set、分配速率、目标空间或 CPU 不足而达不到。\n\n诊断参数是生产底座。JDK 8 用 `PrintGC*` 和 `-Xloggc`，JDK 9+ 统一日志用 `-Xlog:gc*`；OOM 建议开启 `HeapDumpOnOutOfMemoryError` 并配置可写路径；容器化服务常配 `ExitOnOutOfMemoryError` 让外部编排系统拉起新进程。需要查本地内存时可用 NMT，但 `NativeMemoryTracking=summary/detail` 有额外开销，应该按排查窗口开启。\n\n调参要和现象对应：Full/Old GC 后 old 水位不降，优先看 live set、缓存和泄漏；Young GC 频繁但 old 不高，优先看分配速率和临时对象；P99 停顿长，拆 GC 日志阶段；OOM 先按错误类型分 heap/metaspace/direct/native/thread，再选择 heap dump、classloader stats、NMT 或 thread dump。"
+      "content": "GC 参数先按收集器目标分类，而不是背一堆互不关联的数字。吞吐优先的批处理看 Parallel GC，关注吞吐目标 `GCTimeRatio`（默认 99，即 GC 时间占比目标 1%）和并行线程 `ParallelGCThreads`；常规在线服务以 G1 为基线，核心旋钮是 `MaxGCPauseMillis`（默认 200ms），配合 `G1HeapRegionSize`（影响 Region 数量和 Humongous 判定阈值）、`InitiatingHeapOccupancyPercent`（IHOP，触发并发标记的老年代占用阈值，默认 45%）；极低停顿或大堆（>16GB）再压测 ZGC（JDK 15+ production ready）/Shenandoah，同时观察 CPU 开销、RSS 增长和 allocation stall 信号。不要把 G1 的 `MaxGCPauseMillis` 理解成硬 SLA——它是调度目标，收集器会据此估算每次回收的 Region 数量，但如果 live set 大、分配速率快、Humongous 对象多、to-space 不足或 CPU 紧张，实际停顿仍可能超过目标。\n\n诊断参数是生产底座，不是可选项。JDK 8 用 `-XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:<path>`；JDK 9+ 统一日志框架用 `-Xlog:gc*:file=<path>:time,uptime,level,tags:filecount=5,filesize=10m`，可同时输出 GC、heap、safepoint 等子系统。OOM 建议开启 `-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=<path>`，并验证 dump 路径可写且磁盘空间充足（full heap dump 大小等于 live set）；容器化服务常配 `-XX:+ExitOnOutOfMemoryError` 或 `-XX:+CrashOnOutOfMemoryError` 让外部编排系统（K8s Deployment）拉起新进程，而不是带着残缺状态继续服务。需要查本地内存时可用 NMT（`-XX:NativeMemoryTracking=summary/detail`），但 detail 模式有额外 5–10% 开销，应在排查窗口开启、验证后关闭。\n\n调参要和现象对应：Full/Old GC 后 old 水位不降，优先看 live set、长期缓存和对象泄漏；Young GC 频繁但 old 不高，优先看分配速率和短生命周期临时对象；P99 停顿长，拆 GC 日志里的 Evacuation Pause、Concurrent Mark、Remark 等阶段耗时；OOM 先按错误信息分类型（heap space / Metaspace / Direct buffer / unable to create native thread），再选择 heap dump、classloader stats、NMT 或 thread dump 作为排查入口。"
+    },
+    {
+      "type": "explain",
+      "title": "容器场景的特殊约束",
+      "content": "容器里 JVM 面对的不是物理机的「所有资源」，而是 cgroup limit。JDK 10+（和 8u191+）的 `UseContainerSupport`（默认 true）会让 JVM 读取 cgroup v1/v2 的 CPU shares/quota 和 memory limit，并据此调整默认堆大小和 GC 线程数。但几个常见陷阱：\n\n第一，`-Xmx` 不等于进程 RSS，容器 OOM Killer 看的是 RSS 超限而不是 Java heap 用尽。第二，旧版 JDK（8u191 之前）不识别 cgroup，会把宿主机的 CPU 和内存当作可用资源，导致堆设得过大或 GC 线程过多。第三，cgroup v2 的 memory limit 如果同时设置了 swap limit，JVM 的行为会受 `MaxRAMPercentage` 和 swap 交互影响。第四，K8s 的 requests/limits 不对称时，JVM 按 limits 算堆，但调度器按 requests 分配——如果 limits 设得很高但实际节点内存不足，也可能 OOM。\n\n实用做法：先确认 JDK 版本和容器运行时对 cgroup 的支持，再用 `java -XX:+PrintFlagsFinal -version 2>&1 | grep -E 'UseContainerSupport|MaxRAM|ActiveProcessor'` 验证 JVM 读到的容器参数，最后在容器内压测确认 RSS 峰值不超过 limit 的 75–85%（留 buffer 给非堆和系统）。"
     },
     {
       "type": "diagram",
@@ -50,13 +55,13 @@
     },
     {
       "type": "compareTable",
-      "title": "参数族和验证指标",
-      "content": "| 参数族 | 主要解决 | 不适合解决 | 验证指标 |\n| --- | --- | --- | --- |\n| `-Xms/-Xmx`、`MaxRAMPercentage` | 堆容量、容器内存边界 | 真实泄漏、缓存无界 | RSS、heap used after GC、Full/Old GC 后水位 |\n| `-Xmn/NewRatio/SurvivorRatio` | 传统分代 young/old 比例 | G1 默认 young 自适应场景 | Young GC 频率、晋升速率、复制成本 |\n| `UseG1GC/UseZGC/UseParallelGC` | 收集器目标选择 | 代码分配过快或对象被保活 | GC pause、吞吐、CPU、allocation stall |\n| `MaxGCPauseMillis` | G1 停顿目标引导 | 硬性 SLA 承诺 | pause 分布、Mixed GC 效果、to-space 信号 |\n| `Metaspace/DirectMemory/Xss` | 类元数据、直接内存、线程栈边界 | heap 对象泄漏 | Metaspace、NMT、Direct buffer、线程数 |\n| `Xlog/HeapDump/JFR/NMT` | 观测和事后分析 | 直接提升性能 | 日志完整性、dump 可用性、开销可接受 |"
+      "title": "参数族、适用场景与验证指标",
+      "content": "| 参数族 | 主要解决 | 不适合解决 | 验证指标 |\n| --- | --- | --- | --- |\n| `-Xms/-Xmx`、`MaxRAMPercentage` | 堆容量边界、容器内存预算 | 真实泄漏、缓存无界增长 | RSS 峰值、heap used after GC、Full/Old GC 后水位 |\n| `-Xmn/NewRatio/SurvivorRatio` | 传统分代 young/old 比例 | G1/ZGC 默认 young 自适应场景 | Young GC 频率、晋升速率、复制成本 |\n| `UseG1GC/UseZGC/UseParallelGC` | 收集器目标选择（停顿/吞吐/低延迟） | 代码层分配过快或对象被长期保活 | GC pause P99/P999、吞吐、CPU、allocation stall |\n| `MaxGCPauseMillis`、`G1HeapRegionSize`、`IHOP` | G1 停顿目标引导和区域调度 | 无法解决 live set 过大导致的停顿 | pause 分布、Mixed GC 效果、to-space exhausted 信号 |\n| `MaxMetaspaceSize/MaxDirectMemorySize/-Xss` | 类元数据、直接内存、线程栈边界 | heap 对象泄漏 | Metaspace used、NMT、Direct buffer 分配、线程数 vs 容器 PID limit |\n| `-Xlog/HeapDumpOnOOM/JFR/NMT` | 观测和事后根因分析 | 直接提升运行性能 | 日志完整性、dump 可用性、工具开销是否可接受 |\n| `ExitOnOutOfMemoryError/CrashOnOOM` | 容器场景快速退出让编排系统重建 | 不修复 OOM 根因 | 退出后 Pod 重启次数、恢复时间 |"
     },
     {
       "type": "code",
       "title": "可运行命令：打印实际 flags 与 GC 日志口径",
-      "content": "#!/usr/bin/env bash\nset -eu\n\necho \"== Java runtime ==\"\njava -version 2>&1 | sed -n '1,3p'\n\necho\necho \"== Selected command line flags ==\"\njava -XX:+PrintCommandLineFlags -version 2>&1 \\\n  | tr ' ' '\\n' \\\n  | grep -E 'InitialHeapSize|MaxHeapSize|MaxRAMPercentage|Use.*GC' || true\n\necho\necho \"== Memory-related final flags ==\"\njava -XX:+PrintFlagsFinal -version 2>&1 \\\n  | grep -E 'UseContainerSupport|InitialRAMPercentage|MaxRAMPercentage|MinRAMPercentage|MaxDirectMemorySize|MaxMetaspaceSize|MetaspaceSize|ThreadStackSize' \\\n  | sort\n\necho\necho \"== GC logging smoke test ==\"\njava -Xms64m -Xmx64m -XX:+UseG1GC -Xlog:gc -version 2>&1 \\\n  | sed -n '1,8p'",
+      "content": "#!/usr/bin/env bash\nset -eu\n\necho \"== Java runtime ==\"\njava -version 2>&1 | sed -n '1,3p'\n\necho\necho \"== Selected command line flags ==\"\njava -XX:+PrintCommandLineFlags -version 2>&1 \\\n  | tr ' ' '\\n' \\\n  | grep -E 'InitialHeapSize|MaxHeapSize|MaxRAMPercentage|Use.*GC' || true\n\necho\necho \"== Memory-related final flags ==\"\njava -XX:+PrintFlagsFinal -version 2>&1 \\\n  | grep -E 'UseContainerSupport|InitialRAMPercentage|MaxRAMPercentage|MinRAMPercentage|MaxDirectMemorySize|MaxMetaspaceSize|MetaspaceSize|ThreadStackSize' \\\n  | sort\n\necho\necho \"== GC logging smoke test ==\"\njava -Xms64m -Xmx64m -XX:+UseG1GC -Xlog:gc -version 2>&1 \\\n  | sed -n '1,8p'\n\necho\necho \"== Container-awareness check ==\"\njava -XX:+PrintFlagsFinal -version 2>&1 \\\n  | grep -E 'ActiveProcessorCount|MaxRAM'",
       "language": "bash",
       "highlights": [
         {
@@ -70,25 +75,33 @@
         {
           "line": 20,
           "note": "用小堆 smoke test 验证当前 JDK 的统一 GC 日志语法和 G1 可用性。"
+        },
+        {
+          "line": 26,
+          "note": "验证 JVM 是否正确识别了容器的 CPU 和内存限制。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "我会先声明：JVM 调优不是背一组“生产参数”，而是证据驱动闭环。第一步定目标，在线服务看 P99/P999、错误率和 GC pause，批处理看吞吐和总耗时，容器里还要看 RSS 和 limit。第二步采证据：打印实际 flags，开启 GC 日志，用监控看分配速率、GC 次数、old 水位、CPU/RSS，必要时拿 heap dump、thread dump、JFR 或 NMT。\n\n参数上分几组讲。堆用 `-Xms/-Xmx` 或 `MaxRAMPercentage` 控边界，但要给 Metaspace、direct memory、线程栈和系统留余量，不能固定套比例。G1 下 `MaxGCPauseMillis` 是目标不是硬承诺；`-Xmn`、`SurvivorRatio` 更偏传统分代语境。诊断参数如 `-Xlog:gc*`、`HeapDumpOnOutOfMemoryError`、`ExitOnOutOfMemoryError` 是生产必备底座，但 dump 路径和磁盘空间也要验证。\n\n排查时按现象建假设：Full/Old GC 后水位不降，看泄漏或 live set；Young GC 频繁，看分配速率和临时对象；P99 停顿长，拆 GC 日志阶段；OOM 按 heap、metaspace、direct、native thread 分入口。最后一次只改一个变量，用同样压测和灰度指标验证，没改善就回滚。",
+      "content": "我会先声明：JVM 调优不是背一组「生产参数」，而是证据驱动闭环。\n\n**第一步：定目标和采集证据**\n- 在线服务看 P99/P999、错误率和 GC pause；批处理看吞吐和总耗时；容器里还要看 RSS 和 limit\n- 打印实际 flags（`PrintCommandLineFlags`、`PrintFlagsFinal`），确认 JVM 读到的默认值\n- 开 GC 日志，用监控看分配速率、GC 次数、old 水位、CPU/RSS\n- 必要时拿 heap dump、thread dump、JFR 或 NMT\n\n**第二步：参数分组讲**\n- 堆用 `-Xms/-Xmx` 或 `MaxRAMPercentage` 控边界，但要给 Metaspace、direct memory、线程栈和系统留余量\n- G1 下 `MaxGCPauseMillis` 是目标不是硬承诺；`-Xmn`、`SurvivorRatio` 更偏传统分代语境\n- 诊断参数如 `-Xlog:gc*`、`HeapDumpOnOutOfMemoryError`、`ExitOnOutOfMemoryError` 是生产必备底座\n\n**第三步：按现象建假设**\n- Full/Old GC 后水位不降：看泄漏或 live set 过大\n- Young GC 频繁：看分配速率和临时对象\n- P99 停顿长：拆 GC 日志阶段（Evacuation、Mark、Remark）\n- OOM：按 heap/metaspace/direct/native thread 分入口\n\n**第四步：验证闭环**\n- 一次只改一个变量，用同样压测和灰度指标验证，没改善就回滚\n- 容器里还要确认 RSS 不超过 limit 的 75–85%\n\n**追问准备**\n- 无界队列/无上限缓存导致的泄漏不是调参能解决的，要改代码\n- JDK 8 和 JDK 17 的 GC 日志语法、默认收集器和容器感知能力都不同\n- `ExitOnOutOfMemoryError` 让进程在 OOM 后快速退出，靠编排系统重建，比带病运行好",
       "followUpQuestions": [
         {
           "question": "容器里为什么不能只按固定比例设置 `-Xmx`？",
-          "answer": "容器 limit 承载的是整个进程 RSS，不只是 Java heap。除了 heap，还要给 Metaspace、direct memory、线程栈、Code Cache、JIT/GC 线程、JNI/native 库、page cache 和系统留余量。固定比例可能在小容器里过大，也可能在 direct memory 或线程多的服务里触发容器 OOM。正确做法是结合 MaxRAMPercentage、实际 RSS、NMT、线程数和压测指标定边界。"
+          "answer": "容器 limit 承载的是整个进程 RSS，不只是 Java heap。除了 heap，还要给 Metaspace（类元数据）、Direct Memory（NIO/Netty）、线程栈（线程数 × Xss）、Code Cache（JIT 编译产物）、JIT/GC 工作线程、JNI/native 库、page cache 和系统进程留余量。固定比例可能在小容器里过大导致容器 OOM（dmesg 看到 oom-kill），也可能在 direct memory 或线程多的服务里超出限制。正确做法是用 MaxRAMPercentage 做起点，在容器内压测确认 RSS 峰值不超过 limit 的 75–85%。"
         },
         {
           "question": "G1 的 `MaxGCPauseMillis` 为什么不是硬 SLA？",
-          "answer": "它是收集器调度目标，G1 会按目标估算每次回收的 Region 数量和工作量，但如果 live set 太大、对象分配过快、Humongous 太多、to-space 不足或 CPU 资源紧张，实际停顿仍可能超过目标。验证时要看 GC 日志里的 pause 分布、Mixed GC 效果、old 水位和 to-space 相关信号。"
+          "answer": "它是收集器的调度目标，G1 据此估算每次回收的 Region 数量和工作量。但如果 live set 太大、对象分配速率过快、Humongous 对象多（跨 Region 的大对象）、to-space 不足或 CPU 资源紧张，实际停顿仍可能超过目标。验证时要看 GC 日志里的 pause 分布（不只是平均值）、Mixed GC 对 old 水位的回收效果、to-space exhausted 信号和 Evacuation Failure 次数。"
         },
         {
-          "question": "线上 OOM 发生后如何选工具？",
-          "answer": "先按错误类型分入口：Java heap space 用 heap dump 和 MAT 看 dominator tree、retained size、Path to GC Roots；Metaspace 看类加载/卸载、`jcmd VM.classloader_stats` 和 ClassLoader 引用链；Direct buffer memory 看 NMT、Netty/NIO 池和 MaxDirectMemorySize；unable to create native thread 看线程数、`-Xss`、系统 ulimit 和容器 PID/内存限制。"
+          "question": "线上 OOM 发生后如何选排查工具？",
+          "answer": "先按错误信息分入口：Java heap space → 用 heap dump + MAT 看 dominator tree、retained size、Path to GC Roots；Metaspace → 看类加载/卸载数量、`jcmd VM.classloader_stats`、ClassLoader 引用链（常是泄漏）；Direct buffer memory → 看 NMT 的 Internal 段、Netty/NIO buffer 池大小、`MaxDirectMemorySize`；unable to create native thread → 看线程数、`-Xss`、系统 ulimit -u、容器 PID/memory limit。"
+        },
+        {
+          "question": "JDK 8 和 JDK 17 在调优上有哪些关键差异？",
+          "answer": "GC 日志语法完全不同：JDK 8 用 `PrintGCDetails + Xloggc`，JDK 9+ 用 `-Xlog:gc*` 统一日志。默认收集器可能不同（JDK 9+ 默认 G1）。容器感知能力：JDK 8u191+ 才开始识别 cgroup，JDK 10+ 默认 `UseContainerSupport=true`。ZGC 在 JDK 15+ 才 production ready。`-XX:MaxRAMPercentage` 在 JDK 10+ 引入，JDK 8u191+ backport。默认值差异意味着同一份参数在两个版本上效果可能不同。"
         }
       ]
     },
@@ -96,12 +109,14 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能把 JVM 调优讲成 SLO、证据、假设、改参、验证和回滚的闭环",
-        "能区分标准参数、-X 参数和 -XX 参数，并能打印实际 flags",
-        "能说明堆、Metaspace、Direct Memory、线程栈和容器 RSS 的关系",
-        "能说明 G1、ZGC、Parallel 等收集器参数要围绕业务目标和日志调",
-        "能配置 JDK 9+ GC 日志、OOM dump、ExitOnOutOfMemoryError 等诊断参数",
-        "能按 GC 日志、heap dump、JFR、NMT、thread dump 选择排查入口"
+        "能把 JVM 调优讲成 SLO → 证据 → 假设 → 改参 → 验证 → 回滚的闭环",
+        "能区分标准参数、-X 参数和 -XX 参数，并能用 PrintCommandLineFlags/PrintFlagsFinal 打印实际 flags",
+        "能算清堆 + Metaspace + Direct Memory + 线程栈 + Code Cache + native = 全进程 RSS 的账",
+        "能说明 G1/ZGC/Parallel 的参数要围绕业务目标和日志调，不是背数字",
+        "能配置 JDK 9+ GC 日志、OOM dump、ExitOnOutOfMemoryError 等诊断参数，并知道各自开销",
+        "能按 GC 日志、heap dump、JFR、NMT、thread dump 选择不同 OOM/停顿问题的排查入口",
+        "能说明容器场景下 JDK 版本、cgroup 识别、RSS 预算和 ExitOnOOM 的特殊考量",
+        "能解释 MaxGCPauseMillis 是调度目标而非硬 SLA，并说明什么情况会超出"
       ]
     }
   ],
@@ -115,36 +130,52 @@
     },
     {
       "id": "java.jvm.topic-010-3574662f.recall.2",
-      "prompt": "Xms/Xmx、MaxRAMPercentage、MaxGCPauseMillis、MetaspaceSize、MaxDirectMemorySize、Xss 分别影响什么？",
+      "prompt": "Xms/Xmx、MaxRAMPercentage、MaxGCPauseMillis、MetaspaceSize、MaxDirectMemorySize、Xss 分别影响什么？互相之间有什么约束？",
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 4
     },
     {
       "id": "java.jvm.topic-010-3574662f.recall.3",
-      "prompt": "请描述一次 JVM 调优闭环：现象、指标、日志、假设、参数调整、验证与回滚。",
+      "prompt": "请描述一次完整的 JVM 调优闭环：现象、指标、日志、假设、参数调整、验证与回滚。",
       "mode": "text",
       "expectedMinutes": 6,
+      "difficulty": 4
+    },
+    {
+      "id": "java.jvm.topic-010-3574662f.recall.4",
+      "prompt": "容器化 Java 服务出现 RSS 持续增长但 Java heap after GC 稳定，可能是什么原因？你会怎么排查和调参？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "java.jvm.topic-010-3574662f.recall.5",
+      "prompt": "G1 收集器下 P99 停顿持续超过 MaxGCPauseMillis，你会从 GC 日志的哪些信号入手排查？",
+      "mode": "text",
+      "expectedMinutes": 5,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
       "能说出 JVM 调优是定目标、采证据、建假设、改参数、验证和回滚的闭环",
-      "能区分标准、-X、-XX 三类参数，并知道要打印实际 flags",
-      "能说明堆大小不能固定套比例，要把非堆、线程栈、容器 limit 和系统余量一起算",
+      "能区分标准、-X、-XX 三类参数，并知道要打印实际 flags 确认默认值",
+      "能说明堆大小不能固定套比例，要把 Metaspace、Direct Memory、线程栈、Code Cache、容器 limit 和系统余量一起算",
       "能用 GC 日志、heap dump、JFR、NMT、thread dump 选择不同问题的排查入口"
     ],
     "goodToHave": [
-      "能说明 G1 的 MaxGCPauseMillis 是目标不是硬 SLA",
-      "能区分传统分代参数和 G1/ZGC 等现代收集器的调优思路",
-      "能解释 ExitOnOutOfMemoryError、HeapDumpOnOutOfMemoryError、Xlog、NMT 的用途和开销边界"
+      "能说明 G1 的 MaxGCPauseMillis 是调度目标不是硬 SLA，并列举超出目标的典型场景",
+      "能区分传统分代参数（-Xmn/NewRatio/SurvivorRatio）和 G1/ZGC 等现代收集器的调优思路差异",
+      "能解释 ExitOnOutOfMemoryError、HeapDumpOnOutOfMemoryError、-Xlog、NMT 的用途和开销边界",
+      "能说明容器场景下 JDK 版本对 cgroup 识别的影响和 RSS 预算分配"
     ],
     "commonMistakes": [
-      "不看监控和 GC 日志，直接套一组固定生产参数",
-      "以为 `-Xmx` 越大越好，忽略 Full GC、RSS 和容器 OOM",
-      "把堆 OOM、Metaspace OOM、Direct memory、native thread 问题都用同一套参数处理",
-      "改完不压测、不灰度、不保留回滚条件"
+      "不看监控和 GC 日志，直接套一组网上找的固定生产参数",
+      "以为 `-Xmx` 越大越好，忽略 Full GC pause、RSS 增长和容器 OOM 风险",
+      "把堆 OOM、Metaspace OOM、Direct memory OOM、native thread 创建失败都用同一套参数处理",
+      "改完参数不压测、不灰度、不保留回滚条件，无法证明改动有效",
+      "在 G1 下手工固定 -Xmn/SurvivorRatio，干扰收集器的 region 自适应调度"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -153,7 +184,7 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "java.jvm.topic-001-ebcc71cb",
@@ -162,5 +193,5 @@
     "java.jvm.topic-007-e93284f6"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察候选人能否把 JVM 调优讲成证据驱动闭环，能按 SLO、JDK 版本、容器内存、GC 日志和诊断文件选择参数，而不是背固定参数话术。"
+  "interviewerFocus": "考察候选人能否把 JVM 调优讲成证据驱动闭环，能按 SLO、JDK 版本、容器内存、GC 日志和诊断文件选择参数和排查路径，而不是背固定参数话术。"
 }

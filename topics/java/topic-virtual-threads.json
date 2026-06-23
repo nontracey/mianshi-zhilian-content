@@ -6,27 +6,27 @@
   "group": "concurrency",
   "id": "java.concurrency.topic-virtual-threads",
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察能否基于 JDK 21/24 版本事实解释虚拟线程调度、pinning、每任务模型、资源限流和生产迁移排查。",
+  "interviewerFocus": "考察能否基于 JDK 21/24 版本事实解释虚拟线程 mount/unmount 调度、pinning 根因与版本差异、每任务模型与资源限流、ThreadLocal/ScopedValue 取舍、以及生产迁移排查方法。",
   "learningCards": [
     {
-      "content": "Virtual Threads 是 JDK 21 正式特性（OpenJDK JEP 444）。它仍然是 `java.lang.Thread`，但由 JVM 调度，运行时挂载到少量平台线程（carrier）上。它的目标不是让 CPU 变快，而是让“一请求/一任务/一线程”的同步阻塞写法在大量 I/O 等待场景下具备更好的伸缩性。\n\n平台线程直接映射到 OS 线程，创建、栈内存和上下文切换成本较高，所以传统服务常用固定线程池复用平台线程。虚拟线程很便宜，推荐每个任务创建一个：`Executors.newVirtualThreadPerTaskExecutor()`、`Thread.startVirtualThread(...)` 或 `Thread.ofVirtual()`。不要把虚拟线程再池化；如果需要限制并发，限制的是数据库连接、下游 QPS、文件句柄、队列长度等外部资源。\n\n虚拟线程对迁移很友好，因为大量同步阻塞代码可以保留形态；但它不会自动修复慢 SQL、下游限流缺失、ThreadLocal 大对象、锁粒度过大或 CPU 密集计算。\n\n**为什么虚拟线程适合 I/O 而不适合 CPU 密集？**\n虚拟线程的调度单位是 carrier（JVM 管理的少量平台线程）。当虚拟线程执行 CPU 密集任务时，它会一直占用 carrier 的 CPU 时间片，无法让出给其他虚拟线程。由于 carrier 数量有限（默认等于 CPU 核心数），大量 CPU 密集任务会导致 carrier 间发生激烈的 CPU 时间片竞争，上下文切换开销反而增加，性能不如固定大小的平台线程池。\n\n**虚拟线程的异常处理机制：**\n虚拟线程的异常传播机制与传统线程一致。如果虚拟线程在运行期间抛出未捕获的异常，该异常会被传递给 `Thread.UncaughtExceptionHandler`。如果未设置处理器，异常信息会被打印到 `System.err` 并终止该虚拟线程。这与平台线程的行为完全相同，确保了异常处理逻辑的兼容性。\n\n**与现有框架的兼容性：**\n虚拟线程与 Spring、MyBatis 等框架的兼容性总体良好，但需注意线程池配置。Spring 的 `@Async` 默认使用 `SimpleAsyncTaskExecutor` 或 `ThreadPoolTaskExecutor`，需显式配置为虚拟线程执行器。MyBatis 的数据库连接池（如 HikariCP）通常基于平台线程，虚拟线程的大量并发可能会耗尽连接池，因此必须配合连接池大小限制和超时配置。\n\n**Carrier 线程数量与调优：**\n虚拟线程的并行度由 carrier 线程数量决定，默认值为 `Runtime.getRuntime().availableProcessors()`。可以通过 JVM 参数 `jdk.virtualThreadScheduler.parallelism` 调整。在 I/O 密集型场景下，默认值通常足够；但在某些极端高并发场景下，可适当增加 carrier 数量以提升并发度，但需注意 CPU 资源的消耗。\n\n**StructuredTaskScope 与虚拟线程的协作：**\nJDK 21 引入了 `StructuredTaskScope`，它提供了一种结构化并发的机制，允许父线程等待多个子线程（可以是虚拟线程）完成，并处理子线程的异常。这与虚拟线程结合使用，可以更优雅地处理复杂的并发任务，如并行调用多个下游服务并汇总结果。",
-      "title": "虚拟线程让 thread-per-task 回来",
-      "type": "explain"
+      "title": "虚拟线程让 thread-per-task 模型回归",
+      "type": "explain",
+      "content": "Virtual Threads 是 JDK 21 正式特性（OpenJDK JEP 444）。它仍然是 `java.lang.Thread`，但由 JVM 自己调度，运行时挂载到少量平台线程（carrier）上。它的目标不是让 CPU 变快，而是让「一请求/一任务/一线程」的同步阻塞写法在大量 I/O 等待场景下具备更好的伸缩性。\n\n平台线程直接映射到 OS 线程，创建、栈内存和上下文切换成本较高，所以传统服务常用固定线程池复用平台线程。虚拟线程很便宜，推荐每个任务创建一个：`Executors.newVirtualThreadPerTaskExecutor()`、`Thread.startVirtualThread(...)` 或 `Thread.ofVirtual().start(...)`。不要把虚拟线程再池化——池化会让便宜资源重新变成稀缺资源，掩盖真正需要保护的瓶颈。\n\n需要限制并发时，应该限制的是数据库连接、下游 QPS、Redis 连接、文件句柄、队列长度等外部资源，用 Semaphore、连接池、bulkhead 或限流器表达。虚拟线程对迁移很友好，大量同步阻塞代码可以保留形态；但它不会自动修复慢 SQL、下游限流缺失、ThreadLocal 大对象、锁粒度过大或 CPU 密集计算。\n\n**为什么虚拟线程不适合 CPU 密集？**\n虚拟线程调度的物理执行单元是 carrier（默认数量等于 CPU 核心数）。CPU 密集任务会长时间占用 carrier 的 CPU 时间片，无法在等待点卸载。创建再多虚拟线程也不会突破核心数限制，反而增加上下文切换和调度开销，性能不如固定大小的平台线程池。\n\n**异常处理机制与平台线程一致：**\n虚拟线程抛出未捕获异常时，由 `Thread.UncaughtExceptionHandler` 处理；未设置则打印到 `System.err` 并终止该虚拟线程。与平台线程行为完全相同，异常处理逻辑可复用。\n\n**与 Spring、数据库连接池的兼容边界：**\nSpring Boot 3.2+ 支持 `spring.threads.virtual.enabled=true` 开启虚拟线程。`@Async` 默认的 `SimpleAsyncTaskExecutor` 可直接使用虚拟线程，但 `ThreadPoolTaskExecutor` 需要显式替换。HikariCP 连接池大小仍需独立配置，虚拟线程的高并发会快速耗尽连接，必须配合连接超时和 `maximumPoolSize`。MyBatis、JDBC 驱动本身兼容虚拟线程，瓶颈在连接池而非驱动。\n\n**Carrier 线程数量与调优：**\nCarrier 数量默认等于 `Runtime.getRuntime().availableProcessors()`，可通过 `jdk.virtualThreadScheduler.parallelism` 调整。I/O 密集场景下默认值通常足够；极端高并发时可适当增加，但要注意 CPU 资源消耗。"
     },
     {
-      "content": "虚拟线程执行 Java 代码时会 mount 到某个 carrier 平台线程上。遇到 JDK 已适配的阻塞点，例如网络 I/O、`LockSupport.park`、`Thread.sleep`、部分阻塞队列等待，虚拟线程可以 unmount，carrier 被释放去运行其他虚拟线程；等待条件满足后，虚拟线程再 remount 到某个 carrier 继续执行。\n\n这解释了它适合阻塞 I/O 的原因：平台线程不再被大量等待中的请求长期占住。对 CPU 密集任务，虚拟线程仍要消耗真实 CPU 时间，创建再多也不会突破核心数；CPU 密集任务仍要用固定大小执行器、ForkJoin 或并行流等方式控制并行度。\n\n阻塞能否卸载取决于阻塞点是否与虚拟线程协作。老旧 native/foreign 调用、某些不可中断阻塞和长时间持有临界区，仍可能限制伸缩性。\n\n**为什么 CPU 密集任务不适合虚拟线程？**\n虚拟线程在 CPU 密集时仍会争抢 carrier 的 CPU 时间片，导致上下文切换开销增加，反而降低性能。因为 carrier 线程数量有限，大量 CPU 密集任务会导致 carrier 间发生激烈的 CPU 时间片竞争，上下文切换开销反而增加，性能不如固定大小的平台线程池。\n\n**Pinning 的具体表现：**\nPinning 会导致 carrier 线程被长时间占用，无法服务其他虚拟线程，从而降低整体并发能力。例如，当虚拟线程在 `synchronized` 块中执行阻塞 I/O 时，它会被 pin 在 carrier 上，直到阻塞操作完成或退出 `synchronized` 块。这会导致 carrier 无法调度其他虚拟线程，从而降低整体并发能力。\n\n**ThreadLocal 在大量虚拟线程下的内存压力：**\n每个虚拟线程都有独立的 ThreadLocal 副本，大量虚拟线程会导致内存占用线性增长，可能引发 OOM。因此，在使用 ThreadLocal 时，需要特别注意内存管理，避免持有大对象。\n\n**Native/Foreign 调用与不可中断阻塞：**\nNative 调用是 JVM 外部的 C/C++ 函数调用，foreign 调用是外部进程或系统调用。这些调用通常会导致虚拟线程被 pin 住，无法卸载。因此，在使用这些调用时，需要特别注意性能影响。\n\n**MDC/Trace 上下文传播：**\nMDC（Mapped Diagnostic Context）是日志框架的上下文，trace 是链路追踪上下文。在虚拟线程中，这些上下文不会自动传播，需要手动处理。例如，在 Spring 中，可以使用 `TaskDecorator` 来传递 MDC 上下文。\n\n**虚拟线程与平台线程的上下文切换开销对比：**\n平台线程的上下文切换涉及 OS 内核态和用户态的切换，开销较大。虚拟线程的上下文切换主要在 JVM 用户态进行，开销较小。因此，虚拟线程在大量并发场景下具有更好的性能表现。",
-      "title": "mount/unmount：等待时释放 carrier",
-      "type": "explain"
+      "title": "mount/unmount：阻塞时释放 carrier",
+      "type": "explain",
+      "content": "虚拟线程执行 Java 代码时会 mount 到某个 carrier 平台线程上。遇到 JDK 已适配的阻塞点——网络 I/O、`LockSupport.park`、`Thread.sleep`、数据库连接获取、部分阻塞队列等待——虚拟线程可以 unmount，carrier 被释放去运行其他虚拟线程；等待条件满足后，虚拟线程再 remount 到某个空闲 carrier 继续执行。\n\n这解释了它适合阻塞 I/O 的原因：平台线程不再被大量等待中的请求长期占住。对 CPU 密集任务，虚拟线程仍要消耗真实 CPU 时间，创建再多也不会突破核心数。\n\n阻塞能否卸载取决于阻塞点是否与虚拟线程协作。JDK 内部的标准阻塞操作（socket I/O、sleep、park、`ReentrantLock.lock()`、`CountDownLatch.await()`、`Future.get()` 等）已经适配。但老旧 native 调用、JNI 临界区、某些不可中断的底层阻塞、以及 `synchronized` 内的阻塞（JDK 21-23）仍可能 pin 住 carrier。\n\n**ThreadLocal 在大量虚拟线程下的内存压力：**\n每个虚拟线程都有独立的 ThreadLocal 副本。百万级虚拟线程即使每个只存几 KB 上下文，也可能造成数 GB 内存压力。应避免在虚拟线程中持有大对象或使用 ThreadLocal 做缓存；只读上下文优先使用 `ScopedValue`（JDK 21 预览，JDK 24+ 正式化），它在子任务完成后自动清理。\n\n**MDC / Trace 上下文传播：**\n虚拟线程的 ThreadLocal 不会在 unmount/remount 间丢失（JVM 保证），但新创建的虚拟线程不会自动继承父线程的 MDC 或 trace 上下文。Spring Boot 3.2+ 的 `TaskDecorator` 和 Micrometer 的 context propagation 机制可以解决；手动创建虚拟线程时需要显式传递。\n\n**虚拟线程 vs 平台线程的上下文切换开销：**\n平台线程切换涉及 OS 内核态调度（保存/恢复寄存器、TLB flush），开销微秒级。虚拟线程切换在 JVM 用户态完成（保存/恢复 continuation 栈帧），开销纳秒级。这是虚拟线程在高并发 I/O 场景下吞吐更高的核心原因。"
     },
     {
-      "content": "JDK 21-23 中，一个虚拟线程在 `synchronized` 方法或代码块里执行阻塞操作时，可能 pin 住 carrier，导致 carrier 不能去运行其他虚拟线程。JFR 可观察到 `jdk.VirtualThreadPinned` 事件，线程 dump 也能帮助定位长期占用点。\n\nOpenJDK JEP 491 在 JDK 24 改进了 synchronized 与虚拟线程的协作，目标是让虚拟线程在 synchronized 中阻塞时也能释放底层平台线程，消除几乎所有这类 pinning。这个变化意味着 2026 年不能再简单说“虚拟线程场景要把 synchronized 全换成 ReentrantLock”。正确说法是：JDK 21-23 要重点规避 synchronized 内慢阻塞；JDK 24+ 仍要保持临界区短，锁选择回到语义、可中断、超时、多条件队列等需求。\n\nnative/foreign 调用、长时间 CPU 占用、下游资源耗尽和粗粒度锁仍然是边界。\n\n**Pinning 的底层机制：**\nPinning 的底层机制与 JNI 临界区和 synchronized 实现有关。在 JDK 21-23 中，当虚拟线程进入 `synchronized` 块时，它会获取一个监视器锁。如果在该块中执行阻塞操作，虚拟线程会被 pin 在 carrier 上，直到阻塞操作完成或退出 `synchronized` 块。这是因为 JVM 需要保证监视器锁的原子性，防止其他线程在阻塞期间获取锁。\n\n**失败模式案例：**\n例如，在一个 `synchronized` 块中调用阻塞 I/O 方法，会导致 carrier 线程被长时间占用，无法服务其他虚拟线程。这会导致整体并发能力下降，甚至引发 OOM。因此，在虚拟线程中，应尽量避免在 `synchronized` 块中执行阻塞操作。\n\n**JDK 24+ 的改进：**\nJDK 24 的 JEP 491 改进了 synchronized 与虚拟线程的协作，允许虚拟线程在 synchronized 中阻塞时释放 carrier。这消除了绝大多数 pinning 问题，但开发者仍需注意临界区的长度和外部资源的限制。",
       "title": "pinning 的版本边界要讲准",
-      "type": "explain"
+      "type": "explain",
+      "content": "JDK 21-23 中，一个虚拟线程在 `synchronized` 方法或代码块里执行阻塞操作时，会 pin 住 carrier 线程。被 pin 的 carrier 无法去运行其他虚拟线程，直到阻塞操作完成或退出 `synchronized` 块。JFR 可观察到 `jdk.VirtualThreadPinned` 事件，持续超过 20ms 的事件默认开启。\n\n**pinning 的底层原因：**\n`synchronized` 的 monitor 锁在 JVM 内部与 carrier 线程的执行上下文绑定。当虚拟线程在 `synchronized` 块中阻塞时，JVM 需要保证锁的原子性——如果此时 unmount 虚拟线程，锁状态会不一致。所以 JVM 选择 pin 住 carrier，等待阻塞完成。`ReentrantLock` 不涉及这个问题，因为它的实现直接与 continuation 协作，可以在等待时 unmount。\n\n**JEP 491（JDK 24）的改进：**\nOpenJDK JEP 491 让虚拟线程在 `synchronized` 中阻塞时也能释放 carrier，消除几乎所有这类 pinning。这意味着从 JDK 24 起不能再简单说「虚拟线程场景要把 synchronized 全换成 ReentrantLock」。正确说法是：JDK 21-23 要重点规避 synchronized 内慢阻塞（网络 I/O、数据库查询）；JDK 24+ 选择 synchronized 还是 ReentrantLock 回到语义需求（可中断、超时、多条件队列、公平性）。\n\n**失败模式案例：**\n一个在 `synchronized` 块中执行数据库查询的服务，迁移到 JDK 21 虚拟线程后，所有 carrier 被 pin 住，QPS 反而下降。排查方式：JFR `jdk.VirtualThreadPinned` 事件定位 pin 热点，线程 dump 看 carrier 上堆栈，然后改成 `ReentrantLock` 或升级到 JDK 24。\n\n**native/foreign 调用仍是边界：**\nJNI 调用期间虚拟线程也会 pin 住 carrier。使用 Panama Foreign Function API（JDK 22+ 正式）时，downcall 和 upcall 某些场景仍可能 pin。这类 pinning 通常无法通过代码改动消除，需要评估调用频率和耗时。"
     },
     {
-      "content": "迁移到虚拟线程后，最常见的错觉是“线程更多，所以并发更高”。真实瓶颈往往转移到数据库连接池、HTTP 连接池、Redis 连接、第三方接口 QPS、消息队列消费速率或本机文件句柄。虚拟线程让等待便宜，但不会让下游容量变大。\n\n因此每任务虚拟线程通常要配合 Semaphore、连接池、bulkhead、限流器和超时。不要用固定虚拟线程池大小表达资源保护；那会把便宜的线程又变成稀缺资源。应该让虚拟线程多，但让外部资源有明确预算。\n\n观测上要关注：JFR pinning 事件、虚拟线程 thread dump、carrier CPU、下游连接池等待、请求延迟分布、ThreadLocal 内存占用、MDC/trace 上下文传播。JEP 444 说明虚拟线程支持 ThreadLocal，但大量虚拟线程持有大对象会放大内存压力；只读上下文可以评估 ScopedValue。\n\n**上线评估的具体指标：**\n1. **JFR pinning 事件**：监控 `jdk.VirtualThreadPinned` 事件，识别长时间 pin 住的虚拟线程。\n2. **虚拟线程 thread dump**：定期生成 thread dump，分析虚拟线程的状态和分布。\n3. **Carrier CPU**：监控 carrier 线程的 CPU 使用率，确保没有过载。\n4. **下游连接池等待**：监控数据库、HTTP 等连接池的等待时间和连接数。\n5. **请求延迟分布**：分析请求的 P50、P95、P99 延迟，识别性能瓶颈。\n6. **ThreadLocal 内存占用**：监控 ThreadLocal 的内存占用，避免 OOM。\n7. **MDC/Trace 上下文传播**：确保日志和链路追踪上下文在虚拟线程间正确传播。\n\n**资源限流的最佳实践：**\n1. **Semaphore**：使用 Semaphore 限制并发访问外部资源的数量。\n2. **连接池**：合理配置数据库、HTTP 等连接池的大小。\n3. **Bulkhead**：使用 Bulkhead 模式隔离不同服务的调用，防止雪崩。\n4. **限流器**：使用限流器控制请求速率，防止下游服务过载。\n5. **超时**：设置合理的超时时间，避免长时间等待。",
       "title": "上线评估看外部资源和观测",
-      "type": "explain"
+      "type": "explain",
+      "content": "迁移到虚拟线程后，最常见的错觉是「线程更多，所以并发更高」。真实瓶颈几乎总是转移到下游：数据库连接池、HTTP 连接池、Redis 连接、第三方接口 QPS、消息队列消费速率或本机文件句柄。虚拟线程让等待便宜，但不会让下游容量变大。\n\n因此每任务虚拟线程通常要配合外部资源预算：Semaphore 限制并发访问数、连接池大小、bulkhead 隔离不同服务调用、限流器控制请求速率、超时避免长时间等待。不要用固定虚拟线程池大小表达资源保护——那会把便宜的线程又变成稀缺资源。\n\n**上线评估的核心指标：**\n- **JFR pinning 事件**：监控 `jdk.VirtualThreadPinned` 事件频率和持续时间，识别长时间 pin 住 carrier 的热点。\n- **虚拟线程 thread dump**：`jcmd <pid> Thread.dump_to_file -format=json <file>` 可输出完整虚拟线程 dump，分析状态分布（RUNNABLE/BLOCKED/WAITING）。\n- **Carrier CPU 使用率**：确认 carrier 线程没有过载；CPU 100% 但 I/O 等待少说明计算任务混入了虚拟线程。\n- **下游连接池等待时间和连接数**：HikariCP 的 `hikaricp_pending_threads`、`hikaricp_active_connections`，HTTP 连接池的等待队列。\n- **端到端延迟分布**：P50/P95/P99 请求延迟，确认虚拟线程是否带来真实延迟改善。\n- **ThreadLocal 内存占用**：heap dump 分析 ThreadLocalMap 大小，避免 OOM。\n- **MDC/Trace 传播完整性**：日志和链路追踪上下文在虚拟线程间是否正确传播，否则排查问题时缺少关联。"
     },
     {
       "type": "diagram",
@@ -35,24 +35,26 @@
       "sources": [
         {
           "kind": "svg",
-          "content": "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 800 600' style='font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, Helvetica, Arial, sans-serif;'><defs><marker id='arrow' markerWidth='10' markerHeight='10' refX='9' refY='3' orient='auto' markerUnits='strokeWidth'><path d='M0,0 L0,6 L9,3 z' fill='#64748b' /></marker><filter id='shadow' x='-20%' y='-20%' width='140%' height='140%'><feDropShadow dx='2' dy='2' stdDeviation='3' flood-opacity='0.15'/></filter></defs><rect width='100%' height='100%' fill='#f8fafc' /><rect x='50' y='40' width='700' height='520' rx='12' fill='#ffffff' stroke='#e2e8f0' stroke-width='1' /><text x='400' y='75' text-anchor='middle' font-size='18' font-weight='bold' fill='#0f172a'>虚拟线程调度与 Pinning 机制</text><text x='400' y='100' text-anchor='middle' font-size='12' fill='#64748b'>Java 21+ Carrier Threads (OS Threads)</text><line x1='50' y1='120' x2='750' y2='120' stroke='#e2e8f0' stroke-width='2' /><text x='400' y='150' text-anchor='middle' font-size='14' font-weight='bold' fill='#334155'>1. 调度模型：M:N 映射</text><rect x='100' y='170' width='180' height='80' rx='6' fill='#eff6ff' stroke='#3b82f6' stroke-width='1.5' /><text x='190' y='200' text-anchor='middle' font-size='13' font-weight='bold' fill='#1d4ed8'>虚拟线程</text><text x='190' y='220' text-anchor='middle' font-size='11' fill='#3b82f6'>User Space</text><text x='190' y='240' text-anchor='middle' font-size='11' fill='#3b82f6'>轻量级 / 1MB</text><rect x='520' y='170' width='180' height='80' rx='6' fill='#f1f5f9' stroke='#64748b' stroke-width='1.5' /><text x='610' y='200' text-anchor='middle' font-size='13' font-weight='bold' fill='#334155'>Carrier 线程</text><text x='610' y='220' text-anchor='middle' font-size='11' fill='#64748b'>OS Space</text><text x='610' y='240' text-anchor='middle' font-size='11' fill='#64748b'>重量级 / 1MB+</text><path d='M280,210 L520,210' stroke='#64748b' stroke-width='1.5' marker-end='url(#arrow)' /><text x='400' y='200' text-anchor='middle' font-size='10' fill='#64748b'>N:1 映射</text><text x='400' y='280' text-anchor='middle' font-size='14' font-weight='bold' fill='#334155'>2. Pinning (阻塞)</text><rect x='100' y='310' width='180' height='100' rx='6' fill='#fff1f2' stroke='#e11d48' stroke-width='1.5' /><text x='190' y='340' text-anchor='middle' font-size='13' font-weight='bold' fill='#be123c'>虚拟线程阻塞</text><text x='190' y='360' text-anchor='middle' font-size='11' fill='#e11d48'>阻塞 I/O</text><text x='190' y='380' text-anchor='middle' font-size='11' fill='#e11d48'>同步锁</text><text x='190' y='400' text-anchor='middle' font-size='11' fill='#e11d48'>JNI 调用</text><rect x='520' y='310' width='180' height='100' rx='6' fill='#fff1f2' stroke='#e11d48' stroke-width='1.5' /><text x='610' y='340' text-anchor='middle' font-size='13' font-weight='bold' fill='#be123c'>Carrier 线程挂起</text><text x='610' y='360' text-anchor='middle' font-size='11' fill='#e11d48'>Pinned</text><text x='610' y='380' text-anchor='middle' font-size='11' fill='#e11d48'>无法调度</text><text x='610' y='400' text-anchor='middle' font-size='11' fill='#e11d48'>等待恢复</text><path d='M280,360 L520,360' stroke='#e11d48' stroke-width='1.5' marker-end='url(#arrow)' /><text x='400' y='350' text-anchor='middle' font-size='10' fill='#e11d48'>阻塞导致 Pinning</text><text x='400' y='440' text-anchor='middle' font-size='14' font-weight='bold' fill='#334155'>3. 资源边界与观测</text><rect x='100' y='460' width='180' height='80' rx='6' fill='#f0fdf4' stroke='#16a34a' stroke-width='1.5' /><text x='190' y='490' text-anchor='middle' font-size='13' font-weight='bold' fill='#15803d'>虚拟线程</text><text x='190' y='510' text-anchor='middle' font-size='11' fill='#16a34a'>可观测性</text><text x='190' y='530' text-anchor='middle' font-size='11' fill='#16a34a'>Thread ID / Stack</text><rect x='520' y='460' width='180' height='80' rx='6' fill='#f0fdf4' stroke='#16a34a' stroke-width='1.5' /><text x='610' y='490' text-anchor='middle' font-size='13' font-weight='bold' fill='#15803d'>Carrier 线程</text><text x='610' y='510' text-anchor='middle' font-size='11' fill='#16a34a'>资源限流</text><text x='610' y='530' text-anchor='middle' font-size='11' fill='#16a34a'>CPU / 内存</text><path d='M280,500 L520,500' stroke='#16a34a' stroke-width='1.5' marker-end='url(#arrow)' /><text x='400' y='490' text-anchor='middle' font-size='10' fill='#16a34a'>映射关系</text></svg>"
+          "path": "assets/diagrams/java-virtual-thread-mn-scheduling.svg"
         },
         {
           "kind": "text",
           "content": "虚拟线程采用 M:N 调度模型，N 个轻量级虚拟线程映射到 M 个重量级 Carrier 线程。当虚拟线程执行阻塞 I/O 时，会挂起 Carrier 线程，导致该 Carrier 被阻塞（Pinned），无法处理其他虚拟线程。资源边界在于虚拟线程可观测，而 Carrier 线程受限于系统资源。"
         }
       ],
-      "caption": "虚拟线程 M:N 调度与 Pinning 阻塞机制",
-      "fallback": "虚拟线程采用 M:N 调度模型，N 个轻量级虚拟线程映射到 M 个重量级 Carrier 线程。当虚拟线程执行阻塞 I/O 时，会挂起 Carrier 线程，导致该 Carrier 被阻塞（Pinned），无法处理其他虚拟线程。资源边界在于虚拟线程可观测，而 Carrier 线程受限于系统资源。"
+      "caption": "虚拟线程 M:N 调度：正常 unmount 释放 carrier vs pinning 占住 carrier",
+      "fallback": "虚拟线程 M:N 调度：N 个虚拟线程映射到 M 个 carrier 平台线程。阻塞 I/O 时 unmount 释放 carrier 去跑其他虚拟线程；synchronized 内阻塞(JDK 21-23)、JNI/native 调用会 pin 住 carrier，无法调度其他虚拟线程。JDK 24 JEP 491 消除 synchronized pinning。",
+      "content": "assets/diagrams/java-virtual-thread-mn-scheduling.svg"
     },
     {
+      "title": "平台线程、虚拟线程和响应式对比",
+      "type": "compareTable",
       "columns": [
         "维度",
         "平台线程池",
         "虚拟线程",
         "响应式/事件驱动"
       ],
-      "content": "",
       "rows": [
         [
           "编程模型",
@@ -87,7 +89,7 @@
         [
           "ThreadLocal",
           "常用但要清理",
-          "支持，但数量大时谨慎",
+          "支持，但数量大时谨慎；ScopedValue 更适合只读",
           "通常依赖上下文传播机制"
         ],
         [
@@ -95,12 +97,6 @@
           "线程数不足、队列堆积",
           "下游耗尽、pinning、ThreadLocal 内存",
           "心智负担、阻塞污染事件循环"
-        ],
-        [
-          "版本边界",
-          "说明",
-          "",
-          ""
         ],
         [
           "JDK 21",
@@ -116,7 +112,7 @@
         ],
         [
           "JDK 24+",
-          "JEP 491 改进 synchronized pinning，但仍要控制临界区和外部资源",
+          "JEP 491 改进 synchronized pinning，仍要控制临界区和外部资源",
           "",
           ""
         ],
@@ -127,19 +123,21 @@
           ""
         ]
       ],
-      "title": "平台线程、虚拟线程和响应式对比",
-      "type": "compareTable"
+      "content": ""
     },
     {
+      "title": "可运行代码：检测并演示虚拟线程 per-task 模型",
+      "type": "code",
+      "language": "java",
       "content": "import java.lang.reflect.Method;\nimport java.util.ArrayList;\nimport java.util.List;\nimport java.util.concurrent.Callable;\nimport java.util.concurrent.ExecutorService;\nimport java.util.concurrent.Executors;\nimport java.util.concurrent.Future;\nimport java.util.concurrent.Semaphore;\nimport java.util.concurrent.TimeUnit;\nimport java.util.concurrent.atomic.AtomicInteger;\n\npublic class Main {\n    public static void main(String[] args) throws Exception {\n        Method factory;\n        try {\n            factory = Executors.class.getMethod(\"newVirtualThreadPerTaskExecutor\");\n        } catch (NoSuchMethodException notOnJdk21) {\n            System.out.println(\"virtualThreadsAvailable=false, java=\"\n                    + System.getProperty(\"java.version\"));\n            return;\n        }\n\n        ExecutorService executor = (ExecutorService) factory.invoke(null);\n        Semaphore dbPermits = new Semaphore(2);\n        AtomicInteger maxInDb = new AtomicInteger();\n        AtomicInteger activeInDb = new AtomicInteger();\n        List<Future<String>> futures = new ArrayList<>();\n        try {\n            for (int i = 0; i < 6; i++) {\n                int taskId = i;\n                Callable<String> task = () -> {\n                    boolean virtual = isVirtual(Thread.currentThread());\n                    dbPermits.acquire();\n                    int now = activeInDb.incrementAndGet();\n                    maxInDb.accumulateAndGet(now, Math::max);\n                    try {\n                        Thread.sleep(30);\n                        return \"task-\" + taskId + \":virtual=\" + virtual;\n                    } finally {\n                        activeInDb.decrementAndGet();\n                        dbPermits.release();\n                    }\n                };\n                futures.add(executor.submit(task));\n            }\n            for (Future<String> future : futures) {\n                System.out.println(future.get());\n            }\n            System.out.println(\"maxInDb=\" + maxInDb.get());\n            assert maxInDb.get() <= 2;\n        } finally {\n            executor.shutdown();\n            executor.awaitTermination(1, TimeUnit.SECONDS);\n        }\n    }\n\n    static boolean isVirtual(Thread thread) {\n        try {\n            Method method = Thread.class.getMethod(\"isVirtual\");\n            return (Boolean) method.invoke(thread);\n        } catch (ReflectiveOperationException unavailableBeforeJdk21) {\n            return false;\n        }\n    }\n}",
       "highlights": [
         {
           "line": 15,
-          "note": "用反射检测 JDK 21 API，代码在 JDK 17 可运行，在 JDK 21+ 会真实使用虚拟线程执行器。"
+          "note": "用反射检测 JDK 21 API，代码在 JDK 17 可编译运行，在 JDK 21+ 会真实使用虚拟线程执行器。"
         },
         {
           "line": 23,
-          "note": "虚拟线程不再池化，外部资源用 Semaphore 或连接池限制并发。"
+          "note": "虚拟线程不再池化，外部资源用 Semaphore 限制并发。"
         },
         {
           "line": 33,
@@ -147,52 +145,50 @@
         },
         {
           "line": 48,
-          "note": "运行结果验证数据库类资源并发没有超过许可数。"
+          "note": "运行结果验证数据库类资源并发不超过许可数（maxInDb <= 2）。"
         }
-      ],
-      "language": "java",
-      "title": "可运行代码：检测并演示虚拟线程 per-task 模型",
-      "type": "code"
+      ]
     },
     {
-      "content": "我会先定义：虚拟线程是 JDK 21 正式引入的轻量级 `java.lang.Thread`，由 JVM 调度，运行时挂载到 carrier 平台线程上。它让高并发 I/O 服务可以继续使用同步阻塞代码，每个请求一个虚拟线程，而不是把业务拆成复杂回调链。\n\n底层抓手是 mount/unmount：虚拟线程运行 Java 代码时占用 carrier；遇到适配的阻塞 I/O、sleep、park 等等待点可以卸载，carrier 去跑其他虚拟线程；等待结束后再挂载继续。它降低的是等待期间占用平台线程的成本，不提升 CPU 算力。\n\n边界要讲三类。第一，不要池化虚拟线程，直接每任务创建；真正要限的是数据库连接、下游 QPS、文件句柄和队列。第二，JDK 21-23 中 synchronized 内阻塞可能 pin carrier；JDK 24 的 JEP 491 已改善这类 pinning，但 native/foreign 调用、长时间持锁和下游耗尽仍要排查。第三，ThreadLocal 虽被支持，但大量虚拟线程持有大对象会增加内存压力，只读上下文优先考虑作用域化传递。\n\n与响应式相比，虚拟线程保留同步代码和调试体验，适合大量请求型阻塞 I/O；响应式仍适合复杂流处理和显式背压链路。上线验证看 JFR pinning、线程 dump、carrier CPU、下游连接池等待和端到端延迟。",
+      "title": "面试回答思路",
+      "type": "interviewAnswer",
+      "content": "虚拟线程是 JDK 21 正式引入的轻量级 `java.lang.Thread`，由 JVM 调度，运行时挂载到 carrier 平台线程上。它让高并发 I/O 服务可以继续使用同步阻塞代码，每个请求一个虚拟线程，而不是把业务拆成复杂回调链。\n\n**核心机制：mount/unmount**\n- 虚拟线程运行 Java 代码时占用 carrier\n- 遇到适配的阻塞点（网络 I/O、sleep、park、`ReentrantLock.lock()` 等）可以 unmount\n- carrier 被释放去运行其他虚拟线程\n- 等待结束后 remount 到空闲 carrier 继续执行\n- 降低的是等待期间占用平台线程的成本，不提升 CPU 算力\n\n**每任务一个线程，不要池化**\n- `Executors.newVirtualThreadPerTaskExecutor()`、`Thread.ofVirtual().start(runnable)`\n- 池化会让便宜资源重新变成稀缺资源\n- 真正要限的是 DB 连接池、HTTP 连接池、Semaphore、限流器\n\n**CPU 密集不适合**\n- carrier 数量默认等于 CPU 核心数\n- CPU 密集任务长时间占用 carrier，无法在等待点卸载\n- 创建再多虚拟线程不突破核心数，反而增加调度开销\n\n**pinning 版本边界**\n- JDK 21-23：`synchronized` 内阻塞会 pin 住 carrier，JFR `jdk.VirtualThreadPinned` 可观察\n- JDK 24+（JEP 491）：改进 synchronized 与虚拟线程协作，消除绝大多数 pinning\n- native/foreign 调用、长时间 CPU 占用仍是边界\n- JDK 21-23 推荐用 `ReentrantLock` 替代 synchronized 内的慢阻塞\n\n**ThreadLocal 与 ScopedValue**\n- ThreadLocal 支持但大量虚拟线程持有大对象会放大内存压力\n- 只读上下文优先使用 `ScopedValue`（JDK 21 预览，JDK 24+ 正式化），子任务完成后自动清理\n- MDC/trace 需要 `TaskDecorator` 或 context propagation 机制\n\n**上线评估核心指标**\n- JFR pinning 事件频率和持续时间\n- 虚拟线程 thread dump（`jcmd Thread.dump_to_file -format=json`）\n- carrier CPU 使用率\n- 下游连接池等待时间和连接数\n- P50/P95/P99 请求延迟\n- ThreadLocal 内存占用\n\n**与响应式对比**\n- 虚拟线程保留同步代码和调试体验，适合大量请求型阻塞 I/O\n- 响应式仍适合复杂流处理、显式背压链路、事件驱动架构\n- 两者都需要下游限流和超时，不是谁替代谁",
       "followUpQuestions": [
         {
-          "answer": "平台线程昂贵，所以需要池化复用；虚拟线程很便宜，设计目标就是每个任务创建一个并在任务结束后丢弃。池化虚拟线程会重新制造稀缺线程，并掩盖真正需要保护的资源。并发控制应放在数据库连接池、HTTP 连接池、Semaphore、限流器或队列上。",
-          "question": "为什么不要池化虚拟线程？"
+          "question": "为什么不要池化虚拟线程？",
+          "answer": "平台线程昂贵，需要池化复用以控制并发和降低创建成本。虚拟线程很便宜，设计目标就是每个任务创建一个并在任务结束后丢弃。池化虚拟线程会重新制造稀缺线程，掩盖真正需要保护的资源。并发控制应放在数据库连接池、HTTP 连接池、Semaphore、限流器或队列上。"
         },
         {
-          "answer": "不适合用来提升 CPU 密集任务吞吐。虚拟线程只降低等待型任务占用平台线程的成本，CPU 计算仍受核心数限制。CPU 密集任务要限制并行度，用固定大小执行器、ForkJoin 或并行算法，避免创建大量同时争抢 CPU 的任务。",
-          "question": "虚拟线程适合 CPU 密集任务吗？"
+          "question": "虚拟线程适合 CPU 密集任务吗？",
+          "answer": "不适合用来提升 CPU 密集任务吞吐。虚拟线程只降低等待型任务占用平台线程的成本，CPU 计算仍受核心数限制。大量 CPU 密集虚拟线程会让 carrier 线程频繁切换，增加调度开销。CPU 密集任务应使用固定大小平台线程池、ForkJoinPool 或并行算法。"
         },
         {
-          "answer": "先看瓶颈是否转移到下游：数据库连接池等待、HTTP 连接池、第三方限流、文件句柄。再看 JFR 的 pinning 事件和线程 dump，定位 synchronized、native 或长临界区。还要看 ThreadLocal/MDC 内存占用、carrier CPU、请求延迟分布和超时配置，确认不是把等待从线程池转移到了资源池。",
-          "question": "如何排查虚拟线程上线后效果不达预期？"
+          "question": "JDK 21-23 中 synchronized 内阻塞为什么会 pin carrier？JDK 24 改了什么？",
+          "answer": "synchronized 的 monitor 锁在 JVM 内部与 carrier 线程的执行上下文绑定。虚拟线程在 synchronized 块中阻塞时，JVM 需要保证锁的原子性，不能在持锁期间 unmount，所以 pin 住 carrier。JDK 24 的 JEP 491 改进了 synchronized 的实现，让虚拟线程在 synchronized 中阻塞时也能 unmount 释放 carrier，消除几乎所有这类 pinning。从 JDK 24 起，选择 synchronized 还是 ReentrantLock 回到语义需求而非 pinning 规避。"
         },
         {
-          "answer": "虚拟线程的异常传播机制与传统线程一致。如果虚拟线程在运行期间抛出未捕获的异常，该异常会被传递给 `Thread.UncaughtExceptionHandler`。如果未设置处理器，异常信息会被打印到 `System.err` 并终止该虚拟线程。这与平台线程的行为完全相同，确保了异常处理逻辑的兼容性。",
-          "question": "虚拟线程的异常如何处理？"
+          "question": "如何排查虚拟线程上线后效果不达预期？",
+          "answer": "先确认瓶颈是否转移到下游：HikariCP 的 `hikaricp_pending_threads`、HTTP 连接池等待队列、第三方接口限流、文件句柄。再看 JFR `jdk.VirtualThreadPinned` 事件定位 pin 热点，线程 dump 看 carrier 上堆栈是否卡在 synchronized 或 native 调用。还要看 ThreadLocal 内存占用、carrier CPU、请求延迟分布和超时配置。最后对比迁移前后的 P50/P95/P99 延迟和连接池利用率。"
         },
         {
-          "answer": "虚拟线程与 Spring、MyBatis 等框架的兼容性总体良好，但需注意线程池配置。Spring 的 `@Async` 默认使用 `SimpleAsyncTaskExecutor` 或 `ThreadPoolTaskExecutor`，需显式配置为虚拟线程执行器。MyBatis 的数据库连接池（如 HikariCP）通常基于平台线程，虚拟线程的大量并发可能会耗尽连接池，因此必须配合连接池大小限制和超时配置。",
-          "question": "虚拟线程与现有框架（如 Spring、MyBatis）的兼容性如何？"
+          "question": "虚拟线程和响应式编程怎么选？",
+          "answer": "虚拟线程保留同步阻塞代码形态，调试体验好，适合请求-响应型 I/O 服务（每个请求独立、不需要复杂流组合）。响应式（Reactor/RxJava）适合需要显式背压、复杂流编排、事件驱动架构的场景。两者都需要下游限流和超时。虚拟线程不是响应式的替代，但对大多数 Web 服务来说，同步代码 + 虚拟线程比响应式更易维护。"
         }
-      ],
-      "title": "面试回答思路",
-      "type": "interviewAnswer"
+      ]
     },
     {
-      "items": [
-        "能解释虚拟线程、平台线程和 carrier 的关系",
-        "能说明 mount/unmount 如何降低阻塞 I/O 对平台线程的占用",
-        "能写出每任务一个虚拟线程的创建方式，并说明不要池化虚拟线程",
-        "能指出 CPU 密集任务、下游资源耗尽、ThreadLocal 大对象不是虚拟线程能自动解决的问题",
-        "能说明 JDK 21-23 synchronized pinning 与 JDK 24+ JEP 491 的版本差异",
-        "能用 JFR、线程 dump、连接池等待和延迟指标排查迁移问题",
-        "能对比虚拟线程、传统平台线程池和响应式模型的适用边界"
-      ],
       "title": "学完后应能说清楚",
-      "type": "checklist"
+      "type": "checklist",
+      "items": [
+        "能解释虚拟线程、平台线程和 carrier 的关系，以及 M:N 调度模型",
+        "能说明 mount/unmount 如何降低阻塞 I/O 对平台线程的占用",
+        "能写出每任务一个虚拟线程的创建方式，并说明不要池化虚拟线程的原因",
+        "能指出 CPU 密集任务、下游资源耗尽、ThreadLocal 大对象不是虚拟线程能自动解决的问题",
+        "能说明 JDK 21-23 synchronized pinning 的底层原因与 JDK 24 JEP 491 的改进",
+        "能说明 synchronized 内阻塞 pin carrier 而 ReentrantLock 不 pin 的原因",
+        "能用 JFR pinning 事件、线程 dump、连接池等待和延迟指标排查迁移问题",
+        "能对比虚拟线程、传统平台线程池和响应式模型的适用边界"
+      ]
     }
   ],
   "order": 110,
@@ -203,53 +199,68 @@
   "quiz": null,
   "recallPrompts": [
     {
-      "difficulty": 4,
-      "expectedMinutes": 3,
       "id": "java.concurrency.topic-virtual-threads.recall.1",
+      "prompt": "请完整讲一下虚拟线程的实现原理：mount/unmount 机制、carrier 线程角色、为什么适合阻塞 I/O 而不适合 CPU 密集任务。",
       "mode": "text",
-      "prompt": "Virtual Threads（Java 21+） 的实现原理是什么？和平台线程池相比有什么优劣？"
-    },
-    {
-      "difficulty": 4,
       "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
       "id": "java.concurrency.topic-virtual-threads.recall.2",
+      "prompt": "JDK 21-23 中 synchronized 内阻塞为什么会 pin 住 carrier 线程？JDK 24 的 JEP 491 改变了什么？ReentrantLock 为什么不受影响？",
       "mode": "text",
-      "prompt": "Virtual Threads 在 JDK 21-23 中为什么可能发生 pinning？JDK 24+ 的 JEP 491 改变了什么？"
+      "expectedMinutes": 3,
+      "difficulty": 4
     },
     {
-      "difficulty": 4,
-      "expectedMinutes": 4,
       "id": "java.concurrency.topic-virtual-threads.recall.3",
+      "prompt": "为什么说「不要池化虚拟线程」？那并发保护应该放在哪里？",
       "mode": "text",
-      "prompt": "Virtual Threads、传统线程池和响应式编程有什么关键区别？"
+      "expectedMinutes": 3,
+      "difficulty": 4
     },
     {
-      "difficulty": 4,
-      "expectedMinutes": 4,
-      "id": "java.concurrency.topic-virtual-threads.recall.scenario",
+      "id": "java.concurrency.topic-virtual-threads.recall.4",
+      "prompt": "虚拟线程、传统线程池和响应式编程在编程模型、适合场景、并发保护和主要风险上有什么关键区别？",
       "mode": "text",
-      "prompt": "生产环境里 Virtual Threads 出现效果不达预期时，你会如何定位原因、选择修复方案并验证结果？"
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "java.concurrency.topic-virtual-threads.recall.5",
+      "prompt": "生产环境把服务迁移到虚拟线程后，QPS 没有提升、P99 延迟反而升高。你会如何定位原因、选择修复方案并验证结果？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "java.concurrency.topic-virtual-threads.recall.6",
+      "prompt": "ThreadLocal 和 ScopedValue 在虚拟线程场景下有什么区别？什么时候该用哪个？MDC 上下文怎么传播？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
     }
   ],
   "recommendWeight": 84,
   "rubric": {
+    "mustHave": [
+      "能准确描述虚拟线程、平台线程、carrier 的关系和 M:N 调度模型",
+      "能解释阻塞 I/O 时 unmount 释放 carrier 的机制，以及为什么 CPU 密集任务不适合虚拟线程",
+      "能展示每任务一个虚拟线程的代码并说明不要池化、并发保护放在外部资源",
+      "能说明 JDK 21-23 synchronized pinning 底层原因与 JDK 24 JEP 491 的改进，以及 ReentrantLock 不 pin 的原因"
+    ],
+    "goodToHave": [
+      "能指出 DB 连接池、下游限流、ThreadLocal 大对象、MDC 传播、监控兼容性等迁移风险",
+      "能比较虚拟线程、传统线程池、响应式模型的取舍",
+      "能用 JFR pinning 事件、线程 dump、连接池等待和延迟指标诊断定位问题",
+      "能说明 ScopedValue 对只读上下文的适用边界和与 ThreadLocal 的区别"
+    ],
     "commonMistakes": [
       "以为虚拟线程适合 CPU 密集任务或能提升 CPU 算力",
       "继续用固定虚拟线程池控制并发，忽略外部资源限流",
-      "忽略 JDK 版本下 synchronized/native pinning 差异",
-      "把虚拟线程和响应式简单说成谁完全替代谁"
-    ],
-    "goodToHave": [
-      "能指出 DB 连接池、下游限流、ThreadLocal 大对象、监控兼容性等迁移风险",
-      "能比较虚拟线程、传统线程池、响应式模型的取舍",
-      "能用 JFR/线程 dump/pinning 诊断定位问题",
-      "能说明 ScopedValue 对只读上下文的适用边界"
-    ],
-    "mustHave": [
-      "能准确描述虚拟线程、平台线程、carrier 的关系",
-      "能解释阻塞 I/O 时卸载/重新挂载机制",
-      "能展示每任务一个虚拟线程的代码并说明不要池化",
-      "能说明 Java 21-23 pinning 与 Java 24 JEP 491 的版本差异"
+      "忽略 JDK 版本下 synchronized/native pinning 差异，或不知道 JEP 491 已改进",
+      "把虚拟线程和响应式简单说成谁完全替代谁，忽略各自的适用场景",
+      "在大量虚拟线程中无限制使用 ThreadLocal 持有大对象导致 OOM"
     ],
     "scoreWeights": {
       "accuracy": 30,
@@ -259,7 +270,7 @@
     }
   },
   "status": "production",
-  "summary": "讲清 Java 21 虚拟线程的线程-per-task 模型、mount/unmount 到 carrier 的调度机制、适合阻塞 I/O 而非 CPU 加速、JDK 21-23 与 JDK 24 pinning 差异，以及资源限流和观测迁移边界。",
+  "summary": "讲清 Java 21 虚拟线程的线程-per-task 模型、mount/unmount 到 carrier 的调度机制、为什么适合阻塞 I/O 而非 CPU 加速、JDK 21-23 与 JDK 24+ pinning 差异、ThreadLocal 与 ScopedValue 取舍，以及资源限流和生产迁移边界。",
   "tags": [
     "Java",
     "并发编程",
@@ -267,5 +278,5 @@
     "Project Loom"
   ],
   "title": "Virtual Threads（Java 21+）",
-  "updatedAt": "2026-06-20"
+  "updatedAt": "2026-06-22"
 }

@@ -4,7 +4,7 @@
   "category": "engineering",
   "group": "engineering",
   "title": "Webpack 核心原理",
-  "summary": "深入理解Webpack的模块打包原理，掌握Loader和Plugin的区别与实现，了解Tree Shaking、HMR、代码分割的实现机制。",
+  "summary": "Webpack 5 从 entry 递归构建 module graph，Loader 串行转换资源，Plugin 通过 Tapable 钩子介入编译生命周期，涵盖 Tree Shaking、代码分割、HMR 和缓存优化。",
   "tags": [
     "前端",
     "工程化",
@@ -14,25 +14,45 @@
     "Tree Shaking"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 50,
   "order": 10,
   "recommendWeight": 88,
   "status": "production",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Webpack 核心原理：打包流程",
-      "content": "## Webpack核心概念\n\n### 打包流程\n1. 初始化：读取配置，创建Compiler\n2. 编译：从入口出发，递归解析模块依赖\n3. 构建Chunk：将模块按规则分组\n4. 输出：将Chunk转换为文件"
+      "title": "Webpack 打包的五阶段流水线",
+      "content": "Webpack 把构建分成五个阶段，每个阶段由 compiler 和 compilation 对象驱动。\n\n**1. 初始化（init）**\n读取 webpack.config.js 和命令行参数，合并默认配置，创建 Compiler 实例。插件在 `compiler.hooks.environment` 和 `compiler.hooks.initialize` 阶段注册。Compiler 是全局单例，生命周期覆盖整个构建过程。\n\n**2. 编译（compile）/ 构建模块图**\n从 entry 开始，Webpack 用 `compilation.addEntry` 进入模块工厂（NormalModuleFactory）。对每个模块：先用 Resolver 将 import 语句解析为文件路径（考虑 resolve.alias/extensions/mainFields），再根据 module.rules 的 `test/oneOf` 匹配决定使用哪些 Loader 链。Loader 链从右到左执行：比如 `[style-loader, css-loader, sass-loader]` 对 .scss 文件先用 sass-loader 把 SCSS 变成 CSS，再 css-loader 处理 @import 和 url()，最后 style-loader 注入 JS 运行时。每解析完一个模块，Webpack 把它和依赖关系存入 module graph（ModuleGraph）。\n\n**3. 构建 Chunk Graph**\n所有模块解析完成后，进入 seal 阶段。Webpack 根据 entry、SplitChunksPlugin 的分组规则和动态 import 把模块分组为 Chunk。一个入口至少一个 initial chunk；动态 import 生成 async chunk；SplitChunks 提取的公共依赖形成 vendor chunk。ChunkGraph 记录每个 chunk 包含哪些模块。\n\n**4. 代码生成与优化**\n每个 chunk 生成运行时代码（webpack_require 等），Plugin 在 `compilation.hooks.optimize` 系列钩子中做副作用标记、Tree Shaking、模块合并、scope hoisting 等。minimizer（如 Terser）在 `compilation.hooks.processAssets` 阶段压缩代码。\n\n**5. 输出（emit）**\n最终 assets 通过 compiler.hooks.emit 写入磁盘。source map 文件、asset manifest 也在这一步生成。整个流程结束后触发 compiler.hooks.done。"
     },
     {
       "type": "explain",
-      "title": "Webpack 核心原理：Loader vs Plugin、Webpack 核心原理的边界、易错点与取舍",
-      "content": "### Loader vs Plugin\n- **Loader**：转换模块内容（babel-loader、css-loader）\n- **Plugin**：扩展打包能力（HtmlWebpackPlugin、MiniCssExtractPlugin）\n\n### Tree Shaking\n- 基于ESM静态分析\n- 标记未使用的export\n- Terser等压缩工具删除\n- 需要sideEffects配置\n\n### HMR（热模块替换）\n- 开发时只更新变化的模块\n- 保留应用状态\n- 通过WebSocket通信\n\n### 代码分割\n- 入口分割：多entry\n- 动态导入：import()\n- SplitChunksPlugin：提取公共依赖"
+      "title": "Loader 机制：串行执行、pitch、this 上下文",
+      "content": "Loader 本质是一个接收源码、返回可执行模块代码的函数。但 Webpack 对 Loader 的处理比大多数人想的复杂。\n\n**执行顺序**：多个 Loader 组成数组时，从右到左（数组末尾到开头）依次执行。`[babel-loader, eslint-loader]` 会先 babel-loader 转译，再 eslint-loader 检查。如果把 `enforce: 'pre'` 加到 eslint-loader，它会移到普通 loader 之前执行。\n\n**Pitch 阶段**：Loader 不仅有 normal 函数，还可以导出 `pitch` 函数。Pitch 从左到右执行；如果某个 loader 的 pitch 返回了值，后面的 loader 全部跳过，直接把该返回值交给前面的 loader 执行——这是做「熔断」的机制。style-loader 利用 pitch 在运行时注入样式，避免后续 loader 处理 CSS 内容。\n\n**this 上下文**：Loader 函数内的 `this` 是 LoaderContext，提供 `this.getOptions()`、`this.emitFile()`、`this.emitWarning()`、`this.emitError()`、`this.async()`（用于异步 loader）、`this.addDependency()` 等方法。调用 `this.async()` 后 loader 可以做异步操作再通过 callback 返回结果。`this.emitFile()` 让 loader 能输出额外文件（如图片处理后生成新文件）。\n\n**自定义 Loader 的关键细节**：输出必须是合法的 JS 模块代码——如果是字符串会被当作 JS 执行，如果是 Buffer 交给下一个 loader。返回的 source map 格式为 `{ version: 3, sources: [...], mappings: '...' }`。Loader 还可以设 `this.cacheable(true/false)` 控制是否可缓存。"
     },
     {
       "type": "explain",
-      "title": "Webpack 核心原理的边界、调优与面试追问",
-      "content": "Webpack 调优要回到构建阶段和产物阶段两条线。构建慢先看 loader 覆盖范围、缓存、thread-loader/esbuild-loader、resolve alias/extensions 和大型依赖解析；产物大则看 splitChunks、sideEffects、Tree Shaking 是否被 CommonJS 或副作用模块破坏，以及动态 import 是否真的形成异步 chunk。HMR 慢通常和模块边界、React Refresh、source map 和文件监听有关。面试里不要只背 loader/plugin 名字，要能解释一次模块如何进入 module graph、如何变成 chunk、插件在哪些 hooks 介入，以及用 stats/analyzer/profile 数据验证优化。"
+      "title": "Plugin 机制：Tapable 钩子系统",
+      "content": "Plugin 是 Webpack 扩展性的核心。每个 Plugin 实现 `apply(compiler)` 方法，在其中通过 Tapable 钩子注册回调。\n\n**Tapable 的钩子类型**：\n- `SyncHook`：同步调用，比如 `compiler.hooks.run`\n- `AsyncSeriesHook`：异步串行，一个回调完成后才调下一个，如 `compiler.hooks.beforeRun`\n- `AsyncParallelHook`：异步并行，所有回调同时进行，如 `compiler.hooks.make`\n- `SyncBailHook`：同步，如果某回调返回非 undefined 就终止后续，如 `compilation.hooks.shouldGenerateChunkAssets`\n- `SyncWaterfallHook`：同步，前一个回调的返回值作为下一个的参数，如 `compilation.hooks.assetPath`\n\n**Compiler vs Compilation**：Compiler 钩子覆盖整个构建生命周期（从 init 到 done），适合做全局性工作（清理目录、监控构建状态）。Compilation 钩子只在单次编译内有效，适合做模块级/Chunk 级操作（优化、分析、注入代码）。\n\n**关键钩子示例**：\n- `compiler.hooks.compilation`：每次创建新 compilation 时触发，适合注册 compilation 级钩子\n- `compilation.hooks.processAssets`（AsyncSeriesHook）：在输出前处理 assets，做压缩、注入 banner、生成 manifest 的地方\n- `compilation.hooks.optimizeModules`：模块优化阶段\n- `compiler.hooks.afterEmit`：文件写入磁盘后\n\n**典型实现模式**：HtmlWebpackPlugin 在 `compilation.hooks.processAssets` 阶段把 HTML 模板与注入的 script/link 标签合成最终 HTML；MiniCssExtractPlugin 用 pitch 阶段拦截 CSS 内容，再在 `compilation.hooks.processAssets` 输出独立 CSS 文件。"
+    },
+    {
+      "type": "explain",
+      "title": "Tree Shaking 的生效条件与失败场景",
+      "content": "Tree Shaking 在 Webpack 2+ 引入，但很多人以为开了 mode: 'production' 就能自动生效，实际上它需要多个条件同时满足。\n\n**生效条件**：\n1. 使用 ESM 语法（import/export）。CommonJS 的 require 是动态的，Webpack 无法静态分析哪些 export 被用了。如果项目入口文件或第三方库混用 CJS，Tree Shaking 会大幅失效。\n2. package.json 中设置 `sideEffects: false`（或指定有副作用的文件列表）。`sideEffects` 告诉 Webpack：如果模块整体没被引用，整棵树可以删掉。不设这个字段，Webpack 会保守地保留所有模块，因为不敢假设某个模块导入后是否执行了副作用。\n3. 在 Terser 等压缩阶段，被标记为 unused 且无副作用的代码才会真正从产物中物理移除。Webpack 本身只做「标记」，不做删除。\n\n**常见失败场景**：\n- 第三方库是 CommonJS：比如 lodash 整体是 CJS，需要使用 lodash-es（ESM 版本）才能 Tree Shaking。\n- 模块有副作用：`sideEffects` 被设为 true（或未设），Webpack 不敢删。\n- `require()` 混入模块：Babel 编译 import 为 require，需要在 .babelrc 设置 `modules: false` 或使用 `@babel/plugin-transform-modules-commonjs` 配合 `loose` 模式。\n- 动态属性访问：`import * as utils from './utils'; utils[name]()` 这种模式 Webpack 无法判断哪些属性被用了，会保留全部 export。\n- CSS 没被 sideEffects 标记：如果 `sideEffects: false`，但 CSS 文件有副作用（它本身就是副作用），需要写成 `sideEffects: ['*.css', '*.scss']`。"
+    },
+    {
+      "type": "explain",
+      "title": "代码分割：入口、SplitChunks 与动态 import",
+      "content": "代码分割是把一个大 bundle 拆成多个小文件，让浏览器按需加载。\n\n**方式一：多入口（entry）**\n直接配多个 entry，每个入口生成独立的 initial chunk。适合多页应用，每个页面只加载自己需要的代码。缺点是公共依赖会被重复打包。\n\n**方式二：SplitChunksPlugin（Webpack 4+ 内置）**\n替代了过去的 CommonsChunkPlugin。默认配置在 `optimization.splitChunks`：\n- `chunks: 'async'`：只对异步 chunk 生效；设 `'all'` 则 initial chunk 也参与。\n- `minSize`/`maxSize`：被提取的 chunk 至少/最多多大。minSize 太小会生成过多小文件；maxSize 会把大 chunk 再拆成更小的（适合 HTTP/2）。\n- `cacheGroups`：定义分组规则。默认有两个：`vendors`（从 node_modules 来的）和 `default`（被 2+ chunk 引用的模块）。自定义时可以按 `test` 匹配文件路径、`priority` 决定优先级、`reuseExistingChunk` 允许复用已有 chunk。\n\n**方式三：动态 import（import()）**\n`import('./heavy-module')` 会被 Webpack 识别为代码分割点，生成 async chunk。返回 Promise，在运行时按需加载。配合 `webpackChunkName` 魔法注释可以指定 chunk 文件名。\n\n**分割策略的工程考量**：\n- 第三方库走 vendors cacheGroup，长期缓存（contenthash 不变则文件不变）。\n- 业务代码拆出 common chunk，避免重复。\n- HTTP/1.1 下并行请求有限（6-8），chunk 数量不宜过多；HTTP/2 下可以更细粒度。\n- `maxSize` 选项可以把大 chunk 再拆，但注意模块跨 chunk 的边界效应。"
+    },
+    {
+      "type": "explain",
+      "title": "HMR 原理与开发体验优化",
+      "content": "HMR（Hot Module Replacement）在不刷新整个页面的情况下更新变更模块，保留应用状态（如表单输入、路由状态、Redux store）。\n\n**实现链路**：\n1. dev-server 通过 WebSocket 把「文件变化」通知浏览器端运行时代码。\n2. 浏览器端运行时向 dev-server 请求更新清单（hot-update.json），知道哪些 chunk 变了。\n3. 对变化的 chunk，运行时拉取新的模块代码（hot-update.js）。\n4. 用模块系统的新代码替换旧代码，如果模块实现了 `module.hot.accept()`，就调用回调做自定义更新（如重新渲染组件）。\n5. 如果某个模块没实现 accept，更新会冒泡到父模块；最终冒泡到 entry 仍未 accept 时，触发 full reload。\n\n**React/Vue 的 HMR**：\n- React Fast Refresh（推荐，替代旧的 react-hot-loader）：由 babel 插件注入运行时支持，每次编辑组件只更新该组件，保持 state。\n- Vue 的 vue-loader 内置 HMR 支持：.vue 文件修改后只替换组件，不丢失 state。\n\n**HMR 常见问题**：\n- 模块有副作用但没 accept：比如全局样式文件修改后冒泡到 root，触发全页刷新。解决方式是入口文件加 `module.hot.accept('./styles.css', ...)` 或使用 style-loader 的 HMR。\n- Source map 配置不当导致断点偏移：开发时用 `devtool: 'eval-cheap-module-source-map'`（重建快、映射准）比 `cheap-module-source-map` 快很多。\n- HMR update 事件没触发：检查 devServer.hot 是否开启、webpack-dev-server 版本是否正确。"
+    },
+    {
+      "type": "explain",
+      "title": "构建优化：缓存、并行与增量",
+      "content": "大型项目构建慢不是 Webpack 的锅，而是它的工作量太大。优化思路分三层：\n\n**减少工作量**：\n- `resolve.extensions` 只配必要后缀（`['.js', '.jsx']` 而非 `['.js', '.jsx', '.ts', '.tsx', '.json', '.css']`），减少文件系统查询。\n- `resolve.alias` 把大型库直接指向 dist 文件，跳过 node_modules 递归解析。\n- `module.noParse` 对已打包的库（如 jQuery、lodash dist）跳过解析，直接使用。\n\n**并行化**：\n- `thread-loader` 把 loader 编译放到 worker 线程，适合 CPU 密集的 babel-loader。注意 worker 有启动开销，只适合处理时间长的 loader。\n- `esbuild-loader` / `swc-loader` 替换 babel-loader，用 Go/Rust 实现，速度快 10-100 倍。\n\n**缓存**：\n- Webpack 5 内置持久化缓存：`cache: { type: 'filesystem', buildDependencies: { config: [__filename] } }`。把 module graph、chunk graph 和 loader 结果缓存到 node_modules/.cache，二次构建极快。注意：改了 webpack.config.js 需要更新 `buildDependencies.config`，否则缓存不会失效。\n- Loader 自带的缓存：babel-loader 的 `cacheDirectory: true`，把编译结果缓存到 .cache/babel。\n\n**构建产物分析**：\n- `webpack-bundle-analyzer`：可视化 chunk 组成，快速找到哪些库过大。\n- `--stats` 或 `stats.json`：`webpack --stats-error-details` 或 `stats: { children: true, chunks: true }` 输出详细构建信息。\n- `--profile`：输出每个模块的构建耗时，定位慢 loader。"
     },
     {
       "type": "diagram",
@@ -47,9 +67,13 @@
         "SplitChunks将模块分组为Chunk",
         "输出最终的Bundle文件"
       ],
-      "format": "mermaid",
+      "format": "svg",
       "caption": "Webpack 构建链路：入口、依赖图、Loader、Plugin、Chunk 与运行时代码",
       "sources": [
+        {
+          "kind": "svg",
+          "path": "assets/diagrams/generated/frontend-webpack-core.svg"
+        },
         {
           "kind": "mermaid",
           "content": "flowchart TD\nA[\"entry\"] --> B[\"解析模块依赖\"]\nB --> C[\"Loader 转换资源\nTS/CSS/图片\"]\nC --> D[\"构建 Module Graph\"]\nD --> E[\"Plugin hooks\n优化/注入/产物处理\"]\nE --> F[\"Chunk Graph\n代码分割\"]\nF --> G[\"Runtime + Assets 输出\"]\nH[\"tree shaking\"] --> F\nI[\"cache\"] --> B\nJ[\"source map\"] --> G"
@@ -62,37 +86,69 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | Loader | Plugin |\n| --- | --- | --- |\n| 作用 | 转换模块内容 | 扩展打包能力 |\n| 执行时机 | 模块加载时 | 编译生命周期 |\n| 配置方式 | module.rules | plugins数组 |\n| 实现方式 | 导出函数 | apply方法+钩子 |\n| 示例 | babel-loader/css-loader | HtmlWebpackPlugin |\n| 本质 | 文件转换器 | 编译扩展 |"
+      "title": "Loader 与 Plugin 机制对比",
+      "content": "| 维度 | Loader | Plugin |\n| --- | --- | --- |\n| 解决的问题 | 单个资源内容转换（TS→JS、SCSS→CSS） | 构建流程扩展（注入 HTML、提取 CSS、压缩） |\n| 执行阶段 | 模块解析阶段（构建 module graph 时） | 整个编译生命周期（从 init 到 emit） |\n| 配置入口 | `module.rules` 数组 | `plugins` 数组 |\n| 实现形式 | 导出一个函数，接收源码返回模块代码 | 导出一个类，实现 `apply(compiler)` 方法 |\n| 串联方式 | Loader 链从右到左串行执行 | Plugin 通过 Tapable 钩子注册回调，同类钩子按注册顺序执行 |\n| 可访问的状态 | LoaderContext（this.getOptions, this.emitFile） | Compiler 和 Compilation 对象 |\n| pitch 机制 | 有，从左到右，可熔断后续 loader | 无 |\n| 缓存 | Loader 可设 this.cacheable() | Plugin 通常不参与缓存，除非自行实现 |\n\n| 维度 | Module | Chunk | Bundle |\n| --- | --- | --- | --- |\n| 定义 | 单个源文件（一个 .js/.css/.png） | Webpack 把一组模块打包成一个逻辑单元 | 最终输出到磁盘的一个文件 |\n| 关系 | 一个 Module 属于一个或多个 Chunk | 一个 Chunk 包含多个 Module | 一个 Bundle 对应一个 Chunk（1:1） |\n| 来源 | import/require 语句 | 入口点、SplitChunks 分组、动态 import | Chunk 生成产物 |\n| 特殊情况 | 一个模块被多个 chunk 引用时会被复制到多个 chunk 中 | Code Splitting 产生多个 Chunk | source map 文件也是 Bundle 产物 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// webpack.config.js\nconst HtmlWebpackPlugin = require('html-webpack-plugin');\nconst MiniCssExtractPlugin = require('mini-css-extract-plugin');\n\nmodule.exports = {\n  mode: 'production',\n  entry: './src/index.js',\n  output: {\n    filename: '[name].[contenthash:8].js',\n    path: path.resolve(__dirname, 'dist'),\n    clean: true\n  },\n  module: {\n    rules: [\n      {\n        test: /\\.js$/,\n        exclude: /node_modules/,\n        use: 'babel-loader'\n      },\n      {\n        test: /\\.css$/,\n        use: [MiniCssExtractPlugin.loader, 'css-loader', 'postcss-loader']\n      },\n      {\n        test: /\\.(png|jpg|gif)$/,\n        type: 'asset/resource',\n        generator: { filename: 'images/[hash:8][ext]' }\n      }\n    ]\n  },\n  plugins: [\n    new HtmlWebpackPlugin({ template: './src/index.html' }),\n    new MiniCssExtractPlugin({ filename: 'css/[name].[contenthash:8].css' })\n  ],\n  optimization: {\n    splitChunks: {\n      chunks: 'all',\n      cacheGroups: {\n        vendor: {\n          test: /[\\\\/]node_modules[\\\\/]/,\n          name: 'vendors',\n          chunks: 'all'\n        }\n      }\n    }\n  },\n  devServer: {\n    hot: true, // HMR\n    port: 3000\n  }\n};\n\n// 自定义Loader（将markdown转为HTML）\n// markdown-loader.js\nconst { marked } = require('marked');\n\nmodule.exports = function(source) {\n  const html = marked(source);\n  return `export default ${JSON.stringify(html)}`;\n};\n\n// 自定义Plugin（在打包完成后输出提示）\n// done-plugin.js\nclass DonePlugin {\n  apply(compiler) {\n    compiler.hooks.done.tap('DonePlugin', (stats) => {\n      console.log(`打包完成！耗时: ${stats.endTime - stats.startTime}ms`);\n    });\n  }\n}\nmodule.exports = DonePlugin;\n\n// 动态导入（代码分割）\nimport(/* webpackChunkName: 'lodash' */ 'lodash').then(_ => {\n  console.log(_.chunk([1, 2, 3, 4], 2));\n});\n\n// package.json Tree Shaking配置\n// {\n//   \"sideEffects\": false // 或指定有副作用的文件\n//   \"sideEffects\": [\"*.css\", \"*.global.js\"]\n// }",
+      "title": "自定义 Loader、Plugin 与 SplitChunks 配置",
       "language": "javascript",
+      "content": "// === 自定义 Loader：markdown 转 HTML ===\n// markdown-loader.js\nconst { marked } = require('marked');\n\n/** @type {import('webpack').LoaderDefinitionFunction} */\nmodule.exports = function (source) {\n  // this.getOptions() 获取 loader options（Webpack 5 推荐方式，替代 loader-utils）\n  const options = this.getOptions();\n  const html = marked(source, options);\n  // 必须返回合法 JS 模块代码\n  return `export default ${JSON.stringify(html)}`;\n};\n\n// === 自定义 Plugin：构建完成后输出报告 ===\n// build-report-plugin.js\nclass BuildReportPlugin {\n  apply(compiler) {\n    // compiler.hooks.done 是 AsyncSeriesHook，构建完成后触发\n    compiler.hooks.done.tap('BuildReportPlugin', (stats) => {\n      const { errors, warnings, assets, time } = stats.toJson({\n        errors: true, warnings: true, assets: true, time: true\n      });\n      console.log(`\\n--- Build Report ---`);\n      console.log(`Duration: ${time}ms`);\n      console.log(`Assets: ${assets.length}`);\n      console.log(`Errors: ${errors.length}, Warnings: ${warnings.length}`);\n      if (errors.length > 0) {\n        errors.forEach(err => console.error(err.message));\n      }\n    });\n\n    // 在 emit 阶段注入额外文件\n    compiler.hooks.emit.tapAsync('BuildReportPlugin', (compilation, callback) => {\n      const report = JSON.stringify({\n        buildTime: Date.now(),\n        assets: Object.keys(compilation.assets)\n      }, null, 2);\n      // compilation.assets 是即将输出的文件列表\n      compilation.assets['build-report.json'] = {\n        source: () => report,\n        size: () => report.length\n      };\n      callback();\n    });\n  }\n}\n\n// === webpack.config.js 关键配置 ===\nconst path = require('path');\nconst HtmlWebpackPlugin = require('html-webpack-plugin');\nconst MiniCssExtractPlugin = require('mini-css-extract-plugin');\n\nmodule.exports = {\n  mode: 'production',\n  entry: './src/index.js',\n  output: {\n    filename: '[name].[contenthash:8].js',\n    path: path.resolve(__dirname, 'dist'),\n    clean: true\n  },\n  // Webpack 5 持久化缓存，二次构建极快\n  cache: {\n    type: 'filesystem',\n    buildDependencies: {\n      config: [__filename] // webpack.config.js 变化时缓存失效\n    }\n  },\n  module: {\n    rules: [\n      {\n        test: /\\.js$/,\n        exclude: /node_modules/,\n        use: [\n          // thread-loader 放在 babel-loader 前面，把编译放到 worker 线程\n          // 注意：worker 有启动开销，只在编译耗时 > 300ms 时才有收益\n          // 'thread-loader',\n          'babel-loader'\n        ]\n      },\n      {\n        test: /\\.css$/,\n        use: [MiniCssExtractPlugin.loader, 'css-loader', 'postcss-loader']\n      },\n      {\n        test: /\\.(png|jpg|gif)$/,\n        type: 'asset/resource',\n        generator: { filename: 'images/[hash:8][ext]' }\n      }\n    ]\n  },\n  plugins: [\n    new HtmlWebpackPlugin({ template: './src/index.html' }),\n    new MiniCssExtractPlugin({ filename: 'css/[name].[contenthash:8].css' }),\n    new BuildReportPlugin()\n  ],\n  optimization: {\n    splitChunks: {\n      chunks: 'all', // initial + async chunk 都参与分割\n      minSize: 20000, // 至少 20KB 才提取\n      maxSize: 244000, // 超过 244KB 的 chunk 再拆（适合 HTTP/2）\n      cacheGroups: {\n        vendor: {\n          test: /[\\\\/]node_modules[\\\\/]/,\n          name: 'vendors',\n          chunks: 'all',\n          priority: 10\n        },\n        common: {\n          minChunks: 2, // 被 2+ chunk 引用的模块提取到 common\n          name: 'common',\n          chunks: 'all',\n          reuseExistingChunk: true,\n          priority: 5\n        }\n      }\n    },\n    // Webpack 5 生产模式自动启用 TerserPlugin\n    // minimizer: [new TerserPlugin({ parallel: true })]\n  },\n  devServer: {\n    hot: true,\n    port: 3000\n  }\n};\n\n// === 动态导入（代码分割）===\n// webpackChunkName 魔法注释指定 chunk 文件名\nimport(/* webpackChunkName: 'lodash' */ 'lodash-es').then(_ => {\n  console.log(_.chunk([1, 2, 3, 4], 2));\n});\n\n// === package.json sideEffects 配置 ===\n// {\n//   \"sideEffects\": [\"*.css\", \"*.global.js\", \"*.polyfill.js\"]\n// }",
       "highlights": [
         {
-          "line": 59,
-          "note": "loader 返回的是可被 webpack 执行的模块源码；JSON.stringify 负责把 HTML 字符串安全地嵌进 export default。"
+          "line": 1,
+          "note": "Loader 返回必须是合法 JS 模块代码，JSON.stringify 保证 HTML 字符串安全嵌入。"
+        },
+        {
+          "line": 18,
+          "note": "compiler.hooks.done 是 AsyncSeriesHook，stats.toJson() 可定制输出哪些信息。"
+        },
+        {
+          "line": 27,
+          "note": "compilation.assets 是即将输出的文件列表，可以注入额外文件。"
+        },
+        {
+          "line": 70,
+          "note": "Webpack 5 filesystem 缓存，buildDependencies.config 确保配置变化时缓存失效。"
+        },
+        {
+          "line": 89,
+          "note": "SplitChunks 的 maxSize 把大 chunk 再拆，适合 HTTP/2 场景。"
+        },
+        {
+          "line": 108,
+          "note": "动态 import 生成 async chunk，webpackChunkName 魔法注释控制文件名。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "Webpack 的核心流程可以概括为：从 entry 出发递归解析依赖，Loader 把不同资源转换成模块，Plugin 通过 compiler/compilation hooks 介入生命周期，最后根据 module graph 生成 chunk graph 并输出 assets。Loader 解决“单个模块内容怎么变”，Plugin 解决“构建流程什么时候扩展”。\n\nTree Shaking 依赖 ESM 静态结构和 sideEffects 标记，最终还要靠压缩阶段删除未引用代码；代码分割依赖多入口、SplitChunksPlugin 或动态 import；HMR 则在开发服务器和运行时代码之间通过更新清单替换变更模块。真实项目排查时，我会先用 stats/analyzer 看 chunk 组成，再用 profile/cache 日志看构建耗时，避免只凭经验调配置。",
+      "content": "**结论**：Webpack 的核心是模块图（Module Graph）和代码块图（Chunk Graph）。从 entry 出发递归解析依赖、Loader 转换资源内容、Plugin 通过 Tapable 钩子介入编译生命周期，最终把 module graph 分组为 chunk graph 并输出 assets。\n\n**机制主线**\n- **打包流程五阶段**：初始化（创建 Compiler）→ 编译（构建 Module Graph，含 Resolver → Loader 链 → 依赖递归）→ Seal（构建 Chunk Graph，SplitChunks 分组）→ 代码生成（Tree Shaking、压缩、scope hoisting）→ 输出（emit assets、source map）\n- **Loader**：函数，接收源码返回模块代码；链式执行从右到左；有 pitch 阶段可熔断；Webpack 5 用 this.getOptions() 获取 options\n- **Plugin**：类，实现 apply(compiler)；通过 Tapable 钩子（SyncHook/AsyncSeriesHook/AsyncParallelHook 等）在特定时机介入；Compiler 覆盖全生命周期，Compilation 覆盖单次编译\n- **Module/Chunk/Bundle 关系**：Module 是单个源文件，Chunk 是一组模块的逻辑单元，Bundle 是 Chunk 输出到磁盘的文件（1对1）\n- **Tree Shaking**：ESM 静态分析 → Webpack 标记未使用 export → sideEffects 配置告知可删模块 → Terser 物理删除。失败场景：CJS 混入、Babel 编译为 require、sideEffects 未设、动态属性访问\n- **代码分割**：多入口、SplitChunksPlugin（cacheGroups 分组）、动态 import()。关键参数：chunks/minSize/maxSize/cacheGroups/priority\n- **HMR**：WebSocket 通知 → 拉取更新清单 → 替换模块代码 → accept 回调。没 accept 的更新冒泡到父模块，最终 full reload\n\n**边界与工程取舍**\n- 构建慢：resolve.extensions 精简、thread-loader/esbuild-loader、filesystem 缓存、module.noParse\n- 产物大：SplitChunks 配置、sideEffects 标记、确认 Tree Shaking 被 CJS 破坏、检查动态 import 是否真正生效\n- HTTP/1.1 vs HTTP/2：前者 chunk 数量有限（6-8 并行），后者可更细粒度\n- 开发体验：eval-cheap-module-source-map（快重建、准映射）、HMR 未触发排查\n\n**排查路径**：先用 webpack-bundle-analyzer 看 chunk 组成，再用 --profile 定位慢 loader，最后用 stats.json 分析模块依赖链。",
       "followUpQuestions": [
         {
-          "question": "面试官追问「Webpack 核心原理」时，最应该展开哪条机制链？",
-          "answer": "落地时先明确场景、输入输出、性能和兼容性边界，再用最小示例或线上指标验证；常见坑是把概念当成银弹，忽略失败路径、回滚和可观测性。"
+          "question": "Loader 的 pitch 阶段有什么实际用途？举一个真实场景。",
+          "answer": "pitch 从左到右执行，如果某个 loader 的 pitch 返回值，后面的 loader 全部跳过。style-loader 利用 pitch：它的 pitch 返回运行时 JS 代码（把 CSS 内容注入 <style> 标签），这样 css-loader 和 sass-loader 不会执行，CSS 内容不会被处理成 JS 字符串——这避免了样式内容被转义。"
         },
         {
-          "question": "如果「Webpack 核心原理」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "可以先确认现象是否落在「能区分Loader和Plugin」，再结合日志、指标、输入规模和依赖状态验证。"
+          "question": "Webpack 5 的持久化缓存怎么配？有什么要注意的？",
+          "answer": "`cache: { type: 'filesystem', buildDependencies: { config: [__filename] } }`。关键点：buildDependencies.config 必须包含 webpack.config.js 路径，否则改了配置缓存不会失效。另外，loader 和 plugin 的版本变化也会影响缓存——Webpack 用 content hash 做缓存 key，版本变了缓存自动失效。如果要手动清缓存，删 node_modules/.cache 目录。"
         },
         {
-          "question": "Webpack 核心原理 在真实项目里怎么做取舍和验证？",
-          "answer": "落地时先明确场景、输入输出、性能和兼容性边界，再用最小示例或线上指标验证；常见坑是把概念当成银弹，忽略失败路径、回滚和可观测性。"
+          "question": "Tree Shaking 为什么在生产模式生效但开发模式不生效？",
+          "answer": "两层原因：1) Webpack 只做标记（把 unused export 标为 unused），真正物理删除靠 Terser 压缩阶段，而 production 模式默认启用 TerserPlugin；2) 开发模式 sideEffects 默认行为不同——它更保守，怕破坏 HMR 和 source map 映射。另外开发模式用 eval 系列 devtool，模块被包装在 eval() 里，Tree Shaking 标记不适用。"
+        },
+        {
+          "question": "SplitChunks 的 maxSize 和 minSize 怎么配合？",
+          "answer": "minSize 控制「至少多大才会被提取」，避免生成过多小文件增加请求数。maxSize 是「超过多大就再拆」，适合 HTTP/2 场景下对大 chunk 做细粒度拆分。但 maxSize 是「尽力」而非「强制」——如果一个模块本身超过 maxSize，无法再拆。实操建议：minSize 20-50KB，maxSize 244KB（HTTP/2 优化），但必须用 analyzer 验证结果是否合理。"
+        },
+        {
+          "question": "怎么排查 HMR 不生效或触发全页刷新？",
+          "answer": "1) 确认 devServer.hot: true 且是 webpack-dev-server 4+（或最新版本）。2) 检查被修改的模块是否有 `module.hot.accept()`——没有的话更新冒泡到入口，触发 full reload。3) React 项目确认 @pmmmwh/react-refresh-webpack-plugin 和 react-refresh/babel 已配置。4) CSS 文件修改：style-loader 内置 HMR 支持，但如果用了 MiniCssExtractPlugin，CSS 修改不会触发 HMR（会 full reload），除非用 style-loader 替代。5) 看浏览器 console 有无 HMR 相关日志。"
+        },
+        {
+          "question": "Module、Chunk 和 Bundle 分别是什么？关系是什么？",
+          "answer": "Module 是一个源文件（.js/.css/.png），由 import/require 识别。Chunk 是 Webpack 把一组相关模块打包成的逻辑单元：入口点生成 initial chunk，动态 import 生成 async chunk，SplitChunks 提取的公共依赖也是 chunk。Bundle 是 Chunk 输出到磁盘的文件，通常 1:1 对应。一个 Module 可能属于多个 Chunk（被复制），比如公共模块在 vendor chunk 和 app chunk 中都存在。"
         }
       ]
     },
@@ -100,53 +156,91 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "Webpack的完整打包流程",
-        "Loader和Plugin的区别和实现方式",
-        "Tree Shaking的原理和配置",
-        "代码分割的三种方式",
-        "HMR的实现原理"
+        "Webpack 打包的五阶段流水线：初始化 → 编译 → Seal → 代码生成 → 输出",
+        "Resolver、Loader 链（从右到左）、Module Graph 的构建过程",
+        "Loader 的 pitch 阶段机制及其实际用途（如 style-loader）",
+        "Plugin 通过 Tapable 钩子（SyncHook/AsyncSeriesHook/AsyncParallelHook）介入生命周期",
+        "Compiler 与 Compilation 的区别与各自适用场景",
+        "Module、Chunk、Bundle 的定义与三者关系",
+        "Tree Shaking 的生效条件（ESM、sideEffects、Terser）和常见失败场景",
+        "SplitChunksPlugin 的 chunks/minSize/maxSize/cacheGroups 参数含义",
+        "动态 import 如何生成 async chunk、webpackChunkName 魔法注释的用法",
+        "HMR 从 WebSocket 通知到模块替换的完整链路",
+        "Webpack 5 filesystem 缓存的配置与注意事项",
+        "用 webpack-bundle-analyzer 和 --profile 排查构建问题"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "frontend.engineering.topic-webpack-core.recall.1",
-      "prompt": "Loader和Plugin有什么区别？各自如何实现？",
+      "prompt": "请完整描述 Webpack 从 entry 到输出 bundle 的打包流程，包括 Module Graph 和 Chunk Graph 的构建。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "frontend.engineering.topic-webpack-core.recall.2",
-      "prompt": "Tree Shaking的原理是什么？需要哪些条件才能生效？",
+      "prompt": "Loader 和 Plugin 分别在哪个阶段执行？实现一个自定义 Loader 和一个自定义 Plugin 需要注意什么？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "frontend.engineering.topic-webpack-core.recall.3",
+      "prompt": "Tree Shaking 的原理是什么？需要哪些条件才能生效？列出至少三个导致 Tree Shaking 失败的场景。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "frontend.engineering.topic-webpack-core.recall.4",
+      "prompt": "请手写一个 webpack 配置：入口 ./src/index.js，使用 babel-loader 和 css-loader，配置 SplitChunks 提取 node_modules 到 vendor chunk，开启持久化缓存。",
+      "mode": "code",
+      "expectedMinutes": 8,
+      "difficulty": 4
+    },
+    {
+      "id": "frontend.engineering.topic-webpack-core.recall.5",
+      "prompt": "项目构建时间从 10 秒涨到 90 秒，产物体积也翻了两倍。你会怎么排查和优化？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "frontend.engineering.topic-webpack-core.recall.6",
+      "prompt": "HMR 是如何在不刷新页面的情况下更新模块的？如果某个模块没有实现 module.hot.accept() 会怎样？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
-      "id": "frontend.engineering.topic-webpack-core.recall.3",
-      "prompt": "Webpack 核心原理 和相邻概念或常见替代方案有什么关键区别？",
+      "id": "frontend.engineering.topic-webpack-core.recall.7",
+      "prompt": "Loader 的 pitch 阶段有什么作用？请举一个实际利用 pitch 的例子。",
       "mode": "text",
-      "expectedMinutes": 4,
+      "expectedMinutes": 3,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能描述Webpack的打包流程",
-      "能区分Loader和Plugin",
-      "能解释Tree Shaking的原理",
-      "能说出代码分割的方式"
+      "能描述 Webpack 打包的五阶段流水线及其核心对象（Compiler/Compilation/Module Graph/Chunk Graph）",
+      "能区分 Loader 和 Plugin 的执行阶段、实现方式和配置方式",
+      "能解释 Tree Shaking 的生效条件（ESM 静态分析、sideEffects 标记、Terser 删除）和常见失败场景",
+      "能说明代码分割的三种方式（多入口、SplitChunks、动态 import）及关键参数"
     ],
     "goodToHave": [
-      "能手写简单Loader和Plugin",
-      "能解释Tapable钩子机制",
-      "能解释Module/Chunk/Bundle的关系"
+      "能说明 Loader 的 pitch 阶段机制及实际用途（如 style-loader）",
+      "能解释 Tapable 钩子类型（SyncHook/AsyncSeriesHook 等）及 Compiler vs Compilation 区别",
+      "能说明 Module/Chunk/Bundle 的定义和关系",
+      "能配置 Webpack 5 filesystem 缓存并解释 buildDependencies 的作用"
     ],
     "commonMistakes": [
-      "不清楚Loader和Plugin的区别",
-      "不了解Tree Shaking的原理（ESM静态分析）",
-      "代码分割策略选择不当"
+      "把 Loader 和 Plugin 的执行阶段搞混——Loader 在模块解析时执行，Plugin 覆盖整个生命周期",
+      "以为 mode: 'production' 自动开启 Tree Shaking，不了解还需要 ESM 语法和 sideEffects 配置",
+      "Babel 把 import 编译成 require 导致 Tree Shaking 失败，忘记设 modules: false",
+      "SplitChunks 只配 chunks: 'async' 导致 initial chunk 中的公共依赖没被提取",
+      "HMR 不生效时只检查 devServer.hot，忽略模块是否实现了 module.hot.accept()"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -156,6 +250,6 @@
     }
   },
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「Webpack 核心原理」说清能描述Webpack的打包流程、能区分Loader和Plugin，并放到前端工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察能否围绕 Webpack 构建流程（Module Graph → Chunk Graph → Assets）、Loader/Plugin 机制差异、Tree Shaking 生效条件与失败场景、代码分割策略、HMR 原理与构建优化完整展开，并能结合 bundle analyzer 和 profiling 数据做工程排查。",
+  "updatedAt": "2026-06-22"
 }

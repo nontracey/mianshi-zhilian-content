@@ -4,7 +4,7 @@
   "category": "spring",
   "group": "spring",
   "title": "Java SPI 与 Spring 扩展机制",
-  "summary": "对比 JDK SPI（ServiceLoader）、Spring SPI（spring.factories/自动装配）与 Dubbo SPI 的实现与取舍。",
+  "summary": "对比 JDK SPI（ServiceLoader）、Spring SPI（spring.factories → AutoConfiguration.imports）与 Dubbo SPI（ExtensionLoader）的发现机制、加载策略与工程取舍，覆盖线程安全、类加载边界和常见失败路径。",
   "tags": [
     "Java",
     "SPI",
@@ -12,19 +12,29 @@
     "自动装配"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 25,
   "order": 120,
   "recommendWeight": 78,
   "learningCards": [
     {
       "type": "explain",
-      "title": "JDK SPI：ServiceLoader",
-      "content": "## 是什么\nSPI（Service Provider Interface）是一种**面向接口编程 + 解耦**的扩展机制：框架定义接口，第三方提供实现，运行时动态加载，无需改框架代码。\n\n## JDK 实现\n- 在 `META-INF/services/` 下建以**接口全限定名**命名的文件，内容是实现类全名。\n- 用 `ServiceLoader.load(接口.class)` 迭代加载所有实现。\n\n## 典型应用\n- **JDBC**：`java.sql.Driver`，各数据库驱动 jar 通过 SPI 注册（所以 `DriverManager` 能找到驱动，新版不用 `Class.forName`）。\n- **SLF4J**、`Dubbo`、`Spring Boot` 的部分加载。\n\n## 缺点\n- **全量加载**：`ServiceLoader` 会实例化文件里所有实现，不能按名字按需取一个。\n- 无 IOC/AOP，扩展点之间不能依赖注入。"
+      "title": "JDK SPI 的机制与局限",
+      "content": "SPI（Service Provider Interface）的核心思想是**框架定义接口，第三方提供实现，运行时从约定路径发现并加载**。这样框架不需要硬编码依赖具体实现，第三方 jar 只需声明自己实现了哪些接口就能被自动发现。\n\nJDK 的实现路径是：在 `META-INF/services/` 下建一个以**接口全限定名**命名的文件，内容每行一个实现类全名。`ServiceLoader.load(接口.class)` 读取这个文件，返回 `Iterable`，在迭代时逐个实例化实现类。\n\n**JDBC 驱动注册**是最经典的例子。`java.sql.Driver` 的 SPI 文件让各数据库驱动 jar 在 `ServiceLoader` 迭代时被发现，`DriverManager` 在 JDK 6+ 内部用 `ServiceLoader` 自动加载驱动，所以新版代码不再需要 `Class.forName(\"com.mysql.cj.jdbc.Driver\")` 手动注册。\n\n但 JDK SPI 有几个明确的局限：\n1. **全量加载**：`ServiceLoader` 迭代时会实例化文件里所有实现，不能按名字只取一个。如果某个实现的构造函数做了重初始化（建连接、读配置），即使不使用也会触发。\n2. **无依赖注入**：扩展点之间无法互相依赖，也没有容器帮你注入。\n3. **无条件装配**：只要文件里写了就会加载，不能按环境或配置动态决定是否激活。\n4. **线程安全**：`ServiceLoader` 本身不是线程安全的，多线程并发迭代需要外部同步或每线程各持一个实例。\n5. **类加载器边界**：`ServiceLoader.load(Class, ClassLoader)` 接受自定义 ClassLoader，在 OSGi 或自定义类加载体系中需要显式传入正确的 ClassLoader，否则会找不到实现类。"
     },
     {
       "type": "explain",
-      "title": "Spring SPI 与 Dubbo SPI",
-      "content": "## Spring 的扩展机制\n- **spring.factories（旧）**：`META-INF/spring.factories` 里按接口列出实现，`SpringFactoriesLoader` 加载。Spring Boot 2.x 的自动装配（`@EnableAutoConfiguration`）就靠它收集 `AutoConfiguration`。\n- **自动装配新机制（Boot 2.7+/3.x）**：自动配置类改放到 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`，每行一个类，更高效。\n- 这套机制让 starter “引入即生效”，是 Spring Boot 约定优于配置的基础。\n\n## Dubbo SPI（增强版）\n- `@SPI` 标注接口，配置在 `META-INF/dubbo/` 下用 **key=实现类** 形式，可**按名字按需加载**（解决 JDK SPI 全量加载问题）。\n- 支持**自适应扩展**（运行时按 URL 参数选实现）、**IOC**（扩展点之间注入）和 **AOP**（Wrapper 包装），能力远超 JDK SPI。\n\n验证 SPI 是否生效，可以写最小 ServiceLoader 测试、检查 `META-INF/services` 文件名是否等于接口全限定名、查看 Spring Boot conditions report 或自动装配日志。失败路径通常是资源路径写错、实现类没有无参构造、Boot 版本迁移后仍使用旧的 spring.factories 入口。"
+      "title": "Spring 扩展机制：从 spring.factories 到 .imports",
+      "content": "Spring 的扩展机制本质上也是 SPI 思想，但运行在 Spring 容器之上，天然支持依赖注入和条件装配。\n\n**Boot 2.x 时代**：自动配置类声明在 `META-INF/spring.factories` 中，key 是 `org.springframework.boot.autoconfigure.EnableAutoConfiguration`，value 是逗号分隔的自动配置类。`SpringFactoriesLoader.loadFactories()` 在启动时收集所有声明，然后交给容器按 `@Conditional` 系列注解做条件装配。这是 starter \"引入 jar 即生效\" 的基础。\n\n**Boot 2.7+/3.x 迁移**：Spring Boot 2.7 引入了新的加载入口 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`，每行一个类名，不再用 key=value 格式。Boot 3.x **完全移除了对 spring.factories 中自动配置的支持**，如果只在 spring.factories 里声明 AutoConfiguration 而没有迁移到 .imports，自动装配会静默失效。这是版本升级时的高频坑。\n\n**条件装配**是 Spring SPI 超越 JDK SPI 的关键能力。`@ConditionalOnClass`、`@ConditionalOnMissingBean`、`@ConditionalOnProperty` 等让自动配置类只在满足条件时才注册进容器，实现\"按需激活\"而非 JDK SPI 的\"全量加载\"。例如 `DataSourceAutoConfiguration` 只在 classpath 有 `DataSource.class` 且容器中没有用户自定义 DataSource 时才生效。"
+    },
+    {
+      "type": "explain",
+      "title": "Dubbo SPI：按需加载、自适应与 IOC",
+      "content": "Dubbo 的 SPI 设计直接解决了 JDK SPI 的三个痛点：全量加载、无依赖注入、无自适应。\n\n**配置格式不同**：Dubbo SPI 的配置文件在 `META-INF/dubbo/`（还有 `META-INF/dubbo/internal/` 用于框架内置扩展），文件名也是接口全限定名，但内容是 `key=实现类全名` 格式。这样就能用 `ExtensionLoader.getExtensionLoader(接口.class).getExtension(\"名字\")` 按 key 按需获取单个实现。\n\n**@Adaptive 自适应扩展**：在接口方法上标注 `@Adaptive`，Dubbo 会生成代理类，在运行时根据 URL 参数中的 key 动态选择实现。例如 Protocol 接口的 `@Adaptive` 方法会读 URL 的 `protocol` 字段决定用 DubboProtocol 还是 RestProtocol。这样调用方只依赖接口，具体协议由运行时配置决定。\n\n**IOC 注入**：Dubbo 的 ExtensionLoader 支持 setter 注入——如果扩展点实现类有 setter 方法且参数类型是另一个扩展点接口，Dubbo 会自动注入对应实现。这解决了 JDK SPI 扩展点之间无法互相依赖的问题。\n\n**AOP 包装**：Dubbo SPI 支持 Wrapper 模式——如果有一个实现类的构造函数接受接口类型参数，它会被当作 Wrapper，在真正实现外面套一层代理，类似 Filter 链。"
+    },
+    {
+      "type": "explain",
+      "title": "SPI 的工程陷阱与排查",
+      "content": "**ServiceLoader 的懒加载是迭代时触发，不是 load 时触发**。`ServiceLoader.load()` 只是准备迭代器，真正调用 `iterator().next()` 时才读配置文件和实例化。这意味着如果配置文件路径错、实现类没有无参构造、或者类加载器找不到实现类，异常会发生在迭代时刻而非启动时刻，排查时要注意断点位置。\n\n**线程安全问题**：`ServiceLoader` 的 Javadoc 明确说它不是线程安全的。多线程并发迭代同一个 `ServiceLoader` 实例会导致不可预测行为。正确做法是每次使用新建实例，或在 `synchronized` 块中迭代后把结果缓存起来。\n\n**Spring Boot 版本迁移坑**：Boot 2.7+ 引入 .imports 机制，Boot 3.x 彻底移除 spring.factories 对自动配置的支持。如果升级后 starter 只有 spring.factories 声明而没有 .imports 文件，自动装配会静默失效，不会报错。排查时先看 `--debug` 模式下的 conditions report，再检查 `META-INF/spring/AutoConfiguration.imports` 是否存在。\n\n**Dubbo SPI 的 @SPI 默认值**：接口上 `@SPI(\"默认key\")` 指定默认扩展点；如果没指定且调用方没传 key，`getExtension()` 会抛 `IllegalStateException`。这是 Dubbo 配置出错时的常见异常。"
     },
     {
       "type": "diagram",
@@ -46,33 +56,41 @@
     },
     {
       "type": "compareTable",
-      "title": "三种 SPI 对比",
-      "content": "| 对比项 | JDK SPI | Spring SPI | Dubbo SPI |\n| --- | --- | --- | --- |\n| 配置位置 | META-INF/services/接口名 | spring.factories / .imports | META-INF/dubbo/接口名 |\n| 加载方式 | 全量实例化 | 全量收集 | 按 key 按需 |\n| 依赖注入 | 无 | 有（容器） | 有（IOC/AOP） |\n| 自适应 | 无 | 无 | 有（按 URL 选） |\n| 典型场景 | JDBC 驱动 | Boot 自动装配 | RPC 扩展点 |"
+      "title": "三种 SPI 机制对比",
+      "content": "| 对比项 | JDK SPI | Spring SPI | Dubbo SPI |\n| --- | --- | --- | --- |\n| 配置位置 | META-INF/services/接口名 | spring.factories → .imports | META-INF/dubbo/接口名 |\n| 配置格式 | 每行一个实现类 | key=value / 每行一个类 | key=实现类 |\n| 加载方式 | 全量懒迭代 | 全量收集 + 条件过滤 | 按 key 按需 |\n| 依赖注入 | 无 | 容器自动注入 | 扩展点间 setter 注入 |\n| 自适应 | 无 | @Conditional 条件化 | @Adaptive 按 URL 动态选 |\n| AOP 包装 | 无 | BeanPostProcessor | Wrapper 模式 |\n| 线程安全 | 否（需外部同步） | 容器管理 | 内部缓存 + 锁 |\n| 典型场景 | JDBC 驱动、SLF4J | Boot 自动装配 | RPC Protocol/Filter/Registry |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// 1) 定义接口\npublic interface PayChannel { void pay(long cents); }\n\n// 2) 实现类\npublic class WechatPay implements PayChannel {\n    public void pay(long cents) { System.out.println(\"wechat pay \" + cents); }\n}\n\n// 3) 资源文件：META-INF/services/com.example.PayChannel\n//    内容：com.example.WechatPay\n\n// 4) 运行时加载\nimport java.util.ServiceLoader;\npublic class SpiDemo {\n    public static void main(String[] args) {\n        for (PayChannel ch : ServiceLoader.load(PayChannel.class)) {\n            ch.pay(100);   // 加载并实例化所有已注册实现\n        }\n    }\n}",
+      "title": "JDK SPI 最小可运行示例",
       "language": "java",
+      "content": "// 接口定义\npublic interface PayChannel {\n    void pay(long cents);\n}\n\n// 实现类 1\npublic class WechatPay implements PayChannel {\n    public void pay(long cents) {\n        System.out.println(\"wechat pay \" + cents);\n    }\n}\n\n// 实现类 2\npublic class Alipay implements PayChannel {\n    public void pay(long cents) {\n        System.out.println(\"alipay pay \" + cents);\n    }\n}\n\n// META-INF/services/com.example.PayChannel 文件内容：\n// com.example.WechatPay\n// com.example.Alipay\n\nimport java.util.ServiceLoader;\n\npublic class SpiDemo {\n    public static void main(String[] args) {\n        // ServiceLoader 不是线程安全的，每次使用新建实例\n        ServiceLoader<PayChannel> loader = ServiceLoader.load(PayChannel.class);\n        for (PayChannel ch : loader) {\n            ch.pay(100); // 迭代时才实例化，所有注册实现都会被创建\n        }\n        // 无法按名字只取 WechatPay，只能全量遍历\n    }\n}",
       "highlights": [
         {
-          "line": 16,
-          "note": "ServiceLoader 会按 SPI 配置懒加载实现类；工程里要关注类加载器、实现顺序和启动期扫描成本。"
+          "line": 28,
+          "note": "ServiceLoader.load() 只准备迭代器，实例化发生在迭代时。"
+        },
+        {
+          "line": 30,
+          "note": "所有实现都会被实例化，无法只取一个——这是 JDK SPI 的核心局限。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
-      "title": "标准面试回答",
-      "content": "结论：SPI 是面向接口、运行时动态加载实现的解耦机制。JDK 用 META-INF/services + ServiceLoader，典型是 JDBC 驱动；缺点是全量加载、无依赖注入。Spring 用 spring.factories（Boot 2.7+ 改用 AutoConfiguration.imports），是自动装配的基础。Dubbo SPI 最强，支持按名字按需加载、自适应扩展和 IOC/AOP。\n\n机制要点：\n- 机制上，JDK SPI 把接口全名当文件名、内容是实现类，ServiceLoader 迭代实例化；Spring 把收集到的自动配置类按条件装配进容器；Dubbo 用 key=value 配置 + @Adaptive 在运行时按 URL 参数选实现。\n- 追问边界：JDK SPI 不能按需取单个实现且会触发所有实现的类加载，性能和灵活性都不如 Dubbo SPI；Spring Boot 3 已不再读 spring.factories 里的自动配置（迁移到 .imports）。",
+      "title": "面试回答思路",
+      "content": "**结论**：SPI 是「框架定义接口、第三方声明实现、运行时自动发现」的解耦机制。JDK SPI 最基础，Spring SPI 加了条件装配和容器注入，Dubbo SPI 加了按需加载、自适应和扩展点间 IOC。\n\n**JDK SPI 机制**\n- 配置在 `META-INF/services/接口全限定名`，每行一个实现类\n- `ServiceLoader.load(接口.class)` 迭代时逐个实例化\n- 典型应用：JDBC Driver（`java.sql.Driver`）\n- 局限：全量加载、无依赖注入、无线程安全\n\n**Spring SPI 机制**\n- Boot 2.x：`spring.factories` 中 key=EnableAutoConfiguration，value=自动配置类列表\n- Boot 2.7+/3.x：迁移到 `META-INF/spring/...AutoConfiguration.imports`，Boot 3 完全移除 spring.factories 对自动配置的支持\n- 核心增强：`@Conditional` 系列注解做条件装配，引入 jar 不等于全量激活\n- 自动装配是 starter \"引入即生效\" 的基础\n\n**Dubbo SPI 机制**\n- 配置在 `META-INF/dubbo/接口名`，`key=实现类` 格式\n- `ExtensionLoader.getExtension(\"key\")` 按名按需加载\n- `@Adaptive`：运行时按 URL 参数动态选择实现\n- setter 注入：扩展点之间可以互相依赖\n- Wrapper 模式：AOP 包装扩展点\n\n**工程陷阱**\n- ServiceLoader 不是线程安全的\n- Boot 3 移除 spring.factories 对自动配置的支持，升级时要迁移\n- Dubbo `@SPI` 没指定默认 key 且调用方不传 key 会抛异常\n- 配置文件路径写错或实现类缺无参构造，异常在迭代时才暴露",
       "followUpQuestions": [
         {
-          "question": "Spring Boot 自动装配和 JDK SPI 的关系？",
-          "answer": "思想一致——都是“配置文件声明实现，运行时加载”。Boot 2.x 用 SpringFactoriesLoader 读 spring.factories 收集 AutoConfiguration；Boot 2.7+/3.x 迁移到 META-INF/spring/...AutoConfiguration.imports，并配合 @Conditional 做条件装配，比裸 JDK SPI 多了容器注入与条件化能力。"
+          "question": "Spring Boot 3 为什么移除 spring.factories 对自动配置的支持？",
+          "answer": "spring.factories 的全量收集方式在启动时扫描所有声明，Boot 3 改用 AutoConfiguration.imports 配合更高效的解析和条件评估，减少启动开销。同时 .imports 格式每行一个类，比 key=value 更清晰。迁移时需要在新路径下创建文件，否则自动装配静默失效。"
         },
         {
-          "question": "JDK SPI 的全量加载有什么问题，如何规避？",
-          "answer": "ServiceLoader 会实例化文件里所有实现，无法按名字只取一个，既浪费又可能触发不需要的初始化。规避方式是改用支持按 key 取用的机制（如 Dubbo SPI 的 ExtensionLoader）或在框架层加一层名字到实现的映射。"
+          "question": "Dubbo 的 @Adaptive 和 Spring 的 @Conditional 有什么本质区别？",
+          "answer": "@Conditional 是启动时决定是否注册一个 Bean，结果在容器启动后就固定了。@Adaptive 是运行时每次调用时根据 URL 参数动态选择实现，同一个接口在不同请求中可能路由到不同实现。一个偏静态装配，一个偏动态路由。"
+        },
+        {
+          "question": "如果让你设计一个框架的扩展机制，JDK SPI 够用吗？",
+          "answer": "看需求。如果只需要全量发现实现、不需要按需选择和依赖注入，JDK SPI 够用且零依赖。如果需要按名字取、条件激活、扩展点间依赖注入或运行时动态路由，就需要自建或借用 Dubbo ExtensionLoader 这样的增强版。多数框架最终会在 JDK SPI 基础上加 key 映射和条件化。"
         }
       ]
     },
@@ -80,18 +98,20 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说出 SPI 的解耦思想和面向接口编程",
-        "能写出 JDK SPI 的 META-INF/services 配置和 ServiceLoader 用法",
-        "能举出 JDBC 驱动等典型应用",
-        "能说明 Spring 自动装配如何用 SPI 思想（spring.factories/.imports）",
-        "能对比 JDK/Spring/Dubbo SPI 在按需加载和依赖注入上的差异"
+        "能解释 SPI 的解耦思想：框架定义接口、第三方声明实现、运行时自动发现",
+        "能写出 JDK SPI 的 META-INF/services 配置格式和 ServiceLoader 用法",
+        "能举出 JDBC Driver 等标准库中的 SPI 应用",
+        "能说明 Spring Boot 自动装配从 spring.factories 到 .imports 的迁移和条件装配机制",
+        "能对比 JDK/Spring/Dubbo SPI 在按需加载、依赖注入、自适应上的差异",
+        "能指出 ServiceLoader 的线程安全问题和 Boot 3 移除 spring.factories 的版本陷阱",
+        "能说明 Dubbo SPI 的 @Adaptive 自适应扩展和 Wrapper AOP 机制"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "java.spring.topic-spi.recall.1",
-      "prompt": "请说明 JDK SPI 的实现方式（配置位置 + ServiceLoader），并举一个标准库的应用例子。",
+      "prompt": "请说明 JDK SPI 的实现机制（配置位置、ServiceLoader 行为），并举一个标准库中的应用例子。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -105,7 +125,21 @@
     },
     {
       "id": "java.spring.topic-spi.recall.3",
-      "prompt": "Java SPI 与 Spring 扩展机制 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "Spring Boot 从 2.x 升级到 3.x 时，自动装配的配置入口发生了什么变化？如果只保留旧配置会怎样？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "java.spring.topic-spi.recall.4",
+      "prompt": "Dubbo SPI 的 @Adaptive 和 Spring 的 @Conditional 有什么本质区别？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "java.spring.topic-spi.recall.5",
+      "prompt": "ServiceLoader 是线程安全的吗？如果多线程并发使用会怎样？如何正确使用？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -113,20 +147,22 @@
   ],
   "rubric": {
     "mustHave": [
-      "SPI 解耦思想",
-      "META-INF/services + ServiceLoader",
-      "JDBC 等典型应用",
-      "Spring 自动装配的 SPI 本质"
+      "能解释 SPI 的解耦思想和面向接口编程",
+      "能写出 JDK SPI 的 META-INF/services 配置和 ServiceLoader 用法",
+      "能举出 JDBC 驱动等典型应用",
+      "能说明 Spring 自动装配的 SPI 本质及从 spring.factories 到 .imports 的迁移"
     ],
     "goodToHave": [
-      "Boot 2.7+ 迁移到 .imports",
-      "Dubbo SPI 按需/自适应/IOC",
-      "JDK SPI 全量加载缺点"
+      "能说明 Boot 3 移除 spring.factories 自动配置支持的影响",
+      "能对比 Dubbo SPI 的按需加载、@Adaptive 和 IOC",
+      "能指出 JDK SPI 的全量加载和线程安全问题",
+      "能解释 @Adaptive 和 @Conditional 的本质区别"
     ],
     "commonMistakes": [
-      "以为 ServiceLoader 能按名字取单个实现",
-      "不知道 JDBC 驱动靠 SPI 注册",
-      "混淆 spring.factories 与 services 目录"
+      "以为 ServiceLoader.load() 调用时就实例化实现类（实际是迭代时触发）",
+      "以为 ServiceLoader 是线程安全的",
+      "不知道 Boot 3 已移除 spring.factories 对自动配置的支持，升级后自动装配静默失效",
+      "混淆 META-INF/services 和 META-INF/dubbo 的配置格式（前者每行一个类，后者 key=value）"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -135,10 +171,10 @@
       "depth": 20
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "staging",
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察 JDK SPI 的实现与局限，以及 Spring 自动装配、Dubbo SPI 的扩展机制对比。",
+  "interviewerFocus": "考察 JDK SPI 的实现机制与局限、Spring 自动装配从 spring.factories 到 .imports 的迁移、Dubbo SPI 的按需加载与自适应扩展，以及三者在工程取舍上的理解深度。",
   "prerequisites": [
     "java.spring.topic-041-d2d1cd02",
     "java.spring.topic-043-d09a2ea2"

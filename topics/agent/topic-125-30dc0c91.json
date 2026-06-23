@@ -4,7 +4,7 @@
   "category": "tool-agent",
   "group": "agent-architecture",
   "title": "Agent 状态管理",
-  "summary": "LangGraph状态图、状态持久化、检查点机制与人机协作",
+  "summary": "LangGraph 状态图如何把节点读写、reducer 合并、checkpoint 持久化、Human-in-the-Loop 暂停恢复、幂等副作用校验和并发写冲突处理统一成可恢复、可审计的工作流执行框架。",
   "tags": [
     "Agent",
     "Agent架构",
@@ -12,25 +12,35 @@
     "LangGraph"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 34,
   "order": 60,
   "recommendWeight": 78,
   "status": "production",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Agent 状态管理：Agent 状态是什么、状态类型",
-      "content": "## Agent 状态是什么\nAgent 状态包括当前任务目标、对话历史、计划、工具结果、中间结论、错误信息和用户偏好。没有状态管理，Agent 很难处理多轮任务和失败恢复。\n## 状态类型\n短期状态服务于当前执行链路；长期记忆保存可复用偏好和知识；工作流状态记录节点进度、分支选择和检查点。\n## 建模原则\n状态字段要结构化、可序列化、可审计。不要把所有内容都塞进一段自然语言历史，否则后续节点很难稳定消费。\n## 为什么要 checkpoint\n长任务可能因为工具失败、网络中断、人工审批或预算限制而暂停。Checkpoint 能保存关键状态，让任务从上一个可靠点恢复，而不是从头开始。"
+      "title": "Agent 状态管理的核心动机：为什么需要结构化状态",
+      "content": "Agent 不是聊天机器人。一次复杂任务可能跨多轮对话、调用多个工具、经历失败重试和人工审批。如果 Agent 没有结构化状态，每一步都在“回忆”上一步的输出，长链路会丢约束、丢计划、丢错误原因，恢复时从头开始，成本和风险都不可控。\n\n状态管理要解决三个核心问题：**跨步传递**——每个节点拿到上一个节点的真实输出，而不是重新推理；**断点恢复**——长任务中断后从上一个可靠点继续；**副作用安全**——恢复时不会重复执行已经发生的外部操作（扣款、发邮件、写数据库）。\n\nLangGraph 的做法是把状态定义成 TypedDict（或 Pydantic 模型），每个节点读入 state、返回增量 delta，框架通过 reducer 合并 delta 到全局 state。checkpointer 按 thread_id 持久化每次写入后的快照。这个设计让“状态是什么、怎么更新、怎么保存、怎么恢复”变成显式可审计的流程，而不是隐式的聊天上下文。"
     },
     {
       "type": "explain",
-      "title": "Agent 状态管理：存什么、恢复策略",
-      "content": "## 存什么\n通常要保存输入、节点状态、工具结果、错误、计划版本和必要上下文。敏感信息要加密或脱敏，避免状态存储变成新的泄漏点。\n## 恢复策略\n恢复时要检查外部副作用是否已经发生，例如订单、邮件、数据库写入。幂等键、事务日志和补偿动作是状态恢复的重要配套。\n## 记忆边界\n长期记忆不等于把所有对话永久保存。应只保留对后续任务有价值、经过授权且可更新的信息，并支持过期、删除和用户可见性。\n## Human-in-the-Loop\n高风险节点可以暂停等待人工确认，例如执行命令、发送外部消息、修改生产数据或花费预算。人工输入也应写回状态，成为后续推理依据。"
+      "title": "状态结构：短期工作流状态 vs 长期记忆 vs 对话历史",
+      "content": "这三个概念经常被混为一谈，但它们的生命周期、存储方式和访问模式完全不同。\n\n**短期工作流状态**服务于一次任务执行。它包含当前任务目标、消息列表、计划版本、工具调用结果、中间结论、错误信息和人工确认记录。LangGraph 的 `StateGraph(AgentState)` 就是在定义这部分。它的生命周期是一次 thread 执行，通常由 checkpoint 持久化在数据库或内存中。\n\n**长期记忆**保存跨任务可复用的用户偏好、知识片段或历史模式。它不是把所有对话永久保存，而是只保留对后续任务有价值、经过用户授权、可更新且可删除的信息。长期记忆需要过期机制、删除接口和用户可见性控制。\n\n**对话历史**是原始消息序列，用于上下文窗口和用户展示。状态管理不应该依赖对话历史做决策——LLM 上下文窗口有限，历史会被截断；而结构化字段（如 `current_plan`、`tool_results`、`error_reason`）即使在摘要或截断后仍可被节点稳定消费。\n\n建模原则：状态字段要结构化、可序列化、可审计。不要把所有内容都塞进一段自然语言历史，否则后续节点很难稳定读取和判断。"
     },
     {
       "type": "explain",
-      "title": "Agent 状态管理：上下文压缩、并发问题",
-      "content": "## 上下文压缩\n状态增长过快时，需要摘要、引用外部存储或只保留结构化结果。压缩要避免丢失关键约束和失败原因。\n## 并发问题\n多个节点或 Agent 同时写状态时，要处理锁、版本号或冲突合并。否则会出现计划覆盖、工具结果错配和用户确认失效。\n## 审计与回放\n状态管理要支持 trace 回放，能解释每一步为什么执行、用了哪些输入、产生了哪些副作用。它既是调试工具，也是合规要求。\n## 面试抓手\n回答时可以从状态内容、持久化、checkpoint、人工确认、幂等恢复和隐私安全展开，比单纯说“保存上下文”更完整。"
+      "title": "LangGraph 状态图机制：节点、reducer 与增量更新",
+      "content": "LangGraph 的核心抽象是 `StateGraph`：节点是函数，边是路由逻辑，状态是显式的 TypedDict。\n\n**节点函数签名**：每个节点接收当前 state dict，返回一个 delta dict。框架负责把 delta 合并到全局 state。这意味着节点不需要知道完整 state 长什么样，只需要读自己关心的字段、返回自己要更新的字段。\n\n**reducer 决定合并策略**：`Annotated[list, operator.add]` 表示新值 append 到已有列表；默认行为是直接覆盖。你可以自定义 reducer，比如用 `add_messages` 处理去重合并，或者用 `operator.or_` 做字典合并。reducer 的选择直接影响状态正确性——如果 `messages` 用覆盖而不是 append，每次节点执行都会丢掉之前的对话历史。\n\n**条件路由**：`add_conditional_edges` 让图可以根据当前 state 决定下一步走哪个节点。典型模式是 act 节点检查 LLM 是否返回了 tool_calls——有则继续调用工具，没有则结束。这让 Agent 可以动态决定工具调用次数，而不是固定的线性链路。\n\n**checkpointer 持久化**：编译时传入 `checkpointer=MemorySaver()`（或 `SqliteSaver`、`PostgresSaver`），每次 invoke 时传 `config={\"configurable\": {\"thread_id\": \"xxx\"}}`。框架会在每个节点执行后保存快照，支持 `get_state_history()` 回放和 `update_state()` 人工修改。"
+    },
+    {
+      "type": "explain",
+      "title": "Checkpoint 持久化与恢复：不只是保存，而是副作用安全",
+      "content": "Checkpoint 解决的是“中断后从哪里继续”的问题。但恢复不是简单地把 state 拿出来接着跑——因为上一次执行可能已经触发了外部副作用。\n\n**恢复链路**：用户带着同一个 thread_id 重新发起请求 → checkpointer 读取最近的 checkpoint → 框架从该 checkpoint 对应的节点继续执行。但在这之前，必须校验外部副作用是否已经发生：支付网关是否已扣款？邮件是否已发送？数据库记录是否已写入？\n\n**幂等键**：每个工具调用带一个业务幂等键（通常是 request_id 或 idempotency_key）。工具执行前先查：如果这个 key 已经执行过，直接返回之前的结果，不重复执行。这是恢复安全的第一道防线。\n\n**事务日志与补偿**：对于无法天然幂等的操作（发短信、调第三方 API），把调用前状态、请求参数、外部返回和确认状态都写入 checkpoint。恢复时先查日志确认状态，再决定是补写结果、走补偿还是人工确认。\n\n**Human-in-the-Loop**：高风险节点（执行命令、发送外部消息、修改生产数据、花费预算）可以设置 `interrupt_before` 或 `interrupt_after` 暂停等待人工确认。人工输入通过 `update_state()` 写回，成为后续节点的推理依据。这不只是安全机制，也是复杂任务中 Agent 需要人类决策点的自然体现。"
+    },
+    {
+      "type": "explain",
+      "title": "状态压缩、并发写冲突与审计回放",
+      "content": "**上下文压缩**：长任务的状态会持续增长，尤其是 messages 和 intermediate_steps。压缩策略包括：只保留结构化结果（如 `tool_results` 字典），丢弃原始对话轮次；对 messages 做摘要但保留最近 N 轮；把大工具输出存到外部存储，state 里只存引用。关键是压缩不能丢掉约束条件、计划版本、失败原因和人工确认记录——这些是恢复和后续决策的必要信息。\n\n**并发写冲突**：当多个节点或多个 Agent 同时写同一份 state 时，会出现覆盖和错配。LangGraph 的 reducer 机制天然处理 append 类字段（如 messages），但覆盖类字段（如 current_plan）需要额外策略：乐观锁（版本号检查）、调度器串行化、或把不可合并字段标记为需要人工确认。实践中最常见的错误是两个节点都更新了计划字段，后写的覆盖了先写的，导致计划不一致。\n\n**审计与回放**：`get_state_history()` 返回每次 checkpoint 的快照和 metadata，可以回放整个执行过程。这既是调试工具（定位哪一步出了问题、用了什么输入），也是合规要求（证明 Agent 做了什么决策、基于什么信息）。生产系统要在 trace 中记录每个节点的输入 state 版本、输出 delta、工具调用参数和外部返回。"
     },
     {
       "type": "diagram",
@@ -58,49 +68,53 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | 无状态Agent | 有状态Agent |\n| --- | --- | --- |\n| 对话连续性 | 每轮独立 | 跨轮连续 |\n| 错误恢复 | 重新开始 | 断点续传 |\n| 人机协作 | 不支持 | 支持 |\n| 调试能力 | 有限 | 时间旅行 |\n| 复杂度 | 低 | 中 |\n| 适用场景 | 简单问答 | 复杂任务 |"
+      "title": "状态管理关键概念与技术选型对比",
+      "content": "| 概念 | 生命周期 | 典型内容 | 存储位置 | 更新频率 |\n| --- | --- | --- | --- | --- |\n| 短期工作流状态 | 一次 thread 执行 | 消息、计划、工具结果、错误、确认记录 | checkpointer（内存/DB） | 每个节点执行后 |\n| 长期记忆 | 跨任务持久 | 用户偏好、知识片段、历史模式 | 向量库/KV 存储 | 按需更新，有过期机制 |\n| 对话历史 | 会话级别 | 原始消息序列 | 聊天存储 | 每轮追加 |\n\n| Checkpoint 后端 | 持久性 | 适用场景 | 并发支持 |\n| --- | --- | --- | --- |\n| MemorySaver | 内存，进程重启丢失 | 开发调试、单次演示 | 无 |\n| SqliteSaver | 本地文件 | 单机生产、原型验证 | 有限 |\n| PostgresSaver | 数据库 | 分布式生产环境 | 支持，需配合锁策略 |\n\n| 冲突处理策略 | 实现方式 | 适用字段 | 代价 |\n| --- | --- | --- | --- |\n| append-only reducer | `Annotated[list, operator.add]` | messages、events、steps | 无冲突，列表可能很长 |\n| 乐观锁/版本号 | 读时记录版本，写时校验 | current_plan、current_task | 冲突时需重试或合并 |\n| 调度器串行化 | 单写者，其他等待 | 不可合并的关键状态 | 降低并发度 |\n| 人工确认 | interrupt + update_state | 高风险操作结果 | 暂停等待，延迟增加 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "# 完整的Agent 状态管理示例\nfrom langgraph.graph import StateGraph, END\nfrom langgraph.checkpoint.memory import MemorySaver\nfrom typing import TypedDict, Annotated\nimport operator\n\nclass AgentState(TypedDict):\n    messages: Annotated[list, operator.add]  # 消息自动追加\n    intermediate_steps: list  # 中间步骤\n    current_task: str  # 当前任务\n\ndef think_node(state: AgentState):\n    \"\"\"思考节点：分析当前状态，决定下一步\"\"\"\n    messages = state[\"messages\"]\n    response = llm.invoke(messages)\n    return {\n        \"messages\": [response],\n        \"current_task\": \"analyzing\"\n    }\n\ndef act_node(state: AgentState):\n    \"\"\"行动节点：调用工具\"\"\"\n    last_message = state[\"messages\"][-1]\n    tool_call = last_message.tool_calls[0]\n    result = tools_by_name[tool_call[\"name\"]].invoke(tool_call[\"args\"])\n    return {\n        \"messages\": [ToolMessage(content=str(result), tool_call_id=tool_call[\"id\"])],\n        \"intermediate_steps\": [(tool_call, result)]\n    }\n\ndef should_continue(state: AgentState):\n    \"\"\"条件路由：是否继续\"\"\"\n    last_message = state[\"messages\"][-1]\n    if last_message.tool_calls:\n        return \"act\"\n    return END\n\n# 构建工作流\nworkflow = StateGraph(AgentState)\nworkflow.add_node(\"think\", think_node)\nworkflow.add_node(\"act\", act_node)\nworkflow.add_edge(\"think\", \"act\")\nworkflow.add_conditional_edges(\"act\", should_continue, {\"think\": \"think\", END: END})\nworkflow.set_entry_point(\"think\")\n\n# 编译并执行\ncheckpointer = MemorySaver()\napp = workflow.compile(checkpointer=checkpointer)\n\nconfig = {\"configurable\": {\"thread_id\": \"conversation-1\"}}\nresult = app.invoke({\"messages\": [HumanMessage(content=\"帮我搜索...\")]}, config)\n\n# 查看状态历史\nfor state in app.get_state_history(config):\n    print(f\"Step: {state.metadata.get('step')}, Messages: {len(state.values['messages'])}\")",
+      "title": "LangGraph 状态管理完整示例：checkpoint、中断恢复与状态回放",
       "language": "python",
+      "content": "from langgraph.graph import StateGraph, END\nfrom langgraph.checkpoint.memory import MemorySaver\nfrom langgraph.types import interrupt\nfrom typing import TypedDict, Annotated\nimport operator\n\nclass AgentState(TypedDict):\n    messages: Annotated[list, operator.add]       # reducer: append\n    tool_results: dict                            # 工具调用结果\n    current_plan: str                             # 当前计划，覆盖式更新\n    human_confirmations: Annotated[list, operator.add]  # 人工确认记录\n    error: str                                    # 最近错误\n\ndef think_node(state: AgentState):\n    \"\"\"分析当前状态，决定下一步\"\"\"\n    plan = llm.invoke(state[\"messages\"] + [SystemMessage(\n        content=f\"当前计划: {state.get('current_plan', '无')}\\n\"\n                f\"工具结果: {state.get('tool_results', {})}\\n\"\n                f\"错误: {state.get('error', '无')}\"\n    )])\n    return {\n        \"messages\": [plan],\n        \"current_plan\": plan.content  # 覆盖旧计划\n    }\n\ndef act_node(state: AgentState):\n    \"\"\"执行工具调用，带幂等键\"\"\"\n    last = state[\"messages\"][-1]\n    if not last.tool_calls:\n        return {}\n    tc = last.tool_calls[0]\n    idempotency_key = f\"{thread_id}_{tc['id']}\"  # 幂等键\n    # 实际应查询工具是否已执行过\n    result = tools_by_name[tc[\"name\"]].invoke(tc[\"args\"])\n    return {\n        \"messages\": [ToolMessage(content=str(result), tool_call_id=tc[\"id\"])],\n        \"tool_results\": {tc[\"name\"]: str(result)}  # 覆盖式更新\n    }\n\ndef human_review_node(state: AgentState):\n    \"\"\"高风险操作暂停，等待人工确认\"\"\"\n    decision = interrupt({\n        \"question\": \"请确认是否执行以下操作？\",\n        \"plan\": state.get(\"current_plan\"),\n        \"tool_results\": state.get(\"tool_results\")\n    })\n    return {\n        \"human_confirmations\": [decision],\n        \"messages\": [HumanMessage(content=f\"人工确认: {decision}\")]\n    }\n\ndef should_continue(state: AgentState):\n    last = state[\"messages\"][-1]\n    if hasattr(last, \"tool_calls\") and last.tool_calls:\n        return \"act\"\n    return \"review\"\n\n# 构建图\nworkflow = StateGraph(AgentState)\nworkflow.add_node(\"think\", think_node)\nworkflow.add_node(\"act\", act_node)\nworkflow.add_node(\"review\", human_review_node)\nworkflow.add_edge(\"think\", \"act\")\nworkflow.add_conditional_edges(\"act\", should_continue, {\"think\": \"think\", \"review\": \"review\"})\nworkflow.add_edge(\"review\", END)\nworkflow.set_entry_point(\"think\")\n\n# 编译，配置 checkpoint\ncheckpointer = MemorySaver()\napp = workflow.compile(checkpointer=checkpointer)\n\n# 执行\nconfig = {\"configurable\": {\"thread_id\": \"task-001\"}}\nresult = app.invoke({\"messages\": [HumanMessage(content=\"帮我搜索并购买...\"), ], \"tool_results\": {}, \"current_plan\": \"\", \"human_confirmations\": [], \"error\": \"\"}, config)\n\n# 状态回放：查看每个 checkpoint\nfor snapshot in app.get_state_history(config):\n    print(f\"节点: {snapshot.metadata.get('source', 'unknown')}, \"\n          f\"消息数: {len(snapshot.values.get('messages', []))}, \"\n          f\"计划: {snapshot.values.get('current_plan', '')[:50]}\")\n\n# 中断后恢复：人工确认后重新执行\n# app.update_state(config, {\"human_confirmations\": [\"approved\"]})\n# app.invoke(None, config)  # 从 checkpoint 继续",
       "highlights": [
         {
-          "line": 7,
-          "note": "`class AgentState(TypedDict):` 定义了 Agent 状态管理 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 6,
+          "note": "messages 用 Annotated[list, operator.add] 做 append-only reducer，而 current_plan 是直接覆盖——两种更新策略在同一 state 中并存。"
         },
         {
-          "line": 54,
-          "note": "`for state in app.get_state_history(config):` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+          "line": 27,
+          "note": "idempotency_key 保证恢复时不会重复执行工具调用。"
         },
         {
-          "line": 34,
-          "note": "`if last_message.tool_calls:` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 35,
+          "note": "interrupt() 暂停执行等待人工输入，是 Human-in-the-Loop 的核心 API。"
         },
         {
-          "line": 8,
-          "note": "`messages: Annotated[list, operator.add] # 消息自动追加` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "line": 58,
+          "note": "get_state_history() 回放所有 checkpoint，支持调试和审计。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "30 秒结论：Agent 状态管理解决的是长任务、多轮协作和失败恢复问题，不只是“保存聊天记录”。我会把状态拆成任务目标、消息历史、计划、工具结果、错误、人工确认和外部副作用记录，再用 checkpoint 把每个可靠节点的输出持久化。\n\n机制要点：\n- 机制上，LangGraph 这类状态图会把工作流节点和状态结构绑定起来：节点读入当前 state，返回增量更新；checkpointer 按 thread_id 保存快照，恢复时从最近 checkpoint 继续。难点不在保存，而在恢复前确认外部副作用是否已经发生，例如邮件是否已发、订单是否已创建、数据库是否已写入。这里要配合幂等键、事务日志、补偿动作和审计 trace。\n- 边界上，短期状态服务当前任务，长期记忆只保存经授权且可更新的偏好或知识；高风险动作要 Human-in-the-Loop 暂停确认；并发写状态要用版本号、锁或合并策略，否则会出现计划覆盖和工具结果错配。",
+      "content": "**30 秒结论**：Agent 状态管理解决的是长任务、多轮协作和失败恢复问题。核心不是“保存聊天记录”，而是把任务目标、计划、工具结果、错误、人工确认和外部副作用记录结构化，用 checkpoint 持久化每个可靠节点的输出，恢复时经过副作用校验才能安全继续。\n\n**机制主线**\n- **状态结构**：LangGraph 用 TypedDict 定义 state schema，每个节点读 state、返回 delta，框架通过 reducer 合并。`Annotated[list, operator.add]` 做 append，其他字段默认覆盖。reducer 选择直接影响正确性。\n- **checkpoint 持久化**：checkpointer 按 thread_id 在每个节点执行后保存快照。MemorySaver 用于开发，生产用 PostgresSaver。`get_state_history()` 支持时间旅行调试。\n- **恢复与副作用安全**：恢复不是直接重放。必须校验外部副作用是否已发生——用幂等键查工具是否已执行、查事务日志确认支付状态。已发生则补写结果，未发生则正常执行，未知则补偿或人工确认。\n- **Human-in-the-Loop**：高风险节点（付款、发消息、改数据）用 `interrupt()` 暂停，人工输入通过 `update_state()` 写回。\n- **压缩与并发**：长任务压缩状态时保留约束、计划版本和失败原因，丢弃原始对话轮次。并发写用乐观锁、reducer 或调度器串行化。\n\n**追问边界**\n- 付款后超时恢复：幂等键 + 事务日志，查支付网关状态，不直接重试扣款。\n- 状态应存什么不该存什么：一次性工具输出、敏感凭证、过期权限不应进长期记忆。\n- 多 Agent 写同一 state：append-only 字段天然安全，覆盖字段需要版本号或串行化。",
       "followUpQuestions": [
         {
           "question": "Agent 执行到付款工具后超时，恢复时你如何避免重复扣款？",
-          "answer": "我会让工具调用带业务幂等键，并把调用前状态、请求参数、外部返回和确认状态写入 checkpoint。恢复时先查事务日志或支付网关状态：如果已成功就把结果补写回 state 继续后续节点；如果失败或未知，走补偿查询或人工确认，而不是直接重试扣款。"
+          "answer": "让工具调用带业务幂等键（如 request_id），并把调用前状态、请求参数、外部返回和确认状态写入 checkpoint。恢复时先查支付网关的事务状态：已成功则补写结果到 state 继续后续节点；失败或未知则走补偿查询或人工确认，不直接重试扣款。关键是 checkpoint 里要有足够的信息让恢复逻辑做出正确判断。"
         },
         {
-          "question": "状态里哪些内容不应该长期保存？",
-          "answer": "一次性工具输出、敏感凭证、过期权限、临时错误栈和未经用户授权的个人信息不应进入长期记忆。长期记忆要有用途、授权、过期和删除机制；短期工作流状态也要脱敏或加密，避免 checkpoint 成为新的泄漏面。"
+          "question": "LangGraph 的 reducer 机制具体怎么工作？为什么 messages 用 append 而 current_plan 用覆盖？",
+          "answer": "reducer 定义了节点返回的 delta 如何合并到全局 state。`Annotated[list, operator.add]` 表示新值 append 到已有列表，适合 messages 这种需要保留完整历史的字段。current_plan 是覆盖式更新，因为每次 think_node 重新规划后，旧计划没有保留价值，新计划直接替代。选错 reducer 会导致状态错乱——messages 用覆盖会丢历史，plan 用 append 会堆积无用旧版本。"
         },
         {
           "question": "多个 Agent 或节点同时更新同一份状态时怎么处理？",
-          "answer": "要先定义写入粒度和冲突策略。常见做法是 append-only 记录工具事件，用版本号或乐观锁保护计划字段；可合并字段用 reducer 追加，不可合并字段必须由调度器串行化或让人工确认。排查时看 trace 中每个节点读到的 state 版本和写出的 delta。"
+          "answer": "先分类字段：append-only 字段（如 messages、events）用 reducer 天然安全；覆盖字段（如 current_plan）需要保护。常见策略：乐观锁——读时记录版本号，写时校验版本一致才提交，冲突则重试或合并；调度器串行化——关键字段只允许单写者；人工确认——高风险更新由人审批。排查时看 trace 中每个节点读到的 state 版本和写出的 delta。"
+        },
+        {
+          "question": "状态压缩时哪些信息绝对不能丢？",
+          "answer": "不能丢：约束条件（用户明确要求的限制）、计划版本（当前执行到哪一步）、失败原因（上次为什么中断）、人工确认记录（人做了什么决策）、外部副作用状态（哪些操作已经发生）。可以压缩或丢弃：原始对话轮次（可摘要）、大工具输出（存引用）、中间推理过程（保留结论即可）。"
         }
       ]
     },
@@ -108,65 +122,91 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "LangGraph状态图的构建方式",
-        "状态持久化的存储后端选择",
-        "检查点机制的工作原理",
-        "人机协作的实现方式",
-        "与无状态Agent的区别"
+        "能区分短期工作流状态、长期记忆和对话历史的生命周期和存储方式",
+        "能说明 LangGraph StateGraph 中节点如何读 state、返回 delta、reducer 如何合并",
+        "能解释 checkpoint 按 thread_id 持久化和恢复的完整链路",
+        "能讲清恢复前校验外部副作用的三种策略：幂等键、事务日志、补偿动作",
+        "能说明 Human-in-the-Loop 的 interrupt/update_state 机制和适用场景",
+        "能解释 reducer 选择对状态正确性的影响（append vs 覆盖）",
+        "能说明并发写冲突的处理策略：乐观锁、reducer、串行化、人工确认",
+        "能用“付款后超时恢复”案例说明幂等键 + 事务日志 + checkpoint 的配合"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "agent.tool-agent.topic-125-30dc0c91.recall.1",
-      "prompt": "请说明 Agent 状态管理 的核心执行流程、关键状态和失败恢复策略。",
+      "prompt": "请完整说明 LangGraph 状态图中 state 如何定义、节点如何读写、reducer 如何合并 delta、checkpoint 如何按 thread_id 持久化和恢复。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "agent.tool-agent.topic-125-30dc0c91.recall.2",
-      "prompt": "如果面试官问你\"Agent执行到一半中断了，怎么恢复\"，你会怎么回答？",
+      "prompt": "Agent 执行到付款工具后超时中断，恢复时你如何避免重复扣款？请说明幂等键、事务日志和 checkpoint 的配合方式。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "agent.tool-agent.topic-125-30dc0c91.recall.3",
+      "prompt": "短期工作流状态、长期记忆和对话历史有什么区别？它们的生命周期、存储方式和更新策略分别是什么？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.tool-agent.topic-125-30dc0c91.recall.4",
+      "prompt": "多个节点或 Agent 同时写同一份 state 时会出现什么问题？你会用什么策略处理？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "agent.tool-agent.topic-125-30dc0c91.recall.5",
+      "prompt": "状态压缩时哪些信息绝对不能丢？请举例说明压缩如何保留约束、计划版本和失败原因。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
-      "id": "agent.tool-agent.topic-125-30dc0c91.recall.3",
-      "prompt": "Agent 状态管理 和相邻概念或常见替代方案有什么关键区别？",
+      "id": "agent.tool-agent.topic-125-30dc0c91.recall.6",
+      "prompt": "Human-in-the-Loop 在 Agent 状态管理中怎么实现？高风险节点暂停、人工输入写回、恢复继续的完整流程是什么？",
       "mode": "text",
-      "expectedMinutes": 4,
-      "difficulty": 4
+      "expectedMinutes": 3,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能区分短期工作流状态、长期记忆和普通对话历史",
-      "能说明 LangGraph/状态图中节点如何读写 state、checkpoint 如何按 thread_id 恢复",
-      "能讲清恢复前如何校验外部副作用，并使用幂等键、事务日志或补偿动作",
-      "能说明 Human-in-the-Loop、状态脱敏、并发写冲突和审计 trace 的边界"
+      "能区分短期工作流状态、长期记忆和对话历史，说明各自生命周期和存储方式",
+      "能说明 LangGraph 中节点读 state 返回 delta、reducer 合并、checkpoint 按 thread_id 持久化恢复的完整机制",
+      "能讲清恢复前校验外部副作用的策略：幂等键、事务日志、补偿动作",
+      "能说明 Human-in-the-Loop 的 interrupt 暂停和 update_state 写回机制"
     ],
     "goodToHave": [
-      "能用“工具调用超时后恢复”案例说明状态快照、重试和补偿流程",
-      "能说明状态压缩如何保留约束、计划版本和失败原因，而不是只摘要聊天内容",
-      "能解释 reducer/版本号/锁在多节点并发更新状态时的适用场景"
+      "能用“付款后超时恢复”案例说明幂等键、事务日志和 checkpoint 的配合流程",
+      "能解释 reducer 选择（append vs 覆盖）对状态正确性的影响",
+      "能说明并发写冲突的处理策略：乐观锁、reducer、串行化和人工确认的适用场景",
+      "能说明状态压缩应保留什么、可丢弃什么"
     ],
     "commonMistakes": [
-      "把状态管理等同于保存聊天历史，漏掉计划、工具结果、错误和外部副作用",
-      "恢复时直接重放工具调用，没有检查幂等键或事务日志",
-      "长期记忆无限保存用户信息，没有授权、过期、删除和可见性设计"
+      "把状态管理等同于保存聊天历史，漏掉计划、工具结果、错误和外部副作用记录",
+      "恢复时直接重放工具调用，不查幂等键或事务日志，导致重复扣款或重复发消息",
+      "长期记忆无限保存用户信息，没有授权、过期、删除和可见性机制",
+      "messages 字段用覆盖而不是 append，每次节点执行都丢掉之前的对话历史"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "prerequisites": [
     "agent.tool-agent.topic-124-6e95a1cd"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「Agent 状态管理」说清LangGraph状态图、状态持久化机制，并放到Agent/RAG/LLM 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察能否围绕 Agent 状态管理说清 LangGraph 状态图的 state/reducer/checkpoint 机制、副作用安全的恢复策略、Human-in-the-Loop 实现，并在追问中展现对并发冲突、状态压缩、幂等恢复等工程边界的理解。"
 }

@@ -4,7 +4,7 @@
   "category": "java-fundamentals",
   "group": "java-fundamentals",
   "title": "Stream API 详解",
-  "summary": "Stream 是一次性惰性计算管道，重点在中间操作融合、终端触发、Collector 结果语义、资源关闭和并行流边界。",
+  "summary": "Stream 是一次性惰性计算管道：中间操作只组装管道，终端操作触发遍历并消费流；重点在操作分类与融合机制、Collector 结果语义（key 冲突、不可变 List、顺序）、资源型 Stream 关闭、并行流的拆分条件与公共池边界。",
   "tags": [
     "Java",
     "Stream",
@@ -12,24 +12,34 @@
     "parallelStream"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 42,
   "order": 60,
   "recommendWeight": 82,
   "learningCards": [
     {
       "type": "explain",
-      "title": "Stream 不是集合，而是一次性计算管道",
-      "content": "集合负责存储元素，Stream 负责描述一次数据处理过程。中间操作只组装管道，终端操作才触发遍历；终端操作结束后 Stream 被消费，不能复用。这个边界比背 `filter/map/collect` 更重要，因为很多线上问题来自把 Stream 当集合缓存或重复使用。\n\n中间操作分三类看。`filter/map/flatMap/peek` 多数是无状态操作，元素可以独立通过管道。`sorted/distinct` 是有状态操作，可能需要缓存、排序或去重。`limit/skip`、`findFirst/anyMatch` 这类短路操作可以提前结束，但在有序并行流里可能付出额外协调成本。`peek` 更适合调试观察，不应承载业务写入。"
+      "title": "Stream 是一次性惰性计算管道，不是数据结构",
+      "content": "集合存储元素，Stream 描述一次数据处理过程——它不持有数据，只持有数据源引用和操作链。理解这一点是所有后续问题的起点：中间操作只组装管道（返回新 Stream），终端操作才真正遍历数据源并产生结果；终端操作完成后 Stream 被消费，再次使用会抛 `IllegalStateException`。很多线上 bug 来自把 Stream 当缓存或复用变量。\n\n惰性还有性能意义：操作可以融合和短路。`filter().map().findFirst()` 不会先完整过滤再完整映射——元素逐个流过管道，`findFirst` 拿到第一个满足条件的结果后就短路停止，中间不产生集合。这意味着管道长度不等于内存开销，真正决定执行量的是终端操作的触发方式和数据源大小。"
     },
     {
       "type": "explain",
-      "title": "Collector、资源流与结果语义",
-      "content": "面试里要能讲清结果语义的机制与边界。`Collectors.toMap` 遇到重复 key 会抛异常，生产代码通常要显式给 merge 函数，必要时再指定 `LinkedHashMap`、`TreeMap` 或并发 Map 工厂。`groupingBy`、`partitioningBy`、`summarizingInt/Long/Double` 常用于分组统计，但要说明结果是否保序、是否可变、是否适合并发。\n\n还要区分 `stream.collect(Collectors.toList())` 和 `stream.toList()`：前者不承诺具体 List 类型和可变性，后者返回不可变 List（Java 16 起可用）。`Files.lines`、`BufferedReader.lines` 这类资源型 Stream 持有底层资源，应该放进 try-with-resources。无限流如 `Stream.iterate/generate` 必须配合 `limit` 或短路终端操作，否则容易变成无法结束的计算。"
+      "title": "中间操作分类：无状态、有状态和短路",
+      "content": "无状态操作（`filter`、`map`、`flatMap`、`peek`、`mapToInt` 等）对每个元素独立处理，不需要看其他元素，适合逐元素融合进同一次遍历。\n\n有状态操作（`sorted`、`distinct`）需要在处理过程中缓存或协调。`sorted` 要把所有元素收集起来排序后再输出，`distinct` 在并行流中需要额外去重逻辑。它们会打断流水线的逐元素融合，可能显著增加内存占用和延迟。\n\n短路操作（`limit`、`skip`、`findFirst`、`findAny`、`anyMatch`、`allMatch`、`noneMatch`）可以提前结束遍历。在无序流或串行流中短路效果直接；但在有序并行流中，`limit` 和 `findFirst` 需要维护 encounter order，可能限制并行度甚至需要额外排序或协调。\n\n`peek` 是调试辅助操作，不应承载业务写入——它不改变流元素，只是在管道流过时执行一个 Consumer；但它会在并行流中被多线程调用，写共享状态同样危险。"
     },
     {
       "type": "explain",
-      "title": "parallelStream 的真实边界",
-      "content": "并行流默认使用公共 ForkJoinPool，靠 Spliterator 拆分数据、并行处理、再合并结果。它适合数据量足够、拆分均匀、函数近似纯计算、合并便宜且没有共享可变状态的场景。不适合阻塞 IO、小数据量、强顺序依赖、锁竞争重、任务耗时极不均或公共池已被其他业务占满的场景。\n\n并行归约要求 identity、accumulator、combiner 满足一致性和结合律。不要在 `parallelStream().forEach(...)` 里往共享 `ArrayList` 写数据；如果需要结果集合，应使用 `collect`、`groupingByConcurrent` 或显式并发结构，并用压测或 profiling 验证收益。"
+      "title": "Collector 结果语义：key 冲突、不可变性和顺序",
+      "content": "`Collectors.toMap(keyMapper, valueMapper)` 的默认重载遇到重复 key 会抛 `IllegalStateException`。生产代码几乎总要显式给第三个参数 merge function（如 `Integer::sum`），再按需指定第四个参数 Map 工厂（`LinkedHashMap::new` 保插入序，`TreeMap::new` 保排序，`ConcurrentHashMap::new` 用于并发场景）。\n\n`groupingBy(classifier, downstream)` 返回的 Map 键是分类器结果，值由下游 Collector 决定。默认返回 `HashMap`，不保序；需要保序用 `groupingBy(classifier, LinkedHashMap::new, downstream)`。`partitioningBy` 只分 true/false 两组，返回 `Map<Boolean, List<T>>`，适合二分场景。`summarizingInt/Long/Double` 返回 `IntSummaryStatistics` 等，包含 count/sum/min/max/average，对象是可变的——收集后不要在并发环境中修改它。\n\n`stream.collect(Collectors.toList())` 不承诺返回 `ArrayList`（实现可以自由选择），不承诺可变性。`stream.toList()` 从 Java 16 起可用，明确返回不可变 List——对结果调 `add/remove` 会抛 `UnsupportedOperationException`。需要可变结果时用 `Collectors.toCollection(ArrayList::new)`。\n\n资源型 Stream（`Files.lines`、`BufferedReader.lines`、`Files.list`、`Files.walk`）持有底层 I/O 资源，必须用 `try-with-resources` 显式关闭，否则文件句柄或目录锁会泄漏。无限流（`Stream.iterate`、`Stream.generate`）必须配合 `limit` 或短路终端操作（`findFirst`、`anyMatch`），否则永远不终止。"
+    },
+    {
+      "type": "explain",
+      "title": "parallelStream 的拆分、合并和公共池边界",
+      "content": "`parallelStream()` 把数据拆成子任务交给 `ForkJoinPool.commonPool()` 并行处理，再合并结果。拆分质量由 `Spliterator.characteristics()` 决定：`SIZED` 和 `SUBSIZED` 表示精确大小，`ORDERED` 要求维护顺序，`CONCURRENT` 允许并发修改源。`ArrayList`、数组的 Spliterator 能高效二分；`LinkedList`、`HashSet` 的拆分质量较差。\n\n适合并行流的条件：数据量足够大（几千以上才有意义，否则拆分和合并开销大于收益）、拆分均匀、处理函数接近纯计算（无 I/O、无锁等待）、归约/收集的合并便宜、没有共享可变状态。\n\n不适合的场景：阻塞 I/O 或远程调用（占住公共池线程影响其他并行流和 CompletableFuture）、小数据集、强顺序依赖（有序 `limit`/`findFirst` 在并行流中代价高）、函数内部有锁或写共享状态、任务耗时极不均匀导致负载倾斜。\n\n并行归约要求 identity 与 accumulator/combiner 满足一致性，accumulator 和 combiner 满足结合律。`parallelStream().forEach` 的执行顺序不确定——需要保序用 `forEachOrdered`，但性能可能退化回串行。往共享 `ArrayList` 写数据是典型错误：并发写导致数据丢失或 `ArrayIndexOutOfBoundsException`。应该用 `collect`、`reduce` 或 `groupingByConcurrent` 表达合并逻辑。"
+    },
+    {
+      "type": "explain",
+      "title": "Java 16+ 新增和实用操作",
+      "content": "`Stream.toList()`（Java 16）返回不可变 List，语义清晰、实现高效，已成为收集到 List 的首选。`Stream.mapMulti`（Java 16）是 `flatMap` 的替代方案，对每个元素通过 Consumer 产生零到多个结果，在某些场景下避免了创建大量中间 Stream 的开销。\n\n`Collectors.teeing`（Java 12）可以对同一流同时做两种收集再合并，比如同时求最大值和最小值。`Collectors.filtering` 和 `Collectors.flatMapping`（Java 9）可以在 `groupingBy` 的下游 Collector 中做二次过滤和展平，减少预处理步骤。\n\n实践中建议：简单映射用 `map`，一对多用 `flatMap` 或 `mapMulti`；收集到 List 优先用 `stream.toList()`，需要可变则用 `toCollection(ArrayList::new)`；需要不可变 Set/Map 用 `Collectors.toUnmodifiableList/Set/Map`（Java 10）。"
     },
     {
       "type": "diagram",
@@ -51,123 +61,148 @@
     },
     {
       "type": "compareTable",
-      "title": "常见选择与风险",
-      "content": "| 场景 | 推荐判断 | 风险点 |\n| --- | --- | --- |\n| 普通集合转换 | `stream().filter/map/collect` 可读性通常更好 | 链太长时应抽方法命名 |\n| 分组统计 | `groupingBy` + 下游 Collector | 忽略顺序、可变性或内存占用 |\n| key-value 汇总 | `toMap(key, value, merge, mapFactory)` | 忘记 merge 导致重复 key 异常 |\n| 大量 CPU 可拆分计算 | 可评估 `parallelStream` | 公共池竞争、拆分/合并成本、共享状态 |\n| 阻塞 IO 或远程调用 | 优先显式线程池/异步模型 | 并行流占用公共池，吞吐和隔离性差 |\n| 文件逐行处理 | `try (Stream<String> s = Files.lines(path))` | 忘记关闭导致文件句柄泄漏 |"
+      "title": "操作分类、Collector 选择与并行流决策",
+      "content": "| 类型 | 代表操作 | 执行特征 | 性能影响 |\n| --- | --- | --- | --- |\n| 无状态中间 | filter, map, flatMap, peek, mapToInt | 每元素独立处理，可融合进同一次遍历 | 开销低，管道长度不等于内存占用 |\n| 有状态中间 | sorted, distinct | 需要缓存元素或全局协调 | 可能 O(n) 内存，打断流水线融合 |\n| 短路中间/终端 | limit, findFirst, anyMatch, allMatch | 拿到满足条件的结果后提前结束 | 串行流直接短路；有序并行流可能限制并行度 |\n| 终端 | collect, reduce, count, forEach, toArray | 触发遍历，消费 Stream | 决定实际执行量和结果类型 |\n\n| 收集方式 | 返回类型 | 可变性 | 适用场景 |\n| --- | --- | --- | --- |\n| `stream.toList()` | 不可变 List（Java 16+） | 不可变 | 只读结果首选 |\n| `Collectors.toList()` | 不保证具体类型 | 不保证可变 | 通用，需要可变结果时不够明确 |\n| `Collectors.toCollection(ArrayList::new)` | ArrayList | 可变 | 需要可变 List |\n| `Collectors.toUnmodifiableList()` | 不可变 List（Java 10+） | 不可变 | 需要明确不可变语义 |\n| `Collectors.toMap(k,v,merge,factory)` | 指定 Map 类型 | 可变 | 需要处理重复 key 或指定顺序/并发 |\n\n| 场景 | parallelStream | 原因 |\n| --- | --- | --- |\n| 大数据量 + CPU 密集 + 拆分均匀 | 适合 | 拆分合并开销可被并行收益覆盖 |\n| 阻塞 IO / 远程调用 | 不适合 | 占住公共池线程，影响全局 |\n| 小数据集（几百以内） | 不适合 | 拆分和合并开销大于并行收益 |\n| 强顺序依赖（有序 limit/findFirst） | 需谨慎 | 维护 encounter order 可能限制并行度 |\n| 共享可变状态或锁竞争 | 不适合 | 并发修改导致数据损坏或退化为串行 |"
     },
     {
       "type": "code",
-      "title": "Java 可运行：惰性、一次性、Collector、并行流和资源关闭",
-      "content": "import java.io.IOException;\nimport java.nio.file.Files;\nimport java.nio.file.Path;\nimport java.util.IntSummaryStatistics;\nimport java.util.List;\nimport java.util.Map;\nimport java.util.Optional;\nimport java.util.TreeMap;\nimport java.util.concurrent.atomic.AtomicInteger;\nimport java.util.stream.Collectors;\nimport java.util.stream.Stream;\n\npublic class Main {\n    record Order(String user, String category, int amount) {}\n\n    public static void main(String[] args) throws IOException {\n        List<Order> orders = List.of(\n            new Order(\"Ada\", \"book\", 120),\n            new Order(\"Bob\", \"game\", 200),\n            new Order(\"Ada\", \"book\", 80),\n            new Order(\"Cara\", \"book\", 50),\n            new Order(\"Bob\", \"tool\", 30)\n        );\n\n        List<String> vipUsers = orders.stream()\n            .filter(o -> o.amount() >= 100)\n            .map(Order::user)\n            .distinct()\n            .sorted()\n            .toList();\n        System.out.println(\"vip users: \" + vipUsers);\n\n        boolean immutable = false;\n        try {\n            vipUsers.add(\"Zed\");\n        } catch (UnsupportedOperationException e) {\n            immutable = true;\n        }\n\n        Map<String, Integer> totalByUser = orders.stream().collect(\n            Collectors.toMap(Order::user, Order::amount, Integer::sum, TreeMap::new)\n        );\n        System.out.println(\"total by user: \" + totalByUser);\n\n        Map<String, IntSummaryStatistics> statsByCategory = orders.stream().collect(\n            Collectors.groupingBy(Order::category, TreeMap::new, Collectors.summarizingInt(Order::amount))\n        );\n        System.out.println(\"book count/sum: \" + statsByCategory.get(\"book\").getCount() + \"/\" + statsByCategory.get(\"book\").getSum());\n\n        AtomicInteger touched = new AtomicInteger();\n        Stream<Order> lazyPipeline = orders.stream().peek(o -> touched.incrementAndGet()).filter(o -> o.amount() > 100);\n        assert touched.get() == 0;\n        long expensiveCount = lazyPipeline.count();\n        System.out.println(\"after terminal touched/count: \" + touched.get() + \"/\" + expensiveCount);\n\n        boolean consumedThrows = false;\n        try {\n            lazyPipeline.count();\n        } catch (IllegalStateException e) {\n            consumedThrows = true;\n        }\n\n        AtomicInteger visited = new AtomicInteger();\n        Optional<String> firstBig = orders.stream()\n            .filter(o -> {\n                visited.incrementAndGet();\n                return o.amount() > 100;\n            })\n            .map(Order::user)\n            .findFirst();\n        System.out.println(\"first big/visited: \" + firstBig.orElse(\"none\") + \"/\" + visited.get());\n\n        int parallelSum = orders.parallelStream().mapToInt(Order::amount).sum();\n        System.out.println(\"parallel sum: \" + parallelSum);\n\n        Path temp = Files.createTempFile(\"stream-api\", \".txt\");\n        Files.write(temp, List.of(\"a\", \"bb\", \"ccc\"));\n        int lengthSum;\n        try (Stream<String> lines = Files.lines(temp)) {\n            lengthSum = lines.mapToInt(String::length).sum();\n        }\n        Files.deleteIfExists(temp);\n        System.out.println(\"file length sum: \" + lengthSum);\n\n        assert vipUsers.equals(List.of(\"Ada\", \"Bob\"));\n        assert immutable;\n        assert totalByUser.equals(Map.of(\"Ada\", 200, \"Bob\", 230, \"Cara\", 50));\n        assert statsByCategory.get(\"book\").getCount() == 3;\n        assert statsByCategory.get(\"book\").getSum() == 250;\n        assert touched.get() == orders.size();\n        assert expensiveCount == 2;\n        assert consumedThrows;\n        assert firstBig.orElseThrow().equals(\"Ada\");\n        assert visited.get() == 1;\n        assert parallelSum == 480;\n        assert lengthSum == 6;\n    }\n}",
+      "title": "惰性验证、Collector 语义、短路和资源关闭",
+      "content": "import java.io.IOException;\nimport java.nio.file.Files;\nimport java.nio.file.Path;\nimport java.util.ArrayList;\nimport java.util.IntSummaryStatistics;\nimport java.util.LinkedHashMap;\nimport java.util.List;\nimport java.util.Map;\nimport java.util.Optional;\nimport java.util.TreeMap;\nimport java.util.concurrent.atomic.AtomicInteger;\nimport java.util.stream.Collectors;\nimport java.util.stream.Stream;\n\npublic class Main {\n    record Order(String user, String category, int amount) {}\n\n    public static void main(String[] args) throws IOException {\n        List<Order> orders = List.of(\n            new Order(\"Ada\", \"book\", 120),\n            new Order(\"Bob\", \"game\", 200),\n            new Order(\"Ada\", \"book\", 80),\n            new Order(\"Cara\", \"book\", 50),\n            new Order(\"Bob\", \"tool\", 30)\n        );\n\n        // 1. 惰性验证：中间操作不会触发计算\n        AtomicInteger touched = new AtomicInteger();\n        Stream<Order> pipeline = orders.stream()\n            .peek(o -> touched.incrementAndGet())\n            .filter(o -> o.amount() > 100);\n        assert touched.get() == 0 : \"中间操作不应触发计算\";\n\n        // 2. 终端操作触发遍历，完成后 Stream 被消费\n        long count = pipeline.count();\n        assert touched.get() == orders.size() : \"终端操作触发全部元素遍历\";\n        assert count == 2 : \"只统计 amount > 100 的订单\";\n\n        boolean consumedThrows = false;\n        try {\n            pipeline.count(); // 二次使用已消费的 Stream\n        } catch (IllegalStateException e) {\n            consumedThrows = true;\n        }\n        assert consumedThrows : \"Stream 不能复用\";\n\n        // 3. 短路：findFirst 只遍历到第一个匹配项\n        AtomicInteger visited = new AtomicInteger();\n        Optional<String> firstBig = orders.stream()\n            .filter(o -> { visited.incrementAndGet(); return o.amount() > 100; })\n            .map(Order::user)\n            .findFirst();\n        assert firstBig.orElseThrow().equals(\"Ada\");\n        assert visited.get() == 1 : \"findFirst 短路，只访问了第一个元素\";\n\n        // 4. toMap 必须处理重复 key\n        Map<String, Integer> totalByUser = orders.stream().collect(\n            Collectors.toMap(Order::user, Order::amount, Integer::sum, LinkedHashMap::new)\n        );\n        assert totalByUser.keySet().iterator().next().equals(\"Ada\") : \"LinkedHashMap 保插入序\";\n        assert totalByUser.equals(Map.of(\"Ada\", 200, \"Bob\", 230, \"Cara\", 50));\n\n        // 5. groupingBy + 下游 Collector\n        Map<String, IntSummaryStatistics> statsByCategory = orders.stream().collect(\n            Collectors.groupingBy(Order::category, TreeMap::new, Collectors.summarizingInt(Order::amount))\n        );\n        assert statsByCategory.get(\"book\").getCount() == 3;\n        assert statsByCategory.get(\"book\").getSum() == 250;\n\n        // 6. stream.toList() 返回不可变 List\n        List<String> vipUsers = orders.stream()\n            .filter(o -> o.amount() >= 100)\n            .map(Order::user)\n            .distinct()\n            .sorted()\n            .toList();\n        boolean immutable = false;\n        try {\n            vipUsers.add(\"Zed\");\n        } catch (UnsupportedOperationException e) {\n            immutable = true;\n        }\n        assert immutable : \"toList() 返回不可变 List\";\n        assert vipUsers.equals(List.of(\"Ada\", \"Bob\"));\n\n        // 7. 需要可变 List 时用 toCollection\n        List<String> mutableVips = orders.stream()\n            .filter(o -> o.amount() >= 100)\n            .map(Order::user)\n            .distinct()\n            .collect(Collectors.toCollection(ArrayList::new));\n        mutableVips.add(\"Zed\"); // 不抛异常\n        assert mutableVips.size() == 3;\n\n        // 8. 资源型 Stream 必须用 try-with-resources 关闭\n        Path temp = Files.createTempFile(\"stream-api\", \".txt\");\n        Files.write(temp, List.of(\"a\", \"bb\", \"ccc\"));\n        int lengthSum;\n        try (Stream<String> lines = Files.lines(temp)) {\n            lengthSum = lines.mapToInt(String::length).sum();\n        }\n        Files.deleteIfExists(temp);\n        assert lengthSum == 6 : \"a=1 + bb=2 + ccc=3\";\n\n        // 9. parallelStream 基本验证\n        int parallelSum = orders.parallelStream().mapToInt(Order::amount).sum();\n        assert parallelSum == 480;\n\n        System.out.println(\"All assertions passed.\");\n    }\n}",
       "language": "java",
       "highlights": [
         {
-          "line": 25,
-          "note": "这条管道只描述计算：filter、map、distinct、sorted 仍是中间操作，直到 toList 才触发遍历。"
-        },
-        {
           "line": 30,
-          "note": "Stream.toList 返回不可变 List；这和很多人对 Collectors.toList 的经验不同。"
+          "note": "peek 计数器为 0，证明中间操作是惰性的，直到 count 才触发。"
         },
         {
-          "line": 38,
-          "note": "toMap 明确给出 merge 函数 Integer::sum，避免重复 key 直接抛异常。"
+          "line": 42,
+          "note": "二次调用 count 抛 IllegalStateException，Stream 不能复用。"
         },
         {
-          "line": 48,
-          "note": "peek 在这里仅用于证明惰性；业务代码不要依赖 peek 做写库、发消息等副作用。"
+          "line": 50,
+          "note": "findFirst 只遍历了第一个元素就短路返回，visited=1。"
         },
         {
-          "line": 54,
-          "note": "终端操作后 Stream 已被消费，再次 count 会抛 IllegalStateException。"
+          "line": 55,
+          "note": "toMap 给了 merge 函数 Integer::sum 处理 Ada 的两条记录，用 LinkedHashMap 保序。"
         },
         {
-          "line": 76,
+          "line": 67,
+          "note": "groupingBy + summarizingInt 组合，分组后对每组做统计聚合。"
+        },
+        {
+          "line": 78,
+          "note": "toList() 返回不可变 List，add 抛 UnsupportedOperationException。"
+        },
+        {
+          "line": 87,
+          "note": "需要可变 List 时用 toCollection(ArrayList::new)。"
+        },
+        {
+          "line": 94,
           "note": "Files.lines 持有文件资源，必须用 try-with-resources 关闭。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
-      "title": "面试回答抓手",
-      "content": "回答 Stream 先区分集合和管道：集合存数据，Stream 描述一次计算；中间操作惰性，终端操作触发遍历并消费流。接着讲执行细节：无状态操作可逐元素融合，有状态操作如 `sorted/distinct` 可能缓存，短路操作如 `findFirst/anyMatch/limit` 可提前结束。\n\n再补工程边界：`toMap` 要处理重复 key，`groupingBy` 要说清结果集合、顺序和可变性，`Files.lines` 要关闭。并行流不是默认优化项，要看 Spliterator 是否易拆分、函数是否无共享状态、归约是否满足结合律、公共 ForkJoinPool 是否会被阻塞或挤占，最后用压测或 profiling 证明收益。",
+      "title": "面试回答思路",
+      "content": "先区分本质：集合存储元素，Stream 描述一次计算管道——中间操作惰性组装管道，终端操作触发遍历并消费流，消费后不能复用。\n\n**中间操作三分类**\n- 无状态（filter/map/flatMap/peek）：每元素独立，可融合进同一次遍历\n- 有状态（sorted/distinct）：需要缓存或全局协调，可能打断流水线\n- 短路（limit/findFirst/anyMatch）：拿到结果后提前结束；有序并行流维护 encounter order 可能限制并行度\n\n**Collector 结果语义（高频坑点）**\n- `toMap` 默认重载遇重复 key 抛异常，必须给 merge 函数；按需指定 Map 工厂保序或支持并发\n- `groupingBy` 默认返回 HashMap 不保序，需要保序用 `LinkedHashMap::new`\n- `stream.toList()`（Java 16）返回不可变 List；需要可变结果用 `toCollection(ArrayList::new)`\n- `Collectors.toList()` 不承诺具体类型和可变性\n\n**资源型 Stream**\n- `Files.lines`、`BufferedReader.lines`、`Files.list`、`Files.walk` 持有底层资源\n- 必须 `try-with-resources` 关闭，否则句柄泄漏\n\n**parallelStream 边界**\n- 机制：`ForkJoinPool.commonPool()` + `Spliterator` 拆分 → 并行处理 → 合并结果\n- 适合：数据量大、拆分均匀、CPU 密集、无共享可变状态、合并便宜\n- 不适合：阻塞 IO、小数据、强顺序依赖、锁竞争、公共池被占满\n- `parallelStream().forEach` 顺序不确定，写共享 `ArrayList` 是典型错误\n- 并行归约要求 identity/accumulator/combiner 满足一致性与结合律\n- 最终用压测或 profiling 证明收益，不要假设并行更快\n\n**实用补充**\n- `mapMulti`（Java 16）：避免 `flatMap` 创建大量中间 Stream\n- `Collectors.teeing`（Java 12）：对同一流做两种收集再合并\n- `Collectors.filtering/flatMapping`（Java 9）：groupingBy 下游二次过滤/展平",
       "followUpQuestions": [
         {
-          "question": "为什么 `filter().map().findFirst()` 不会先生成两个中间集合？",
-          "answer": "中间操作是惰性的，终端操作触发后元素按管道逐个流动。`findFirst` 找到结果后可以短路，所以不会先完整过滤再完整映射。"
+          "question": "`filter().map().findFirst()` 为什么不会先生成两个中间集合？",
+          "answer": "中间操作是惰性的，终端操作触发后元素按管道逐个流动。第一个元素经过 filter、map 后，findFirst 发现已满足条件就短路返回，不会遍历剩余元素，更不会缓存中间结果。"
         },
         {
-          "question": "`Collectors.toMap` 在生产代码里最容易漏掉什么？",
-          "answer": "最容易漏掉重复 key 的 merge 函数。默认重载遇到重复 key 会抛异常；如果还关心顺序、排序或并发，需要再指定 Map 工厂或选择合适的并发收集方式。"
+          "question": "`Collectors.toList()` 和 `stream.toList()` 的关键区别？",
+          "answer": "`Collectors.toList()` 不承诺返回的具体 List 实现类型和可变性——不同 JDK 版本/实现可能返回 `ArrayList`、`Arrays.asList` 包装甚至不可变 List。`stream.toList()`（Java 16 起）明确返回不可变 List，语义清晰、实现高效。需要可变结果时应显式用 `Collectors.toCollection(ArrayList::new)`。"
         },
         {
-          "question": "为什么不建议在 `parallelStream().forEach` 里写共享 `ArrayList`？",
-          "answer": "多个任务会并发修改同一个非线程安全容器，可能出现数据丢失、结构破坏或异常。即使用同步容器，也可能把并行收益消耗在锁竞争上；更好的方式是用 collect/reduce 表达合并逻辑。"
+          "question": "parallelStream 用了公共 ForkJoinPool 会带来什么问题？",
+          "answer": "所有未指定池的并行流和没有指定 executor 的 `CompletableFuture` 共享同一个 commonPool。如果某个并行流的任务阻塞（IO、锁等待），会占用公共池线程，导致其他并行流和 CompletableFuture 被饥饿。解决办法是把阻塞任务提交到自建的线程池，或者用 `submit(ForkJoinPool)` 包装。"
+        },
+        {
+          "question": "并行流中为什么不能往共享 ArrayList 写数据？",
+          "answer": "`ArrayList` 不是线程安全的，并发写会导致内部数组扩容竞争、size 字段不一致、数据丢失甚至 `ArrayIndexOutOfBoundsException`。即使用 `Collections.synchronizedList`，也会把并行收益消耗在锁竞争上。正确做法是用 `collect`/`reduce`/`groupingByConcurrent` 让框架管理合并。"
+        },
+        {
+          "question": "有序流中的 `findFirst` 和 `limit` 在并行流中有什么额外代价？",
+          "answer": "有序流需要维护 encounter order（元素出现顺序）。并行流中 `findFirst` 必须保证返回的是源中第一个满足条件的元素，可能需要额外排序或阻塞等待前面的分片完成。`limit(n)` 在有序并行流中也需要按序选取前 n 个，可能限制并行度。如果顺序不重要，可以用 `Stream.unordered()` 或 `findAny` 来降低协调成本。"
         }
       ]
     },
     {
       "type": "checklist",
-      "title": "自查清单",
+      "title": "学完后应能说清楚",
       "items": [
-        "能说明 Stream 是一次性计算管道，不是数据结构",
-        "能区分无状态中间操作、有状态中间操作、短路操作和终端操作",
-        "能解释惰性求值、操作融合、短路和流不可复用",
-        "能处理 groupingBy、partitioningBy、toMap、reduce 和 summarizing 等常见收集/归约",
-        "能说明 stream.toList、Collectors.toList 和资源型 Stream 的差异",
-        "能判断 parallelStream 是否适合当前场景，并说明公共 ForkJoinPool、共享状态和结合律风险"
+        "能区分 Stream 与集合的本质区别：一次性计算管道 vs 数据容器",
+        "能解释中间操作惰性、终端操作触发、短路执行和流不可复用的机制",
+        "能分类无状态操作（filter/map）、有状态操作（sorted/distinct）和短路操作（limit/findFirst/anyMatch）的执行差异",
+        "能说明 toMap 的 merge 函数、groupingBy 的结果顺序和可变性、toList vs toCollection 的区别",
+        "能用 try-with-resources 关闭 Files.lines 等资源型 Stream",
+        "能判断 parallelStream 是否适合当前场景：数据量、拆分质量、CPU 密集 vs IO、共享状态、公共池影响",
+        "能解释有序流在并行流中维护 encounter order 对 limit/findFirst 的额外成本",
+        "能写出正确的 toMap（含 merge 和 factory）、groupingBy + downstream、toList/toCollection 代码"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "java.java-fundamentals.topic-stream-api.recall.1",
-      "prompt": "Stream 的中间操作为什么惰性？终端操作、短路和一次性消费分别如何影响执行过程？",
+      "prompt": "请完整解释 Stream 的中间操作为什么惰性？终端操作、短路和一次性消费分别如何影响执行过程？举例说明 `filter().map().findFirst()` 的实际遍历量。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "java.java-fundamentals.topic-stream-api.recall.2",
-      "prompt": "Collectors.toMap、groupingBy、Stream.toList 和 Files.lines 各自有哪些容易踩错的结果语义或资源边界？",
+      "prompt": "Collectors.toMap、groupingBy、Stream.toList 和 Files.lines 各自有哪些容易踩错的结果语义或资源边界？如果面试官要求你写一段把订单按用户分组并统计总额的代码，你怎么写？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "java.java-fundamentals.topic-stream-api.recall.3",
-      "prompt": "parallelStream 适合什么样的数据和计算？为什么共享可变状态、阻塞 IO 或强顺序要求会让它变差？",
+      "prompt": "parallelStream 适合什么样的数据和计算？为什么不建议在 `parallelStream().forEach` 里往共享 ArrayList 写数据？公共 ForkJoinPool 被阻塞任务占满会怎样？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "java.java-fundamentals.topic-stream-api.recall.4",
-      "prompt": "请用 Stream 写一段代码：filter 过滤、map 转换、collect toMap 合并重复 key、groupingBy 分组统计，并说明结果的可变性和顺序边界。",
+      "prompt": "请用 Stream 写一段代码，演示：惰性验证（peek 计数器）、toMap 处理重复 key 用 merge + LinkedHashMap 保序、groupingBy + summarizingInt 分组统计、toList 不可变 vs toCollection 可变、Files.lines 资源关闭。",
+      "mode": "code",
+      "expectedMinutes": 10,
+      "difficulty": 3
+    },
+    {
+      "id": "java.java-fundamentals.topic-stream-api.recall.5",
+      "prompt": "有序流在并行流中使用 `findFirst` 和 `limit` 会有什么额外代价？`Stream.unordered()` 能帮什么忙？",
       "mode": "text",
-      "expectedMinutes": 4,
+      "expectedMinutes": 3,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能准确区分 Stream 与集合、一次性管道与数据容器",
-      "能解释中间操作惰性、终端操作触发、短路执行和流不可复用",
-      "能写出 map/filter/flatMap/collect/reduce/groupingBy/toMap 等常用代码",
-      "能处理 toMap key 冲突、Stream.toList 不可变结果和资源型 Stream 关闭",
-      "能说明 parallelStream 的适用条件、公共池影响、共享状态和结合律风险"
+      "能准确区分 Stream 与集合的本质差异：一次性惰性计算管道 vs 数据容器",
+      "能解释中间操作惰性、终端操作触发、短路执行、流不可复用的完整机制",
+      "能写出 map/filter/flatMap/collect/reduce/groupingBy/toMap 等常用代码，能正确处理 toMap key 冲突",
+      "能说明 stream.toList 不可变、Collectors.toList 不承诺类型、资源型 Stream 须关闭",
+      "能解释 parallelStream 的适用条件：数据量、拆分均匀、CPU 密集、无共享状态、公共池影响"
     ],
     "goodToHave": [
-      "能解释 Spliterator、无状态/有状态操作、顺序流/并行流的执行差异",
-      "能说明 ordered/unordered 对 limit、findFirst 和并行流成本的影响",
-      "能通过压测或 profiling 判断并行流是否真正收益",
+      "能分类无状态/有状态/短路中间操作并说明它们对性能和内存的不同影响",
+      "能解释有序流在并行流中维护 encounter order 对 limit/findFirst 的额外成本",
+      "能说明 Java 16+ stream.toList、mapMulti 和 Collectors.teeing 等新增特性",
       "能把复杂 Stream 链拆成命名方法，兼顾表达力和可维护性"
     ],
     "commonMistakes": [
-      "把 Stream 当集合复用",
-      "在并行流中修改共享集合或调用阻塞 IO",
-      "认为 parallelStream 总会更快",
-      "不知道中间操作直到终端操作才执行",
-      "忘记关闭 Files.lines 返回的资源型 Stream"
+      "把 Stream 当集合复用，终端操作后再次使用抛 IllegalStateException",
+      "在 parallelStream().forEach 中往共享 ArrayList 写数据导致并发破坏",
+      "认为 parallelStream 总会更快，不考虑拆分质量、阻塞和公共池竞争",
+      "忘记给 toMap 传 merge 函数，遇重复 key 直接抛异常",
+      "忘记用 try-with-resources 关闭 Files.lines 等资源型 Stream，导致文件句柄泄漏"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -176,11 +211,11 @@
       "depth": 20
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "java.java-fundamentals.topic-028-905d9b58"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "重点考察候选人能否把 Stream 说成一次性惰性管道，并能落到 Collector 结果语义、资源关闭、并行流拆分合并和共享状态风险这些工程边界。"
+  "interviewerFocus": "考察候选人能否把 Stream 说成一次性惰性管道（不是集合复用），并能落到中间操作分类、Collector 结果语义（toMap key 冲突、toList 不可变、资源流关闭）、并行流的拆分合并条件与公共池边界这些工程细节。"
 }

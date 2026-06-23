@@ -39,7 +39,7 @@ export function buildMessages(topic) {
   ].join("\n");
 
   const user = [
-    "在现有内容基础上逐卡改写优化这篇 topic：每张卡都改好/补强，**不要删卡**（现有卡都承载真实内容），需要时可新增卡。别整篇从 0 重造一份。",
+    `在现有内容基础上逐卡改写优化这篇 topic：每张卡都改好/补强，**不要删卡**（现有卡都承载真实内容），需要时可新增卡。别整篇从 0 重造一份。原文有 ${topic.learningCards?.length || 0} 张卡（${[...new Set((topic.learningCards||[]).map(c=>c.type))].map(t=>t+' '+(topic.learningCards.filter(c=>c.type===t).length)+'张').join('、')}），输出的 learningCards 必须包含同等数量或更多——合并两张卡算删卡，程序会判失败。`,
     "只读上下文（仅用于判断范围和深度，不改写）：",
     "```json\n" + JSON.stringify(context, null, 0) + "\n```",
     "待改写的内容字段（现有全部卡）：",

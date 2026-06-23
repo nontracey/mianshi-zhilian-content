@@ -4,7 +4,7 @@
   "category": "engineering-python",
   "group": "engineering-python",
   "title": "性能分析与优化",
-  "summary": "性能分析工具、常见性能陷阱、优化策略、C 扩展、JIT 编译、内存管理",
+  "summary": "Python 性能优化的核心路径：用 cProfile/py-spy 定位热点而非凭直觉猜，先算法和数据结构再语言技巧再 C 扩展，理解 GIL 对 CPU 密集的限制、CPython 字节码执行开销和对象模型成本，结合内存 profiling 排查隐性分配。",
   "tags": [
     "Python",
     "性能",
@@ -14,24 +14,34 @@
     "内存"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 33,
   "order": 180,
   "recommendWeight": 70,
   "learningCards": [
     {
       "type": "explain",
-      "title": "性能分析与优化：性能分析工具、cProfile（内置）",
-      "content": "## 一、性能分析工具\n\n### cProfile（内置）\n```python\nimport cProfile\ncProfile.run(\"func()\", sort=\"cumtime\")\n# 或命令行\npython -m cProfile -s cumtime script.py\n```\n\n输出按累计时间排序，帮助找到最耗时的函数。\n\n### timeit（微基准）\n```python\nimport timeit\ntimeit.timeit(\"func()\", setup=\"from __main__ import func\", number=1000)\n```\n\n## 二、常见性能陷阱\n\n| 陷阱 | 错误写法 | 正确写法 |\n| --- | --- | --- |\n| 字符串拼接 | `s += str(i)` | `\"\".join(parts)` |\n| 属性查找 | `for i in range(len(lst)): lst[i]` | `for item in lst` |\n| 重复计算 | `len(lst)` 在循环中重复 | 一次计算后缓存 |\n| 不必要的属性访问 | `import math` 后在循环中用 math.sqrt | `from math import sqrt` 局部绑定 |\n| 滥用列表推导| 嵌套循环列表推导可读性差 | 用普通循环或生成器 |"
+      "title": "测量先行：cProfile、timeit 和 py-spy 各自的精度边界",
+      "content": "Python 性能优化的第一原则是「先定位瓶颈再动手」。cProfile 是 CPython 内置的确定性 profiler，按函数粒度记录每次调用的累计时间（cumtime）和自身时间（tottime），适合开发阶段快速找热点。它的开销在 2-4 倍，不适合生产长时间运行。\n\n`timeit` 用于微基准：它禁用垃圾回收、多次执行取最小值，消除一次性开销干扰，适合比较两个写法谁快。但要注意它的 `setup` 参数保证了每次迭代的独立性，测 I/O 或有副作用的代码时要小心。\n\n生产环境用 py-spy 采样式 profiler：它通过 `/proc` 读取目标进程内存，不注入代码、不暂停进程，每秒采样 100 次左右，开销极低。生成的火焰图中，横轴是采样占比，宽矩形代表热点。py-spy 还能 attach 到已运行进程（`py-spy top --pid PID`），排查线上卡顿无需重启。\n\n实测流程建议：先 cProfile 找 cumtime 最大的函数 → timeit 验证假设 → py-spy 看调用栈全景。不要跳过测量直接优化，因为你猜的瓶颈往往不是真的瓶颈。"
     },
     {
       "type": "explain",
-      "title": "性能分析与优化：优化策略、使用内置函数和库",
-      "content": "## 三、优化策略\n\n### 1. 使用内置函数和库\n\nPython 内置函数（`map`、`filter`、`sum`、`sorted`）用 C 实现，比手写 Python 循环快。\n\n```python\n# 慢\nresult = []\nfor x in data:\n    if x > 0:\n        result.append(x * 2)\n\n# 快（列表推导式在 C 层执行）\nresult = [x * 2 for x in data if x > 0]\n```\n\n### 2. 局部变量绑定\n```python\ndef fast_func(items):\n    # 局部变量绑定避免全局查找\n    append = items.append\n    for x in range(1000):\n        append(x)\n```\n\n### 3. 数据结构选择\n- 频繁查找用 `set`/`dict`（O(1)）而不是 `list`（O(n)）\n- 频繁插入删除用 `collections.deque` 而不是 list\n- 计数用 `collections.Counter` 而不是手动 dict"
+      "title": "CPython 为什么慢：字节码、GIL 和对象模型的成本",
+      "content": "CPython 慢不是因为「Python 是脚本语言」，而是三个具体机制的叠加：\n\n**字节码解释开销**：Python 源码编译成 `.pyc` 字节码后，由 CPython 虚拟机逐条执行。每条字节码（如 `BINARY_ADD`）都有类型检查、引用计数、对象拆箱装箱的开销。一个简单的 `a + b` 在 C 层要走 3-4 个分支，而 C 语言的 `a + b` 就是一条指令。这解释了为什么 Python 循环体即使很简单也比 C 慢 50-100 倍。\n\n**GIL（Global Interpreter Lock）**：CPython 用一把全局锁保护引用计数和对象分配。多线程只能有一个线程执行 Python 字节码，其他线程等锁。CPU 密集的多线程几乎无加速（甚至更慢，因为锁竞争）。I/O 密集的多线程不受影响，因为等待 I/O 时释放 GIL。这是为什么 CPU 密集必须用多进程（`multiprocessing`）或 C 扩展释放 GIL。\n\n**对象模型成本**：Python 一切皆对象，一个 `int` 在 CPython 3.12+ 占 28 字节（`PyObject_HEAD` 16 字节 + 值 + 对齐），而 C 的 `int64_t` 就是 8 字节。列表存的是指针，不是连续内存，遍历时缓存不友好。理解这一点才能明白为什么 NumPy 快——它绕过 Python 对象，用连续内存存 C 类型数据。"
     },
     {
       "type": "explain",
-      "title": "性能分析与优化：使用 `__slots__`、延迟求值与缓存",
-      "content": "### 4. 使用 `__slots__`\n\n大量实例的类用 `__slots__` 减少内存和属性访问时间。\n\n### 5. 延迟求值与缓存\n- 生成器替代列表（大数据量时节省内存）\n- `@functools.lru_cache` 缓存重复计算结果\n- `@functools.cache`（Python 3.9+）\n\n## 四、C 扩展与 JIT\n\n| 方案 | 说明 | 适合场景 |\n| --- | --- | --- |\n| Cython | Python 代码转 C 扩展 | 数值计算、性能热点 |\n| NumPy | 向量化计算 | 数组/矩阵运算 |\n| Numba | JIT 编译装饰器 | 数值算法 |\n| C 扩展 | 用 C 写模块 | 极致性能 |\n| mypyc | mypy 的 Python→C 编译器 | 类型标注代码 |\n| PyPy | JIT 实现的 Python 解释器 | 纯 Python 长时间运行 |"
+      "title": "常见性能陷阱：从属性访问到字符串拼接的具体机制",
+      "content": "**属性查找链**：`obj.method()` 要走 `type(obj).__mro__` 逐层查 `__getattribute__`，涉及多层字典查找。循环中反复 `math.sqrt` 会重复查 `math.__dict__`，用 `sqrt = math.sqrt` 局部绑定后变成 `LOAD_FAST`（一次字节码），快 30-50%。\n\n**字符串拼接**：`s += str(i)` 在循环中每次创建新字符串对象（Python 字符串不可变），时间复杂度 O(n²)。`\"\".join(parts)` 先算总长度再一次性分配，O(n)。区别在万级拼接时明显。\n\n**全局变量查找**：`LOAD_GLOBAL` 字节码要查 `globals()` 和 `builtins` 两个字典；`LOAD_FAST` 只读局部数组的固定偏移。循环体中把全局函数赋给局部变量，消除重复查找。\n\n**列表推导 vs 手写循环**：列表推导式在 C 层执行 `LIST_APPEND` 字节码，避免了 Python 层的 `for` + `append` 的多次函数调用。对简单过滤/映射，列表推导快 1.5-3 倍。\n\n**`len()` 在循环中**：`for i in range(len(lst))` 中 `len()` 调用本身很快（O(1)），但真正的陷阱是后面 `lst[i]` 的索引开销和丢失 Pythonic 迭代的优化机会。直接 `for item in lst` 更快更清晰。"
+    },
+    {
+      "type": "explain",
+      "title": "优化策略分层：算法→语言技巧→缓存→C 扩展",
+      "content": "**第一层：算法和数据结构**\n算法优化的收益是指数级的，语言技巧只是常数级。先想清楚复杂度是否合理。用 `set` 做成员检查是 O(1)，用 `list` 是 O(n)；`collections.deque` 的 `popleft` 是 O(1)，`list.pop(0)` 是 O(n)——底层是整体搬移数组。`dict` 在 Python 3.7+ 保证插入顺序，可以替代 `OrderedDict`。\n\n**第二层：语言技巧**\n局部变量绑定（`append = lst.append`）消除属性查找；生成器表达式（`(x*2 for x in data)`）延迟求值，避免中间列表的内存分配；`map`/`filter` 在 CPython 中由 C 实现的迭代器执行，比等价列表推导略快（但可读性差，差异通常不值得）。\n\n**第三层：缓存和惰性求值**\n`@functools.lru_cache(maxsize=...)` 对纯函数结果做哈希缓存，避免重复计算。适合递归、动态规划和重复参数调用。注意：参数必须可哈希（list 不行，用 tuple）；`maxsize` 过大占内存、过小命中率低；缓存有锁开销，多线程高并发时可能成为瓶颈。Python 3.9+ 的 `@functools.cache` 是无上限版本，慎用。\n\n**第四层：C 扩展和 JIT**\n当算法和语言层面都优化后仍有热点，才考虑 C 层：NumPy 向量化（数组运算全在 C 层）、Numba 的 `@njit` 装饰器（把数值函数编译成机器码，首次调用有编译延迟）、Cython（给 Python 加类型声明生成 C 代码）、纯 C 扩展（CPython API，最灵活但开发成本最高）。"
+    },
+    {
+      "type": "explain",
+      "title": "__slots__、内存 profiling 和隐性分配",
+      "content": "`__slots__` 通过在类定义中声明固定属性名，阻止创建实例的 `__dict__`。好处：每个实例节省一个空 dict（约 64-120 字节），属性访问从字典查找变成固定偏移（略快）。代价：不能动态添加属性、不能使用多继承中多个带 `__slots__` 的基类、子类需要也声明 `__slots__` 否则会创建 `__dict__`。适用场景：数百万小实例（如 ORM 行、粒子系统、坐标点）。\n\n内存 profiling 工具：`tracemalloc`（CPython 3.4+）能追踪每次分配的调用栈，`tracemalloc.take_snapshot().statistics('lineno')` 按行号汇总内存占用，定位谁在分配大对象。`objgraph` 可以可视化对象引用关系，排查循环引用导致的内存泄漏。\n\n隐性分配陷阱：字符串格式化 `f\"{x}\"` 每次创建新字符串对象；`dict.get()` 创建临时 tuple；循环内反复创建 lambda 或闭包。在热点路径中，这些小分配累积起来可观。用 `__slots__`、预分配列表、`bytearray` 替代频繁拼接的 bytes 可以减少 GC 压力。"
     },
     {
       "type": "diagram",
@@ -53,33 +63,57 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 方案 | 加速比 | 开发成本 | 维护成本 | 适用场景 |\n| --- | --- | --- | --- | --- |\n| 算法优化 | 10x-100x | 中 | 低 | 所有场景首选 |\n| 内置函数/列表推导 | 2x-5x | 低 | 低 | 日常优化 |\n| __slots__ | 1.2x + 省内存 | 低 | 低 | 大量实例 |\n| NumPy 向量化 | 10x-100x | 中 | 中 | 数值计算 |\n| Cython | 10x-100x | 高 | 高 | 性能热点 |\n| Numba JIT | 10x-100x | 中 | 中 | 数值算法 |\n| PyPy | 2x-10x | 低（兼容 CPython） | 低 | 长时间运行脚本 |\n| C 扩展 | 100x+ | 极高 | 极高 | 极致性能需求 |"
+      "title": "各优化方案的投入产出与适用边界",
+      "content": "| 方案 | 典型加速 | 开发成本 | 维护成本 | 适用场景 | 关键限制 |\n| --- | --- | --- | --- | --- | --- |\n| 算法优化 | 10x-1000x | 中 | 低 | 所有场景（首选） | 需要理解复杂度和数据规模 |\n| 列表推导/内置函数 | 1.5x-3x | 低 | 低 | 简单映射/过滤 | 嵌套推导可读性差 |\n| 局部变量绑定 | 1.3x-1.5x | 低 | 低 | 属性/全局查找密集循环 | 收益随热点函数占比缩小 |\n| `__slots__` | 1.1x-1.2x + 省内存 40% | 低 | 中 | 数百万小实例 | 禁止动态属性、多重继承受限 |\n| `lru_cache` | 视命中率，可 10x+ | 低 | 中 | 递归/重复参数计算 | 参数必须可哈希，缓存有锁和内存开销 |\n| NumPy 向量化 | 10x-100x | 中 | 中 | 数组/矩阵数值运算 | 数据需转成 ndarray，调试难度增加 |\n| Numba @njit | 10x-100x | 中 | 中 | 数值热点循环 | 首次调用编译延迟，不支持所有 Python 特性 |\n| Cython | 10x-100x | 高 | 高 | 性能热点 + 需要调 C 库 | 需类型声明，编译工具链复杂 |\n| C 扩展 (CPython API) | 100x+ | 极高 | 极高 | 极致性能需求 | 需手动管理引用计数，易内存泄漏 |\n| PyPy | 2x-10x | 低 | 低 | 长时间运行纯 Python | C 扩展兼容性差，启动慢 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "# 1. cProfile 使用\nimport cProfile\nimport pstats\n\ndef slow_function():\n    total = 0\n    for i in range(1000000):\n        total += i ** 2\n    return total\n\nprofiler = cProfile.Profile()\nprofiler.enable()\nslow_function()\nprofiler.disable()\n\nstats = pstats.Stats(profiler).sort_stats(\"cumtime\")\nstats.print_stats(10)  # 输出前 10 个\n\n# 2. 使用局部变量加速\nimport math\n\n# 慢：每次查找 math.sqrt\ndef slow(data):\n    return [math.sqrt(x) for x in data]\n\n# 快：本地绑定\ndef fast(data):\n    sqrt = math.sqrt\n    return [sqrt(x) for x in data]\n\n# 3. lru_cache 缓存\n@functools.lru_cache(maxsize=128)\ndef expensive_computation(n):\n    # 假设这是计算密集操作\n    return sum(i * i for i in range(n))\n\n# 4. __slots__ 减少内存\nclass Point:\n    __slots__ = (\"x\", \"y\")  # 避免 __dict__\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n\n# 5. deque 替代 list 做队列\nfrom collections import deque\nqueue = deque()\nqueue.append(1)   # O(1)\nqueue.popleft()   # O(1) — list.pop(0) 是 O(n)",
+      "title": "实战代码：cProfile 定位 → 逐级优化对比",
       "language": "python",
+      "content": "import cProfile\nimport pstats\nimport timeit\nimport functools\nfrom collections import deque\n\n# ========== 1. cProfile 定位热点 ==========\ndef naive_sum(n):\n    \"\"\"故意写慢：属性查找 + 字符串拼接 + 冗余计算\"\"\"\n    import math\n    result = \"\"\n    total = 0\n    for i in range(n):\n        total += math.sqrt(i)  # 每次查找 math.sqrt\n        if i % 1000 == 0:\n            result += str(i) + \",\"  # O(n²) 字符串拼接\n    return total, len(result)\n\nprint(\"=== cProfile 输出 ===\")\ncProfile.run(\"naive_sum(50000)\", sort=\"tottime\")\n\n# ========== 2. 局部绑定优化 ==========\ndef optimized_sum(n):\n    sqrt = math.sqrt  # 局部绑定\n    parts = []        # 列表收集\n    append = parts.append\n    total = 0.0\n    for i in range(n):\n        total += sqrt(i)\n        if i % 1000 == 0:\n            append(str(i))\n    return total, len(\",\".join(parts))\n\nimport math\nprint(\"\\n=== timeit 对比 ===\")\nt_slow = timeit.timeit(lambda: naive_sum(10000), number=3) / 3\nt_fast = timeit.timeit(lambda: optimized_sum(10000), number=3) / 3\nprint(f\"naive: {t_slow:.4f}s, optimized: {t_fast:.4f}s, speedup: {t_slow/t_fast:.1f}x\")\n\n# ========== 3. lru_cache 缓存递归 ==========\n@functools.lru_cache(maxsize=256)\ndef fib_cached(n):\n    if n < 2:\n        return n\n    return fib_cached(n - 1) + fib_cached(n - 2)\n\ndef fib_naive(n):\n    if n < 2:\n        return n\n    return fib_naive(n - 1) + fib_naive(n - 2)\n\nprint(\"\\n=== fib(30) ===\")\nt_naive = timeit.timeit(lambda: fib_naive(30), number=1)\nt_cached = timeit.timeit(lambda: fib_cached(30), number=1)\nprint(f\"naive: {t_naive:.3f}s, cached: {t_cached:.6f}s\")\nfib_cached.cache_clear()  # 清缓存\n\n# ========== 4. deque vs list 做队列 ==========\ndef bench_list_queue(n):\n    q = []\n    for i in range(n):\n        q.append(i)\n    for _ in range(n):\n        q.pop(0)  # O(n) 每次\n\ndef bench_deque_queue(n):\n    q = deque()\n    for i in range(n):\n        q.append(i)\n    for _ in range(n):\n        q.popleft()  # O(1) 每次\n\nn = 100000\nprint(f\"\\n=== deque vs list queue ({n}) ===\")\nt_list = timeit.timeit(lambda: bench_list_queue(n), number=3) / 3\nt_deque = timeit.timeit(lambda: bench_deque_queue(n), number=3) / 3\nprint(f\"list: {t_list:.3f}s, deque: {t_deque:.3f}s, speedup: {t_list/t_deque:.0f}x\")\n\n# ========== 5. __slots__ 内存对比 ==========\nclass PointDict:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n\nclass PointSlots:\n    __slots__ = (\"x\", \"y\")\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n\nimport sys\nn_points = 100000\ndict_pts = [PointDict(i, i) for i in range(n_points)]\nslots_pts = [PointSlots(i, i) for i in range(n_points)]\n\n# 单实例大小估算\ndict_size = sys.getsizeof(dict_pts[0]) + sys.getsizeof(dict_pts[0].__dict__)\nslots_size = sys.getsizeof(slots_pts[0])\nprint(f\"\\n=== __slots__ 内存 ===\")\nprint(f\"PointDict 单实例: {dict_size} bytes, PointSlots: {slots_size} bytes\")\nprint(f\"省 {dict_size - slots_size} bytes/实例, {n_points} 个实例省 {(dict_size - slots_size) * n_points / 1024 / 1024:.1f} MB\")",
       "highlights": [
         {
-          "line": 7,
-          "note": "「for i in range(1000000):」 是这段示例的主遍历；它决定处理顺序和成本上界，说明「性能分析与优化」时要补上每轮维护的状态。"
+          "line": 8,
+          "note": "math.sqrt 在循环内反复通过模块属性查找，是典型的属性查找开销。"
+        },
+        {
+          "line": 10,
+          "note": "字符串拼接 O(n²)，应改用列表收集 + join。"
+        },
+        {
+          "line": 20,
+          "note": "局部绑定 sqrt = math.sqrt 将 LOAD_GLOBAL 变为 LOAD_FAST。"
+        },
+        {
+          "line": 38,
+          "note": "lru_cache 将指数复杂度的递归降为线性，但参数必须可哈希。"
+        },
+        {
+          "line": 55,
+          "note": "list.pop(0) 是 O(n)，deque.popleft 是 O(1)，数据量大时差异巨大。"
+        },
+        {
+          "line": 76,
+          "note": "__slots__ 省掉每个实例的 __dict__，对大量小实例节省可观内存。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**高频问题 1：Python 程序性能分析的一般步骤是什么？**\n\n遵循「先测量再优化」原则。先用 cProfile 找出热点函数（cumtime 最大的），用 timeit 精确验证假设。常见的优化顺序为：算法级优化（数据结构选择）→ 语言级优化（局部变量绑定、列表推导式）→ 缓存和惰性求值 → C 扩展/JIT。不要优化还没确定是瓶颈的部分。\n\n**高频问题 2：Python 中哪些操作比较慢？怎么优化？**\n\n慢操作包括：属性访问（`.`）、全局变量查找、函数调用开销、字符串拼接、在循环中使用 `len()` 等。优化策略：\n- 局部绑定减少属性/全局查表\n- 列表推导式替代手写循环\n- 用 `join` 替代字符串拼接\n- 用 set/dict 替代 list 做查找\n- 对于大规模数值操作，使用 NumPy 向量化。\n\n**高频问题 3：__slots__ 是怎么工作的？对性能有多大提升？**\n\n`__slots__` 阻止创建 `__dict__`，实例的属性存储在固定长度的数组中。这减少了内存占用（每个实例节省一个 dict 的开销）并略微提升了属性访问速度。对于只有少量实例的场景提升不大，但对于数百万个实例的类（如 ORM 模型、游戏实体），内存节省非常显著。",
+      "content": "**结论**：Python 性能优化遵循「先测量后优化、先算法后工具」的原则，核心挑战是 CPython 的字节码解释开销、GIL 限制和对象模型内存成本。\n\n**测量工具选型**\n- cProfile：开发阶段函数级热点定位，看 `tottime`（自身耗时）找 CPU 密集函数\n- timeit：微基准比较两个写法，多次执行取最小值消除噪声\n- py-spy：生产环境采样式 profiler，零侵入，生成火焰图看调用栈占比\n- tracemalloc：定位内存分配热点，按调用栈汇总\n\n**优化策略分层（按投入产出排序）**\n1. **算法和数据结构**：`set`/`dict` 替代 `list` 做查找，`deque` 替代 `list` 做队列，复杂度优化收益最大\n2. **语言技巧**：局部变量绑定消除属性查找（`sqrt = math.sqrt`）、列表推导替代手写循环、`join` 替代字符串拼接\n3. **缓存**：`lru_cache` 对递归/重复参数调用效果显著，注意参数可哈希和缓存大小\n4. **C 扩展/JIT**：NumPy 向量化 > Numba @njit > Cython > 纯 C 扩展，按需升级\n\n**GIL 的工程影响**\n- CPU 密集多线程无加速 → 用 `multiprocessing` 或 C 扩展释放 GIL\n- I/O 密集多线程正常工作（等待 I/O 时释放 GIL）\n- Python 3.13 实验性 free-threaded 模式移除 GIL，单线程性能下降 10-30%，多线程接近线性加速，暂不推荐生产\n\n**`__slots__` 的取舍**\n- 省内存（省掉 `__dict__`，每实例省 64-120 字节），属性访问略快\n- 代价：不能动态加属性、多重继承受限、子类需声明 `__slots__`\n- 适用：数百万小实例（ORM、粒子、坐标），少量实例收益可忽略\n\n**线上排查路径**\n- latency 飙高 → py-spy 采样看火焰图，找到热点函数\n- 内存泄漏 → tracemalloc snapshot 对比，找增量最大的分配点\n- CPU 打满 → cProfile 或 py-spy 看 tottime 最大的函数\n- 多线程无效 → 确认 GIL 限制，考虑多进程或 C 扩展",
       "followUpQuestions": [
         {
-          "question": "用 cProfile 分析出瓶颈后，怎么看火焰图？",
-          "answer": "把 cProfile 的统计结果导出为 .prof 文件，用 snakeviz 或 py-spy 生成火焰图。火焰图中每个矩形代表一个函数调用，宽度表示占用 CPU 时间。顶部平顶矩形代表热点函数——这是需要优化的目标。也可以使用 py-spy 直接对生产进程采样，无需修改代码。"
+          "question": "cProfile 和 py-spy 的原理区别是什么？各适合什么场景？",
+          "answer": "cProfile 是确定性 profiler，在 CPython C 层 hook 每次函数调用和返回，记录精确时间，开销 2-4 倍，适合开发环境找精确热点。py-spy 是采样式 profiler，通过 `/proc` 读目标进程栈内存，每秒采样约 100 次，开销极低（<5%），适合生产环境和不能重启的服务。cProfile 的输出是精确的函数调用统计，py-spy 输出是概率性的火焰图，但能捕获 GIL 等待、I/O 阻塞等 cProfile 看不到的状态。"
         },
         {
-          "question": "Python 的 GIL 移除（free-threaded）对性能有多大影响？",
-          "answer": "Python 3.13 的实验性 free-threaded 模式移除了 GIL，但引入了每个对象的细粒度锁。单线程性能会下降约 10-30%（加锁开销），多线程 CPU 密集任务能接近线性加速比。目前仍不推荐生产环境使用，但这是 Python 性能的未来方向，预计在 3.14-3.15 逐步成熟。"
+          "question": "为什么说 NumPy 比纯 Python 快的主因不是「C 语言写的」？",
+          "answer": "NumPy 快的核心原因是数据布局：它用连续内存存放同类型 C 数据（如 float64），避免了 Python 对象的指针间接访问和类型检查。一个 Python list 存 100 万个 int，实际是 100 万个 PyObject 指针散布在堆上，遍历时 CPU 缓存不友好；NumPy 的 100 万个 float64 是连续 8MB，可被 CPU 预取和 SIMD 加速。次要原因才是 NumPy 的计算函数用 C/Fortran 实现。"
+        },
+        {
+          "question": "lru_cache 在什么场景下反而会变慢？",
+          "answer": "当参数空间很大、命中率低时，lru_cache 的哈希计算、锁获取和缓存查找开销会超过重新计算的成本。例如缓存一个参数为随机浮点数的函数，几乎永远不会命中。另外多线程高并发时，lru_cache 内部的锁成为瓶颈。Python 3.12 优化了 lru_cache 的锁粒度，但高并发场景仍需评估。"
         }
       ]
     },
@@ -87,34 +121,49 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能使用 cProfile 定位性能瓶颈",
-        "能使用 timeit 做微基准测试",
-        "能识别并优化常见 Python 性能陷阱",
-        "能正确使用局部绑定和列表推导式",
-        "能理解 __slots__ 的内存和性能影响",
-        "能合理选择优化方案（算法→语言→C扩展）",
-        "能使用 lru_cache 缓存函数结果"
+        "能用 cProfile 的 tottime/cumtime 定位 CPU 热点，区分自身耗时和累计耗时",
+        "能用 timeit 做微基准对比，理解 setup 参数的作用",
+        "能用 py-spy 生产环境采样和生成火焰图",
+        "能解释 CPython 字节码解释、GIL、对象模型三个慢的原因",
+        "能识别属性查找、字符串拼接、全局变量查找等常见陷阱并优化",
+        "能按算法→语言技巧→缓存→C 扩展的顺序选择优化方案",
+        "能解释 __slots__ 的原理、收益和限制",
+        "能用 tracemalloc 定位内存分配热点"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "python.engineering-python.performance.recall.1",
-      "prompt": "Python 性能优化的原则是什么？列出至少 4 个常见的性能陷阱和对应的优化方案。",
+      "prompt": "Python 程序变慢了，你用什么工具定位瓶颈？具体步骤是什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
       "id": "python.engineering-python.performance.recall.2",
-      "prompt": "写一段代码比较 list.append 和 deque.append + popleft 在大量数据下的性能差异。",
+      "prompt": "解释 CPython 为什么比 C 慢 50-100 倍，从字节码、GIL 和对象模型三个角度分析。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "python.engineering-python.performance.recall.3",
+      "prompt": "写一段代码演示：局部变量绑定 vs 模块属性查找的性能差异，用 timeit 量化。",
       "mode": "code",
       "expectedMinutes": 5,
       "difficulty": 4
     },
     {
-      "id": "python.engineering-python.performance.recall.3",
-      "prompt": "性能分析与优化 和相邻概念或常见替代方案有什么关键区别？",
+      "id": "python.engineering-python.performance.recall.4",
+      "prompt": "线上服务 CPU 100%、内存持续增长，你怎么排查？用哪些工具、看什么指标？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "python.engineering-python.performance.recall.5",
+      "prompt": "什么时候该用 NumPy，什么时候该用 Numba，什么时候该用 Cython？决策依据是什么？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
@@ -122,20 +171,22 @@
   ],
   "rubric": {
     "mustHave": [
-      "能使用 cProfile 和 timeit 进行性能分析",
-      "能识别并优化常见性能陷阱",
-      "能说明 __slots__ 的作用",
-      "能理解算法优化的优先级"
+      "能用 cProfile 和 timeit 定位和验证性能瓶颈",
+      "能解释 CPython 慢的三个核心原因（字节码、GIL、对象模型）",
+      "能识别并优化属性查找、字符串拼接、全局变量等常见陷阱",
+      "能按算法→语言技巧→缓存→C 扩展的顺序选择优化方案"
     ],
     "goodToHave": [
-      "能使用 lru_cache 进行缓存",
-      "能理解局部变量绑定的原理",
-      "能对比不同优化方案的投入产出比"
+      "能解释 __slots__ 的原理、收益和适用限制",
+      "能用 py-spy 生产环境采样并读火焰图",
+      "能解释 lru_cache 的适用场景和陷阱",
+      "能说明 Python 3.13 free-threaded 模式的现状和影响"
     ],
     "commonMistakes": [
-      "没有测量就开始优化",
-      "在 I/O 密集场景过度优化 CPU 部分",
-      "滥用 __slots__ 导致代码僵化"
+      "没有测量就凭直觉优化，优化了不是瓶颈的部分",
+      "在 I/O 密集场景用多进程「解决」GIL，实际多线程就够",
+      "大量小实例不用 __slots__，白白浪费几十 MB 内存",
+      "lru_cache 用于参数不可哈希或参数空间极大的函数，命中率低反而更慢"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -146,8 +197,8 @@
   },
   "status": "production",
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「性能分析与优化」说清能使用 cProfile 和 timeit 进行性能分析、能识别并优化常见性能陷阱，并放到Python 工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-18",
+  "interviewerFocus": "考察是否能围绕性能分析工具（cProfile/timeit/py-spy）的实际使用、CPython 性能瓶颈的深层原因（字节码/GIL/对象模型）、优化策略的分层决策、以及线上排查路径（CPU/内存/多线程无效）进行系统性回答。",
+  "updatedAt": "2026-06-22",
   "prerequisites": [
     "python.engineering-python.memory-gc"
   ]

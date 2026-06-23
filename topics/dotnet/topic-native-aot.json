@@ -4,7 +4,7 @@
   "category": "dotnet-core",
   "group": "dotnet-core",
   "title": "Native AOT 与启动性能",
-  "summary": "理解 Native AOT 的提前编译与裁剪如何带来秒级冷启动、低内存，以及无反射等限制。",
+  "summary": "讲清 Native AOT 在发布时裁剪 IL 并编译为原生可执行文件的完整链路：编译器如何做静态分析和裁剪、哪些运行时动态特性被禁止、Source Generator 和 trimming hints 如何填补反射缺口、JIT 与 AOT 在冷启动/内存/稳态吞吐上的真实差异，以及 .NET 8+ 官方支持状态和 Serverless/容器场景的工程验证方法。",
   "tags": [
     ".NET",
     "Native AOT",
@@ -12,19 +12,29 @@
     "云原生"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 24,
   "order": 60,
   "recommendWeight": 78,
   "learningCards": [
     {
       "type": "explain",
-      "title": "AOT 是什么，收益在哪",
-      "content": "## JIT vs AOT\n常规 .NET 程序发布的是 IL，运行时由 **JIT** 即时编译成机器码——首次执行有预热延迟，且要带运行时和 JIT。**Native AOT** 在**发布时**直接把程序编译成**独立的原生机器码可执行文件**，不含 JIT、按需裁剪未使用的 IL（trimming）。\n\n## 收益\n- **秒级/毫秒级冷启动**：无 JIT 预热，进程起来即满速——对 Serverless、CLI、自动扩缩容微服务很关键。\n- **更低内存**：无 JIT、运行时更精简。\n- **更小镜像/体积**：裁剪后体积小，配合容器（chiseled/distroless）部署更轻。\n- 不依赖目标机安装 .NET 运行时（self-contained native）。"
+      "title": "AOT 的动机和发布链路",
+      "content": "常规 .NET 应用发布的是 IL（中间语言），目标机上由 JIT 在运行时按方法粒度把 IL 编译成机器码。这意味着第一次执行任何方法时都有编译开销，而且运行时必须携带 JIT 编译器、完整的类型元数据和反射基础设施。对长时间运行的服务这些成本可以被预热摊平，但对 Serverless 冷启动、CLI 启动、自动扩缩容场景，几百毫秒到秒级的 JIT 预热和几十 MB 的运行时内存是真实痛点。\n\nNative AOT 的发布链路分三步。第一步是 IL 裁剪（trimming）：编译器从程序入口做静态可达性分析，没被引用的类型、方法和程序集从 IL 中移除，减少体积和元数据。第二步是 AOT 编译：把剩余 IL 直接编译为目标平台的原生机器码，生成不带 JIT 的独立可执行文件（或带小运行时的 self-contained 二进制）。第三步是链接：把运行时 GC、线程池、异步状态机等最小必要的本地库打包进去，最终产物可以直接在目标 OS 上运行，不依赖机器安装 .NET SDK 或运行时。\n\n这个链路的关键约束是「编译期必须确定一切」：入口可达的代码图被完整编译，不可达的被裁掉，运行时没有机会再发现新类型或生成新代码。这个约束直接决定了 AOT 的收益和限制。"
     },
     {
       "type": "explain",
-      "title": "Native AOT 与启动性能 的边界与易错点",
-      "content": "## 限制（关键）\nAOT 在编译期就确定所有代码，**运行时无法动态生成/发现类型**，因此：\n- **不支持运行时反射的动态场景**（任意类型的反射、`System.Reflection.Emit`、运行时生成代码）。\n- **不支持运行时加载程序集**（`Assembly.LoadFrom` 动态插件）。\n- 依赖反射的库（部分旧序列化器、ORM、DI 反射扫描）可能不兼容，需要改用 **Source Generator**（编译期生成代码）方案，如 System.Text.Json 源生成、编译期 DI。\n\n## 适用 / 不适用\n- **适合**：Serverless 函数、CLI 工具、对启动和内存敏感的微服务、Minimal API。\n- **不适合**：重度依赖运行时反射/动态加载/插件化的应用（如某些大型框架、动态代理 AOP）。\n\n## 一句话\nAOT 用“编译期确定一切”换“启动快、内存省、体积小”，代价是放弃运行时动态性。\n\n上线前要用数字验证，而不是只看编译是否成功：比较 JIT 与 Native AOT 的冷启动耗时、RSS/Working Set、容器镜像体积、首次请求延迟和裁剪警告。若日志出现 missing method、反射创建失败、动态代理不可用，说明依赖没有满足 AOT 静态分析要求，需要 Source Generator、显式保留元数据或放弃 AOT。"
+      "title": "AOT 禁止了哪些运行时动态特性、为什么",
+      "content": "AOT 在发布时做静态分析，只把可达代码编译进二进制。运行时不再有 JIT 也没有完整的反射元数据，所以以下场景在 Native AOT 下不可用或需要特殊适配：\n\n**任意类型的运行时反射**：`typeof(T)` 在编译期就确定没问题，但 `Activator.CreateInstance(type)` 用一个运行时才拿到的 Type 去创建实例，编译器在静态分析阶段不知道这个 Type 是什么，不会为它生成构造函数机器码。运行时调用会抛 `PlatformNotSupportedException` 或缺失方法。同样的限制影响 `PropertyInfo.SetValue`、`MethodInfo.Invoke` 等动态反射调用。\n\n**System.Reflection.Emit / 动态代码生成**：`DynamicMethod`、`ILGenerator` 在运行时动态生成方法体，AOT 编译后没有 JIT 来编译动态生成的 IL，这些 API 直接不可用。动态代理库（如 Castle.DynamicProxy）依赖 Emit，AOT 下会失败。\n\n**动态程序集加载**：`Assembly.LoadFrom` / `AssemblyLoadContext.LoadFromStream` 在运行时加载新程序集，AOT 没有为这些程序集中的代码准备机器码，加载后调用任何方法都会失败。\n\n**不是所有反射都禁**：编译器能静态分析到的反射（如 `typeof(Foo).GetMethod`，且 Foo 确实在编译图中）会保留元数据和方法体。限制的是编译器无法静态推断目标的「开放世界反射」。"
+    },
+    {
+      "type": "explain",
+      "title": "如何适配：Source Generator、trimming hints 和验证",
+      "content": "AOT 不兼容反射并不意味着要手动替换所有框架，生态已经在做适配。核心策略是把运行时的动态发现变成编译期的代码生成。\n\n**Source Generator**：在编译阶段扫描代码并生成替代反射的静态代码。System.Text.Json 的 `JsonSerializerContext` 就是典型案例——为每个需要序列化的类型生成编译期的元数据和序列化方法，取代运行时反射扫描属性。EF Core 8+ 提供了 AOT 兼容模式，编译期生成查询。ASP.NET Minimal API 在 .NET 8 AOT 下自动生成路由绑定代码。DI 容器需要编译期注册扫描或用 `Microsoft.Extensions.DependencyInjection` 的 source gen 版本。\n\n**Trimming hints**：当某些代码路径必须保留反射但编译器裁不掉时，可以用 `[DynamicallyAccessedMembers]` 注解告诉裁剪器保留特定类型的构造函数、属性或方法。`rd.xml`（运行时指令文件）可以更粗粒度地保留类型，但粒度控制不如代码注解，且容易过度保留抵消裁剪收益。官方推荐优先用代码注解 + source gen，rd.xml 作为兜底。\n\n**验证方法**：发布后运行 `dotnet publish -c Release /p:PublishAot=true`，观察 trim warnings（IL2026/IL2070 等）。这些警告表示裁剪器无法保证某些代码路径的类型完整性。上线前必须做端到端功能测试，特别是序列化、DI 注册、中间件管道、动态路由这些反射重灾区。不能只看「编译成功」——编译成功不等于运行时不崩。"
+    },
+    {
+      "type": "explain",
+      "title": "冷启动收益的量化与稳态吞吐的真相",
+      "content": "AOT 优化的是「从进程启动到第一次能服务请求」这段时间。JIT 模式下，方法首次执行时需要编译 IL→机器码，加上运行时初始化（JIT 本身加载、GC 配置、线程池预热），典型 Web 应用冷启动在 1-3 秒。AOT 跳过了 JIT 编译，进程加载二进制后直接执行，冷启动可以降到 100-300ms 级别，内存 RSS 从 100-200MB 降到 30-60MB 量级。这些数字因应用复杂度、目标平台和运行时版本差异很大，但量级差异是确定的。\n\n稳态吞吐是另一回事。JIT 在运行时有分层编译（Tiered Compilation）和 PGO（Profile-Guided Optimization），可以把热点方法根据实际运行模式优化到比 AOT 静态编译更好的机器码。.NET 的动态 PGO（.NET 8+ 默认开启）甚至能在运行时内联虚方法调用、消除分支，这些优化 AOT 编译时没有运行 profile 数据做不了。所以稳态吞吐上 AOT ≈ JIT，有时 JIT 反而略胜。\n\n选 AOT 的决策公式是：应用有频繁冷启动（Serverless、自动扩缩容、CLI）→ 强收益；长驻服务且稳态吞吐优先 → JIT 通常更好或至少没有劣势。"
     },
     {
       "type": "diagram",
@@ -46,21 +56,49 @@
     },
     {
       "type": "compareTable",
-      "title": "JIT vs Native AOT",
-      "content": "| 维度 | JIT(常规) | Native AOT |\n| --- | --- | --- |\n| 编译时机 | 运行时即时编译 | 发布时提前编译为原生码 |\n| 冷启动 | 有预热延迟 | 秒级/毫秒级 |\n| 内存/体积 | 较高 | 更低/更小 |\n| 运行时反射 | 完整支持 | 受限(动态反射不可用) |\n| 动态加载程序集 | 支持 | 不支持 |\n| 适用 | 通用、长驻服务 | Serverless/CLI/启动敏感 |"
+      "title": "JIT vs Native AOT 选型对比",
+      "content": "| 维度 | JIT（常规发布） | Native AOT |\n| --- | --- | --- |\n| 编译时机 | 运行时按方法粒度即时编译 | 发布时全部编译为原生码 |\n| 冷启动 | 1-3 秒（JIT 预热 + 运行时初始化） | 100-300ms（无 JIT，进程即满速） |\n| 内存 RSS | 100-200MB | 30-60MB（无 JIT + 裁剪后运行时精简） |\n| 镜像体积 | 依赖基础镜像 + 运行时（~200MB+） | 独立二进制 + 最小基础层（~10-50MB） |\n| 稳态吞吐 | 分层编译 + 动态 PGO，热点优化更激进 | 静态编译，≈JIT 有时略逊 |\n| 运行时反射 | 完整支持 | 受限：开放世界反射不可用 |\n| 动态加载程序集 | 支持 | 不支持 |\n| Reflection.Emit | 支持 | 不支持 |\n| 生态兼容性 | 所有 NuGet 包直接可用 | 需验证 AOT 兼容性，部分需 source gen |\n| 部署依赖 | 目标机需 .NET 运行时 | self-contained，无外部依赖 |\n| 适用场景 | 通用长驻服务、反射密集型框架 | Serverless/CLI/边缘/启动敏感微服务 |"
+    },
+    {
+      "type": "code",
+      "title": "AOT 发布与 trim warnings 验证",
+      "language": "bash",
+      "content": "# 1. 发布 Native AOT\n# --self-contained true 是默认行为\n# -c Release 必须（Debug 下 AOT 编译很慢且不优化）\ndotnet publish -c Release /p:PublishAot=true\n\n# 2. 观察裁剪警告\n# IL2026: Members annotated with RequiresUnreferencedCode\n# IL2070: Unrecognized reflection pattern\n# IL3050: RequiresDynamicCode (AOT incompatible)\n# 如果看到这些警告，说明运行时可能缺失类型或方法\n\n# 3. 发布后产物分析\nls -lh bin/Release/net8.0/linux-x64/publish/\n# 对比 JIT 发布：\ndotnet publish -c Release --self-contained true\nls -lh bin/Release/net8.0/linux-x64/publish/\n\n# 4. 冷启动基准对比\n# JIT 版本\ntime dotnet bin/Release/net8.0/linux-x64/publish/MyApp.dll\n# AOT 版本（直接运行二进制）\ntime ./bin/Release/net8.0/linux-x64/publish/MyApp\n\n# 5. Docker 容器体积对比\n# AOT 用 chiseled 基础镜像\n# Dockerfile (AOT):\n# FROM mcr.microsoft.com/dotnet/nightly/runtime-deps:8.0-jammy-chiseled\n# COPY bin/Release/net8.0/linux-x64/publish/MyApp /\n# ENTRYPOINT [\"/MyApp\"]",
+      "highlights": [
+        {
+          "line": 2,
+          "note": "必须用 Release 配置，Debug 下 AOT 编译非常慢且产物未优化。"
+        },
+        {
+          "line": 7,
+          "note": "trim warnings 是 AOT 适配的核心信号，编译成功不代表运行时不崩。"
+        },
+        {
+          "line": 15,
+          "note": "AOT 产物是直接可执行二进制，不需要 dotnet CLI 来运行。"
+        },
+        {
+          "line": 24,
+          "note": "chiseled 容镜像是 AOT 最佳搭配：无包管理器、无 shell，攻击面最小。"
+        }
+      ]
     },
     {
       "type": "interviewAnswer",
       "title": "标准面试回答",
-      "content": "结论：Native AOT 在发布时把 .NET 程序直接编译成裁剪过的原生可执行文件，不带 JIT。好处是冷启动从“JIT 预热”变成进程起来即满速（秒级/毫秒级）、内存更低、体积更小，非常适合 Serverless、CLI 和启动敏感的微服务。\n\n机制要点：\n- 代价是编译期必须确定所有代码，所以不支持运行时动态反射、Reflection.Emit 和动态加载程序集；依赖反射的库要改用 Source Generator 方案（如 JSON 源生成）。\n- 追问边界：AOT 不是万能加速——它优化的是启动和内存，稳态吞吐与 JIT 差别不大；重度依赖反射/动态代理/插件化的应用不适合 AOT。\n- 实战判断时我会先选 Serverless、CLI、边缘服务这类冷启动敏感场景做试点，再用启动时间、内存、镜像体积和裁剪告警验证收益；如果核心库大量依赖反射、动态代理或运行时代码生成，Native AOT 反而会增加适配风险。",
+      "content": "**结论**：Native AOT 在发布时把 .NET 应用裁剪 IL 并编译成独立的原生可执行文件，不带 JIT 编译器。收益是冷启动从秒级降到百毫秒级、内存降低 50-70%、镜像体积缩小数倍，非常适合 Serverless 函数、CLI 工具、边缘计算和启动敏感的微服务。\n\n**机制要点**\n- 发布链路：IL 裁剪（静态可达性分析移除未引用代码）→ AOT 编译（IL→原生机器码）→ 链接最小运行时（GC、线程池等）。产物是 self-contained 二进制，不依赖目标机安装 .NET。\n- 代价是编译期必须确定所有代码路径，因此不支持开放世界反射（Activator.CreateInstance、运行时 Type 参数）、Reflection.Emit（动态代理）、动态程序集加载。依赖这些特性的库必须适配：JSON 序列化改用 System.Text.Json source generator、DI 改用编译期注册、EF Core 用 AOT 兼容模式。\n- 裁剪器输出的 IL 警告（IL2026/IL2070 等）是关键质量信号——编译成功不等于运行时不崩，必须做端到端功能验证。\n\n**追问边界**\n- AOT 不提升稳态吞吐：JIT 的分层编译和动态 PGO 能根据运行时 profile 做更激进的优化（虚方法去虚拟化、分支消除），AOT 编译时没有这些数据，稳态吞吐与 JIT 持平或略逊。\n- 适用判断：频繁冷启动的短生命周期任务是 AOT 的甜蜜点；长驻服务如果核心库大量依赖反射，AOT 适配成本可能超过收益。",
       "followUpQuestions": [
         {
-          "question": "为什么 Native AOT 不支持运行时反射？",
-          "answer": "AOT 在编译期裁剪掉未被静态引用的类型和元数据并生成固定机器码，运行时没有 JIT 也没有完整元数据去动态发现/构造任意类型。所以任意类型的反射、Reflection.Emit、运行时生成代码都不可用；需要的功能要在编译期用 Source Generator 生成出来。"
+          "question": "AOT 编译时裁剪器怎么决定哪些代码保留、哪些裁掉？",
+          "answer": "裁剪器从程序入口点（Main 方法）做静态可达性分析：遍历所有被直接和间接调用的类型、方法、字段，标记为保留；未被标记的代码从 IL 中移除。裁剪粒度可以配置为 assembly（移除整个程序集）、type（移除整个类型）或 member（移除单个方法/字段）。标记为 [DynamicallyAccessedMembers] 的类型会按注解保留指定成员，供运行时反射使用。"
         },
         {
-          "question": "AOT 能提升稳态吞吐吗？",
-          "answer": "基本不能。AOT 主要优化冷启动延迟、内存占用和体积。稳态运行时 JIT 早已编译完成（甚至有分层编译/PGO 把热点优化得很好），二者吞吐相近，有时 JIT 的运行时优化还略胜。选 AOT 是为了启动和资源，不是为了峰值吞吐。"
+          "question": "为什么 AOT 不能像 JVM GraalVM native-image 那样用 tracing agent 记录反射行为？",
+          "answer": ".NET AOT 和 GraalVM native-image 的策略不同。GraalVM 的 tracing agent 在 JIT 模式运行时记录所有反射调用点，再把记录喂给 native-image 编译器，相当于「先运行一遍收集动态行为」。.NET 8 AOT 没有官方 tracing agent，依赖静态分析 + 代码注解 + source generator。但 .NET 9 在探索更完善的动态特性分析。当前做法是用 trim warnings 做静态反馈、用端到端测试做运行时验证。"
+        },
+        {
+          "question": "如果一个第三方库不兼容 AOT 怎么办？",
+          "answer": "三步判断：1）检查该库的 issue tracker 是否有 AOT/trimming 支持计划（主流库如 Dapper、Serilog、Polly 已适配或正在适配）。2）如果不适配，评估能否用 AOT 兼容的替代库（如用 System.Text.Json source gen 替代 Newtonsoft.Json）。3）如果无法替换且该库是核心依赖，放弃 AOT 回退到 JIT 发布，或用 rd.xml 粗粒度保留类型但接受体积增大。不要为了 AOT 而 AOT，启动优化有其他手段（ReadyToRun 编译、Tiered PGO、容器预热）。"
         }
       ]
     },
@@ -68,32 +106,49 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能区分 JIT 与 Native AOT 的编译时机",
-        "能说出 AOT 的冷启动/内存/体积收益及适用场景",
-        "能解释 AOT 为何不支持运行时反射和动态加载",
-        "能说明依赖反射的库要改用 Source Generator",
-        "能说清 AOT 优化启动而非稳态吞吐"
+        "能描述 AOT 发布的三步链路：裁剪→编译→链接",
+        "能解释裁剪器的静态可达性分析如何决定保留/移除代码",
+        "能列举 AOT 禁止的运行时动态特性及其原因（开放世界反射、Emit、动态加载）",
+        "能说明 Source Generator 如何替代反射、System.Text.Json 的典型案例",
+        "能区分 AOT 对冷启动的显著收益和对稳态吞吐的无收益",
+        "能说出 trim warnings 的含义和端到端验证的必要性",
+        "能判断 Serverless/CLI/边缘 vs 长驻服务的 AOT 选型",
+        "能用代码演示 AOT 发布、体积和冷启动基准对比"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "dotnet.dotnet-core.topic-native-aot.recall.1",
-      "prompt": "Native AOT 相比 JIT 的收益和限制分别是什么？适合哪些场景？",
+      "prompt": "请完整描述 Native AOT 的发布链路、收益和核心限制。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "dotnet.dotnet-core.topic-native-aot.recall.2",
-      "prompt": "为什么 AOT 不支持运行时反射，依赖反射的库该怎么办？",
+      "prompt": "为什么 AOT 不支持运行时反射？编译器怎么决定哪些代码保留、哪些裁掉？依赖反射的库怎么适配？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "dotnet.dotnet-core.topic-native-aot.recall.3",
+      "prompt": "AOT 能提升稳态吞吐吗？为什么 JIT 在某些场景下吞吐反而更好？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
-      "id": "dotnet.dotnet-core.topic-native-aot.recall.3",
-      "prompt": "Native AOT 与启动性能 和相邻概念或常见替代方案有什么关键区别？",
+      "id": "dotnet.dotnet-core.topic-native-aot.recall.4",
+      "prompt": "一个现有 ASP.NET Core 微服务要迁移到 AOT，你会怎么评估适配成本和收益？重点关注哪些点？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "dotnet.dotnet-core.topic-native-aot.recall.5",
+      "prompt": "AOT 编译成功但运行时报 missing method 或反射失败，怎么排查？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
@@ -101,30 +156,32 @@
   ],
   "rubric": {
     "mustHave": [
-      "AOT 发布期编译为原生码无 JIT",
-      "冷启动/内存/体积收益",
-      "不支持运行时反射/动态加载",
-      "Source Generator 替代反射"
+      "能描述 AOT 发布链路：裁剪→编译→链接为 self-contained 原生二进制",
+      "能解释 AOT 禁止运行时反射/动态代码生成/动态加载的原因（编译期确定一切）",
+      "能说明冷启动/内存/体积收益及其适用场景（Serverless/CLI/边缘）",
+      "能解释 Source Generator 如何替代反射、trim warnings 的含义"
     ],
     "goodToHave": [
-      "适用 Serverless/CLI",
-      "AOT 不提升稳态吞吐",
-      "chiseled/distroless 容器"
+      "能区分 AOT 对稳态吞吐无收益甚至略逊 JIT（分层编译+动态 PGO）",
+      "能说明 trimming 的可达性分析机制和注解保留策略",
+      "能结合 chiseled/distroless 容器和体积基准做部署优化",
+      "能评估第三方库 AOT 兼容性和适配路径"
     ],
     "commonMistakes": [
-      "以为 AOT 提升稳态吞吐",
-      "认为所有库都能 AOT",
-      "不知道反射受限"
+      "以为 AOT 提升稳态吞吐，忽略 JIT 的分层编译和动态 PGO 优势",
+      "只看编译成功不关注 trim warnings，运行时才发现反射失败",
+      "认为所有反射都禁——编译器能静态分析到的反射是可用的",
+      "把 rd.xml 当万能方案，过度保留类型导致裁剪收益被抵消"
     ],
     "scoreWeights": {
-      "coverage": 30,
+      "coverage": 25,
       "accuracy": 30,
       "interviewExpression": 15,
-      "depth": 25
+      "depth": 30
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察 Native AOT 的提前编译收益、反射等限制及适用场景，区分启动优化与稳态吞吐。"
+  "interviewerFocus": "考察能否从发布链路、静态裁剪机制、运行时动态限制、Source Generator 适配、冷启动 vs 稳态吞吐差异和工程验证方法完整解释 Native AOT，区分「能背收益」和「能做选型判断」。"
 }

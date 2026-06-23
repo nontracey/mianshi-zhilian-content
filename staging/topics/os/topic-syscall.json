@@ -4,7 +4,7 @@
   "category": "process-thread",
   "group": "process-thread",
   "title": "系统调用与用户态/内核态切换",
-  "summary": "讲清用户态/内核态隔离的原因、系统调用的陷入流程与态切换开销，以及批处理、vDSO、io_uring 等减少开销的手段。",
+  "summary": "从特权级隔离、syscall 入口指令与系统调用表、内核参数校验与受控复制、开销来源（寄存器/栈切换、权限检查、缓冲复制、缓存扰动）与上下文切换边界、批处理/vDSO/io_uring/共享内存等优化手段、到 strace/perf/eBPF 验证，建立可落地的系统调用分析框架。",
   "tags": [
     "操作系统",
     "系统调用",
@@ -12,50 +12,98 @@
     "上下文切换"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 30,
   "order": 60,
-  "recommendWeight": 85,
+  "recommendWeight": 86,
   "learningCards": [
     {
       "type": "explain",
-      "title": "用户态/内核态与为什么要隔离",
-      "content": "## 两种特权级\nCPU 用特权级隔离应用与内核：x86 的 **ring3（用户态）** 跑应用、**ring0（内核态）** 跑内核。用户态**不能直接**执行特权指令（操作硬件、改页表、关中断）或访问内核内存。\n\n## 为什么隔离\n- **安全**：应用不能越权破坏系统或其他进程。\n- **稳定**：应用崩溃不拖垮内核。\n- 应用要用内核能力（读写文件、收发网络、创建进程）必须通过受控入口——**系统调用**。\n\n## 系统调用如何发生\n应用通过库函数（如 glibc 的 `read`）触发 **`syscall` 指令 / 软中断（int 0x80）**，CPU 切到内核态、跳到系统调用入口，按调用号执行内核例程，完成后切回用户态返回结果。这一来一回就是**用户态↔内核态切换**。"
+      "title": "特权级隔离：为什么应用不能直接碰内核",
+      "content": "CPU 用硬件特权级把应用和内核隔开。x86-64 有 ring0 到 ring3 四个特权级，内核运行在 ring0，应用运行在 ring3；ARM 有 EL0/EL1（用户/内核），RISC-V 有 U/S/M 模式。用户态不能直接修改页表基址寄存器（CR3/TTBR0）、关中断、访问内核地址空间或操作设备 MMIO 寄存器——这些操作都在更高特权级的保护下。\n\n隔离的价值是双重故障边界：应用越界访问、野指针或恶意代码不会直接破坏内核数据结构或其他进程的地址空间；应用崩溃可以被内核干净回收，不会拖垮整机。没有这个边界，一个 buggy 的进程就能通过改页表把自己映射到任意物理内存，安全和稳定性无从谈起。"
     },
     {
       "type": "explain",
-      "title": "切换开销与减少手段",
-      "content": "## 开销从哪来\n一次系统调用/态切换的成本包括：保存与恢复寄存器、切换栈、CPU 流水线与缓存（指令/数据 cache、TLB）的扰动。**比普通函数调用贵得多**，但比线程上下文切换便宜（不换地址空间）。高频小 IO 时，syscall 开销可能成为瓶颈。\n\n## 减少手段\n- **批处理**：一次系统调用处理更多数据/事件。`readv/writev` 聚合 IO；`epoll` 一次拿多个就绪事件；**`io_uring`** 用提交/完成队列批量提交，大幅减少 syscall 次数。\n- **vDSO**：把 `gettimeofday`、`clock_gettime` 等只读调用映射到用户空间执行，**不陷入内核**，避免切换。\n- **缓冲**：用户态缓冲（如 stdio 的 buffer）合并多次小写为一次 write。\n- **用户态协议栈/DPDK**：极端场景把网络处理搬到用户态绕开内核。\n\n## 观测\n`strace` 跟踪进程的系统调用、`perf` 看 syscall 频率与耗时，定位“系统调用过多”型性能问题。"
+      "title": "系统调用入口：从 libc 到内核的受控通道",
+      "content": "应用想读文件、收发网络、创建进程，必须通过系统调用这个受控入口。Linux/x86-64 的典型路径：业务代码调用 libc 包装函数（如 `read`、`write`、`socket`），libc 把系统调用号放到 `rax`，参数放到 `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` 等约定寄存器，然后执行 `syscall` 指令。CPU 检查到特权级切换，自动保存用户态 `rip` 到 `rcx`、`rflags` 到 `r11`，跳转到内核预设的入口地址（MSR_LSTAR），切换到内核栈（从 TSS 读 RSP0）。\n\n内核入口代码先保存所有用户态寄存器到内核栈上的 `pt_regs` 结构，然后用 `rax` 中的调用号查 `sys_call_table`，分发到具体内核函数（如 `sys_read`）。旧 32 位 x86 可见 `int 0x80`（通过 IDT 中断门）或 `sysenter`/`sysexit`；ARM 使用 `svc`（Supervisor Call），RISC-V 使用 `ecall`。返回时执行 `sysret`（或 `iret`），从内核栈恢复用户态寄存器，切回 ring3。"
+    },
+    {
+      "type": "explain",
+      "title": "内核参数校验：不信任任何用户态输入",
+      "content": "内核拿到参数后不会直接使用，必须重新校验每一个值。`fd` 要在当前进程的文件描述符表里查找，确认它确实打开着且有对应权限（读/写/追加）；用户态传来的缓冲区指针必须在用户地址空间范围内且页已映射，防止内核读写到自己的数据；长度和偏移要满足文件大小、对齐和溢出约束；网络地址结构的长度和类型也要检查。\n\n跨边界数据不能直接解引用用户态指针，而是通过 `copy_from_user`/`copy_to_user` 这类受控函数在用户态缓冲区和内核态缓冲区之间复制。这些函数内部会做地址范围检查，如果访问未映射页会返回错误而不是内核崩溃（`stac/clac` 指令在 SMAP 启用时临时放开访问权限）。`fd` 操作还涉及 VFS 路径解析、inode 权限、锁粒度和阻塞语义；网络操作涉及 socket 状态机、协议栈校验和路由查找。\n\n返回路径同样重要：内核返回值放到 `rax`，成功时是结果（如字节数），失败时是负的错误码（如 -EFAULT、-EAGAIN）；libc 检测到负值后把绝对值写到 `errno` 并返回 -1 给调用者。`EINTR` 表示被信号中断后可重试，`EAGAIN` 表示非阻塞模式下暂时不可用，短读/短写表示实际传输量可能小于请求量——这些都不是异常，而是正常的系统调用语义。"
+    },
+    {
+      "type": "explain",
+      "title": "开销来源：系统调用贵在哪里",
+      "content": "一次系统调用的开销远大于普通函数调用，但不能简单等同于上下文切换。开销来自几个层面：\n\n**特权级切换本身**：`syscall` 指令要把 `rip` 保存到 `rcx`、`rflags` 保存到 `r11`，切换到内核栈，执行内核入口的寄存器保存/恢复序列。`sysret` 反向执行。这个路径涉及微码和流水线刷新。\n\n**权限检查与数据复制**：内核对 fd、指针、长度、权限的每次校验都有成本；`copy_from_user`/`copy_to_user` 还要逐页检查可访问性。安全缓解机制（如 SMAP/SMEP、Retpoline、IBRS）也会增加入口开销。\n\n**缓存和分支预测扰动**：内核代码和数据会挤占 L1/L2 cache 和 BTB/TLB 条目，返回用户态后短期内容易 miss。频繁系统调用的服务，这个效应可能比切换本身更显著。\n\n**阻塞是关键分水岭**：如果系统调用阻塞（如 read 等数据、accept 等连接），当前线程会被内核挂到等待队列并触发调度器。这时系统调用会叠加上下文切换成本——保存/恢复调度上下文、可能的地址空间切换（跨进程时 TLB 刷新、页表切换）。同进程的纯系统调用不阻塞时，远比一次跨进程上下文切换轻量；但阻塞后，两者成本可以接近甚至逆转。"
+    },
+    {
+      "type": "explain",
+      "title": "优化手段：减少入口次数与快路径",
+      "content": "优化系统调用开销的核心思路是减少入口次数和避免不必要的内核往返：\n\n**批处理**：把多次小请求合并成少量入口。`readv`/`writev` 用分散/聚集 IO 把多个缓冲区一次提交；`sendmmsg`/`recvmmsg` 批量发送/接收网络报文；`epoll_wait` 一次返回多个就绪事件而不是每个 fd 一次 `poll`/`select`；`io_uring` 用提交队列（SQ）和完成队列（CQ）映射到共享内存，应用批量放请求、内核批量写回完成，`io_uring_enter` 减少为少次入口，SQPOLL 模式还能让内核轮询 SQ 减少显式提交。\n\n**缓冲**：stdio buffer 把多次小 `printf`/`fwrite` 合并成较少的 `write`；应用侧队列和日志批量刷盘是同样的思路——把高频小 IO 变成低频大 IO。\n\n**vDSO 快路径**：内核把一小段代码和只读数据页映射到每个进程地址空间（`linux-vdso.so.1`）。某些只读时间/CPU 信息查询（如 `clock_gettime(CLOCK_REALTIME)`、`getcpu`）可以在用户态直接完成，不走完整 `syscall` 入口。但它是条件性的：哪些时钟源、哪些架构、内核版本是否支持，都会影响是否 fallback 到真正 syscall。它只适合不需要修改内核状态的查询。\n\n**用户态协议栈与共享内存**：DPDK、SPDK、mmap 等方案绕过内核网络/存储栈，直接在用户态操作设备或共享内存，减少内核参与。代价是失去内核提供的隔离、路由、过滤、审计和标准可观测性，需要自建协议栈和运维能力。"
     },
     {
       "type": "diagram",
-      "format": "mermaid",
-      "title": "系统调用与用户态/内核态切换：机制分支与风险路径",
-      "content": "flowchart TD\nN1w4x85tS[系统调用与用户态/内核态切换 触发入口] --> N1w4x85tM[核心对象或状态: 操作系统]\nN1w4x85tM --> N1w4x85tC{系统调用与用户态/内核态切换 是否走正常路径}\nN1w4x85tC -->|正常| N1w4x85tN[执行 系统调用与用户态/内核态切换 主流程]\nN1w4x85tC -->|异常| N1w4x85tF[处理 系统调用与用户态/内核态切换 边界风险]\nN1w4x85tN --> N1w4x85tO[输出结果或交给下一组件]\nN1w4x85tF --> N1w4x85tR[按 系统调用与用户态/内核态切换 语义降级/重试/报错]\nN1w4x85tO --> N1w4x85tV[验证 系统调用与用户态/内核态切换 日志、指标或测试]\nN1w4x85tR --> N1w4x85tV",
-      "caption": "系统调用与用户态/内核态切换 图中的分支用于区分本题正常机制、异常边界和工程验证路径。",
-      "fallback": "系统调用与用户态/内核态切换 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。",
+      "title": "系统调用入口、内核校验、成本来源与优化边界",
+      "content": "assets/diagrams/os-syscall-user-kernel.svg",
+      "caption": "图中按真实路径拆开用户态业务代码、libc 包装、CPU 入口、系统调用表、参数校验、内核执行、返回 errno，并把成本来源、vDSO/io_uring/批处理等优化边界和 strace/perf/eBPF 验证方式放在同一张图中。",
+      "fallback": "系统调用的主线是用户代码通过 libc 或直接 syscall 进入内核，CPU 切换特权级，内核按调用号分发并校验 fd、指针和权限，执行 VFS/socket/driver 等工作后返回结果或 errno。优化主要靠批处理、缓冲、vDSO 快路径、io_uring 共享队列和共享内存/用户态协议栈，但必须用 strace、perf、eBPF 证明次数、耗时和尾延迟真的下降。",
+      "format": "svg",
       "sources": [
         {
-          "kind": "mermaid",
-          "content": "flowchart TD\nN1w4x85tS[系统调用与用户态/内核态切换 触发入口] --> N1w4x85tM[核心对象或状态: 操作系统]\nN1w4x85tM --> N1w4x85tC{系统调用与用户态/内核态切换 是否走正常路径}\nN1w4x85tC -->|正常| N1w4x85tN[执行 系统调用与用户态/内核态切换 主流程]\nN1w4x85tC -->|异常| N1w4x85tF[处理 系统调用与用户态/内核态切换 边界风险]\nN1w4x85tN --> N1w4x85tO[输出结果或交给下一组件]\nN1w4x85tF --> N1w4x85tR[按 系统调用与用户态/内核态切换 语义降级/重试/报错]\nN1w4x85tO --> N1w4x85tV[验证 系统调用与用户态/内核态切换 日志、指标或测试]\nN1w4x85tR --> N1w4x85tV"
+          "kind": "svg",
+          "path": "assets/diagrams/os-syscall-user-kernel.svg"
         },
         {
           "kind": "text",
-          "content": "系统调用与用户态/内核态切换 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。"
+          "content": "系统调用的主线是用户代码通过 libc 或直接 syscall 进入内核，CPU 切换特权级，内核按调用号分发并校验 fd、指针和权限，执行 VFS/socket/driver 等工作后返回结果或 errno。优化主要靠批处理、缓冲、vDSO 快路径、io_uring 共享队列和共享内存/用户态协议栈，但必须用 strace、perf、eBPF 证明次数、耗时和尾延迟真的下降。"
+        }
+      ]
+    },
+    {
+      "type": "compareTable",
+      "title": "系统调用 vs 上下文切换 vs 函数调用",
+      "content": "| 维度 | 普通函数调用 | 系统调用（非阻塞） | 线程切换（同进程） | 进程切换（跨进程） |\n| --- | --- | --- | --- | --- |\n| 特权级 | 不切换（ring3→ring3） | ring3→ring0→ring3 | 通常 ring3 | 通常 ring3，内核态辅助 |\n| 地址空间 | 不变 | 不变 | 不变 | 切换（CR3/TTBR0） |\n| 栈切换 | 用户态调用栈 | 用户栈→内核栈→用户栈 | 用户栈切换 | 用户栈切换 |\n| TLB 影响 | 无 | 无（不换地址空间） | 无或很小 | 刷新（PCID 可部分缓解） |\n| 缓存影响 | 极小 | 内核代码/数据挤占 L1/L2 | 调度上下文污染 | TLB+cache 双重污染 |\n| 典型成本 | 纳秒级 | 数十~数百纳秒（不含阻塞） | 数百纳秒~微秒 | 微秒级（含 TLB 填充） |\n| 关键变量 | 函数大小 | 是否阻塞、安全缓解开销 | 调度器负载 | 地址空间大小、PCID |\n\n| 优化手段 | 适用场景 | 限制与代价 |\n| --- | --- | --- |\n| readv/writev | 多缓冲区聚合读写 | 需要 scatter/gather 缓冲区布局 |\n| sendmmsg/recvmmsg | 高频网络报文批量收发 | 需要内核版本支持，UDP 更适合 |\n| epoll_wait 批量事件 | 大量 fd 就绪轮询 | 事件处理本身也需批量策略 |\n| io_uring SQ/CQ | 异步 IO 批量提交/收割 | 内核版本 ≥5.1，SQPOLL 需权限和 CPU 预算 |\n| vDSO 快路径 | clock_gettime/getcpu 等只读查询 | 条件性，不适用于写操作和所有时钟源 |\n| DPDK/mmap 共享内存 | 极致低延迟网络/存储 | 失去内核隔离/路由/过滤，需自建栈 |"
+    },
+    {
+      "type": "code",
+      "title": "Python 可运行：系统调用次数对比（多次小写 vs writev 批量）",
+      "language": "python",
+      "content": "import os\nimport tempfile\n\nchunks = [f\"seg{i}-\".encode() for i in range(5)]\npayload = b\"\".join(chunks)\n\nwith tempfile.TemporaryDirectory() as tmp:\n    many_path = os.path.join(tmp, \"many.bin\")\n    batch_path = os.path.join(tmp, \"batch.bin\")\n\n    # 多次小 write：每次进入内核一次\n    fd = os.open(many_path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)\n    many_calls = 0\n    for chunk in chunks:\n        os.write(fd, chunk)\n        many_calls += 1  # 每次 os.write 对应一次 write syscall\n    os.close(fd)\n\n    # writev 批量：一次 syscall 提交所有缓冲区\n    fd = os.open(batch_path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)\n    if hasattr(os, \"writev\"):\n        written = os.writev(fd, chunks)\n        batch_api = \"writev\"\n    else:\n        written = os.write(fd, payload)\n        batch_api = \"write (concatenated)\"\n    batch_calls = 1\n    os.close(fd)\n\n    # 验证内容一致\n    with open(many_path, \"rb\") as f:\n        many_data = f.read()\n    with open(batch_path, \"rb\") as f:\n        batch_data = f.read()\n\nprint(f\"多次小 write: {many_calls} 次系统调用\")\nprint(f\"批量 {batch_api}: {batch_calls} 次系统调用\")\nprint(f\"总字节数: {len(payload)}\")\nprint(f\"内容一致: {many_data == batch_data == payload}\")\n\nassert many_calls == len(chunks)\nassert batch_calls == 1\nassert written == len(payload)\nassert many_data == batch_data == payload\n\n# 实际线上验证要用 strace -c -T 统计次数和耗时\n# 用 perf trace 看内核栈热点\n# 用 eBPF 统计 syscall 延迟分布和错误码",
+      "highlights": [
+        {
+          "line": 11,
+          "note": "逐段 os.write 每次都触发 write syscall，5 段数据进入内核 5 次。"
+        },
+        {
+          "line": 19,
+          "note": "writev 一次提交多个缓冲区，只触发 1 次系统调用。"
+        },
+        {
+          "line": 35,
+          "note": "线上真实 syscall 次数和耗时要用 strace/perf/eBPF 验证，不能只看代码。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：CPU 用特权级把应用和内核隔离开——用户态（x86 的 ring3）跑应用、内核态（ring0）跑内核。用户态不能直接执行特权指令或访问内核内存，要用内核能力（读写文件、收发网络、创建进程）必须通过系统调用这个受控入口。\n\n机制要点：\n- 为什么隔离：安全，应用不能越权破坏系统；稳定，应用崩溃不拖垮内核。\n- 系统调用怎么发生：应用通过库函数（如 glibc 的 read）触发 syscall 指令或软中断，CPU 切到内核态、跳到系统调用入口、按调用号执行内核例程，完成后切回用户态返回，这一来一回就是用户态和内核态切换。\n- 开销和优化（高频）。一次态切换要保存恢复寄存器、切栈、扰动流水线和 cache、TLB，比普通函数调用贵得多，但比线程上下文切换便宜（不换地址空间）。高频小 IO 时 syscall 开销会成瓶颈。减少手段：① 批处理，readv/writev 聚合 IO、epoll 一次拿多个事件、io_uring 用提交/完成队列批量提交。② vDSO，把 gettimeofday 这类只读调用映射到用户空间执行、不陷入内核。③ 用户态缓冲，stdio buffer 合并多次小写。④ 极端场景用 DPDK 等用户态协议栈绕开内核。观测用 strace 跟踪、perf 看频率耗时。",
+      "content": "**30 秒结论**\n系统调用是用户态访问内核能力的受控入口。它解决的问题是安全和稳定隔离：应用不能直接碰硬件、页表和内核内存，只能把请求交给内核校验、执行并返回结果。\n\n**完整路径（以 Linux/x86-64 read 为例）**\n1. 业务代码调用 libc 的 `read` 包装函数\n2. libc 把系统调用号放到 `rax`，fd/缓冲区/长度放到 `rdi`/`rsi`/`rdx`，执行 `syscall` 指令\n3. CPU 切到 ring0，保存用户 `rip`→`rcx`、`rflags`→`r11`，从 TSS 取 RSP0 切到内核栈\n4. 内核入口保存所有用户态寄存器到 `pt_regs`\n5. 用 `rax` 查 `sys_call_table`，进入 `sys_read`\n6. 内核校验 fd 在进程文件表中的有效性、缓冲区指针在用户空间且可访问、长度合法\n7. 通过 VFS 路径找到具体文件系统实现，可能阻塞等待数据\n8. 数据通过 `copy_to_user` 复制到用户态缓冲区\n9. 返回实际读取字节数（成功）或负错误码（如 -EAGAIN、-EFAULT）\n10. `sysret` 切回 ring3，libc 检测到负值把绝对值写 `errno` 并返回 -1\n\n**开销来源**\n- 特权级切换：微码和流水线刷新\n- 寄存器保存/恢复：pt_regs 读写\n- 参数校验：fd 查表、指针验证、权限检查\n- 数据复制：copy_from_user/copy_to_user 逐页校验\n- 缓存扰动：内核代码/数据挤占 L1/L2/BTB/TLB\n- 安全缓解：SMAP/SMEP、Retpoline、IBRS 额外开销\n\n**关键边界**\n系统调用不等于上下文切换。非阻塞系统调用只切特权级和栈，不切地址空间，远轻于跨进程切换。但如果系统调用阻塞（如 read 等数据、accept 等连接），线程会被挂到等待队列并触发调度，这时会叠加上下文切换成本。所以「系统调用比线程切换便宜」这句话只有在非阻塞前提下才成立。\n\n**优化手段**\n- 批处理：readv/writev、sendmmsg/recvmmsg、epoll_wait 批量事件、io_uring SQ/CQ\n- 缓冲：stdio buffer、应用侧队列、日志批量刷盘\n- vDSO：clock_gettime 等只读查询的用户态快路径（条件性）\n- io_uring：共享 SQ/CQ 减少入口，SQPOLL 减少显式提交\n- 用户态栈：DPDK/mmap 绕过内核（代价是失去隔离和标准可观测性）\n\n**验证方法**\n`strace -c -T` 看次数和耗时 → `perf trace`/`perf top` 看内核栈热点 → eBPF 统计延迟分布和错误码 → 对照优化前后的吞吐、P99、CPU、队列积压和错误率。",
       "followUpQuestions": [
         {
-          "question": "系统调用切换和线程上下文切换哪个贵？",
-          "answer": "线程上下文切换更贵。系统调用只在同一进程内切特权级，不切换地址空间；线程/进程切换要保存恢复更多寄存器、可能切换地址空间并刷新 TLB（进程切换尤甚）。但系统调用仍比普通函数调用贵得多。"
+          "question": "系统调用和线程上下文切换哪个更贵？",
+          "answer": "不能绝对化。非阻塞系统调用只切特权级和栈，不切地址空间，比跨进程上下文切换轻量得多。但如果系统调用阻塞并触发调度，它会叠加上下文切换成本，此时两者接近甚至逆转。同进程线程切换也不换地址空间，所以非阻塞系统调用和同进程线程切换成本在同一量级。面试里更稳妥的说法是：取决于是否阻塞、是否换地址空间、缓存/TLB 命中情况。"
         },
         {
-          "question": "io_uring 为什么能减少系统调用开销？",
-          "answer": "传统每次 IO 一个 syscall；io_uring 用一对共享内存的提交队列(SQ)和完成队列(CQ)，应用批量把请求放进 SQ、内核完成后放进 CQ，一次 syscall 可提交/收割大量 IO，甚至在 polling 模式下几乎零 syscall，大幅降低态切换次数。"
+          "question": "copy_from_user 为什么不能直接用 memcpy？",
+          "answer": "用户态传来的指针可能指向内核地址空间（如果 SMAP 未启用）、可能未映射、可能在调用过程中被另一个线程 munmap。直接 memcpy 会导致内核读写非法地址或安全漏洞。copy_from_user 内部会做地址范围检查（access_ok），逐页验证可访问性，遇到非法地址返回错误而不是内核崩溃。它还会临时放开 SMAP 保护（stac/clac），完成后立即恢复。"
+        },
+        {
+          "question": "io_uring 为什么能降低系统调用开销？",
+          "answer": "传统模型每个 IO 都要一次系统调用进入内核。io_uring 把提交队列（SQ）和完成队列（CQ）映射到用户态/内核共享内存，应用批量放请求到 SQ，内核批量从 CQ 写回完成。`io_uring_enter` 把多次提交合并成一次入口；SQPOLL 模式下内核轮询线程消费 SQ，应用甚至可以不调 io_uring_enter 就提交。它降低的是高频入口和事件收割成本，不是所有场景都天然更快——内核版本、文件类型、polling 线程的 CPU 开销都是限制。"
+        },
+        {
+          "question": "vDSO 为什么能避免陷入内核？",
+          "answer": "内核把一小段代码和只读数据页（`linux-vdso.so.1`）映射到每个进程地址空间。用户态调用 `clock_gettime(CLOCK_REALTIME)` 等查询时，vDSO 代码可以直接从共享数据页读取内核定期更新的时间信息，不走完整 syscall 入口。它只适合不需要修改内核状态、可用只读数据回答的问题。具体是否走 vDSO 取决于内核版本、架构、时钟源类型和运行环境（如虚拟化可能 fallback）。"
         }
       ]
     },
@@ -63,63 +111,84 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释用户态/内核态特权级隔离及其安全/稳定意义",
-        "能说清系统调用如何通过 syscall 指令陷入内核再返回",
-        "能说明态切换的开销来源(寄存器/栈/cache/TLB)",
-        "能给出批处理/vDSO/缓冲等减少 syscall 的手段",
-        "能比较系统调用切换与线程上下文切换的开销"
+        "能解释用户态/内核态硬件特权级隔离解决的安全和稳定问题",
+        "能画出从 libc wrapper → syscall 指令 → pt_regs → sys_call_table → 参数校验 → 内核执行 → errno 返回的完整路径",
+        "能说明 fd 查表、指针验证、copy_from_user/copy_to_user 为什么不能省略",
+        "能区分系统调用、普通函数调用、线程切换、进程切换的成本边界和关键变量",
+        "能列举批处理、缓冲、vDSO、io_uring、DPDK/mmap 等优化手段及适用限制",
+        "能用 strace -c -T、perf trace/top、eBPF 统计 syscall 次数、耗时和阻塞点",
+        "能解释 EINTR/EAGAIN、短读短写和阻塞睡眠是正常语义而不是异常",
+        "能避免把 vDSO 或 io_uring 说成所有场景下都更快或都不进内核"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "os.process-thread.topic-syscall.recall.1",
-      "prompt": "解释为什么需要用户态/内核态隔离，以及一次系统调用是怎么完成态切换的。",
+      "prompt": "画出一次 read 系统调用从用户代码到内核返回的完整路径，并说明每一步为什么需要边界校验。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "os.process-thread.topic-syscall.recall.2",
-      "prompt": "系统调用切换的开销来自哪里？有哪些减少系统调用次数的工程手段？",
+      "prompt": "系统调用开销来自哪里？为什么不能简单说它一定比线程上下文切换便宜或更贵？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "os.process-thread.topic-syscall.recall.3",
+      "prompt": "线上服务每秒有大量小 write/recvfrom 调用时，你会如何验证瓶颈、选择批处理或缓冲方案，并证明修复有效？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "os.process-thread.topic-syscall.recall.4",
+      "prompt": "copy_from_user 为什么不能直接用 memcpy？它内部做了哪些保护？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
-      "id": "os.process-thread.topic-syscall.recall.3",
-      "prompt": "一次系统调用的完整过程是什么？用户态到内核态切换的开销主要花在哪里？",
+      "id": "os.process-thread.topic-syscall.recall.5",
+      "prompt": "vDSO 和 io_uring 分别通过什么机制减少系统调用开销？它们各自的适用边界和限制是什么？",
       "mode": "text",
-      "expectedMinutes": 3,
-      "difficulty": 3
+      "expectedMinutes": 4,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能解释用户态/内核态特权级隔离的目的",
-      "能描述系统调用经 syscall 指令陷入内核、执行后返回的流程",
-      "能说出态切换的开销来源和与函数调用、线程切换的对比",
-      "能列出批处理、vDSO、缓冲等减少系统调用的手段"
+      "能解释用户态/内核态硬件特权级隔离的目的（安全边界+故障隔离）",
+      "能描述从 libc wrapper → syscall 指令 → pt_regs → sys_call_table → 参数校验 → 内核执行 → errno 返回的完整流程",
+      "能说清系统调用开销来源（特权级切换、寄存器保存、权限校验、缓冲复制、缓存扰动），并避免把它绝对化等同于线程或进程上下文切换",
+      "能列出批处理、缓冲、vDSO、io_uring 等减少系统调用开销的手段及限制"
     ],
     "goodToHave": [
-      "能说明 io_uring 为什么减少 syscall",
-      "能解释 vDSO 让只读调用不陷入内核",
-      "能用 strace 或 perf 定位 syscall 过多"
+      "能解释 copy_from_user/copy_to_user 的安全必要性和内部保护机制",
+      "能说明 EINTR/EAGAIN、短读短写和阻塞睡眠是正常系统调用语义的一部分",
+      "能区分 vDSO 的条件性快路径和 io_uring SQ/CQ、SQPOLL 的成本边界",
+      "能用 strace -c -T、perf trace/top、eBPF 延迟直方图定位 syscall 过多或慢 syscall"
     ],
     "commonMistakes": [
-      "以为系统调用和普通函数调用开销差不多",
-      "不知道态切换比线程上下文切换便宜",
-      "忽略 vDSO 等避免陷入内核的优化"
+      "把系统调用当成普通库函数调用，不提特权级、系统调用表和参数校验",
+      "绝对化地说系统调用一定比线程切换便宜，忽略阻塞和调度触发",
+      "把 vDSO 说成所有时间相关调用都不会陷入内核（条件性快路径）",
+      "把 io_uring 说成任何 IO 都天然更快，忽略内核版本、文件类型、polling 成本和权限要求",
+      "只背批处理名词，不会用 strace/perf/eBPF 证明 syscall 次数和耗时真的下降",
+      "忽略 copy_from_user 不能用 memcpy 替代的原因（地址校验、SMAP、并发 munmap）"
     ],
     "scoreWeights": {
-      "coverage": 30,
+      "coverage": 25,
       "accuracy": 30,
-      "interviewExpression": 15,
+      "interviewExpression": 20,
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "staging",
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否解释特权级隔离、描述系统调用流程与切换开销，并说出 io_uring、vDSO、批处理等降低 syscall 开销的方法。"
+  "interviewerFocus": "考察是否能围绕「系统调用与用户态/内核态切换」说清特权级隔离、syscall 入口指令与系统调用表、内核参数校验与受控复制（copy_from_user）、errno 返回、开销来源与阻塞边界、批处理/vDSO/io_uring 优化手段、以及 strace/perf/eBPF 验证能力。"
 }

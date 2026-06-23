@@ -7,7 +7,7 @@
   "status": "production",
   "order": 100,
   "difficulty": 5,
-  "estimatedMinutes": 36,
+  "estimatedMinutes": 40,
   "interviewFrequency": "high",
   "recommendWeight": 88,
   "tags": [
@@ -19,27 +19,32 @@
     "java.jvm.topic-001-ebcc71cb",
     "java.jvm.topic-010-3574662f"
   ],
-  "summary": "按线上故障处理链路讲清止血、保现场、症状分流、证据采集、根因定位、最小修复和同指标复验，并覆盖 CPU、OOM、GC、锁等待等 JVM 常见事故。",
+  "summary": "线上 JVM 问题排查是一套事故处理方法论：先止血保现场，再按 CPU/OOM/GC/RT 四条主症状分流采集证据，用线程栈、heap dump、GC 日志、JFR 等工具建立可复验的证据链，最小变更修复后用同一组指标复验并沉淀复盘。难点在于区分各类 OOM 的证据入口、判断 GC 信号背后的分配速率与存活集问题、以及每个诊断动作本身的现场风险。",
   "learningCards": [
     {
       "type": "explain",
       "title": "先稳住用户，再保存现场",
-      "content": "线上排查不是工具背诵，而是事故处理。第一步先确认影响面：哪些接口、哪些实例、哪个版本、错误率和 p99/p999 是否越过 SLO、是否刚发布或刚改配置。对用户有影响时先止血，例如摘除异常实例、限流、回滚、扩容、关闭可降级功能；但要尽量保留一台带病实例用于取证，避免重启后线程栈、堆对象、GC 状态和本地临时文件全部消失。\n\n取证要按时间线保存：应用日志、GC 日志、线程 dump、heap dump、JFR/火焰图、监控截图、JVM flags、容器 limit、系统 dmesg/OOM killer 日志、最近发布记录和配置变更。取证动作本身也有风险：`jmap -dump:live` 可能触发 Full GC，heap dump 可能占满磁盘，Arthas watch/trace 可能给热点方法增加额外开销，`jcmd GC.run` 会改变现场。生产里要先确认磁盘、权限和业务影响。\n\n一个成熟回答要体现顺序：先保护用户和证据，再按主症状分流；不要先凭经验改参数。每次只改一个变量，修完用同一批指标复验，最后把根因、影响面、处置时间线和预防措施写进复盘。"
+      "content": "线上排查不是工具背诵，而是事故处理。第一步确认影响面：哪些接口受影响、哪些实例、哪个版本、错误率和 p99/p999 是否越过 SLO、是否刚发布或刚改配置。对用户有影响时先止血——摘除异常实例、限流、回滚、扩容、关闭可降级功能；但要尽量保留一台带病实例用于取证，避免重启后线程栈、堆对象、GC 状态和本地临时文件全部消失。\n\n取证要按时间线保存：应用日志、GC 日志、线程 dump、heap dump、JFR/火焰图、监控截图、JVM flags、容器 limit、系统 dmesg/OOM killer 日志、最近发布记录和配置变更。取证动作本身有风险：`jmap -dump:live` 会触发一次 Full GC 来回收弱引用并只保留存活对象，heap dump 文件可能瞬间写满磁盘（堆多大 dump 多大），Arthas 的 `watch`/`trace` 在高频方法上会增加 CPU 和 RT 开销，`jcmd GC.run` 直接改变 GC 现场。生产环境取证前必须确认磁盘空间、文件权限和业务影响窗口。\n\n成熟回答的顺序是：先保护用户和证据，再按主症状分流诊断。不要先凭经验改参数或直接重启——重启丢现场，没有前后对比的参数调整无法证明有效。每次只改一个变量，修完用同一批指标复验，最后把根因、影响面、处置时间线和预防措施写进复盘。"
     },
     {
       "type": "explain",
-      "title": "CPU 高：把热线程映射到代码栈",
-      "content": "CPU 飙高的证据链是“进程 -> 线程 -> 栈 -> 代码/资源”。Linux 常用路径是 `top` 找 Java 进程，`top -H -p <pid>` 或 `pidstat -t -p <pid> 1` 找高 CPU 线程，线程 id 转十六进制后在 `jcmd <pid> Thread.print -l` 或 `jstack -l <pid>` 里搜索 `nid=0x...`。如果线程名是 `GC Thread` 或日志里 GC 很密集，CPU 可能消耗在 GC；如果是业务线程 RUNNABLE，要看栈顶是否是死循环、正则回溯、JSON 序列化、加解密、集合遍历、RPC SDK 重试或日志同步输出。\n\n线程 dump 是瞬时快照，单次栈不够时要连续抓 3 到 5 次，间隔 2 到 5 秒，看同一个线程是否反复停在同一段代码。CPU 火焰图、JFR 或 async-profiler 更适合证明热点占比；Arthas 的 `thread -n 5` 能快速列出热点线程，`trace` 和 `watch` 用于低频方法验证，热点请求上要控制条件和采样，避免诊断动作放大故障。\n\n定位到代码后还要区分处理策略：死循环/灾难性正则要修代码或加超时；频繁 GC 要转到内存和 GC 路线；锁自旋或线程池打满要看阻塞链、队列长度、连接池和下游延迟；native CPU 高还要结合 `top`、`perf`、JFR native sample 或容器宿主机指标。"
+      "title": "CPU 高：从进程到线程到代码栈的映射链",
+      "content": "CPU 飙高时的证据链是「进程 → 线程 → 栈 → 代码/资源」。Linux 上常用路径：`top` 找到 Java 进程 PID，`top -H -p <pid>` 或 `pidstat -t -p <pid> 1` 找到高 CPU 的线程（LWP），把线程 id 转十六进制后在 `jcmd <pid> Thread.print -l` 或 `jstack -l <pid>` 里搜索 `nid=0x...`。如果线程名显示 `GC Thread` 或 GC 日志非常密集，CPU 可能消耗在垃圾回收；如果是业务线程且状态为 RUNNABLE，要看栈顶是死循环、灾难性正则回溯、JSON 序列化/反序列化、加解密、集合遍历、RPC SDK 重试循环还是日志同步写入。\n\n线程 dump 是瞬时快照，单次不够时要连续抓 3～5 次、间隔 2～5 秒，观察同一线程是否反复停在同一段代码上。需要量化热点占比时，CPU 火焰图（async-profiler 的 `-e cpu`）、JFR 的 `jdk.ExecutionSample` 事件更合适。Arthas 的 `thread -n 5` 能快速列出 CPU 占比最高的线程，`trace` 和 `watch` 用于低频方法验证；但在热点方法上用 Arthas 要控制采样条件，避免诊断动作本身放大故障。\n\n定位到代码后要区分处理策略：死循环和灾难性正则要修代码或加超时；频繁 GC 导致 CPU 高要转到内存/GC 路线；锁自旋或线程池打满要看阻塞链、队列长度、连接池和下游延迟；native 层 CPU 高还要结合 `perf record`、JFR native sample 或宿主机指标进一步定位。"
     },
     {
       "type": "explain",
-      "title": "内存问题先按 OOM 类型分入口",
-      "content": "看到 `OutOfMemoryError` 不能只说“导 dump”。不同错误对应不同入口。`Java heap space` 看堆对象、缓存、集合、请求堆积和大对象。`GC overhead limit exceeded` 看回收后老年代水位和分配速率。`Metaspace` 看类加载器泄漏、动态代理、脚本引擎和热部署。`Direct buffer memory` 看 NIO/Netty 直接内存、池化和 `MaxDirectMemorySize`。`unable to create native thread` 看线程数、`-Xss`、ulimit、容器 pid/memory limit。容器 OOMKilled 则要看 RSS，而不是只看 Java heap。\n\n堆泄漏排查常用 `-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=...` 自动留证，应用仍可用时用 `jcmd <pid> GC.heap_dump /path/heap.hprof` 或谨慎使用 `jmap -dump`。MAT 里先看 Dominator Tree、retained size、Histogram 和 Path to GC Roots，判断是谁保活了大对象；如果回收后 old 水位持续上升，并且 dominator 指向静态集合、ThreadLocal、无界缓存、未关闭资源或监听器列表，才像泄漏。一次性流量尖峰或堆配置过小则是容量问题，不应误判成泄漏。\n\nMetaspace 要看类加载和卸载曲线，结合 `jcmd <pid> VM.classloader_stats`、类加载日志或 JFR；Direct/native 要提前开启 NMT 才能用 `jcmd <pid> VM.native_memory summary` 看结构。Netty 服务还要看 direct memory、arena、ByteBuf 泄漏检测和连接数。线上结论要说出“哪类 OOM、谁保活、为什么释放不了、修复或容量策略是什么”。"
+      "title": "内存问题按 OOM 类型分入口，不能一刀切",
+      "content": "看到 `OutOfMemoryError` 不能只说「导 dump 查泄漏」。不同 OOM 错误信息指向完全不同的排查入口。\n\n`java.lang.OutOfMemoryError: Java heap space` 看堆内对象：缓存、集合、请求堆积、大对象、序列化结果。用 `-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=...` 自动留证，应用仍可用时用 `jcmd <pid> GC.heap_dump /path/heap.hprof`。MAT 里先看 Dominator Tree 的 retained size、Histogram 和 Path to GC Roots，判断谁保活了大对象——静态集合、ThreadLocal（线程池场景下线程不死 ThreadLocal 也不释放）、无界缓存、未关闭的资源和监听器列表是常见来源。如果回收后 old 水位持续上升且被同一对象持有，才是泄漏；一次性流量尖峰或堆配置过小是容量问题，不应误判成泄漏。\n\n`GC overhead limit exceeded` 是 GC 花了 98% 以上时间但回收不到 2% 堆空间，本质也是堆不够或存活集太大，入口同 heap space，但要特别注意分配速率和对象生命周期。\n\n`java.lang.OutOfMemoryError: Metaspace` 看类加载器泄漏：CGLIB 代理反复生成、Groovy/脚本引擎重复编译、热部署框架卸载不干净、OSGi 或自定义 ClassLoader 未释放。结合 `jcmd <pid> VM.classloader_stats` 看已加载类数和活跃 ClassLoader，或用 JFR 的 `jdk.ClassLoad`/`jdk.ClassUnload` 事件观察类加载/卸载趋势。\n\n`java.lang.OutOfMemoryError: Direct buffer memory` 看 NIO/Netty 的直接内存。Netty 开启 `-Dio.netty.leakDetection.level=advanced` 后 ByteBuf 未释放会在日志里打泄漏报告；`-XX:MaxDirectMemorySize` 设上限能让问题尽早暴露。`jcmd <pid> VM.native_memory summary`（需要启动时加 `-XX:NativeMemoryTracking=summary`）能看 direct 内存分类。\n\n`java.lang.OutOfMemoryError: unable to create native thread` 看线程数和 OS 限制：`-Xss` 设定每线程栈大小、`ulimit -u` 和 `/proc/<pid>/limits` 看进程级线程数上限、容器 cgroup 的 pid limit 和 memory limit。栈空间越大，同内存预算能创建的线程越少。\n\n容器被 OOMKilled 时（`dmesg | grep -i oom` 或 kubelet 日志），要看 RSS 和 cgroup 内存统计，不能只看 JVM heap——native 内存、direct 内存、线程栈、Code Cache、mmap 都可能贡献 RSS。"
     },
     {
       "type": "explain",
-      "title": "GC 与响应慢要从日志回到业务",
-      "content": "GC 异常常见表现是 pause 长、Young GC 频繁、Full/Old GC 频繁、allocation stall、回收后 old 水位降不下来。JDK 9+ 应使用统一日志 `-Xlog:gc*,safepoint:file=gc.log:time,uptime,level,tags`，JDK 8 再使用 `PrintGCDetails`、`PrintGCDateStamps` 和 `Xloggc`。分析时不要只看平均停顿，要看最大停顿、分位数、触发原因、回收前后各区大小、promotion rate、allocation rate、humongous、to-space exhausted、metadata threshold、explicit GC 和 safepoint 时间。\n\n判断方向有几个硬信号。Full/Old GC 后 old 仍高，优先看存活集、泄漏或缓存上限。Young GC 频繁但 old 不高，多数是分配速率和临时对象问题。Full GC 触发原因是 `System.gc()`，要查调用方或禁显式 GC。Metaspace 触发要转类加载路线。G1 出现 humongous 或 to-space 相关信号，要看大对象、Region、堆余量和晋升失败风险。\n\nRT 高、死锁和线程池耗尽则看线程状态。`Thread.print -l` 能看到 `BLOCKED`、`WAITING`、死锁检测、monitor owner 和 ownable synchronizers。连续 dump 里大量请求线程卡在同一个连接池、RPC、数据库锁或 synchronized 入口，说明瓶颈在下游或锁竞争，而不在 JVM 参数。最后要把 JVM 指标和业务指标对齐：GC pause 是否与 RT 峰值同一时间发生，错误率是否同步上升，修复后同一压测或灰度流量下是否恢复。"
+      "title": "GC 与响应慢：从日志回到业务指标",
+      "content": "GC 异常的常见表现是 pause 长、Young GC 频繁、Full/Old GC 频繁、allocation stall、回收后 old 水位降不下来。JDK 9+ 使用统一日志 `-Xlog:gc*,safepoint:file=gc.log:time,uptime,level,tags`；JDK 8 使用 `-XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:gc.log`。分析时不要只看平均停顿，要看：最大停顿和分位数、触发原因（allocation failure / humongous allocation / to-space exhausted / metadata GC threshold / explicit GC / System.gc()）、回收前后各区大小、promotion rate、allocation rate、humongous 对象数量、safepoint 时间。\n\n判断方向有几个硬信号。Full/Old GC 后 old 水位仍然很高，优先看存活集是否真正很大、是否有泄漏或缓存无上限。Young GC 频繁但 old 不高，多数是分配速率过大（临时对象、序列化缓冲区、日志拼接），需要治理分配热点或调大 Young 区。触发原因是 `System.gc()`，要查谁调用了或用 `-XX:+DisableExplicitGC` 禁掉（注意 NIO DirectByteBuffer 依赖 System.gc 回收，禁用后要确保直接内存有足够上限）。Metaspace 触发的 GC 要转类加载排查路线。G1 出现 humongous allocation 说明有对象超过 region 大小的一半，频繁 humongous 会导致 region 碎片化和并发标记开销上升；to-space exhausted 说明在 Young GC 时 Survivor/Old 空间不足以存放晋升对象，需要增加堆余量或治理存活集。\n\nRT 高和死锁则看线程状态。`jcmd <pid> Thread.print -l` 能看到 BLOCKED（等 monitor）、WAITING/TIMED_WAITING（等条件变量）、死锁检测结果、monitor owner 和 ownable synchronizers。连续 dump 里大量请求线程卡在同一个连接池、RPC 超时、数据库锁或 synchronized 入口，说明瓶颈在下游或锁竞争，不在 JVM 参数。最后要把 JVM 指标和业务指标对齐：GC pause 是否与 RT 峰值在同一时间发生、错误率是否同步上升、修复后同一压测或灰度流量下是否恢复——这才是可复验的闭环。"
+    },
+    {
+      "type": "explain",
+      "title": "诊断动作本身有风险，线上要控制取证代价",
+      "content": "每个排查工具都有副作用，不了解这些风险就可能把诊断变成二次故障。\n\n`jmap -dump:live` 里的 `:live` 选项会触发一次 Full GC 来标记存活对象，然后只导出存活对象。这会改变 GC 现场——回收后老年代水位可能骤降、后续 GC 日志不再反映故障时状态。不带 `:live` 则导出全量堆（包括垃圾对象），dump 文件更大但不改变 GC 状态。`jcmd <pid> GC.heap_dump /path` 行为类似，也支持 `:live`。dump 期间应用暂停（STW），暂停时间和堆中对象数量与引用关系复杂度成正比。堆越大，dump 文件越大——8G 堆的 live dump 可能产出 4～6G 文件，必须提前确认磁盘空间。\n\n`jstack`/`jcmd Thread.print` 触发一次 safepoint，在线程数很多或 CPU 极高时可能导致短暂 STW。连续多次 dump 间隔不宜太短（建议 2～5 秒），也要评估 safepoint 等待时间。\n\nArthas 的 `watch` 和 `trace` 通过字节码增强注入探针，对高频方法增加的开销不可忽略。线上热点方法上用 Arthas 要严格限定条件表达式和采样次数，用完及时 `reset` 还原字节码。`stack` 命令在高 QPS 方法上也要控制 `maxTimes` 和 `condition`。\n\n`jcmd <pid> GC.run` 直接触发一次 Full GC，会改变现场。`jcmd <pid> VM.native_memory summary` 在运行时做 native 内存快照，有少量 CPU 开销，但不会改变堆状态。JFR 开持续记录时对 CPU 的额外开销通常在 1～3% 左右，属于低侵入方式，适合长期开启以备回溯。\n\n结论：取证前评估磁盘、CPU 和暂停风险，优先选择低侵入工具（JFR、jstat、GC 日志），高侵入工具（dump、Arthas trace）要控制条件和时机。"
     },
     {
       "type": "diagram",
@@ -62,44 +67,48 @@
     {
       "type": "compareTable",
       "title": "症状、证据和下一步",
-      "content": "| 主症状 | 先取证 | 关键判断 | 下一步 |\n| --- | --- | --- | --- |\n| CPU 高 | `top -H`/`pidstat -t`、`jcmd Thread.print`、JFR/火焰图 | 高 CPU 是业务线程、GC 线程还是 native 线程 | 业务栈修代码；GC 线程转内存路线；native 结合系统工具 |\n| 堆 OOM | 自动 heap dump、MAT Dominator Tree、GC Roots | retained size 被谁保活，回收后 old 是否下降 | 修泄漏、加缓存上限、限流或调整堆边界 |\n| Metaspace OOM | 类加载曲线、classloader stats、JFR | ClassLoader 是否无法卸载，动态类是否增长 | 修热部署/代理/脚本加载，限制生成类或调整元空间 |\n| Direct/native OOM | NMT、Netty 指标、RSS、容器事件 | heap 不高但 RSS 高，direct/thread/native 哪块增长 | 设置 direct 上限、修 ByteBuf 泄漏、降线程数或调 `-Xss` |\n| GC pause 长 | GC 日志、safepoint、业务 RT 对齐 | pause 原因、回收后水位、humongous/to-space/metadata 信号 | 治理存活集和分配速率，再评估收集器与参数 |\n| RT 高/死锁 | 连续线程 dump、Arthas trace、下游监控 | BLOCKED/WAITING 集中在哪个锁、连接池或 RPC | 扩容下游、修锁粒度、调线程池/连接池、加超时熔断 |"
+      "content": "| 主症状 | 先取证 | 关键判断 | 下一步 |\n| --- | --- | --- | --- |\n| CPU 高 | `top -H`/`pidstat -t`、`jcmd Thread.print`、JFR/火焰图 | 高 CPU 是业务线程、GC 线程还是 native 线程 | 业务栈修代码；GC 线程转内存路线；native 用 `perf`/JFR native sample |\n| 堆 OOM | 自动 heap dump、MAT Dominator Tree、Path to GC Roots | retained size 被谁保活，回收后 old 是否下降 | 修泄漏源或加缓存上限、限流、调堆大小 |\n| Metaspace OOM | 类加载曲线、`classloader_stats`、JFR 类事件 | ClassLoader 是否无法卸载，动态类是否持续增长 | 修热部署/代理/脚本加载策略，限制运行时生成类 |\n| Direct/native OOM | NMT（需启动参数）、Netty 泄漏检测、RSS | heap 不高但 RSS 高，direct/thread/native 哪块增长 | 设 direct 上限、修 ByteBuf 泄漏、降线程数、调 `-Xss` |\n| GC pause 长 | GC 日志、safepoint 时间、业务 RT 对齐 | pause 触发原因、回收后各区水位、humongous/to-space/explicit GC | 治理存活集和分配速率，再评估收集器与参数 |\n| RT 高/死锁 | 连续线程 dump、Arthas trace、下游监控 | BLOCKED/WAITING 集中在哪个锁、连接池、RPC | 扩容下游、修锁粒度、调线程池/连接池、加超时熔断 |\n| 容器 OOMKilled | `dmesg`/kubelet 日志、cgroup 内存统计 | RSS 构成：heap + metaspace + direct + thread stack + native | 按 RSS 构成分流定位，而非只看 JVM heap |"
     },
     {
       "type": "code",
-      "title": "可运行脚本：启动一个热点线程并用 jcmd 抓证据",
-      "content": "#!/usr/bin/env bash\nset -euo pipefail\n\ntmpdir=\"$(mktemp -d)\"\ncat > \"$tmpdir/BusyDemo.java\" <<'JAVA'\npublic class BusyDemo {\n    public static void main(String[] args) throws Exception {\n        Thread hot = new Thread(() -> {\n            long x = 0;\n            while (!Thread.currentThread().isInterrupted()) {\n                x += System.nanoTime() & 7;\n                if ((x & 0x3fffff) == 0) {\n                    Thread.yield();\n                }\n            }\n        }, \"hot-loop-demo\");\n        hot.start();\n        Thread.sleep(15000);\n    }\n}\nJAVA\n\njavac \"$tmpdir/BusyDemo.java\"\njava -Xms64m -Xmx64m -cp \"$tmpdir\" BusyDemo &\npid=\"$!\"\ntrap 'kill \"$pid\" 2>/dev/null || true' EXIT\nsleep 1\n\njcmd \"$pid\" VM.flags | sed -n '1,5p'\njcmd \"$pid\" GC.heap_info | sed -n '1,10p'\njcmd \"$pid\" Thread.print -l > \"$tmpdir/thread.txt\"\ngrep -A 12 '\"hot-loop-demo\"' \"$tmpdir/thread.txt\"",
+      "title": "可运行脚本：启动热点线程并用 jcmd 抓证据",
+      "content": "#!/usr/bin/env bash\nset -euo pipefail\n\ntmpdir=\"$(mktemp -d)\"\ncat > \"$tmpdir/BusyDemo.java\" <<'JAVA'\npublic class BusyDemo {\n    public static void main(String[] args) throws Exception {\n        Thread hot = new Thread(() -> {\n            long x = 0;\n            while (!Thread.currentThread().isInterrupted()) {\n                x += System.nanoTime() & 7;\n                if ((x & 0x3fffff) == 0) {\n                    Thread.yield();\n                }\n            }\n        }, \"hot-loop-demo\");\n        hot.start();\n        Thread.sleep(15000);\n    }\n}\nJAVA\n\njavac \"$tmpdir/BusyDemo.java\"\njava -Xms64m -Xmx64m -cp \"$tmpdir\" BusyDemo &\npid=\"$!\"\ntrap 'kill \"$pid\" 2>/dev/null || true' EXIT\nsleep 1\n\n# 确认运行边界\njcmd \"$pid\" VM.flags | sed -n '1,5p'\njcmd \"$pid\" GC.heap_info | sed -n '1,10p'\n\n# 线程 dump：找热点线程\njcmd \"$pid\" Thread.print -l > \"$tmpdir/thread.txt\"\ngrep -A 12 '\"hot-loop-demo\"' \"$tmpdir/thread.txt\"\n\n# 确认热点线程的系统级 CPU 占用\npidstat -t -p \"$pid\" 1 2 | grep -A 2 'hot-loop-demo' || true",
       "language": "bash",
       "highlights": [
         {
-          "line": 5,
-          "note": "脚本现场生成一个 Java 进程，避免依赖外部业务工程。"
-        },
-        {
           "line": 26,
-          "note": "`jcmd VM.flags` 和 `GC.heap_info` 是排查时先确认运行边界的低风险命令。"
+          "note": "`jcmd VM.flags` 和 `GC.heap_info` 是低风险命令，先确认 JVM 运行边界。"
         },
         {
-          "line": 28,
-          "note": "线程 dump 里能直接看到命名热点线程和 Java 栈，真实排查时再结合 top/pidstat 的线程 id。"
+          "line": 29,
+          "note": "线程 dump 能看到命名热点线程的 Java 栈和状态（RUNNABLE），真实排查时再结合 top/pidstat 的 LWP id 映射。"
+        },
+        {
+          "line": 33,
+          "note": "pidstat 输出的 TID 就是线程 dump 里的 nid（十进制），转十六进制后可直接对应。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "线上 JVM 问题先止血和保现场，再按症状建立证据链，最后最小变更修复并用同一指标复验。不要一上来重启或调参数；重启会丢线程栈、堆对象和 GC 状态，调参没有前后对比也无法证明有效。\n\n**方法论（事故处理顺序）**\n- 确认影响面：哪些接口、哪些实例、哪个版本、错误率和 p99/p999 是否越过 SLO\n- 止血：摘除异常实例、限流、回滚、扩容、关闭可降级功能\n- 保现场：保留一台带病实例用于取证\n- 取证：日志、GC 日志、线程 dump、heap dump、JFR、监控截图、JVM flags、容器 limit、dmesg\n- 最小修复：每次只改一个变量\n- 复验：用同一批指标验证\n- 复盘：根因、影响面、处置时间线、预防措施\n\n**CPU 高（进程 → 线程 → 栈 → 代码）**\n- `top` 找 Java 进程\n- `top -H -p <pid>` 或 `pidstat -t -p <pid> 1` 找高 CPU 线程\n- 线程 id 转十六进制，在 `jcmd Thread.print -l` 或 `jstack -l` 里搜 `nid=0x...`\n- 连续抓 3-5 次确认栈稳定\n- 业务线程：死循环、正则回溯、序列化、锁自旋\n- GC 线程：转 GC 日志和内存路线\n- native：`perf`、JFR native sample\n\n**OOM（按错误类型分入口）**\n- `Java heap space`：heap dump、MAT Dominator Tree、Path to GC Roots\n- `GC overhead limit exceeded`：回收后老年代水位、分配速率\n- `Metaspace`：ClassLoader、动态代理、脚本引擎、热部署\n- `Direct buffer memory`：NIO/Netty 直接内存、`MaxDirectMemorySize`\n- `unable to create native thread`：线程数、`-Xss`、ulimit、容器 limit\n- 容器 OOMKilled：看 RSS 和 cgroup 事件，不只看 Java heap\n\n**GC 异常**\n- JDK 9+ 统一日志：`-Xlog:gc*,safepoint:file=gc.log:time,uptime,level,tags`\n- 看最大停顿、分位数、触发原因、回收前后各区大小、promotion/allocation rate\n- humongous、to-space exhausted、metadata threshold、explicit GC、safepoint 时间\n- 与业务 RT 对齐：GC pause 是否与 RT 峰值同一时间\n\n**RT 高 / 死锁**\n- 连续线程 dump、Arthas trace、下游监控\n- 看 BLOCKED、WAITING、死锁检测、monitor owner\n- 连接池、RPC、数据库锁、synchronized 入口\n\n**最终交付**\n- 影响面、现场证据、根因链路、修复为什么能解决、复验指标、监控预防\n- 不是「我用了哪些工具」，而是可复验的闭环",
+      "content": "线上 JVM 问题先止血和保现场，再按症状建立证据链，最后最小变更修复并用同一指标复验。不要一上来重启或调参数——重启丢线程栈、堆对象和 GC 状态，调参没有前后对比也无法证明有效。\n\n**方法论：事故处理顺序**\n- 确认影响面：哪些接口、哪些实例、哪个版本、错误率和 p99/p999 是否越过 SLO\n- 止血：摘除异常实例、限流、回滚、扩容、关闭可降级功能\n- 保现场：保留一台带病实例用于取证\n- 取证：日志、GC 日志、线程 dump、heap dump、JFR、监控截图、JVM flags、容器 limit、dmesg\n- 最小修复：每次只改一个变量\n- 复验：用同一批指标验证\n- 复盘：根因、影响面、处置时间线、预防措施\n\n**CPU 高：进程 → 线程 → 栈 → 代码**\n- `top` 找 Java PID\n- `top -H -p <pid>` 或 `pidstat -t -p <pid> 1` 找高 CPU 线程（LWP）\n- 线程 id 转十六进制，在 `jcmd Thread.print -l` 或 `jstack -l` 里搜 `nid=0x...`\n- 连续抓 3～5 次确认栈稳定\n- 业务线程 RUNNABLE：死循环、正则回溯、序列化、锁自旋\n- GC 线程：转 GC 日志和内存路线\n- native 热点：`perf`、JFR native sample\n\n**OOM：按错误信息分入口**\n- `Java heap space`：heap dump → MAT Dominator Tree、retained size、Path to GC Roots\n- `GC overhead limit exceeded`：同 heap，关注回收后老年代水位和分配速率\n- `Metaspace`：ClassLoader 泄漏、动态代理/脚本引擎/热部署\n- `Direct buffer memory`：NIO/Netty 直接内存、`MaxDirectMemorySize`、ByteBuf 泄漏\n- `unable to create native thread`：线程数、`-Xss`、ulimit、容器 pid/memory limit\n- 容器 OOMKilled：看 RSS 和 cgroup 事件，不能只看 JVM heap\n\n**GC 异常**\n- JDK 9+ 统一日志：`-Xlog:gc*,safepoint:file=gc.log:time,uptime,level,tags`\n- 看最大停顿、分位数、触发原因、回收前后各区大小、promotion/allocation rate\n- 关键信号：humongous、to-space exhausted、metadata threshold、explicit GC、safepoint\n- GC pause 与业务 RT 同时间发生才能说 GC 是主因\n\n**RT 高 / 死锁**\n- 连续线程 dump 看 BLOCKED、WAITING、死锁检测、monitor owner\n- 连接池、RPC、数据库锁、synchronized 入口\n\n**最终交付**\n- 影响面、现场证据、根因链路、修复为什么能解决、复验指标、监控预防\n- 不是「我用了哪些工具」，而是可复验的闭环",
       "followUpQuestions": [
         {
-          "question": "线上 CPU 100%，你会如何从现象定位到代码？",
-          "answer": "先确认影响面并保留现场实例，然后用 `top` 找 Java PID，用 `top -H -p <pid>` 或 `pidstat -t -p <pid> 1` 找高 CPU 线程，把线程 id 转成十六进制，在 `jcmd <pid> Thread.print -l` 或 `jstack -l <pid>` 里搜 `nid=0x...`。连续抓几次确认栈稳定，再判断是业务死循环、正则回溯、序列化、锁自旋、GC 线程还是 native 热点。需要占比证据时补 JFR 或 async-profiler 火焰图。"
+          "question": "线上 CPU 100%，你会如何从现象一步步定位到具体代码？",
+          "answer": "先确认影响面并保留现场实例，然后用 `top` 找 Java PID，用 `top -H -p <pid>` 或 `pidstat -t -p <pid> 1` 找高 CPU 的 LWP，把线程 id 转十六进制在 `jcmd Thread.print -l` 里搜 `nid=0x...`。连续抓 3～5 次（间隔 2～5 秒）确认同一线程的栈是否稳定在同一段代码。栈顶若是 RUNNABLE 状态的业务代码，判断是死循环、正则回溯、序列化还是锁自旋。需要量化热点占比时补 async-profiler（`-e cpu`）或 JFR 的 `jdk.ExecutionSample` 火焰图。如果高 CPU 线程是 GC Thread，要转到 GC 日志和内存排查路线。"
         },
         {
-          "question": "Java 服务内存持续上涨但 heap used 不高，可能看哪里？",
-          "answer": "先看 RSS 是否上涨。如果 heap 不高但 RSS 高，入口可能是 Direct Memory、Metaspace、线程栈、Code Cache、JNI/native、mmap 或 page cache。Direct 看 Netty/NIO 指标和 `MaxDirectMemorySize`，Metaspace 看类加载器和动态类，native 需要提前启 NMT 后用 `jcmd VM.native_memory summary`，线程问题看线程数、`-Xss`、ulimit 和容器 pid/memory limit。容器 OOMKilled 要看 cgroup 事件和系统日志，不能只看 JVM heap。"
+          "question": "Java 服务内存持续上涨但 heap used 不高，可能是什么原因？如何排查？",
+          "answer": "先看 RSS（`ps -o rss,pid` 或容器 cgroup 统计）是否上涨。如果 heap 不高但 RSS 高，可能是 Direct Memory、Metaspace、线程栈、Code Cache、JNI native 或 mmap。Direct 看 Netty 泄漏检测和 `MaxDirectMemorySize`，Metaspace 看 `classloader_stats` 和类加载趋势，native 需启动时加 `-XX:NativeMemoryTracking=summary` 后用 `jcmd VM.native_memory summary`，线程问题看 `ps -eLf | grep <pid> | wc -l` 和容器 pid/memory limit。容器 OOMKilled 时看 `dmesg` 和 cgroup 事件，按 RSS 构成分流而非只看 JVM heap。"
         },
         {
-          "question": "频繁 Full GC 但每次回收后老年代都降不下来，怎么判断？",
-          "answer": "这说明存活集很大或有泄漏。先看 GC 日志确认 Full/Old GC 触发原因和回收前后 old 水位，再导 heap dump 用 MAT 看 retained size、Dominator Tree 和 Path to GC Roots。若大对象被静态集合、ThreadLocal、无界缓存、监听器或 ClassLoader 保活，就是泄漏或缓存策略问题；若存活对象确实来自业务高峰，则要从容量、限流、缓存上限和对象生命周期治理。"
+          "question": "频繁 Full GC 但每次回收后老年代都降不下来，怎么判断是泄漏还是容量不足？",
+          "answer": "Full/Old GC 后 old 水位仍高说明存活集很大。先看 GC 日志确认触发原因和回收前后 old 水位，再导 heap dump 用 MAT 看 Dominator Tree 的 retained size 和 Path to GC Roots。如果 dominator 指向静态集合、ThreadLocal、无界缓存、未关闭资源或 ClassLoader 持有的监听器列表，且每次 GC 后 retained size 不降反升，是泄漏或缓存策略问题。如果存活对象确实是业务高峰期间的正常数据（大量并发请求的上下文、大结果集缓存），则是容量问题——需要限流、缓存过期策略、对象池化或堆扩容。一次性尖峰恢复正常说明不是泄漏。"
+        },
+        {
+          "question": "`jmap -dump:live` 和不带 `:live` 的 `jmap -dump` 有什么区别？线上应该用哪个？",
+          "answer": "`:live` 选项会先触发一次 Full GC 标记存活对象，然后只导出存活对象到 dump 文件。好处是文件更小、MAT 分析更快；坏处是改变了 GC 现场（回收后老年代水位骤降、后续 GC 日志不再反映故障时状态），而且 Full GC 本身有 STW 暂停。不带 `:live` 导出全量堆（包括垃圾对象），文件更大但不改变 GC 状态。线上建议：如果主要目的是保留现场不改变状态，用不带 `:live` 的 dump 或 `jcmd GC.heap_dump`；如果磁盘空间紧张且只需要看存活对象，用带 `:live` 的版本但要在文档中记录这次 dump 触发了 Full GC。优先用 `jcmd` 代替 `jmap`，因为 `jcmd` 是官方推荐工具且行为一致。"
         }
       ]
     },
@@ -107,60 +116,83 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能按止血、保现场、分症状下钻、最小修复、同指标复验讲完整流程",
-        "能把 CPU 高从进程、线程、十六进制 nid 映射到 Java 栈和代码热点",
-        "能按 heap、Metaspace、direct/native、thread、容器 OOMKilled 区分内存入口",
-        "能用 GC 日志解释 Full/Old GC、Young GC、allocation stall、humongous、to-space 等信号",
-        "能说明 jcmd、jstack、jmap、jstat、JFR、MAT、Arthas 各自适用和风险",
-        "能说明诊断动作可能造成 Full GC、磁盘压力或运行时开销，并做风险控制",
-        "能给出可复验的根因结论和预防措施，而不是只罗列工具命令"
+        "能按「止血 → 保现场 → 分症状下钻 → 最小修复 → 同指标复验 → 复盘」讲完整流程",
+        "能把 CPU 高从进程 PID → 线程 LWP → 十六进制 nid → Java 栈 → 代码热点完整映射",
+        "能按 heap / Metaspace / Direct / native thread / 容器 OOMKilled 区分 OOM 入口并说出各自证据",
+        "能用 GC 日志解释 Full GC 触发原因、回收后水位、allocation rate、humongous、to-space exhausted 信号",
+        "能说明 jmap dump（带/不带 `:live`）、heap dump、Arthas trace/watch、jcmd GC.run 各自的现场风险",
+        "能区分泄漏（retained size 持续上升、GC Roots 保活）与容量问题（瞬时尖峰、配置过小）",
+        "能给出可复验的根因结论：根因链路、修复为什么有效、复验指标、预防措施",
+        "能说明诊断动作可能造成 Full GC、磁盘压力或运行时开销，并给出风险控制策略"
       ]
     }
   ],
-  "interviewerFocus": "考察候选人能否把线上 JVM 故障处理成证据链：先止血保现场，再按 CPU、OOM、GC、RT/锁等待分流定位，并能说明工具风险、根因闭环和复验指标。",
+  "interviewerFocus": "考察候选人能否把线上 JVM 故障处理成可复验的证据链：先止血保现场，再按 CPU、OOM（区分六种入口）、GC 信号、RT/锁等待四条路线分流定位，能说明每个诊断动作的风险和副作用，最终给出根因闭环（根因→修复为什么有效→复验指标→预防措施）而非只罗列工具命令。",
   "recallPrompts": [
     {
       "id": "java.jvm.topic-011-c6bc7422.recall.1",
-      "prompt": "Java 服务 CPU 飙高时，你会如何用 top/pidstat、线程 nid、jcmd Thread.print、JFR 或火焰图建立证据链？",
+      "prompt": "Java 服务 CPU 飙高时，你会如何用 top/pidstat、线程 nid、jcmd Thread.print、JFR 或火焰图建立证据链？请完整描述从发现到定位代码的过程。",
       "mode": "text",
       "expectedMinutes": 6,
       "difficulty": 5
     },
     {
       "id": "java.jvm.topic-011-c6bc7422.recall.2",
-      "prompt": "Java 服务内存持续上涨时，请区分 heap、Metaspace、direct/native、thread 和容器 OOMKilled 的证据入口。",
+      "prompt": "Java 服务内存持续上涨时，请区分 heap、Metaspace、direct/native、thread 和容器 OOMKilled 的证据入口和排查方法。",
       "mode": "text",
       "expectedMinutes": 6,
       "difficulty": 5
     },
     {
       "id": "java.jvm.topic-011-c6bc7422.recall.3",
-      "prompt": "请按“止血-保现场-采证据-定位-最小修复-复验-复盘”讲一次线上 JVM 故障处理流程。",
+      "prompt": "请按「止血-保现场-采证据-定位-最小修复-复验-复盘」完整讲一次线上 JVM 故障处理流程，说明每步要做什么、为什么这个顺序。",
       "mode": "text",
       "expectedMinutes": 6,
+      "difficulty": 5
+    },
+    {
+      "id": "java.jvm.topic-011-c6bc7422.recall.4",
+      "prompt": "线上频繁 Full GC 且每次回收后老年代水位都降不下来，你如何判断是内存泄漏还是容量不足？需要哪些证据？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 5
+    },
+    {
+      "id": "java.jvm.topic-011-c6bc7422.recall.5",
+      "prompt": "`jmap -dump:live`、`jcmd GC.heap_dump`、Arthas `trace`、`jcmd GC.run` 各自在线上会造成什么影响？你会如何控制取证代价？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 5
+    },
+    {
+      "id": "java.jvm.topic-011-c6bc7422.recall.6",
+      "prompt": "你在线上发现容器被 OOMKilled，但 JVM heap 监控显示不高。请描述完整的排查思路，包括要看哪些指标和命令。",
+      "mode": "text",
+      "expectedMinutes": 5,
       "difficulty": 5
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出先止血、保现场、再定位的线上处理顺序",
-      "能说出 CPU 高的进程、线程、nid、线程栈映射方法",
-      "能用 heap dump、MAT、GC Roots 分析堆 OOM",
-      "能区分堆、Metaspace、direct/native、线程和容器 OOM",
-      "能用 GC 日志和业务 RT 对齐判断 GC 是否是主因"
+      "能说出先止血、保现场、再定位的线上处理顺序，并解释为什么不能先重启",
+      "能说出 CPU 高的进程→LWP→nid→线程栈→代码的完整映射方法",
+      "能按 heap/Metaspace/direct/native/thread/容器 OOMKilled 区分 OOM 入口并给出各自证据来源",
+      "能用 GC 日志解释 Full GC 触发原因、回收后水位和业务 RT 对齐关系",
+      "能说明泄漏（retained size 持续上升、GC Roots 保活）与容量问题的区分方法"
     ],
     "goodToHave": [
-      "能说明 jmap live dump、heap dump、Arthas trace/watch、jcmd GC.run 的线上风险",
-      "能用 JFR/async-profiler 补充 CPU 热点证据",
-      "能说明 NMT、classloader stats、safepoint、humongous/to-space 等深层信号",
-      "能给出灰度、回退、复验和复盘的闭环"
+      "能说明 jmap live dump、heap dump、Arthas trace/watch、jcmd GC.run 的线上风险和副作用",
+      "能用 JFR/async-profiler 补充 CPU 热点证据并说明各自开销",
+      "能说明 NMT、classloader stats、safepoint、humongous/to-space exhausted 等深层信号",
+      "能给出灰度、回退、复验和复盘的完整闭环",
+      "能说明诊断动作本身的现场风险并给出控制策略"
     ],
     "commonMistakes": [
-      "故障时直接重启导致现场证据丢失",
+      "故障时直接重启导致线程栈、堆对象和 GC 现场全部丢失",
       "一次修改多个变量，无法判断哪项修复有效",
-      "只背工具命令，不说每个命令要验证什么假设",
-      "把所有 OOM 都当堆泄漏处理",
-      "只看 GC pause 均值，不看触发原因、回收后水位和业务指标"
+      "只背工具命令而不说每个命令要验证什么假设、会造成什么副作用",
+      "把所有 OOM 都当堆泄漏处理，忽略 Metaspace/direct/native/线程/容器限制",
+      "只看 GC pause 均值，不看触发原因、回收后各区水位和业务指标对齐"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -169,5 +201,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-19"
+  "updatedAt": "2026-06-22"
 }

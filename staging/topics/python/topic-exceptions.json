@@ -4,7 +4,7 @@
   "category": "python-advanced",
   "group": "python-advanced",
   "title": "异常处理与 ExceptionGroup",
-  "summary": "讲清 Python 异常层级、try/except/else/finally 执行时机、raise from 异常链，以及 3.11 的 ExceptionGroup 和 except*。",
+  "summary": "讲清 Python 异常层级（BaseException → Exception）、try/except/else/finally 四子句执行时机与 finally 陷阱、raise from 异常链机制、except 顺序匹配规则，以及 3.11 ExceptionGroup + except* 处理并发多任务失败。",
   "tags": [
     "Python",
     "异常",
@@ -12,74 +12,105 @@
     "3.11"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 31,
   "order": 90,
   "recommendWeight": 85,
   "learningCards": [
     {
       "type": "explain",
-      "title": "异常体系与 try 的四个子句",
-      "content": "## 异常层级\n所有异常继承自 `BaseException`；用户一般捕获 `Exception` 及其子类。`KeyboardInterrupt`、`SystemExit` 直接继承 `BaseException`，所以 `except Exception` **不会**误吞它们。\n\n## try/except/else/finally 执行时机\n- `try`：可能抛异常的代码。\n- `except`：匹配到异常时执行（从上到下第一个匹配）。\n- `else`：`try` **没有**异常时执行（适合放“成功才做”的逻辑，缩小 try 范围）。\n- `finally`：**无论是否异常都执行**，常用于释放资源；即使 try/except 里有 return，finally 也会先执行。\n\n## raise 与异常链\n- `raise` 重新抛出当前异常（保留栈）。\n- `raise NewError() from e`：显式标注**异常链**（`__cause__`），排查时能看到根因；裸 `raise NewError()` 会隐式链（`__context__`）。\n- 自定义异常：继承 `Exception`，按业务建立异常体系便于分层捕获。"
+      "title": "异常层级：为什么 except Exception 不会吞 Ctrl+C",
+      "content": "Python 所有异常的根是 `BaseException`。业务代码通常只继承和捕获 `Exception`，但 `KeyboardInterrupt`（Ctrl+C）和 `SystemExit`（`sys.exit()`）**直接继承 `BaseException`**，不经过 `Exception`。这个设计是有意为之——系统级中断和退出信号不能被业务代码随意吞掉。\n\n实际编码中，`except Exception:` 是最宽泛的合理写法；`except BaseException:` 才能拦截 Ctrl+C 和 sys.exit，但一般不建议，除非你在写解释器、守护进程或测试框架的顶层捕获。\n\n自定义异常应继承 `Exception`，按业务域建立层级：比如 `AppError` → `AuthError`/`ValidationError`，这样上层可以用 `except AppError` 一次性兜底，底层可以精确捕获子类。\n\n`ExceptionGroup`（3.11+）也继承自 `BaseException` 而非 `Exception`，这意味着 `except Exception` 也无法直接捕获一个裸 ExceptionGroup，需要 `except*` 或显式 `except ExceptionGroup`。但 `except*` 要求目标类型是 `Exception` 的子类，不能用 `except* BaseException`（会报 TypeError）。\n\n**工程边界**：`except Exception` 不捕获 `KeyboardInterrupt` 和 `SystemExit` 是语言设计层面的刻意选择，不是 bug。写守护进程或测试框架时如果确实需要拦截 Ctrl+C，必须显式 `except BaseException`，但要确保最终仍能正常退出，否则进程无法被终止。常见的坑是用 `except BaseException: pass` 导致 Ctrl+C 完全失效，用户只能 kill 进程。"
     },
     {
       "type": "explain",
-      "title": "ExceptionGroup 与 except*（3.11+）",
-      "content": "## 解决什么问题\n并发场景（如 `asyncio.TaskGroup`）里**多个任务可能同时失败**，传统单异常模型只能抛一个。3.11 引入 **ExceptionGroup** 把多个异常聚合成一个，配合 **`except*`** 按类型分别处理。\n\n## 用法\n```python\ntry:\n    raise ExceptionGroup(\"errs\", [ValueError(\"a\"), TypeError(\"b\")])\nexcept* ValueError as eg:\n    ...  # 只处理组里的 ValueError 子组\nexcept* TypeError as eg:\n    ...  # 只处理 TypeError 子组\n```\n- `except*` 会把匹配的子异常拆成子 ExceptionGroup 处理，未匹配的继续向上传播。\n- `asyncio.TaskGroup`（3.11+）中任一任务失败，会以 ExceptionGroup 抛出所有失败。\n\n## 配套\n- `contextlib.suppress(Exc)` 优雅忽略特定异常；`add_note()`（3.11）给异常附加上下文信息。"
+      "title": "try/except/else/finally 四子句的执行时机与陷阱",
+      "content": "四个子句的规则其实很简单，但有几个工程陷阱容易踩：\n\n**执行顺序**\n- `try`：执行可能抛异常的代码。\n- `except`：try 块抛出异常时，**从上到下**找到第一个类型匹配的分支执行。匹配规则是 `isinstance`，所以写 except 时父类必须放子类后面，否则子类分支永远走不到。\n- `else`：try 块**没有**异常时才执行。它的价值是缩小 try 范围——把不可能出错的后续逻辑放到 else 里，避免意外捕获不属于你预期的异常。另一个实际作用：`except` 不会捕获 `else` 里的异常，这能帮助定位错误来源。\n- `finally`：**无论如何都执行**，包括 try/except 里有 `return`/`break`/`continue` 的情况。finally 在这些控制流语句之前生效。\n\n**finally 的两个陷阱**\n1. **finally 里 return 会吞异常**：如果 try 块抛了异常，finally 里写了 `return`，异常会被静默丢弃，函数返回 finally 的值。这是极难排查的 bug，生产代码永远不要在 finally 里 return。\n2. **finally 里可以修改 return 值**：try 里 `return x`，finally 里 `x = 999`，如果 x 是可变对象（如列表），修改会反映到返回值；如果是不可变对象（如 int），try 里已经把值绑定好了，finally 的修改无效。\n\n**except 的匹配顺序**\nPython 按 except 书写顺序从上到下匹配，不是按继承关系选最具体。这意味着 `except Exception` 放在 `except ValueError` 前面，后者永远不会被执行。正确做法：子类在前、父类在后。"
+    },
+    {
+      "type": "explain",
+      "title": "raise from 与异常链：排查链路的关键工具",
+      "content": "异常链的核心目的是让你在排查问题时能看到「这个问题是怎么引起的」。\n\n**显式链（`raise X from e`）**\n在 except 块里用 `raise NewError() from original_error`，会把 `original_error` 设置为 `NewError` 的 `__cause__`。traceback 输出会显示 `The above exception was the direct cause of the following exception:`，根因一目了然。这是主动转换异常类型时的最佳实践。\n\n**隐式链（裸 `raise` 或 `raise X` 在 except 块内）**\n在 except 块里直接 `raise NewError()`（不带 from），Python 会自动把正在处理的异常设为 `NewError` 的 `__context__`。traceback 显示 `During handling of the above exception, another exception occurred:`。语义是「处理旧异常时又发生了新异常」，比显式链弱一些。\n\n**中断隐式链**\n`raise NewError() from None` 可以显式切断隐式链，traceback 不会再显示旧异常。适用于底层异常对排查没帮助、你不希望泄露内部细节的场景。\n\n**实际工程建议**\n- 底层 IO/网络/数据库异常转换为业务异常时，始终用 `from e`，保留根因。\n- 框架层转译异常时，如果底层异常细节会暴露安全信息，用 `from None` 切断。\n- 日志框架（如 logging.exception）会自动打印完整异常链，前提是你维护了 `__cause__` 或 `__context__`。"
+    },
+    {
+      "type": "explain",
+      "title": "ExceptionGroup 与 except*：并发多异常的聚合处理",
+      "content": "**问题背景**\n传统单异常模型假设一次操作只失败一次。但在并发场景下——比如 `asyncio.TaskGroup` 同时跑 5 个任务，3 个都失败了——你不可能只抛一个异常而丢掉其他失败信息。Python 3.11 引入 `ExceptionGroup` 和 `except*` 解决这个问题。\n\n**ExceptionGroup 是什么**\n`ExceptionGroup(msg, exceptions)` 把多个异常聚合成一个对象，它继承自 `BaseException`（不是 `Exception`）。它有一个 `.exceptions` 属性存储子异常列表，子异常本身也可以是 ExceptionGroup（嵌套组）。\n\n**except* 的匹配和拆分**\n`except*` 不是传统 except 的「捕获一个」，而是「从组里拆出匹配的子组」：\n- `except* ValueError as eg:` 会从 ExceptionGroup 中拆出所有 ValueError 及其子类，组成一个新的 ExceptionGroup 交给 eg。\n- 一个 try 块可以有多个 `except*` 分支，每个分支处理不同类型。\n- 未被任何 `except*` 匹配的异常会**继续向外传播**，包含已被匹配但类型不同的残余。\n\n**asyncio.TaskGroup 的行为**\n`asyncio.TaskGroup` 中任一任务抛异常时，它会：1）取消同组所有未完成任务；2）等待所有任务结束（包括取消的）；3）把所有失败汇总成 ExceptionGroup 抛出。这保证你不会丢失任何任务的失败信息。\n\n**与 contextlib.suppress 的区别**\n`contextlib.suppress(ValueError)` 是优雅地忽略特定异常（等价于空 except 但更清晰），它不处理多异常聚合的场景。ExceptionGroup 面向的是「我需要同时感知和处理多个失败」。\n\n**使用边界**：ExceptionGroup 仅 Python 3.11+ 可用，低版本只能用第三方库 `exceptiongroup`。当并发任务之间有数据依赖（后一个依赖前一个输出）时，用普通 try/except 即可，不需要 ExceptionGroup。只有多个**独立**任务同时失败、且你需要感知所有失败信息时才用它。`except*` 不能用于非 ExceptionGroup 的普通异常——对普通异常用 `except* ValueError` 会抛 `TypeError`。嵌套 ExceptionGroup 会让拆分逻辑变得复杂，建议控制嵌套深度。"
     },
     {
       "type": "diagram",
       "format": "mermaid",
-      "title": "异常处理与 ExceptionGroup：机制分支与风险路径",
-      "content": "flowchart TD\nNgetbrjS[异常处理与 ExceptionGroup 触发入口] --> NgetbrjM[核心对象或状态: Python]\nNgetbrjM --> NgetbrjC{异常处理与 ExceptionGroup 是否走正常路径}\nNgetbrjC -->|正常| NgetbrjN[执行 异常处理与 ExceptionGroup 主流程]\nNgetbrjC -->|异常| NgetbrjF[处理 异常处理与 ExceptionGroup 边界风险]\nNgetbrjN --> NgetbrjO[输出结果或交给下一组件]\nNgetbrjF --> NgetbrjR[按 异常处理与 ExceptionGroup 语义降级/重试/报错]\nNgetbrjO --> NgetbrjV[验证 异常处理与 ExceptionGroup 日志、指标或测试]\nNgetbrjR --> NgetbrjV",
-      "caption": "异常处理与 ExceptionGroup 图中的分支用于区分本题正常机制、异常边界和工程验证路径。",
-      "fallback": "异常处理与 ExceptionGroup 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。",
+      "title": "异常处理与 ExceptionGroup：传播与拆分",
+      "content": "flowchart TD\nA[try 代码块执行] --> B{是否抛异常?}\nB -->|否| C[执行 else]\nC --> D[执行 finally]\nB -->|是| E[按 except 从上到下匹配]\nE -->|匹配| F[执行对应 except]\nE -->|未匹配| G[异常继续向外传播]\nF --> H{是否 raise from e?}\nH -->|是| I[保留 __cause__ 异常链]\nH -->|否| J[隐式 __context__ 或直接处理]\nI --> D\nJ --> D\nG --> D\nK[asyncio.TaskGroup 多任务失败] --> L[抛 ExceptionGroup]\nL --> M[except* 按类型拆出子组]\nM --> N[未匹配子异常继续传播]",
+      "caption": "普通异常按 except 顺序匹配，finally 总执行；ExceptionGroup 用 except* 按类型拆分处理，未匹配部分继续传播。",
+      "fallback": "try 无异常时走 else，再走 finally；有异常时按 except 顺序匹配，raise from 能保留根因链。asyncio.TaskGroup 可能抛 ExceptionGroup，except* 会按异常类型拆出子组处理，剩余未匹配异常继续向外传播。",
       "sources": [
         {
           "kind": "mermaid",
-          "content": "flowchart TD\nNgetbrjS[异常处理与 ExceptionGroup 触发入口] --> NgetbrjM[核心对象或状态: Python]\nNgetbrjM --> NgetbrjC{异常处理与 ExceptionGroup 是否走正常路径}\nNgetbrjC -->|正常| NgetbrjN[执行 异常处理与 ExceptionGroup 主流程]\nNgetbrjC -->|异常| NgetbrjF[处理 异常处理与 ExceptionGroup 边界风险]\nNgetbrjN --> NgetbrjO[输出结果或交给下一组件]\nNgetbrjF --> NgetbrjR[按 异常处理与 ExceptionGroup 语义降级/重试/报错]\nNgetbrjO --> NgetbrjV[验证 异常处理与 ExceptionGroup 日志、指标或测试]\nNgetbrjR --> NgetbrjV"
+          "content": "flowchart TD\nA[try 代码块执行] --> B{是否抛异常?}\nB -->|否| C[执行 else]\nC --> D[执行 finally]\nB -->|是| E[按 except 从上到下匹配]\nE -->|匹配| F[执行对应 except]\nE -->|未匹配| G[异常继续向外传播]\nF --> H{是否 raise from e?}\nH -->|是| I[保留 __cause__ 异常链]\nH -->|否| J[隐式 __context__ 或直接处理]\nI --> D\nJ --> D\nG --> D\nK[asyncio.TaskGroup 多任务失败] --> L[抛 ExceptionGroup]\nL --> M[except* 按类型拆出子组]\nM --> N[未匹配子异常继续传播]"
         },
         {
           "kind": "text",
-          "content": "异常处理与 ExceptionGroup 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。"
+          "content": "try 无异常时走 else，再走 finally；有异常时按 except 顺序匹配，raise from 能保留根因链。asyncio.TaskGroup 可能抛 ExceptionGroup，except* 会按异常类型拆出子组处理，剩余未匹配异常继续向外传播。"
         }
       ]
     },
     {
+      "type": "compareTable",
+      "title": "异常处理关键机制对比",
+      "content": "| 机制 | 作用 | 关键细节 | 常见坑 |\n| --- | --- | --- | --- |\n| `except Exception` | 捕获业务异常 | 不捕获 KeyboardInterrupt/SystemExit/ExceptionGroup | 裸 `except:` 会误吞 Ctrl+C |\n| `except* ValueError` | 从 ExceptionGroup 拆出匹配子组 | 未匹配的异常继续传播 | 只能在 ExceptionGroup 上下文中使用 |\n| `raise X from e` | 显式异常链（__cause__） | traceback 显示\"直接引起\" | 忘记 from 导致根因丢失 |\n| `raise X`（在 except 块内） | 隐式异常链（__context__） | traceback 显示\"处理时发生\" | 语义不如 from 清晰 |\n| `raise X from None` | 切断隐式链 | 不显示旧异常 | 可能隐藏排查信息 |\n| `else` 子句 | try 成功后的逻辑 | except 不捕获 else 中的异常 | 误以为 else 只是语法糖 |\n| `finally` 子句 | 无论如何执行 | 有 return 时先于 return 执行 | finally 里 return 会吞异常 |\n| `contextlib.suppress` | 优雅忽略异常 | 等价于空 except 但更清晰 | 不处理 ExceptionGroup 场景 |\n| `add_note()`（3.11） | 给异常附加信息 | 多次调用可累积注释 | 过度添加导致信息噪声 |"
+    },
+    {
       "type": "code",
-      "title": "代码示例",
-      "content": "import asyncio\n\nasync def worker(n):\n    if n == 2:\n        raise ValueError(f\"bad {n}\")\n    await asyncio.sleep(0.1)\n    return n\n\nasync def main():\n    try:\n        async with asyncio.TaskGroup() as tg:   # 3.11+\n            for i in range(4):\n                tg.create_task(worker(i))\n    except* ValueError as eg:                    # 处理聚合里的 ValueError\n        print(\"caught\", [str(e) for e in eg.exceptions])\n\n# try/except/else/finally 时机\ndef divide(a, b):\n    try:\n        r = a / b\n    except ZeroDivisionError as e:\n        raise ValueError(\"b must be non-zero\") from e   # 异常链\n    else:\n        return r            # 仅无异常时\n    finally:\n        print(\"always runs\")  # 总会执行\n\nasyncio.run(main())",
+      "title": "代码示例：四子句时机、异常链与 ExceptionGroup",
+      "content": "import asyncio\n\n# === 1. try/except/else/finally 四子句时机 ===\ndef divide(a, b):\n    try:\n        result = a / b\n    except ZeroDivisionError as e:\n        # 显式异常链：转换类型但保留根因\n        raise ValueError(\"b must be non-zero\") from e\n    else:\n        # 仅 try 无异常时执行；except 不会捕获 else 里的异常\n        return result\n    finally:\n        # 无论如何都执行，即使 try/except 里有 return\n        print(\"finally: always runs\")\n\n# finally 陷阱：return 会吞异常\ndef bad_finally():\n    try:\n        raise ValueError(\"original error\")\n    finally:\n        return \"from finally\"  # 静默丢弃了 ValueError!\n\nassert bad_finally() == \"from finally\"  # 异常被吞掉\n\n# === 2. except 顺序问题 ===\ndef match_order(n):\n    try:\n        if n < 0:\n            raise ValueError(\"negative\")\n    except ValueError:\n        print(\"caught ValueError\")  # 子类在前，优先匹配\n    except Exception:\n        print(\"caught Exception\")   # 父类兜底，放在后面\n\n# === 3. ExceptionGroup + except*（3.11+）===\nasync def worker(n):\n    if n == 2:\n        raise ValueError(f\"bad value: {n}\")\n    if n == 3:\n        raise TypeError(f\"bad type: {n}\")\n    await asyncio.sleep(0.01)\n    return n\n\nasync def taskgroup_demo():\n    try:\n        async with asyncio.TaskGroup() as tg:  # 3.11+\n            for i in range(5):\n                tg.create_task(worker(i))\n    except* ValueError as eg:\n        print(f\"ValueError group: {[str(e) for e in eg.exceptions]}\")\n    except* TypeError as eg:\n        print(f\"TypeError group: {[str(e) for e in eg.exceptions]}\")\n\nasyncio.run(taskgroup_demo())",
       "language": "python",
       "highlights": [
         {
-          "line": 18,
-          "note": "`def divide(a, b):` 定义了 异常处理与 ExceptionGroup 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
-        },
-        {
           "line": 12,
-          "note": "`for i in range(4):` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+          "note": "finally 子句在 return 之前执行，适合做资源释放。"
         },
         {
-          "line": 4,
-          "note": "`if n == 2:` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 20,
+          "note": "finally 里的 return 会静默吞掉 try 中抛出的异常，这是极难排查的 bug。"
         },
         {
-          "line": 3,
-          "note": "`async def worker(n):` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+          "line": 28,
+          "note": "子类异常写在前面，否则父类先匹配会吞掉子类分支。"
+        },
+        {
+          "line": 43,
+          "note": "TaskGroup 中任一任务失败会取消同组其他任务并汇总所有失败。"
+        },
+        {
+          "line": 45,
+          "note": "except* 从 ExceptionGroup 中按类型拆出子组，多个 except* 可以并存处理不同类型。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：Python 异常体系以 BaseException 为根，业务一般捕获 Exception；try 有 try/except/else/finally 四个子句，3.11 还加了 ExceptionGroup 和 except* 处理并发下的多异常。\n\n要点：\n\n1. 层级：KeyboardInterrupt、SystemExit 直接继承 BaseException，所以 except Exception 不会误吞它们，Ctrl+C 还能中断。\n2. 四子句时机：try 放可能出错的代码；except 匹配到才执行、从上到下第一个匹配；else 在 try 没异常时执行，适合放「成功才做」的逻辑、缩小 try 范围；finally 无论是否异常都执行，即使 try 里有 return，finally 也先执行，常用于释放资源。\n3. 异常链：raise NewError() from e 显式标根因（__cause__），排查时能看到「由谁引起」；自定义异常继承 Exception、按业务分层便于捕获。\n4. ExceptionGroup（3.11）：并发场景（asyncio.TaskGroup）里多个任务可能同时失败，单异常模型只能抛一个，ExceptionGroup 把多个聚合成一个，配合 except* 按类型分别处理。\n\n边界。① 别用 except Exception: pass 吞掉所有异常，至少记日志，否则问题被掩盖。② finally 里别 return，会覆盖 try 的返回值和异常。③ 捕获要尽量具体，从上到下先写子类异常再写父类，否则父类先匹配、子类分支永远走不到。",
+      "content": "**结论**：Python 异常体系以 BaseException 为根，业务继承 Exception；try/except/else/finally 四个子句各有明确执行时机；3.11 引入 ExceptionGroup + except* 解决并发多任务同时失败的聚合处理问题。\n\n**层级与捕获**\n- BaseException 是所有异常的根；KeyboardInterrupt 和 SystemExit 直接继承它，不经过 Exception\n- `except Exception` 不会误吞 Ctrl+C 和 sys.exit，这是刻意设计\n- 自定义异常继承 Exception，按业务域建层级（如 AppError → AuthError / ValidationError）\n- ExceptionGroup 继承 BaseException，需要 except* 或显式 except ExceptionGroup 处理\n\n**四子句时机**\n- try：可能抛异常的代码\n- except：从上到下按 isinstance 匹配第一个，子类要写在父类前面\n- else：try 没异常时执行，缩小 try 范围，except 不捕获 else 里的异常\n- finally：无论如何都执行，即使有 return；finally 里的 return 会吞掉异常\n\n**异常链**\n- `raise X from e`：显式设 __cause__，traceback 显示「直接引起」，保留根因\n- 裸 `raise X` 在 except 块内：隐式设 __context__，语义较弱\n- `raise X from None`：切断隐式链，适用于底层异常无排查价值的场景\n\n**ExceptionGroup 与 except***\n- 并发场景（asyncio.TaskGroup）多个任务可能同时失败，单异常模型只能抛一个\n- ExceptionGroup 把多个异常聚合成一个对象\n- except* 按类型从组里拆出匹配的子组，未匹配的继续传播\n- TaskGroup 中一个任务失败会取消同组所有未完成任务，然后汇总所有失败抛出\n\n**工程边界**\n- 不要用 `except Exception: pass` 静默吞异常，至少记日志\n- finally 里不要 return\n- except 块里捕获要具体，子类在前父类在后\n- 框架层转译异常用 `from e` 保留链路，用 `from None` 切断无用链路",
       "followUpQuestions": [
         {
-          "question": "except Exception 能捕获 KeyboardInterrupt 吗？",
-          "answer": "不能。KeyboardInterrupt 和 SystemExit 直接继承 BaseException 而非 Exception，所以 except Exception 不会吞掉它们，保证 Ctrl+C、sys.exit 能正常中断/退出。要捕获它们得显式 except BaseException（一般不建议）。"
+          "question": "except Exception 能捕获 KeyboardInterrupt 吗？为什么？",
+          "answer": "不能。KeyboardInterrupt 和 SystemExit 直接继承 BaseException 而非 Exception，这是刻意设计——系统级中断信号不能被业务代码随意吞掉。要捕获它们需要显式 except BaseException，但一般不建议这么做。"
         },
         {
-          "question": "raise NewError() 和 raise NewError() from e 有什么区别？",
-          "answer": "from e 显式设置 __cause__，traceback 会明确显示“由 e 引起”，根因清晰；不带 from 时若在 except 块里抛出，会隐式设置 __context__（“处理 e 时又发生了”），语义较弱。排查链路问题时优先用 from。"
+          "question": "finally 里写 return 会发生什么？",
+          "answer": "finally 里的 return 会静默吞掉 try 或 except 中抛出的异常，函数返回 finally 的返回值。这会导致错误被掩盖，极难排查。生产代码永远不要在 finally 里 return。"
+        },
+        {
+          "question": "raise X 和 raise X from e 有什么区别？",
+          "answer": "`from e` 显式设置 `__cause__`，traceback 明确显示「由 e 引起」，根因清晰；不带 from 在 except 块内抛出时，隐式设置 `__context__`（「处理 e 时又发生了」），语义较弱。排查链路问题时优先用 from，不想暴露底层细节时用 `from None` 切断。"
+        },
+        {
+          "question": "except* 和传统 except 有什么本质区别？",
+          "answer": "传统 except 是「捕获一个异常」；except* 是「从 ExceptionGroup 中按类型拆出匹配的子组」。一个 try 块可以有多个 except* 分支并存，每个处理不同类型；未被匹配的异常继续传播。except* 只在 ExceptionGroup 上下文中有意义。"
+        },
+        {
+          "question": "asyncio.TaskGroup 中一个任务失败后，其他任务会怎样？",
+          "answer": "TaskGroup 会取消同组所有未完成任务，等待它们结束（包括取消的），然后把所有失败的任务的异常汇总成一个 ExceptionGroup 抛出。这保证不会丢失任何失败信息。"
         }
       ]
     },
@@ -87,32 +118,56 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能画出 BaseException/Exception 层级并解释为何 except Exception 不吞 KeyboardInterrupt",
-        "能说清 try/except/else/finally 四个子句的执行时机",
-        "能用 raise from 维护异常链并解释作用",
-        "能用 ExceptionGroup + except* 处理并发多异常",
-        "能说明 asyncio.TaskGroup 失败时的异常聚合行为"
+        "能画出 BaseException/Exception 层级，解释为什么 except Exception 不会捕获 KeyboardInterrupt 和 SystemExit",
+        "能说清 try/except/else/finally 四个子句各自的执行时机",
+        "能解释 finally 里 return 会吞异常的机制和危害",
+        "能用 raise from 维护异常链，区分 __cause__ 和 __context__",
+        "能解释 except 从上到下匹配的顺序问题，子类必须在父类前面",
+        "能用 ExceptionGroup + except* 处理并发多异常，解释拆分和传播机制",
+        "能说明 asyncio.TaskGroup 失败时的取消和异常聚合行为",
+        "能用 contextlib.suppress 优雅忽略特定异常"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "python.python-advanced.topic-exceptions.recall.1",
-      "prompt": "解释 try/except/else/finally 各自的执行时机，并说明 finally 里有 return 的风险。",
+      "prompt": "解释 try/except/else/finally 各自的执行时机，并说明 finally 里有 return 会怎样。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "python.python-advanced.topic-exceptions.recall.2",
-      "prompt": "ExceptionGroup 和 except* 解决了什么问题？写一段用 asyncio.TaskGroup 触发并按类型处理的代码思路。",
-      "mode": "code",
+      "prompt": "raise X、raise X from e、raise X from None 三种写法分别对应异常链的什么行为？排查时怎么看 traceback？",
+      "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "python.python-advanced.topic-exceptions.recall.3",
-      "prompt": "自定义异常体系应该怎么设计？什么时候捕获、什么时候让异常抛出去？裸 except 为什么危险？",
+      "prompt": "ExceptionGroup 和 except* 解决了什么问题？写一段用 asyncio.TaskGroup 触发并按类型处理的代码，说明 except* 的拆分和传播规则。",
+      "mode": "code",
+      "expectedMinutes": 5,
+      "difficulty": 3
+    },
+    {
+      "id": "python.python-advanced.topic-exceptions.recall.4",
+      "prompt": "except ValueError 写在 except Exception 后面会怎样？为什么？",
+      "mode": "text",
+      "expectedMinutes": 2,
+      "difficulty": 3
+    },
+    {
+      "id": "python.python-advanced.topic-exceptions.recall.5",
+      "prompt": "线上发现一个函数在 try 块抛异常后返回了奇怪的值，排查发现 finally 里有 return。解释这个 bug 的机制。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "python.python-advanced.topic-exceptions.recall.6",
+      "prompt": "自定义异常体系应该怎么设计？什么时候捕获、什么时候让异常向上抛出？为什么不能用裸 except 或 except Exception: pass？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -120,20 +175,24 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说出 BaseException/Exception 层级，except Exception 不吞 KeyboardInterrupt",
+      "能说出 BaseException/Exception 层级，except Exception 不会捕获 KeyboardInterrupt/SystemExit",
       "能讲清 try/except/else/finally 四子句的执行时机",
-      "能解释 raise ... from 异常链的作用",
-      "能说明 ExceptionGroup 和 except* 解决并发多异常"
+      "能解释 raise from 显式异常链（__cause__）和隐式异常链（__context__）的区别",
+      "能说明 ExceptionGroup 和 except* 解决并发多异常的作用，以及拆分和传播规则"
     ],
     "goodToHave": [
-      "能说明 finally 即使有 return 也会执行",
+      "能解释 finally 里 return 会吞异常的机制和危害",
+      "能说明 except 匹配顺序问题：子类在前、父类在后",
       "能用 contextlib.suppress 优雅忽略异常",
-      "能说出 asyncio.TaskGroup 用 ExceptionGroup 抛多个失败"
+      "能说明 asyncio.TaskGroup 失败时取消同组任务并汇总异常的行为",
+      "能用 raise from None 切断无用的隐式链"
     ],
     "commonMistakes": [
-      "用 except Exception: pass 静默吞掉异常",
-      "except 父类写在子类前导致子类分支走不到",
-      "在 finally 里 return 覆盖了正常返回值或异常"
+      "用 `except Exception: pass` 或裸 `except:` 静默吞掉所有异常，导致问题无法排查",
+      "except 父类写在子类前面，导致子类分支永远走不到",
+      "在 finally 里 return，静默吞掉 try/except 中的异常",
+      "忘记用 raise from 保留原始异常信息，导致排查时丢失根因",
+      "以为 except* 是传统 except 的替代，不知道它只在 ExceptionGroup 上下文中才有意义"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -142,10 +201,10 @@
       "depth": 20
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "staging",
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否说清异常层级和四子句时机、解释异常链和 except 顺序坑，并了解 ExceptionGroup/except* 处理并发多异常。",
+  "interviewerFocus": "考察能否说清异常层级与四子句时机、解释异常链维护与 except 顺序陷阱、理解 ExceptionGroup/except* 处理并发多异常的拆分传播机制，以及 finally 陷阱等工程边界。",
   "prerequisites": [
     "python.python-advanced.decorators"
   ]

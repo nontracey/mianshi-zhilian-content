@@ -4,7 +4,7 @@
   "category": "csharp",
   "group": "csharp",
   "title": "async/await 异步编程",
-  "summary": "讲清 async/await 的状态机本质、await 挂起释放线程、async void 与 .Result 死锁的坑、ConfigureAwait 和 ValueTask 等要点。",
+  "summary": "讲清 async/await 的状态机本质（编译器如何把 async 方法变成 MoveNext 链）、await 挂起时释放线程与恢复时回到同步上下文的机制、async void 与 .Result/.Wait() 死锁的成因和解法、ConfigureAwait(false) 在库代码中的意义、ValueTask 减少同步完成路径分配、以及 Task.WhenAll 并发、取消和超时等实用模式。",
   "tags": [
     ".NET",
     "C#",
@@ -14,20 +14,30 @@
     "await"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 35,
   "order": 30,
   "recommendWeight": 95,
   "status": "production",
   "learningCards": [
     {
       "type": "explain",
-      "title": "async/await 异步编程：Task 与 Task<T>、async/await 工作原理",
-      "content": "async/await 是 C# 5.0 引入的异步编程模型，它简化了异步代码的编写，让异步代码看起来像同步代码一样直观。\n\n## Task 与 Task<T>\n\n**Task**：表示一个异步操作，不返回结果\n```csharp\nTask task = DoWorkAsync();\nawait task;\n```\n\n**Task<T>**：表示一个返回 T 类型结果的异步操作\n```csharp\nTask<int> task = GetValueAsync();\nint result = await task;\n```\n\n**Task 的状态**：\n- Created：已创建\n- WaitingForActivation：等待激活\n- WaitingToRun：等待运行\n- Running：正在运行\n- RanToCompletion：成功完成\n- Faulted：发生异常\n- Canceled：已取消\n\n## async/await 工作原理\n\n当编译器遇到 `async` 方法时，会将其转换为状态机：\n1. 方法开始执行，直到遇到第一个 `await`\n2. 如果 await 的任务未完成，方法返回一个未完成的 Task\n3. 当 await 的任务完成时，方法从上次暂停的地方继续执行\n4. 整个过程中，UI 线程不会被阻塞\n\n```csharp\npublic async Task<string> GetDataAsync()\n{\n    // 第一部分：同步执行\n    var client = new HttpClient();\n    \n    // 遇到 await，方法返回，UI 线程继续\n    string data = await client.GetStringAsync(\"https://api.example.com\");\n    \n    // 第二部分：异步完成后继续\n    return data.ToUpper();\n}\n```\n\n## ConfigureAwait 的重要性\n\n**ConfigureAwait(bool continueOnCapturedContext)**：\n- `ConfigureAwait(true)`（默认）：在原始同步上下文（如 UI 线程）上继续执行\n- `ConfigureAwait(false)`：不强制回到原始上下文，可能在线程池线程上继续\n\n**UI 应用程序**：\n```csharp\n// 需要访问 UI 控件，必须回到 UI 线程\nawait DoWorkAsync().ConfigureAwait(true);\ntextBox.Text = \"Done\"; // 安全\n```\n\n**库代码**：\n```csharp\n// 库代码不应依赖特定同步上下文\nawait DoWorkAsync().ConfigureAwait(false);\n```\n\n## SynchronizationContext\n\nSynchronizationContext 提供了在特定线程上执行代码的机制：\n- UI 程序：WindowsFormsSynchronizationContext / DispatcherSynchronizationContext\n- ASP.NET（旧版）：AspNetSynchronizationContext\n- 控制台/线程池：null\n\n```csharp\n// 获取当前同步上下文\nvar context = SynchronizationContext.Current;\n\n// 在 UI 线程上执行\ncontext.Post(_ => textBox.Text = \"Updated\", null);\n```"
+      "title": "async/await 的状态机本质：编译器把方法切成 MoveNext 片段",
+      "content": "async/await 是 C# 5.0 引入的语法糖，编译器会把一个 async 方法转换成一个实现了 IAsyncStateMachine 的状态机结构。这个结构包含一个 `state` 字段和所有跨 await 边界需要存活的局部变量（被提升为字段）。每次调用 `MoveNext()` 会从上次暂停的位置继续，遇到下一个 await 时根据任务是否完成决定是同步继续还是挂起并返回。\n\n关键流程：调用 async 方法 → 编译器创建状态机 → 执行同步代码直到遇到第一个 await → 如果 await 的任务已完成（IsCompleted == true），状态机直接取结果、更新状态、继续执行下一段同步代码 → 如果任务未完成，状态机把 continuation 注册到任务上（通过 GetAwaiter().OnCompleted），然后从 MoveNext 返回，调用者拿到一个未完成的 Task → 任务完成时框架回调 continuation，状态机从上次暂停的 state 重新进入 MoveNext，执行剩余代码。\n\n所以 await 不是「开线程」，它只是「如果还没做完就把 continuation 挂上去、让当前线程去做别的事」。真正做 IO 的是底层的 OS 异步机制（IOCP、epoll 等），线程只在有事可做时才被使用。这就是 async/await 的核心价值：在 IO 等待期间不占用线程。"
     },
     {
       "type": "explain",
-      "title": "async/await 异步编程：常见陷阱与解决方案、性能优化",
-      "content": "## 常见陷阱与解决方案\n\n### 1. async void\n```csharp\n// 错误：无法捕获异常，无法等待\nasync void DoWork() { ... }\n\n// 正确：返回 Task\nasync Task DoWorkAsync() { ... }\n```\n\n### 2. 死锁\n```csharp\n// 危险：在同步代码中调用异步方法\nvar result = GetDataAsync().Result; // 可能死锁\n\n// 解决方案1：全部异步\nvar result = await GetDataAsync();\n\n// 反模式：用 Task.Run(...).Result 包一层通常只是转移阻塞，不能作为通用解决方案\n// var result = Task.Run(() => GetDataAsync()).Result;\n```\n\n### 3. 异常处理\n```csharp\ntry\n{\n    await DoWorkAsync();\n}\ncatch (Exception ex)\n{\n    // 异步异常可以正常捕获\n    Console.WriteLine(ex.Message);\n}\n```\n\n### 4. 取消支持\n```csharp\npublic async Task DoWorkAsync(CancellationToken cancellationToken)\n{\n    await Task.Delay(1000, cancellationToken);\n    cancellationToken.ThrowIfCancellationRequested();\n}\n```\n\n## 性能优化\n\n1. **避免不必要的 async/await**：\n```csharp\n// 不需要\npublic async Task<int> GetValueAsync()\n{\n    return await _repository.GetValueAsync();\n}\n\n// 直接返回 Task\npublic Task<int> GetValueAsync()\n{\n    return _repository.GetValueAsync();\n}\n```\n\n2. **使用 ValueTask**：对于可能同步完成的操作\n```csharp\npublic ValueTask<int> GetValueAsync()\n{\n    if (_cache.TryGetValue(key, out var value))\n        return new ValueTask<int>(value);\n    \n    return new ValueTask<int>(GetValueFromDbAsync());\n}\n```\n\n3. **并行执行多个异步操作**：\n```csharp\nvar task1 = GetOrderAsync();\nvar task2 = GetCustomerAsync();\nawait Task.WhenAll(task1, task2);\n```\n\n4. **使用 Task.WhenAny 实现超时**：\n```csharp\nvar task = DoWorkAsync();\nif (await Task.WhenAny(task, Task.Delay(5000)) != task)\n{\n    throw new TimeoutException();\n}\n```"
+      "title": "await 挂起与同步上下文：线程释放、恢复和 ConfigureAwait",
+      "content": "当 await 的任务未完成时，当前方法会把控制权返回给调用者，当前线程被释放回线程池（或 UI 消息循环继续处理其他消息）。任务完成后，框架需要决定在哪个线程上执行 continuation，这个决策取决于 `SynchronizationContext` 和 `ConfigureAwait`。\n\n默认行为（ConfigureAwait(true) 或不写）：框架会捕获当前的 SynchronizationContext，任务完成后把 continuation Post 到这个上下文上执行。在 WPF/WinForms 里这意味着回到 UI 线程；在旧版 ASP.NET 里这意味着回到请求上下文（AspNetSynchronizationContext）。在控制台程序和 ASP.NET Core 里 SynchronizationContext.Current 是 null，continuation 直接在线程池线程上执行。\n\nConfigureAwait(false) 的作用是告诉编译器「不要捕获 SynchronizationContext」，continuation 在任意线程池线程上执行。对库代码而言，你不知道调用方的 SynchronizationContext 是什么，加 ConfigureAwait(false) 可以：① 避免强制回到 UI 线程（减少切换开销）；② 避免在有单线程同步上下文的环境里造成死锁。规则：UI 层代码需要访问控件时用默认 true；业务逻辑层、基础设施层、NuGet 库内部一律 ConfigureAwait(false)。在 .NET Core/.NET 5+ 中可以使用 NuGet 包 ConfigureAwait.Fody 或 Microsoft.VisualStudio.Threading 的 ConfigureAwait 分析器自动注入。"
+    },
+    {
+      "type": "explain",
+      "title": "async void 的危害与 .Result 死锁：两个经典坑",
+      "content": "**async void** 的本质问题：编译器为 async void 生成的状态机不会把异常包装到 Task 里，未捕获异常会直接抛到 SynchronizationContext（UI 环境会崩溃应用）或线程池的 UncaughtException（导致进程终止）。同时 async void 方法的调用者拿不到 Task，无法 await、无法知道它何时完成、无法捕获异常。唯一合法的使用场景是事件处理器（按钮点击等，签名由框架决定为 void）。如果需要从 async void 方法中 fire-and-forget，至少要在方法内部用 try-catch 兜住所有异常并记录日志。\n\n**.Result / .Wait() 死锁**的成因：在有单线程同步上下文的环境（WPF、WinForms、旧版 ASP.NET）中，同步代码调用 `.Result` 会阻塞当前线程。但 async 方法内部的 await 默认需要回到这个同步上下文来执行 continuation，而这个线程被 .Result 阻塞了——形成死锁。在 ASP.NET Core 中没有这个同步上下文，所以 .Result 不会死锁，但仍然会浪费一个线程做阻塞等待，违背异步的初衷。\n\n解法：① 根治——全链路 async/await，不在任何地方 .Result 或 .Wait()。② 库内部加 ConfigureAwait(false)，让 continuation 不需要回到原上下文。③ 如果确实需要在同步方法中调用异步代码（遗留迁移），可以用 `Task.Run(() => AsyncMethod()).Result`——但注意这只是把阻塞移到线程池线程，不能作为通用方案。④ ASP.NET Core 本身没有同步上下文，但项目级 .Result 仍然不推荐（阻塞线程池线程）。"
+    },
+    {
+      "type": "explain",
+      "title": "ValueTask、并行 await、取消和超时：实用模式",
+      "content": "**ValueTask<T>** 解决的是「大量异步操作实际同步完成」的场景。Task 是引用类型，每次 await 都要堆分配一个 Task 对象；当方法高频调用且命中缓存（同步返回）时，这个分配成了无谓开销。ValueTask 是结构体，可以直接包装一个已有的结果值而零分配。但 ValueTask 有限制：只能被 await 一次（不能多次 await、不能并发 WhenAll、不能 .Result），也不能在 await 后再次访问（内部可能复用缓冲区）。原则：默认用 Task，只在 profiler 证明分配热点且多数同步完成时换 ValueTask。\n\n**Task.WhenAll** 并发：多个无依赖的异步操作应该同时启动再一起等待，而不是逐个 await。逐个 await 会串行化总耗时，WhenAll 让它们并行执行。注意异常聚合：WhenAll 会把所有任务的异常都收集到一个 AggregateException 中，await 时只抛出第一个；如果需要收集全部异常要 catch AggregateException 后遍历 InnerExceptions。\n\n**取消和超时**：CancellationToken 是 .NET 异步取消的标准模式。方法签名接受 CancellationToken，内部定期检查 ThrowIfCancellationRequested() 或传给支持取消的 API（Task.Delay、HttpClient.SendAsync 等）。超时可以用 CancellationTokenSource.CancelAfter(ms) 实现，也可以用 Task.WhenAny(task, Task.Delay(timeout)) 做更灵活的超时控制。注意：CancelAfter 不会取消底层的 TCP 连接等 OS 资源，需要配合 HttpClient 的 Timeout 或手动 Dispose 实现真正的资源释放。"
     },
     {
       "type": "diagram",
@@ -49,38 +59,54 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | async/await | Task.ContinueWith |\n| --- | --- | --- |\n| 可读性 | 类似同步代码，直观 | 回调嵌套，难以维护 |\n| 异常处理 | try/catch 直接捕获 | 需要在 ContinueWith 中检查 |\n| 同步上下文 | 自动捕获和恢复 | 需要手动处理 |\n| 调试 | 支持断点调试 | 调试困难 |\n| 性能 | 编译器优化状态机 | 每次 ContinueWith 分配新 Task |\n| 使用场景 | 首选，绝大多数场景 | 需要精细控制任务调度时 |"
+      "title": "async/await 与 Task.ContinueWith 对比",
+      "content": "| 维度 | async/await | Task.ContinueWith |\n| --- | --- | --- |\n| 可读性 | 同步风格，直观 | 回调嵌套，形成金字塔 |\n| 异常处理 | 直接 try/catch | 需在 ContinueWith 里检查 Task.IsFaulted |\n| 同步上下文 | 自动捕获和恢复（ConfigureAwait 可控） | 需手动指定 TaskScheduler |\n| 调试 | 断点、堆栈自然 | 堆栈断裂，调试困难 |\n| 状态机 | 编译器生成高效状态机 | 每次 ContinueWith 分配新 Task + delegate |\n| 取消 | 传 CancellationToken 到 await 的方法 | 需要 Accept 参数 CancellationToken |\n| 使用场景 | 首选，绝大多数异步代码 | 需要精细控制调度器或 TaskScheduler 时 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | Task | ValueTask |\n| --- | --- | --- |\n| 类型 | 引用类型 | 结构体（值类型） |\n| 分配 | 每次分配堆内存 | 可能零分配 |\n| 适用场景 | 异步操作通常异步完成 | 操作可能同步完成 |\n| 多次 await | 可以多次 await | 只能 await 一次 |\n| 缓存 | 不可缓存 | 可缓存实例 |\n| 典型应用 | 大多数异步操作 | 缓存命中、快速路径 |"
+      "title": "Task 与 ValueTask 对比",
+      "content": "| 维度 | Task / Task<T> | ValueTask / ValueTask<T> |\n| --- | --- | --- |\n| 类型 | 引用类型，堆分配 | 结构体，可能零分配 |\n| await 次数 | 可多次 await、可 WhenAll | 只能 await 一次 |\n| 缓存 | 不可缓存实例 | 可缓存和复用（GetAwaiter() 只能调一次） |\n| 适用场景 | 大多数异步操作、需要组合 | 高频调用且多数同步完成（缓存命中、快速路径） |\n| 性能热点 | 每次分配一个小对象（通常可接受） | 消除分配，但在堆上被装箱时反而更差 |\n| 典型案例 | DB 查询、HTTP 请求、文件 IO | 带缓存的数据访问、已知的同步快速路径 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Collections.Generic;\nusing System.Net.Http;\nusing System.Threading;\nusing System.Threading.Tasks;\n\nnamespace AsyncAwaitDemo\n{\n    public class AsyncExamples\n    {\n        private readonly HttpClient _httpClient = new HttpClient();\n\n        // 基本的 async/await\n        public async Task<string> FetchDataAsync(string url)\n        {\n            try\n            {\n                // 异步等待，不阻塞线程\n                string data = await _httpClient.GetStringAsync(url);\n                return data;\n            }\n            catch (HttpRequestException ex)\n            {\n                Console.WriteLine($\"请求失败: {ex.Message}\");\n                throw;\n            }\n        }\n\n        // 并行执行多个异步操作\n        public async Task<(string Order, string Customer)> GetOrderAndCustomerAsync()\n        {\n            // 同时启动两个任务\n            var orderTask = GetOrderAsync();\n            var customerTask = GetCustomerAsync();\n\n            // 等待所有任务完成\n            await Task.WhenAll(orderTask, customerTask);\n\n            // 获取结果\n            return (await orderTask, await customerTask);\n        }\n\n        private async Task<string> GetOrderAsync()\n        {\n            await Task.Delay(1000); // 模拟耗时操作\n            return \"Order-001\";\n        }\n\n        private async Task<string> GetCustomerAsync()\n        {\n            await Task.Delay(800); // 模拟耗时操作\n            return \"Customer-Alice\";\n        }\n\n        // 带取消支持的异步操作\n        public async Task ProcessDataAsync(CancellationToken cancellationToken)\n        {\n            for (int i = 0; i < 10; i++)\n            {\n                // 检查取消请求\n                cancellationToken.ThrowIfCancellationRequested();\n\n                // 模拟处理\n                await Task.Delay(500, cancellationToken);\n                Console.WriteLine($\"处理第 {i + 1} 项...\");\n            }\n        }\n\n        // 避免不必要的 async/await\n        public Task<int> GetValueAsync()\n        {\n            // 直接返回 Task，避免状态机开销\n            return _repository.GetValueAsync();\n        }\n\n        private IRepository _repository;\n\n        // ConfigureAwait 示例\n        public async Task LibraryMethodAsync()\n        {\n            // 库代码使用 ConfigureAwait(false)\n            await DoWorkAsync().ConfigureAwait(false);\n            \n            // 不需要回到原始上下文\n            Console.WriteLine(\"在线程池线程上执行\");\n        }\n\n        // 超时控制\n        public async Task<string> FetchWithTimeoutAsync(string url, int timeoutMs)\n        {\n            using var cts = new CancellationTokenSource();\n            cts.CancelAfter(timeoutMs);\n\n            try\n            {\n                return await _httpClient.GetStringAsync(url, cts.Token);\n            }\n            catch (OperationCanceledException)\n            {\n                throw new TimeoutException($\"请求超时: {timeoutMs}ms\");\n            }\n        }\n\n        // 异步流 (C# 8.0+)\n        public async IAsyncEnumerable<int> GenerateNumbersAsync()\n        {\n            for (int i = 0; i < 10; i++)\n            {\n                await Task.Delay(100);\n                yield return i;\n            }\n        }\n\n        // 使用异步流\n        public async Task ProcessStreamAsync()\n        {\n            await foreach (var number in GenerateNumbersAsync())\n            {\n                Console.WriteLine($\"收到: {number}\");\n            }\n        }\n    }\n\n    public interface IRepository\n    {\n        Task<int> GetValueAsync();\n    }\n\n    // 同步上下文示例\n    public class UISynchronizationContextExample\n    {\n        private SynchronizationContext _uiContext;\n\n        public UISynchronizationContextExample()\n        {\n            // 捕获 UI 同步上下文\n            _uiContext = SynchronizationContext.Current;\n        }\n\n        public async Task UpdateUIAsync()\n        {\n            // 在后台线程执行耗时操作\n            await Task.Run(() =>\n            {\n                // 耗时计算\n                Thread.Sleep(1000);\n            });\n\n            // 回到 UI 线程更新界面\n            _uiContext.Post(_ =>\n            {\n                // 更新 UI 控件\n                Console.WriteLine(\"UI 已更新\");\n            }, null);\n        }\n    }\n}",
+      "title": "可运行代码：状态机、死锁演示、WhenAll、ValueTask 和取消",
       "language": "csharp",
+      "content": "using System;\nusing System.Collections.Concurrent;\nusing System.Threading;\nusing System.Threading.Tasks;\n\nnamespace AsyncAwaitDeepDemo\n{\n    public class Program\n    {\n        public static async Task Main()\n        {\n            await DemonstrateStateMachine();\n            await DemonstrateWhenAllVsSequential();\n            DemonstrateValueTaskCaching();\n            await DemonstrateCancellation();\n        }\n\n        // 状态机：多个 await 的暂停-恢复\n        static async Task DemonstrateStateMachine()\n        {\n            Console.WriteLine(\"[StateMachine] 开始，线程=\" + Thread.CurrentThread.ManagedThreadId);\n\n            int step1 = await ComputeAsync(1);\n            Console.WriteLine($\"[StateMachine] step1={step1}，线程=\" + Thread.CurrentThread.ManagedThreadId);\n\n            int step2 = await ComputeAsync(2);\n            Console.WriteLine($\"[StateMachine] step2={step2}，线程=\" + Thread.CurrentThread.ManagedThreadId);\n\n            // 两次 await 之间可能切换线程（线程池环境）\n        }\n\n        static async Task<int> ComputeAsync(int value)\n        {\n            await Task.Delay(50); // 模拟 IO\n            return value * 10;\n        }\n\n        // WhenAll vs 逐个 await 的耗时差异\n        static async Task DemonstrateWhenAllVsSequential()\n        {\n            var sw = System.Diagnostics.Stopwatch.StartNew();\n            await SimulateIOAsync(\"A\", 200);\n            await SimulateIOAsync(\"B\", 200);\n            await SimulateIOAsync(\"C\", 200);\n            sw.Stop();\n            Console.WriteLine($\"[Sequential] 串行总耗时={sw.ElapsedMilliseconds}ms\");\n\n            sw.Restart();\n            await Task.WhenAll(\n                SimulateIOAsync(\"A\", 200),\n                SimulateIOAsync(\"B\", 200),\n                SimulateIOAsync(\"C\", 200));\n            sw.Stop();\n            Console.WriteLine($\"[WhenAll] 并行总耗时={sw.ElapsedMilliseconds}ms\");\n        }\n\n        static async Task SimulateIOAsync(string name, int ms)\n        {\n            await Task.Delay(ms);\n            Console.WriteLine($\"  {name} 完成\");\n        }\n\n        // ValueTask：缓存命中时零分配\n        static void DemonstrateValueTaskCaching()\n        {\n            var cache = new ConcurrentDictionary<int, int>();\n            cache[42] = 999;\n\n            // 第一次调用：缓存命中，同步返回，零分配\n            ValueTask<int> vt = GetValueOrFetchAsync(cache, 42);\n            Console.WriteLine($\"[ValueTask] 缓存命中，IsCompleted={vt.IsCompleted}\");\n\n            // 注意：ValueTask 只能 await 一次\n        }\n\n        static async ValueTask<int> GetValueOrFetchAsync(ConcurrentDictionary<int, int> cache, int key)\n        {\n            if (cache.TryGetValue(key, out var cached))\n                return new ValueTask<int>(cached); // 零分配\n\n            // 缓存未命中，走异步 IO\n            await Task.Delay(100);\n            int value = key * 23;\n            cache[key] = value;\n            return value;\n        }\n\n        // CancellationToken 超时与取消\n        static async Task DemonstrateCancellation()\n        {\n            using var cts = new CancellationTokenSource();\n            cts.CancelAfter(300); // 300ms 后自动取消\n\n            try\n            {\n                await LongRunningAsync(cts.Token);\n                Console.WriteLine(\"[Cancel] 不应该到这里\");\n            }\n            catch (OperationCanceledException)\n            {\n                Console.WriteLine(\"[Cancel] 任务被取消（超时）\");\n            }\n        }\n\n        static async Task LongRunningAsync(CancellationToken ct)\n        {\n            for (int i = 0; i < 100; i++)\n            {\n                ct.ThrowIfCancellationRequested();\n                await Task.Delay(50, ct);\n                Console.WriteLine($\"[LongRunning] 进度={i + 1}\");\n            }\n        }\n    }\n}",
       "highlights": [
         {
-          "line": 58,
-          "note": "「for (int i = 0; i < 10; i++)」 是这段示例的主遍历；它决定处理顺序和成本上界，说明「async/await 异步编程」时要补上每轮维护的状态。"
+          "line": 14,
+          "note": "两个 await 之间可能切换线程——状态机在每次恢复时都可能在线程池的不同线程上执行。"
+        },
+        {
+          "line": 44,
+          "note": "WhenAll 让三个 200ms 的 IO 并行执行，总耗时约 200ms 而非 600ms。"
+        },
+        {
+          "line": 65,
+          "note": "缓存命中时 ValueTask 直接包装结果值，零堆分配。"
+        },
+        {
+          "line": 85,
+          "note": "CancelAfter + ThrowIfCancellationRequested 是标准超时取消模式。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：C# 的 async/await 让异步代码写得像同步。编译器把 async 方法编译成状态机：执行到第一个 await，如果任务没完成就返回未完成的 Task、把控制权交还调用者，任务完成后从暂停处继续——整个过程不阻塞线程。它解决的是 IO 等待时不浪费线程。\n\n要点：\n\n1. Task/Task<T> 表示异步操作及其结果；await 一个未完成的 Task 会挂起当前方法、释放线程，完成后恢复。\n2. async 方法返回 Task/Task<T>；返回 void 只用于事件处理器，别的地方禁止 async void（异常无法被 catch、也没法 await）。\n3. ConfigureAwait(false)：库代码里用它表示「不需要回到原始同步上下文」，能避免回到 UI 线程、减少开销；UI 代码需要回到 UI 线程更新界面就用默认 true。\n\n最经典的坑是死锁：在 UI 或老 ASP.NET 同步上下文里对异步方法 .Result 或 .Wait() 会死锁——await 要回到被你阻塞占用的上下文，互相等。解法是全程 async 别混用同步阻塞、库代码加 ConfigureAwait(false)。其它：① 用 Task.WhenAll 并发跑多个异步、而不是逐个 await。② 可能同步完成的高频路径用 ValueTask 减少分配。③ 传 CancellationToken 支持取消。",
+      "content": "C# 的 async/await 本质是编译器语法糖：async 方法被编译成一个状态机类，包含 state 字段和跨 await 存活的局部变量。每次 MoveNext 从当前 state 继续执行，遇到 await 时如果任务已完成就同步取结果继续，如果未完成就把 continuation 注册到任务上然后返回——调用者拿到一个未完成的 Task，当前线程被释放。任务完成后框架回调 continuation，状态机恢复执行。这就是「不阻塞线程做 IO」的核心机制。\n\n**同步上下文与 ConfigureAwait**\n- 默认 await 会捕获 SynchronizationContext，任务完成后 continuation 回到该上下文（UI 线程或请求上下文）\n- ConfigureAwait(false) 跳过捕获，continuation 在任意线程池线程执行\n- 库代码应该用 ConfigureAwait(false) 避免强制回到 UI 线程、避免死锁\n- ASP.NET Core 没有 SynchronizationContext，所以不容易死锁，但好习惯仍然推荐\n\n**两个经典坑**\n- async void：异常无法被外部 catch（会直接 crash 或静默丢失），调用者拿不到 Task 无法等待。只用于事件处理器\n- .Result/.Wait() 死锁：在有单线程同步上下文的环境里，.Result 阻塞当前线程，await 的 continuation 又要回到这个线程，互相等。解法：全链路 async，或库内 ConfigureAwait(false)\n\n**实用模式**\n- Task.WhenAll 并行执行多个无依赖的异步操作，而非逐个 await\n- ValueTask 在高频同步完成路径上减少分配（缓存命中等），但只能 await 一次\n- CancellationToken + ThrowIfCancellationRequested 实现取消，CancelAfter 实现超时\n- 避免不必要的 async/await 包装（只转发时直接 return Task，减少状态机分配）",
       "followUpQuestions": [
         {
-          "question": "为什么在 UI 或老 ASP.NET 里对 async 方法调 .Result 会死锁？怎么避免？",
-          "answer": "因为这些环境有「单线程同步上下文」。await 默认会在任务完成后回到捕获的同步上下文（UI 线程或请求上下文）继续；而你用 .Result 阻塞了这个线程在等任务完成——任务的延续却要回到这个被占着的线程，于是互相等、死锁。避免办法：全程 async/await、绝不用 .Result 或 .Wait() 混阻塞；库内部对每个 await 加 ConfigureAwait(false)，让延续不必回到原上下文。ASP.NET Core 没有这个同步上下文，所以不容易触发，但好习惯仍要保持。"
+          "question": "async 方法的状态机具体长什么样？编译器做了什么？",
+          "answer": "编译器生成一个实现了 IAsyncStateMachine 的 struct（或 class，取决于是否有 ref 参数），包含 state 字段和所有跨 await 边界的局部变量（提升为字段）。MoveNext 方法是一个大 switch，根据 state 跳到对应位置执行。每次遇到 await，如果任务未完成就调用 AwaitUnsafeOnCompleted 把自己作为 continuation 注册上去，然后 return；下次 MoveNext 从 switch 的下一个 case 继续。每次 MoveNext 结束后会检查是否需要 Dispose builder。这就是为什么局部变量跨 await 还能用——它们已经是状态机的字段了。"
         },
         {
-          "question": "Task 和 ValueTask 有什么区别？什么时候该用 ValueTask？",
-          "answer": "Task 是引用类型、每次都要堆分配；ValueTask 是值类型，对「经常同步完成、不需要真正异步」的高频路径能避免分配、减轻 GC。典型场景是带缓存的方法：命中缓存时同步返回、没命中才走异步 IO。但 ValueTask 有限制：只能 await 一次、不能多次 await 或并发用、不能直接 WhenAll，所以默认还是用 Task，只在性能敏感且确认大多同步完成时才换 ValueTask。"
+          "question": "为什么 ASP.NET Core 里 .Result 不会死锁，但仍然不推荐？",
+          "answer": "ASP.NET Core 从 1.0 开始就没有 SynchronizationContext，await 的 continuation 在线程池线程上执行，不会被阻塞的 UI 线程卡住，所以不会死锁。但 .Result 会把一个线程池线程阻塞在那里等待异步操作完成，这违背了异步的初衷——你白白浪费了一个线程做等待。在高并发场景下，大量这样的阻塞会耗尽线程池，造成线程饥饿。正确做法是全链路 async/await。"
+        },
+        {
+          "question": "ValueTask 有哪些坑？为什么不能无脑替换 Task？",
+          "answer": "ValueTask 只能被 await 一次——多次 await 或 WhenAll 会导致未定义行为（内部 IValueTaskSource 可能已被回收）。ValueTask 的 GetAwaiter() 也是只能调一次。另外如果 ValueTask 被装箱（比如赋给 object），分配反而比 Task 更多。正确用法：只用于性能热点、确认高频同步完成的场景，默认还是用 Task。"
         }
       ]
     },
@@ -88,66 +114,91 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "async/await 的工作原理和状态机机制",
-        "Task 和 Task<T> 的区别及使用场景",
-        "ConfigureAwait 的作用和最佳实践",
-        "SynchronizationContext 的概念和影响",
-        "异步编程中的常见陷阱及解决方案",
-        "异步编程的性能优化技巧"
+        "能解释 async 方法被编译成状态机的过程：state 字段、MoveNext、局部变量提升为字段",
+        "能描述 await 的挂起-恢复机制：未完成时注册 continuation 并释放线程，完成后回调恢复",
+        "能说明 SynchronizationContext 的作用和 ConfigureAwait(false) 在库代码中的必要性",
+        "能解释 async void 的危害（异常无法捕获、无法等待）及其唯一合法场景（事件处理器）",
+        "能解释 .Result/.Wait() 在有同步上下文环境中的死锁成因和解法",
+        "能用 Task.WhenAll 并行执行多个无依赖异步操作，知道异常聚合方式",
+        "能说明 ValueTask 的适用场景（高频同步完成）和限制（只能 await 一次）",
+        "能用 CancellationToken + CancelAfter 实现异步取消和超时"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "dotnet.csharp.async-await.recall.1",
-      "prompt": "请说明 async/await 异步编程 的核心机制、典型使用场景和常见坑。",
+      "prompt": "请完整说明 async/await 的状态机本质：编译器做了什么、await 挂起时发生了什么、线程如何释放和恢复。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "dotnet.csharp.async-await.recall.2",
-      "prompt": "什么是 ConfigureAwait？为什么在库代码中应该使用 ConfigureAwait(false)？",
+      "prompt": "什么是 SynchronizationContext？为什么库代码应该用 ConfigureAwait(false)？它在 UI 应用和 ASP.NET Core 中有何不同？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.csharp.async-await.recall.3",
+      "prompt": "async void 为什么危险？.Result 在什么场景下会死锁？怎么避免？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
-      "id": "dotnet.csharp.async-await.recall.3",
-      "prompt": "async void 和 async Task 的区别是什么？为什么除了事件处理器都不应该用 async void？",
+      "id": "dotnet.csharp.async-await.recall.4",
+      "prompt": "Task 和 ValueTask 有什么区别？什么场景下该用 ValueTask？它有哪些限制？",
       "mode": "text",
       "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.csharp.async-await.recall.5",
+      "prompt": "如何实现多个无依赖异步操作的并行执行？用 CancellationToken 实现超时取消的标准模式是什么？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.csharp.async-await.recall.6",
+      "prompt": "线上发现一个 ASP.NET Core 接口的 p99 延迟飙升，排查后发现调用链里有 .Result 同步阻塞。请分析原因并说明如何修复。",
+      "mode": "text",
+      "expectedMinutes": 5,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能解释 async 方法被编译成状态机、await 挂起并释放线程",
-      "能说明 async void 的危害、只用于事件处理器",
-      "能解释 .Result/.Wait() 在有同步上下文时的死锁及解法",
-      "能说出 ConfigureAwait(false) 的作用和适用场景"
+      "能解释 async 方法被编译成状态机、await 挂起时注册 continuation 并释放线程",
+      "能说明 async void 的危害（异常无法捕获、无法 await）及其唯一合法场景",
+      "能解释 .Result/.Wait() 在有同步上下文环境中的死锁成因和解法（全链路 async、ConfigureAwait(false)）",
+      "能说出 ConfigureAwait(false) 的作用：不捕获 SynchronizationContext，continuation 在线程池执行"
     ],
     "goodToHave": [
-      "能用 Task.WhenAll 并发执行多个异步",
-      "能说明 ValueTask 减少分配的场景",
-      "能用 CancellationToken 支持取消"
+      "能用 Task.WhenAll 并行执行多个异步操作并知道异常聚合",
+      "能说明 ValueTask 的适用场景（高频同步完成）和限制（只能 await 一次）",
+      "能用 CancellationToken + CancelAfter 实现标准取消和超时",
+      "能解释 ASP.NET Core 为什么没有 SynchronizationContext 以及 .Result 为何仍然不推荐"
     ],
     "commonMistakes": [
-      "对异步方法用 .Result/.Wait() 导致死锁",
-      "滥用 async void 让异常无法捕获",
-      "逐个 await 而不用 WhenAll 并发"
+      "在 UI 或旧 ASP.NET 中对 async 方法调 .Result/.Wait() 导致死锁",
+      "滥用 async void 导致异常无法捕获、应用崩溃",
+      "逐个 await 无依赖的异步操作而不使用 WhenAll，浪费并行机会",
+      "无脑用 ValueTask 替换 Task，忽略只能 await 一次的限制导致 bug"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
   "prerequisites": [
     "dotnet.csharp.type-system"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否解释状态机与 await 释放线程、说清 async void 和 .Result 死锁、ConfigureAwait(false) 的作用，并知道 WhenAll、ValueTask 等优化。",
-  "updatedAt": "2026-06-12"
+  "interviewerFocus": "考察能否从编译器状态机的角度解释 async/await 机制、说清同步上下文与 ConfigureAwait 的关系、async void 和 .Result 死锁的成因和解法，并知道 WhenAll 并行、ValueTask、取消超时等实用模式。",
+  "updatedAt": "2026-06-22"
 }

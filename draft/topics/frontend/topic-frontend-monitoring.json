@@ -4,7 +4,7 @@
   "category": "engineering",
   "group": "engineering",
   "title": "前端监控与错误追踪",
-  "summary": "讲清前端监控三大类（错误/性能/行为）、错误采集与 Source Map 还原、Core Web Vitals，以及采样上报和 sendBeacon 等落地取舍。",
+  "summary": "讲清前端监控三大类（错误/性能/行为）、错误采集四层捕获与 Source Map 还原链路、Core Web Vitals 指标与 INP 取代 FID 的变化、采样策略与 sendBeacon 上报取舍，以及跨域 Script error、隐私脱敏和监控有效性验证。",
   "tags": [
     "前端",
     "工程化",
@@ -13,27 +13,37 @@
     "Core Web Vitals"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 38,
   "order": 50,
   "recommendWeight": 75,
   "status": "draft",
   "learningCards": [
     {
       "type": "explain",
-      "title": "前端监控与错误追踪的主流程与关键机制",
-      "content": "## 前端监控体系\n\n### 三大监控\n- **错误监控**：JS异常、接口错误、资源加载失败\n- **性能监控**：Core Web Vitals、页面加载时间\n- **行为监控**：PV/UV、点击、停留时长\n\n### Sentry错误监控\n- 全局捕获JS错误和未处理Promise\n- Source Map还原压缩代码\n- 错误聚合和告警\n- 性能追踪（Performance）"
+      "title": "前端监控体系：为什么需要以及怎么分层",
+      "content": "前端运行在用户浏览器上，代码经过压缩混淆、环境不可控、网络条件千差万别，出问题时无法像后端一样直接看日志。前端监控的价值就是把线上质量变成可观测的数据——哪些页面报错了、报错影响多少用户、页面快不快、用户在哪里流失。\n\n按采集目标分三大类：\n\n**错误监控**是底线。JS 运行时异常（同步错误、未捕获 Promise rejection）、接口请求失败（HTTP 4xx/5xx、超时、CORS）、资源加载失败（图片/CSS/JS 加载 404）。前两类影响功能可用性，第三类影响页面完整性但容易被忽略。\n\n**性能监控**衡量用户体验。Core Web Vitals 是 Google 定义的三个核心指标，直接关联搜索排名：LCP 衡量加载速度、INP 衡量交互响应、CLS 衡量视觉稳定性。除此之外还有 FCP、TTFB 等辅助指标。性能数据要区分实验室数据（Lighthouse，固定环境）和真实用户数据（RUM，web-vitals 库采集），两者差异很大。\n\n**行为监控**追踪用户怎么用产品。PV/UV、页面停留、点击热力图、关键路径转化率。行为数据主要服务产品决策，但也常和错误数据关联——比如某个错误集中在哪条用户路径上。\n\n三类数据共享一套上报基础设施：SDK 采集 → 上报队列（采样、脱敏、批量） → 监控平台聚合 → 告警和影响面分析。理解这个链路，才能在面试中讲清楚「怎么从一个线上错误定位到源码行」。"
     },
     {
       "type": "explain",
-      "title": "前端监控与错误追踪的边界、易错点与取舍",
-      "content": "### Core Web Vitals\n- **LCP（Largest Contentful Paint）**：最大内容绘制，≤2.5s\n- **FID/INP（First Input Delay/Interaction to Next Paint）**：交互延迟\n- **CLS（Cumulative Layout Shift）**：布局偏移，≤0.1\n\n### Source Map\n- 生产环境不上传到CDN\n- 上传到Sentry等监控平台\n- 用于还原压缩/编译后的代码\n\n## 取舍与落地\n监控的取舍主要在「数据量、成本、可定位性」。全量上报最全但量大、贵，实践是错误全量上报、性能和行为按比例采样。上报方式用 navigator.sendBeacon（页面卸载也能发、不阻塞）或 image 打点，批量合并、利用 requestIdleCallback 在空闲时发，避免监控本身拖慢页面。验证监控有效性：故意制造一个错误看 Sentry 能不能收到且 Source Map 还原到正确源码行；用 web-vitals 采集真实用户数据（RUM）和 Lighthouse 实验室数据对比。一个关键点：Source Map 没配好时错误栈全是混淆名根本没法定位，所以接入第一步就要验证 Source Map 还原。"
+      "title": "错误采集四层捕获与 Source Map 还原链路",
+      "content": "前端错误采集不是只靠 `window.onerror`。完整方案是四层覆盖，每层捕获不同类型错误，缺一层就有盲区。\n\n**第一层：window.onerror + window.addEventListener('error')**\n`window.onerror` 捕获同步运行时异常，回调签名 `(message, source, lineno, colno, error)` 五个参数。`addEventListener('error')` 在捕获阶段监听时能额外捕获资源加载失败（img/script/link 的 404），但要注意对资源错误，回调的 `event.target` 是触发错误的 DOM 元素而不是 Error 对象，需要从 `target.src` 或 `target.href` 取失败地址。\n\n**第二层：unhandledrejection**\nPromise rejection 如果没有 `.catch()` 或 `async/await` 的 `try/catch`，不会被 `window.onerror` 捕获。必须单独监听 `unhandledrejection` 事件。注意 `event.preventDefault()` 可以阻止浏览器控制台报错，但不应滥用——在上报逻辑中调用即可，业务代码应正确处理 Promise。\n\n**第三层：框架层 Error Boundary / errorHandler**\nReact 的 `ErrorBoundary`（`getDerivedStateFromError` + `componentDidCatch`）捕获组件树渲染错误，防止整棵子树白屏。Vue 3 的 `app.config.errorHandler` 是全局错误钩子。框架层错误有组件栈信息，比 `window.onerror` 更容易定位到哪个组件出了问题。\n\n**第四层：网络请求错误**\nXMLHttpRequest 需要包装或用 `addEventListener('error')`/`addEventListener('timeout')`。Fetch API 需要注意：HTTP 4xx/5xx 不会触发 `catch`，必须在响应后检查 `response.ok`。最佳实践是用 Axios 拦截器或 Fetch wrapper 统一处理，上报时带上请求 URL、状态码、响应体片段。\n\n**Source Map 还原**\n生产代码经过 Terser/Webpack 压缩、Babel 转译，错误栈里的文件名、行号、列号都对不上源码。Source Map 记录了压缩后位置到源码位置的映射。关键规则：\n- 构建时生成 Source Map（Webpack `devtool: 'hidden-source-map'`、Vite `build.sourcemap: 'hidden'`），`hidden` 意味着不把 `//# sourceMappingURL` 注入到产物 JS 里，防止浏览器直接请求到。\n- Source Map 文件**不上传 CDN**，否则源码泄露。通过 sentry-cli 或 Webpack/Vite 插件在构建后上传到 Sentry 等监控平台。\n- 监控平台收到错误栈后用 Source Map 反查，还原出「哪个源文件、第几行、哪个函数」。\n- **接入第一步就验证这条链路**：故意在代码里 `throw new Error('test-source-map')`，部署后看 Sentry 能不能收到且还原到正确源码行。没验证就上线，出了错才发现 Source Map 没配好，白白浪费排查时间。\n\n**跨域脚本问题**\n如果 JS 文件部署在 CDN（跨域），`window.onerror` 只能拿到 `Script error`，没有文件名、行号、列号。解决方案：给 `<script>` 加 `crossorigin` 属性，且 CDN 服务器返回 `Access-Control-Allow-Origin` 头。两者缺一不可。"
+    },
+    {
+      "type": "explain",
+      "title": "Core Web Vitals 指标定义、采集与 INP 取代 FID 的变化",
+      "content": "Core Web Vitals 是 Google 定义的、直接影响搜索排名的用户体验指标。2024 年 3 月起，INP 正式取代 FID 成为核心指标。\n\n**LCP（Largest Contentful Paint）— 加载速度**\n衡量页面最大内容元素（首屏大图、视频封面、大块文本）完成渲染的时间。目标 ≤2.5 秒。优化手段：压缩图片并用 WebP/AVIF、CDN 分发、`<link rel=\"preload\">` 预加载关键资源、SSR/SSG 减少客户端渲染等待、移除首屏不必要的 JS/CSS。\n\n**INP（Interaction to Next Paint）— 交互响应**\n衡量用户所有交互（点击、键盘、触摸）中，从输入到下一帧绘制完成的延迟的第 98 百分位。目标 ≤200ms。INP 比 FID 更严格：FID 只看首次交互的输入延迟，INP 看所有交互中最差的那些。优化：拆分长任务（>50ms 的任务阻塞主线程）、用 Web Worker 处理计算密集逻辑、减少不必要的 DOM 操作和重排重绘、用 `requestIdleCallback` 延迟非关键工作。\n\n**CLS（Cumulative Layout Shift）— 视觉稳定性**\n衡量页面生命周期中所有意外布局偏移的累积值。目标 ≤0.1。偏移来源：图片/视频/广告位没预设尺寸导致加载后撑开、动态插入内容把已有元素挤走、Web 字体加载导致文字重排。优化：给媒体元素设置明确的 `width`/`height` 或 `aspect-ratio`、用 `font-display: optional` 或预加载字体、用 CSS `contain` 限制布局影响范围。\n\n**采集方式**\n用 `web-vitals` 库（Google 官方）是最简单的方式，API 就是 `onLCP(callback)`、`onINP(callback)`、`onCLS(callback)`。回调参数包含 `name`、`value`、`id`（用于去重）。在 `visibilitychange` 为 `hidden` 时发送最终值——这是 web-vitals 内部处理的，不需要手动监听。\n\n**实验室 vs 真实用户**\nLighthouse 是实验室数据，固定设备、固定网络、固定操作路径，适合 CI 管线和开发阶段发现回归。RUM（Real User Monitoring）是真实用户数据，用 web-vitals 采集后上报，反映真实网络、设备和用户行为。两者差异可以很大——一个页面 Lighthouse 90 分，但真实用户中低端手机占比高导致 LCP 可能远超 2.5s。"
+    },
+    {
+      "type": "explain",
+      "title": "采样、上报与隐私脱敏的工程取舍",
+      "content": "监控系统面临的核心取舍是**数据完整性 vs 成本 vs 性能影响**。\n\n**采样策略**\n全量上报最完整，但错误量大的页面（比如第三方 SDK 频繁报错）会产生海量重复数据，增加存储和分析成本。实践做法：\n- 错误事件：全量上报，但通过错误指纹（message + filename + lineno + colno 哈希）在前端或后端去重。同一个用户短时间内重复触发相同错误只上报一次。\n- 性能事件：按比例采样，常见 1%-10%。采样率根据流量大小和成本预算调整。低流量时期可提高采样率保证样本量。\n- 行为事件：按比例采样，关键路径（注册、付费）全量。\n- Sentry 的 `tracesSampleRate` 控制性能追踪采样，`replaysOnErrorSampleRate: 1.0` 保证错误发生时 100% 录制 Session Replay。\n\n**上报方式**\n`navigator.sendBeacon(url, data)` 是首选。它在页面卸载（关闭、跳转）时仍能发出请求，不阻塞页面导航，浏览器会在空闲时发送。局限：POST 请求、数据大小限制（Chrome 约 64KB）、没有自定义 Header。\n\n对于非卸载场景的常规上报，用 `fetch` 的 `keepalive: true` 也可以。批量合并多条数据后上报，减少请求数量。利用 `requestIdleCallback` 或 `setTimeout` 在空闲时发送，避免监控上报本身阻塞主线程。\n\n**隐私脱敏**\n`beforeSend` 钩子（Sentry 的配置项）在事件发送前执行，可以过滤或修改事件数据：\n- 过滤已知无意义错误（如 `Script error`、第三方 SDK 内部错误）。\n- 脱敏敏感信息：URL 中的 token、表单输入中的密码/身份证。\n- 移除 PII（个人可识别信息）：用户邮箱、手机号等，符合 GDPR 等隐私法规。\n\n**监控有效性验证**\n部署后不是「配了就算完」，必须验证闭环：\n1. 故意制造一个带特征信息的错误，确认 Sentry 能收到且 Source Map 还原正确。\n2. 确认采样率配置生效——错误全量、性能按预期比例。\n3. 确认告警规则触发——错误数超过阈值时有通知。\n4. 确认跨域脚本的 `crossorigin` 配置有效——跨域 JS 错误不再只是 `Script error`。"
     },
     {
       "type": "diagram",
       "format": "mermaid",
       "title": "前端监控链路：错误、性能、行为、资源、SourceMap 与告警闭环",
       "content": "flowchart TD\nA[\"浏览器运行时\"] --> B[\"JS Error / Promise Rejection\"]\nA --> C[\"Performance Web Vitals\"]\nA --> D[\"Resource/API Timing\"]\nA --> E[\"用户行为和路由\"]\nB --> F[\"SDK 采集并加 traceId/sessionId\"]\nC --> F\nD --> F\nE --> F\nF --> G[\"上报队列\n采样/脱敏/重试\"]\nG --> H[\"监控平台聚合\"]\nH --> I[\"SourceMap 还原堆栈\"]\nH --> J[\"告警和影响面分析\"]",
-      "caption": "前端监控链路：错误、性能、行为、资源、SourceMap 与告警闭环",
+      "caption": "前端监控链路：浏览器运行时采集四类数据 → SDK 附加上下文 → 上报队列（采样脱敏重试） → 平台聚合 → SourceMap 还原 + 告警影响面分析",
       "fallback": "图展示前端监控要把错误、性能、资源、行为、SourceMap、采样脱敏和告警影响面串成闭环。",
       "sources": [
         {
@@ -48,45 +58,61 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 指标 | 含义 | 好值 | 采集方式 |\n| --- | --- | --- | --- |\n| LCP | 最大内容绘制时间 | ≤2.5s | onLCP |\n| FID | 首次输入延迟 | ≤100ms | onFID |\n| INP | 交互到下一帧绘制 | ≤200ms | onINP |\n| CLS | 累积布局偏移 | ≤0.1 | onCLS |\n| FCP | 首次内容绘制 | ≤1.8s | PerformanceObserver |\n| TTFB | 首字节时间 | ≤800ms | Performance API |"
+      "title": "Core Web Vitals 与辅助指标对比",
+      "content": "| 指标 | 衡量什么 | 目标阈值 | 采集方式 | 优化重点 |\n| --- | --- | --- | --- | --- |\n| LCP | 最大内容元素渲染完成 | ≤2.5s | onLCP / PerformanceObserver | 图片压缩、CDN、预加载、SSR |\n| INP（取代 FID） | 所有交互中最差响应延迟（P98） | ≤200ms | onINP | 拆长任务、Worker、减少重排 |\n| CLS | 累积意外布局偏移 | ≤0.1 | onCLS | 预设尺寸、字体加载策略 |\n| FCP | 首次内容绘制 | ≤1.8s | PerformanceObserver | 减少渲染阻塞资源 |\n| TTFB | 服务端响应首字节 | ≤800ms | Performance API | CDN、服务端优化 |\n| FID（已废弃） | 首次交互输入延迟 | ≤100ms | onFID | 2024.3 起被 INP 取代 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// Sentry配置\nimport * as Sentry from '@sentry/react';\n\nSentry.init({\n  dsn: 'https://xxx@sentry.io/xxx',\n  environment: process.env.NODE_ENV,\n  release: process.env.npm_package_version,\n  integrations: [\n    Sentry.browserTracingIntegration(),\n    Sentry.replayIntegration()\n  ],\n  tracesSampleRate: 0.1, // 10%的性能追踪\n  replaysSessionSampleRate: 0.1,\n  replaysOnErrorSampleRate: 1.0, // 错误时100%录制\n  beforeSend(event) {\n    // 过滤敏感信息\n    if (event.exception) {\n      const error = event.exception.values[0];\n      if (error?.value?.includes('Script error')) return null;\n    }\n    return event;\n  }\n});\n\n// 全局错误捕获\nwindow.onerror = (msg, url, line, col, error) => {\n  console.error('Global error:', { msg, url, line, col, error });\n  // 上报到监控平台\n};\n\nwindow.addEventListener('unhandledrejection', (event) => {\n  console.error('Unhandled rejection:', event.reason);\n});\n\n// 资源加载错误\ndocument.addEventListener('error', (event) => {\n  if (event.target.tagName) {\n    console.error('Resource error:', event.target.src || event.target.href);\n  }\n}, true);\n\n// Core Web Vitals监控\nimport { onLCP, onFID, onCLS, onINP } from 'web-vitals';\n\nfunction sendToAnalytics({ name, value, id }) {\n  // 发送到监控平台\n  navigator.sendBeacon('/api/vitals', JSON.stringify({ name, value, id }));\n}\n\nonLCP(sendToAnalytics);\nonFID(sendToAnalytics);\nonCLS(sendToAnalytics);\nonINP(sendToAnalytics);\n\n// 自定义性能埋点\nfunction measurePerformance(name, fn) {\n  const start = performance.now();\n  const result = fn();\n  const duration = performance.now() - start;\n  console.log(`${name}: ${duration.toFixed(2)}ms`);\n  return result;\n}\n\n// Source Map配置\n// .sentryclirc\n// [auth]\n// token=xxx\n// [defaults]\n// org=my-org\n// project=my-project\n\n// webpack配置\nmodule.exports = {\n  devtool: 'hidden-source-map', // 生成但不暴露\n};\n\n// vite配置\nexport default defineConfig({\n  build: {\n    sourcemap: 'hidden'\n  }\n});",
+      "title": "Sentry 接入与四层错误捕获",
       "language": "javascript",
+      "content": "// === 1. Sentry 初始化 ===\nimport * as Sentry from '@sentry/react';\n\nSentry.init({\n  dsn: 'https://xxx@sentry.io/xxx',\n  environment: process.env.NODE_ENV,\n  release: process.env.npm_package_version,\n  integrations: [\n    Sentry.browserTracingIntegration(),\n    Sentry.replayIntegration()\n  ],\n  tracesSampleRate: 0.1,\n  replaysSessionSampleRate: 0.1,\n  replaysOnErrorSampleRate: 1.0,\n  beforeSend(event) {\n    // 过滤已知无意义错误\n    if (event.exception) {\n      const error = event.exception.values[0];\n      if (error?.value?.includes('Script error')) return null;\n    }\n    // 脱敏 URL 中的 token\n    if (event.request?.url) {\n      event.request.url = event.request.url.replace(/token=[^&]+/, 'token=***');\n    }\n    return event;\n  }\n});\n\n// === 2. 全局错误捕获（第一层：同步异常） ===\nwindow.onerror = (msg, url, line, col, error) => {\n  // Sentry SDK 内部已注册，通常不需要手动上报\n  console.error('Global error:', { msg, url, line, col, error });\n};\n\n// === 3. 未处理 Promise rejection（第二层） ===\nwindow.addEventListener('unhandledrejection', (event) => {\n  // event.preventDefault() 阻止控制台报错，仅在上报逻辑中使用\n  console.error('Unhandled rejection:', event.reason);\n});\n\n// === 4. 资源加载错误（第一层补充，捕获阶段） ===\ndocument.addEventListener('error', (event) => {\n  if (event.target.tagName) {\n    const url = event.target.src || event.target.href;\n    console.error('Resource load failed:', url);\n    // 上报资源加载失败\n  }\n}, true); // true = 捕获阶段，才能拿到资源错误\n\n// === 5. 框架层错误边界（第三层，以 React 为例） ===\n// class ErrorBoundary extends React.Component {\n//   static getDerivedStateFromError(error) { return { hasError: true }; }\n//   componentDidCatch(error, errorInfo) {\n//     Sentry.captureException(error, { contexts: { react: errorInfo } });\n//   }\n//   render() { return this.state.hasError ? <Fallback /> : this.props.children; }\n// }\n\n// === 6. Core Web Vitals 采集 ===\nimport { onLCP, onINP, onCLS } from 'web-vitals';\n\nfunction sendToAnalytics({ name, value, id }) {\n  navigator.sendBeacon('/api/vitals', JSON.stringify({ name, value, id }));\n}\n\nonLCP(sendToAnalytics);\nonINP(sendToAnalytics);\nonCLS(sendToAnalytics);\n\n// === 7. Source Map 构建配置 ===\n// webpack: devtool: 'hidden-source-map' // 生成但不暴露 sourceMappingURL\n// vite: build: { sourcemap: 'hidden' }\n// 构建后用 sentry-cli upload-sourcemaps 上传到 Sentry",
       "highlights": [
         {
-          "line": 26,
-          "note": "`window.onerror = (msg, url, line, col, error) => {` 定义了 前端监控与错误追踪 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
-        },
-        {
-          "line": 17,
-          "note": "`if (event.exception) {` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 19,
+          "note": "beforeSend 在事件发送前执行，用于过滤无意义错误和脱敏敏感信息。"
         },
         {
           "line": 31,
-          "note": "`window.addEventListener('unhandledrejection', (event) => {` 定义了 前端监控与错误追踪 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "note": "window.onerror 捕获同步运行时异常，五个参数：message, source, lineno, colno, error。"
         },
         {
-          "line": 15,
-          "note": "`beforeSend(event) {` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+          "line": 36,
+          "note": "unhandledrejection 捕获未处理的 Promise rejection，onerror 拿不到这类错误。"
+        },
+        {
+          "line": 41,
+          "note": "addEventListener('error', handler, true) 用捕获阶段才能拿到资源加载失败事件。"
+        },
+        {
+          "line": 59,
+          "note": "sendBeacon 在页面卸载时仍能发出，不阻塞导航。"
+        },
+        {
+          "line": 65,
+          "note": "hidden-source-map 生成 Source Map 但不在产物 JS 中注入 sourceMappingURL 注释。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：前端监控是「线上质量的眼睛」，分三大块——错误监控（JS 异常、接口错误、资源加载失败）、性能监控（Core Web Vitals、加载时间）、行为监控（PV/UV、点击、停留）。核心是采集到上报到聚合告警到定位的闭环。\n\n错误监控：\n\n1. 采集：window.onerror 和 addEventListener('error') 抓 JS 错误和资源错误，unhandledrejection 抓未处理的 Promise，框架层用 errorBoundary（React）或 errorHandler（Vue）。\n2. Source Map：生产代码是压缩的、错误栈是混淆的，要把 Source Map 上传到 Sentry 等平台（不上 CDN，防源码泄露）还原成源码位置。\n3. 聚合告警：按错误指纹去重聚合、设阈值告警。\n\n性能监控：Core Web Vitals——LCP（最大内容绘制 ≤2.5s）、INP（交互到下次绘制，取代 FID）、CLS（布局偏移 ≤0.1），用 web-vitals 库或 PerformanceObserver 采集。\n\n边界和坑。① 跨域脚本的 onerror 拿不到详细信息（Script error），要给 script 加 crossorigin 并配 CORS 头。② 采样上报——全量上报量太大，错误全量加性能采样。③ 监控本身别影响性能，上报用 sendBeacon、批量、空闲时发。",
+      "content": "**结论**：前端监控是线上质量的眼睛，分错误监控、性能监控、行为监控三大块，核心是从采集到上报到聚合告警到源码定位的闭环。\n\n**错误监控**\n- 四层捕获：`window.onerror` 抓同步异常、`addEventListener('error', handler, true)` 在捕获阶段抓资源加载失败、`unhandledrejection` 抓未处理 Promise rejection、框架 ErrorBoundary/ errorHandler 抓组件树渲染错误\n- 网络请求错误：Fetch 的 4xx/5xx 不会触发 catch，要检查 `response.ok`；用 Axios 拦截器统一处理\n- Source Map 还原：构建时生成 `hidden-source-map`（不在产物中暴露），通过 sentry-cli 上传到 Sentry（不传 CDN），平台用 Source Map 把错误栈还原到源码行\n- **接入第一步就验证 Source Map**：故意 throw 一个错误，部署后确认 Sentry 收到且还原正确\n- 跨域脚本 `Script error`：给 `<script>` 加 `crossorigin` + CDN 返回 CORS 头\n\n**性能监控**\n- Core Web Vitals 三指标（2024.3 起）：LCP ≤2.5s（加载速度）、INP ≤200ms（交互响应，取代 FID）、CLS ≤0.1（视觉稳定性）\n- 用 `web-vitals` 库采集真实用户数据（RUM），比 Lighthouse 实验室数据更反映真实体验\n- 辅助指标：FCP、TTFB\n\n**采样与上报**\n- 错误：全量上报，靠错误指纹去重；性能/行为：按比例采样（1%-10%）\n- 上报方式：`sendBeacon`（页面卸载不丢失、不阻塞导航）、`fetch({ keepalive: true })`、批量合并、`requestIdleCallback` 空闲时发\n- `beforeSend` 钩子：过滤无意义错误、脱敏 URL/token、移除 PII\n\n**行为监控**：PV/UV、点击、停留、转化漏斗，主要服务产品决策，但常和错误数据关联分析\n\n**验证闭环**：故意制造错误 → Sentry 收到且 Source Map 还原 → 告警触发 → 确认采样率生效",
       "followUpQuestions": [
         {
           "question": "线上报了个错但错误栈全是混淆的看不懂，怎么办？",
-          "answer": "这是没配好 Source Map。生产代码经过压缩混淆，错误栈里是 a.b.c、行号也对不上源码。解决：构建时生成 Source Map，但不要部署到 CDN（会暴露源码），而是上传到 Sentry 这类监控平台（用 sentry-cli 或构建插件），平台拿到错误栈后用 Source Map 反查还原成「哪个文件、哪一行、哪个函数」。接入监控时第一件事就该验证这条链路——故意抛个错，看平台收到的是不是还原后的源码位置。另外跨域脚本的错误默认是 Script error 没详情，要给 script 加 crossorigin 并让 CDN 返回 CORS 头。"
+          "answer": "Source Map 没配好。生产代码经过 Terser/Webpack 压缩混淆，错误栈里的文件名和行号对不上源码。解决：构建时生成 Source Map（Webpack `devtool: 'hidden-source-map'`、Vite `build.sourcemap: 'hidden'`），用 sentry-cli 或构建插件在 CI 中上传到 Sentry。不要把 Source Map 传到 CDN，否则源码泄露。接入时第一步就验证——故意 throw 一个错误，确认 Sentry 收到且还原到正确源码行。另外跨域脚本默认只能拿到 `Script error`，要给 `<script>` 加 `crossorigin` 且 CDN 返回 `Access-Control-Allow-Origin` 头。"
         },
         {
-          "question": "Core Web Vitals 是哪几个指标？分别衡量什么、怎么优化？",
-          "answer": "三个核心：LCP（最大内容绘制，衡量加载速度，目标 ≤2.5s），优化靠压缩图片、CDN、预加载关键资源、SSR/SSG；INP（交互到下次绘制，取代了 FID，衡量交互响应，目标 ≤200ms），优化靠拆分长任务、减少主线程阻塞、用 Web Worker；CLS（累积布局偏移，衡量视觉稳定性，目标 ≤0.1），优化靠给图片和广告位预设尺寸、避免动态插入内容把已有内容挤走。用 web-vitals 库采集真实用户数据（RUM），比 Lighthouse 实验室数据更反映真实体验。"
+          "question": "INP 和 FID 有什么区别？为什么要取代？",
+          "answer": "FID（First Input Delay）只衡量首次交互从输入到浏览器开始处理之间的延迟，不包括事件处理时间和渲染时间。用户可能感觉到「点了但页面卡了一下」，FID 却显示正常。INP（Interaction to Next Paint）衡量页面生命周期中所有交互的延迟，取第 98 百分位最差值，覆盖从输入到下一帧绘制完成的全流程，更能反映真实的交互体验。Google 在 2024 年 3 月正式用 INP 取代 FID 作为核心指标。"
+        },
+        {
+          "question": "如何确保监控本身不影响页面性能？",
+          "answer": "几层保障：上报用 `navigator.sendBeacon` 或 `fetch({ keepalive: true })`，不阻塞页面导航和主线程；多条数据批量合并后上报，减少请求数量；利用 `requestIdleCallback` 或 `setTimeout` 在浏览器空闲时发送；采样控制数据量，错误全量但用指纹去重，性能按 1%-10% 采样；`beforeSend` 过滤已知无意义的第三方 SDK 错误减少无效数据。Sentry SDK 本身也有性能开销，要关注其 bundle size 和运行时影响。"
+        },
+        {
+          "question": "为什么错误要全量上报但性能要采样？",
+          "answer": "错误是异常事件，量相对小且每条都可能影响用户，遗漏就可能漏掉一个影响面很大的 bug。全量上报加上前端/后端的错误指纹去重，数据量可控。性能指标是常态数据，每个页面加载都会产生，全量上报会产生海量数据（日活百万就是百万条 LCP 数据），存储和分析成本高。按比例采样（比如 5%）就能得到统计上可信的分布数据，同时控制成本。"
         }
       ]
     },
@@ -94,65 +120,92 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "前端监控的三大类（错误/性能/行为）",
-        "Sentry的配置和Source Map使用",
-        "Core Web Vitals的三个核心指标",
-        "全局错误捕获的方式（onerror/unhandledrejection）",
-        "Source Map的安全管理"
+        "前端监控三大类（错误/性能/行为）分别采集什么数据",
+        "错误采集四层覆盖：onerror、资源错误、unhandledrejection、框架 ErrorBoundary",
+        "Source Map 的生成（hidden-source-map）、存储（上传 Sentry 不传 CDN）和还原链路",
+        "跨域脚本 Script error 的原因和解决方案（crossorigin + CORS）",
+        "Core Web Vitals 三个指标的含义、阈值和优化方向，INP 取代 FID 的原因",
+        "采样策略：错误全量+指纹去重 vs 性能/行为按比例采样",
+        "sendBeacon 的优势（页面卸载可用、不阻塞）和局限（无自定义 Header、64KB 限制）",
+        "beforeSend 钩子的用途：过滤无意义错误、脱敏敏感信息、移除 PII",
+        "监控有效性验证：故意制造错误 → 确认 Source Map 还原 → 确认告警触发"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "frontend.engineering.topic-frontend-monitoring.recall.1",
-      "prompt": "Core Web Vitals包含哪些指标？各自的阈值是多少？",
+      "prompt": "请完整讲一下前端错误采集的四层覆盖分别是什么，每层捕获哪类错误？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "frontend.engineering.topic-frontend-monitoring.recall.2",
-      "prompt": "如何配置前端错误监控？Source Map应该如何管理？",
+      "prompt": "Core Web Vitals 包含哪些指标？各自的阈值是多少？INP 和 FID 有什么区别？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "frontend.engineering.topic-frontend-monitoring.recall.3",
-      "prompt": "前端监控与错误追踪 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "如何配置前端错误监控的 Source Map？为什么 Source Map 不能传到 CDN？接入时第一步应该做什么验证？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "frontend.engineering.topic-frontend-monitoring.recall.4",
+      "prompt": "跨域脚本为什么只会报 Script error？怎么解决？",
+      "mode": "text",
+      "expectedMinutes": 2,
+      "difficulty": 3
+    },
+    {
+      "id": "frontend.engineering.topic-frontend-monitoring.recall.5",
+      "prompt": "前端监控的采样策略怎么设计？为什么错误全量上报但性能要采样？上报用什么方式不阻塞页面？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "frontend.engineering.topic-frontend-monitoring.recall.6",
+      "prompt": "线上用户反馈页面报错但 Sentry 上没有错误记录，可能是什么原因？怎么排查？",
+      "mode": "text",
+      "expectedMinutes": 5,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出前端监控三大类：错误、性能、行为",
-      "能说明错误采集（onerror、unhandledrejection）和 Source Map 还原",
-      "能说出 Core Web Vitals（LCP/INP/CLS）",
-      "能说明采集到上报到聚合告警的闭环"
+      "能说出前端监控三大类：错误、性能、行为，以及各自采集的核心数据",
+      "能说明错误采集四层覆盖：window.onerror、资源错误捕获、unhandledrejection、框架层 ErrorBoundary",
+      "能说出 Core Web Vitals 三个指标（LCP/INP/CLS）的含义和阈值，知道 INP 取代 FID",
+      "能说明 Source Map 的生成、上传（不传 CDN）和还原链路，以及接入时必须验证"
     ],
     "goodToHave": [
-      "能解释跨域脚本 Script error 及 crossorigin 解决",
-      "能说明 sendBeacon 和采样上报",
-      "能说明监控本身不应影响性能"
+      "能解释跨域脚本 Script error 的原因和 crossorigin + CORS 解决方案",
+      "能说明采样策略（错误全量+指纹去重 vs 性能采样）和 sendBeacon 上报方式",
+      "能说明 beforeSend 的过滤和脱敏用途",
+      "能区分实验室数据（Lighthouse）和真实用户数据（RUM）"
     ],
     "commonMistakes": [
-      "不配 Source Map 导致错误栈无法定位",
-      "全量上报拖垮性能或成本",
-      "跨域脚本拿不到错误详情却不知原因"
+      "不配 Source Map 或 Source Map 传到了 CDN，导致错误栈无法定位或源码泄露",
+      "只用 window.onerror 漏掉了 Promise rejection 和资源加载错误",
+      "跨域脚本不加 crossorigin，所有错误都变成 Script error 无法排查",
+      "全量上报性能数据不采样，数据量暴增导致成本失控或监控平台响应变慢"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
   "prerequisites": [
     "frontend.engineering.topic-cicd-deploy"
   ],
   "interviewFrequency": "low",
-  "interviewerFocus": "考察能否说清监控三大类、错误采集与 Source Map、Core Web Vitals 指标，并知道采样上报、sendBeacon 和跨域 Script error。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察能否完整说清错误采集四层覆盖、Source Map 还原链路与安全、Core Web Vitals 指标与 INP 变化、采样上报策略，以及跨域 Script error 和监控有效性验证等实战落地细节。",
+  "updatedAt": "2026-06-22"
 }

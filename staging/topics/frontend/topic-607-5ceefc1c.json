@@ -4,7 +4,7 @@
   "category": "js-fundamentals",
   "group": "js-fundamentals",
   "title": "手写 Promise",
-  "summary": "Promise三种状态及转换规则；构造函数中executor的执行时机；then方法返回新Promise的原因。",
+  "summary": "讲清 Promise 作为状态机的三种状态与不可逆迁移规则、executor 的同步执行与 resolve/reject 的时机控制、then 返回新 Promise 实现链式调用的机制（回调存储、微任务调度、递归解析 resolvePromise）、循环引用检测与 thenable 兼容、以及 Promise/A+ 规范对异步行为的强制要求，最终能在面试中完整手写并通过 872 个官方用例。",
   "tags": [
     "前端",
     "JavaScript",
@@ -12,25 +12,30 @@
     "手写"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 42,
   "order": 60,
   "recommendWeight": 88,
   "status": "staging",
   "learningCards": [
     {
       "type": "explain",
-      "title": "手写 Promise：核心要点",
-      "content": "## 核心要点\nPromise 是一个状态机，有三种状态：pending、fulfilled、rejected。状态只能从 pending 单向转变到 fulfilled 或 rejected，且一旦转变不可逆、值也固定下来——这保证了 then 回调拿到的结果是确定的。手写 Promise 的本质就是实现这个状态机，加上一套「状态变化时触发回调」的发布订阅机制。"
+      "title": "Promise 本质是一个有限状态机，不是回调容器",
+      "content": "很多人把 Promise 理解成「异步回调的容器」，这导致手写时只关注回调怎么存、怎么触发，忽略了状态机才是核心。Promise 有且仅有三种状态：pending、fulfilled、rejected。状态迁移只能从 pending 出发，单向到达 fulfilled 或 rejected，一旦到达就锁定——同一个 Promise 的状态和值不可再变。\n\n这个「不可变」设计不是装饰：如果状态能反复变化，第一个 then 拿到 fulfilled 的值开始执行后续逻辑，第二个 then 又看到 rejected，整个链式调用的结果就不确定了。状态锁定保证了每个 then 的回调拿到的结果是确定的，所有下游消费者看到同一个最终值。\n\n手写时状态迁移只发生在 resolve 和 reject 两个函数内部，入口必须先检查 `if (this.status !== PENDING) return`——这个 guard 是整个 Promise 正确性的基石，去掉它状态就能被反复篡改。resolve 接收的 value 如果本身是 Promise 或 thenable（有 then 方法的对象），不能直接赋值，必须递归解析，这是 Promise Resolution Procedure 的核心规则（Promises/A+ 2.3 节）。"
     },
     {
       "type": "explain",
-      "title": "手写 Promise：关键实现",
-      "content": "## 关键实现\n手写一个符合 Promise/A+ 的 Promise，核心是四步：\n1. 构造函数接收 executor 并同步执行，把 resolve/reject 传进去；resolve/reject 改状态并保存值。\n2. then 方法返回一个新 Promise，从而支持链式调用——新 Promise 的状态由当前回调的执行结果决定。\n3. 如果调用 then 时还是 pending，要把成功/失败回调存进队列（发布订阅），等状态改变时再依次触发。\n4. 回调必须异步执行（用 queueMicrotask 放进微任务队列），保证 then 的回调总在当前同步代码跑完后才执行。\n最难的是 then 返回值的处理：如果回调返回的还是一个 Promise，要递归等它定型、把它的结果透传出去。"
+      "title": "executor 同步执行：resolve/reject 的时机由调用方控制",
+      "content": "`new Promise(executor)` 的构造函数会**同步**调用 executor，并把 resolve 和 reject 作为参数传进去。这意味着 executor 里的代码在 new 的那一刻就开始跑了——如果 executor 里有同步的 resolve，Promise 在构造结束时就已经 fulfilled 了；如果 resolve 被包在 setTimeout 里，Promise 在构造结束时还是 pending。\n\n这个设计的工程意义是：调用方通过控制 resolve/reject 的调用时机来决定 Promise 何时定型（settle），而不需要知道内部实现。构造函数必须用 try/catch 包住 executor 的调用——如果 executor 抛异常，应该直接让 Promise rejected，而不是让异常逃逸到 new 语句外。这是所有实现的第一道防线：\n```javascript\ntry {\n    executor(this.resolve.bind(this), this.reject.bind(this));\n} catch (e) {\n    this.reject(e);\n}\n```\n\n还有一个常被忽略的细节：resolve 和 reject 必须绑定 this，否则作为参数传递时 this 会丢失。bind 或箭头函数都可以，但 bind 是最稳妥的方式。"
     },
     {
       "type": "explain",
-      "title": "手写 Promise：面试高频考点",
-      "content": "## 面试高频考点\n- 为什么then返回新Promise？（实现链式调用）\n- 如何处理异步？（回调队列）\n- resolve的值是Promise怎么办？（递归解析）\n\n## 验证与边界\n验证手写实现是否正确，标准做法是跑 promises-aplus-tests 官方测试套件（872 个用例全过才算合规）。常见踩坑和取舍：① then 回调必须异步——很多人用 setTimeout 也能过测试，但 setTimeout 是宏任务、和原生 Promise 的微任务时机不一致，正确该用 queueMicrotask。② resolvePromise 里要做循环引用检测和 thenable 兼容，否则递归解析会栈溢出。③ 手写只为理解原理，生产一律用原生 Promise——V8 内部用 C++ 实现，性能远高于 JS 手写版。"
+      "title": "then 的三重职责：注册回调、返回新 Promise、微任务调度",
+      "content": "then 是 Promise 最复杂的方法，它同时承担三个职责：\n\n**职责一：注册回调。** then(onFulfilled, onRejected) 接收两个回调。如果调用 then 时 Promise 已经 fulfilled，onFulfilled 应该被执行；如果已经 rejected，onRejected 应该被执行；如果还是 pending，回调必须被存进队列，等状态改变时再依次触发——这就是发布订阅模式。存储结构通常是一个数组，每个元素包含 onFulfilled 和 onRejected 两个回调引用。\n\n**职责二：返回新 Promise。** then 的返回值是一个**全新的** Promise，它的状态和值由 onFulfilled/onRejected 的返回值决定。这才是链式调用 `a.then(f).then(g).then(h)` 的基础——每个 then 返回的 Promise 成为下一个 then 的接收者。如果 then 不返回新 Promise，链就断了。新 Promise 的状态判定规则（即 resolvePromise）：\n- 回调返回普通值 → 新 Promise fulfilled，值为返回值\n- 回调返回 Promise/thenable → 新 Promise 等待它 settle，值/原因透传\n- 回调抛异常 → 新 Promise rejected，原因为异常\n- 回调没有返回值（返回 undefined） → 新 Promise fulfilled，值为 undefined\n\n**职责三：微任务调度。** Promise/A+ 规范 2.2.4 条明确规定：回调必须在执行栈清空后异步调用。这保证了 then 的回调总是在当前同步代码跑完后才执行，执行顺序可预测。手写时用 `queueMicrotask` 而不是 `setTimeout`——虽然 setTimeout 也能通过测试套件，但它是宏任务，和原生 Promise 的微任务时机不完全一致。在同一个事件循环轮次中，微任务（Promise 回调）在当前宏任务结束后立即执行，而 setTimeout 要等下一个宏任务。"
+    },
+    {
+      "type": "explain",
+      "title": "resolvePromise 递归解析：thenable 兼容与循环引用检测",
+      "content": "当 then 的回调返回一个值时，需要判断这个值的类型来决定新 Promise 的状态。Promise/A+ 2.3 节定义了一套完整的 Promise Resolution Procedure，核心逻辑是：\n\n1. 如果返回值 === 新 Promise 本身（循环引用），直接 reject，抛 TypeError。这个检查必须在最前面，否则后续递归会无限循环导致栈溢出。\n2. 如果返回值是 Promise 或 thenable（有 then 方法的对象），要取出它的 then 方法，用 `then.call(returnedValue, resolvePromise, rejectPromise)` 调用，递归解析。每次递归都要重新做循环引用检测。\n3. 如果 then 属性是通过 getter 定义的（Object.defineProperty），getter 可能抛异常——规范要求捕获这个异常并 reject 新 Promise。\n4. 如果返回值是普通值（不是 Promise/thenable），直接用该值 resolve 新 Promise。\n\nthenable 兼容的意义是跨库互操作：不同 Promise 实现（bluebird、Q、原生 Promise）之间可以通过 thenable 协议互相传递。这也是为什么 Promise.resolve(thenable) 会「吸收」thenable——它不是简单包装，而是递归等它 settle。"
     },
     {
       "type": "diagram",
@@ -52,41 +57,85 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | 手写 Promise | async/await |\n| --- | --- | --- |\n| 本质 | 状态机+回调队列 | Promise的语法糖 |\n| 错误处理 | catch方法 | try/catch |\n| 链式调用 | then返回新Promise | 自动展开 |\n| 调试难度 | 难 | 容易 |\n| 面试频率 | 高 | 低（太简单）|"
+      "title": "手写 Promise 关键实现与原生 Promise 对比",
+      "content": "| 维度 | 手写实现要点 | 原生 Promise（V8 引擎） |\n| --- | --- | --- |\n| 状态机 | JS 层 status 字段 + guard 检查 | C++ 内部状态，原子操作保证线程安全 |\n| 回调调度 | queueMicrotask（微任务） | 内部微任务队列，时机与 queueMicrotask 一致 |\n| then 返回值 | 新建 MyPromise 实例，手动递归 resolvePromise | 内部创建新 Promise，C++ 层递归解析 |\n| 循环引用 | JS 层 identity check（===） | C++ 层 set 记录已访问 Promise |\n| thenable 兼容 | duck type 检测 .then 方法 | 同，规范要求跨库互操作 |\n| 性能 | JS 对象 + 闭包，每次 then 创建新对象 | C++ 内存布局紧凑，GC 友好 |\n| 测试标准 | promises-aplus-tests（872 用例） | 同一标准 + V8 额外集成测试 |\n| 错误处理 | try/catch 包 executor 和回调 | 同，额外有 HostPromiseRejectionTracker |\n\n| 对比维度 | Promise | async/await |\n| --- | --- | --- |\n| 本质 | 状态机 + 回调队列 | Promise 的语法糖，编译为 Promise 链 |\n| 错误处理 | .catch() 或 then 的 onRejected | try/catch，更直观 |\n| 链式调用 | then 返回新 Promise | 自动 await 展开，顺序更清晰 |\n| 调试体验 | 链式调用栈难追踪 | 可以用 await 断点，栈更清晰 |\n| 面试考察重点 | 手写机制、状态流转、微任务调度 | 很少单独考手写，但考语义（如 for...of + await 的串行问题） |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "class MyPromise {\n    static PENDING = 'pending';\n    static FULFILLED = 'fulfilled';\n    static REJECTED = 'rejected';\n\n    constructor(executor) {\n        this.status = MyPromise.PENDING;\n        this.value = undefined;\n        this.callbacks = [];\n        try {\n            executor(this.resolve.bind(this), this.reject.bind(this));\n        } catch (e) {\n            this.reject(e);\n        }\n    }\n\n    resolve(value) {\n        if (this.status !== MyPromise.PENDING) return;\n        this.status = MyPromise.FULFILLED;\n        this.value = value;\n        this.callbacks.forEach(cb => cb.onFulfilled(value));\n    }\n\n    reject(reason) {\n        if (this.status !== MyPromise.PENDING) return;\n        this.status = MyPromise.REJECTED;\n        this.value = reason;\n        this.callbacks.forEach(cb => cb.onRejected(reason));\n    }\n\n    then(onFulfilled, onRejected) {\n        return new MyPromise((resolve, reject) => {\n            const handle = (fn) => {\n                queueMicrotask(() => {\n                    try {\n                        const result = fn(this.value);\n                        if (result instanceof MyPromise) {\n                            result.then(resolve, reject);\n                        } else {\n                            resolve(result);\n                        }\n                    } catch (e) {\n                        reject(e);\n                    }\n                });\n            };\n            if (this.status === MyPromise.FULFILLED) {\n                handle(onFulfilled);\n            } else if (this.status === MyPromise.REJECTED) {\n                handle(onRejected);\n            } else {\n                this.callbacks.push({ onFulfilled: () => handle(onFulfilled), onRejected: () => handle(onRejected) });\n            }\n        });\n    }\n}",
+      "title": "完整手写 Promise：状态机 + then 链式 + resolvePromise 递归解析",
       "language": "javascript",
+      "content": "const PENDING = 'pending';\nconst FULFILLED = 'fulfilled';\nconst REJECTED = 'rejected';\n\nclass MyPromise {\n    constructor(executor) {\n        this.status = PENDING;\n        this.value = undefined;       // fulfilled 时存 value，rejected 时存 reason\n        this.onFulfilledCallbacks = []; // pending 时暂存的成功回调\n        this.onRejectedCallbacks = [];  // pending 时暂存的失败回调\n\n        const resolve = (value) => {\n            if (this.status !== PENDING) return; // 状态锁定：只迁移一次\n\n            // resolve 的值如果是 Promise/thenable，递归解析\n            if (value instanceof MyPromise || (value !== null && typeof value === 'object' && typeof value.then === 'function')) {\n                value.then(resolve, reject); // 吸收 thenable\n                return;\n            }\n\n            this.status = FULFILLED;\n            this.value = value;\n            this.onFulfilledCallbacks.forEach(fn => fn());\n        };\n\n        const reject = (reason) => {\n            if (this.status !== PENDING) return;\n            this.status = REJECTED;\n            this.value = reason;\n            this.onRejectedCallbacks.forEach(fn => fn());\n        };\n\n        try {\n            executor(resolve, reject); // 同步调用 executor\n        } catch (e) {\n            reject(e); // executor 抛异常 → rejected\n        }\n    }\n\n    then(onFulfilled, onRejected) {\n        // 值穿透：onFulfilled/onRejected 不是函数时透传值\n        onFulfilled = typeof onFulfilled === 'function' ? onFulfilled : value => value;\n        onRejected = typeof onRejected === 'function' ? onRejected : reason => { throw reason; };\n\n        const promise2 = new MyPromise((resolve, reject) => {\n            const handle = (callback) => {\n                queueMicrotask(() => { // 微任务异步执行\n                    try {\n                        const x = callback(this.value);\n                        resolvePromise(promise2, x, resolve, reject); // 核心：递归解析\n                    } catch (e) {\n                        reject(e);\n                    }\n                });\n            };\n\n            if (this.status === FULFILLED) {\n                handle(onFulfilled);\n            } else if (this.status === REJECTED) {\n                handle(onRejected);\n            } else { // pending：存队列，发布订阅\n                this.onFulfilledCallbacks.push(() => handle(onFulfilled));\n                this.onRejectedCallbacks.push(() => handle(onRejected));\n            }\n        });\n        return promise2; // 返回新 Promise，链式调用的基础\n    }\n\n    catch(onRejected) {\n        return this.then(null, onRejected);\n    }\n\n    finally(callback) {\n        return this.then(\n            value => MyPromise.resolve(callback()).then(() => value),\n            reason => MyPromise.resolve(callback()).then(() => { throw reason; })\n        );\n    }\n\n    // 静态方法\n    static resolve(value) {\n        if (value instanceof MyPromise) return value;\n        return new MyPromise(resolve => resolve(value));\n    }\n\n    static reject(reason) {\n        return new MyPromise((_, reject) => reject(reason));\n    }\n\n    static all(promises) {\n        return new MyPromise((resolve, reject) => {\n            const results = [];\n            let count = 0;\n            const items = Array.from(promises);\n            if (items.length === 0) return resolve(results); // 空数组立即 resolve\n            items.forEach((p, i) => {\n                MyPromise.resolve(p).then( // 非 Promise 值自动包装\n                    value => {\n                        results[i] = value;\n                        if (++count === items.length) resolve(results);\n                    },\n                    reason => reject(reason) // 任一失败立即 reject（短路）\n                );\n            });\n        });\n    }\n\n    static race(promises) {\n        return new MyPromise((resolve, reject) => {\n            Array.from(promises).forEach(p => {\n                MyPromise.resolve(p).then(resolve, reject); // 第一个定型的决定结果\n            });\n        });\n    }\n}\n\n// Promise Resolution Procedure（Promises/A+ 2.3 节）\nfunction resolvePromise(promise2, x, resolve, reject) {\n    // 循环引用检测：x === promise2 则 reject TypeError\n    if (x === promise2) {\n        return reject(new TypeError('Chaining cycle detected'));\n    }\n\n    // x 是 MyPromise 实例：等它 settle 后透传\n    if (x instanceof MyPromise) {\n        x.then(resolve, reject);\n        return;\n    }\n\n    // x 是 thenable：duck type 检测 .then 方法\n    if (x !== null && (typeof x === 'object' || typeof x === 'function')) {\n        let called = false; // 防止 thenable 的 then 被多次调用\n        try {\n            const then = x.then; // getter 可能抛异常\n            if (typeof then === 'function') {\n                then.call(\n                    x,\n                    y => { // resolvePromise\n                        if (called) return;\n                        called = true;\n                        resolvePromise(promise2, y, resolve, reject); // 递归解析\n                    },\n                    r => { // rejectPromise\n                        if (called) return;\n                        called = true;\n                        reject(r);\n                    }\n                );\n            } else {\n                resolve(x); // 有 .then 但不是函数，当普通值处理\n            }\n        } catch (e) {\n            if (called) return; // 已经调用过则忽略后续异常\n            called = true;\n            reject(e);\n        }\n    } else {\n        resolve(x); // 普通值直接 resolve\n    }\n}\n\n// 验证：接入 promises-aplus-tests 套件\nMyPromise.deferred = function () {\n    let result = {};\n    result.promise = new MyPromise((resolve, reject) => {\n        result.resolve = resolve;\n        result.reject = reject;\n    });\n    return result;\n};\nmodule.exports = MyPromise;",
       "highlights": [
         {
-          "line": 1,
-          "note": "这段代码用于定位 手写 Promise 的入口实现；讲解时要说明输入如何进入、状态在哪里变化，以及异常时哪一行最先暴露问题。"
+          "line": 12,
+          "note": "resolve 入口 guard：状态只迁移一次的保证，去掉它整个 Promise 就废了。"
+        },
+        {
+          "line": 16,
+          "note": "resolve 值是 Promise/thenable 时递归吸收，不直接赋值——这是 thenable 兼容的核心。"
+        },
+        {
+          "line": 47,
+          "note": "值穿透：onFulfilled 不是函数时透传 value，保证 `.then(null).then(fn)` 也能拿到值。"
+        },
+        {
+          "line": 53,
+          "note": "queueMicrotask 微任务执行——Promise/A+ 2.2.4 要求，不用 setTimeout。"
+        },
+        {
+          "line": 55,
+          "note": "resolvePromise 递归解析是 then 返回值处理的核心——回调返回 Promise/thenable 都走这里。"
+        },
+        {
+          "line": 62,
+          "note": "pending 时存队列（发布订阅），状态改变时在 resolve/reject 里遍历触发。"
+        },
+        {
+          "line": 68,
+          "note": "then 返回新 Promise（promise2），链式调用的基础。每个 then 创建独立的 Promise 实例。"
+        },
+        {
+          "line": 112,
+          "note": "空数组立即 resolve——all 的边界条件。"
+        },
+        {
+          "line": 127,
+          "note": "循环引用检测：x === promise2 时 reject TypeError，防止无限递归。"
+        },
+        {
+          "line": 134,
+          "note": "thenable duck type 检测：取 x.then 时可能抛异常（getter），必须 try/catch。"
+        },
+        {
+          "line": 138,
+          "note": "called 标志：防止 thenable 的 then 被多次调用（规范要求只接受第一次调用）。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：手写 Promise 考的是对「状态机加微任务加链式调用」三件事的理解。Promise 本质是一个状态机：pending 单向转 fulfilled 或 rejected、不可逆；then 注册回调、返回新 Promise 实现链式；回调通过微任务异步触发。\n\n关键实现四步：\n\n1. 构造函数同步执行 executor，resolve/reject 改状态并存值。\n2. then 返回新 Promise（链式的基础），新 Promise 状态由本次回调结果决定。\n3. 调 then 时若还 pending，把回调存进队列，状态改变时再触发（发布订阅）。\n4. 回调用 queueMicrotask 异步执行，保证在同步代码之后跑。\n\n几个必答的考点：\n\n1. then 为什么必须异步？Promise/A+ 规定回调必须在执行栈清空后异步调用，保证执行顺序确定、不会有时同步有时异步。\n2. 状态为什么只能迁移一次？保证一个 Promise 的结果确定且不变，下游能安全依赖。\n3. then 回调返回 Promise 怎么办？要在 resolvePromise 里递归解析，等它定型再把值透传，链式才能正确串起异步。\n\n边界。① resolve 的值是 Promise 或 thenable 时要递归展开兼容。② 要做循环引用检测（then 返回的 Promise 是它自己就抛 TypeError）。③ 实际开发用原生 Promise，手写主要是理解原理和应付面试。",
+      "content": "**一句话结论**\n手写 Promise 考的是「状态机 + 微任务 + 链式调用」三件事的工程实现：状态单向迁移保证结果确定性，then 返回新 Promise 实现链式，回调通过微任务异步执行保证顺序可预测。\n\n**状态机（必答）**\nPromise 有 pending、fulfilled、rejected 三种状态，只能从 pending 单向迁移、不可逆。resolve 和 reject 内部用 `if (status !== PENDING) return` 做 guard，保证状态只变一次。resolve 接收的值如果是 Promise 或 thenable，必须递归解析（吸收），不能直接赋值。\n\n**executor 的执行时机（必答）**\n构造函数同步调用 executor，resolve/reject 作为参数传入。executor 抛异常时 catch 后直接 reject。resolve/reject 必须绑定 this（bind），否则作为参数传递时 this 丢失。\n\n**then 的三重职责**\n1. 注册回调：pending 时存队列（发布订阅），定型后立即触发\n2. 返回新 Promise：链式调用的基础，新 Promise 的状态由回调返回值经 resolvePromise 决定\n3. 微任务调度：queueMicrotask 异步执行回调，对齐原生 Promise 语义\n\n**resolvePromise（区分度所在）**\n循环引用检测 → Promise 实例递归 → thenable duck type 兼容 → 普通值直接 resolve。thenable 的 then getter 可能抛异常必须 catch；called 标志防止 thenable.then 被多次调用。\n\n**值穿透**\nonFulfilled 不是函数时用 `value => value` 替代，onRejected 不是函数时用 `reason => { throw reason }` 替代。这保证 `.then().then(fn)` 也能拿到值。\n\n**验证**\n接入 promises-aplus-tests 套件（872 用例），导出 deferred 工厂方法。手写只为理解原理，生产用原生 Promise——V8 C++ 实现性能远高于 JS 手写。\n\n**常见陷阱**\n- 用 setTimeout 而不是 queueMicrotask：宏任务 vs 微任务，时机不一致\n- then 不返回新 Promise：链断了\n- 不做循环引用检测：栈溢出\n- 不处理 thenable：跨库互操作失败\n- called 标志缺失：thenable.then 被多次调用导致状态重复迁移",
       "followUpQuestions": [
         {
-          "question": "Promise/A+ 中 then 为什么必须异步调用？状态为什么只能从 pending 迁移一次？",
-          "answer": "then 异步调用可以保证回调执行顺序稳定，避免同步/异步混用导致结果不可预测。状态只能迁移一次，是为了让异步结果确定后不可反复变化，后续所有 then 都基于同一个最终状态执行。"
+          "question": "then 回调为什么必须异步执行？用 setTimeout 行不行？",
+          "answer": "Promise/A+ 2.2.4 规定回调必须在执行栈清空后异步调用，保证执行顺序稳定——不会出现有时候同步执行、有时候异步执行的情况。用 setTimeout 能通过测试套件（因为它也是异步的），但 setTimeout 是宏任务，和原生 Promise 的微任务时机不完全一致。经典例子：`Promise.resolve().then(() => console.log('micro'))` 永远在 `setTimeout(() => console.log('macro'), 0)` 之前执行。所以正确做法是 queueMicrotask。"
         },
         {
-          "question": "手写 Promise 时如何处理 then 返回另一个 Promise 的解析过程？",
-          "answer": "需要实现 Promise Resolution Procedure：如果回调返回普通值，新 Promise fulfilled；如果返回 Promise 或 thenable，新 Promise 必须等待它 settle；如果解析过程中抛错，则新 Promise rejected，并要防止循环引用。"
+          "question": "resolve 的值是 thenable 对象时怎么处理？为什么要递归？",
+          "answer": "按 Promise/A+ 2.3 节处理：取 x.then（getter 可能抛异常要 catch），如果是函数就用 then.call(x, resolvePromise, rejectPromise) 调用。递归是因为 thenable 的 then 回调可能又返回 thenable，必须一层层展开直到拿到普通值或真正 settle 的 Promise。这是跨库互操作的基础——不同 Promise 实现之间通过 thenable 协议传递。"
         },
         {
-          "question": "原生 Promise 的 then 回调是宏任务还是微任务？和 setTimeout 谁先执行？",
-          "answer": "then 回调是微任务（microtask），setTimeout 是宏任务（macrotask）。事件循环每跑完一个宏任务，会清空所有微任务再进下一个宏任务，所以同一轮里微任务永远先于下一个宏任务执行。经典题：console.log(1)、setTimeout 里 log(4)、Promise.resolve().then 里 log(3)、console.log(2)，输出是 1 2 3 4——同步的 1、2 先，然后微任务 3，最后宏任务 4。手写 Promise 时用 queueMicrotask 而不是 setTimeout，就是为了对齐这个微任务语义。"
+          "question": "循环引用怎么检测？不检测会怎样？",
+          "answer": "在 resolvePromise 入口做 `if (x === promise2)` 的 identity check。如果 then 的回调返回了它自己的 promise2（即 `p.then(() => p)`），不检测的话 resolvePromise 会无限递归调用自己，最终栈溢出。检测到后直接 reject TypeError('Chaining cycle detected')。"
         },
         {
-          "question": "Promise.all、allSettled、race、any 有什么区别？",
-          "answer": "all：全部成功才成功、返回结果数组，任一失败就立即 reject（短路）。allSettled：等全部定型，返回每个的状态和值或原因，不会因某个失败而短路，适合「都要跑完、分别看结果」。race：第一个定型的（不管成功失败）就决定结果，常用于超时控制（和一个 setTimeout reject 赛跑）。any：第一个成功的就 resolve，全部失败才 reject（返回 AggregateError），适合多源取最快成功的。关键是「要不要全部、要不要因失败短路、看成功还是看定型」。"
+          "question": "Promise.all 空数组传入会怎样？allSettled 和 race 呢？",
+          "answer": "Promise.all([]) 立即 resolve 空数组——因为没有需要等待的项，count 从 0 就满足了。Promise.allSettled([]) 也立即 resolve 空数组。Promise.race([]) 永远 pending——因为没有任何项来触发 resolve 或 reject，这是 race 的一个坑，生产中需要加超时兜底。Promise.any([]) 立即 reject AggregateError——所有项都「失败」了（连失败都没有，但语义上全部失败）。"
+        },
+        {
+          "question": "then 里 onFulfilled 和 onRejected 不是函数怎么办？",
+          "answer": "Promise/A+ 规定：如果不是函数，必须用值穿透替代。onFulfilled 不是函数时用 `value => value`，保证值沿链传递；onRejected 不是函数时用 `reason => { throw reason }`，保证错误沿链传播。这就是为什么 `.then().then(fn)` 或 `.then(null).catch(fn)` 能正确工作。"
         }
       ]
     },
@@ -94,74 +143,95 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "Promise三种状态及转换规则",
-        "构造函数中executor的执行时机",
-        "then方法返回新Promise的原因",
-        "异步回调的存储和执行机制",
-        "微任务执行方式",
-        "resolve传入Promise的递归处理",
-        "手写代码能跑通基本用例"
+        "Promise 三种状态（pending/fulfilled/rejected）及单向不可逆迁移规则",
+        "executor 在构造函数中被同步调用，resolve/reject 的 guard 检查保证状态只迁移一次",
+        "resolve 接收 Promise/thenable 时递归解析（吸收），不能直接赋值",
+        "then 返回新 Promise 实现链式调用，新 Promise 状态由回调返回值经 resolvePromise 决定",
+        "pending 时回调存队列（发布订阅），定型后用 queueMicrotask 微任务异步触发",
+        "resolvePromise 的完整逻辑：循环引用检测 → Promise 实例递归 → thenable duck type 兼容（called 标志） → 普通值直接 resolve",
+        "值穿透：onFulfilled/onRejected 不是函数时的默认替代逻辑",
+        "finally 的实现原理：用 then 包装，callback 返回值不影响原始值/原因",
+        "Promise.all 空数组立即 resolve、race 空数组永远 pending 的边界行为",
+        "能接入 promises-aplus-tests 套件跑通 872 个用例"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "frontend.js-fundamentals.topic-607-5ceefc1c.recall.1",
-      "prompt": "请说明 Promise 的 pending/fulfilled/rejected 状态流转、then 链式调用和微任务调度。",
+      "prompt": "请说明 Promise 的 pending/fulfilled/rejected 状态流转规则、then 链式调用机制和微任务调度时机。",
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 4
     },
     {
       "id": "frontend.js-fundamentals.topic-607-5ceefc1c.recall.2",
-      "prompt": "请手写一个符合核心语义的 Promise：状态保存、then 注册、resolvePromise 递归解析。",
+      "prompt": "请手写一个符合核心语义的 Promise：状态机、executor 同步执行、then 返回新 Promise、resolvePromise 递归解析、循环引用检测。",
       "mode": "code",
       "expectedMinutes": 12,
       "difficulty": 4
     },
     {
       "id": "frontend.js-fundamentals.topic-607-5ceefc1c.recall.3",
-      "prompt": "请手写 Promise.all，并说明空数组、非 Promise 值、任一失败时如何处理。",
+      "prompt": "请手写 Promise.all，并说明空数组、非 Promise 值、任一失败短路、结果顺序保持这四个边界行为。",
       "mode": "code",
       "expectedMinutes": 8,
       "difficulty": 4
     },
     {
       "id": "frontend.js-fundamentals.topic-607-5ceefc1c.recall.4",
-      "prompt": "Promise.resolve(thenable) 为什么要吸收 thenable？循环引用应该如何拒绝？",
+      "prompt": "resolve 的值是 thenable 时为什么要递归解析？循环引用应该如何检测和拒绝？called 标志的作用是什么？",
       "mode": "text",
       "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "frontend.js-fundamentals.topic-607-5ceefc1c.recall.5",
+      "prompt": "then 回调为什么必须用微任务异步执行？用 setTimeout 和 queueMicrotask 有什么区别？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "frontend.js-fundamentals.topic-607-5ceefc1c.recall.6",
+      "prompt": "then 里 onFulfilled 不是函数时怎么办？值穿透的实现原理是什么？",
+      "mode": "text",
+      "expectedMinutes": 3,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出 Promise 是状态机：pending 单向不可逆",
-      "能说明 then 返回新 Promise 实现链式",
-      "能说明回调用微任务异步触发",
-      "能说明 then 回调返回 Promise 要递归解析"
+      "能说出 Promise 是状态机：pending 单向不可逆迁移，resolve/reject 用 guard 保证状态只变一次",
+      "能说明 then 返回新 Promise 实现链式调用，新 Promise 状态由回调返回值经 resolvePromise 决定",
+      "能说明回调通过 queueMicrotask 微任务异步执行（Promise/A+ 2.2.4）",
+      "能说明 resolvePromise 的递归解析逻辑：循环引用检测、Promise/thenable 递归、called 标志防多次调用",
+      "能说明值穿透：onFulfilled/onRejected 不是函数时的默认替代"
     ],
     "goodToHave": [
-      "能解释 then 为什么必须异步（Promise/A+）",
-      "能说明 pending 时回调存队列的发布订阅",
-      "能说明循环引用检测"
+      "能解释 pending 时回调存队列的发布订阅模式",
+      "能说明 resolve 接收 thenable 时的吸收（absorb）机制",
+      "能解释 finally 的实现原理（callback 返回值不影响原始值/原因）",
+      "能说明 Promise.all 空数组立即 resolve、race 空数组永远 pending 的边界行为"
     ],
     "commonMistakes": [
-      "以为 then 回调可以同步执行",
-      "then 不返回新 Promise 导致链式断裂",
-      "不处理回调返回 Promise 的递归解析"
+      "用 setTimeout 而不是 queueMicrotask，宏任务 vs 微任务时机不一致",
+      "then 不返回新 Promise，链式调用断裂",
+      "不检测循环引用（x === promise2），导致栈溢出",
+      "不处理 thenable 的 called 标志，thenable.then 被多次调用导致状态重复迁移",
+      "值穿透缺失：onFulfilled 不是函数时不替代，导致 .then().then(fn) 拿不到值"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
   "prerequisites": [
     "frontend.js-fundamentals.topic-closure-scope"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「手写 Promise」说清Promise三种状态及转换规则、构造函数中executor的执行时机，并放到前端工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-12"
+  "interviewerFocus": "考察能否围绕「手写 Promise」完整说清状态机设计（三状态单向迁移、guard 检查）、executor 同步执行与异常捕获、then 的三重职责（注册回调、返回新 Promise、微任务调度）、resolvePromise 递归解析（循环引用检测、thenable 兼容、called 标志）、值穿透，以及 promises-aplus-tests 验证方法。",
+  "updatedAt": "2026-06-23"
 }

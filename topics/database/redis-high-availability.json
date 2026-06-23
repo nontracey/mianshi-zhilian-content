@@ -4,7 +4,7 @@
   "category": "redis-cache",
   "group": "redis-cache",
   "title": "Redis 主从、哨兵与 Cluster",
-  "summary": "讲清 Redis 主从复制、哨兵故障转移、Cluster 槽位分片三层高可用能力，以及异步复制丢数据、跨槽操作受限等一致性边界。",
+  "summary": "讲清 Redis 主从复制的 PSYNC 协议与异步复制窗口、哨兵从主观下线到客观下线到选主的故障转移流程、Cluster 的 16384 hash slot 分片与 MOVED/ASK 重定向机制，以及异步复制丢数据、跨槽操作受限、reshard 迁移窗口等一致性与可用性边界。",
   "tags": [
     "数据库",
     "Redis",
@@ -13,23 +13,43 @@
     "Cluster"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 25,
   "order": 110,
   "recommendWeight": 85,
   "status": "production",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否区分复制/哨兵/Cluster 三层、说清哨兵故障转移和 Cluster 分片路由，并意识到异步复制丢数据、跨槽操作和复制延迟等边界。",
+  "interviewerFocus": "考察能否清晰区分复制/哨兵/Cluster 三层能力、说清 PSYNC 协议和哨兵故障转移完整流程、理解 Cluster 槽位路由与重定向机制，并意识到异步复制丢数据、跨槽操作受限、reshard 迁移窗口等一致性与可用性边界。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Redis 主从、哨兵与 Cluster的职责边界",
-      "content": "Redis 高可用通常从主从复制开始，哨兵负责监控和自动故障转移，Cluster 进一步用槽位分片解决容量和写入扩展问题。它们不是同一层能力：复制解决副本，哨兵解决主节点故障，Cluster 解决分片。\n学习 Redis 主从、哨兵与 Cluster 时，可以先沿「主库写入 -> 复制到从库 -> 哨兵判定下线 -> 新主库提升 -> Cluster 槽位路由」看整体脉络：前一个环节会约束后一个环节的输入、成本和失败表现。\n- 主从复制通过 PSYNC、复制积压缓冲区和 RDB/AOF 同步数据\n- 哨兵通过主观下线、客观下线、选主和通知客户端完成故障转移\n- Cluster 使用 16384 个 hash slot 分布数据，节点负责不同槽位\n- 客户端需要处理 MOVED/ASK 重定向和拓扑刷新\n\n把这条路径落回 Redis 主从、哨兵与 Cluster 的场景，排查时就能区分是入口条件、状态变化还是边界假设出了问题。"
+      "title": "三层能力各管一件事，不要混为一谈",
+      "content": "Redis 的高可用不是单一机制，而是三层叠加能力：主从复制解决数据副本和读扩展，哨兵解决主节点故障的自动转移，Cluster 解决数据量和写入吞吐的水平扩展。这三层的成熟度在 Redis 发展中逐步叠加——先有复制，再有哨兵，最后才有 Cluster。\n\n理解这三层有一个实用顺序：主库写入 → 复制到从库 → 哨兵判定主库下线 → 新主库提升 → Cluster 用槽位路由写入。每一层的输出是下一层的输入约束，排查时也能沿着这条链路定位问题。\n\n主从复制：从库通过 PSYNC 协议同步主库数据，全量阶段传输 RDB 快照，增量阶段靠复制积压缓冲区（replication backlog）重放偏移之后的写入。默认异步复制，主库确认后从库可能还没收到数据。\n\n哨兵（Sentinel）：一组独立进程互相监控并通过 gossip 协议交换主库健康信息。单个哨兵判定主观下线（SDOWN），达到 quorum 数量后确认客观下线（ODOWN），然后由领头哨兵执行 failover：选新主、重配从库、通知客户端。\n\nCluster：16384 个 hash slot 映射到多个主节点，每个主节点各自带从库。客户端根据 key 的 CRC16 算出 slot 并路由到对应节点，拓扑变化时收到 MOVED 或 ASK 重定向后刷新路由表。"
     },
     {
       "type": "explain",
-      "title": "Redis 主从、哨兵与 Cluster的失败模式与排查",
-      "content": "高可用题的难点在一致性边界。Redis 复制默认异步，主库写入还没复制到从库时发生故障可能丢数据；Cluster 的 MOVED/ASK 重定向要求客户端理解槽位变化，扩容缩容也会带来迁移窗口。\nRedis 主从、哨兵与 Cluster 的深入理解要落到三件事：触发条件、状态或数据如何变化、失败时能从哪些结果反推原因。\n- 异步复制下主从切换可能丢失最近写入\n- 读从库会遇到复制延迟和读到旧数据\n- Cluster 不支持跨槽多 key 原子操作，除非使用 hash tag 控制同槽\n- 故障转移期间连接抖动和写入失败需要业务重试\n\n排查时不要先猜结论，应把现象映射到 复制到从库、哨兵判定下线、新主库提升 这些环节，再结合 master_link_status、replication offset、sentinel 日志、cluster slots、客户端重定向错误 验证。"
+      "title": "主从复制协议细节与异步丢数据窗口",
+      "content": "PSYNC 的设计解决了早期 SYNC 的全量传输瓶颈。从库首次连接或复制偏移量不在积压缓冲区范围内时，触发全量同步：主库执行 BGSAVE 生成 RDB、传输给从库、同时把期间的新写入缓存起来发送。增量同步则只发送 backlog 中缺失的命令。\n\n关键配置参数影响复制行为：\n- `repl-backlog-size`：积压缓冲区大小，决定主从断线后能否增量恢复。默认 1MB 很小，生产应根据写入速率设为几十到几百 MB。\n- `repl-backlog-ttl`：没有从库连接时 backlog 保留时长。\n- `min-replicas-to-write` / `min-replicas-max-lag`：主库拒绝写入的从库数量和延迟阈值，用来减少丢数据窗口但不是完全消除。\n\n异步复制丢数据的根本原因：主库收到写入后立即返回 OK 给客户端，然后才异步发送给从库。如果主库在这段窗口内宕机，从库提升为新主后这些写入就不存在了。Redis 没有 Raft 那样的多节点同步确认，WAIT 命令可以阻塞等待 N 个从库确认，但它只是阻塞等待而非事务提交保证，网络分区场景仍有边界。"
+    },
+    {
+      "type": "explain",
+      "title": "哨兵故障转移的完整流程",
+      "content": "哨兵是一个由多个独立进程组成的监控系统，典型部署是三节点或五节点。它的故障转移流程分为四步：\n\n**第一步：健康检查与主观下线（SDOWN）。** 每个哨兵以 `down-after-milliseconds` 的周期向主库发 PING，连续超时无有效回复（PONG、LOADING、MASTERDOWN 以外的回复都算无效）就判定主观下线。这是单个哨兵的视角。\n\n**第二步：客观下线（ODOWN）。** 一个哨兵判定 SDOWN 后会向其他哨兵发 `SENTINEL is-master-down-by-addr` 请求投票，当有 `quorum` 个哨兵同意时确认 ODOWN。quorum 通常设为哨兵总数的一半加一。注意 ODOWN 只针对主库，从库和哨兵下线只用 SDOWN。\n\n**第三步：领头哨兵选举与选新主。** 确认 ODOWN 的哨兵用 Raft 协议选出一个 leader 执行 failover。选新主时的优先级：replica-priority → 复制偏移量最大（数据最新）→ runid 最小。选中后执行 `SLAVEOF NO ONE`，重配其他从库指向新主。\n\n**第四步：通知。** 哨兵通过发布/订阅频道 `+switch-master` 通知客户端，客户端的哨兵感知库会自动更新连接。整个切换窗口通常是秒级，但取决于 `down-after-milliseconds` + 投票 + 选主 + 重配的时间总和。"
+    },
+    {
+      "type": "explain",
+      "title": "Cluster 槽位分片与路由协议",
+      "content": "Cluster 把键空间划分为 16384 个 hash slot，每个主节点负责一部分槽位。客户端对 key 执行 `CRC16(key) % 16384` 计算 slot，然后路由到持有该 slot 的节点。对于包含 `{}` 的 key，只对 `{}` 内的部分计算 hash，这就是 hash tag 机制——可以把相关 key 强制落到同一 slot，从而支持跨 key 操作（如 MGET、事务）。\n\n路由遇到两种重定向：\n- **MOVED**：永久重定向，表示 slot 已经永久归属另一个节点。客户端应更新本地路由表并重发命令。\n- **ASK**：临时重定向，表示 slot 正在迁移中，目标节点有该 key 但源节点没有。客户端应只对这一次请求发 `ASKING` + 命令到目标节点，不更新本地路由表。\n\nCluster 的高可用靠每个主节点各自带从库：主节点故障后该分片的从库自动提升（gossip 检测 + 投票），不影响其他分片。这比哨兵更细粒度——哨兵管整个集群的一个主，Cluster 管每个分片各自的主。"
+    },
+    {
+      "type": "explain",
+      "title": "扩容、缩容与 reshard 迁移窗口",
+      "content": "Cluster 扩容流程：新节点加入集群 → 从已有节点迁出部分 slot → 迁移期间源节点和目标节点都持有 slot 的部分 key，ASK 重定向保证请求被转发到正确位置。\n\n迁移期间的客户端行为：客户端向源节点发命令，如果 key 还在源节点就地执行；如果 key 已迁走，源节点返回 ASK 重定向到目标节点。客户端需要先发 ASKING 命令再发实际命令。这个窗口期请求延迟可能增加，且如果客户端实现不正确（不处理 ASK）会报错。\n\n缩容是反向过程：先将 slot 迁移到其他节点，再下线节点。迁移未完成就下线会导致数据丢失。\n\n生产实践：reshard 是在线操作，但大规模迁移（如几十 GB）会有明显的性能影响，通常在低峰期执行并配合监控观察延迟和命中率。redis-cli 的 `--cluster reshard` 工具能逐步迁移 slot。"
+    },
+    {
+      "type": "explain",
+      "title": "失败模式与线上排查",
+      "content": "Redis 高可用的排查要落到具体现象和指标：\n\n**主从复制延迟大：** 看 `INFO replication` 的 `master_repl_offset` 和 `slave_repl_offset` 的差值，差值持续增大说明从库消费速度跟不上主库写入。常见原因是从库执行命令慢（大 key 操作、fork 阻塞）、网络带宽不足、repl-backlog-size 过小导致频繁全量同步。\n\n**主从切换丢数据：** 切换后比较新旧主库的数据差异。预防措施：设 `min-replicas-to-write 1` 和合理的 `min-replicas-max-lag`，在从库不足或延迟过大时主库拒绝写入。但这会让主库在从库全挂时不可用，是可用性和一致性的取舍。\n\n**哨兵切换失败：** 看哨兵日志中的 `+sdown`、`+odown`、`+failover-state`、`+switch-master`。常见问题：quorum 配置不合理（太低误判、太高无法触发）、网络分区导致无法达成投票多数、`down-after-milliseconds` 太短导致频繁误切换。\n\n**Cluster 节点故障：** 看 `CLUSTER NODES` 输出确认节点状态（fail/pfail）。单个主节点故障后从库应自动提升；如果从库也故障，该分片的 slot 不可用。监控 `CLUSTER INFO` 的 `cluster_state` 是否为 ok，`cluster_slots_fail` 是否为 0。\n\n**客户端报错处理：** `MOVED` 需要刷新路由表，`ASK` 需要单次重定向，`CLUSTERDOWN` 说明集群不可用需等待恢复。连接池要支持拓扑刷新和重试。"
     },
     {
       "type": "diagram",
@@ -53,51 +73,33 @@
     {
       "type": "compareTable",
       "title": "主从、哨兵与 Cluster 对比",
-      "columns": [
-        "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
-      ],
-      "rows": [
-        [
-          "主从复制",
-          "数据副本和读扩展",
-          "读多写少、备份节点",
-          "异步复制可能延迟"
-        ],
-        [
-          "Sentinel",
-          "监控和自动主从切换",
-          "单主高可用",
-          "切换窗口可能失败或丢写"
-        ],
-        [
-          "Cluster",
-          "槽位分片和水平扩展",
-          "数据量大、写入扩展",
-          "跨槽操作受限"
-        ],
-        [
-          "客户端路由",
-          "识别主从和槽位变化",
-          "连接池、SDK",
-          "拓扑缓存过旧会报错"
-        ]
-      ]
+      "content": "| 维度 | 主从复制 | 哨兵 Sentinel | Cluster |\n| --- | --- | --- | --- |\n| 解决问题 | 数据副本和读扩展 | 主节点故障自动切换 | 数据量和写入的水平扩展 |\n| 核心机制 | PSYNC（全量RDB+增量backlog） | SDOWN→ODOWN→Raft选leader→选新主→通知客户端 | 16384 hash slot 分片 + MOVED/ASK 重定向 |\n| 部署形态 | 一主多从 | 3或5哨兵进程 + 主从 | 多个主节点各带从库 |\n| 写入能力 | 只有主节点可写 | 只有主节点可写 | 多个主节点并行写 |\n| 一致性保证 | 异步复制，可能丢写入 | 同主从，切换窗口有丢数据风险 | 同主从，分片内异步复制 |\n| 适用场景 | 读多写少、备份 | 单主高可用、自动故障转移 | 数据量大、写入吞吐高、需水平扩展 |\n| 主要风险 | 复制延迟、从库读旧数据、主库故障丢写入 | 误切换、切换窗口不可写、quorum 配置不当 | 跨槽操作受限、reshard 性能影响、客户端需处理 ASK/MOVED |\n| 关键指标 | master_link_status、repl_offset 差值 | +sdown/+odown/+switch-master 日志 | cluster_state、cluster_slots_fail、节点状态 |"
+    },
+    {
+      "type": "compareTable",
+      "title": "Cluster 路由重定向对比",
+      "content": "| 重定向类型 | 含义 | 触发条件 | 客户端行为 | 路由表更新 |\n| --- | --- | --- | --- | --- |\n| MOVED | 永久重定向 | slot 已永久归属其他节点 | 更新路由表，重发命令到新节点 | 更新 |\n| ASK | 临时重定向 | slot 正在迁移，key 可能在目标节点 | 发 ASKING + 命令到目标节点 | 不更新 |"
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：Redis 高可用是三层能力，别混为一谈：主从复制解决「数据副本」，哨兵 Sentinel 解决「主节点故障自动切换」，Cluster 解决「容量和写入扩展（分片）」。一句话——复制管副本、哨兵管故障转移、Cluster 管分片。\n\n逐层说：\n\n1. 主从复制：从库通过 PSYNC 从主库同步数据（全量 RDB 加增量复制积压缓冲区），实现读写分离和副本。默认异步复制。\n2. 哨兵：独立进程监控主从，主观下线（单个哨兵觉得主挂了）到客观下线（多数哨兵确认）到选举新主到通知客户端切换。解决主节点单点故障。\n3. Cluster：用 16384 个 hash slot 把数据分片到多个主节点，每个主节点负责一部分槽位、各自带从库，客户端按 key 算 slot 路由，遇到 MOVED/ASK 重定向要刷新拓扑。\n\n最核心的边界是一致性（必问）：\n\n1. 异步复制会丢数据——主库确认给客户端后、还没复制到从库就故障，提升旧从库就丢了这部分写入。要更强保证用 WAIT 命令或 min-replicas。\n2. 读从库有复制延迟，会读到旧数据。\n3. Cluster 不支持跨槽多 key 原子操作，要用 hash tag（{xxx}）把相关 key 固定到同一槽。\n4. 故障转移期间会有连接抖动和写失败，业务要重试。\n\n排查工具：master_link_status 看主从连接、replication offset 看延迟、sentinel 日志看切换、cluster slots 看槽位分布。",
+      "content": "Redis 高可用是三层叠加能力，别混为一谈：复制管副本、哨兵管故障转移、Cluster 管分片。\n\n**第一层：主从复制**\n- 从库通过 PSYNC 同步主库数据：首次全量（BGSAVE 生成 RDB + 传输），之后增量（复制积压缓冲区 backlog）\n- 默认异步复制：主库确认写入后才异步发给从库\n- 核心风险：主库宕机时从库可能没收到最近的写入，提升从库会丢数据\n- 用 `min-replicas-to-write` / `min-replicas-max-lag` 缩小窗口，但主库在从库全挂时会拒绝写入\n\n**第二层：哨兵**\n- 多个哨兵进程监控主从节点\n- 主观下线 SDOWN：单个哨兵连续 `down-after-milliseconds` 没收到主库有效 PONG\n- 客观下线 ODOWN：quorum 个哨兵确认 SDOWN\n- 领头哨兵用 Raft 选出 → 按优先级/偏移量/runid 选新主 → 重配从库 → 发布 +switch-master 通知客户端\n- 整个切换窗口是秒级，取决于 down-after-milliseconds + 投票 + 选主耗时\n\n**第三层：Cluster**\n- 16384 个 hash slot 分配到多个主节点，CRC16(key) % 16384 定位 slot\n- hash tag {xxx} 让相关 key 落同槽，支持 MGET 和事务\n- MOVED：slot 永久归属变了，客户端更新路由表\n- ASK：slot 在迁移中，key 可能已到目标节点，客户端只对本次请求发 ASKING + 命令\n- 每个主节点各自带从库，分片级别故障转移，比哨兵更细粒度\n\n**一致性边界（高频追问）**\n- 异步复制会丢数据，WAIT 命令可阻塞等从库确认但不是强一致\n- 读从库有复制延迟，可能读到旧数据\n- Cluster 不支持跨槽原子操作，除非 hash tag\n- reshard 期间 ASK 重定向增加延迟，客户端实现不正确会报错\n\n**排查**\n- master_link_status、repl_offset 差值看复制健康\n- 哨兵日志 +sdown/+odown/+switch-master 看切换\n- CLUSTER NODES/CLUSTER INFO 看集群状态和故障 slot",
       "followUpQuestions": [
         {
           "question": "主从切换为什么可能丢数据？",
-          "answer": "复制是异步的，主库确认给客户端后数据可能还没到从库，此时主库故障并提升旧从库就会丢失这部分写入。"
+          "answer": "Redis 复制是异步的，主库执行写入并返回 OK 后才异步发送给从库。主库在此窗口内宕机时从库提升为新主，这部分已确认但未复制的写入就丢失了。Redis 不像 Raft 那样要求多数节点确认才返回客户端。"
         },
         {
           "question": "Cluster 跨槽多 key 操作为什么受限？",
-          "answer": "不同 key 可能落在不同节点，Redis 无法在多个槽位上保持单节点原子性；需要用 hash tag 让相关 key 落到同一槽。"
+          "answer": "Redis Cluster 把数据按 slot 分散到不同节点，不同 key 可能落在不同节点上。每个节点只管理自己的 slot，无法跨节点保持原子性。用 hash tag（{tag}）可以让相关 key 的 hash 只取 {} 内的部分，从而落到同一 slot。"
+        },
+        {
+          "question": "哨兵的 quorum 设多少合适？为什么不能太低也不能太高？",
+          "answer": "quorum 通常设为哨兵总数的一半加一（3 哨兵设 2，5 哨兵设 3）。太低（如 1）容易误判，网络抖动就可能触发不必要的切换；太高（如等于总数）在网络分区时可能无法达成多数，导致无法触发故障转移，集群卡在不可用状态。"
+        },
+        {
+          "question": "Cluster 扩容 reshard 期间客户端行为是怎样的？",
+          "answer": "迁移期间源节点和目标节点都持有 slot 的部分 key。客户端发命令到源节点：key 还在源节点就地执行；key 已迁走则源节点返回 ASK 重定向，客户端需先发 ASKING 命令再发实际命令到目标节点。如果不处理 ASK，请求会报错。"
         }
       ]
     },
@@ -105,52 +107,79 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能区分主从、哨兵、Cluster",
-        "能解释异步复制一致性边界",
-        "能说明槽位和跨槽限制",
-        "能描述故障转移期间客户端处理"
+        "能区分主从复制（副本）、哨兵（故障转移）、Cluster（分片）三层各自解决什么问题",
+        "能描述 PSYNC 的全量同步和增量同步流程，以及 repl-backlog-size 的作用",
+        "能解释哨兵 SDOWN→ODOWN→Raft 选主→选新主→通知的完整故障转移链路",
+        "能说明 Cluster 的 16384 hash slot、CRC16 路由、hash tag 机制",
+        "能区分 MOVED（永久）和 ASK（临时迁移）两种重定向的触发条件和客户端行为",
+        "能解释异步复制丢数据的根本原因和 WAIT/min-replicas 的缓解边界",
+        "能用 master_repl_offset、哨兵日志、CLUSTER INFO 等指标排查线上问题",
+        "能说明 reshard 扩缩容期间的客户端行为和性能影响"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "database.redis-cache.redis-high-availability.recall.1",
-      "prompt": "Redis 主从复制、哨兵和 Cluster 分别解决什么问题？",
+      "prompt": "Redis 主从复制、哨兵和 Cluster 分别解决什么问题？请说清楚各自的职责边界。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "database.redis-cache.redis-high-availability.recall.2",
-      "prompt": "为什么 Redis 主从切换可能出现数据丢失或旧读？",
+      "prompt": "主从切换为什么可能丢数据？有哪些缓解措施和它们的边界？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "database.redis-cache.redis-high-availability.recall.3",
-      "prompt": "Cluster 的 hash slot 和 MOVED/ASK 重定向如何影响客户端？",
+      "prompt": "哨兵的主观下线、客观下线和选主流程是怎样的？quorum 设置过高或过低分别有什么问题？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "database.redis-cache.redis-high-availability.recall.4",
+      "prompt": "Cluster 的 MOVED 和 ASK 重定向有什么区别？客户端分别应该怎么处理？",
       "mode": "text",
       "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "database.redis-cache.redis-high-availability.recall.5",
+      "prompt": "线上 Redis 主从复制延迟持续增大，你怎么排查？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "database.redis-cache.redis-high-availability.recall.6",
+      "prompt": "Cluster 扩容 reshard 期间，客户端发一个 key 到源节点但 key 已迁走，整个链路是怎么处理的？",
+      "mode": "text",
+      "expectedMinutes": 4,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能区分主从复制、哨兵、Cluster 三层能力",
-      "能说明哨兵的主观下线/客观下线/选主/通知流程",
-      "能解释 Cluster 的 16384 槽位分片和 MOVED/ASK 重定向",
-      "能指出异步复制可能丢数据"
+      "能区分主从复制、哨兵、Cluster 三层各自解决的问题和核心机制",
+      "能说明哨兵 SDOWN→ODOWN→选主→通知的完整故障转移流程",
+      "能解释 Cluster 的 16384 hash slot、CRC16 路由、MOVED/ASK 重定向机制",
+      "能指出异步复制丢数据的根本原因和 WAIT/min-replicas 的缓解边界"
     ],
     "goodToHave": [
-      "能说明读从库的复制延迟和读旧数据",
-      "能用 hash tag 解决 Cluster 跨槽操作",
-      "能用 master_link_status/offset/sentinel 日志排查"
+      "能说明 PSYNC 全量/增量同步和 repl-backlog-size 的作用",
+      "能用 hash tag 解决 Cluster 跨槽操作限制",
+      "能用 master_repl_offset、哨兵日志、CLUSTER INFO 等指标做线上排查",
+      "能解释 reshard 迁移期间客户端行为和 ASK 重定向链路"
     ],
     "commonMistakes": [
-      "把主从、哨兵、Cluster 当成一回事",
-      "以为主从切换不会丢数据（异步复制会丢）",
-      "在 Cluster 上做跨槽多 key 事务"
+      "把主从、哨兵、Cluster 当成一回事，不区分各自解决的问题",
+      "以为主从切换不会丢数据，不知道异步复制的丢写入窗口",
+      "在 Cluster 上做跨槽多 key 事务导致报错",
+      "哨兵 quorum 设为 1 导致误切换，或设为总数导致网络分区时无法切换"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -159,5 +188,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

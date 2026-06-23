@@ -4,44 +4,54 @@
   "category": "concurrency",
   "group": "concurrency",
   "title": "CountDownLatch、CyclicBarrier 与 Semaphore",
-  "summary": "讲清 CountDownLatch 的一次性完成门闩、CyclicBarrier 的可复用阶段屏障、Semaphore 的许可证限流，以及它们的等待关系、底层实现、异常边界和线上排查点。",
+  "summary": "讲清 CountDownLatch 的一次性完成门闩（AQS 共享模式，count 归零链式释放等待者，不可重置）、CyclicBarrier 的可复用阶段屏障（ReentrantLock + Condition + generation 机制，broken 四种触发条件及处理）、Semaphore 的许可证限流（acquire/release 配平，泄漏与超发风险，公平与非公平选择，集群边界），以及三者的等待关系差异、底层实现选型理由、异常边界与死等风险、Phaser 作为动态 parties 替代品的定位、线上排查方法。",
   "tags": [
     "Java",
     "并发编程",
     "同步工具"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 35,
+  "estimatedMinutes": 47,
   "order": 80,
   "recommendWeight": 82,
   "learningCards": [
     {
       "type": "explain",
       "title": "先判断等待关系，不先背 API",
-      "content": "这三个工具都和计数有关，但它们表达的协作关系不同。CountDownLatch 是“一个或多个等待者等一批事件完成”：初始化计数，工作线程完成后 `countDown()`，计数归零后所有 `await()` 线程放行。CyclicBarrier 是“同一批参与者在阶段边界互等”：每个参与者到达 `await()`，最后一个到达者打开本代屏障，所有线程一起进入下一阶段。Semaphore 是“访问资源前先拿许可证”：许可数限制同时进入临界资源的线程数量。\n\n面试时可以按三个问题展开：谁在等待谁，计数什么时候变化，能不能复用。Latch 的计数只会向 0 走，适合任务汇总或启动就绪；Barrier 会进入下一代，适合分阶段并行计算；Semaphore 的许可会被反复 acquire/release，适合连接池、下载并发、第三方 API 并发预算等资源配额。"
+      "content": "这三个工具都和计数有关，但它们表达的协作关系完全不同。CountDownLatch 是「一个或多个等待者等一批事件完成」：初始化计数，工作线程完成后 `countDown()`，计数归零后所有 `await()` 线程放行。CyclicBarrier 是「同一批参与者在阶段边界互等」：每个参与者到达 `await()`，最后一个到达者打开本代屏障，所有线程一起进入下一阶段。Semaphore 是「访问资源前先拿许可证」：许可数限制同时进入临界资源的线程数量。\n\n面试时可以按三个问题展开：谁在等待谁，计数什么时候变化，能不能复用。Latch 的计数只会向 0 走，适合任务汇总或启动就绪；Barrier 会进入下一代，适合分阶段并行计算；Semaphore 的许可会被反复 acquire/release，适合连接池、下载并发、第三方 API 并发预算等资源配额。区分清楚协作关系后，API 只是实现手段，选错工具才是真正的坑——用 Latch 做分阶段同步会导致无法重置，用 Barrier 做一次性等待会引入不必要的 generation 管理和 broken 风险。"
     },
     {
       "type": "explain",
       "title": "CountDownLatch：一次性完成信号",
-      "content": "CountDownLatch 基于 AQS 共享模式，state 表示剩余计数。`await()` 在 state 不为 0 时进入共享等待；`countDown()` CAS 递减 state，减到 0 后释放所有等待者。它没有把 state 加回初始值的公开能力，因此是一次性工具。\n\n典型用法有两类：主线程等待 N 个初始化任务完成后再对外提供服务；并发测试中用一个起跑 latch 同时释放工作线程，再用另一个完成 latch 等全部结束。注意 `countDown()` 应放在任务的 finally 中，否则任务异常会让等待者卡住。`await(timeout, unit)` 可以给启动流程设置预算，超时后要记录哪些任务没有完成，而不是继续假装系统已就绪。\n\n它不适合表达“每轮都集合一次”的阶段协作；这种需求应该看 CyclicBarrier、Phaser 或自定义状态机。"
+      "content": "CountDownLatch 基于 AQS 共享模式，state 表示剩余计数。`await()` 检查 state 不为 0 时，当前线程进入 AQS 的共享等待队列（CLH 变体）；`countDown()` 用 CAS 将 state 减 1，减到 0 后触发 `releaseShared`，通过 `doReleaseShared` 链式传播依次唤醒所有等待线程。它没有把 state 加回初始值的公开能力，归零后后续 `await()` 直接通过——这就是「一次性」的技术含义。\n\n典型用法有两类。第一类是主线程等待 N 个初始化任务完成后再对外提供服务：构造 `CountDownLatch(N)`，每个初始化任务在 finally 中 countDown，主线程 await 直到就绪。第二类是并发测试中用一个起跑 latch 同时释放工作线程（`new CountDownLatch(1)`，所有 worker await，测试主线程 countDown），再用另一个完成 latch 等全部结束。\n\n异常安全的关键点：`countDown()` 应放在任务的 finally 中，否则任务中途异常会让 await 永远卡住。`await(timeout, unit)` 可以给启动流程设置预算，超时后要记录哪些任务没有完成（通过 latch 的当前计数或自定义状态标记），而不是继续假装系统已就绪。它不适合表达「每轮都集合一次」的阶段协作，这种需求应该看 CyclicBarrier 或 Phaser。"
     },
     {
       "type": "explain",
       "title": "CyclicBarrier：可复用的阶段屏障",
-      "content": "CyclicBarrier 不基于 AQS，而是用 ReentrantLock + Condition 维护 `parties`、当前剩余 `count` 和 `generation`。每个线程调用 `await()` 时把 count 减一；最后一个到达的线程执行可选的 barrierAction，唤醒本代等待者，然后重置 count 并切换到下一代，所以同一个 Barrier 可以在循环中反复使用。\n\n它的失败语义比 CountDownLatch 更强：等待中的线程被中断、等待超时、barrierAction 抛异常或外部调用 reset，都会打破当前 generation，其他正在等待的线程会收到 BrokenBarrierException。工程上要把这个异常当作“本轮协作失败”，让所有参与者退出或重试同一轮，而不是让部分线程继续下一阶段。\n\n还有一个常见死等来源：线程池大小小于 parties。比如 parties=8，却只给固定线程池 4 个工作线程，前 4 个任务在 await 卡住，后 4 个任务无法被调度，屏障就无法打开。"
+      "content": "CyclicBarrier 不基于 AQS，而是用 ReentrantLock + Condition 维护三个关键状态：`parties`（每代参与者总数，不变）、`count`（当前代剩余未到达数）、`generation`（代次标记，用于区分不同轮次）。每个线程调用 `await()` 时获取锁、将 count 减一；如果 count > 0，当前线程在 Condition 上 await 进入等待；最后一个到达的线程（count == 0）执行可选的 `barrierAction`（Runnable，同步执行），然后调用 `nextGeneration()`：唤醒所有 Condition 上的等待者、重置 count 为 parties、generation 切换到下一代。这个 cycle 机制让同一个 Barrier 可以在循环中反复使用。\n\n它的失败语义比 CountDownLatch 更强。以下四种情况会打破当前 generation：① 等待中的线程被中断（`Thread.interrupt()`）；② `await(timeout, unit)` 等待超时；③ barrierAction 抛出异常；④ 外部调用 `reset()`。任何一种情况发生后，generation 被标记为 broken，其他正在等待的线程会收到 `BrokenBarrierException`，而触发 broken 的线程如果是中断则抛 `InterruptedException`、如果是超时则抛 `TimeoutException`。工程上要把 BrokenBarrierException 当作「本轮协作失败」，让所有参与者退出或重试同一轮，而不是让部分线程继续下一阶段——那样会导致数据不一致。\n\n还有一个常见死等来源：线程池大小小于 parties。比如 parties=8，却只给固定线程池 4 个工作线程，前 4 个任务在 await 卡住，后 4 个任务在队列中无法被调度，count 永远无法减到 0，屏障永远打不开。这是用 Barrier 时最容易犯的配置错误。正确做法是线程池大小 >= parties，或者改用 Semaphore 限制并发而非 Barrier 做同步。"
     },
     {
       "type": "explain",
       "title": "Semaphore：许可证不是资源池",
-      "content": "Semaphore 基于 AQS 共享模式，state 表示剩余许可证。`acquire()` 获取许可并递减 state，没有许可就排队等待；`release()` 归还许可并递增 state，可能唤醒等待者。默认是非公平模式，吞吐通常更高；公平模式按等待队列顺序分配许可，适合对排队顺序敏感的场景。\n\nSemaphore 只负责计数，不负责真实资源的生命周期。把它用于连接、文件句柄或下游接口限流时，资源获取、业务执行和 release 要写成清晰的 try/finally。少 release 会造成许可证泄漏，并发度逐渐降到 0；多 release 会把许可证数放大，限流形同虚设。允许不同线程 release，这在某些异步协议里有用，但也要求业务自己维护“谁拿了许可、何时归还”的一致性。\n\n单 JVM 内的 Semaphore 不能限制集群总并发；多实例限流要用分布式令牌、中心化配额或网关侧限流。"
+      "content": "Semaphore 基于 AQS 共享模式，state 表示剩余许可证。`acquire()` 获取许可并用 CAS 递减 state，没有许可（state == 0）就进入 AQS 等待队列排队；`release()` 用 CAS 递增 state，可能唤醒队列中的等待者。默认是非公平模式（`new Semaphore(permits)`），新到达的线程直接尝试 CAS 抢许可而不检查队列，吞吐通常更高；公平模式（`new Semaphore(permits, true)`）内部使用 AQS 的公平队列，严格按等待顺序分配许可，适合对排队顺序敏感的场景（如避免饥饿、保证长连接按序获取）。\n\nSemaphore 只负责计数，不负责真实资源的生命周期。把它用于连接、文件句柄或下游接口限流时，资源获取、业务执行和 release 要写成清晰的 try/finally 结构：`acquire()` 成功后标记 `acquired = true`，finally 中判断 acquired 才 release。少 release 会造成许可证泄漏——可用许可逐渐减少，并发度逐渐降到 0，表现为系统越来越慢但不报错；多 release（如在 acquire 失败的 catch 分支也 release、或同一任务重复 release）会把许可证数放大到超过初始值，限流形同虚设，可用许可超过 permits 初始值。允许不同线程 release（如 A 线程 acquire、B 线程 release），这在异步回调协议里有用，但也要求业务自己维护「谁拿了许可、何时归还」的一致性。\n\n单 JVM 内的 Semaphore 不能限制集群总并发。10 个实例各配 20 许可，集群总并发可达 200，远超预期。多实例限流要用分布式令牌桶（如 Redis + Lua）、中心化配额服务或网关侧限流。"
+    },
+    {
+      "type": "explain",
+      "title": "AQS 共享模式 vs ReentrantLock+Condition：底层选型理由",
+      "content": "CountDownLatch 和 Semaphore 都基于 AQS 共享模式（`tryAcquireShared` / `tryReleaseShared`），因为它们的语义天然适合共享——多个线程可以同时满足条件（计数归零 / 有可用许可），需要一次性唤醒多个等待者。AQS 的共享模式在 state 变化时通过 `doReleaseShared` 链式传播唤醒，正好匹配这个需求。\n\nCyclicBarrier 用 ReentrantLock + Condition，因为它的语义是「最后一个到达者触发唤醒」，而且每一代结束后需要重置状态切换到下一代。如果用 AQS 实现，需要自己处理 generation 切换时的 state 重置、中断传播和 broken 标记，复杂度反而更高。ReentrantLock + Condition 让「加锁 → 减 count → 判断是否最后一个 → condition.await 或 signalAll → 重置」这条路径更直观，也更容易在 generation 切换时做清理。\n\nPhaser 是更灵活的替代品：支持动态注册/注销 parties（`register()` / `bulkRegister()` / `arriveAndDeregister()`）、支持树形分层（`Phaser(parent)` 减少竞争）、多代复用。如果 parties 数量在运行时会变化，或者需要分层缩减竞争，Phaser 比 CyclicBarrier 更合适。但 Phaser 的 API 更复杂，理解成本更高，简单场景用 CyclicBarrier 就够了。"
+    },
+    {
+      "type": "explain",
+      "title": "线上同步工具问题的排查框架",
+      "content": "线上同步工具故障的表现和排查方法各不相同，但思路一致：看线程 dump 确认等待位置，看计数指标确认状态，看业务代码确认逻辑。\n\n**CountDownLatch 卡住**\n表现：主线程或依赖线程长期阻塞在 `CountDownLatch.await()`，服务启动超时或任务永远不结束。排查：① 线程 dump 看哪些线程在 await 栈上；② 检查 latch 的 count 值（反射或自定义包装）确认还剩多少没 countDown；③ 对应检查那些应该 countDown 的线程是否还活着、是否抛了异常后没有执行 finally 中的 countDown。修复：countDown 放 finally；await 带超时并记录未完成任务。\n\n**CyclicBarrier 打破**\n表现：大量 `BrokenBarrierException` 日志，或者线程 dump 中多个线程卡在 `Condition.await()`。排查：① 找到触发 broken 的线程——是中断、超时还是 barrierAction 异常；② 确认线程池大小是否 >= parties（死等场景不会报 BrokenBarrierException，而是所有线程永远卡住）；③ 检查是否有线程在 await 之后没有正确处理 BrokenBarrierException 就继续执行下一阶段。修复：线程池 >= parties；barrierAction 不抛异常；BrokenBarrierException 统一退出本轮。\n\n**Semaphore 阻塞**\n表现：线程大量堆积在 `Semaphore.acquire()`，系统并发度持续下降。排查：① 检查 `availablePermits`——如果远低于初始值，说明有许可泄漏（少 release）；如果高于初始值，说明有超发（多 release）；② 线程 dump 看 acquire 等待栈，确认阻塞的是哪类业务线程；③ 代码审查 acquire/release 是否配对——重点看 catch 分支和异步回调路径。修复：acquire/release 必须配平；用 try/finally 保证；监控 availablePermits。"
     },
     {
       "type": "diagram",
       "format": "svg",
       "title": "三种计数协作工具的状态路径",
       "content": "assets/diagrams/java-counting-synchronizers.svg",
-      "caption": "图中把 CountDownLatch 的 countDown 递减到 0 释放等待者、CyclicBarrier 的 parties 互等到 generation 切换、Semaphore 的 acquire/release 许可证增减、以及各自的失败/死等路径（任务异常未 countDown、Barrier broken、线程池小于 parties、许可泄漏）放在同一张状态图里。",
-      "fallback": "CountDownLatch 基于 AQS 共享模式，state 是剩余计数，countDown CAS 递减到 0 后释放所有等待者，不可重置。CyclicBarrier 用 ReentrantLock + Condition 维护 parties/count/generation，最后一个到达者执行 barrierAction、唤醒本代、重置 count 切换下一代；中断/超时/barrierAction 失败打破本代，抛 BrokenBarrierException。Semaphore 基于 AQS 共享模式，state 是剩余许可证，acquire 减 release 加；公平模式 new Semaphore(permits, true) 按队列顺序分配。风险：Latch 任务异常未 countDown 卡住、Barrier 线程池小于 parties 死等、Semaphore acquire/release 不配平导致泄漏或超发。",
+      "caption": "CountDownLatch 的 countDown 递减到 0 释放等待者、CyclicBarrier 的 parties 互等到 generation 切换、Semaphore 的 acquire/release 许可证增减，以及各自的失败/死等路径（任务异常未 countDown、Barrier broken、线程池小于 parties、许可泄漏与超发）。",
+      "fallback": "CountDownLatch 基于 AQS 共享模式，state 是剩余计数，countDown CAS 递减到 0 后释放所有等待者，不可重置。CyclicBarrier 用 ReentrantLock + Condition 维护 parties/count/generation，最后一个到达者执行 barrierAction、唤醒本代、重置 count 切换下一代；中断/超时/barrierAction 失败/reset 打破本代，抛 BrokenBarrierException。Semaphore 基于 AQS 共享模式，state 是剩余许可证，acquire 减 release 加；公平模式 new Semaphore(permits, true) 按队列顺序分配。风险：Latch 任务异常未 countDown 卡住、Barrier 线程池小于 parties 死等、Semaphore acquire/release 不配平导致泄漏或超发。",
       "sources": [
         {
           "kind": "svg",
@@ -55,49 +65,65 @@
     },
     {
       "type": "compareTable",
-      "title": "语义、底层和风险对比",
-      "content": "| 维度 | CountDownLatch | CyclicBarrier | Semaphore |\n| --- | --- | --- | --- |\n| 核心语义 | 等一批事件完成 | 一批线程阶段对齐 | 限制同时进入资源的人数 |\n| 谁等待谁 | 等待者等 count 归零 | parties 互相等待 | 请求方等许可证 |\n| 计数变化 | `countDown` 递减到 0 | 每代到达递减，开屏障后重置 | `acquire` 减，`release` 加 |\n| 是否复用 | 一次性 | 可按 generation 复用 | 可长期反复使用 |\n| 底层 | AQS 共享模式 | ReentrantLock + Condition | AQS 共享模式 |\n| 典型场景 | 启动就绪、任务汇总、并发测试收尾 | 分阶段计算、批处理轮次同步 | 连接池保护、下载并发、下游调用预算 |\n| 主要风险 | 任务异常未 countDown 导致等待卡住 | 中断/超时打破本代，线程池小于 parties 会死等 | 许可泄漏或多 release 导致并发度失真 |\n| 排查线索 | `await` 卡住、剩余任务未完成 | BrokenBarrierException、TimeoutException、generation 被打破 | availablePermits 异常、等待线程堆积、临界区过慢 |"
+      "title": "语义、底层、复用与风险对比",
+      "content": "| 维度 | CountDownLatch | CyclicBarrier | Semaphore | Phaser |\n| --- | --- | --- | --- | --- |\n| 核心语义 | 等一批事件完成（完成门闩） | 一批线程阶段对齐（阶段屏障） | 限制同时进入资源的人数（许可证限流） | 动态 parties 的分阶段同步 |\n| 谁等待谁 | 等待者等 count 归零（一对多） | parties 互相等待（多对多） | 请求方等可用许可 | 参与者互等，可动态增减 |\n| 计数变化 | `countDown` 只减不增，到 0 释放 | 每代到达递减，开屏障后重置为 parties | `acquire` 减，`release` 加，可反复 | `arrive` 减，代结束重置 |\n| 是否复用 | 一次性，归零后 await 直接通过 | 按 generation 可复用 | 可长期反复使用 | 按 phase 可复用 |\n| 底层实现 | AQS 共享模式 | ReentrantLock + Condition | AQS 共享模式 | AQS + 分层树 |\n| 唤醒方式 | state→0 后链式唤醒所有等待者 | 最后到达者 signalAll 唤醒本代 | release 后唤醒一个或多个等待者 | 最后到达者唤醒本代 |\n| 公平模式 | 无（语义不需要） | 无（ReentrantLock 可配但默认非公平） | `new Semaphore(permits, true)` | 无 |\n| 动态增减 | 不支持 | 不支持 | 不支持 | `register()` / `arriveAndDeregister()` |\n| 典型场景 | 启动就绪、任务汇总、并发测试门闩 | 分阶段计算、批处理轮次同步 | 连接池保护、下载并发、下游调用预算 | parties 变化的并行计算 |\n| 失败/边界 | 任务异常未 countDown → 等待卡住 | 中断/超时/barrierAction 异常/reset → BrokenBarrierException | 许可泄漏（少 release）、限流失效（多 release） | 参与者异常 → `arriveAndAwaitAdvance` 传播 |\n| 死等风险 | 所有任务都不 countDown | 线程池 < parties 时屏障永远打不开 | acquire 后忘记 release，并发度降到 0 | 同 Barrier，线程不足死等 |\n| 排查线索 | 线程 dump 看 await 栈、剩余计数 | BrokenBarrierException、generation 不变、TimeoutException | availablePermits 异常、等待线程堆积 | 同 Barrier |\n| 集群限制 | 单 JVM 即可（一次性同步） | 单 JVM 即可（同组线程） | 单 JVM 不限集群，需分布式令牌/网关限流 | 单 JVM |"
     },
     {
       "type": "code",
       "title": "可运行代码：完成门闩、阶段屏障和许可证限流",
       "language": "java",
-      "content": "import java.util.concurrent.BrokenBarrierException;\nimport java.util.concurrent.CountDownLatch;\nimport java.util.concurrent.CyclicBarrier;\nimport java.util.concurrent.Semaphore;\nimport java.util.concurrent.atomic.AtomicInteger;\n\npublic class Main {\n    public static void main(String[] args) throws Exception {\n        demoCountDownLatch();\n        demoCyclicBarrier();\n        demoSemaphore();\n    }\n\n    static void demoCountDownLatch() throws InterruptedException {\n        CountDownLatch done = new CountDownLatch(3);\n        AtomicInteger loaded = new AtomicInteger();\n        for (int i = 0; i < 3; i++) {\n            final int part = i + 1;\n            new Thread(() -> {\n                try {\n                    loaded.addAndGet(part);\n                } finally {\n                    done.countDown();\n                }\n            }, \"loader-\" + part).start();\n        }\n        done.await();\n        System.out.println(\"latch loaded=\" + loaded.get());\n        assert loaded.get() == 6;\n    }\n\n    static void demoCyclicBarrier() throws InterruptedException {\n        AtomicInteger completedPhases = new AtomicInteger();\n        CyclicBarrier barrier = new CyclicBarrier(3, completedPhases::incrementAndGet);\n        CountDownLatch finished = new CountDownLatch(3);\n        for (int i = 0; i < 3; i++) {\n            final int worker = i;\n            new Thread(() -> {\n                try {\n                    for (int phase = 0; phase < 2; phase++) {\n                        doPhaseWork(worker, phase);\n                        barrier.await();\n                    }\n                } catch (InterruptedException e) {\n                    Thread.currentThread().interrupt();\n                } catch (BrokenBarrierException e) {\n                    throw new IllegalStateException(\"barrier generation failed\", e);\n                } finally {\n                    finished.countDown();\n                }\n            }, \"barrier-worker-\" + worker).start();\n        }\n        finished.await();\n        System.out.println(\"barrier phases=\" + completedPhases.get());\n        assert completedPhases.get() == 2;\n    }\n\n    static void doPhaseWork(int worker, int phase) {\n        if (worker == 0 && phase == 0) {\n            Thread.yield();\n        }\n    }\n\n    static void demoSemaphore() throws InterruptedException {\n        Semaphore permits = new Semaphore(2);\n        AtomicInteger active = new AtomicInteger();\n        AtomicInteger maxActive = new AtomicInteger();\n        CountDownLatch finished = new CountDownLatch(5);\n        for (int i = 0; i < 5; i++) {\n            new Thread(() -> {\n                boolean acquired = false;\n                try {\n                    permits.acquire();\n                    acquired = true;\n                    int now = active.incrementAndGet();\n                    maxActive.accumulateAndGet(now, Math::max);\n                    Thread.sleep(20);\n                    active.decrementAndGet();\n                } catch (InterruptedException e) {\n                    Thread.currentThread().interrupt();\n                } finally {\n                    if (acquired) {\n                        permits.release();\n                    }\n                    finished.countDown();\n                }\n            }, \"semaphore-user-\" + i).start();\n        }\n        finished.await();\n        System.out.println(\"semaphore maxActive=\" + maxActive.get());\n        assert maxActive.get() <= 2;\n        assert permits.availablePermits() == 2;\n    }\n}",
+      "content": "import java.util.concurrent.BrokenBarrierException;\nimport java.util.concurrent.CountDownLatch;\nimport java.util.concurrent.CyclicBarrier;\nimport java.util.concurrent.Semaphore;\nimport java.util.concurrent.atomic.AtomicInteger;\n\npublic class Main {\n    public static void main(String[] args) throws Exception {\n        demoCountDownLatch();\n        demoCyclicBarrier();\n        demoSemaphore();\n    }\n\n    // CountDownLatch：主线程等 3 个初始化任务完成\n    static void demoCountDownLatch() throws InterruptedException {\n        CountDownLatch done = new CountDownLatch(3);\n        AtomicInteger loaded = new AtomicInteger();\n        for (int i = 0; i < 3; i++) {\n            final int part = i + 1;\n            new Thread(() -> {\n                try {\n                    loaded.addAndGet(part);\n                } finally {\n                    done.countDown(); // 异常安全：无论成功失败都 countDown\n                }\n            }, \"loader-\" + part).start();\n        }\n        done.await();\n        System.out.println(\"latch loaded=\" + loaded.get());\n        assert loaded.get() == 6;\n    }\n\n    // CyclicBarrier：3 个 worker 跑 2 个阶段，barrierAction 记录完成阶段数\n    static void demoCyclicBarrier() throws InterruptedException {\n        AtomicInteger completedPhases = new AtomicInteger();\n        CyclicBarrier barrier = new CyclicBarrier(3, completedPhases::incrementAndGet);\n        CountDownLatch finished = new CountDownLatch(3);\n        for (int i = 0; i < 3; i++) {\n            final int worker = i;\n            new Thread(() -> {\n                try {\n                    for (int phase = 0; phase < 2; phase++) {\n                        doPhaseWork(worker, phase);\n                        barrier.await(); // 每代互相等待\n                    }\n                } catch (InterruptedException e) {\n                    Thread.currentThread().interrupt();\n                } catch (BrokenBarrierException e) {\n                    // 本代协作失败，不应继续下一阶段\n                    throw new IllegalStateException(\"barrier generation failed\", e);\n                } finally {\n                    finished.countDown();\n                }\n            }, \"barrier-worker-\" + worker).start();\n        }\n        finished.await();\n        System.out.println(\"barrier phases=\" + completedPhases.get());\n        assert completedPhases.get() == 2;\n    }\n\n    static void doPhaseWork(int worker, int phase) {\n        if (worker == 0 && phase == 0) {\n            Thread.yield(); // 模拟不同 worker 完成时间不同\n        }\n    }\n\n    // Semaphore：限制同时活跃线程不超过 2\n    static void demoSemaphore() throws InterruptedException {\n        Semaphore permits = new Semaphore(2);\n        AtomicInteger active = new AtomicInteger();\n        AtomicInteger maxActive = new AtomicInteger();\n        CountDownLatch finished = new CountDownLatch(5);\n        for (int i = 0; i < 5; i++) {\n            new Thread(() -> {\n                boolean acquired = false;\n                try {\n                    permits.acquire();\n                    acquired = true;\n                    int now = active.incrementAndGet();\n                    maxActive.accumulateAndGet(now, Math::max);\n                    Thread.sleep(20);\n                    active.decrementAndGet();\n                } catch (InterruptedException e) {\n                    Thread.currentThread().interrupt();\n                } finally {\n                    if (acquired) {\n                        permits.release(); // 只在获取成功后才 release，避免许可超发\n                    }\n                    finished.countDown();\n                }\n            }, \"semaphore-user-\" + i).start();\n        }\n        finished.await();\n        System.out.println(\"semaphore maxActive=\" + maxActive.get());\n        assert maxActive.get() <= 2;\n        assert permits.availablePermits() == 2;\n    }\n}",
       "highlights": [
         {
-          "line": 21,
-          "note": "countDown 放在 finally 中，避免任务异常让主线程长期等待。"
+          "line": 22,
+          "note": "countDown 放在 finally 中，避免任务异常让主线程长期等待——这是 CountDownLatch 最常见的线上坑。"
         },
         {
-          "line": 39,
-          "note": "同一组线程循环两次 await，barrierAction 每一代只执行一次。"
+          "line": 43,
+          "note": "同一组线程循环两次 await，barrierAction 每一代只执行一次，generation 自动切换。"
         },
         {
-          "line": 72,
-          "note": "许可证获取成功后才允许 release，避免失败分支把许可数放大。"
+          "line": 50,
+          "note": "捕获 BrokenBarrierException 后应退出本轮，不能继续下一阶段——否则部分线程跳过本轮导致数据不一致。"
         },
         {
-          "line": 84,
-          "note": "maxActive 用运行结果验证并发度没有超过许可证数量。"
+          "line": 81,
+          "note": "acquire 成功后标记 acquired=true，finally 中只在 acquired 时才 release，避免许可超发。"
+        },
+        {
+          "line": 93,
+          "note": "最终 availablePermits 回到初始值 2，验证没有泄漏——如果这里是 1 或 0 说明有泄漏。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "一句话区分：CountDownLatch 是一次性完成门闩，CyclicBarrier 是可复用阶段屏障，Semaphore 是许可证限流。\n\n**等待关系**\n- Latch：等待者等 count 归零（一对多）\n- Barrier：parties 互相等到同一阶段边界（多对多）\n- Semaphore：请求方等可用许可（资源配额）\n\n**底层实现**\n- CountDownLatch：AQS 共享模式，state 是 volatile int 剩余计数，countDown CAS 递减\n- Semaphore：AQS 共享模式，state 是剩余许可证，acquire 减 / release 加\n- CyclicBarrier：ReentrantLock + Condition，维护 parties、count、generation；最后一个到达者执行 barrierAction、唤醒本代、重置 count 切换下一代\n- 公平模式：`new Semaphore(permits, true)` 按队列顺序分配\n\n**典型适用场景**\n- CountDownLatch：服务启动等 N 个初始化任务完成、并发测试起跑门闩 + 收尾门闩\n- CyclicBarrier：分阶段并行计算、批处理轮次同步\n- Semaphore：连接池保护、下载并发预算、第三方 API 限流\n- 需要动态注册 parties 用 JDK 7+ `Phaser`\n\n**边界与风险**\n- Latch 不能重置，任务异常要在 finally countDown，否则等待者卡住\n- Barrier 任一等待线程中断、超时或 barrierAction 失败会打破本代，所有参与者收到 `BrokenBarrierException`，要统一退出或重试\n- 线程池大小 < parties 会导致 Barrier 死等（前几个 await 卡住，后续任务无法调度）\n- Semaphore 要保证 acquire/release 配平：少 release 许可泄漏（并发度逐渐降到 0），多 release 限流失效\n- 单 JVM Semaphore 不能限制集群总并发，多实例要用分布式令牌或网关限流\n\n**排查**\n- 线程 dump 看等待栈（await 卡在哪）\n- availablePermits、getCount、Barrier 是否 broken\n- 临界区是否包含慢调用",
+      "content": "**一句话区分**\nCountDownLatch 是一次性完成门闩，CyclicBarrier 是可复用阶段屏障，Semaphore 是许可证限流。\n\n**等待关系**\n- Latch：等待者等 count 归零（一对多，等待者和计数者角色不对称）\n- Barrier：parties 互相等到同一阶段边界（多对多，所有参与者角色对称）\n- Semaphore：请求方等可用许可（资源配额模型）\n\n**底层实现选型**\n- CountDownLatch 和 Semaphore 基于 AQS 共享模式——语义天然适合「多个线程同时满足条件」，state 归零/有可用许可时链式唤醒\n- CyclicBarrier 用 ReentrantLock + Condition——因为需要「最后一个到达者触发 + 重置状态切换代次」，Condition 让这条路径更直观，generation 切换时清理也更自然\n- 公平模式：`new Semaphore(permits, true)` 按 AQS 公平队列顺序分配\n\n**复用性差异**\n- Latch 不可重置，归零后 await 直接通过（无 `setCount` 方法）\n- Barrier 有 generation 机制，last arrival 调用 nextGeneration() 重置 count 并切换代次\n- 需要动态增减 parties 时用 Phaser（`register()` / `arriveAndDeregister()`），但 API 更复杂\n\n**典型适用场景**\n- CountDownLatch：服务启动等 N 个初始化任务完成、并发测试起跑门闩 + 收尾门闩\n- CyclicBarrier：分阶段并行计算（如多线程矩阵运算每轮交换边界数据）、批处理轮次同步\n- Semaphore：连接池保护、下载并发预算、第三方 API QPS 限流\n\n**边界与风险**\n- Latch：任务异常要在 finally countDown，否则等待者卡住；await 带超时，超时后记录未完成任务\n- Barrier：中断/超时/barrierAction 异常/reset 会打破本代，所有参与者收到 BrokenBarrierException，要统一退出或重试；线程池大小 < parties 会死等\n- Semaphore：acquire/release 必须配平——少 release 许可泄漏并发度降到 0，多 release 限流失效；单 JVM Semaphore 不限集群，需分布式方案\n\n**排查方法**\n- 线程 dump 看等待栈：await 卡在 CountDownLatch.await / Condition.await / AbstractQueuedSynchronizer.acquire\n- 看计数指标：remaining count、generation 是否变化、availablePermits\n- 检查临界区是否包含慢调用（导致 Semaphore 持有时间过长）",
       "followUpQuestions": [
         {
-          "question": "为什么 CountDownLatch 不能复用，而 CyclicBarrier 可以复用？",
-          "answer": "CountDownLatch 的 state 是剩余计数，只能通过 countDown 递减，归零后没有公开重置入口；后续 await 会直接通过。CyclicBarrier 有 generation 概念，本代最后一个线程到达后会唤醒等待者、重置 count 并切换到下一代，所以可以在循环中反复作为阶段屏障使用。"
+          "question": "为什么 CountDownLatch 不能复用，而 CyclicBarrier 可以进入下一轮？",
+          "answer": "CountDownLatch 的 state 是剩余计数，只能通过 countDown 递减，归零后没有 public 方法把 state 加回初始值（`setCount` 只在 JDK 未发布版本中出现过），后续 await 直接通过。CyclicBarrier 有 generation 概念：最后一个到达者执行 barrierAction 后，调用 nextGeneration() 将 count 重置为 parties 并切换到下一代，所有线程在新 generation 上重新开始，所以可以在循环中反复使用。"
         },
         {
           "question": "CyclicBarrier 被打破后应该怎么处理？",
-          "answer": "被打破说明当前 generation 的协作已经失败，可能是等待线程中断、超时、reset 或 barrierAction 抛异常。收到 BrokenBarrierException 的线程不应独自进入下一阶段，而应让本轮参与者统一退出、清理状态后重试，或者把失败传给上层调度器。"
+          "answer": "被打破说明当前 generation 的协作已经失败。收到 BrokenBarrierException 的线程不应独自进入下一阶段，而应让本轮参与者统一退出当前循环、清理共享状态后重试，或者将失败上报给调度器。如果让部分线程跳过本轮继续，会导致各线程处于不同的代次，处理的数据版本不一致。"
         },
         {
           "question": "Semaphore 做限流时最容易出现什么线上问题？",
-          "answer": "最常见是许可证数和真实资源不一致。业务异常后没有 release，会让可用许可逐渐减少，最终请求全部阻塞；失败分支或重复 finally 中多次 release，会让许可数超过设计值，限流失效。排查时看 availablePermits、等待线程数、慢调用栈以及 acquire/release 是否一一配平。"
+          "answer": "最常见的两个问题：① 许可泄漏——业务异常后没有在 finally 中 release，可用许可逐渐减少，最终全部 acquire 阻塞，并发度降到 0，表现为系统越来越慢但不报错；② 许可超发——在 acquire 失败的 catch 分支中也执行了 release，或者同一任务重复 release，让许可数超过初始值，限流形同虚设。排查时看 availablePermits 是否和预期一致、等待线程数是否持续增长。"
+        },
+        {
+          "question": "为什么 CyclicBarrier 用 ReentrantLock + Condition 而不是 AQS？",
+          "answer": "CyclicBarrier 的语义是「最后一个到达者触发唤醒 + 重置状态切换到下一代」。如果用 AQS 共享模式实现，需要自己处理 generation 切换时的 state 重置、中断传播和 broken 标记，逻辑复杂度更高。ReentrantLock + Condition 让「加锁 → 减 count → 判断是否最后一个 → signalAll → 重置」这条路径更直观，generation 切换时的清理也更自然。"
+        },
+        {
+          "question": "线程池大小小于 CyclicBarrier 的 parties 会怎样？",
+          "answer": "会永久死等。比如 parties=8，但线程池只有 4 个线程：前 4 个任务被调度执行后调用 await 进入等待（count 减到 4），但后 4 个任务在队列中无法被调度执行，count 永远无法减到 0，屏障永远打不开。正确做法是线程池大小 >= parties，或者使用 Semaphore 限制并发而不是 Barrier 做同步。"
+        },
+        {
+          "question": "Semaphore 用于限制下游接口并发调用时，单 JVM 内能限制集群总 QPS 吗？",
+          "answer": "不能。单 JVM 内的 Semaphore 只限制本进程内的并发数，10 个实例各配 20 许可，集群总并发可达 200。要限制集群总 QPS，需要用分布式令牌桶（如 Redis + Lua 脚本保证原子性）、中心化配额服务或网关侧限流。"
         }
       ]
     },
@@ -105,13 +131,16 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能用等待关系区分三者：等完成、等阶段、等许可证",
-        "能说明 CountDownLatch 和 Semaphore 的 AQS state 语义差异",
-        "能说明 CyclicBarrier 的 generation、barrierAction 和 broken 语义",
-        "能解释 CountDownLatch 不可复用以及 CyclicBarrier 可复用的原因",
-        "能写出 acquire/release 和 countDown 的异常安全写法",
-        "能指出线程池大小小于 parties 导致 CyclicBarrier 死等的风险",
-        "能结合线程 dump、计数和许可指标排查线上阻塞"
+        "能用等待关系区分三者：等完成（一对多）、等阶段（多对多互等）、等许可证（资源配额）",
+        "能说明 CountDownLatch 和 Semaphore 的 AQS 共享模式 state 语义差异（剩余计数 vs 剩余许可）",
+        "能说明 CyclicBarrier 的 generation 机制、barrierAction 执行时机和 broken 四种触发条件",
+        "能解释 CountDownLatch 不可复用（无重置入口）和 CyclicBarrier 可复用（generation 切换 + count 重置）的技术原因",
+        "能解释 CyclicBarrier 用 ReentrantLock + Condition 而非 AQS 实现的工程原因",
+        "能写出 countDown 的 finally 安全写法和 acquire/release 的配平写法",
+        "能指出线程池大小 < parties 导致 CyclicBarrier 死等的风险及根因",
+        "能说明 Semaphore 许可泄漏和超发的区别、表现及排查方法",
+        "能说出 Phaser 作为 CyclicBarrier 替代品的定位（动态 parties、分层竞争）和适用场景",
+        "能结合线程 dump（等待栈）、计数指标和许可指标排查线上阻塞问题"
       ]
     }
   ],
@@ -133,7 +162,28 @@
     },
     {
       "id": "java.concurrency.topic-019-a5a85fab.recall.3",
-      "prompt": "用 Semaphore 写资源池限流时，为什么 release 要放在 finally 且只在获取成功后执行？",
+      "prompt": "用 Semaphore 写资源池限流时，为什么 release 要放在 finally 且只在获取成功后执行？如果不这样做会出现什么问题？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
+      "id": "java.concurrency.topic-019-a5a85fab.recall.4",
+      "prompt": "CyclicBarrier 等待中的线程被中断或超时，会发生什么？其他参与者应该怎么处理？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "java.concurrency.topic-019-a5a85fab.recall.5",
+      "prompt": "线程池大小为 4，但 CyclicBarrier 的 parties 设为 8，会发生什么？怎么排查和修复？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "java.concurrency.topic-019-a5a85fab.recall.6",
+      "prompt": "Semaphore 用于限制下游接口并发调用时，单 JVM 内能限制集群总 QPS 吗？为什么？该怎么办？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
@@ -141,36 +191,38 @@
   ],
   "rubric": {
     "mustHave": [
-      "能区分三者语义：完成门闩、阶段屏障、许可证限流",
-      "能说出各自的典型适用场景",
-      "能说明 CountDownLatch/Semaphore 基于 AQS 共享模式",
-      "能指出 CountDownLatch 不可重置、CyclicBarrier 可复用"
+      "能用等待关系区分三者：完成门闩（一对多）、阶段屏障（多对多互等）、许可证限流（资源配额）",
+      "能说出各自的典型适用场景和选型依据",
+      "能说明 CountDownLatch/Semaphore 基于 AQS 共享模式，CyclicBarrier 基于 ReentrantLock + Condition",
+      "能解释 CountDownLatch 不可复用和 CyclicBarrier 可复用的技术原因（generation 机制）"
     ],
     "goodToHave": [
-      "能说明 CyclicBarrier 屏障被打破的触发条件和处理方式",
-      "能指出 Semaphore 许可证泄漏和超发问题",
-      "能说明 CyclicBarrier 用 ReentrantLock 加 Condition 实现",
-      "能指出线程池大小和 parties 不匹配导致死等"
+      "能说明 CyclicBarrier 屏障被打破的四种触发条件及 BrokenBarrierException 的处理方式",
+      "能指出 Semaphore 许可泄漏（少 release）和超发（多 release）的区别、表现及排查方法",
+      "能解释 CyclicBarrier 用 ReentrantLock + Condition 而非 AQS 实现的工程原因",
+      "能指出线程池大小 < parties 导致 Barrier 死等的风险及根因",
+      "能区分公平/非公平 Semaphore 的适用场景及 Phaser 作为动态替代品的定位"
     ],
     "commonMistakes": [
-      "需要复用却用了 CountDownLatch",
-      "Semaphore 的 acquire/release 不成对导致许可泄漏或超发",
-      "忽略 CyclicBarrier 的 BrokenBarrierException",
-      "线程池工作线程少于 parties 却等待所有参与者到达屏障"
+      "需要复用却用了 CountDownLatch，归零后无法重置",
+      "Semaphore 的 acquire/release 不成对——异常分支漏 release 导致许可泄漏，或多 release 导致限流失效",
+      "忽略 BrokenBarrierException，部分线程独自进入下一阶段导致数据不一致",
+      "线程池工作线程少于 CyclicBarrier 的 parties，屏障永远打不开",
+      "用 Semaphore 做集群限流但只在单 JVM 配许可数，未意识到集群总并发远超预期"
     ],
     "scoreWeights": {
-      "coverage": 30,
-      "accuracy": 35,
+      "coverage": 25,
+      "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 25
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-23",
   "status": "production",
   "prerequisites": [
     "java.concurrency.topic-017-df4531b1",
     "java.concurrency.topic-018-01ac6cc3"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察能否基于等待关系和计数语义区分三类同步工具，并能说明复用、broken、许可泄漏和线上排查边界。"
+  "interviewerFocus": "考察能否基于等待关系和计数语义区分三类同步工具，并能说明底层实现差异（AQS 共享 vs Lock+Condition）及其选型理由、generation 复用机制、broken 四种触发条件及处理、许可泄漏/超发风险、线程池与 parties 不匹配的死等问题、Phaser 作为动态替代品的定位，以及线上排查方法。"
 }

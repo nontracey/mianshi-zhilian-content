@@ -4,7 +4,7 @@
   "category": "ef-core",
   "group": "ef-core",
   "title": "仓储模式与工作单元",
-  "summary": "掌握 Repository 和 Unit of Work 模式在 EF Core 中的实现以及与 DDD 的结合",
+  "summary": "Repository 和 Unit of Work 在 EF Core 中的价值不是「包装 DbContext」，而是把聚合根的持久化边界、SaveChanges 的事务语义和领域事件的 dispatch 时机变成可测试、可约束的契约。EF Core 的 DbContext 本身就是 Unit of Work，但 DDD 项目仍需显式抽象来隔离领域层对 ORM 的依赖。",
   "tags": [
     ".NET",
     "EF Core",
@@ -14,20 +14,35 @@
     "Repository"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 40,
+  "estimatedMinutes": 53,
   "order": 30,
   "recommendWeight": 80,
   "status": "production",
   "learningCards": [
     {
       "type": "explain",
-      "title": "仓储模式与工作单元：仓储接口与实现、仓储模式",
-      "content": "仓储模式（Repository）和工作单元（Unit of Work）是数据访问层的常用设计模式，它们与 EF Core 和 DDD 有很好的结合。\n\n## 仓储模式\n\n仓储模式抽象了数据访问逻辑，提供统一的接口来操作实体：\n```csharp\npublic interface IRepository<T> where T : class\n{\n    Task<T> GetByIdAsync(int id);\n    Task<IEnumerable<T>> GetAllAsync();\n    Task<IEnumerable<T>> FindAsync(Expression<Func<T, bool>> predicate);\n    Task AddAsync(T entity);\n    void Update(T entity);\n    void Delete(T entity);\n}\n```\n\n**通用仓储实现**：\n```csharp\npublic class Repository<T> : IRepository<T> where T : class\n{\n    protected readonly DbContext _context;\n    protected readonly DbSet<T> _dbSet;\n\n    public Repository(DbContext context)\n    {\n        _context = context;\n        _dbSet = context.Set<T>();\n    }\npublic async Task<T> GetByIdAsync(int id)\n    {\n        return await _dbSet.FindAsync(id);\n    }\n\n    public async Task<IEnumerable<T>> GetAllAsync()\n    {\n        return await _dbSet.ToListAsync();\n    }\n\n    public async Task<IEnumerable<T>> FindAsync(Expression<Func<T, bool>> predicate)\n    {\n        return await _dbSet.Where(predicate).ToListAsync();\n    }\n\n    public async Task AddAsync(T entity)\n    {\n        await _dbSet.AddAsync(entity);\n    }\n\n    public void Update(T entity)\n    {\n        _dbSet.Update(entity);\n    }\n\n    public void Delete(T entity)\n    {\n        _dbSet.Remove(entity);\n    }\n}\n```\n\n## 工作单元模式\n\n工作单元确保多个操作在同一事务中完成：\n```csharp\npublic interface IUnitOfWork : IDisposable\n{\n    IRepository<User> Users { get; }\n    IRepository<Order> Orders { get; }\n    Task<int> SaveChangesAsync();\n}\n\npublic class UnitOfWork : IUnitOfWork\n{\n    private readonly AppDbContext _context;\n    private IRepository<User> _users;\n    private IRepository<Order> _orders;\n\n    public UnitOfWork(AppDbContext context)\n    {\n        _context = context;\n    }\n\n    public IRepository<User> Users =>\n        _users ??= new Repository<User>(_context);\n\n    public IRepository<Order> Orders =>\n        _orders ??= new Repository<Order>(_context);\n\n    public async Task<int> SaveChangesAsync()\n    {\n        return await _context.SaveChangesAsync();\n    }\n\n    public void Dispose()\n    {\n        _context.Dispose();\n    }\n}\n```\n\n## 使用工作单元\n\n```csharp\npublic class OrderService\n{\n    private readonly IUnitOfWork _unitOfWork;\n\n    public OrderService(IUnitOfWork unitOfWork)\n    {\n        _unitOfWork = unitOfWork;\n    }\n\n    public async Task CreateOrderAsync(int userId, List<OrderItem> items)\n    {\n        // 创建订单\n        var order = new Order\n        {\n            UserId = userId,\n            Items = items,\n            TotalAmount = items.Sum(i => i.Price * i.Quantity)\n        };\n\n        await _unitOfWork.Orders.AddAsync(order);\n\n        // 更新用户积分\n        var user = await _unitOfWork.Users.GetByIdAsync(userId);\n        user.Points += (int)(order.TotalAmount / 10);\n\n        // 保存所有更改\n        await _unitOfWork.SaveChangesAsync();\n    }\n}\n```\n\n## 与 DDD 结合\n\n**聚合根（Aggregate Root）**：\n```csharp\npublic abstract class AggregateRoot\n{\n    public int Id { get; protected set; }\n    private readonly List<IDomainEvent> _domainEvents = new();\n\n    public IReadOnlyList<IDomainEvent> DomainEvents => _domainEvents;\n\n    protected void AddDomainEvent(IDomainEvent domainEvent)\n    {\n        _domainEvents.Add(domainEvent);\n    }\n\n    public void ClearDomainEvents()\n    {\n        _domainEvents.Clear();\n    }\n}\n\npublic class Order : AggregateRoot\n{\n    public int UserId { get; private set; }\n    public decimal TotalAmount { get; private set; }\n    public OrderStatus Status { get; private set; }\n    private readonly List<OrderItem> _items = new();\n\n    public void AddItem(string productName, decimal price, int quantity)\n    {\n        var item = new OrderItem(productName, price, quantity);\n        _items.Add(item);\n        TotalAmount += price * quantity;\n\n        AddDomainEvent(new OrderItemAddedEvent(Id, productName, quantity));\n    }\n\n    public void Submit()\n    {\n        Status = OrderStatus.Submitted;\n        AddDomainEvent(new OrderSubmittedEvent(Id));\n    }\n}\n```\n\n**领域仓储**：\n```csharp\npublic interface IOrderRepository : IRepository<Order>\n{\n    Task<Order> GetByIdWithItemsAsync(int orderId);\n    Task<IEnumerable<Order>> GetOrdersByUserIdAsync(int userId);\n    Task<IEnumerable<Order>> GetPendingOrdersAsync();\n}\n\npublic class OrderRepository : Repository<Order>, IOrderRepository\n{\n    public OrderRepository(AppDbContext context) : base(context) { }\n\n    public async Task<Order> GetByIdWithItemsAsync(int orderId)\n    {\n        return await _dbSet\n            .Include(o => o.Items)\n            .FirstOrDefaultAsync(o => o.Id == orderId);\n    }\n\n    public async Task<IEnumerable<Order>> GetOrdersByUserIdAsync(int userId)\n    {\n        return await _dbSet\n            .Where(o => o.UserId == userId)\n            .OrderByDescending(o => o.CreatedAt)\n            .ToListAsync();\n    }\n\n    public async Task<IEnumerable<Order>> GetPendingOrdersAsync()\n    {\n        return await _dbSet\n            .Where(o => o.Status == OrderStatus.Pending)\n            .ToListAsync();\n    }\n}\n```"
+      "title": "Repository 的本质是聚合根的持久化契约，不是 CRUD 包装",
+      "content": "Repository 模式的核心假设是：领域层不应该知道数据存在哪里、用什么技术存。它只表达「我需要一个 Order，根据这个 ID」或「把这条新 Order 存起来」。\n\n这层抽象在什么场景才有价值？当领域层需要与基础设施解耦——比如要做单元测试、未来可能换存储引擎、或者上层有多个 bounded context 共享同一个领域模型。简单 CRUD 项目直接用 DbContext 反而更清晰，因为此时领域逻辑几乎为零，抽象只增加间接层。\n\nRepository 的接口应该按**聚合根**定义，而不是按数据库表。一个 Order 聚合包含 OrderItem 列表，所以 OrderRepository 负责整个聚合的加载和持久，不会单独暴露 OrderItemRepository。子实体只通过聚合根的导航属性访问。\n\n接口上的方法应当表达**领域意图**而非数据库操作。`GetPendingOrdersAsync()` 比 `GetByStatusAsync(OrderStatus.Pending)` 好，因为它把查询语义留在领域层，调用方不需要知道状态字段叫什么。`FindAsync` 这类通用查询方法只适合通用仓储基类，专用仓储应该有表达业务意图的方法。"
     },
     {
       "type": "explain",
-      "title": "仓储模式与工作单元：领域事件、仓储模式的优缺点",
-      "content": "## 领域事件\n\n```csharp\npublic interface IDomainEvent { }\n\npublic class OrderSubmittedEvent : IDomainEvent\n{\n    public int OrderId { get; }\n    public DateTime OccurredOn { get; }\n\n    public OrderSubmittedEvent(int orderId)\n    {\n        OrderId = orderId;\n        OccurredOn = DateTime.UtcNow;\n    }\n}\n\npublic interface IDomainEventHandler<in TEvent> where TEvent : IDomainEvent\n{\n    Task HandleAsync(TEvent domainEvent);\n}\n\npublic class OrderSubmittedEventHandler : IDomainEventHandler<OrderSubmittedEvent>\n{\n    private readonly IEmailService _emailService;\n\n    public OrderSubmittedEventHandler(IEmailService emailService)\n    {\n        _emailService = emailService;\n    }\n\n    public async Task HandleAsync(OrderSubmittedEvent domainEvent)\n    {\n        await _emailService.SendOrderConfirmationAsync(domainEvent.OrderId);\n    }\n}\n```\n\n## 仓储模式的优缺点\n\n**优点**：\n1. 抽象数据访问逻辑\n2. 便于单元测试\n3. 支持多种数据源\n4. 与 DDD 结合良好\n\n**缺点**：\n1. 可能过度抽象\n2. 复杂查询难以表达\n3. 性能可能受影响\n4. 增加代码复杂度\n\n## 最佳实践\n\n1. **聚合根才有仓储**：不是所有实体都需要仓储\n2. **仓储只操作聚合根**：通过聚合根管理子实体\n3. **工作单元管理事务**：确保数据一致性\n4. **领域事件解耦**：使用事件处理跨聚合操作"
+      "title": "EF Core 的 DbContext 本身就是 Unit of Work，为什么要再包一层",
+      "content": "Unit of Work 模式的核心语义是：**把多个操作收进同一个事务，最后一次性提交或回滚**。EF Core 的 DbContext 天然满足这一点——多个 Add/Update/Remove 调用只是标记实体的 ChangeTracker 状态，直到 `SaveChangesAsync()` 才生成 SQL 并在一个显式或隐式事务中执行。\n\n那为什么 DDD 项目还要定义 `IUnitOfWork` 接口？\n\n第一，**隔离依赖**。应用服务不应该直接依赖 DbContext 这个具体实现；`IUnitOfWork` 是一个轻量接口，只暴露 `SaveChangesAsync()` 和仓储属性，方便测试时 Mock。第二，**统一事务边界**。当一个用例涉及多个聚合根的修改时，`IUnitOfWork` 的 `SaveChangesAsync()` 明确标识了「这些操作要么全部成功，要么全部回滚」这个语义。第三，**集成领域事件 dispatch**。很多实现把「在 SaveChanges 前后 dispatch 领域事件」放在 UoW 里，确保事件在正确的事务边界内触发。\n\n但有一个反模式要注意：如果 IUnitOfWork 只是机械地封装了 `DbContext.SaveChangesAsync()`，没有增加事务管理、事件 dispatch 或多 DbContext 协调能力，那这层抽象就是纯噪音。要避免为了「看起来像 DDD」而强加无意义的包装。"
+    },
+    {
+      "type": "explain",
+      "title": "聚合根、领域事件与 Repository 的协作边界",
+      "content": "在 DDD 中，**聚合根（Aggregate Root）**是一致性边界。一个聚合内部的实体可以被聚合根自由修改，但跨聚合的修改必须通过独立的事务或最终一致性来保证。因此 Repository 只为聚合根存在——你加载一个 Order（带 Items），修改它，保存它，这整个聚合内部的一致性由聚合根自身保证。\n\n**领域事件**解决的是跨聚合通信。当 Order.Submit() 被调用时，Order 实体把一个 `OrderSubmittedEvent` 加入自身的 `_domainEvents` 列表。`SaveChangesAsync()` 前后，UoW 或一个 DomainEventDispatcher 读取所有已跟踪实体的领域事件并逐个 dispatch。这样领域逻辑本身不直接调用外部服务（发邮件、扣库存），而是通过事件解耦。\n\ndispatch 的时机影响行为：**提交前 dispatch**适合需要在同一事务内完成的副作用（比如另一个聚合的状态变更）；**提交后 dispatch**适合非本地操作（发消息、调外部 API），但要考虑这些操作失败后的补偿。实践中很多框架采用「SaveChanges 前收集事件 → SaveChanges → 提交后 dispatch 进程内事件 → dispatch 进程外事件（消息队列）」的分层策略。\n\n领域的不变量（比如 OrderItem 数量不能为负）由聚合根在方法内直接检查。不要把不变量检查放到 Repository 或 UoW——那是基础设施层，不应该承载业务规则。"
+    },
+    {
+      "type": "explain",
+      "title": "Repository 的常见反模式和工程边界",
+      "content": "**反模式一：把 IQueryable 暴露到领域层**。如果 Repository 的方法返回 `IQueryable<T>`，调用方可以随意拼 `.Where().Select().GroupBy()`，Repository 就退化成了 DbContext 的透传，抽象完全失效。正确做法是 Repository 内部构建完整查询并返回 `Task<T>` 或 `Task<List<T>>`。\n\n**反模式二：为每个实体建 Repository**。只有聚合根需要 Repository。OrderItem、Address 这类从属实体通过 Order 聚合根访问。如果每个表都有 Repository，代码会爆炸，而且你实际上是在数据库表上做面向对象建模，这不是 DDD。\n\n**反模式三：通用仓储 + Specification 滥用**。通用仓储（`IRepository<T>`）适合简单的 CRUD 场景，但如果项目里查询条件复杂、需要 Include 多层导航、需要投影到 DTO，通用接口很快会变成 `FindAsync(Specification)` 这种万能方法，不如直接定义专用仓储接口。\n\n**性能边界**。EF Core 的变更追踪是有开销的。当只需要读取数据用于展示（Read Model）时，用 `.AsNoTracking()` 可以跳过 ChangeTracker，查询速度提升显著。CQRS 模式把读和写分开，读侧可以直接用 Dapper 或 raw SQL，写侧才走 Repository + UoW。这是 Repository 模式的自然演进方向。"
+    },
+    {
+      "type": "explain",
+      "title": "EF Core 特有的 SaveChanges 行为和并发控制",
+      "content": "EF Core 的 `SaveChangesAsync()` 在一次调用中生成所有 pending changes 的 SQL，通过单个数据库连接在默认的隐式事务中执行（或显式调用 `BeginTransaction`）。如果任何一条 SQL 失败，整次 SaveChanges 回滚。\n\n**乐观并发**：给实体加 `[Timestamp]` 或 `.IsRowVersion()` 标记的并发令牌后，EF Core 在 UPDATE 语句的 WHERE 子句中检查原始版本值。版本不匹配时抛 `DbUpdateConcurrencyException`，应用层决定是重试、合并还是提示用户。\n\n**SaveChanges 的触发时机**：UoW 通常在用例的最后一行调用 `SaveChangesAsync()`。不要在领域方法内部调 SaveChanges——这会把持久化时机耦合到领域逻辑，测试时需要真实数据库，而且多个领域方法的事务边界会变得模糊。\n\n**软删除**：EF Core 的全局查询过滤器（`HasQueryFilter`）可以实现软删除。在 Repository 的 Delete 方法中不调 `_dbSet.Remove()`，而是设置 `IsDeleted = true`。SaveChanges 时生成 UPDATE 而非 DELETE。注意：聚合内部的子实体如果也需要软删除，要在聚合根的方法中同步处理。"
     },
     {
       "type": "diagram",
@@ -56,50 +71,62 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | 直接使用 DbContext | 仓储模式 |\n| --- | --- | --- |\n| 复杂度 | 低 | 中 |\n| 可测试性 | 需要内存数据库 | 易于 Mock |\n| 灵活性 | 高（直接访问） | 中（通过接口） |\n| 代码量 | 少 | 多 |\n| 适用场景 | 简单项目 | 复杂项目、DDD |\n| 学习曲线 | 低 | 中 |"
+      "title": "直接 DbContext vs Repository + UoW 的工程取舍",
+      "content": "| 维度 | 直接使用 DbContext | Repository + UoW |\n| --- | --- | --- |\n| 代码量 | 少，无中间层 | 多，需定义接口和实现 |\n| 领域与基础设施耦合 | 高，领域层直接依赖 EF Core | 低，领域层只依赖 Repository 接口 |\n| 单元测试 | 需内存数据库或集成测试 | 可直接 Mock Repository 接口 |\n| 查询灵活性 | 最高，可直接写 LINQ/IQueryable | 受 Repository 接口约束，复杂查询需在实现中处理 |\n| 事务语义 | 隐式（单 DbContext）或显式 BeginTransaction | UoW 接口明确事务边界，可扩展跨 DbContext 事务 |\n| DDD 适配 | 不适合，缺少聚合边界约束 | 适合，聚合根-Repository 对齐 |\n| CQRS 演进 | 可直接拆分读写模型 | 天然支持读写分离，读侧可替换为 Dapper |\n| 适用场景 | 简单 CRUD、快速原型 | 复杂领域、多团队协作、长期维护项目 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | DbContext | IUnitOfWork |\n| --- | --- | --- |\n| 职责 | 数据访问 + 变更追踪 | 管理多个仓储 + 事务 |\n| 生命周期 | Scoped（DbContext） | Scoped（IUnitOfWork） |\n| 接口数量 | 1个 | 多个仓储接口 |\n| 适用场景 | 直接使用 | 封装业务逻辑 |\n| DDD 支持 | 一般 | 好 |"
+      "title": "EF Core SaveChanges 与显式事务 API 的区别",
+      "content": "| 场景 | SaveChangesAsync 默认行为 | 显式 BeginTransaction |\n| --- | --- | --- |\n| 事务范围 | 仅包含当前 SaveChanges 的 SQL | 可包含多次 SaveChanges 或原生 SQL |\n| 跨 DbContext 事务 | 不支持 | 支持（TransactionScope 或 DbTransaction 共享） |\n| 隔离级别 | 数据库默认（通常 Read Committed） | 可指定 Snapshot、Serializable 等 |\n| 嵌套 SaveChanges | 每次独立事务 | 同一事务内多次 SaveChanges 全部原子 |\n| 使用建议 | 单聚合、单次保存 | 跨聚合一致性要求高、需原生 SQL 混合操作 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Collections.Generic;\nusing System.Linq;\nusing System.Linq.Expressions;\nusing System.Threading.Tasks;\nusing Microsoft.EntityFrameworkCore;\n\nnamespace RepositoryUoWDemo\n{\n    // 通用仓储接口\n    public interface IRepository<T> where T : class\n    {\n        Task<T> GetByIdAsync(int id);\n        Task<IEnumerable<T>> GetAllAsync();\n        Task<IEnumerable<T>> FindAsync(Expression<Func<T, bool>> predicate);\n        Task<T> FirstOrDefaultAsync(Expression<Func<T, bool>> predicate);\n        Task AddAsync(T entity);\n        void Update(T entity);\n        void Delete(T entity);\n        Task<bool> ExistsAsync(Expression<Func<T, bool>> predicate);\n        Task<int> CountAsync(Expression<Func<T, bool>> predicate = null);\n    }\n\n    // 通用仓储实现\n    public class Repository<T> : IRepository<T> where T : class\n    {\n        protected readonly AppDbContext _context;\n        protected readonly DbSet<T> _dbSet;\n\n        public Repository(AppDbContext context)\n        {\n            _context = context;\n            _dbSet = context.Set<T>();\n        }\n\n        public async Task<T> GetByIdAsync(int id)\n        {\n            return await _dbSet.FindAsync(id);\n        }\n\n        public async Task<IEnumerable<T>> GetAllAsync()\n        {\n            return await _dbSet.ToListAsync();\n        }\n\n        public async Task<IEnumerable<T>> FindAsync(Expression<Func<T, bool>> predicate)\n        {\n            return await _dbSet.Where(predicate).ToListAsync();\n        }\n\n        public async Task<T> FirstOrDefaultAsync(Expression<Func<T, bool>> predicate)\n        {\n            return await _dbSet.FirstOrDefaultAsync(predicate);\n        }\n\n        public async Task AddAsync(T entity)\n        {\n            await _dbSet.AddAsync(entity);\n        }\n\n        public void Update(T entity)\n        {\n            _dbSet.Update(entity);\n        }\n\n        public void Delete(T entity)\n        {\n            _dbSet.Remove(entity);\n        }\n\n        public async Task<bool> ExistsAsync(Expression<Func<T, bool>> predicate)\n        {\n            return await _dbSet.AnyAsync(predicate);\n        }\n\n        public async Task<int> CountAsync(Expression<Func<T, bool>> predicate = null)\n        {\n            return predicate == null\n                ? await _dbSet.CountAsync()\n                : await _dbSet.CountAsync(predicate);\n        }\n    }\n\n    // 工作单元接口\n    public interface IUnitOfWork : IDisposable\n    {\n        IUserRepository Users { get; }\n        IOrderRepository Orders { get; }\n        Task<int> SaveChangesAsync();\n    }\n\n    // 工作单元实现\n    public class UnitOfWork : IUnitOfWork\n    {\n        private readonly AppDbContext _context;\n        private IUserRepository _users;\n        private IOrderRepository _orders;\n\n        public UnitOfWork(AppDbContext context)\n        {\n            _context = context;\n        }\n\n        public IUserRepository Users =>\n            _users ??= new UserRepository(_context);\n\n        public IOrderRepository Orders =>\n            _orders ??= new OrderRepository(_context);\n\n        public async Task<int> SaveChangesAsync()\n        {\n            return await _context.SaveChangesAsync();\n        }\n\n        public void Dispose()\n        {\n            _context.Dispose();\n        }\n    }\n\n    // 用户仓储接口\n    public interface IUserRepository : IRepository<User>\n    {\n        Task<User> GetByEmailAsync(string email);\n        Task<IEnumerable<User>> GetActiveUsersAsync();\n    }\n\n    // 用户仓储实现\n    public class UserRepository : Repository<User>, IUserRepository\n    {\n        public UserRepository(AppDbContext context) : base(context) { }\n\n        public async Task<User> GetByEmailAsync(string email)\n        {\n            return await _dbSet.FirstOrDefaultAsync(u => u.Email == email);\n        }\n\n        public async Task<IEnumerable<User>> GetActiveUsersAsync()\n        {\n            return await _dbSet.Where(u => u.IsActive).ToListAsync();\n        }\n    }\n\n    // 订单仓储接口\n    public interface IOrderRepository : IRepository<Order>\n    {\n        Task<Order> GetByIdWithItemsAsync(int orderId);\n        Task<IEnumerable<Order>> GetOrdersByUserIdAsync(int userId);\n        Task<IEnumerable<Order>> GetOrdersByStatusAsync(OrderStatus status);\n    }\n\n    // 订单仓储实现\n    public class OrderRepository : Repository<Order>, IOrderRepository\n    {\n        public OrderRepository(AppDbContext context) : base(context) { }\n\n        public async Task<Order> GetByIdWithItemsAsync(int orderId)\n        {\n            return await _dbSet\n                .Include(o => o.Items)\n                .FirstOrDefaultAsync(o => o.Id == orderId);\n        }\n\n        public async Task<IEnumerable<Order>> GetOrdersByUserIdAsync(int userId)\n        {\n            return await _dbSet\n                .Where(o => o.UserId == userId)\n                .OrderByDescending(o => o.CreatedAt)\n                .ToListAsync();\n        }\n\n        public async Task<IEnumerable<Order>> GetOrdersByStatusAsync(OrderStatus status)\n        {\n            return await _dbSet\n                .Where(o => o.Status == status)\n                .ToListAsync();\n        }\n    }\n\n    // 实体类\n    public class User\n    {\n        public int Id { get; set; }\n        public string Name { get; set; }\n        public string Email { get; set; }\n        public bool IsActive { get; set; } = true;\n        public int Points { get; set; }\n    }\n\n    public class Order\n    {\n        public int Id { get; set; }\n        public int UserId { get; set; }\n        public User User { get; set; }\n        public decimal TotalAmount { get; set; }\n        public OrderStatus Status { get; set; } = OrderStatus.Pending;\n        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;\n        public List<OrderItem> Items { get; set; } = new();\n    }\n\n    public class OrderItem\n    {\n        public int Id { get; set; }\n        public string ProductName { get; set; }\n        public decimal Price { get; set; }\n        public int Quantity { get; set; }\n        public int OrderId { get; set; }\n        public Order Order { get; set; }\n    }\n\n    public enum OrderStatus\n    {\n        Pending,\n        Submitted,\n        Processing,\n        Completed,\n        Cancelled\n    }\n\n    // 使用示例\n    public class OrderService\n    {\n        private readonly IUnitOfWork _unitOfWork;\n\n        public OrderService(IUnitOfWork unitOfWork)\n        {\n            _unitOfWork = unitOfWork;\n        }\n\n        public async Task<Order> CreateOrderAsync(int userId, List<OrderItem> items)\n        {\n            var user = await _unitOfWork.Users.GetByIdAsync(userId);\n            if (user == null)\n                throw new ArgumentException(\"用户不存在\");\n\n            var order = new Order\n            {\n                UserId = userId,\n                Items = items,\n                TotalAmount = items.Sum(i => i.Price * i.Quantity)\n            };\n\n            // 更新用户积分\n            user.Points += (int)(order.TotalAmount / 10);\n\n            await _unitOfWork.Orders.AddAsync(order);\n            await _unitOfWork.SaveChangesAsync();\n\n            return order;\n        }\n\n        public async Task<Order> GetOrderDetailsAsync(int orderId)\n        {\n            return await _unitOfWork.Orders.GetByIdWithItemsAsync(orderId);\n        }\n\n        public async Task<IEnumerable<Order>> GetUserOrdersAsync(int userId)\n        {\n            return await _unitOfWork.Orders.GetOrdersByUserIdAsync(userId);\n        }\n    }\n\n    // DbContext\n    public class AppDbContext : DbContext\n    {\n        public DbSet<User> Users { get; set; }\n        public DbSet<Order> Orders { get; set; }\n        public DbSet<OrderItem> OrderItems { get; set; }\n\n        public AppDbContext(DbContextOptions<AppDbContext> options)\n            : base(options) { }\n    }\n\n    // 服务注册\n    public static class ServiceCollectionExtensions\n    {\n        public static IServiceCollection AddRepositoryPattern(\n            this IServiceCollection services)\n        {\n            services.AddScoped<IUnitOfWork, UnitOfWork>();\n            services.AddScoped(typeof(IRepository<>), typeof(Repository<>));\n\n            return services;\n        }\n    }\n}",
+      "title": "完整实现：通用仓储、专用仓储、UoW 和领域事件 dispatch",
       "language": "csharp",
+      "content": "using System;\nusing System.Collections.Generic;\nusing System.Linq;\nusing System.Linq.Expressions;\nusing System.Threading.Tasks;\nusing Microsoft.EntityFrameworkCore;\nusing Microsoft.Extensions.DependencyInjection;\n\n// ===================== 领域层 =====================\n\n// 领域事件标记接口\npublic interface IDomainEvent { }\n\n// 聚合根基类\npublic abstract class AggregateRoot\n{\n    public int Id { get; protected set; }\n    private readonly List<IDomainEvent> _domainEvents = new();\n    public IReadOnlyList<IDomainEvent> DomainEvents => _domainEvents;\n\n    protected void AddDomainEvent(IDomainEvent domainEvent)\n        => _domainEvents.Add(domainEvent);\n\n    public void ClearDomainEvents()\n        => _domainEvents.Clear();\n}\n\n// Order 聚合根\npublic class Order : AggregateRoot\n{\n    public int UserId { get; private set; }\n    public decimal TotalAmount { get; private set; }\n    public OrderStatus Status { get; private set; }\n    private readonly List<OrderItem> _items = new();\n    public IReadOnlyList<OrderItem> Items => _items;\n\n    public static Order Create(int userId)\n    {\n        return new Order { UserId = userId, Status = OrderStatus.Pending };\n    }\n\n    public void AddItem(string productName, decimal price, int quantity)\n    {\n        if (quantity <= 0) throw new ArgumentException(\"数量必须大于零\");\n        _items.Add(new OrderItem(productName, price, quantity));\n        TotalAmount += price * quantity;\n        AddDomainEvent(new OrderItemAddedEvent(Id, productName, quantity));\n    }\n\n    public void Submit()\n    {\n        if (Status != OrderStatus.Pending)\n            throw new InvalidOperationException(\"只有待处理订单可以提交\");\n        if (_items.Count == 0)\n            throw new InvalidOperationException(\"空订单不能提交\");\n        Status = OrderStatus.Submitted;\n        AddDomainEvent(new OrderSubmittedEvent(Id));\n    }\n}\n\npublic class OrderItem\n{\n    public int Id { get; set; }\n    public string ProductName { get; private set; }\n    public decimal Price { get; private set; }\n    public int Quantity { get; private set; }\n    public int OrderId { get; set; }\n\n    private OrderItem() { }\n    internal OrderItem(string productName, decimal price, int quantity)\n    {\n        ProductName = productName;\n        Price = price;\n        Quantity = quantity;\n    }\n}\n\npublic enum OrderStatus { Pending, Submitted, Processing, Completed, Cancelled }\n\npublic class OrderSubmittedEvent : IDomainEvent\n{\n    public int OrderId { get; }\n    public DateTime OccurredOn { get; }\n    public OrderSubmittedEvent(int orderId)\n    {\n        OrderId = orderId;\n        OccurredOn = DateTime.UtcNow;\n    }\n}\n\npublic class OrderItemAddedEvent : IDomainEvent\n{\n    public int OrderId { get; }\n    public string ProductName { get; }\n    public int Quantity { get; }\n    public DateTime OccurredOn { get; }\n    public OrderItemAddedEvent(int orderId, string productName, int quantity)\n    {\n        OrderId = orderId;\n        ProductName = productName;\n        Quantity = quantity;\n        OccurredOn = DateTime.UtcNow;\n    }\n}\n\n// 领域仓储接口（只为聚合根定义）\npublic interface IOrderRepository\n{\n    Task<Order?> GetByIdAsync(int orderId);\n    Task<Order?> GetByIdWithItemsAsync(int orderId);\n    Task<List<Order>> GetPendingOrdersAsync();\n    Task AddAsync(Order order);\n}\n\n// ===================== 基础设施层 =====================\n\n// 仓储实现\npublic class OrderRepository : IOrderRepository\n{\n    private readonly AppDbContext _context;\n    public OrderRepository(AppDbContext context) => _context = context;\n\n    public async Task<Order?> GetByIdAsync(int orderId)\n        => await _context.Orders.FindAsync(orderId);\n\n    public async Task<Order?> GetByIdWithItemsAsync(int orderId)\n        => await _context.Orders\n            .Include(o => o.Items)\n            .FirstOrDefaultAsync(o => o.Id == orderId);\n\n    public async Task<List<Order>> GetPendingOrdersAsync()\n        => await _context.Orders\n            .Where(o => o.Status == OrderStatus.Pending)\n            .OrderBy(o => o.Id)\n            .ToListAsync();\n\n    public async Task AddAsync(Order order)\n        => await _context.Orders.AddAsync(order);\n}\n\n// 领域事件 Dispatcher\npublic interface IDomainEventDispatcher\n{\n    Task DispatchAsync(IEnumerable<IDomainEvent> events);\n}\n\npublic class DomainEventDispatcher : IDomainEventDispatcher\n{\n    private readonly IServiceProvider _sp;\n    public DomainEventDispatcher(IServiceProvider sp) => _sp = sp;\n\n    public async Task DispatchAsync(IEnumerable<IDomainEvent> events)\n    {\n        foreach (var domainEvent in events)\n        {\n            var handlerType = typeof(IDomainEventHandler<>).MakeGenericType(domainEvent.GetType());\n            var handlers = _sp.GetServices(handlerType);\n            foreach (var handler in handlers)\n            {\n                var method = handlerType.GetMethod(\"HandleAsync\");\n                await (Task)method!.Invoke(handler, new object[] { domainEvent });\n            }\n        }\n    }\n}\n\npublic interface IDomainEventHandler<in TEvent> where TEvent : IDomainEvent\n{\n    Task HandleAsync(TEvent domainEvent);\n}\n\npublic class OrderSubmittedEmailHandler : IDomainEventHandler<OrderSubmittedEvent>\n{\n    public async Task HandleAsync(OrderSubmittedEvent domainEvent)\n    {\n        // 模拟发邮件\n        Console.WriteLine($\"[邮件] 订单 {domainEvent.OrderId} 已提交，发送确认邮件\");\n        await Task.CompletedTask;\n    }\n}\n\n// Unit of Work\npublic interface IUnitOfWork : IDisposable\n{\n    IOrderRepository Orders { get; }\n    Task<int> SaveChangesAsync(CancellationToken ct = default);\n}\n\npublic class UnitOfWork : IUnitOfWork\n{\n    private readonly AppDbContext _context;\n    private readonly IDomainEventDispatcher _dispatcher;\n    private IOrderRepository _orders;\n\n    public UnitOfWork(AppDbContext context, IDomainEventDispatcher dispatcher)\n    {\n        _context = context;\n        _dispatcher = dispatcher;\n    }\n\n    public IOrderRepository Orders\n        => _orders ??= new OrderRepository(_context);\n\n    public async Task<int> SaveChangesAsync(CancellationToken ct = default)\n    {\n        // 收集所有聚合根的领域事件\n        var entries = _context.ChangeTracker.Entries<AggregateRoot>()\n            .Where(e => e.Entity.DomainEvents.Any())\n            .ToList();\n\n        var allEvents = entries\n            .SelectMany(e => e.Entity.DomainEvents)\n            .ToList();\n\n        // 提交前 dispatch 本地事件（同事务内）\n        await _dispatcher.DispatchAsync(allEvents);\n\n        // 清除事件，避免重复 dispatch\n        entries.ForEach(e => e.Entity.ClearDomainEvents());\n\n        // 持久化\n        var result = await _context.SaveChangesAsync(ct);\n\n        // 提交后可 dispatch 进程外事件（消息队列等），此处省略\n        return result;\n    }\n\n    public void Dispose() => _context.Dispose();\n}\n\n// ===================== 基础设施配置 =====================\n\npublic class User\n{\n    public int Id { get; set; }\n    public string Name { get; set; } = \"\";\n    public int Points { get; set; }\n}\n\npublic class AppDbContext : DbContext\n{\n    public DbSet<User> Users => Set<User>();\n    public DbSet<Order> Orders => Set<Order>();\n    public DbSet<OrderItem> OrderItems => Set<OrderItem>();\n\n    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }\n\n    protected override void OnModelCreating(ModelBuilder builder)\n    {\n        builder.Entity<Order>(b =>\n        {\n            b.Ignore(o => o.DomainEvents);\n            b.HasMany(o => o.Items)\n             .WithOne()\n             .HasForeignKey(i => i.OrderId);\n        });\n    }\n}\n\n// DI 注册\npublic static class RepositoryUowExtensions\n{\n    public static IServiceCollection AddRepositoryUoW(this IServiceCollection services)\n    {\n        services.AddScoped<IUnitOfWork, UnitOfWork>();\n        services.AddScoped<IDomainEventDispatcher, DomainEventDispatcher>();\n        services.AddScoped<IDomainEventHandler<OrderSubmittedEvent>, OrderSubmittedEmailHandler>();\n        return services;\n    }\n}\n\n// ===================== 应用层使用示例 =====================\n\npublic class OrderService\n{\n    private readonly IUnitOfWork _uow;\n    public OrderService(IUnitOfWork uow) => _uow = uow;\n\n    public async Task<Order> CreateAndSubmitOrderAsync(int userId)\n    {\n        var order = Order.Create(userId);\n        order.AddItem(\"键盘\", 299.99m, 1);\n        order.AddItem(\"鼠标\", 99.99m, 2);\n\n        await _uow.Orders.AddAsync(order);\n        order.Submit(); // 产生 OrderSubmittedEvent\n\n        await _uow.SaveChangesAsync(); // 事务提交 + 事件 dispatch\n        return order;\n    }\n}",
       "highlights": [
         {
-          "line": 11,
-          "note": "`public interface IRepository<T> where T : class` 定义了 仓储模式与工作单元 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 54,
+          "note": "聚合根的不变量检查在领域方法内部完成，不依赖基础设施。"
         },
         {
-          "line": 79,
-          "note": "`? await _dbSet.CountAsync()` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 78,
+          "note": "领域仓储接口只表达业务意图，不暴露 IQueryable。"
         },
         {
-          "line": 17,
-          "note": "`Task AddAsync(T entity);` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "line": 131,
+          "note": "SaveChangesAsync 中先收集 ChangeTracker 上所有聚合根的领域事件。"
         },
         {
-          "line": 5,
-          "note": "`using System.Threading.Tasks;` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+          "line": 136,
+          "note": "提交前 dispatch 本地事件，确保同事务内完成副作用。"
+        },
+        {
+          "line": 149,
+          "note": "DomainEvents 属性被 EF Core 配置为 Ignore，不映射到数据库列。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "仓储模式抽象了数据访问逻辑，提供统一的接口来操作实体。通用仓储接口包括 GetById、GetAll、Find、Add、Update、Delete 等方法。仓储模式的好处是便于单元测试，可以轻松 Mock 数据访问层。\n\n机制要点：\n- 工作单元模式确保多个操作在同一事务中完成。它管理多个仓储，通过 SaveChangesAsync 方法提交所有更改。在 EF Core 中，DbContext 本身就实现了工作单元模式，但显式实现工作单元可以让代码更清晰。\n- 与 DDD 结合时，只有聚合根才有仓储。聚合根是领域模型的一致性边界，通过聚合根管理子实体。领域事件用于解耦聚合之间的通信。\n- 仓储模式的优缺点：优点是抽象数据访问、便于测试、支持多种数据源；缺点是可能过度抽象、复杂查询难以表达、增加代码复杂度。\n- 在实际开发中，我会根据项目复杂度决定是否使用仓储模式。简单项目可以直接使用 DbContext，复杂项目特别是 DDD 项目会使用仓储模式。",
+      "content": "**结论**：Repository 和 Unit of Work 的价值不是包一层 DbContext，而是把聚合根的持久化边界和事务语义变成可测试、可约束的契约。\n\n**机制主线**：\n- **Repository 是聚合根的持久化接口**。只有聚合根才有仓储，子实体通过聚合根导航属性访问。接口方法应表达领域意图（`GetPendingOrdersAsync`），不是数据库操作的映射。\n- **EF Core 的 DbContext 本身就是 Unit of Work**。多个 Save 前操作只标记 ChangeTracker 状态，SaveChangesAsync 一次性生成 SQL 并在事务中执行。显式定义 IUnitOfWork 的价值在于隔离依赖、统一事务边界、集成领域事件 dispatch。\n- **领域事件解决跨聚合通信**。聚合根方法产生事件，UoW 在 SaveChanges 前后分层 dispatch——提交前处理同事务副作用，提交后处理进程外操作。\n- **反模式**：暴露 IQueryable 到领域层让抽象失效；为每个表建 Repository 是数据库建模而非领域建模；无意义的 DbContext 包装层。\n\n**边界与取舍**：\n- 简单 CRUD 项目直接用 DbContext，抽象只增加间接层。\n- 读多写少场景可用 CQRS，读侧用 AsNoTracking 或 Dapper，写侧走 Repository + UoW。\n- 乐观并发用 `[Timestamp]` 并发令牌，SaveChanges 时自动检查版本。\n- UoW 的 SaveChangesAsync 在用例最后一行调用，不要在领域方法内部调。\n\n**追问准备**：\n- 为什么只有聚合根才有仓储？→ 一致性边界，聚合内部自由修改，跨聚合需要独立事务。\n- UoW 和 DbContext 是什么关系？→ DbContext 天然是 UoW，显式抽象用于解耦和事件集成。\n- 领域事件 dispatch 放在哪里？→ UoW 的 SaveChanges 前后，前处理本地事务副作用，后处理外部系统。",
       "followUpQuestions": [
         {
-          "question": "面试官追问「仓储模式与工作单元」时，最应该展开哪条机制链？",
-          "answer": "回答「仓储模式与工作单元」时先抓住 理解仓储模式的概念和实现，再展开 理解工作单元模式的作用。仓储模式与工作单元 不能停在定义层，要把 .NET 版本、GC 指标、输出结果和 P95 延迟 串起来，才像真实 .NET 工程里的判断。"
+          "question": "为什么只有聚合根才有 Repository，而不是每个实体都有？",
+          "answer": "聚合根是一致性边界，内部子实体（如 OrderItem）只通过聚合根访问和修改，不能被外部直接持久化。如果每个实体都有 Repository，外部代码可以绕过聚合根直接操作子实体，破坏一致性保证。这是 DDD 的核心约束，不是代码组织偏好。"
         },
         {
-          "question": "如果「仓储模式与工作单元」在线上或编码中出问题，你会优先检查什么？",
-          "answer": "可以先确认现象是否落在「理解工作单元模式的作用」，再结合日志、指标、输入规模和依赖状态验证。"
+          "question": "EF Core 的 DbContext 已经是 Unit of Work 了，为什么还要定义 IUnitOfWork 接口？",
+          "answer": "DbContext 是具体实现，领域层依赖它就耦合了 ORM。IUnitOfWork 只暴露 SaveChangesAsync 和仓储属性，方便 Mock 测试。同时 IUnitOfWork 可以扩展为集成领域事件 dispatch、跨 DbContext 事务协调、outbox 模式等能力。如果项目只需要 DbContext 的原生能力且不需要测试隔离，不必强加 IUnitOfWork。"
+        },
+        {
+          "question": "领域事件应该在 SaveChanges 前还是后 dispatch？为什么？",
+          "answer": "取决于副作用的性质。同事务内的本地副作用（比如另一个聚合的状态变更）应在 SaveChanges 前 dispatch，因为它们需要在同一事务内原子完成。进程外副作用（发邮件、调 API、写消息队列）应在 SaveChanges 后 dispatch，因为这些操作不属于数据库事务，先提交再通知避免了长事务和补偿复杂度。实践中很多实现采用分层策略：前 dispatch 本地 → SaveChanges → 后 dispatch 进程外。"
+        },
+        {
+          "question": "仓储接口返回 IQueryable 有什么问题？",
+          "answer": "IQueryable 把数据库查询构造能力泄漏到领域层。调用方可以随意拼 Where、Select、GroupBy，仓储退化成 DbContext 的透传层，抽象完全失效。测试时 IQueryable 难以 Mock（需要 InMemory Provider），且查询优化被延迟到枚举时执行，调试困难。正确做法是 Repository 内部构建完整查询，返回 `Task<T>` 或 `Task<List<T>>`。"
         }
       ]
     },
@@ -107,33 +134,49 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "仓储模式的概念和实现方式",
-        "工作单元模式的作用和实现",
-        "如何与 DDD 结合使用",
-        "聚合根和领域事件的概念",
-        "仓储模式的优缺点",
-        "何时使用仓储模式"
+        "能解释 Repository 模式的核心假设：领域层不依赖具体存储技术，只通过接口表达持久化意图",
+        "能说明为什么只有聚合根才有 Repository，子实体通过聚合根导航访问",
+        "能解释 EF Core DbContext 天然是 Unit of Work，以及显式定义 IUnitOfWork 的三个价值（解耦、事务边界、事件集成）",
+        "能描述领域事件的产生（聚合根方法）、收集（ChangeTracker）和分层 dispatch（SaveChanges 前本地、后进程外）",
+        "能识别三个反模式：暴露 IQueryable、为每个表建 Repository、无意义的 DbContext 包装",
+        "能区分何时直接用 DbContext（简单 CRUD）、何时用 Repository + UoW（复杂领域、DDD、多团队）",
+        "能说明 CQRS 作为 Repository 模式的演进方向，读侧 AsNoTracking/Dapper，写侧 Repository + UoW",
+        "能解释乐观并发在 SaveChanges 中的工作机制（DbUpdateConcurrencyException）"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "dotnet.ef-core.repository-uow.recall.1",
-      "prompt": "请说明 仓储模式与工作单元 的核心机制、典型使用场景和常见坑。",
+      "prompt": "请说明 Repository 和 Unit of Work 模式在 EF Core 中的核心机制、与 DbContext 的关系、以及什么时候该用、什么时候不该用。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "dotnet.ef-core.repository-uow.recall.2",
-      "prompt": "在 DDD 中，什么是聚合根？为什么只有聚合根才有仓储？",
+      "prompt": "在 DDD 中，什么是聚合根？为什么只有聚合根才有仓储？领域事件如何与 Repository 和 Unit of Work 协作？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "dotnet.ef-core.repository-uow.recall.3",
-      "prompt": "仓储模式与工作单元 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "Repository 接口返回 IQueryable 有什么问题？除此之外还有哪些 Repository 模式的常见反模式？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.ef-core.repository-uow.recall.4",
+      "prompt": "EF Core 的 SaveChangesAsync 前后 dispatch 领域事件各适合什么场景？如果 dispatch 进程外事件失败了怎么处理？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.ef-core.repository-uow.recall.5",
+      "prompt": "如何在 Repository + UoW 架构中实现读写分离（CQRS）？读侧为什么可以不用 Repository？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -141,20 +184,22 @@
   ],
   "rubric": {
     "mustHave": [
-      "理解仓储模式的概念和实现",
-      "理解工作单元模式的作用",
-      "知道如何与 EF Core 结合",
-      "了解 DDD 的基本概念"
+      "能解释 Repository 是聚合根的持久化契约，不是 CRUD 包装，子实体通过聚合根导航访问",
+      "能说明 EF Core DbContext 天然是 Unit of Work，显式 IUnitOfWork 的价值在于解耦、事务边界和事件集成",
+      "能描述领域事件的产生、收集和分层 dispatch 机制",
+      "能识别暴露 IQueryable、为每个表建 Repository 等反模式"
     ],
     "goodToHave": [
-      "了解领域事件的实现",
-      "知道聚合根的设计原则",
-      "理解 CQRS 模式"
+      "能说明 CQRS 作为 Repository 模式的演进方向",
+      "能解释乐观并发与 SaveChanges 的协作机制",
+      "能区分 SaveChanges 前后 dispatch 领域事件的适用场景和失败处理"
     ],
     "commonMistakes": [
-      "只列出 EF Core、仓储模式、工作单元，但说不出触发条件、状态变化和验证证据",
-      "把「仓储模式与工作单元」的适用场景、失效条件和相邻概念混在一起",
-      "遇到.NET 工程里的真实问题时，不能说明「仓储模式与工作单元」应该观察哪些状态、日志或指标"
+      "把 Repository 当成 DbContext 的机械包装层，所有方法只是透传 DbSet 调用",
+      "为每个数据库表创建 Repository，而不是只为聚合根创建",
+      "Repository 方法返回 IQueryable，导致查询逻辑泄漏到领域层",
+      "在领域方法内部调用 SaveChangesAsync，把持久化时机耦合到领域逻辑",
+      "以为虚拟线程或新 .NET 版本就不需要 Repository 模式了——模式与 ORM 版本无关，与架构复杂度有关"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -167,6 +212,6 @@
     "dotnet.ef-core.basics"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「仓储模式与工作单元」说清理解仓储模式的概念和实现、理解工作单元模式的作用，并放到.NET 工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察是否能围绕 Repository 和 Unit of Work 说清其本质是聚合根的持久化契约而非 CRUD 包装、EF Core DbContext 与显式 UoW 的关系、领域事件的分层 dispatch 机制、反模式识别，以及在不同项目复杂度下的取舍判断。",
+  "updatedAt": "2026-06-22"
 }

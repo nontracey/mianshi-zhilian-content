@@ -4,7 +4,7 @@
   "category": "batch",
   "group": "batch",
   "title": "Spark Shuffle 原理与 AQE 优化",
-  "summary": "讲清 Hash/Sort Shuffle 演进、Shuffle Write/Read 路径、数据倾斜定位与 AQE 自适应执行的治理手段。",
+  "summary": "讲清 Hash/Sort Shuffle 演进与文件结构差异、Map 端攒数据-spill-归并的写入路径、Reduce 端 ShuffleBlockFetcherIterator 限流拉取与 External Shuffle Service 的角色、数据倾斜三层证据与两阶段 salting、AQE 三大能力及其 groupBy 倾斜边界。",
   "tags": [
     "数据工程",
     "Spark",
@@ -13,28 +13,43 @@
     "AQE"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 35,
+  "estimatedMinutes": 38,
   "order": 60,
   "recommendWeight": 82,
   "status": "staging",
   "prerequisites": [],
   "interviewFrequency": "medium",
-  "interviewerFocus": "重点考察是否能讲清 Sort Shuffle 的写入与拉取过程、数据倾斜的定位证据，以及 AQE 在 Spark 3.x 之后如何动态合并分区与拆分 skew。",
+  "interviewerFocus": "重点考察是否能讲清 Sort Shuffle 的写入与拉取过程、Bypass 和 Unsafe 分支的触发条件、数据倾斜的定位证据链，以及 AQE 在 Spark 3.x 之后如何动态合并分区与拆分 skew 及其 groupBy 倾斜边界。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Hash Shuffle 到 Sort Shuffle 的演进与 Map 端写入路径",
-      "content": "Spark 1.2 之前默认 Hash Shuffle：每个 Map Task 给每个 Reduce 分区单独开一个文件，M 个 Map × R 个 Reduce 会产生 M×R 个小文件，加上同时打开的 FileChannel，executor 容易在中等规模就把磁盘 inode 和文件句柄打爆。1.2 引入 Consolidate Hash Shuffle（同 core 复用文件），1.6 之后默认改为 Sort-Based Shuffle，Tungsten Sort 也并入同一套实现。\n\nSort Shuffle 的 Map 端写入路径是面试核心：每个 Map Task 用 PartitionedAppendOnlyMap（需要 map 端聚合）或 PartitionedPairBuffer（不聚合）在内存攒数据；超过 spark.shuffle.spill.numElementsForceSpillThreshold 或受内存压力触发 spill，按 (partitionId, key) 排序后写出多个 spill 文件，最后归并成两个文件——data 文件按分区顺序拼接、index 文件记录每个分区的起止偏移。一个 Map Task 最终只留 2 个文件，shuffle 文件数从 M×R 降到 2M，这是大集群能跑下来的关键。\n\n判断走哪条写入分支看 spark.shuffle.sort.bypassMergeThreshold：reduce 分区数 ≤ 阈值（默认 200）且不需要 map 端聚合时走 BypassMergeSortShuffleWriter，跳过排序直接按分区写再合并；其余走 SortShuffleWriter 或 UnsafeShuffleWriter（Tungsten 序列化后排序，省 GC）。"
+      "title": "Hash Shuffle 到 Sort Shuffle 的演进与文件数问题",
+      "content": "Spark 1.2 之前默认 Hash Shuffle：每个 Map Task 为每个 Reduce 分区单独写一个文件，M 个 Map × R 个 Reduce 产生 M×R 个小文件。同时打开的 FileChannel 数量是 M×R 级别，executor 的磁盘 inode 和文件句柄在中等集群规模就会被打爆，这是 Hash Shuffle 被淘汰的根本原因。1.2 引入 Consolidate Hash Shuffle（同 core 复用文件，文件数降到 cores×R），但治标不治本。\n\n1.6 之后默认改为 Sort-Based Shuffle：每个 Map Task 最终只产生两个文件——data 文件按 partitionId 顺序拼接所有 reduce 分区的数据，index 文件记录每个分区在 data 文件中的起止偏移。Reduce 端拿到 mapId 后先读 index 定位偏移再 seek 到 data 文件读取，文件数从 M×R 降到 2M，executor 同时打开的文件句柄从 R 降到 2。这是大集群能跑 Shuffle 的关键设计。\n\nTungsten Sort（UnsafeShuffleWriter）并入同一套实现：用 Tungsten 的 off-heap 序列化格式攒数据，按 (partitionId, binaryPrefix) 排序避免反序列化，减少 GC 开销；要求序列化器支持 Relocation、单条记录不超过 128MB、不需要 map 端聚合。三个 Writer 分支的入口由 ShuffleManager 按条件分发。"
     },
     {
       "type": "explain",
-      "title": "Shuffle Read 拉取、External Shuffle Service 与失败放大",
-      "content": "Reduce 端读取由 ShuffleBlockFetcherIterator 驱动：driver 把每个 reduce 分区对应的 (BlockManagerId, blockId, size) 列表下发给 Task，Task 按 spark.reducer.maxSizeInFlight（默认 48MB）和 spark.reducer.maxBlocksInFlightPerAddress 控制并发，从远端 executor 走 Netty 拉块，本地块走磁盘直读。拉到的数据需要聚合走 ExternalAppendOnlyMap，需要排序走 ExternalSorter，超内存继续 spill 到磁盘。\n\nExternal Shuffle Service（spark.shuffle.service.enabled）是动态资源分配的前提：它是常驻在 NodeManager / Worker 上的独立进程，Map 阶段把 shuffle 文件写到本地磁盘后，由 Shuffle Service 代为响应 Reduce 端的拉取请求。这样即使产生 shuffle 的 executor 因为 dynamicAllocation 被释放，下游 reduce 仍然能拉到中间结果。\n\nShuffle 阶段的失败模式：FetchFailedException 表示远端 executor 挂了或文件丢了，DAGScheduler 会回退到上一个 ShuffleMapStage 重算，连环 retry 是 OOM 故障被放大成几十分钟跑不完的常见原因；ExecutorLost + shuffle file lost 会触发整个上游 Stage 重做；spark.shuffle.io.maxRetries / retryWait 决定网络抖动时的重试窗口。看到一个 Stage 反复 retry，应先翻 executor 日志找 OOM 或 GC，再看 Shuffle Service 日志，最后才考虑加资源。"
+      "title": "Map 端写入路径：攒数据、spill、归并、Bypass 分支",
+      "content": "SortShuffleWriter 的写入路径：Map Task 选择 PartitionedAppendOnlyMap（需要 map 端聚合，如 reduceByKey）或 PartitionedPairBuffer（不需要聚合）作为内存缓冲区，按 (partitionId, key) 插入。内存压力触发 spill 时（spark.shuffle.spill.numElementsForceSpillThreshold 或 TaskMemoryManager 的申请失败），按 (partitionId, key) 排序后写成一个 spill 文件。Map Task 结束前把所有 spill 文件和剩余内存数据做归并排序，按分区顺序依次写出 data 文件，同时构建 index 文件记录每个分区的偏移。\n\nBypassMergeSortShuffleWriter 的触发条件是：reduce 分区数 ≤ spark.shuffle.sort.bypassMergeThreshold（默认 200）且不需要 map 端聚合。它跳过排序，直接为每个 reduce 分区写一个临时文件，最后合并成 data+index。分区少时排序开销是纯浪费，Bypass 直接合并更高效。但分区数一超过阈值就会退回 SortShuffleWriter，阈值不要乱调——调大后合并文件数增多，合并本身的 IO 和 seek 开销反而比排序更大。\n\nUnsafeShuffleWriter 走 Tungsten 路径：数据序列化成固定格式的二进制记录后按 (partitionId, prefix) 排序，spill 时直接写二进制流，避免 GC。触发条件严格：Serializer 支持 Relocation、单条不超 128MB、无 map 端聚合；不满足就退回 SortShuffleWriter。"
     },
     {
       "type": "explain",
-      "title": "数据倾斜的证据链与 AQE 的自适应治理",
-      "content": "数据倾斜判定要给三层证据：第一，Spark UI 里 Stage 的 Tasks 表按 Shuffle Read Size / Records 排序，max 是 median 的 5 倍以上；第二，Summary Metrics 中 Shuffle Spill (Memory/Disk) 的 max 远超 75% 分位；第三，把卡死的几个 task 单独抓出来，用 df.groupBy(key).count().orderBy(desc).show() 复算 key 分布。三条对上才是 skew，否则可能只是分区数太少或 GC 拖慢。\n\nSpark 3.0 之前主要靠手工治理：调 spark.sql.shuffle.partitions（默认 200，大表通常拉到 1000~4000）、对 skew key 做 salting（key 拼随机后缀打散，再二次聚合）、广播小表（spark.sql.autoBroadcastJoinThreshold 默认 10MB）、把 skew 单独 union 处理。这些都需要事先知道哪个 key 倾斜，调试成本高。\n\nSpark 3.x 默认开启的 AQE（spark.sql.adaptive.enabled=true）把这三件事自动化：(1) Coalesce Partitions 在每个 shuffle stage 完成后根据实际分区大小动态合并小分区，避免几千个空 task 调度开销；(2) Skew Join 处理（spark.sql.adaptive.skewJoin.enabled）检测到某分区大小超过 skewedPartitionFactor (默认 5) × median 且超过 skewedPartitionThresholdInBytes（默认 256MB）时，自动把大分区切成多个 sub-partition，对应小表那一侧做复制 join，相当于自动 salting；(3) 动态切换 Join 策略，运行期发现一侧 shuffle 后真实大小小于广播阈值时，把 SortMergeJoin 自动改成 BroadcastHashJoin。AQE 不是银弹，groupBy 单 key 聚合倾斜依然要手工 salting，因为 Skew Join 只处理 join 不处理聚合。"
+      "title": "Shuffle Read 拉取、限流与 External Shuffle Service",
+      "content": "Reduce 端读取由 ShuffleBlockFetcherIterator 驱动：driver 汇总每个 reduce 分区对应的 (BlockManagerId, blockId, size) 列表下发给 Task。Task 按 spark.reducer.maxSizeInFlight（默认 48MB）和 spark.reducer.maxBlocksInFlightPerAddress（默认 3）控制并发，本地块走磁盘直读，远端块走 Netty 拉取。maxSizeInFlight 限制的是每个 in-flight 请求的总字节数，防止网卡被打满或接收端 OOM。拉到的数据需要聚合走 ExternalAppendOnlyMap，需要排序走 ExternalSorter，超内存继续 spill。\n\nExternal Shuffle Service（spark.shuffle.service.enabled）是独立于 executor 的常驻进程，部署在 NodeManager 或 Worker 上，代为响应 reduce 端对 shuffle 文件的拉取请求。它解决的核心问题是：dynamicAllocation 开启后空闲 executor 会被回收，如果 shuffle 文件在 executor 本地，executor 一释放 reduce 就拉不到了。开了 Shuffle Service，executor 释放后文件仍可被消费，所以 Shuffle Service 是动态资源分配的硬前提。没开它就开 dynamicAllocation，必然 FetchFailed。\n\nShuffle Service 本身的稳定性也值得注意：YARN 模式下它运行在 NodeManager 进程内，NM GC 或 OOM 会影响所有该节点的 shuffle 文件读取。K8s 模式下通常用独立 Pod 部署。"
+    },
+    {
+      "type": "explain",
+      "title": "FetchFailed 的排查顺序与失败放大",
+      "content": "FetchFailedException 是 reduce 端拉不到上游 shuffle 文件时抛出的异常，DAGScheduler 收到后会把上游 ShuffleMapStage 标记为 pending 并重算。重算意味着上游 stage 的所有 task 重新执行，如果上游 task 本身有 OOM 或数据膨胀，重算也会失败，形成连环 retry——这就是 OOM 故障被放大成几十分钟跑不完的常见机制。\n\n排查顺序要固定：(1) 看丢文件的 executor 是否存活。executor lost + shuffle file lost 通常是 OOM 被 YARN/K8s kill，翻 executor stderr 找 \"Container killed by YARN for exceeding memory\" 或 GC overhead limit exceeded；(2) executor 存活但文件还在：看 Shuffle Service 日志，NM 的 GC 或进程异常会导致拉取超时；(3) 网络抖动：spark.shuffle.io.maxRetries（默认 3）和 spark.shuffle.io.retryWait（默认 5s）控制重试窗口，跨机房或网络不稳时调大；(4) 如果上游 stage 反复重算才成功，说明 OOM 未必在当前 stage，要回去看上游 task 的 Shuffle Write Size 和内存曲线，找数据膨胀点。加资源只是兜底，根因通常是数据膨胀或配置不合理。"
+    },
+    {
+      "type": "explain",
+      "title": "数据倾斜的三层证据与手工治理",
+      "content": "判定数据倾斜要给三条证据对齐，缺一不可：(1) Spark UI 的 Stage Tasks 表，按 Shuffle Read Size 或 Records 排序，如果 max 是 median 的 5 倍以上高度可疑；(2) Summary Metrics 中 Shuffle Spill (Memory) 和 Shuffle Spill (Disk) 的 max 远超 75% 分位，说明个别 task 内存压力极大；(3) 用代码复算 key 分布：df.groupBy(key).count().orderBy(desc).show()，前几个 key 占总量的绝大多数。三条对齐才能确认是 skew，否则可能只是分区数太少或个别 task GC 拖慢。\n\n3.0 之前的手工治理手段：(1) 调大 spark.sql.shuffle.partitions（默认 200，大表通常拉到 1000~4000），但调太大空 task 调度开销也不小；(2) 对 skew key 做 salting——key 拼随机后缀打散到 N 个 reduce 分区，先做局部聚合再二次合并；(3) 广播小表让 join 端变成 BroadcastHashJoin，避免 shuffle；(4) 把 skew key 单独过滤出来 union 处理。这些方法都需要事先知道哪个 key 倾斜，调试成本高，业务变更后可能失效。"
+    },
+    {
+      "type": "explain",
+      "title": "AQE 三大能力及其 groupBy 倾斜边界",
+      "content": "Spark 3.0 引入 AQE（spark.sql.adaptive.enabled，默认从 3.2 开始 true），核心思路是每个 Shuffle Stage 完成后根据实际输出数据量做运行期调整。\n\n(1) Coalesce Partitions（spark.sql.adaptive.coalescePartitions.enabled）：每个 shuffle stage 完成后，按目标分区大小（spark.sql.adaptive.advisoryPartitionSizeInBytes，默认 64MB）合并连续的小分区。解决的痛点是 shuffle.partitions 设太大导致几千个空或极小的 task，调度和序列化开销白白吃掉资源。Coalesce 后实际 task 数和数据量匹配。\n\n(2) Skew Join 处理（spark.sql.adaptive.skewJoin.enabled）：join 两侧 shuffle 完成后，检测某 reduce 分区是否同时满足 size > skewedPartitionFactor（默认 5）× median 和 size > skewedPartitionThresholdInBytes（默认 256MB），命中则把该分区切成 N 个 sub-partition（N = size / advisoryPartitionSizeInBytes），对应小表那一侧的分区复制 N 份分别 join，结果再 union。相当于自动 salting，但只在 join 场景生效。\n\n(3) 动态切换 Join 策略：SortMergeJoin 在运行期发现一侧 shuffle 后实际数据量小于 autoBroadcastJoinThreshold 时，自动切成 BroadcastHashJoin，省掉一侧的 shuffle 和排序。\n\n关键边界：AQE 的 Skew Join 只处理 join，不处理 groupBy 单 key 聚合倾斜。因为 groupBy 的语义要求相同 key 必须由同一个 task 计算最终结果，切分后聚合结果会错。聚合 skew 仍然只能靠两阶段 salting：先按 (key, salt) 聚合出 partial 结果，再去 salt 合并，且只支持可结合函数（sum/count/max，不支持 avg）。"
     },
     {
       "type": "diagram",
@@ -57,50 +72,7 @@
     {
       "type": "compareTable",
       "title": "Hash Shuffle、Sort Shuffle、Bypass Merge 与 AQE 对比",
-      "columns": [
-        "维度",
-        "Hash Shuffle (1.2 前)",
-        "Sort Shuffle (1.6+ 默认)",
-        "BypassMergeSortShuffle",
-        "AQE 自适应 (3.0+)"
-      ],
-      "rows": [
-        [
-          "文件数量",
-          "M×R, 容易打爆 inode",
-          "2M (data+index)",
-          "R 个临时 + 1 个合并",
-          "运行期合并空分区, 实际更少"
-        ],
-        [
-          "是否排序",
-          "不排序",
-          "按 (partition,key) 排序",
-          "不排序, 直接按分区写",
-          "在 Sort Shuffle 之上, 不改写入"
-        ],
-        [
-          "触发条件",
-          "spark.shuffle.manager=hash",
-          "默认",
-          "reduce 分区 ≤ bypassMergeThreshold 且无 map 端聚合",
-          "spark.sql.adaptive.enabled=true"
-        ],
-        [
-          "解决的核心问题",
-          "无 (问题本身)",
-          "降低小文件数, 支持大集群",
-          "省排序开销, 适合分区少的场景",
-          "动态合并空分区 + skew join 切分 + 切换 broadcast"
-        ],
-        [
-          "典型坑",
-          "executor 文件句柄耗尽",
-          "spill 多时磁盘 IO 高",
-          "分区一多就退化, 阈值不能乱调",
-          "聚合倾斜 (groupBy) 处理不了, 仍需手工 salting"
-        ]
-      ]
+      "content": "| 维度 | Hash Shuffle (1.2 前) | Sort Shuffle (1.6+ 默认) | BypassMergeSortShuffle | AQE 自适应 (3.0+) |\n| --- | --- | --- | --- | --- |\n| 文件数量 | M×R，打爆 inode 和句柄 | 2M（data+index） | R 个临时 + 1 个合并文件 | 不改写入，运行期合并空分区后实际 task 更少 |\n| 是否排序 | 不排序 | 按 (partitionId, key) 排序 | 不排序，直接按分区写再合并 | 在 Sort Shuffle 基础上，不改写入逻辑 |\n| 触发条件 | spark.shuffle.manager=hash | 默认 Writer | reduce 分区 ≤ 200 且无 map 端聚合 | spark.sql.adaptive.enabled=true |\n| 解决的核心问题 | 无（问题本身） | 降低文件数到 2M，支持大集群 | 省排序开销，分区少时更高效 | 合并空分区 + skew join 切分 + 运行期切 broadcast |\n| 典型坑 | executor 文件句柄耗尽，中等集群就跑不了 | spill 多时磁盘 IO 高，需关注 spill 指标 | 分区数一超过阈值就退化，阈值调大合并开销反而更大 | groupBy 聚合倾斜处理不了，仍需手工 salting |\n| 内存缓冲 | 无特殊优化 | PartitionedAppendOnlyMap / PairBuffer | 无排序缓冲 | 不涉及写入阶段 |\n| GC 优化 | 无 | UnsafeShuffleWriter 走 Tungsten off-heap | 无 | 不涉及写入阶段 |"
     },
     {
       "type": "code",
@@ -110,38 +82,42 @@
       "highlights": [
         {
           "line": 3,
-          "note": "用 groupBy(key).count().orderBy(desc) 是判断倾斜最直接的证据, 比只看 Spark UI 多一层确认"
+          "note": "groupBy(key).count().orderBy(desc) 是判断倾斜最直接的证据，比只看 Spark UI 多一层数据确认"
         },
         {
           "line": 11,
-          "note": "salt 桶数 N 要看 max/median 比值, 太小打散不开, 太大反而增加二次聚合开销"
+          "note": "salt 桶数 N 要参考 max/median 比值，太小打散不开，太大增加二次聚合开销和 task 数"
         },
         {
           "line": 15,
-          "note": "两阶段聚合的关键: 第一阶段产生 partial_sum, 第二阶段必须用可结合函数 (sum/count/max), avg 不能这么拆"
+          "note": "两阶段聚合的关键：第二阶段必须用可结合函数（sum/count/max），avg 不能这样拆分"
         },
         {
           "line": 28,
-          "note": "skewedPartitionFactor 默认 5, 业务数据更不均时降到 3, 让 AQE 更激进地切分大分区"
+          "note": "skewedPartitionFactor 默认 5，业务数据更不均时降到 3 让 AQE 更激进地切分大分区"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "Spark Shuffle 我会分三层讲。\n\n机制要点：\n- 第一层是写入演进：1.2 之前的 Hash Shuffle 会产生 M×R 个文件，executor 文件句柄很容易爆；1.6 之后默认 Sort Shuffle，Map Task 用 PartitionedAppendOnlyMap 攒数据，超内存 spill 排序，最后归并成 data + index 两个文件，shuffle 文件数降到 2M。reduce 分区不多且无 map 端聚合时还会走 BypassMergeSortShuffleWriter 跳过排序。\n- 第二层是 Shuffle Read 和稳定性：Reduce 端 ShuffleBlockFetcherIterator 按 maxSizeInFlight=48MB 限流从 Netty 拉块，External Shuffle Service 是动态资源分配的前提，让 executor 释放后中间结果仍能被消费。FetchFailedException 会触发上游 ShuffleMapStage 重算，连环 retry 多半是 OOM 被放大，排查顺序是 executor 日志、Shuffle Service 日志、网络，最后才是加资源。\n- 第三层是数据倾斜与 AQE：判定倾斜要看 Stage Tasks 的 Shuffle Read max/median 比值、Spill 分布，再用 groupBy(key).count() 复算。3.0 之前靠 salting、调 shuffle.partitions、广播小表手工治理；3.0 之后 AQE 自动做三件事——合并空分区、把 join 端大于 skewedPartitionFactor×median 的分区切开复制 join、运行期把 SortMergeJoin 切成 BroadcastHashJoin。AQE 解决不了 groupBy 单 key 聚合倾斜，那种还是得两阶段 salting。",
+      "content": "Spark Shuffle 我会分四层讲：写入机制、读取与稳定性、数据倾斜判定、AQE 自适应。\n\n**第一层：写入机制（Hash → Sort 的演进）**\n- Hash Shuffle 每个 Map Task 给每个 Reduce 分区写一个文件，M×R 个文件打爆 inode 和句柄\n- Sort Shuffle 把同 Map 的所有分区合并成 data+index 两个文件，文件数从 M×R 降到 2M\n- Map 端用 PartitionedAppendOnlyMap（聚合）或 PairBuffer（不聚合）攒数据，超内存 spill 排序后归并\n- BypassMergeSortShuffleWriter：reduce 分区 ≤ 200 且无 map 端聚合时跳过排序直接合并\n- UnsafeShuffleWriter（Tungsten）：序列化后排序，避免反序列化和 GC，但要求严格\n\n**第二层：读取与稳定性**\n- ShuffleBlockFetcherIterator 按 maxSizeInFlight=48MB 限流从 Netty 拉块\n- External Shuffle Service 是动态资源分配的硬前提，executor 释放后 shuffle 文件仍可读\n- FetchFailedException 触发上游 ShuffleMapStage 重算，连环 retry 多半是 OOM 被放大\n\n**第三层：数据倾斜判定**\n- 三层证据：Spark UI 的 task max/median 比值、Spill 的 max vs 75% 分位、groupBy(key).count() 复算\n- 手工治理：调 shuffle.partitions、salting、广播小表、skew key 单独处理\n\n**第四层：AQE 三大能力**\n- Coalesce Partitions：合并空分区，省调度开销\n- Skew Join：切分大分区 + 复制小表，自动 salting join\n- 动态切 Broadcast：运行期 SortMergeJoin → BroadcastHashJoin\n- 关键边界：AQE 处理不了 groupBy 单 key 聚合倾斜，仍需两阶段 salting（只能用可结合函数）",
       "followUpQuestions": [
         {
-          "question": "Sort Shuffle 的 Map Task 最终只生成两个文件，data 和 index 各起什么作用？为什么这样设计能比 Hash Shuffle 省一个数量级的文件数？",
-          "answer": "data 文件按 partitionId 顺序拼接所有 reduce 分区的数据，index 文件记录每个分区在 data 文件中的起止偏移。Reduce 端拿到 (blockManagerId, mapId, reduceId) 后，先读 index 定位偏移，再 seek 到 data 文件对应位置读出该分区的数据。Hash Shuffle 是 M×R 个文件因为每个 (map, reduce) 对都要单独一个；Sort Shuffle 把同一个 Map 的所有 reduce 分区合并到一个 data 文件，文件数从 M×R 降到 2M，executor 同时打开的文件句柄也从 R 个降到 2 个，大集群才扛得住。"
+          "question": "Sort Shuffle 的 data 文件和 index 文件分别起什么作用？为什么这种设计能把文件数从 M×R 降到 2M？",
+          "answer": "data 文件按 partitionId 顺序拼接同一个 Map Task 写给所有 reduce 分区的数据；index 文件记录每个分区在 data 文件中的起止偏移。Reduce 端先读 index 定位偏移，再 seek 到 data 文件读对应分区。Hash Shuffle 为每个 (map, reduce) 对开独立文件，所以 M×R；Sort Shuffle 把同一 Map 的所有 reduce 分区合并到一个 data 文件，文件数变成 2M（M 个 data + M 个 index），executor 同时打开的文件句柄也从 R 降到 2。"
         },
         {
-          "question": "AQE 的 Skew Join 优化具体怎么切分 skew 分区？为什么聚合倾斜（groupBy 单 key）AQE 处理不了？",
-          "answer": "Skew Join 的判定是某 reduce 分区 size > skewedPartitionFactor (默认 5) × median 且 > skewedPartitionThresholdInBytes (默认 256MB)。命中后把这个大分区切成 N 个 sub-partition，对小表那一侧的对应分区复制 N 份，让 N 个 sub-partition 分别和复制后的小表做 join，结果再 union。聚合倾斜处理不了是因为 groupBy 一旦 key 落到同一 reduce 分区，必须由同一个 task 处理才能算出 sum/count，AQE 切分了大分区后聚合结果就是错的，所以聚合 skew 只能靠 salting 做两阶段聚合，先按 (key, salt) 部分聚合再合并。"
+          "question": "AQE 的 Skew Join 具体怎么切分大分区？为什么 groupBy 单 key 倾斜它处理不了？",
+          "answer": "Skew Join 判定条件是分区 size > skewedPartitionFactor (默认 5) × median 且 > skewedPartitionThresholdInBytes (默认 256MB)。命中后把该大分区切成 N = size / advisoryPartitionSizeInBytes 个 sub-partition，小表对应分区复制 N 份分别 join 再 union。groupBy 处理不了是因为聚合要求相同 key 必须由同一个 task 计算最终结果，切分后同一个 key 分散到多个 sub-task，聚合结果就错了。聚合 skew 只能靠 salting：先按 (key, salt) 部分聚合，再去 salt 合并，且只能用 sum/count/max 等可结合函数。"
         },
         {
-          "question": "线上 Spark 任务一个 Stage 反复 FetchFailed 重试，应该怎么排查？",
-          "answer": "FetchFailed 表示 reduce 端拉不到上游 shuffle 文件。排查顺序：(1) 看丢文件的 executor 是否还在，executor lost + shuffle file lost 通常是 OOM 被 YARN/K8s kill，看 executor stderr 里的 GC overhead 或 Container killed by YARN for exceeding memory；(2) 没开 External Shuffle Service 时 executor 一释放 shuffle 文件就丢，开启后 Shuffle Service 进程异常也会导致拉取失败，要看 NodeManager 日志；(3) spark.shuffle.io.maxRetries 和 retryWait 控制网络抖动重试，机房间链路不稳时要调大；(4) 上游 Stage 反复重算说明问题可能不是 shuffle 本身，而是 OOM 引发的连锁失败，要回去看上游 task 的内存曲线和数据膨胀点，加内存只是兜底。"
+          "question": "线上 Spark 任务一个 Stage 反复 FetchFailed 重试，最后整体跑了几十分钟，排查顺序是什么？",
+          "answer": "(1) 看丢文件的 executor 是否存活：executor lost + shuffle file lost 通常是 OOM 被 kill，翻 stderr 找 Container killed 或 GC overhead；(2) executor 存活但文件丢了：看 Shuffle Service 日志，NM 的 GC 或进程异常会导致拉取超时；(3) 网络：spark.shuffle.io.maxRetries 和 retryWait 控制重试，跨机房时调大；(4) 上游 stage 反复重算：看上游 task 的 Shuffle Write Size 和内存曲线找数据膨胀点。加资源是兜底，根因通常是 OOM 或数据膨胀引发的连锁重试。"
+        },
+        {
+          "question": "BypassMergeSortShuffleWriter 的触发条件是什么？为什么不把阈值调大让它适用于更多场景？",
+          "answer": "触发条件是 reduce 分区数 ≤ bypassMergeThreshold（默认 200）且不需要 map 端聚合。它跳过排序直接为每个 reduce 分区写临时文件后合并。阈值调大后虽然省了排序，但需要同时打开 R 个文件写入，R 很大时文件句柄和 IO seek 开销反而比排序更大，退化回 Hash Shuffle 的问题。所以 200 是个经验值，分区少时 Bypass 更快，分区多时排序归并更划算。"
         }
       ]
     },
@@ -150,25 +126,27 @@
       "title": "面试自检清单",
       "items": [
         "能讲清 Hash Shuffle 的 M×R 文件数问题，以及 Sort Shuffle 用 data+index 把它降到 2M 的机制",
-        "能描述 Map 端 PartitionedAppendOnlyMap/PartitionedPairBuffer 的 spill、归并过程，以及 Bypass 的触发条件 (reduce 分区 ≤ bypassMergeThreshold 且无 map 端聚合)",
-        "能解释 ShuffleBlockFetcherIterator 用 maxSizeInFlight=48MB 限流，以及 External Shuffle Service 是动态资源分配的前提",
-        "能给出数据倾斜的三层证据：Spark UI 的 task max/median、Spill 分布、groupBy(key).count() 复算",
-        "能区分 AQE Coalesce/SkewJoin/动态切 Broadcast 三个能力，以及 AQE 处理不了 groupBy 聚合倾斜的边界",
-        "能说明 FetchFailedException 的排查顺序：executor OOM → Shuffle Service → 网络 → 资源"
+        "能描述 Map 端 PartitionedAppendOnlyMap/PartitionedPairBuffer 的攒数据、spill 排序、归并写入路径",
+        "能说出 BypassMergeSortShuffleWriter 的触发条件（reduce 分区 ≤ 200 且无 map 端聚合）及 UnsafeShuffleWriter 的限制",
+        "能解释 ShuffleBlockFetcherIterator 的 maxSizeInFlight=48MB 限流机制和 External Shuffle Service 是动态资源分配的前提",
+        "能给出数据倾斜的三层证据：UI task max/median 比值、Spill 分位差、groupBy(key).count() 复算",
+        "能区分 AQE 的 Coalesce Partitions、Skew Join、动态切 Broadcast 三个能力，以及 groupBy 聚合倾斜处理不了的边界",
+        "能说明 FetchFailedException 的排查顺序：executor OOM → Shuffle Service → 网络 → 上游数据膨胀",
+        "能用两阶段 salting 解决 groupBy 倾斜，并指出只能用可结合函数（不能用 avg）"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "data-engineering.batch.spark-shuffle.recall.1",
-      "prompt": "Hash Shuffle 和 Sort Shuffle 在文件结构上有什么本质区别？为什么 Spark 1.6 之后默认改成 Sort Shuffle？BypassMergeSortShuffleWriter 又是在什么条件下被触发的？",
+      "prompt": "Hash Shuffle 和 Sort Shuffle 在文件结构上有什么本质区别？Sort Shuffle 的 data 和 index 文件分别起什么作用？BypassMergeSortShuffleWriter 在什么条件下被触发？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "data-engineering.batch.spark-shuffle.recall.2",
-      "prompt": "你怎么判断一个 Spark Stage 是数据倾斜而不是单纯并行度不够？请给出至少 3 条具体证据，以及对应的 Spark UI 指标。",
+      "prompt": "你怎么判断一个 Spark Stage 是数据倾斜而不是单纯并行度不够或 GC 拖慢？请给出至少 3 条具体证据，以及对应的 Spark UI 指标。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
@@ -186,25 +164,32 @@
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 5
+    },
+    {
+      "id": "data-engineering.batch.spark-shuffle.recall.5",
+      "prompt": "External Shuffle Service 和动态资源分配之间是什么关系？没有 Shuffle Service 就开 dynamicAllocation 会导致什么问题？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
       "讲清 Hash Shuffle 的 M×R 文件数问题，以及 Sort Shuffle 用 data+index 文件降到 2M 的机制",
       "说出 Map 端 PartitionedAppendOnlyMap 攒数据—spill 排序—归并的写入路径，以及 Bypass 的触发条件",
-      "描述 Reduce 端 ShuffleBlockFetcherIterator 限流拉取与 External Shuffle Service 在动态资源分配中的作用",
+      "描述 Reduce 端 ShuffleBlockFetcherIterator 限流拉取与 External Shuffle Service 在动态资源分配中的前提作用",
       "给出数据倾斜的三层证据：UI task max/median 比值、Spill 分布、groupBy(key).count() 复算",
-      "区分 AQE 的 Coalesce Partitions、Skew Join、动态切 Broadcast 三种能力以及它们解决的痛点"
+      "区分 AQE 的 Coalesce Partitions、Skew Join、动态切 Broadcast 三种能力以及 groupBy 聚合倾斜处理不了的边界"
     ],
     "goodToHave": [
-      "能解释 SortShuffleWriter / UnsafeShuffleWriter / BypassMergeSortShuffleWriter 三条分支的选择逻辑",
+      "能解释 SortShuffleWriter / UnsafeShuffleWriter / BypassMergeSortShuffleWriter 三条分支的选择逻辑与触发条件",
       "能说出 spark.reducer.maxSizeInFlight、bypassMergeThreshold、skewedPartitionFactor 等关键参数的默认值与调优思路",
       "能用两阶段 salting (rand salt + 局部聚合 + 二次聚合) 解决 groupBy 单 key 倾斜，并指出只能用可结合函数",
       "能在 FetchFailedException 排查中区分 executor OOM、Shuffle Service 异常、网络抖动三类根因"
     ],
     "commonMistakes": [
       "把所有慢任务都归因为资源不足，忽略 max/median 比值与 Spill 分布证据",
-      "广播小表只看 spark.sql.autoBroadcastJoinThreshold，不看压缩后展开大小，导致 executor OOM",
+      "广播小表只看 autoBroadcastJoinThreshold 默认值，不看压缩后展开大小，导致 executor OOM",
       "salting 时第二阶段误用 avg 等不可结合函数，让两阶段聚合结果错误",
       "把 AQE 当万能开关，没意识到 groupBy 单 key 聚合倾斜 Skew Join 处理不了",
       "动态资源分配开了但没启用 External Shuffle Service，executor 释放后必然 FetchFailed"
@@ -216,5 +201,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

@@ -4,7 +4,7 @@
   "category": "foundation",
   "group": "foundation",
   "title": "ETL 与 ELT 数据加工",
-  "summary": "对比 ETL/ELT 转换位置差异，讲清全量/增量/CDC 入仓策略与 DataX、Sqoop、Flink CDC 工具选型。",
+  "summary": "对比 ETL/ELT 转换位置差异及其对算力归属、原始数据保留和 Schema 治理的影响，讲清全量/增量/CDC 三种入仓策略的适用场景、源端压力和 delete 捕获能力，结合 DataX、Sqoop、Flink CDC、Canal 的工具选型与 CDC 链路的幂等、binlog 过期、upsert 等生产边界。",
   "tags": [
     "数据工程",
     "ETL",
@@ -15,7 +15,7 @@
     "Sqoop"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 22,
   "order": 30,
   "recommendWeight": 90,
   "status": "draft",
@@ -26,7 +26,13 @@
     {
       "type": "explain",
       "title": "ETL 与 ELT 的本质差别：转换发生在源端还是仓内",
-      "content": "ETL（Extract-Transform-Load）在抽取出来后、写入目标库之前，由独立 ETL 引擎（Kettle、Informatica、DataStage、Spark Job）完成 join、清洗、维度查找等转换，最终只把结果表写入目标。ELT（Extract-Load-Transform）则先把原始数据原样落到湖仓的 ODS/raw 层，再由仓库自己的 SQL 引擎（Snowflake、BigQuery、Hive、Doris、StarRocks）做转换。\n\n核心差别有三条：\n\n- **算力位置**：ETL 吃 ETL 集群的 CPU/内存，受限于服务器规模；ELT 把转换下推到数仓，可借 MPP 和列存按需弹性扩。\n- **是否保留原始数据**：ETL 的中间状态通常落在临时表，覆盖即丢失；ELT 必须保留 ODS 原始层，下游模型出错可以从 ODS 重算而不重新抽源库。\n- **Schema 治理**：ETL 在写入前已经强制 schema 对齐，下游表结构稳定；ELT 在原始层允许 schema drift，需要在 stg/dwd 转换层显式处理新增字段。\n\n选型口径：源系统弱（业务库怕全表扫描）、目标平台计算弱、合规要求转换前脱敏 → 选 ETL；目标是云数仓/湖仓、需要保留原始数据用于重算或审计、SQL 团队比 Java/Spark 团队强 → 选 ELT。"
+      "content": "ETL（Extract-Transform-Load）在抽取出来后、写入目标库之前，由独立 ETL 引擎（Kettle、Informatica、DataStage、Spark Job）完成 join、清洗、维度查找等转换，最终只把结果表写入目标。ELT（Extract-Load-Transform）则先把原始数据原样落到湖仓的 ODS/raw 层，再由仓库自己的 SQL 引擎（Snowflake、BigQuery、Hive、Doris、StarRocks）做转换。\n\n核心差别有三条：\n\n- **算力位置**：ETL 吃 ETL 集群的 CPU/内存，受限于服务器规模；ELT 把转换下推到数仓，可借 MPP 和列存按需弹性扩。\n- **是否保留原始数据**：ETL 的中间状态通常落在临时表，覆盖即丢失；ELT 必须保留 ODS 原始层，下游模型出错可以从 ODS 重算而不重新抽源库。\n- **Schema 治理**：ETL 在写入前已经强制 schema 对齐，下游表结构稳定；ELT 在原始层允许 schema drift，需要在 stg/dwd 转换层显式处理新增字段。\n\n选型口径：源系统弱（业务库怕全表扫描）、目标平台计算弱、合规要求转换前脱敏 → 选 ETL；目标是云数仓/湖仓、需要保留原始数据用于重算或审计、SQL 团队比 Java/Spark 团队强 → 选 ELT。",
+      "items": [
+        "ETL 在外部转换引擎做清洗后再写目标，ELT 先落到 ODS 再用仓内 SQL 转换",
+        "算力归属不同：ETL 受限于 ETL 集群，ELT 下推到 MPP/列存弹性扩",
+        "ELT 必须保留 ODS 原始层，支持下游重算和审计回溯",
+        "ETL schema 在写入前强制对齐，ELT 允许原始层 schema drift 需显式处理"
+      ]
     },
     {
       "type": "explain",
@@ -59,7 +65,7 @@
           "并发 mapper 全表扫描，压力大",
           "分钟～小时级",
           "传统 Hadoop 生态 RDBMS→HDFS/Hive 批量导入",
-          "Apache 已停止维护（2021 退休），MR 启动慢，已被 DataX/Spark 取代"
+          "Apache 已停止维护（2021 退役），MR 启动慢，已被 DataX/Spark 取代"
         ],
         [
           "Canal",
@@ -114,14 +120,23 @@
           "note": "Flink CDC source 定义 MySQL binlog 消费"
         },
         {
-          "line": 19,
-          "note": "这里开始定义 Iceberg ODS 目标表，分区和主键会决定后续 upsert、快照回滚和下游查询的代价。"
+          "line": 15,
+          "note": "initial 模式让首次全量和后续 binlog 增量无缝衔接，无需手动切换"
+        },
+        {
+          "line": 16,
+          "note": "2.x 增量快照通过 chunk 分片读取避免全表锁，是与老版本的核心区别"
         },
         {
           "line": 26,
-          "note": "upsert 开关处理 update/delete 事件"
+          "note": "write.upsert.enabled=true 确保 update/delete 事件按主键 upsert，否则 update 会变新行"
         }
       ]
+    },
+    {
+      "type": "explain",
+      "title": "Flink CDC 2.x 增量快照机制与 binlog 过期的生产边界",
+      "content": "Flink CDC 1.x 的全量阶段会先执行 SELECT * 加锁读（FLUSH TABLES WITH READ LOCK），在大表上会阻塞业务写入。2.x 引入增量快照（incremental snapshot）：把表按主键拆成多个 chunk，并发读取，每个 chunk 内使用一致性快照（SELECT * FROM t WHERE id BETWEEN ? AND ?）；全量读取的同时 binlog 后台消费并缓冲；全量完成后切换到 binlog 位点继续增量。整个过程不加全局锁，业务几乎无感。\n\n但增量快照对 chunk 粒度敏感：chunk 太大，单片读取慢、checkpoint 间隔长；chunk 太小，元数据多、状态膨胀。生产上通常按表行数动态设置 chunk size（默认 8096 行），大表可以调到 4096 甚至更小。\n\nbinlog 过期是 CDC 链路最常见的翻车点。MySQL 默认 expire_logs_days=7，任务挂掉超过 7 天再重启，会报 binlog file not found，只能重做全量。生产做法：(1) binlog 保留期调到 14 天以上给容灾留余量；(2) 监控 binlog lag（Flink CDC source 端的 currentEmitEventTimeLag metric），超过阈值就告警；(3) 关键链路考虑 Kafka 二级缓冲，Kafka 保留期可设更长。\n\n另一个边界是 server-id 冲突：MySQL binlog 消费需要每个 slave 使用唯一的 server-id。Flink CDC 通过配置 'server-id' = '5400-5410' 分配一段 ID 范围给 TaskManager，多并发 reader 各占一个。如果和其他 Canal/Debezium 实例冲突，会出现 binlog 读取丢失或重复。生产必须全局登记 server-id 分配。"
     },
     {
       "type": "interviewAnswer",
@@ -150,7 +165,10 @@
         "能区分全量、增量、CDC 三种入仓策略的适用大小、对源库压力和 delete 捕获能力",
         "能在 DataX、Sqoop、Canal、Flink CDC 之间按延迟、源库压力、运维能力做选型",
         "能解释 Flink CDC 的 initial 模式如何把全量和 binlog 增量无缝衔接，主键和 server-id 为什么是必填",
-        "能说明 CDC 链路下游必须 upsert、binlog 过期会导致只能重做全量这两个生产边界"
+        "能说明 CDC 链路下游必须 upsert、binlog 过期会导致只能重做全量这两个生产边界",
+        "能解释 Flink CDC 2.x 增量快照通过 chunk 分片避免全局锁的机制",
+        "能说明覆盖写先写临时表再 rename 的原子切换、Schema drift 在 ODS 兼容落地在 DWD 显式处理的分层策略",
+        "能列出 CDC 链路的监控指标：binlog lag、行数对账、主键唯一性、reject/失败计数"
       ]
     }
   ],
@@ -175,6 +193,13 @@
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
+    },
+    {
+      "id": "data-engineering.foundation.etl-elt.recall.4",
+      "prompt": "线上 CDC 任务 binlog lag 持续上升、下游 Iceberg 表出现主键重复行，你怎么排查？最终改什么配置或换什么方案？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
     }
   ],
   "rubric": {
@@ -182,13 +207,14 @@
       "ETL 在外部转换、ELT 在仓内转换；ELT 必须保留 ODS 原始层用于重算",
       "全量/增量/CDC 三种策略的适用场景，以及只有 CDC 能捕获物理 delete",
       "DataX 适合离线异构批同步、Flink CDC 适合实时入湖、Canal 只覆盖 MySQL、Sqoop 已停止维护",
-      "CDC 链路必须声明主键并下游 upsert，否则 update/delete 事件会写错"
+      "CDC 链路必须声明主键并下游 upsert，否则 update/delete 事件会写错",
+      "Flink CDC 2.x 增量快照通过 chunk 分片避免全表锁，与 1.x 全局锁有本质区别"
     ],
     "goodToHave": [
-      "能说明 Flink CDC 2.x 增量快照如何避免老版本全局锁",
-      "能讲清 binlog 过期、server-id 冲突、schema drift 三类生产事故的处理",
+      "能讲清 binlog 过期（默认 7 天）、server-id 冲突、schema drift 三类生产事故的处理",
       "能解释覆盖写时先写临时表再 rename 的原子切换做法",
-      "能说出 Iceberg/Hudi 时间旅行对审计追溯的价值"
+      "能说出 Iceberg/Hudi 时间旅行对审计追溯的价值",
+      "能说明 Flink CDC chunk 粒度对 checkpoint 和状态的影响"
     ],
     "commonMistakes": [
       "把 ETL/ELT 简单总结成先转后转，忽略算力位置和原始数据保留两个真正差异",
@@ -204,5 +230,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

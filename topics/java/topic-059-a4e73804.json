@@ -4,26 +4,36 @@
   "category": "microservice",
   "group": "microservice",
   "title": "Gateway",
-  "summary": "讲清 Spring Cloud Gateway 的 Server WebFlux/Web MVC 形态、Route/Predicate/Filter 模型、转发链路、失败治理和容量边界。",
+  "summary": "讲清 Spring Cloud Gateway 的 Route/Predicate/Filter 模型、WebFlux 与 Web MVC 两种 Server 形态的线程差异、请求从进入到转发的完整链路、鉴权限流重试熔断的生产治理、路径改写的常见故障、以及网关层的容量边界。",
   "tags": [
     "Java",
     "微服务",
     "Gateway"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 44,
   "order": 30,
   "recommendWeight": 86,
   "learningCards": [
     {
       "type": "explain",
-      "title": "Gateway 的核心：路由匹配和过滤器链",
-      "content": "Spring Cloud Gateway 是 Spring Cloud 生态里的 API Gateway，负责把入口 HTTP 请求按规则转发到后端服务，同时承载横切能力：鉴权、限流、CORS、路径改写、灰度、观测、熔断、重试和响应头处理。\n\n**2026 口径要先分清产品形态**\n- Spring Cloud Gateway 当前稳定文档列出 5.0.2；它基于 Spring Framework 7、Spring Boot 4 和 Project Reactor。\n- Gateway 有两个主要 flavor：Server 和 Proxy Exchange。Server 是完整 API Gateway，可以独立运行或嵌入 Spring Boot 应用；Proxy Exchange 是在 WebFlux/MVC handler 方法里用 `ProxyExchange` 手动代理。\n- Server 又区分 WebFlux 和 Web MVC 兼容形态。老经验里“Gateway 只能是 WebFlux/Reactor Netty”的说法已经不完整；新内容要说清自己用的是 `spring-cloud-starter-gateway-server-webflux` 还是 `spring-cloud-starter-gateway-server-webmvc`。\n\n**核心模型**\n- `RouteDefinition`：一条路由的 id、目标 URI、Predicate 列表、Filter 列表、order 和 metadata。\n- Predicate：决定请求是否命中路由，常见有 Path、Host、Method、Header、Query、Cookie、RemoteAddr、Weight 等。\n- Filter：命中路由后进入过滤器链。GlobalFilter 作用于所有路由，GatewayFilter 作用于某条路由；pre 阶段处理请求，post 阶段处理响应。\n- 目标 URI：`lb://service-name` 走 Spring Cloud LoadBalancer 和服务发现；`http://`、`https://` 直连；`forward:` 可转发到本地 handler。\n\n**一次请求怎么走**\n1. 请求进入 Gateway，由 HandlerMapping/RoutePredicateHandlerMapping 查找 Route。\n2. Predicate 匹配失败，返回 404 或交给后续 handler；匹配成功后按顺序组装 GlobalFilter 和 route filter。\n3. pre filter 做鉴权、限流、StripPrefix、RewritePath、Header 改写、灰度标记、trace 注入等。\n4. 根据目标 URI 选择服务实例或固定地址，再由 WebFlux/Netty 或 MVC 代理机制转发。\n5. 后端响应回来后，post filter 处理响应头、日志、指标、异常映射，最后返回客户端。\n\n高阶回答不要把 Gateway 讲成“统一入口”四个字。要落到 Route、Predicate、Filter、target URI、LoadBalancer、失败路径和线程/内存边界。"
+      "title": "Gateway 的核心模型：Route、Predicate、Filter",
+      "content": "Spring Cloud Gateway 的设计不是「统一入口」四个字能概括的。它把「哪类请求走哪条路、路上做什么处理」拆成三个明确的概念：Route 定义目标和策略，Predicate 决定是否命中，Filter 在转发前后做横切处理。\n\n**RouteDefinition** 一条路由包含：id（唯一标识）、目标 URI（告诉网关转发到哪里）、Predicate 列表（决定这条路由是否匹配当前请求）、Filter 列表（命中后按序执行的处理链）、order（路由优先级）和 metadata（自定义扩展）。多条路由同时命中时，order 小的优先。\n\n**Predicate** 是路由匹配条件。Spring Cloud Gateway 内置了 Path、Host、Method、Header、Query、Cookie、RemoteAddr、Weight 等工厂。Path 匹配最常用，支持 Ant 风格和变量提取（如 `/orders/{id}`）；Weight 用于灰度分流，按权重把流量导到不同路由。多条 Predicate 之间是 AND 关系——全部满足才命中。\n\n**Filter** 分两层：GlobalFilter 作用于所有路由（例如 NettyRoutingFilter、LoadBalancerClientFilter、TraceFilter），GatewayFilter 仅作用于声明它的路由（例如 StripPrefix、RewritePath、AddRequestHeader）。每个 Filter 声明自己是 pre 还是 post：pre 在转发前执行（改请求、鉴权、限流），post 在响应返回后执行（改响应头、记录指标、异常映射）。Filter 通过 order 排序，同类 Filter 之间 order 决定先后。\n\n**目标 URI** 有三种写法：`lb://service-name` 走 Spring Cloud LoadBalancer + 服务发现，适合微服务内部调用；`http://` 或 `https://` 直连固定地址，适合外部服务或 CDN；`forward:/local-path` 转发到网关自身应用内的 handler，适合 BFF 聚合逻辑内置到网关的场景。lb 和 http 的超时、重试和指标维度要分开配置，不能混用。"
     },
     {
       "type": "explain",
-      "title": "生产治理：阻塞、限流、重试和可观测性",
-      "content": "**鉴权和限流要尽早拒绝**\n- 鉴权失败直接返回 401/403，避免把无效请求打到下游。\n- RequestRateLimiter 通常配合 RedisRateLimiter 或自定义 RateLimiter，key resolver 要明确维度，例如用户、租户、IP、clientId。没有稳定 key 的限流很容易误伤或失效。\n- 限流返回 429 时要打上 routeId、key、限流策略和网关实例标签，否则线上只能看到“网关拒绝”却定位不到原因。\n\n**重试和熔断要控制预算**\n- Retry 只适合幂等请求或明确可重放的调用，必须限制次数、状态码、方法和异常类型。\n- CircuitBreaker 适合隔离慢下游，fallback 要明确返回语义。读链路可以降级，写链路更多是快速失败、排队补偿或幂等重试。\n- 网关层重试会放大下游压力；如果服务端、客户端和网关都重试，实际请求数会成倍增长。\n\n**WebFlux 形态要关注阻塞代码**\n- WebFlux/Netty 形态下，过滤器里的阻塞调用会占用事件循环线程，可能造成全局尾延迟抬升。\n- 读取或修改请求体需要缓存 body，大请求、上传、聚合响应都要设置大小、超时和降级策略。\n- 需要调用外部鉴权中心时，优先用非阻塞客户端，或者隔离到专门线程池并设置超时。\n\n**路由和路径改写是常见故障源**\n- `StripPrefix`、`RewritePath`、context path、后端服务 base path 很容易叠加出错。\n- 多条路由同时命中时，order 决定优先级；灰度、权重路由和 Host/Path 组合要用测试用例覆盖。\n- 动态路由刷新后要确认缓存、Actuator 端点和配置中心事件是否同步。\n\n**观测要以 routeId 为核心**\n网关的日志、指标和 trace 都要带 routeId、目标 serviceId、状态码、耗时、异常类型、限流 key 和 fallback 标记。没有这些维度，排查 404、401、429、502、504 或慢调用时只能靠猜。"
+      "title": "请求链路：从进入到返回的每一步",
+      "content": "理解 Gateway 需要看到一次请求从进入到返回的完整路径，而不是只知道「有路由有过滤器」。\n\n**第一步：路由查找。** 请求进入 Gateway 后，由 `RoutePredicateHandlerMapping`（WebFlux 形态）或对应的 MVC handler mapping 遍历所有 RouteDefinition，逐条执行 Predicate。如果没有任何路由命中，返回 404。\n\n**第二步：过滤器链组装。** 命中路由后，Gateway 把该路由声明的 GatewayFilter 和全局 GlobalFilter 合并，按 order 排序，形成一条过滤器链。这条链在内存中是一个 FilterChain，pre 和 post 分别按正序和逆序执行。\n\n**第三步：pre 阶段处理。** 过滤器按序执行，典型操作包括：鉴权（校验 Token、JWT、API Key，失败直接返回 401/403）、限流（RequestRateLimiter 判断是否超阈值，超了返回 429）、路径改写（StripPrefix 去掉前缀、RewritePath 正则替换）、Header 注入（加 Authorization、X-Request-Id、X-Real-IP、灰度标记）、CORS 处理。pre 阶段越早拒绝无效请求，下游压力越小。\n\n**第四步：转发到后端。** 根据目标 URI 选择转发方式：`lb://` 走 LoadBalancer 选实例（配合 DiscoveryClient 从注册中心拉取实例列表），`http://` 直连地址，`forward:` 调本地。WebFlux 形态由 Netty HttpClient 发出请求，Web MVC 形态由 RestTemplate 或 WebClient 代理。连接超时、读超时、重试策略在这一步生效。\n\n**第五步：post 阶段处理。** 后端响应回来后，post filter 按逆序执行：处理响应头（去掉内部 Header、加 CORS Header）、记录指标（状态码、耗时、routeId）、写访问日志、异常映射（把 5xx 转成网关标准错误格式）。最后响应返回客户端。"
+    },
+    {
+      "type": "explain",
+      "title": "WebFlux 与 Web MVC 两种 Server 形态的差异",
+      "content": "Spring Cloud Gateway 从 4.x 开始同时提供 WebFlux 和 Web MVC 两种 Server 形态，选择不同形态会影响线程模型、Filter API 和阻塞风险。\n\n**WebFlux 形态**（starter：`spring-cloud-starter-gateway-server-webflux`）基于 Project Reactor 和 Reactor Netty。少量事件循环线程处理大量连接，Filter 实现 `GatewayFilter` 或 `GlobalFilter`，返回 `Mono<Void>`。这种形态吞吐高、内存占用低，但过滤器里**不能写阻塞代码**——一个阻塞调用（Redis、DB、外部鉴权 HTTP）会占住事件循环线程，其他请求全部排队，尾延迟被全局放大。需要阻塞时必须用 `Schedulers.boundedElastic()` 隔离或用非阻塞客户端。\n\n**Web MVC 形态**（starter：`spring-cloud-starter-gateway-server-webmvc`）基于 Spring MVC 和 Servlet 容器。请求由 Servlet 线程池处理，Filter 沿用 Spring MVC 的 `GatewayFilter` 接口。这种形态对传统 Servlet 开发者更熟悉，过滤器里可以直接写阻塞代码（线程阻塞只影响自己，不会拖垮其他连接），但线程数上限决定了并发能力，高并发下线程切换成本高。适合已有 Spring MVC 应用需要嵌入网关功能的渐进迁移场景。\n\n**怎么选：** 全新网关、高并发入口、过滤器以非阻塞为主 → WebFlux。已有 MVC 应用嵌入、过滤器含阻塞调用且并发不极端 → Web MVC。无论哪种形态，Route/Predicate/Filter 模型相同，区别在运行时线程和 Filter API。"
+    },
+    {
+      "type": "explain",
+      "title": "生产治理：限流、重试、熔断和可观测性",
+      "content": "网关层的治理能力不是越多越好，每一项都有成本和边界。\n\n**限流要尽早拒绝、维度要明确。** RequestRateLimiter 配合 RedisRateLimiter 或自定义实现，key resolver 决定限流维度——按用户 ID、租户、IP、clientId 还是路由。没有稳定 key 的限流要么误伤要么无效。限流返回 429 时必须带上 routeId、key、策略名称和网关实例标签，否则线上只能看到「网关拒绝」，定位不到是哪条路由、哪个租户、哪个窗口被限。\n\n**重试只对幂等请求有意义。** Retry Filter 限定：HTTP 方法（通常只 GET、HEAD）、状态码（如 502、503、504）、异常类型（如连接超时）、最大重试次数和退避策略。POST/PUT/DELETE 默认不重试，除非业务层做了幂等。网关层重试会放大下游压力——客户端超时重试 + 网关重试 + 服务端重试，实际请求数可能翻 3-9 倍。\n\n**CircuitBreaker 隔离慢下游。** Resilience4j CircuitBreaker 在网关层保护的是「到某个服务的这条路径」，不是整个网关。fallback 要有业务语义：读链路可以降级返回缓存或默认值，写链路只能快速失败或排队补偿。半开状态下试探请求的成功率决定是否恢复。\n\n**路径改写是常见故障源。** StripPrefix、RewritePath、后端服务的 context-path 和 base path 叠加，很容易改出 404 或打到错误路径。建议用集成测试覆盖：网关层 `/api/orders/{id}` → StripPrefix(1) → `/orders/{id}` → 后端 context-path 是 `/` 还是 `/svc`。多条路由同时命中时 order 决定优先级，灰度和权重路由要用测试用例验证比例。\n\n**观测以 routeId 为核心。** 日志、Metrics、Trace 都要带 routeId、目标 serviceId、匹配的 Predicate、状态码、耗时、异常类型、限流 key 和 fallback 标记。没有这些维度，404（路由没命中）、401（鉴权失败）、429（限流）、502（后端挂）、504（超时）、慢调用（后端慢或事件循环阻塞）的排查只能靠猜。"
     },
     {
       "type": "diagram",
@@ -35,57 +45,61 @@
     },
     {
       "type": "compareTable",
-      "title": "Gateway、Nginx、BFF、服务内过滤器对比",
-      "content": "| 维度 | Spring Cloud Gateway | Nginx / Envoy | BFF | 服务内 Filter/Interceptor |\n| --- | --- | --- | --- | --- |\n| 主要职责 | 微服务入口、动态路由、Java 生态过滤器 | L7 代理、TLS、流量治理、边缘接入 | 面向端的聚合和裁剪 | 单服务内部横切逻辑 |\n| 编程模型 | Route + Predicate + Filter | 配置/扩展插件 | 业务代码/API 编排 | 框架拦截器或过滤器 |\n| 服务发现 | 与 Spring Cloud LoadBalancer/DiscoveryClient 集成 | 依赖控制面或外部配置 | 自己调用下游 | 不负责跨服务发现 |\n| 适合做 | 鉴权、限流、CORS、轻量改写、路由灰度、观测 | TLS、WAF、边缘限流、全局代理 | 页面/端侧聚合、业务适配 | 单服务参数校验、权限细节 |\n| 不适合做 | 重业务编排、大 body 聚合、长耗时同步逻辑 | 深业务判断 | 统一入口网关和全局流量治理 | 跨服务入口治理 |\n| 常见风险 | 阻塞事件循环、body 缓存占内存、重试放大、路由顺序误伤 | 配置漂移、规则复杂、扩展语言成本 | 变成大而全中台 | 每个服务重复实现横切能力 |"
+      "title": "Gateway、Nginx/Envoy、BFF、服务内 Filter 的职责边界",
+      "content": "| 维度 | Spring Cloud Gateway | Nginx / Envoy | BFF | 服务内 Filter/Interceptor |\n| --- | --- | --- | --- | --- |\n| 定位 | 微服务入口网关，Java 生态动态路由 | L7 反向代理、边缘接入 | 面向端的聚合层 | 单服务内部横切逻辑 |\n| 路由能力 | Route + Predicate + Filter，支持服务发现和动态刷新 | 静态配置或 xDS 控制面下发 | 代码里写业务路由 | 不负责路由 |\n| 服务发现 | 原生集成 Spring Cloud LoadBalancer/DiscoveryClient | 需要外部对接（Consul/EDS） | 自己调用下游 | 不涉及跨服务发现 |\n| 编程模型 | Java Filter（WebFlux 回调或 MVC 拦截） | Lua/NGINX 配置/Wasm | 业务代码 | 框架拦截器 |\n| 擅长 | 鉴权、限流、CORS、路径改写、灰度、轻量观测 | TLS 终止、WAF、边缘限流、静态资源 | 页面聚合、端侧适配、协议转换 | 单服务参数校验、权限细节 |\n| 不擅长 | 重业务编排、大 body 聚合、长耗时同步逻辑 | 深业务逻辑判断、动态 Java 生态集成 | 统一入口治理、全局流量控制 | 跨服务入口统一治理 |\n| 典型风险 | WebFlux 阻塞事件循环、body 缓存 OOM、重试放大 | 配置漂移、规则调试困难 | 膨胀成大中台、单点瓶颈 | 每个服务重复实现横切逻辑 |"
     },
     {
       "type": "code",
-      "title": "可运行代码：本地模拟 Route、Filter、转发和限流",
+      "title": "可运行代码：模拟 Gateway 路由匹配、pre/post 过滤器和限流",
       "language": "java",
-      "content": "import com.sun.net.httpserver.HttpServer;\nimport java.io.IOException;\nimport java.io.OutputStream;\nimport java.net.InetSocketAddress;\nimport java.net.URI;\nimport java.net.http.HttpClient;\nimport java.net.http.HttpRequest;\nimport java.net.http.HttpResponse;\nimport java.nio.charset.StandardCharsets;\nimport java.time.Duration;\nimport java.util.*;\nimport java.util.concurrent.atomic.AtomicInteger;\n\npublic class Main {\n    static final class FixedWindowLimiter {\n        private final int capacity;\n        private final Map<String, Integer> counts = new HashMap<>();\n\n        FixedWindowLimiter(int capacity) {\n            this.capacity = capacity;\n        }\n\n        synchronized boolean allow(String key) {\n            int used = counts.getOrDefault(key, 0);\n            if (used >= capacity) {\n                return false;\n            }\n            counts.put(key, used + 1);\n            return true;\n        }\n    }\n\n    static final AtomicInteger REQUEST_ID = new AtomicInteger();\n\n    public static void main(String[] args) throws Exception {\n        HttpServer backend = HttpServer.create(new InetSocketAddress(0), 0);\n        backend.createContext(\"/orders/42\", exchange -> {\n            String rid = exchange.getRequestHeaders().getFirst(\"X-Request-Id\");\n            String auth = exchange.getRequestHeaders().getFirst(\"Authorization\");\n            respond(exchange, 200, \"backend path=/orders/42,rid=\" + rid + \",auth=\" + auth);\n        });\n        backend.start();\n\n        FixedWindowLimiter limiter = new FixedWindowLimiter(2);\n        HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();\n        HttpServer gateway = HttpServer.create(new InetSocketAddress(0), 0);\n        int backendPort = backend.getAddress().getPort();\n        gateway.createContext(\"/\", exchange -> {\n            try {\n                handleGateway(exchange, backendPort, limiter, client);\n            } catch (InterruptedException interrupted) {\n                Thread.currentThread().interrupt();\n                respond(exchange, 500, \"gateway interrupted\");\n            } catch (Exception failure) {\n                respond(exchange, 502, \"gateway error=\" + failure.getClass().getSimpleName());\n            }\n        });\n        gateway.start();\n\n        try {\n            int gatewayPort = gateway.getAddress().getPort();\n            System.out.println(call(gatewayPort, \"/missing\", null));\n            System.out.println(call(gatewayPort, \"/api/orders/42\", null));\n            System.out.println(call(gatewayPort, \"/api/orders/42\", \"Bearer demo\"));\n            System.out.println(call(gatewayPort, \"/api/orders/42\", \"Bearer demo\"));\n            System.out.println(call(gatewayPort, \"/api/orders/42\", \"Bearer demo\"));\n        } finally {\n            gateway.stop(0);\n            backend.stop(0);\n        }\n    }\n\n    static void handleGateway(com.sun.net.httpserver.HttpExchange exchange, int backendPort,\n                              FixedWindowLimiter limiter, HttpClient client) throws IOException, InterruptedException {\n        String path = exchange.getRequestURI().getPath();\n        if (!path.startsWith(\"/api/\")) {\n            respond(exchange, 404, \"no route\");\n            return;\n        }\n\n        String auth = exchange.getRequestHeaders().getFirst(\"Authorization\");\n        if (auth == null || auth.isBlank()) {\n            respond(exchange, 401, \"unauthorized\");\n            return;\n        }\n\n        if (!limiter.allow(auth)) {\n            respond(exchange, 429, \"rate limited route=orders\");\n            return;\n        }\n\n        String rewrittenPath = path.substring(\"/api\".length());\n        String requestId = \"gw-\" + REQUEST_ID.incrementAndGet();\n        HttpRequest request = HttpRequest.newBuilder()\n                .uri(URI.create(\"http://127.0.0.1:\" + backendPort + rewrittenPath))\n                .timeout(Duration.ofSeconds(2))\n                .header(\"Authorization\", auth)\n                .header(\"X-Request-Id\", requestId)\n                .GET()\n                .build();\n        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());\n        exchange.getResponseHeaders().add(\"X-Gateway-Route\", \"orders\");\n        respond(exchange, response.statusCode(), \"gateway route=orders -> \" + response.body());\n    }\n\n    static String call(int port, String path, String auth) throws Exception {\n        HttpRequest.Builder builder = HttpRequest.newBuilder()\n                .uri(URI.create(\"http://127.0.0.1:\" + port + path))\n                .timeout(Duration.ofSeconds(2))\n                .GET();\n        if (auth != null) {\n            builder.header(\"Authorization\", auth);\n        }\n        HttpResponse<String> response = HttpClient.newHttpClient().send(builder.build(), HttpResponse.BodyHandlers.ofString());\n        return response.statusCode() + \" \" + response.body();\n    }\n\n    static void respond(com.sun.net.httpserver.HttpExchange exchange, int status, String body) throws IOException {\n        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);\n        exchange.sendResponseHeaders(status, bytes.length);\n        try (OutputStream out = exchange.getResponseBody()) {\n            out.write(bytes);\n        }\n    }\n}",
+      "content": "import com.sun.net.httpserver.HttpServer;\nimport java.io.IOException;\nimport java.io.OutputStream;\nimport java.net.InetSocketAddress;\nimport java.net.URI;\nimport java.net.http.HttpClient;\nimport java.net.http.HttpRequest;\nimport java.net.http.HttpResponse;\nimport java.nio.charset.StandardCharsets;\nimport java.time.Duration;\nimport java.util.HashMap;\nimport java.util.Map;\nimport java.util.concurrent.atomic.AtomicInteger;\n\npublic class Main {\n    // 简单固定窗口限流器，模拟 RequestRateLimiter\n    static final class FixedWindowLimiter {\n        private final int capacity;\n        private final Map<String, Integer> counts = new HashMap<>();\n        FixedWindowLimiter(int capacity) { this.capacity = capacity; }\n        synchronized boolean allow(String key) {\n            int used = counts.getOrDefault(key, 0);\n            if (used >= capacity) return false;\n            counts.put(key, used + 1);\n            return true;\n        }\n    }\n\n    static final AtomicInteger REQUEST_ID = new AtomicInteger();\n\n    public static void main(String[] args) throws Exception {\n        // 模拟后端服务\n        HttpServer backend = HttpServer.create(new InetSocketAddress(0), 0);\n        backend.createContext(\"/orders/42\", exchange -> {\n            String rid = exchange.getRequestHeaders().getFirst(\"X-Request-Id\");\n            respond(exchange, 200, \"backend rid=\" + rid);\n        });\n        backend.start();\n\n        FixedWindowLimiter limiter = new FixedWindowLimiter(2);\n        HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();\n        HttpServer gateway = HttpServer.create(new InetSocketAddress(0), 0);\n        int backendPort = backend.getAddress().getPort();\n        gateway.createContext(\"/\", exchange -> {\n            try {\n                handleGateway(exchange, backendPort, limiter, client);\n            } catch (Exception e) {\n                respond(exchange, 502, \"gateway error=\" + e.getClass().getSimpleName());\n            }\n        });\n        gateway.start();\n\n        int gwPort = gateway.getAddress().getPort();\n        // 1. 路由不匹配 → 404\n        System.out.println(call(gwPort, \"/missing\", null));\n        // 2. 无鉴权 → 401\n        System.out.println(call(gwPort, \"/api/orders/42\", null));\n        // 3. 正常请求 → 200\n        System.out.println(call(gwPort, \"/api/orders/42\", \"Bearer tok\"));\n        // 4. 第二次正常\n        System.out.println(call(gwPort, \"/api/orders/42\", \"Bearer tok\"));\n        // 5. 第三次限流 → 429\n        System.out.println(call(gwPort, \"/api/orders/42\", \"Bearer tok\"));\n\n        gateway.stop(0);\n        backend.stop(0);\n    }\n\n    static void handleGateway(com.sun.net.httpserver.HttpExchange ex, int backendPort,\n                              FixedWindowLimiter limiter, HttpClient client) throws Exception {\n        String path = ex.getRequestURI().getPath();\n        // --- Predicate 匹配：只匹配 /api/** ---\n        if (!path.startsWith(\"/api/\")) {\n            respond(ex, 404, \"no route matched\");\n            return;\n        }\n        // --- pre filter 1: 鉴权 ---\n        String auth = ex.getRequestHeaders().getFirst(\"Authorization\");\n        if (auth == null || auth.isBlank()) {\n            respond(ex, 401, \"unauthorized\");\n            return;\n        }\n        // --- pre filter 2: 限流 ---\n        if (!limiter.allow(auth)) {\n            respond(ex, 429, \"rate limited key=\" + auth);\n            return;\n        }\n        // --- pre filter 3: StripPrefix + Header 注入 ---\n        String rewrittenPath = path.substring(\"/api\".length());\n        String reqId = \"gw-\" + REQUEST_ID.incrementAndGet();\n        HttpRequest req = HttpRequest.newBuilder()\n                .uri(URI.create(\"http://127.0.0.1:\" + backendPort + rewrittenPath))\n                .timeout(Duration.ofSeconds(2))\n                .header(\"Authorization\", auth)\n                .header(\"X-Request-Id\", reqId)\n                .GET().build();\n        // --- 转发到后端 ---\n        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());\n        // --- post filter: 加响应头 ---\n        ex.getResponseHeaders().add(\"X-Gateway-RouteId\", \"orders\");\n        respond(ex, resp.statusCode(), \"route=orders, \" + resp.body());\n    }\n\n    static String call(int port, String path, String auth) throws Exception {\n        var b = HttpRequest.newBuilder()\n                .uri(URI.create(\"http://127.0.0.1:\" + port + path))\n                .timeout(Duration.ofSeconds(2)).GET();\n        if (auth != null) b.header(\"Authorization\", auth);\n        var r = HttpClient.newHttpClient().send(b.build(), HttpResponse.BodyHandlers.ofString());\n        return r.statusCode() + \" \" + r.body();\n    }\n\n    static void respond(com.sun.net.httpserver.HttpExchange ex, int status, String body) throws IOException {\n        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);\n        ex.sendResponseHeaders(status, bytes.length);\n        try (OutputStream out = ex.getResponseBody()) { out.write(bytes); }\n    }\n}",
       "highlights": [
         {
-          "line": 64,
-          "note": "Path Predicate 失败时直接返回 404，等价于没有命中 Route。"
+          "line": 52,
+          "note": "Predicate 匹配失败直接返回 404，对应路由查找阶段。"
         },
         {
-          "line": 70,
-          "note": "鉴权属于 pre filter，越早拒绝越能减少下游压力。"
+          "line": 57,
+          "note": "pre filter 1：鉴权放在最前面，越早拒绝越能保护下游。"
         },
         {
-          "line": 76,
-          "note": "限流失败返回 429，并带上 route 标签，方便线上定位。"
+          "line": 63,
+          "note": "pre filter 2：限流返回 429，带限流 key 方便定位。"
         },
         {
-          "line": 81,
-          "note": "StripPrefix/RewritePath 本质是在进入后端前改写目标路径。"
+          "line": 68,
+          "note": "pre filter 3：StripPrefix 改写路径 + 注入 X-Request-Id。"
         },
         {
-          "line": 94,
-          "note": "响应返回后再加网关响应头，模拟 post filter 阶段。"
+          "line": 78,
+          "note": "post filter：在响应返回后加网关标识头和指标维度。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "我会先给结论：Spring Cloud Gateway 的核心模型是 Route、Predicate、Filter。Route 定义目标 URI 和过滤器；Predicate 决定请求是否命中；Filter 在转发前后做鉴权、限流、路径改写、观测、熔断和响应处理。\n\n第一步先说版本形态。当前 Spring Cloud Gateway 文档里要区分 Server 和 Proxy Exchange；Server 是完整 API Gateway，又有 WebFlux 和 Web MVC 兼容形态。WebFlux 形态强调响应式和 Reactor Netty；Web MVC 形态更贴近 Servlet/MVC 路由函数。具体项目要先说清 starter 和运行模型，否则线程、过滤器 API 和部署依赖都会讲错。\n\n第二步讲请求链路：请求进入后，HandlerMapping 根据 RouteDefinition 找路由；Path、Host、Method、Header、Query 等 Predicate 判断是否命中；命中后把 GlobalFilter 和路由自己的 GatewayFilter 合并排序。pre 阶段做认证、鉴权、限流、CORS、RewritePath、StripPrefix、Header 注入和灰度标记；然后根据 URI 走 `lb://` 服务发现、固定 http/https 地址或 forward 本地 handler；下游响应返回后，post 阶段处理响应头、日志、指标和异常映射。\n\n第三步讲生产边界：网关适合做入口治理和轻量改写，不适合重业务编排和大 body 聚合。WebFlux 形态下过滤器里不能随意阻塞；body 缓存和响应聚合要控制内存；Retry 要限定幂等、次数和状态码；CircuitBreaker 和 fallback 要有业务语义；RequestRateLimiter 要有稳定 key。排查时围绕 routeId、predicate 命中、filter order、target URI、状态码、耗时、限流 key、异常类型和 trace span 定位。",
+      "content": "Spring Cloud Gateway 的核心模型是 Route + Predicate + Filter。Route 定义目标 URI、Predicate 和 Filter 列表；Predicate 判断请求是否命中路由（Path、Host、Method、Header 等，AND 关系）；Filter 在转发前后做横切处理——pre 做鉴权限流改写，post 做响应头处理和指标记录。\n\n**请求链路：** 进入网关 → RoutePredicateHandlerMapping 遍历路由做 Predicate 匹配 → 命中后合并 GlobalFilter + GatewayFilter 按 order 排序 → pre 阶段执行（鉴权 401/403 → 限流 429 → StripPrefix/RewritePath → Header 注入）→ 根据 target URI 转发（`lb://` 走 LoadBalancer 服务发现，`http://` 直连，`forward:` 调本地）→ 后端返回 → post 阶段（响应头、日志、指标）→ 返回客户端。未命中返回 404。\n\n**两种 Server 形态：** WebFlux 形态（`gateway-server-webflux`）基于 Reactor Netty 事件循环，过滤器不能阻塞；Web MVC 形态（`gateway-server-webmvc`）基于 Servlet 线程池，过滤器可以阻塞但线程数决定并发上限。选型看：全新高并发网关且过滤器非阻塞 → WebFlux；已有 MVC 应用嵌入且并发不极端 → Web MVC。\n\n**生产治理边界：** 限流要有稳定 key 维度，返回 429 带 routeId 和 key；重试只对幂等请求（通常 GET），限制次数和状态码，避免客户端+网关+服务端三级重试放大；CircuitBreaker 隔离慢下游，fallback 要有业务语义；路径改写要集成测试覆盖 StripPrefix、RewritePath 和后端 context-path 的叠加。WebFlux 形态下阻塞调用要隔离到弹性线程池。\n\n**排查维度：** 404 看 Predicate 是否命中和路由 order；401/403 看鉴权 filter 逻辑；429 看限流 key、容量和窗口；502 看后端可用性和连接；504 看超时配置和后端延迟；慢调用看事件循环是否被阻塞或下游慢。所有指标围绕 routeId、状态码、耗时、限流 key 和异常类型。",
       "followUpQuestions": [
         {
-          "question": "Gateway 的 Route、Predicate、Filter 分别是什么？",
-          "answer": "Route 是一条路由定义，包含 id、目标 URI、Predicate、Filter、order 等；Predicate 判断请求是否命中，例如 Path、Host、Header；Filter 是命中后执行的过滤器链，pre 处理请求，post 处理响应。"
+          "question": "Gateway 的 Route、Predicate、Filter 分别是什么？它们怎么协作？",
+          "answer": "Route 是路由定义，包含 id、目标 URI、Predicate 列表、Filter 列表和 order。Predicate 判断请求是否匹配（Path、Host、Method 等，AND 关系）。Filter 是命中后执行的处理链，pre 在转发前（鉴权、限流、路径改写），post 在响应后（响应头、指标）。三者协作：先用 Predicate 找路由，再按 Filter 链处理，最后转发到 Route 的目标 URI。"
         },
         {
-          "question": "lb://service 和 http://host 有什么区别？",
-          "answer": "`lb://service` 会交给 Spring Cloud LoadBalancer 和服务发现选择实例，适合微服务内部调用；`http://host` 或 `https://host` 是固定地址，适合外部服务或静态目标。两者的超时、重试和可观测维度都要分开配置。"
+          "question": "lb://service 和 http://host 的区别是什么？",
+          "answer": "`lb://service-name` 通过 Spring Cloud LoadBalancer 和 DiscoveryClient 从注册中心获取实例列表并负载均衡，适合微服务内部调用；`http://` 或 `https://` 是固定地址直连，适合外部服务或静态目标。两者超时、重试和指标维度要分开配置。"
         },
         {
           "question": "WebFlux Gateway 为什么怕阻塞调用？",
-          "answer": "WebFlux/Netty 使用少量事件循环线程处理大量连接，过滤器里阻塞会占住事件循环，导致其他请求排队，尾延迟被放大。外部鉴权、Redis、DB 调用要用非阻塞客户端或隔离线程池并设置超时。"
+          "answer": "WebFlux 基于 Reactor Netty 的少量事件循环线程处理所有连接。过滤器里一个阻塞调用（如同步 HTTP、DB、Redis）会占住事件循环线程，其他请求全部排队等，尾延迟被全局放大。解决方案：用非阻塞客户端（WebClient），或用 `Schedulers.boundedElastic()` 把阻塞逻辑隔离到独立线程池。"
         },
         {
-          "question": "Gateway 出现 404、429、502/504 时怎么排查？",
-          "answer": "404 看 routeId 和 Predicate 是否命中；429 看限流 key、容量和窗口；502/504 看 target URI、LoadBalancer 实例、下游可用性、超时、CircuitBreaker、Retry 和网关线程/连接池指标。"
+          "question": "网关层重试有什么风险？",
+          "answer": "网关重试会放大下游压力。最坏情况：客户端超时重试 3 次 + 网关重试 3 次 + 服务端重试 3 次 = 27 倍请求。解决：只对幂等请求（GET）重试、限制次数和状态码、客户端和网关的重试策略要对齐、下游做幂等保护。"
+        },
+        {
+          "question": "Gateway 出现 404、429、502/504 怎么排查？",
+          "answer": "404：检查 Predicate 是否匹配、路由 order 是否被其他路由抢先、动态路由是否刷新成功。429：检查限流 key resolver 维度、RedisRateLimiter 容量/窗口配置、是否单租户打满。502：检查 target URI、LoadBalancer 实例是否可用、后端是否挂了。504：检查网关超时配置（connectTimeout、readTimeout）和后端实际延迟。所有排查围绕 routeId 和 trace span。"
         }
       ]
     },
@@ -93,34 +107,42 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能区分 Spring Cloud Gateway Server WebFlux、Server Web MVC 和 Proxy Exchange",
-        "能解释 RouteDefinition、Predicate、GlobalFilter、GatewayFilter、target URI 的职责",
-        "能按 HandlerMapping、Predicate 匹配、Filter 链、LoadBalancer/转发、post filter 串起请求链路",
-        "能说明 `lb://`、`http/https`、`forward:` 的适用边界",
-        "能解释鉴权、限流、RewritePath、StripPrefix、CircuitBreaker、Retry 的风险和配置要点",
-        "能说清 WebFlux 阻塞调用、body 缓存和重试放大的容量风险",
-        "能围绕 routeId、状态码、耗时、限流 key、异常类型和 trace 做线上排查"
+        "能区分 Spring Cloud Gateway Server WebFlux、Server Web MVC 和 Proxy Exchange 三种形态及其适用场景",
+        "能解释 RouteDefinition、Predicate（AND 关系）、GlobalFilter/GatewayFilter、target URI 各自职责",
+        "能描述请求从进入到返回的完整链路：路由查找 → pre filter → 转发 → 后端 → post filter → 返回",
+        "能说明 lb://、http://、forward: 三种 target URI 的区别和配置差异",
+        "能解释鉴权、限流、StripPrefix/RewritePath、CircuitBreaker、Retry 的生产配置要点和风险",
+        "能说清 WebFlux 形态下阻塞调用的危害和隔离方案、body 缓存的内存风险、重试放大的压力问题",
+        "能围绕 routeId、Predicate 命中、filter order、状态码、耗时、限流 key、异常类型做线上排查",
+        "能比较 Gateway 与 Nginx/Envoy、BFF、服务内 Filter 的职责边界和选型依据"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "java.microservice.topic-059-a4e73804.recall.1",
-      "prompt": "Gateway 一次请求从进入到返回，会经过哪些关键组件？",
+      "prompt": "请讲清 Spring Cloud Gateway 的 Route、Predicate、Filter 模型，以及一次请求从进入到返回的完整链路。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "java.microservice.topic-059-a4e73804.recall.2",
-      "prompt": "Route、Predicate、Filter、target URI 各自解决什么问题？",
+      "prompt": "Spring Cloud Gateway 的 WebFlux 形态和 Web MVC 形态有什么区别？分别适合什么场景？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "java.microservice.topic-059-a4e73804.recall.3",
-      "prompt": "Gateway 在线上出现 404、429、502/504 或慢调用时如何排查？",
+      "prompt": "Gateway 在线上出现 404、429、502/504 或慢调用时，你的排查思路是什么？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "java.microservice.topic-059-a4e73804.recall.4",
+      "prompt": "网关层的限流、重试、熔断分别有哪些配置要点和风险？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -128,36 +150,37 @@
   ],
   "rubric": {
     "mustHave": [
-      "能区分 Server WebFlux、Server Web MVC 和 Proxy Exchange 的边界",
-      "能讲清 RouteDefinition、Predicate、Filter、target URI、LoadBalancer 的请求链路",
-      "能说明鉴权、限流、路径改写、熔断、重试、观测的生产治理要求",
-      "能解释 WebFlux 阻塞、body 缓存、重试放大和路由顺序误伤等容量风险"
+      "能区分 Server WebFlux、Server Web MVC 和 Proxy Exchange 的边界和适用场景",
+      "能讲清 RouteDefinition、Predicate（AND 关系）、GlobalFilter/GatewayFilter、target URI、LoadBalancer 的请求链路",
+      "能说明鉴权、限流、路径改写、熔断、重试的生产治理要求和配置要点",
+      "能解释 WebFlux 阻塞事件循环、body 缓存 OOM、重试放大、路由顺序误伤等容量风险"
     ],
     "goodToHave": [
-      "能结合 5.0.2、Spring Boot 4、Framework 7 的当前文档口径说明版本差异",
-      "能给出 404、401/403、429、502/504、慢调用的排查路径",
-      "能比较 Gateway、Nginx/Envoy、BFF、服务内 Filter 的职责边界"
+      "能比较 Gateway、Nginx/Envoy、BFF、服务内 Filter 的职责边界和选型依据",
+      "能给出 404/401/403/429/502/504/慢调用的完整排查路径",
+      "能说明动态路由刷新、Actuator 端点、配置中心事件同步的注意事项",
+      "能解释 Gateway 5.x 基于 Spring Boot 4 / Framework 7 的版本背景"
     ],
     "commonMistakes": [
-      "只说 Gateway 是统一入口，讲不出 Route、Predicate、Filter 的执行模型",
+      "只说 Gateway 是统一入口，讲不出 Route/Predicate/Filter 的执行模型和请求链路",
       "把所有 Gateway 都说成 WebFlux/Reactor Netty，忽略 Web MVC Server 形态",
-      "在 WebFlux 过滤器里写阻塞调用，导致事件循环被占用",
-      "把重试、熔断、降级都堆在网关层，忽略幂等性和压力放大",
-      "路径改写、StripPrefix 和后端 base path 混用，导致线上 404"
+      "在 WebFlux 过滤器里写阻塞调用（同步 HTTP、DB、Redis），导致事件循环被占用",
+      "把重试、熔断、降级都堆在网关层，忽略幂等性和三级重试放大的压力",
+      "StripPrefix/RewritePath 和后端 context-path 叠加错误导致线上 404"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "java.microservice.topic-055-e51532ee",
     "java.spring.topic-043-d09a2ea2"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能把 Gateway 从统一入口讲到 Route/Predicate/Filter 链路、WebFlux/Web MVC 形态、负载均衡、限流熔断、路径改写和线上排查。"
+  "interviewerFocus": "考察能否从 Route/Predicate/Filter 模型讲到完整请求链路、WebFlux 与 Web MVC 形态差异、负载均衡、限流熔断重试的生产治理、路径改写的常见故障、以及线上排查方法。"
 }

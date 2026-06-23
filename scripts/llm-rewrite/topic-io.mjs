@@ -60,10 +60,21 @@ function countText(topic) {
   return chars;
 }
 
-// estimatedMinutes 由内容密度重算（~250 字/分钟，钳制在合理区间）。
+// 难度对应的学习时长区间（与 content_quality_audit.mjs 保持一致）。
+function expectedMinutesRange(difficulty) {
+  if (difficulty <= 1) return [8, 20];
+  if (difficulty === 2) return [12, 30];
+  if (difficulty === 3) return [20, 40];
+  if (difficulty === 4) return [28, 50];
+  return [35, 65];
+}
+
+// estimatedMinutes 由内容密度重算（~250 字/分钟），再钳制到难度对应区间。
 export function recomputeMinutes(topic) {
   const chars = countText(topic);
-  return Math.max(5, Math.min(60, Math.round(chars / 250)));
+  const raw = Math.max(5, Math.min(60, Math.round(chars / 250)));
+  const [min, max] = expectedMinutesRange(topic.difficulty ?? 3);
+  return Math.max(min, Math.min(max, raw));
 }
 
 // recallPrompts.id 由程序按既有命名规则归一，不信任模型生成的 id。

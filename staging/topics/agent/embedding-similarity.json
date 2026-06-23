@@ -4,7 +4,7 @@
   "category": "embedding-retrieval",
   "group": "embedding-retrieval",
   "title": "Embedding 模型与相似度计算",
-  "summary": "Embedding 将文本映射为稠密向量，通过余弦相似度或内积衡量语义接近程度，是 RAG 检索和语义搜索的基础能力。",
+  "summary": "Embedding 将文本映射为固定维度的稠密向量，通过余弦相似度或内积衡量语义接近程度，是 RAG 检索和语义搜索的基础能力；工程上需要确保 query 与文档使用同一模型、同一归一化策略，再配合 metadata filter 和 reranker 形成完整的召回-评估闭环。",
   "tags": [
     "Embedding",
     "向量检索",
@@ -13,14 +13,19 @@
     "语义搜索"
   ],
   "difficulty": 2,
-  "estimatedMinutes": 25,
+  "estimatedMinutes": 21,
   "order": 5,
   "recommendWeight": 90,
   "learningCards": [
     {
       "type": "explain",
-      "title": "Embedding 模型与相似度计算的机制、边界与面试抓手",
-      "content": "Embedding 模型把文本编码成固定维度的稠密向量。训练时通常通过对比学习或相关性排序，让语义接近的样本在向量空间里更近，让无关样本更远。面试里不要只说“转成向量”，还要说清向量维度、归一化和相似度指标怎样影响召回结果。\n\n相似度指标的选择要和向量处理方式配套。余弦相似度只看方向，适合先做 L2 归一化的语义检索；内积会同时受方向和向量长度影响，如果向量已归一化，内积排序和余弦排序等价；欧氏距离更关注绝对坐标差，常见于聚类或特定向量库配置。归一化的意义是把“向量长度”从排序因素中拿掉，避免某些模型输出范数较大的文本天然占优。\n\n评估 Embedding 不能只看单条 query 的感觉，要准备一组带标准答案的查询集，观察 Recall@K、MRR、nDCG 和 bad case。公开基准可以参考 MTEB、C-MTEB 或业务内部标注集；真正上线时还要结合 chunk 粒度、权限过滤、重排序和引用命中率判断。"
+      "title": "Embedding 是什么：从文本到向量空间的映射",
+      "content": "## 为什么需要 Embedding\n传统的关键词检索（TF-IDF、BM25）只能做字面匹配，无法处理同义词、改写、跨语言等语义等价场景。Embedding 模型的核心思想是：**把文本编码成稠密向量，让语义相似的文本在向量空间中距离更近**。训练时通常通过对比学习（contrastive learning）或相关性排序（pairwise/passage ranking），拉近正样本对、推远负样本对，使模型学到的向量能捕捉语义信息而非字面重叠。\n\n## 关键属性\n- **维度（dimension）**：常见 384/768/1024/1536/3072。维度越高，理论上表达能力越强，但存储和计算成本线性增长。text-embedding-3-large 默认 3072 维，text-embedding-3-small 默认 1536 维，后者可以通过 `dimensions` 参数降维（OpenAI 的 Matryoshka 表示学习）。\n- **模型一致性**：query 和文档必须用同一个 Embedding 模型编码。不同模型学到的向量空间完全不同，混用会导致相似度计算毫无意义——这不是\"质量下降\"，而是数学上不可比。\n- **语言与领域适配**：通用英文模型（如 text-embedding-3-small）在中文场景效果可能不如专用中文模型（如 BGE-zh、M3E、Jina-v2-zh）。选型时用业务标注集实测，不要只看公开排行榜。\n\n## 边界\nEmbedding 捕捉的是语义近邻关系，不是事实正确性。相似度高只说明两段文本\"话题接近\"，不代表文档能回答 query。事实性、完整性、时效性需要 RAG 后续链路（reranker、生成模型、引用校验）保证。"
+    },
+    {
+      "type": "explain",
+      "title": "相似度指标与归一化：cosine、内积、L2 的区别与配套",
+      "content": "## 三个指标的数学含义\n- **余弦相似度（cosine similarity）**：$\\cos(\\theta) = \\frac{\\vec{a} \\cdot \\vec{b}}{|\\vec{a}| \\cdot |\\vec{b}|}$，只衡量两个向量的方向夹角，不受向量长度影响。值域 [-1, 1]，1 表示方向完全一致。\n- **内积（inner product / dot product）**：$\\vec{a} \\cdot \\vec{b}$，同时受方向和向量长度（范数）影响。如果两个向量范数很大，即使方向稍偏，内积也可能很高。\n- **欧氏距离（L2 distance）**：$|\\vec{a} - \\vec{b}|_2$，衡量向量间的绝对坐标差。值越小越相似，常用于聚类（如 K-Means）。\n\n## 归一化的关键作用\nL2 归一化将每个向量除以自身范数，使其长度恒为 1。归一化后：\n- 余弦相似度 = 内积（因为分母 $|\\vec{a}| \\cdot |\\vec{b}| = 1 \\times 1 = 1$）\n- L2 距离与余弦相似度有确定的数学关系：$|\\vec{a} - \\vec{b}|^2 = 2(1 - \\cos(\\theta))$\n\n所以很多向量库（如 Faiss、Milvus）在索引配置为 cosine 时，内部实际做的是对归一化向量用内积（IP）计算，因为内积在硬件上更快。\n\n## 未归一化时的风险\n如果向量未做 L2 归一化就直接用内积，范数大的向量会天然占优——一篇长文档即使语义偏了，只要模型输出的向量范数大，内积就可能很高，排在前面。这不是 cosine 的问题，是指标和预处理不配套的问题。\n\n## 工程决策\n- **语义检索（RAG、问答匹配）**：优先 cosine + L2 归一化，最稳定\n- **向量库原生支持 cosine**：确认其底层实现（很多是归一化后走 IP）\n- **聚类或特定 ANN 索引（如 Faiss IVF）**：可能默认 L2，需在建索引和查询时保持一致\n- **换指标 = 换索引**：指标变了必须重建索引并重跑评估，不能只改查询参数"
     },
     {
       "type": "diagram",
@@ -28,7 +33,7 @@
       "format": "mermaid",
       "content": "flowchart LR\nA[\"原始 query / 文档 chunk\"] --> B[\"同一 Embedding 模型编码\n维度必须一致\"]\nB --> C{\"是否 L2 归一化\"}\nC -->|是| D[\"cosine 与 inner product\n排序通常等价\"]\nC -->|否| E[\"向量范数会影响内积\n需确认模型与索引配置\"]\nD --> F[\"向量库 ANN 召回 TopK\"]\nE --> F\nF --> G[\"metadata filter\n租户/权限/时间/来源\"]\nG --> H[\"reranker / 阈值 / 去重\"]\nH --> I[\"进入 RAG 上下文\"]\nI --> J[\"Recall@K / MRR / nDCG\nbad case 归因\"]",
       "fallback": "图展示 Embedding 从同模型编码、归一化和相似度选择，到向量库召回、权限过滤、重排和评估的完整链路。",
-      "caption": "Embedding 题不能只讲“文本转向量”，还要讲模型一致性、相似度配置、权限过滤和评估闭环。",
+      "caption": "Embedding 检索不是\"文本转向量\"就结束，还要保证模型一致性、归一化策略与指标配套，再经过权限过滤和重排才能进入 RAG 上下文。",
       "sources": [
         {
           "kind": "mermaid",
@@ -42,33 +47,49 @@
     },
     {
       "type": "compareTable",
-      "title": "Embedding 模型与指标选型",
-      "content": "| 对比项 | 选型关注点 | 常见边界 |\n| --- | --- | --- |\n| OpenAI text-embedding-3-small | 默认 1536 维，可通过 dimensions 降维；适合成本敏感通用检索 | 上线前以官方模型页和价格页为准 |\n| OpenAI text-embedding-3-large | 默认 3072 维，质量更强但存储和计算成本更高 | 维度越大不等于业务收益一定更高 |\n| BGE / E5 / Jina 等开源模型 | 可私有化、可按中英文/领域评测选择 | 不能和其他模型生成的向量混用 |\n| 相似度指标 | cosine、inner product、L2 要与归一化和索引配置匹配 | 指标换了要重建索引并重跑评估 |"
+      "title": "Embedding 模型与相似度指标选型",
+      "content": "| 对比项 | 选型关注点 | 常见边界 |\n| --- | --- | --- |\n| text-embedding-3-small | 默认 1536 维，Matryoshka 支持降维；成本低，适合通用场景 | 中文效果可能不如专用模型；以上线前官方文档为准 |\n| text-embedding-3-large | 默认 3072 维，质量更强 | 维度越大存储和计算成本越高；降维后质量衰减需实测 |\n| BGE / E5 / Jina 等开源模型 | 可私有化部署，按语言/领域选型 | 不同模型的向量空间不可混用，换模型必须重建索引 |\n| cosine + L2 归一化 | 语义检索首选，方向一致即相似 | 归一化后内积等价于 cosine；换指标要重建索引 |\n| inner product (未归一化) | 适合有\"质量分\"语义的场景（如推荐系统打分融合） | 范数大的向量天然占优，需确认向量库默认配置 |\n| L2 欧氏距离 | 聚类、异常检测 | 对高维稀疏场景不友好；维度灾难影响距离区分度 |"
     },
     {
       "type": "code",
-      "title": "相似度计算",
-      "content": "import numpy as np\n\ndef cosine_similarity(a, b):\n    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))\n\n# Python 示例\nvec1 = embed(\"什么是向量数据库\")\nvec2 = embed(\"向量数据库的定义\")\nsim = cosine_similarity(vec1, vec2)  # 接近 1.0",
+      "title": "相似度计算与 Embedding API 调用",
+      "content": "import numpy as np\nfrom openai import OpenAI\n\nclient = OpenAI()\n\ndef get_embedding(text: str, model: str = \"text-embedding-3-small\", dimensions: int = 1536) -> list[float]:\n    \"\"\"调用 Embedding API 并返回归一化向量\"\"\"\n    resp = client.embeddings.create(input=[text], model=model, dimensions=dimensions)\n    return resp.data[0].embedding\n\ndef cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:\n    \"\"\"余弦相似度：归一化后等价于内积，但这里显式计算更稳健\"\"\"\n    norm_a, norm_b = np.linalg.norm(a), np.linalg.norm(b)\n    if norm_a == 0 or norm_b == 0:\n        return 0.0  # 零向量保护，避免除零\n    return float(np.dot(a, b) / (norm_a * norm_b))\n\ndef inner_product(a: np.ndarray, b: np.ndarray) -> float:\n    \"\"\"内积：归一化后与 cosine 等价；未归一化时受范数影响\"\"\"\n    return float(np.dot(a, b))\n\n# 演示：语义相似的两段文本\nvec_q = np.array(get_embedding(\"什么是向量数据库\"))\nvec_d = np.array(get_embedding(\"向量数据库的定义与用途\"))\n\nprint(f\"cosine: {cosine_similarity(vec_q, vec_d):.4f}\")   # 接近 1.0\nprint(f\"inner product: {inner_product(vec_q, vec_d):.4f}\")  # 归一化后接近 cosine",
       "language": "python",
       "highlights": [
         {
-          "line": 4,
-          "note": "这里要先处理零向量，否则范数为 0 会导致除零；线上实现还要保证 query 和文档使用同一模型与同一归一化策略。"
+          "line": 5,
+          "note": "OpenAI text-embedding-3-small 支持 dimensions 参数降维（Matryoshka 表示学习），可权衡质量与成本。"
+        },
+        {
+          "line": 13,
+          "note": "零向量保护：范数为 0 会导致除零，线上必须处理。"
+        },
+        {
+          "line": 20,
+          "note": "query 和文档必须用同一模型、同一 dimensions 参数编码，否则向量空间不可比。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "标准面试回答",
-      "content": "结论：Embedding 是把 query 和文档片段映射到同一个向量空间，用近邻搜索找到语义相关证据。工程上真正难的是模型一致性、相似度配置、权限过滤、chunk 粒度和评估闭环。\n\n我会按四步讲：\n1. 选择同一个 embedding 模型编码 query 与文档，确认维度、语言和领域适配。\n2. 明确是否归一化，再选择 cosine、inner product 或 L2；归一化后 cosine 和内积排序通常等价。\n3. 用向量库召回 TopK，再叠加 metadata filter、去重和 reranker。\n4. 用标注集评估 Recall@K、MRR、nDCG 和 bad case，而不是凭单条 demo 判断效果。\n\n边界：相似度高不等于答案正确；它只说明语义近邻。权限、时效性、事实完整性和生成忠实度还需要 RAG 后续链路保证。",
+      "content": "**30 秒结论**\nEmbedding 是把文本映射到同一向量空间，用近邻搜索找到语义相关证据。工程上真正难的是模型一致性、相似度指标与归一化配套、权限过滤、chunk 粒度控制和评估闭环。\n\n**核心机制**\n- **向量表示**：Embedding 模型（如 text-embedding-3-small、BGE）将文本编码为固定维度稠密向量，训练时通过对比学习让语义相近的文本向量更接近\n- **相似度指标**：余弦相似度只看方向，适合 L2 归一化后的语义检索；内积同时受方向和范数影响，归一化后与 cosine 等价；L2 距离关注绝对坐标差，常见于聚类\n- **归一化的作用**：L2 归一化后向量长度恒为 1，消除范数对排序的影响，使 cosine 和内积等价；很多向量库 cosine 底层就是归一化 + 内积\n- **RAG 链路**：向量库 ANN 召回 TopK → metadata filter（租户/权限/时间） → reranker 精排 → 阈值/去重 → 进入生成上下文\n- **评估闭环**：用标注查询集评估 Recall@K、MRR、nDCG，分析 bad case 归因（是 embedding 质量差、chunk 粒度不对、还是缺少过滤）\n\n**高频追问边界**\n- 相似度高 ≠ 答案正确，只说明语义近邻\n- 不同模型向量空间不可混用，换模型必须重建索引\n- 维度越大不等于效果越好，需用业务集实测权衡成本\n- chunk 粒度太大召回噪声多，太小可能丢失上下文——通常 256-512 tokens 作为起点",
       "followUpQuestions": [
         {
-          "question": "余弦相似度和内积有什么区别？",
-          "answer": "余弦关注方向，适合归一化后的语义相似；内积同时受方向和向量长度影响，很多向量库在归一化后内积近似余弦。"
+          "question": "余弦相似度和内积有什么区别？什么时候它们等价？",
+          "answer": "余弦只衡量方向夹角，值域 [-1, 1]；内积同时受方向和向量长度影响。当两个向量都做了 L2 归一化（范数=1）时，余弦 = 内积，排序完全等价。很多向量库配置 cosine 时内部就是归一化 + 内积，因为内积在硬件上计算更快。"
         },
         {
-          "question": "Embedding 模型如何选型？",
-          "answer": "看语言覆盖、领域效果、维度、吞吐、成本和与向量库指标的匹配，用标注查询集评估 Recall@K 和 MRR。"
+          "question": "为什么不同 Embedding 模型生成的向量不能混用？",
+          "answer": "每个 Embedding 模型独立训练，学到的向量空间完全不同——模型 A 把\"猫\"编码为 [0.2, 0.8, ...]，模型 B 可能编码为 [-0.5, 0.1, ...]。用模型 A 编码 query、用模型 B 编码文档，计算出来的相似度没有任何语义意义。这不是\"质量下降\"，是数学上不可比。"
+        },
+        {
+          "question": "如何评估 Embedding 模型的效果？",
+          "answer": "准备一组带标准答案的标注查询集，计算 Recall@K（前 K 个结果中包含正确答案的比例）、MRR（正确答案排名的倒数均值）、nDCG（考虑位置的增益）。公开基准可参考 MTEB（英文）和 C-MTEB（中文）。业务上线前用自己的标注集实测，分析 bad case 归因是 embedding 质量、chunk 粒度还是缺少过滤。"
+        },
+        {
+          "question": "chunk 粒度怎么选？对检索有什么影响？",
+          "answer": "chunk 太大（如整页），embedding 会\"稀释\"核心信息，召回的文档包含大量无关上下文；chunk 太小（如单句），可能丢失必要的上下文导致 embedding 不够语义完整。通常 256-512 tokens 作为起点，结合重叠窗口（overlap 50-100 tokens）避免切裂关键信息。不同粒度可以做 A/B 实测。"
         }
       ]
     },
@@ -76,32 +97,48 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释 Embedding 的语义向量化原理",
-        "能区分 cosine、inner product、L2 与归一化的关系",
-        "能说明不同模型/维度的向量不能混用",
-        "能用 Recall@K、MRR、nDCG 和 bad case 评估检索质量",
-        "能把 embedding 放回 RAG 的 chunk、filter、reranker 链路"
+        "能解释 Embedding 的语义向量化原理：对比学习让语义相近文本的向量更接近",
+        "能区分 cosine（方向）、inner product（方向+范数）、L2（坐标差）的数学含义与适用场景",
+        "能说明 L2 归一化后 cosine 与内积等价，以及未归一化时内积的风险",
+        "能解释不同模型向量空间不可混用，换模型必须重建索引",
+        "能把 Embedding 放回 RAG 的完整链路：编码 → ANN 召回 → metadata filter → reranker → 生成",
+        "能用 Recall@K、MRR、nDCG 和 bad case 归因评估检索质量",
+        "能说明 chunk 粒度对召回的影响和常见起始配置（256-512 tokens + overlap）"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "agent.embedding-retrieval.embedding-similarity.recall.1",
-      "prompt": "请解释 Embedding 是什么，以及余弦相似度、内积、欧氏距离各自适合什么场景。",
+      "prompt": "请解释 Embedding 是什么，以及余弦相似度、内积、欧氏距离各自适合什么场景。归一化如何影响 cosine 和内积的关系？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 2
     },
     {
       "id": "agent.embedding-retrieval.embedding-similarity.recall.2",
-      "prompt": "为什么语义相似不等于答案相关？RAG 中如何评估召回质量？",
+      "prompt": "为什么不同 Embedding 模型生成的向量不能混用？如果线上混用了会有什么现象？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 2
     },
     {
       "id": "agent.embedding-retrieval.embedding-similarity.recall.3",
-      "prompt": "如何评估 Embedding 模型的质量？有哪些公开的评测基准？",
+      "prompt": "RAG 中用 Embedding 做向量检索后，为什么相似度高不等于答案正确？需要哪些后续链路来保证最终质量？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 2
+    },
+    {
+      "id": "agent.embedding-retrieval.embedding-similarity.recall.4",
+      "prompt": "如何评估 Embedding 模型的检索质量？Recall@K、MRR、nDCG 分别衡量什么？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 2
+    },
+    {
+      "id": "agent.embedding-retrieval.embedding-similarity.recall.5",
+      "prompt": "chunk 粒度对 Embedding 检索有什么影响？你一般怎么选择和调整？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 2
@@ -109,30 +146,33 @@
   ],
   "rubric": {
     "mustHave": [
-      "能说明 Embedding 模型、维度、归一化和相似度指标的配套关系",
-      "能解释为什么不同模型生成的向量不能混用",
-      "能把向量召回放回 RAG 的 chunk/filter/rerank/生成链路",
-      "能用 Recall@K、MRR、nDCG 和 bad case 做离线评估"
+      "能说明 Embedding 的向量化原理：对比学习/相关性排序，让语义相近文本的向量更接近",
+      "能解释 cosine（方向）、inner product（方向+范数）、L2（坐标差）的区别，以及归一化后 cosine 与内积等价",
+      "能强调 query 与文档必须使用同一模型、同一归一化策略，否则向量空间不可比",
+      "能把 Embedding 放回 RAG 的完整链路：编码 → ANN 召回 → metadata filter → reranker → 生成",
+      "能用 Recall@K、MRR、nDCG 和 bad case 归因做离线评估"
     ],
     "goodToHave": [
-      "能说明 text-embedding-3-small/large 等模型维度口径并提醒以上线前官方文档为准",
-      "能分析阈值、TopK、metadata filter 对召回和误召回的影响",
+      "能说明 text-embedding-3-small/large 的维度差异和 Matryoshka 降维能力，提醒以上线前官方文档为准",
+      "能分析 chunk 粒度（256-512 tokens + overlap）对召回质量和上下文完整性的影响",
+      "能说明向量库 cosine 底层通常归一化 + 内积的实现原因",
       "能结合业务标注集做模型/参数 A/B 对比"
     ],
     "commonMistakes": [
-      "认为相似度高就一定能回答",
-      "混用不同模型或不同归一化策略生成的向量",
-      "只看单条 demo，不建立标注集和失败归因"
+      "换 embedding 模型却不重建索引，新旧向量空间不可混用导致检索错乱",
+      "向量未做 L2 归一化就用 cosine，或在已归一化向量上误期望 inner product 与 cosine 不同",
+      "用关键词重合度而非语义相似度评估检索质量",
+      "盲目选大维度模型，忽视存储与计算成本及降维后的质量实测"
     ],
     "scoreWeights": {
-      "coverage": 40,
-      "accuracy": 25,
+      "coverage": 30,
+      "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "interviewFrequency": "high",
   "status": "staging",
-  "interviewerFocus": "考察是否能围绕「Embedding 模型与相似度计算」说清向量表示、相似度指标，并放到Agent/RAG/LLM 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察是否能围绕「Embedding 模型与相似度计算」说清向量表示、相似度指标与归一化的配套关系，强调模型一致性，并放到 RAG 工程场景中解释召回链路、评估闭环和关键边界（相似度高≠答案正确、不同模型不可混用、chunk 粒度影响）。"
 }

@@ -4,7 +4,7 @@
   "category": "http-https",
   "group": "http-https",
   "title": "HTTP 1.0/1.1/2.0/3.0 演进",
-  "summary": "梳理 HTTP 从 0.9 文本协议到 1.0 短连接、1.1 keep-alive/管道化、2 二进制分帧/多路复用/HPACK、3 QUIC 的演进，理解每代要解决的痛点和队头阻塞在不同层的表现。",
+  "summary": "梳理 HTTP 从 0.9 文本协议到 1.0 短连接、1.1 默认持久连接与 pipelining、2 二进制分帧与 HPACK 多路复用、3 QUIC 内嵌 TLS 与独立 stream 可靠交付的完整演进。重点理解每代真正解决的痛点、队头阻塞在应用层/TCP 层/QUIC stream 层的不同表现、HPACK→QPACK 的原因、以及 Server Push 失败后 103 Early Hints 的替代路径。",
   "tags": [
     "HTTP",
     "HTTP/2",
@@ -14,26 +14,31 @@
     "队头阻塞"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 22,
+  "estimatedMinutes": 35,
   "order": 10,
   "recommendWeight": 90,
   "learningCards": [
     {
       "type": "explain",
       "title": "四代 HTTP 各自要解决的痛点",
-      "content": "## HTTP/0.9（1991）：只有 GET 一行\n请求只能 `GET /index.html\\r\\n`，响应只回 HTML 文本，没有 header、状态码、Content-Type，连接收完即关。它定义了请求-响应模型，但无法承载图片、表单、缓存、虚拟主机。\n\n## HTTP/1.0（1996，RFC 1945）：补齐 header 但短连接\n引入状态码、Content-Type、Content-Length、版本号、POST，方法和 header 沿用至今。痛点是默认短连接，每个请求都要 TCP 三次握手 + 慢启动；要复用通常依赖非标准化的 `Connection: keep-alive` 扩展。`Host` 在 1.1 才被强制要求，1.0 时代的虚拟主机能力不完整。\n\n## HTTP/1.1（1997 起，现行核心见 RFC 9110/9112）：keep-alive 默认开 + Host\n默认持久连接、强制 Host 头（让虚拟主机和反向代理成为可能）、Transfer-Encoding: chunked、Range/206、Cache-Control/ETag、100-continue。痛点：管道化（pipelining）虽然允许在一个连接上连续发送多个请求，但响应必须按发出顺序返回，前一个响应慢就阻塞后面所有响应——这就是 HTTP 层队头阻塞。主流浏览器默认关闭 pipelining，转而用多条并发 TCP 连接绕开。\n\n## HTTP/2（2015，现行 RFC 9113；HPACK 见 RFC 7541）：二进制分帧 + 多路复用 + HPACK\n保留 HTTP 语义（方法、状态码、header 名），只改报文层：把请求/响应拆成 HEADERS、DATA、SETTINGS、WINDOW_UPDATE、PUSH_PROMISE 等二进制帧，多个 stream（每对请求-响应一个 stream_id）在同一 TCP 连接上交错传输。HPACK 用静态表（61 项常用 header 如 `:method GET`）+ 动态表 + Huffman 编码压缩 header。解决了 HTTP 层队头阻塞，但 stream 跑在同一条 TCP 上，一旦丢包，TCP 必须按序交付——所有 stream 都要等重传完成，这就是 TCP 层队头阻塞。\n\n## HTTP/3（2022，RFC 9114）：换底座到 QUIC/UDP\nQUIC 在 UDP 之上重做传输层，把 TLS 1.3、拥塞控制、多路复用都内置：每个 stream 有独立的偏移量、重组缓冲和流控状态，丢包只影响该 stream，不再有 TCP 层队头阻塞；首次连接通常 1-RTT 内完成 TLS+传输握手，之前连过的对端可在合适场景启用 0-RTT；用 Connection ID 标识连接，手机从 Wi-Fi 切到 4G 也能保持连接（连接迁移）。HPACK 因依赖严格顺序在 QUIC 下会引入新阻塞，被替换为 QPACK（RFC 9204）。"
+      "content": "HTTP/0.9（1991）只支持 `GET /path\\r\\n`，响应就是裸 HTML 文本，没有 header、状态码、Content-Type，连接收完即关。它确立了请求-响应模型，但没法承载图片、表单、缓存、虚拟主机等任何 Web 需要的能力。\n\nHTTP/1.0（RFC 1945，1996）补齐了状态码、Content-Type、Content-Length、版本号、POST 方法，请求头和响应头从此成为 HTTP 的标配。但它的默认行为是短连接——每个请求走完就关 TCP，下一个请求再三次握手 + 慢启动。浏览器和服务器通过非标准化的 `Connection: keep-alive` 扩展来复用连接，但规范不强制。`Host` 头在 1.0 中是可选的，意味着一台服务器 IP 上跑多个域名（虚拟主机）没有可靠机制。\n\nHTTP/1.1（核心规范见 RFC 9110/9112）把持久连接变成默认行为（`Connection: keep-alive` 不再需要显式声明），强制要求 `Host` 头（虚拟主机和反向代理从此有了基础），引入 `Transfer-Encoding: chunked`（不用提前知道内容长度就能流式传输）、`Range`/`206 Partial Content`（断点续传）、`Cache-Control`/`ETag`（缓存语义更丰富）、`100-continue`（POST 大体前先确认服务端是否接受）。但它在并发模型上开了个口又没开到底：pipelining 允许客户端在同一个连接上连续发出多个请求而不等前一个响应，但服务端必须按请求顺序返回响应。前面一个慢接口（比如复杂查询要 2 秒）会卡住后面所有响应——这就是应用层队头阻塞。主流浏览器实际默认关闭 pipelining，转而靠 6-8 条并发 TCP 连接绕开，但更多连接意味着更多握手、更多 TLS 状态和各自独立的慢启动。\n\nHTTP/2（RFC 9113，2015；HPACK 见 RFC 7541）保留了 HTTP 的全部语义（方法、状态码、头部名、URI），只改报文层：把请求和响应拆成 HEADERS 帧、DATA 帧、SETTINGS 帧、WINDOW_UPDATE 帧、PUSH_PROMISE 帧等二进制结构，每个请求-响应对对应一个 stream（由 stream_id 标识），多个 stream 的帧在同一条 TCP 连接上交错发送。HPACK 压缩头部：静态表（61 项常见 header 如 `:method GET` 的 index 2）直接引用索引，新的 header 加入连接级动态表后续用索引引用，字面量值用 Huffman 编码压缩。应用层队头阻塞被解决，但所有 stream 跑在同一条 TCP 上，TCP 是字节流协议必须按序交付——任何 stream 的一个包丢了，内核就不把后续字节交给应用，所有 stream 跟着等，这就是 TCP 层队头阻塞。弱网、高丢包或跨地域链路上，HTTP/2 的优势可能被抵消甚至反转。\n\nHTTP/3（RFC 9114，2022）换掉底座，在 QUIC/UDP（RFC 9000）上重建传输层。QUIC 把 TLS 1.3（RFC 9001）和拥塞控制内置在协议里，每个 stream 有独立的偏移量空间、重组缓冲和流控状态，stream A 丢包只重传 A 的字节，stream B 直接交付——TCP 层队头阻塞被消除。首次连接 1-RTT 完成 TLS + 传输握手，之前连过的对端可在幂等请求上尝试 0-RTT。用 Connection Connection ID 标识连接（而非 TCP 的五元组），手机从 Wi-Fi 切 4G 也能保持连接。HPACK 依赖严格的发送顺序维护动态表状态，在 QUIC 的乱序 stream 到达场景下会引入新阻塞，被替换为 QPACK（RFC 9204）。"
     },
     {
       "type": "explain",
       "title": "队头阻塞在三层的不同表现",
-      "content": "## HTTP/1.1 应用层队头阻塞\n非管道化时，一条 HTTP/1.1 连接上通常要等前一个响应收完再发下一个请求；管道化虽然可连续发多个请求，但响应仍必须按 FIFO 返回。前面一个慢接口（比如报表）会卡住后面所有静态资源。浏览器长期通过多条并发 TCP 连接、域名分片（sharding）来绕开，但代价是更多握手、更多 TLS 状态和各自慢启动。\n\n## HTTP/2 传输层队头阻塞\n应用层不再阻塞：100 个 stream 可以在同一条 TCP 上帧交错。但 TCP 是按字节流可靠交付，stream A 的某个 DATA 帧落在 seq=10000 丢了，操作系统内核就不会把 seq>10000 的字节交给应用——即便那些字节属于 stream B、C。结果是丢包越明显，HTTP/2 相对 HTTP/1.1 多连接的优势越容易被 TCP 层队头阻塞抵消；弱网下甚至可能更差，因为只有一条 TCP，重传期间所有 stream 都要等。\n\n## HTTP/3 消除 TCP 层队头阻塞\nQUIC 把 stream 概念下沉到传输层，每个 stream 有独立的偏移量和重组缓冲。stream A 丢包，QUIC 只重传 A 的字节，stream B、C 的数据直接交付应用。但要注意：HTTP/3 没有消除业务层队头阻塞——如果你在一个 stream 里塞了一个大对象，那个 stream 内部仍然按序。\n\n## 验证手段\nChrome DevTools Network 面板的 Protocol 列直接看 `h2`/`h3`；`curl --http2 -v` / `curl --http3 -v` 看协商；`nghttp -nv https://...` 看 HTTP/2 帧序列；Wireshark 过滤 `http2` 或 `quic` 看具体帧；`SSLKEYLOGFILE` 需要在启动客户端前设置，才能配合 Wireshark 解密对应 TLS/QUIC 流量。"
+      "content": "**HTTP/1.1 应用层队头阻塞**：非管道化模式下，一条连接上客户端发完请求 1，必须等响应 1 收完才能发请求 2；pipelining 允许连续发请求 1、2、3，但服务端必须按 1→2→3 的顺序返回响应。如果响应 1 因为后端慢查询卡了 2 秒，响应 2 和 3 就得排队等着。浏览器长期靠多条并发 TCP 连接（Chrome 对同一域名开 6 条）和域名分片（sharding，把资源分散到多个域名）来绕开，代价是更多的握手开销、更多的 TLS 会话状态和各自独立的慢启动窗口。\n\n**HTTP/2 TCP 层队头阻塞**：应用层不再阻塞——100 个 stream 的帧可以在同一 TCP 上交错发送。但 TCP 内核实现是按字节流交付的：stream A 的某个 DATA 帧落在 TCP seq=10000 处丢了，内核就不会把 seq>10000 的字节交给应用层，即便那些字节属于 stream B 和 C。结果是丢包率越高，HTTP/2 相对 HTTP/1.1 多连接的优势越容易被抵消；Google 的实验数据显示，丢包率超过约 2% 时，HTTP/2 单连接的性能就开始劣于 HTTP/1.1 的多连接。\n\n**HTTP/3 QUIC stream 层消除 TCP 队头阻塞**：QUIC 在 UDP 上实现了独立的 stream 概念，每个 stream 有自己的字节偏移、重组缓冲和流控窗口。stream A 的包丢了，QUIC 只重传 stream A 的字节，stream B 和 C 的数据可以继续上交应用。但要注意边界：HTTP/3 没有消除业务层队头阻塞——如果你把一个大对象（比如视频）塞在单个 stream 里，这个 stream 内部仍然是按序交付的，前面的字节丢了后面的也得等。正确的做法是把大资源拆到独立 stream，或者用 Range 请求分段拉取。\n\n**验证手段**：Chrome DevTools Network 面板的 Protocol 列可以直接看 `h2` / `h3`；`curl -vso /dev/null https://...` 看 ALPN 协商结果；`nghttp -nv https://...` 看 HTTP/2 帧序列和 stream_id 交错；Wireshark 过滤 `http2` 或 `quic` 抓帧分析；`SSLKEYLOGFILE=/tmp/sslkeys.log` 需要在启动 curl/浏览器前设置环境变量，才能配合 Wireshark 解密 TLS 1.3 或 QUIC 流量。"
+    },
+    {
+      "type": "explain",
+      "title": "HPACK 到 QPACK：头部压缩为什么不能直接搬",
+      "content": "HTTP/1.1 没有头部压缩，每个请求都重复发送完整 header。一个典型请求的 Cookie 就有几百字节，加上 User-Agent、Accept、Referer，头部开销可达 1-2KB。在页面请求数动辄上百的场景下，header 冗余成为显著浪费。\n\nHTTP/2 引入 HPACK（RFC 7541）解决这个问题，由三部分组成：\n\n**静态表**：61 项写死的常见 header，index 2 就是 `:method GET`，index 8 就是 `:status 200`，index 14 就是 `content-type: application/json`。发送端只需发一个索引号，接收端查表还原，零字节负载。\n\n**动态表**：连接级别的，当发送端发出一个静态表里没有的 header（比如 `cookie: session=abcd1234`），它会加到动态表并分配 index。同一个连接后续再发这个 header，只需发索引号。动态表的大小通过 SETTINGS 帧的 SETTINGS_HEADER_TABLE_SIZE 协商（默认 4096 字节），超出时用 LRU 策略淘汰最旧的条目。\n\n**Huffman 编码**：对字面量值做 RFC 7541 定义的静态 Huffman 压缩，大约能压缩 20-30%。\n\nHPACK 的核心约束是：动态表的更新和引用必须严格按发送顺序解码。因为每次 HEADERS 帧可能往动态表里加新条目，解码端必须按序处理，否则 index 含义会错。这在 TCP 上完全没问题——TCP 保证按序交付。\n\n但 QUIC 把多路复用下沉到传输层，stream 可以乱序到达。如果 HTTP/3 还用 HPACK，stream 2 的 HEADERS 帧引用了 stream 1 刚加进动态表的 index，但 stream 1 的 HEADERS 帧还没到，stream 2 就得阻塞等——又退回到队头阻塞。\n\nQPACK（RFC 9204）用两个单向流解耦这个顺序依赖：**编码器流**专门发动态表的插入指令（加新条目、确认接收），**解码器流**专门发确认。请求流的 HEADERS 帧只引用已确认的动态表 index 或发出字面量；如果动态表条目还没确认，编码端可以选择不引用而用字面量。这样 stream 的乱序到达就不会导致 header 解码阻塞。代价是 QPACK 的压缩率通常比 HPACK 略低，因为字面量比例更高。"
     },
     {
       "type": "diagram",
       "title": "HTTP 演进主线：连接复用、分帧与队头阻塞",
       "format": "mermaid",
       "content": "flowchart LR\nH09[HTTP/0.9: GET + HTML + 短连接] --> H10[HTTP/1.0: Header / 状态码 / Content-Type]\nH10 -->|每请求新建连接, 握手和慢启动昂贵| H11[HTTP/1.1: keep-alive + Host + chunked]\nH11 -->|pipelining 响应必须 FIFO| HOL1[应用层队头阻塞]\nH11 --> H2[HTTP/2: 二进制分帧 + stream 多路复用 + HPACK]\nHOL1 --> H2\nH2 -->|同一 TCP 字节流丢包必须按序交付| HOL2[TCP 层队头阻塞]\nH2 --> H3[HTTP/3: QUIC/UDP + TLS 1.3 + QPACK]\nHOL2 --> H3\nH3 --> STREAM[每个 QUIC stream 独立重组和流控]\nH3 --> CID[Connection ID 支持移动端切网迁移]\nH3 --> FALL[UDP 不通时通过 Alt-Svc 回退 h2]\nH2 --> PUSH[Server Push 实践失败, 转向 103 Early Hints / preload]",
-      "caption": "这张图用一条演进线串起每代真正解决的问题：1.1 解决短连接成本但留下应用层 FIFO；2 解决应用层阻塞但受 TCP 丢包拖累；3 把 stream 下沉到 QUIC，并带来连接迁移和 h2 回退问题。",
+      "caption": "HTTP 演进主线：1.0 补齐 header 但短连接昂贵；1.1 默认 keep-alive 解决连接复用，但 pipelining 受 FIFO 响应约束留下应用层队头阻塞；2 用二进制分帧和 stream 复用解决应用层阻塞，但受 TCP 字节流按序交付拖累；3 用 QUIC/UDP 把 stream 可靠交付下沉到传输层，并带来 Connection ID 连接迁移和 Alt-Svc 回退机制。",
       "fallback": "HTTP 演进主线：1.0 补齐 header 但短连接昂贵；1.1 默认 keep-alive，但 pipelining 受 FIFO 响应约束；HTTP/2 用二进制分帧和 stream 复用解决应用层队头阻塞；HTTP/3 用 QUIC/UDP 解决 TCP 层队头阻塞，并通过 Connection ID 支持迁移、通过 Alt-Svc 保留回退。",
       "sources": [
         {
@@ -49,48 +54,48 @@
     {
       "type": "compareTable",
       "title": "四代 HTTP 关键能力对比",
-      "content": "| 维度 | HTTP/1.0 | HTTP/1.1 | HTTP/2 | HTTP/3 |\n| --- | --- | --- | --- | --- |\n| 连接模型 | 默认短连接，keep-alive 是扩展 | 默认持久连接，pipelining 实践上很少启用 | 单 TCP 多 stream 多路复用 | QUIC/UDP，每 stream 独立 |\n| 报文格式 | 文本，行分隔 | 文本，chunked 分块 | 二进制分帧（HEADERS/DATA/SETTINGS） | QUIC stream 内承载 HTTP/3 帧 |\n| 头部压缩 | 无 | 无 | HPACK（静态表 61 项 + 动态表 + Huffman） | QPACK（用单向流解耦动态表顺序依赖） |\n| 队头阻塞 | 连接级（每请求新连接） | 应用层（响应必须按序） | TCP 层（丢包卡所有 stream） | TCP 层已消除，业务层仍可能 |\n| 握手成本 | TCP 1-RTT | TCP 1-RTT，HTTPS 还要 TLS 握手 | TCP 1-RTT + TLS 握手，复用后收益明显 | QUIC+TLS 1.3 合并 1-RTT，复访可在幂等场景用 0-RTT |\n| 多路复用 | 不支持 | 不支持（pipelining 不是并行响应） | 支持 | 支持，且无 TCP 队头阻塞 |\n| 服务端推送 | 无 | 无 | PUSH_PROMISE（浏览器支持基本退出） | 协议保留但实现普遍不启用 |\n| 加密 | 可选（HTTP） | 可选（HTTPS 走 TLS） | 规范允许明文 h2c，但浏览器实践依赖 TLS+ALPN | QUIC 内建 TLS 1.3 保护 |\n| 连接迁移 | 不支持 | 不支持 | 不支持（依赖五元组） | 支持（Connection ID 解耦五元组） |\n| 关键 RFC | RFC 1945 | RFC 9110 / 9112 | RFC 9113 / 7541 | RFC 9114 / 9000 / 9001 / 9204 |"
+      "content": "| 维度 | HTTP/1.0 | HTTP/1.1 | HTTP/2 | HTTP/3 |\n| --- | --- | --- | --- | --- |\n| 连接模型 | 默认短连接，keep-alive 是扩展 | 默认持久连接；pipelining 实践上很少启用 | 单 TCP 多 stream 多路复用 | QUIC/UDP，每 stream 独立可靠交付 |\n| 报文格式 | 文本行分隔 | 文本，chunked 分块传输 | 二进制分帧（HEADERS/DATA/SETTINGS/WINDOW_UPDATE） | QUIC stream 内承载 HTTP/3 帧 |\n| 头部压缩 | 无 | 无 | HPACK（静态表 61 项 + 动态表 + Huffman） | QPACK（编码器/解码器单向流解耦顺序依赖） |\n| 队头阻塞 | 连接级（每请求新建连接） | 应用层（pipelining 响应必须按序） | TCP 层（丢包卡所有 stream） | TCP 层已消除；业务层若大对象塞单 stream 仍可能 |\n| 握手成本 | TCP 1-RTT | TCP 1-RTT，HTTPS 额外 TLS 往返 | TCP 1-RTT + TLS 握手，复用后收益大 | QUIC+TLS 1.3 合并 1-RTT，幂等请求可尝试 0-RTT |\n| 多路复用 | 不支持 | 不支持（pipelining 不是并行响应） | 支持，stream 帧交错 | 支持且无 TCP 队头阻塞 |\n| 服务端推送 | 无 | 无 | PUSH_PROMISE（Chrome 2022 已移除） | 协议保留但实现普遍不启用 |\n| 加密 | 可选 | 可选（HTTPS 走 TLS） | 规范允许 h2c 明文，但浏览器依赖 TLS+ALPN | QUIC 内建 TLS 1.3，无法关闭 |\n| 连接迁移 | 不支持 | 不支持 | 不支持（TCP 五元组绑定） | 支持（Connection ID 解耦五元组） |\n| 关键 RFC | RFC 1945 | RFC 9110 / 9112 | RFC 9113 / 7541 | RFC 9114 / 9000 / 9001 / 9204 |"
     },
     {
       "type": "code",
       "title": "用 curl 和 nghttp 观测协议差异",
-      "content": "# 0. 如需用 Wireshark 解密 TLS/QUIC，先设置 key log，再启动 curl 或浏览器\nexport SSLKEYLOGFILE=/tmp/sslkeys.log\n\n# 1. 看 ALPN 协商出哪一代\ncurl -vso /dev/null https://www.cloudflare.com 2>&1 | grep -Ei 'ALPN|HTTP/'\n# 关注 server accepted h2 / HTTP/2，说明 TLS ALPN 协商到 h2\n\n# 2. 强制 HTTP/1.1，确认没有 HTTP/2 stream 多路复用\ncurl --http1.1 -vso /dev/null https://www.example.com/ 2>&1 | grep -Ei 'ALPN|HTTP/'\n\n# 3. HTTP/2 多路复用：两个请求会在同一连接上分配不同 stream_id\nnghttp -nv https://nghttp2.org/httpbin/get https://nghttp2.org/httpbin/headers\n# 关注 send HEADERS frame <stream_id=1/3> 与 recv DATA frame <stream_id=...> 的交错\n\n# 4. HPACK 观察：同一连接内重复 header 会转成索引或动态表引用\nnghttp -nv -H 'cookie: session=abcd' https://nghttp2.org/ https://nghttp2.org/\n# 不要死背压缩字节数，重点看 HEADERS frame、indexed representation、dynamic table\n\n# 5. HTTP/3 协商（curl 需带 ngtcp2/nghttp3、quiche 等 HTTP/3 支持）\ncurl --http3 -vso /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>&1 | grep -Ei 'HTTP/3|h3|QUIC'\n# UDP 443 不通或 curl 不支持 h3 时，应回退验证 --http2\n\n# 6. 抓包：Wireshark 过滤 http2 或 quic；QUIC 解密依赖第 0 步的 SSLKEYLOGFILE\n# HTTP/2 看 stream_id、RST_STREAM、WINDOW_UPDATE；HTTP/3 看 QUIC stream、CRYPTO、ACK、RESET_STREAM",
+      "content": "# 0. 如需用 Wireshark 解密 TLS/QUIC 流量，先设置 key log 文件路径\nexport SSLKEYLOGFILE=/tmp/sslkeys.log\n\n# 1. 查看 ALPN 协商结果：h2 表示 HTTP/2，无 ALPN 基本降到 HTTP/1.1\ncurl -vso /dev/null https://www.cloudflare.com 2>&1 | grep -Ei 'ALPN|HTTP/'\n\n# 2. 强制 HTTP/1.1，确认降级（无 stream_id、无二进制帧）\ncurl --http1.1 -vso /dev/null https://www.example.com/ 2>&1 | grep -Ei 'ALPN|HTTP/'\n\n# 3. HTTP/2 多路复用验证：两个请求在同一连接分配不同 stream_id\nghttp -nv https://nghttp2.org/httpbin/get https://nghttp2.org/httpbin/headers\n# 重点看 send HEADERS frame <stream_id=1> 与 <stream_id=3> 的 DATA 帧是否交错返回\n\n# 4. HPACK 观察：同一连接内重复 header 会被动态表索引化\nnghttp -nv -H 'cookie: session=abcd' https://nghttp2.org/ https://nghttp2.org/\n# 第二个请求的 cookie 通常会变成 indexed representation，HEADERS 帧负载明显更小\n\n# 5. HTTP/3 协商验证（curl 需编译时启用 ngtcp2/nghttp3 或 quiche）\ncurl --http3 -vso /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>&1 | grep -Ei 'HTTP/3|h3|QUIC'\n# UDP 443 不通或工具不支持时，回退 --http2 验证降级路径\n\n# 6. Wireshark 抓包：HTTP/2 过滤 http2 看 stream_id/RST_STREAM/WINDOW_UPDATE\n# HTTP/3 过滤 quic 看 QUIC stream/CRYPTO/ACK/RESET_STREAM 帧\n# QUIC 解密依赖第 0 步的 SSLKEYLOGFILE",
       "language": "bash",
       "highlights": [
         {
-          "line": 5,
-          "note": "ALPN 是 TLS 握手里协商应用层协议的扩展，h2/h3 都靠它选版本；看不到 ALPN 基本就是降到 HTTP/1.1。"
+          "line": 4,
+          "note": "SSLKEYLOGFILE 必须在启动 curl/浏览器前设置，才能让 Wireshark 拿到 TLS 1.3/QUIC 的会话密钥解密流量。"
         },
         {
-          "line": 12,
-          "note": "看 stream_id 交错就能确认多路复用真的发生：stream 3 的 DATA 早于 stream 1 返回，说明响应不再 FIFO。"
+          "line": 11,
+          "note": "看 stream_id 交错：stream 3 的 DATA 帧在 stream 1 的响应之前返回，证明多路复用真正生效、响应不再 FIFO。"
         },
         {
-          "line": 17,
-          "note": "HPACK 动态表是同一连接内有效；连接断开后表清空，所以短连重连场景看不到压缩收益。"
+          "line": 15,
+          "note": "HPACK 动态表是连接级别的，连接断开后清空；短连接重连场景看不到压缩收益。"
         },
         {
-          "line": 22,
-          "note": "HTTP/3 验证依赖客户端编译能力、UDP 443 连通性和服务端 Alt-Svc；失败时先区分本地工具不支持、网络丢 UDP、服务端未开启三类原因。"
+          "line": 19,
+          "note": "HTTP/3 验证失败的三类原因：本地 curl 不支持 h3（编译问题）、UDP 443 被丢（网络/防火墙）、服务端未开启 h3（Alt-Svc 缺失）。分别排查。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答：HTTP 协议演进",
-      "content": "30 秒结论：HTTP 一路演进的主线就是怎么把多个请求塞进更少的连接、又不互相阻塞。0.9 只有 GET，1.0 补齐 header 和方法但默认短连接，1.1 默认 keep-alive 加 Host 但 pipelining 卡在响应必须按序导致 HTTP 层队头阻塞，2 用二进制分帧和多路复用解决应用层阻塞同时用 HPACK 压缩 header，但只要丢包仍会触发 TCP 层队头阻塞，3 换到 QUIC/UDP，每个 stream 独立可靠交付，并把 TLS 1.3 内嵌实现 1-RTT 握手、受限 0-RTT 和连接迁移。\n\n机制要点：\n- 关键机制：HTTP/2 的二进制分帧把请求拆成 HEADERS 帧和 DATA 帧带上 stream_id，多个 stream 在一条 TCP 上交错；HPACK 用静态表（61 个常见 header 索引）加动态表加 Huffman 编码压缩头部。HTTP/3 的 QUIC 把多路复用下沉到传输层，每个 stream 有自己的重传和流控状态，stream A 丢包不会卡 stream B。\n- 队头阻塞分三层看：1.1 是应用层 FIFO 响应，2 是传输层 TCP 字节流必须按序，3 在 TCP 层消除但业务层若把大对象塞一个 stream 仍可能卡。\n- 选型边界：稳定内网、低丢包或 UDP 受限环境里 HTTP/2 已经足够；移动网络、跨地域、弱网下 HTTP/3 更值得试，但需要 CDN/网关支持 UDP 443，部分企业出口防火墙会丢 UDP，要用 Alt-Svc 做 h2 回退。HTTP/2 Server Push 因为命中率低、易污染浏览器缓存，浏览器支持基本退出，现在主流是 103 Early Hints + preload。",
+      "content": "**30 秒结论**：HTTP 演进主线就是把多个请求塞进更少连接、又不互相阻塞。1.0 补齐 header 但默认短连接，1.1 默认 keep-alive 加强制 Host 但 pipelining 受 FIFO 响应约束导致应用层队头阻塞，2 用二进制分帧和 stream 多路复用解决应用层阻塞同时用 HPACK 压缩头部，但丢包时 TCP 按序交付会卡所有 stream，3 换到 QUIC/UDP 让每个 stream 独立可靠交付并把 TLS 1.3 内嵌实现 1-RTT 握手和连接迁移。\n\n**机制要点**：\n- **HTTP/2 分帧**：请求拆成 HEADERS 帧（带 stream_id）和 DATA 帧，多个 stream 的帧在一条 TCP 上交错传输。HPACK 用静态表（61 项常用 header 索引）+ 连接级动态表 + Huffman 编码，同一连接第二次发同样 Cookie 只需发索引号。\n- **队头阻塞分三层**：1.1 是应用层 FIFO——响应必须按请求顺序返回；2 是 TCP 字节流按序交付——任意 stream 的一个包丢了所有 stream 都卡；3 在 TCP 层消除但业务层若把大对象塞一个 stream 内部仍按序。\n- **HPACK→QPACK**：HPACK 动态表按发送顺序维护，QUIC stream 乱序到达时引用未到条目会阻塞。QPACK 用编码器流/解码器流单向流解耦顺序依赖，请求流只引用已确认的 index。\n- **选型边界**：稳定内网、低丢包、UDP 受限环境 HTTP/2 够用；移动网络、跨地域弱网 HTTP/3 更值得，但需 CDN/网关支持 UDP 443，部分企业防火墙会丢 UDP，需 Alt-Svc 回退 h2。HTTP/2 Server Push 因命中率低、易污染缓存已被 Chrome 移除，替代方案是 103 Early Hints + preload。",
       "followUpQuestions": [
         {
-          "question": "HTTP/2 已经多路复用了，为什么还要 HTTP/3？多路复用不是已经解决队头阻塞了吗？",
-          "answer": "HTTP/2 只解决了应用层队头阻塞——多个 stream 可以在一条 TCP 上交错发送。但 TCP 本身是按字节流可靠交付，只要任意一个 stream 的某个包丢了，TCP 内核缓冲区就会卡住后面所有字节，等重传完成才上交应用，导致其他 stream 跟着停。这就是 TCP 层队头阻塞。弱网、高丢包或跨地域链路上，HTTP/2 相对 HTTP/1.1 多连接的优势可能被抵消。HTTP/3 把可靠交付下沉到 QUIC 的 stream 粒度，stream A 丢包只重传 A 的字节，stream B 直接交付，消除 TCP 层阻塞。另外 QUIC 还顺带做了 1-RTT 握手、受限 0-RTT、连接迁移（Connection ID 而非五元组）这些 TCP 改不动的事。"
+          "question": "HTTP/2 已经多路复用了，为什么还要 HTTP/3？",
+          "answer": "HTTP/2 只解决了应用层队头阻塞——多个 stream 可以在一条 TCP 上交错。但 TCP 是字节流协议，必须按序交付：stream A 的一个包丢了，内核就不把 seq>丢包位置的字节交给应用，stream B 和 C 的数据也被卡住，等重传完成才恢复。这就是 TCP 层队头阻塞。弱网或跨地域链路丢包率高时，HTTP/2 单连接可能比 HTTP/1.1 多连接更慢。HTTP/3 的 QUIC 把可靠交付下沉到 stream 粒度，stream A 丢包只重传 A，stream B 直接交付，消除了 TCP 层阻塞。另外 QUIC 顺带内嵌 TLS 1.3 实现 1-RTT 握手，支持 Connection ID 连接迁移（切 Wi-Fi/4G 不断连），这些是 TCP 层改不动的。"
         },
         {
           "question": "HPACK 是怎么工作的？为什么 HTTP/3 要换成 QPACK？",
-          "answer": "HPACK 三件套：静态表（61 个写死的常用 header，比如 index 2 是 :method GET，index 8 是 :status 200）、动态表（连接级别，新见到的 header 加进去后续用索引引用）、Huffman 编码（对字面量做静态 Huffman 压缩）。同一连接里第二次发同样的 cookie，header 字面量通常会转成索引或动态表引用，抓帧时能看到 HEADERS 帧负载明显变小。但 HPACK 编码必须严格按发送顺序解码，因为动态表的状态依赖前面 HEADERS 帧。在 QUIC 上 stream 是乱序到达的，如果还用 HPACK，stream 2 想用 stream 1 刚加进动态表的项，就得阻塞等 stream 1 的 header 帧到达——又退回队头阻塞。QPACK 把动态表的更新放在专门的单向流上，请求流只引用已确认的索引项，解耦了顺序依赖。"
+          "answer": "HPACK 三件套：静态表 61 项（index 2 是 `:method GET`，index 8 是 `:status 200`）直接引用索引零字节；动态表是连接级的，新 header 加进去后续用索引；字面量值用 Huffman 编码压缩约 20-30%。同一连接第二次发同样的 Cookie 通常变成索引引用，HEADERS 帧负载大幅减小。但 HPACK 动态表按发送顺序维护——stream 2 引用了 stream 1 刚加的动态表条目，stream 1 的 HEADERS 帧没到时 stream 2 必须阻塞等待。在 QUIC 上 stream 乱序到达是常态，这会重新引入队头阻塞。QPACK 用编码器流发插入指令、解码器流发确认，请求流只引用已确认的 index，解耦了顺序依赖。代价是压缩率比 HPACK 略低。"
         },
         {
           "question": "实际部署 HTTP/3 时遇到过哪些坑？怎么排查？",
-          "answer": "常见三类坑。一是 UDP 被丢：企业出口、运营商或老防火墙会限速或直接丢 UDP 443，表现是 curl --http3 超时但 --http2 正常；定位靠抓包看 Initial 包是否离开本机、对端是否回 ACK，回退方案是服务端配置 Alt-Svc 让客户端降级到 h2。二是 0-RTT 重放风险：0-RTT 数据可被重放，必须只在幂等请求（GET）上启用，POST 走 1-RTT。三是连接迁移导致的中间设备问题：Connection ID 切换网络时，运营商 NAT 表如果不识别 QUIC 会丢包；可以在监控里看 quic_connection_migration 计数、对比有无迁移的请求时延 P99。观测工具用 qlog（QUIC 标准日志格式）+ qvis 可视化，比 tcpdump 直观。"
+          "answer": "三类常见坑。一是 UDP 被丢：企业出口防火墙、运营商或老设备会限速或丢弃 UDP 443，表现是 `curl --http3` 超时但 `--http2` 正常。排查抓包看 QUIC Initial 包是否离开本机、对端是否回 ACK，回退是服务端配 Alt-Svc 让客户端降级 h2。二是 0-RTT 重放：0-RTT 数据可被网络重放，必须只在幂等请求（GET）上启用，POST/写操作走 1-RTT。三是连接迁移中间设备问题：Connection ID 切换时运营商 NAT 表不识别 QUIC 新 CID 会丢包，监控里看 `connection_migration` 计数和有无迁移的 P99 时延差异。工具用 qlog（QUIC 标准日志格式）配合 qvis 可视化，比 tcpdump 直观得多。"
         }
       ]
     },
@@ -98,14 +103,14 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "0.9/1.0/1.1/2/3 各代解决了上一代的什么痛点",
-        "HTTP/1.1 keep-alive 和 pipelining 的区别，pipelining 为什么没普及",
-        "HTTP/2 二进制分帧的 stream/HEADERS/DATA 帧关系",
-        "HPACK 的静态表、动态表、Huffman 三件套",
-        "队头阻塞在应用层、TCP 层、QUIC stream 层的不同表现",
-        "QUIC 的 1-RTT/0-RTT 握手和连接迁移机制",
-        "为什么 HTTP/3 要把 HPACK 替换成 QPACK",
-        "Alt-Svc、ALPN 在协议协商和回退中的作用"
+        "能按 0.9→1.0→1.1→2→3 顺序说明每代解决了上一代的什么核心痛点",
+        "能区分 keep-alive（连接复用）和 pipelining（连续发请求但响应必须按序），解释 pipelining 为什么没普及",
+        "能解释 HTTP/2 二进制分帧中 stream/HEADERS/DATA 帧的关系，以及 stream_id 如何标识请求-响应对",
+        "能说清 HPACK 静态表（61 项）、连接级动态表、Huffman 编码三件套各自的分工和压缩效果",
+        "能分清队头阻塞在应用层（1.1 FIFO）、TCP 层（2 字节流按序）、QUIC stream 层（3 已消除但业务层仍可能）的不同表现",
+        "能解释 QUIC 的 1-RTT/0-RTT 握手机制、Connection ID 连接迁移原理",
+        "能说明 HPACK 因顺序依赖在 QUIC 下会阻塞而被 QPACK 替代的原因",
+        "能解释 ALPN 协商 h2/h3 的作用和 Alt-Svc 回退降级机制"
       ]
     }
   ],
@@ -137,26 +142,42 @@
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
+    },
+    {
+      "id": "network.http-https.topic-http-evolution.recall.5",
+      "prompt": "你们的 CDN 要从 HTTP/2 升级到 HTTP/3，但企业客户反馈 UDP 443 不通。你怎么排查、怎么设计回退？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "network.http-https.topic-http-evolution.recall.6",
+      "prompt": "弱网丢包率 5% 的场景下，HTTP/2 单连接 vs HTTP/1.1 六连接 vs HTTP/3 各自的吞吐表现大概是什么关系？为什么？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "四代版本的核心改进：1.0 短连接+header、1.1 keep-alive+Host、2 二进制分帧+多路复用+HPACK、3 QUIC+QPACK",
-      "队头阻塞分层定位：1.1 应用层 FIFO、2 TCP 字节流按序、3 QUIC stream 独立",
-      "HTTP/2 二进制分帧的 stream/HEADERS/DATA 帧概念，以及 HPACK 静态表+动态表+Huffman 三件套",
-      "HTTP/3 基于 QUIC 的 1-RTT/0-RTT 握手和 Connection ID 连接迁移"
+      "四代版本的核心改进：1.0 短连接+header、1.1 默认 keep-alive+强制 Host、2 二进制分帧+stream 多路复用+HPACK、3 QUIC 内嵌 TLS 1.3+独立 stream+QPACK",
+      "队头阻塞分层定位：1.1 应用层 FIFO 响应、2 TCP 字节流按序交付卡所有 stream、3 QUIC stream 独立重组但业务层仍可能",
+      "HTTP/2 二进制分帧中 stream/HEADERS/DATA 帧概念和 HPACK 静态表+动态表+Huffman 三件套分工",
+      "HTTP/3 QUIC 的 1-RTT 握手、Connection ID 连接迁移、Alt-Svc 回退降级"
     ],
     "goodToHave": [
-      "QPACK 与 HPACK 在动态表更新机制上的差异（解耦顺序依赖）",
-      "HTTP/2 Server Push 已被 Chrome 弃用、由 103 Early Hints + preload 替代",
-      "弱网/丢包场景下 HTTP/2 vs HTTP/3 vs HTTP/1.1 多连接的实测差异",
-      "ALPN 协商、Alt-Svc 降级在生产环境中的作用"
+      "QPACK 用编码器流/解码器流解耦动态表顺序依赖的机制",
+      "HTTP/2 Server Push 已被 Chrome 移除，103 Early Hints + preload 是替代方案",
+      "弱网丢包场景下 HTTP/2 单连接 vs HTTP/1.1 多连接的性能反转（约 2% 丢包率是转折点）",
+      "ALPN 协商 h2/h3、Alt-Svc 降级在生产环境中的具体配置和作用",
+      "QUIC 0-RTT 的重放风险以及只在幂等请求上启用的限制"
     ],
     "commonMistakes": [
-      "把 keep-alive 和 pipelining 混为一谈，认为 1.1 已经支持并行请求",
-      "认为 HTTP/2 多路复用彻底解决了队头阻塞，忽视 TCP 层仍会阻塞",
-      "把 HTTP/3 等同于 HTTP/2 over UDP，忽略它内嵌 TLS 1.3 和 stream 独立可靠交付",
-      "把 HPACK 描述成普通 gzip 压缩，没说出静态表+动态表+Huffman 的分工"
+      "把 keep-alive 和 pipelining 混为一谈，认为 1.1 已经支持并行响应",
+      "认为 HTTP/2 多路复用彻底解决了队头阻塞，忽视 TCP 字节流按序交付的限制",
+      "把 HTTP/3 等同于 HTTP/2 over UDP，忽略 QUIC 内嵌 TLS 1.3 和 stream 独立可靠交付",
+      "把 HPACK 描述成 gzip 之类的通用压缩，没说出静态表索引+动态表连接级复用+Huffman 三件套分工",
+      "混淆 HTTP/2 Server Push（已弃用）和 103 Early Hints（服务端提示、浏览器决定拉取）"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -165,8 +186,8 @@
       "depth": 15
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "interviewFrequency": "high",
-  "interviewerFocus": "看候选人能不能把四代 HTTP 的核心痛点串起来：1.1 keep-alive 与 pipelining 的区别、HTTP/2 二进制分帧与 HPACK、HTTP/3 QUIC 如何消除 TCP 层队头阻塞，以及在弱网或企业出口下的回退策略。"
+  "interviewerFocus": "看候选人能否把四代 HTTP 的核心痛点串成一条线：1.1 keep-alive 解决短连接但 pipelining 的 FIFO 响应留下应用层队头阻塞；HTTP/2 二进制分帧+HPACK 解决应用层阻塞但 TCP 字节流按序交付留下传输层队头阻塞；HTTP/3 QUIC 把 stream 可靠交付下沉到传输层消除 TCP 阻塞并带来连接迁移；以及 HPACK→QPACK 的原因、Server Push 失败后的 103 Early Hints、弱网下的协议选择和 UDP 不通时的回退策略。"
 }

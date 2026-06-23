@@ -4,31 +4,41 @@
   "category": "jvm",
   "group": "jvm",
   "title": "GC Roots 与引用类型",
-  "summary": "用 GC Roots 可达性判断对象生死；用强、软、弱、虚四种引用描述对象只剩特定引用可达时的清理时机，并能落到 ThreadLocal 泄漏和 heap dump 引用链排查。",
+  "summary": "用 GC Roots 可达性判断对象生死；用强、软、弱、虚四种引用描述对象只剩特定引用可达时的清理时机，理解 Reference 阶段在 GC 中的位置；落到 ThreadLocal 泄漏链路和 heap dump 引用链排查。",
   "tags": [
     "Java",
     "JVM",
     "GC Roots 与引用类型"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 32,
+  "estimatedMinutes": 35,
   "order": 40,
   "recommendWeight": 88,
   "learningCards": [
     {
       "type": "explain",
-      "title": "对象为什么还活着",
-      "content": "JVM 判断对象是否可回收，主线不是“引用计数为 0”，而是从一组 GC Roots 出发做可达性分析。只要从根集合沿引用链能到达对象，该对象就是存活对象；如果整块对象图从根集合不可达，即使内部互相引用，也会进入回收候选。\n\n常见 GC Roots 可以按“运行中仍被 VM 认为正在使用”来记：线程栈帧中的局部变量和操作数栈引用、类相关的 Class 镜像和静态字段引用、JNI native 引用、JVM 内部结构引用、被 synchronized monitor 持有的对象，以及 JMX/JVMTI 等运行时设施持有的引用。实际根集合会受虚拟机实现、收集器阶段和运行时状态影响，面试里要讲分类，不要把某个列表背成固定全集。\n\n这里有两个容易说错的边界。第一，强引用可达时对象不会被回收；如果强引用链断了，对象当然可以回收，所以不能说“强引用对象不会回收”。第二，GC Roots 是引用链起点，引用类型决定的是对象只剩软、弱、虚这类引用可达时，GC 如何处理它。两者合在一起，才能解释“为什么这个对象还活着”。"
+      "title": "对象为什么还活着：可达性分析与根集合",
+      "content": "JVM 判断对象是否可回收的主线是 GC Roots 可达性分析，而不是引用计数。引用计数无法处理循环引用（两个对象互相引用但外部已不可达时，计数都不为 0），可达性分析从根集合出发遍历对象图，只要从根沿引用链能到达对象，该对象就存活；整体不可达的对象进入回收候选。\n\nGC Roots 的本质是「VM 认为此刻仍在使用的对象起点」。具体来源会因虚拟机实现、收集器和运行时状态而变化，但主要类别包括：\n\n1. **线程栈帧引用**：正在执行的方法的局部变量和操作数栈上的对象引用。\n2. **类元数据引用**：Class 镜像对象（`java.lang.Class`）、静态字段引用的对象。\n3. **JNI 引用**：native 代码通过 JNI 函数持有的全局/局部引用。\n4. **JVM 内部引用**：异常处理器、类加载器、JIT 编译器缓存等运行时设施持有的引用。\n5. **同步锁引用**：被 synchronized monitor 持有的对象。\n6. **运行时设施**：JMX、JVMTI agent、注册的 finalizer 队列（Java 8 前）等持有的引用。\n\n面试时不要背成固定清单，应说明「根集合是 VM 认为正在使用的一组起点，具体包含什么取决于实现和运行状态」。\n\n两个容易说错的边界：第一，「强引用可达时对象不回收」不等于「强引用对象永远不回收」，强引用链断开后对象当然可以回收。第二，GC Roots 是可达性分析的起点，而引用类型（强/软/弱/虚）决定的是对象只剩特定引用可达时 GC 如何处理它——两者是不同层次的概念。"
     },
     {
       "type": "explain",
       "title": "四种引用的清理时机与工程选型",
-      "content": "强引用就是普通对象引用，例如局部变量、字段、集合元素。强引用可达时对象保活，真实泄漏也常来自静态集合、长生命周期缓存、线程对象或 ClassLoader 还持有业务对象。\n\nSoftReference 描述「可以丢，但丢了能重建」的对象。HotSpot 的清理策略由 `-XX:SoftRefLRUPolicyMSPerMB`（默认 1000ms/MB）控制：堆剩余空间越小，软引用存活时间越短。它不适合承诺命中率或过期时间。工程上做缓存更常用 Caffeine（W-TinyLFU 算法）、Redis 或带容量/TTL 的缓存；软引用更像 JVM 兜底策略，而不是完整缓存方案。\n\nWeakReference 描述「不影响目标对象生命周期」的关联关系。只剩弱引用可达时，目标会在后续 GC 的引用处理阶段被清理，WeakHashMap 的 key 就是典型例子——它的 `expungeStaleEntries` 在每次访问 map 时触发清理。弱引用适合做对象元数据、监听器弱关联等，但 value 或回调里如果反向强引用 key，仍然会把对象保活。\n\nPhantomReference 不能通过 `get()` 取回对象（始终返回 null），主要和 ReferenceQueue 配合，用来在对象进入可清理状态后收到通知。它适合堆外资源、native handle、DirectByteBuffer/Cleaner 这类「Java 对象死亡后还要释放非堆资源」的场景。Java 9 引入 `java.lang.ref.Cleaner`，是 PhantomReference 的官方封装，替代了被标记为 deprecated 的 `finalize()`。\n\n引用处理发生在 GC 末尾，是 STW 的一部分；ReferenceQueue 的入队时机不是确定时刻，依赖 GC 触发。生产中不要用 `System.gc()` 试图强制清理软/弱引用——它只是建议，G1/ZGC 可能直接忽略，且会触发 Full GC 停顿。"
+      "content": "**强引用**就是普通对象引用（局部变量、字段、集合元素）。只要从 GC Roots 沿强引用链可达，对象就不会被回收。真实泄漏常来自 static 集合、长生命周期缓存、线程对象或 ClassLoader 持有业务对象。注意：强引用是唯一能让对象「保活」的引用；软/弱/虚引用都不是保活语义。\n\n**SoftReference** 描述「可以丢，但能重建」的对象。HotSpot 的清理策略由 `-XX:SoftRefLRUPolicyMSPerMB`（默认 1000）控制：上次 GC 后存活的秒数 × 堆空闲 MB 与该阈值比较，空闲越少越可能清理。软引用不适合稳定缓存——它没有容量控制、淘汰策略和命中率保证。工程上做缓存更常用 Caffeine（W-TinyLFU）、Redis 或带容量/TTL 的本地缓存；软引用更像 JVM 层面的兜底降级，不是完整方案。\n\n**WeakReference** 描述「不影响目标对象生命周期」的关联关系。只剩弱引用可达时，目标在该次 GC 的引用处理（Reference Processing）阶段被清除。WeakHashMap 的 key 是典型：`expungeStaleEntries` 在每次 get/put/size 时触发清理，所以批量失效的 entry 不会立即释放，而是在后续访问时逐步清理。弱引用适合对象元数据、监听器弱关联等，但如果 value 或回调里反向强引用了 key，对象仍被保活。\n\n**PhantomReference** 不能通过 `get()` 取回对象（始终返回 null），必须配合 ReferenceQueue。对象进入 finalizable 或 phantom-reachable 状态后，Reference 对象被入队，后台线程可据此释放堆外资源、native handle 等。Java 9 引入 `java.lang.ref.Cleaner` 作为 PhantomReference 的官方封装，替代了 deprecated 的 `finalize()`。DirectByteBuffer 的 Cleaner 就是用这个机制释放堆外内存。\n\n引用处理发生在 GC 标记完成后、清除或压缩前的 Reference Processing 阶段，是 STW 的一部分。ReferenceQueue 的入队时机不保证在某个确定时刻，依赖 GC 触发。不要用 `System.gc()` 强制清理软/弱引用——它只是建议，G1/ZGC 可能忽略或仅触发轻量 GC。"
     },
     {
       "type": "explain",
-      "title": "ThreadLocal 泄漏与排查口径",
-      "content": "ThreadLocalMap 的 Entry key 是 ThreadLocal 的弱引用，value 是强引用。弱 key 能避免 ThreadLocal 对象自身被永久挂住，但不能自动释放 value：当外部不再强引用 ThreadLocal 时，key 可能被清理成 null；如果线程还活着，Entry 和 value 仍挂在 Thread 的 ThreadLocalMap 上，直到后续访问触发清理或线程结束。线程池线程生命周期很长，所以 ThreadLocal 使用规范是 try-finally 里 remove。\n\n排查“对象看似没用却回收不了”时，不要只猜引用类型，直接看 heap dump：先用 dominator tree 找 retained size 最大的保留者，再看 Path to GC Roots。常见根链包括 static Map、ThreadLocalMap、线程栈局部变量、ClassLoader、连接池/缓存队列、定时任务和监听器列表。能把引用链说清，才算真正理解 GC Roots。\n\n取舍上，引用类型不是「越弱越好」。强引用最安全但保活；软引用看似省内存但清理时机不可控，OOM 风险仍在；弱引用适合元数据但不适合业务数据；虚引用只用于资源清理，不能当引用用。生产监控要关注：SoftReference 在高负载下是否频繁清理（命中率下降）、WeakHashMap 是否在访问时才清理（批量过期延迟）、PhantomReference/Cleaner 是否及时释放堆外内存（DirectByteBuffer 泄漏排查）。堆外内存泄漏用 `-XX:MaxDirectMemorySize` 设上限 + `Native Memory Tracking`（`jcmd <pid> VM.native_memory`）追踪。"
+      "title": "Reference Processing 在 GC 中的位置",
+      "content": "GC 不是「标记完就清除」的两步走。以分代收集器为例，引用处理发生在标记之后、清除之前的专门阶段。具体流程：\n\n1. **初始标记（Initial Mark）**：从 GC Roots 标记直接可达对象（通常 STW）。\n2. **并发标记（Concurrent Mark）**：遍历对象图，标记所有可达对象。\n3. **最终标记 / 重新标记（Remark）**：处理并发标记期间的增量引用变化（STW）。\n4. **Reference Processing**：遍历所有待处理的 Reference 对象（由 JVM 在对象变为特定可达状态时挂入 pending 列表），按软 → 弱 → 虚顺序处理。对每个 Reference，检查其 referent 可达性，决定是否清除 referent 并将 Reference 入队到关联的 ReferenceQueue。finalize 引用（Java 8 前）也在此阶段处理。\n5. **清除 / 压缩（Evacuation / Compaction）**：回收不可达对象，整理内存。\n\n这意味着：Reference 入队和 referent 清除不是「对象不可达时立即发生」，而是要等 GC 运行并进入 Reference Processing 阶段。两次 GC 之间，弱引用对象可能仍然占据内存。G1 和 ZGC 的引用处理可以部分并发，但仍需要 STW pause 来完成最终处理。\n\n理解这个位置对面试有用：它解释了为什么「只剩弱引用可达」不等于「立即释放」，也解释了为什么 WeakHashMap 的 entry 可能在多次 GC 后才被清理。"
+    },
+    {
+      "type": "explain",
+      "title": "ThreadLocal 泄漏链路与排查口径",
+      "content": "ThreadLocalMap 的 Entry 结构是理解泄漏的关键：`Entry extends WeakReference<ThreadLocal<?>>`，key 是 ThreadLocal 对象的弱引用，value 是强引用。\n\n泄漏链路：当外部不再强引用 ThreadLocal 对象时，key 的弱引用在下次 GC 被清除（key 变为 null）。但 Entry 和 value 仍挂在 Thread 的 `threadLocals` 字段上（Thread → ThreadLocalMap → Entry[] → value），只要线程活着，value 就不会被回收。线程池线程生命周期很长，所以如果不用 try-finally remove，大量业务对象会堆积在线程的 ThreadLocalMap 中。\n\n为什么设计成弱 key 而不是强 key？如果不做弱引用，当外部把 ThreadLocal 置 null 时，ThreadLocalMap 仍通过 Entry.key 强引用 ThreadLocal 对象，ThreadLocal 本身也泄漏。弱 key 至少保证 ThreadLocal 对象自身能被回收；但 value 的生命周期需要使用者自己管理。\n\n排查「对象看似没用却回收不了」：不要只猜引用类型，直接看 heap dump。先用 Eclipse MAT 的 dominator tree 找 retained size 最大的保留者，再看 Path to GC Roots（排除弱/软引用，只看强引用链）。常见根链包括 static Map、ThreadLocalMap、线程栈局部变量、ClassLoader、连接池/缓存队列、定时任务和监听器列表。能把引用链说清，才算真正理解 GC Roots。"
+    },
+    {
+      "type": "explain",
+      "title": "工程取舍与生产监控",
+      "content": "引用类型不是「越弱越好」。选择取决于语义：\n\n- **强引用**：业务需要保活的对象，泄漏风险来自生命周期不匹配。\n- **软引用**：可重建数据的兜底，但清理时机由 JVM 决定，不适合精确控制。\n- **弱引用**：不影响目标生命周期的关联，适合元数据/监听器，不适合业务数据。\n- **虚引用**：只用于资源清理通知，不能当引用使用。\n\n生产监控关注点：\n1. **SoftReference 命中率**：如果高负载下软引用频繁被清理，说明缓存命中率下降，需要换真正的缓存方案。\n2. **WeakHashMap 访问频率**：大量 entry 失效但 map 访问频率低时，stale entry 会长期占用内存。\n3. **DirectByteBuffer / Cleaner 及时性**：堆外内存泄漏用 `-XX:MaxDirectMemorySize` 设上限 + `Native Memory Tracking`（`jcmd <pid> VM.native_memory`）追踪。如果 PhantomReference/Cleaner 的后台线程（如 CleanerFactory.cleaner 用的 CleanerThread）处理不及时，堆外内存可能持续增长。\n4. **ThreadLocal 使用规范**：线程池场景必须 try-finally remove；监控 ThreadLocalMap entry 数量可以发现异常增长。"
     },
     {
       "type": "diagram",
@@ -51,48 +61,52 @@
     {
       "type": "compareTable",
       "title": "引用类型对比",
-      "content": "| 类型 | 对象可访问性 | 只剩该引用可达时的处理 | 典型用途 | 常见误区 |\n| --- | --- | --- | --- | --- |\n| 强引用 | 直接访问对象 | 强可达时保活，强引用链断开后才可能回收 | 普通对象、集合、字段 | 把强引用说成对象本身永久不回收 |\n| 软引用 | `SoftReference.get()` 可能返回对象 | 内存压力下由 JVM 策略清理 | 可重建的大对象缓存兜底 | 当成稳定缓存或精确 LRU |\n| 弱引用 | `WeakReference.get()` 可能返回对象 | 弱可达时在 GC 引用处理阶段清理 | WeakHashMap key、弱关联元数据 | 忽略 value 反向强引用导致仍保活 |\n| 虚引用 | `PhantomReference.get()` 返回 null | 配合 ReferenceQueue 接收清理通知 | 堆外资源、native handle 清理 | 以为能用它重新访问对象 |"
+      "content": "| 维度 | 强引用 | 软引用 | 弱引用 | 虚引用 |\n| --- | --- | --- | --- | --- |\n| 对象可访问性 | 直接访问 | `SoftReference.get()` 可能返回 | `WeakReference.get()` 可能返回 | `get()` 始终返回 null |\n| 只剩该引用时处理 | 不适用（强可达=保活） | 内存压力下 JVM 策略清理 | GC 引用处理阶段清除 | 配合 ReferenceQueue 入队通知 |\n| 清理时机 | 强引用链断开后随 GC | `-XX:SoftRefLRUPolicyMSPerMB` 控制 | 下次 GC 进入 Reference Processing | 下次 GC 进入 Reference Processing |\n| 典型用途 | 普通对象、集合、字段 | 可重建大对象缓存兜底 | WeakHashMap key、弱关联元数据 | 堆外资源、native handle 清理 |\n| 常见误区 | 说成对象不会回收 | 当成稳定缓存或精确 LRU | 忽略 value 反向强引用保活 | 以为能用它重新访问对象 |"
     },
     {
       "type": "code",
       "title": "可运行验证：弱引用、引用队列与 ThreadLocal remove",
-      "content": "import java.lang.ref.PhantomReference;\nimport java.lang.ref.Reference;\nimport java.lang.ref.ReferenceQueue;\nimport java.lang.ref.SoftReference;\nimport java.lang.ref.WeakReference;\nimport java.util.WeakHashMap;\nimport java.util.function.BooleanSupplier;\n\npublic class Main {\n    static boolean waitForGc(BooleanSupplier condition) throws InterruptedException {\n        for (int i = 0; i < 20; i++) {\n            if (condition.getAsBoolean()) return true;\n            System.gc();\n            byte[] pressure = new byte[512 * 1024];\n            if (pressure.length == 0) System.out.println();\n            Thread.sleep(50);\n        }\n        return condition.getAsBoolean();\n    }\n\n    public static void main(String[] args) throws Exception {\n        Object strong = new Object();\n        WeakReference<Object> weak = new WeakReference<>(strong);\n        System.gc();\n        assert weak.get() != null;\n        strong = null;\n        boolean weakCleared = waitForGc(() -> weak.get() == null);\n        System.out.println(\"weak cleared: \" + weakCleared);\n        assert weakCleared;\n\n        WeakHashMap<Object, String> map = new WeakHashMap<>();\n        Object key = new Object();\n        map.put(key, \"metadata\");\n        key = null;\n        boolean mapCleared = waitForGc(() -> {\n            map.size();\n            return map.isEmpty();\n        });\n        System.out.println(\"weak map cleared: \" + mapCleared);\n        assert mapCleared;\n\n        SoftReference<byte[]> soft = new SoftReference<>(new byte[1024]);\n        System.out.println(\"soft currently available: \" + (soft.get() != null));\n\n        ReferenceQueue<Object> queue = new ReferenceQueue<>();\n        Object target = new Object();\n        WeakReference<Object> queuedWeak = new WeakReference<>(target, queue);\n        target = null;\n        Reference<?>[] polled = new Reference<?>[1];\n        boolean enqueued = waitForGc(() -> {\n            polled[0] = queue.poll();\n            return polled[0] != null;\n        });\n        System.out.println(\"weak queued: \" + enqueued);\n        assert enqueued;\n        assert polled[0] == queuedWeak;\n\n        ReferenceQueue<Object> phantomQueue = new ReferenceQueue<>();\n        PhantomReference<Object> phantom = new PhantomReference<>(new Object(), phantomQueue);\n        assert phantom.get() == null;\n        System.out.println(\"phantom get is null: \" + (phantom.get() == null));\n\n        ThreadLocal<byte[]> threadLocal = new ThreadLocal<>();\n        threadLocal.set(new byte[1024]);\n        threadLocal.remove();\n        System.out.println(\"threadLocal remove called\");\n    }\n}",
+      "content": "import java.lang.ref.PhantomReference;\nimport java.lang.ref.Reference;\nimport java.lang.ref.ReferenceQueue;\nimport java.lang.ref.SoftReference;\nimport java.lang.ref.WeakReference;\nimport java.util.WeakHashMap;\nimport java.util.function.BooleanSupplier;\n\npublic class Main {\n    static boolean waitForGc(BooleanSupplier condition) throws InterruptedException {\n        for (int i = 0; i < 20; i++) {\n            if (condition.getAsBoolean()) return true;\n            System.gc();\n            byte[] pressure = new byte[512 * 1024];\n            if (pressure.length == 0) System.out.println();\n            Thread.sleep(50);\n        }\n        return condition.getAsBoolean();\n    }\n\n    public static void main(String[] args) throws Exception {\n        // 1. 强引用在时，弱引用不被清除\n        Object strong = new Object();\n        WeakReference<Object> weak = new WeakReference<>(strong);\n        System.gc();\n        assert weak.get() != null : \"strong reference keeps object alive\";\n\n        // 2. 强引用断开后，弱引用在 GC 时被清除\n        strong = null;\n        boolean weakCleared = waitForGc(() -> weak.get() == null);\n        System.out.println(\"weak cleared: \" + weakCleared);\n        assert weakCleared;\n\n        // 3. WeakHashMap 在访问时清理失效 entry\n        WeakHashMap<Object, String> map = new WeakHashMap<>();\n        Object key = new Object();\n        map.put(key, \"metadata\");\n        key = null;\n        boolean mapCleared = waitForGc(() -> {\n            map.size(); // triggers expungeStaleEntries\n            return map.isEmpty();\n        });\n        System.out.println(\"weak map cleared: \" + mapCleared);\n        assert mapCleared;\n\n        // 4. 软引用在内存充足时通常存活\n        SoftReference<byte[]> soft = new SoftReference<>(new byte[1024]);\n        System.out.println(\"soft currently available: \" + (soft.get() != null));\n\n        // 5. ReferenceQueue 接收弱引用入队通知\n        ReferenceQueue<Object> queue = new ReferenceQueue<>();\n        Object target = new Object();\n        WeakReference<Object> queuedWeak = new WeakReference<>(target, queue);\n        target = null;\n        Reference<?>[] polled = new Reference<?>[1];\n        boolean enqueued = waitForGc(() -> {\n            polled[0] = queue.poll();\n            return polled[0] != null;\n        });\n        System.out.println(\"weak queued: \" + enqueued);\n        assert enqueued;\n        assert polled[0] == queuedWeak : \"enqueued reference is the one we created\";\n\n        // 6. 虚引用 get() 始终返回 null\n        ReferenceQueue<Object> phantomQueue = new ReferenceQueue<>();\n        PhantomReference<Object> phantom = new PhantomReference<>(new Object(), phantomQueue);\n        assert phantom.get() == null : \"phantom.get() always returns null\";\n        System.out.println(\"phantom get is null: true\");\n\n        // 7. ThreadLocal 必须 remove\n        ThreadLocal<byte[]> threadLocal = new ThreadLocal<>();\n        threadLocal.set(new byte[1024]);\n        threadLocal.remove();\n        System.out.println(\"threadLocal remove called in finally\");\n    }\n}",
       "language": "java",
       "highlights": [
         {
           "line": 23,
-          "note": "弱引用不保活目标对象；只要 strong 还指向目标，weak.get() 仍能取到。"
+          "note": "强引用保活对象；strong 不为 null 时 weak.get() 一定返回对象。"
         },
         {
           "line": 35,
-          "note": "WeakHashMap 清理依赖 key 不再强可达，访问 map 时会顺手清理已失效 entry。"
+          "note": "WeakHashMap 通过访问时触发 expungeStaleEntries 清理失效 entry。"
         },
         {
           "line": 45,
-          "note": "ReferenceQueue 可以把“对象已进入可清理状态”的通知交给后台清理逻辑处理。"
+          "note": "ReferenceQueue 可以在对象变为特定可达状态后通知清理逻辑。"
         },
         {
           "line": 65,
-          "note": "线程池里用 ThreadLocal 后要在 finally 中 remove，避免 value 被长期线程保留。"
+          "note": "线程池场景下 ThreadLocal 必须 try-finally remove，否则 value 泄漏。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "我会先把对象生死和引用类型分开说。对象是否存活靠 GC Roots 可达性分析：从线程栈、Class/静态字段、JNI、JVM 内部引用、monitor 等根出发遍历对象图，能到达就存活，到不了才进入回收候选。这比引用计数更能处理循环引用，因为两个对象互相引用但整体不可达时仍可回收。\n\n然后讲四种引用。强引用可达时对象保活；软引用适合可重建缓存，但清理时机由 JVM 在内存压力下决定；弱引用不影响目标生命周期，WeakHashMap key 是典型例子；虚引用 get() 拿不到对象，主要配合 ReferenceQueue 做堆外资源或 native handle 的清理通知。\n\n最后落到工程坑。ThreadLocalMap 的 key 是弱引用，value 是强引用。线程池里如果不 remove，key 可能被清掉但 value 仍被 ThreadLocalMap 挂在线程上，导致业务对象泄漏。真正排查时看 heap dump 的 dominator tree 和 Path to GC Roots，找出是 static、线程、ClassLoader、缓存还是 ThreadLocalMap 把对象保活。",
+      "content": "对象是否存活靠 GC Roots 可达性分析，不是引用计数。从一组 VM 认为正在使用的根起点（线程栈局部变量、Class/静态字段、JNI 引用、JVM 内部引用、monitor 等）出发遍历对象图，能到达就存活，不可达才进入回收候选。这能处理循环引用，因为两个对象互相引用但整体从根不可达时仍可回收。\n\n四种引用处理的是「对象只剩特定引用可达时怎么办」：\n- 强引用：可达即保活，断开后可回收\n- 软引用：内存紧张时 JVM 清理，适合可重建数据兜底但不适合稳定缓存\n- 弱引用：下次 GC 的引用处理阶段清除，WeakHashMap key 是典型\n- 虚引用：`get()` 返回 null，配合 ReferenceQueue 做堆外资源清理通知，Java 9 的 Cleaner 是其官方封装\n\n引用处理发生在 GC 标记完成后、清除前的 Reference Processing 阶段，不是立即发生。\n\n工程上最常见的泄漏是 ThreadLocal：Entry key 是弱引用，value 是强引用。线程池里不 remove，key 被 GC 清掉但 value 仍挂在 Thread 上，业务对象泄漏。排查看 heap dump 的 dominator tree 找 retained size 最大的保留者，再看 Path to GC Roots（排除弱/软引用），找出是 static Map、ThreadLocalMap、ClassLoader、缓存还是监听器把对象保活。",
       "followUpQuestions": [
         {
           "question": "为什么可达性分析能解决循环引用，而引用计数不行？",
-          "answer": "引用计数只看对象被引用了几次，两个对象互相引用时计数都不为 0，即使外部已经无法访问也难以回收。可达性分析从 GC Roots 出发看整条对象图是否还能被运行时使用，只要这两个对象整体从根不可达，就会被判为回收候选。"
+          "answer": "引用计数只看对象被引用了几次，两个对象互相引用时计数都不为 0，即使外部已经无法访问也难以回收。可达性分析从 GC Roots 出发看整条对象图是否还能被运行时使用，两个对象只要整体从根不可达就会被判为回收候选。"
         },
         {
-          "question": "软引用和弱引用的工程选择有什么区别？",
-          "answer": "软引用偏缓存兜底，目标是内存够时尽量保留、内存紧张时让 JVM 清掉，但它不提供稳定命中率和淘汰策略。弱引用偏弱关联，目标是不改变对象生命周期，例如 WeakHashMap key 或对象元数据表；对象没有强引用后，关联关系也跟着失效。"
+          "question": "软引用和弱引用的工程选择区别？",
+          "answer": "软引用偏缓存兜底——内存够时尽量保留，内存紧张时让 JVM 清掉，但不保证命中率和淘汰策略。弱引用偏弱关联——不改变对象生命周期，对象没有强引用后关联关系也跟着失效。软引用适合可重建大数据的 JVM 级兜底；弱引用适合元数据表、监听器等不想强保活的关联。"
         },
         {
-          "question": "怎么用 heap dump 判断是正常 live set 还是内存泄漏？",
-          "answer": "先看 dominator tree 的 retained size，找谁保留了最多对象；再看 Path to GC Roots。如果引用链来自合理缓存容量、连接池或仍在执行的请求，可能是正常 live set；如果来自无限增长的 static Map、未 remove 的 ThreadLocalMap、未注销监听器或旧 ClassLoader，才更像泄漏。"
+          "question": "WeakHashMap 和 ThreadLocalMap 都用弱引用 key，为什么 ThreadLocal 泄漏更严重？",
+          "answer": "WeakHashMap 的 value 没有单独的强引用链路——key 被清除后整个 Entry 变为可回收。ThreadLocalMap 的 Entry 虽然 key 是弱引用，但 value 是强引用，且 Entry 挂在 Thread 对象上（Thread → ThreadLocalMap → Entry[] → value），只要线程活着 value 就不会回收。线程池线程长期存活，所以 ThreadLocal 不 remove 会持续累积泄漏对象。"
+        },
+        {
+          "question": "Reference Processing 是 STW 的还是并发的？",
+          "answer": "传统收集器（CMS 的 remark 阶段、Parallel 的 Full GC）的引用处理是 STW 的一部分。G1 可以在并发标记阶段处理一部分引用，但最终仍需要 STW pause 完成。ZGC 也尽量并发处理引用，但 Reference 入队和最终清除需要 safepoint。所以引用处理不是完全异步的，大量 Reference 对象会增加 pause 时间。"
         }
       ]
     },
@@ -100,12 +114,13 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释 GC Roots 是可达性分析的起点，并说明可达对象为什么存活",
-        "能列出线程栈、静态字段/Class、JNI、JVM 内部引用、monitor 等常见根来源",
-        "能把强、软、弱、虚引用的清理时机和适用场景讲清楚",
-        "能说明 ReferenceQueue 的用途和时机不确定性",
-        "能讲清 ThreadLocalMap key 弱 value 强的泄漏链路，并给出 remove 规范",
-        "能用 dominator tree 和 Path to GC Roots 解释对象为什么没有被回收"
+        "能解释 GC Roots 可达性分析如何判断对象生死，并说明为何比引用计数更适合",
+        "能列出主要 GC Roots 类型，并说明根集合因实现和运行状态而异",
+        "能把强/软/弱/虚引用的清理时机、适用场景和常见误区讲清楚",
+        "能说明 Reference Processing 在 GC 中的位置（标记之后、清除之前）",
+        "能讲清 ThreadLocalMap key 弱 value 强的泄漏链路，并给出 try-finally remove 规范",
+        "能用 dominator tree 和 Path to GC Roots 解释对象为什么没有被回收",
+        "能说明 SoftReference 不适合做稳定缓存，以及 WeakHashMap 访问时清理的行为"
       ]
     }
   ],
@@ -137,26 +152,40 @@
       "mode": "text",
       "expectedMinutes": 6,
       "difficulty": 4
+    },
+    {
+      "id": "java.jvm.topic-006-e97a07bb.recall.5",
+      "prompt": "Reference Processing 发生在 GC 的哪个阶段？为什么弱引用对象不是「不可达就立即释放」？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "java.jvm.topic-006-e97a07bb.recall.6",
+      "prompt": "SoftRefLRUPolicyMSPerMB 默认 1000，它怎么影响软引用清理？为什么软引用不适合做缓存？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能解释 GC Roots 是可达性分析的起点、可达即存活",
-      "能列出主要 GC Roots 类型，并说明根集合不是固定背诵清单",
+      "能解释 GC Roots 可达性分析的机制，并说明为何比引用计数更适合处理循环引用",
+      "能列出主要 GC Roots 类型，说明根集合因实现和运行状态而变化",
       "能区分强/软/弱/虚四种引用的清理时机和工程用途",
-      "能说明可达性分析为何比引用计数更适合处理循环引用"
+      "能说明 Reference Processing 发生在 GC 标记完成后、清除前，不是立即释放"
     ],
     "goodToHave": [
-      "能说明 SoftReference 不等同于稳定缓存策略",
-      "能说明 WeakHashMap key 与 ThreadLocalMap key 的弱引用边界",
-      "能说明虚引用配合 ReferenceQueue/Cleaner 做非堆资源清理通知",
+      "能说明 SoftReference 的 SoftRefLRUPolicyMSPerMB 机制及为何不适合稳定缓存",
+      "能说明 WeakHashMap 访问时清理 stale entry 的行为和延迟清理风险",
+      "能讲清 ThreadLocalMap key 弱 value 强的完整泄漏链路，以及 try-finally remove 规范",
       "能结合 heap dump 的 dominator tree 和 Path to GC Roots 排查泄漏"
     ],
     "commonMistakes": [
       "把强引用说成对象不会被回收，而不是强可达时不会被回收",
       "以为 JVM 主要靠引用计数判断对象生死",
-      "把 System.gc()、软引用清理和引用入队说成确定时刻",
-      "认为 ThreadLocalMap key 是弱引用就不会泄漏，忽略 value 的强引用链"
+      "把 System.gc()、软引用清理和引用入队说成确定时刻或立即发生",
+      "认为 ThreadLocalMap key 是弱引用就不会泄漏，忽略 value 的强引用链和线程池长期存活"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -165,11 +194,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "java.jvm.topic-001-ebcc71cb"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察能否解释 GC Roots 可达性、四种引用类型、ReferenceQueue、ThreadLocal 弱 key 强 value 泄漏链路，并能用 heap dump 引用链做诊断。"
+  "interviewerFocus": "考察能否解释 GC Roots 可达性机制与根集合来源、四种引用类型的清理时机与工程选型、Reference Processing 在 GC 中的位置、ThreadLocal 弱 key 强 value 泄漏链路，并能用 heap dump 引用链做诊断。"
 }

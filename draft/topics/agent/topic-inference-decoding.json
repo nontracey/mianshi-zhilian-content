@@ -4,7 +4,7 @@
   "category": "llm-foundation",
   "group": "inference",
   "title": "推理机制与解码参数",
-  "summary": "理解自回归推理的 Token 生成过程、贪心/束搜索/采样等解码策略、温度和 Top-P 等参数的作用，以及 KV Cache、量化、投机采样等推理优化技术。",
+  "summary": "理解自回归推理的 Prefill/Decode 两阶段特性与资源瓶颈差异、Temperature/Top-P/Top-K 各自控制的概率分布维度及其组合效果、KV Cache 的线性增长问题与 GQA/MLA/PagedAttention 优化路径、以及量化与投机采样在生产环境的真实权衡。",
   "tags": [
     "LLM",
     "推理",
@@ -19,20 +19,40 @@
   "recommendWeight": 85,
   "status": "draft",
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能围绕「推理机制与解码参数」说清理解自回归推理的 Token 生成过程、区分 Prefill 和 Decode 阶段的特点，并放到Agent/RAG/LLM 工程场景中解释关键流程、边界条件和出错后的处理思路。",
+  "interviewerFocus": "考察是否能围绕自回归推理的两阶段特性、KV Cache 的增长与优化、解码参数的概率控制维度、以及量化/投机采样/PagedAttention 等工程优化手段，完整解释 LLM 推理的核心机制与生产调优思路。",
   "prerequisites": [
     "agent.llm-foundation.topic-104-b4f897e0"
   ],
   "learningCards": [
     {
       "type": "explain",
-      "title": "推理机制与解码参数：自回归推理过程、解码策略",
-      "content": "LLM 推理是自回归（Autoregressive）过程：每次生成一个 Token，将其追加到输入序列，再预测下一个 Token，直到生成结束符或达到最大长度。\n\n**推理流程**：\n```\n输入 Prompt → Prefill 阶段（并行处理所有输入 Token） → Decode 阶段（逐 Token 生成） → 输出\n```\n\n**Prefill vs Decode**：\n- Prefill：一次性处理所有输入 Token，计算密集，GPU 利用率高\n- Decode：每次只生成一个 Token，访存密集，GPU 利用率低\n- 这就是为什么「输入长、输出短」比「输入短、输出长」更省 Token 费用\n\n**KV Cache**：\n- 推理时需要缓存每个 Token 的 Key 和 Value 向量\n- 避免重复计算，是推理加速的核心技术\n- 但 KV Cache 会随序列长度线性增长，占用大量显存\n- 优化方案：GQA（分组查询注意力）、MLA（多头潜注意力）、PagedAttention\n\n**贪心解码（Greedy）**：每次选概率最高的 Token。确定性强但容易重复，适合代码生成等精确任务。\n\n**束搜索（Beam Search）**：同时维护 K 个候选序列，选总概率最高的。质量优于贪心，但速度慢 K 倍，适合翻译等有明确正确答案的任务。\n\n**采样（Sampling）**：从概率分布中随机抽样。多样性高但可能不连贯。\n\n**Top-K 采样**：只从概率最高的 K 个 Token 中采样。避免低概率 Token 干扰，但 K 是固定的。\n\n**Top-P（Nucleus）采样**：从累积概率达到 P 的最小 Token 集合中采样。自适应候选集大小，比 Top-K 更灵活。\n\n解码策略的选择取决于任务类型。代码生成用贪心或低温采样保证准确性；创意写作用高温 Top-P 采样增加多样性；对话系统通常用 Top-P=0.9 平衡质量和多样性。"
+      "title": "自回归推理：Prefill 与 Decode 的资源瓶颈完全不同",
+      "content": "LLM 推理是自回归过程：模型根据已有序列预测下一个 Token，把新 Token 追加到序列末尾，再继续预测，直到生成结束符或达到 max_tokens。这个过程分成两个资源特性完全不同的阶段。\n\n**Prefill 阶段**：把整段 Prompt 一次性送进模型，每个 Token 的注意力计算可以完全并行。这一阶段主要瓶颈是算力（FLOPs），GPU 利用率高。输入越长 Prefill 越慢，但只做一次。\n\n**Decode 阶段**：每次只生成一个 Token，注意力计算需要读取之前所有 Token 的 KV 向量。瓶颈从算力切换到显存带宽（memory-bound），因为每生成一个 Token 要读取的 KV 数据量远大于计算量。GPU 大量时间在等数据搬运而非计算。这是为什么「输入长输出短」比「输入短输出长」更便宜——Prefill 是一次性算力成本，Decode 是逐 Token 的带宽成本。\n\n实际工程中，Prefill 慢主要影响首 Token 延迟（Time to First Token, TTFT），Decode 慢影响生成速度（Tokens/s）。两个指标需要分别监控和优化。"
     },
     {
       "type": "explain",
-      "title": "推理机制与解码参数：关键解码参数、推理优化技术",
-      "content": "**Temperature（温度）**：\n- 控制概率分布的「尖锐程度」\n- T→0：趋向贪心，输出确定性强\n- T=1：原始概率分布\n- T>1：分布更平坦，输出更随机\n- 公式：P(i) = exp(logit_i/T) / Σexp(logit_j/T)\n\n**Top-P**：\n- 累积概率阈值，如 Top-P=0.9 表示从累积概率 90% 的 Token 中采样\n- 比 Top-K 更自适应：概率集中时候选少，概率分散时候选多\n\n**Top-K**：\n- 固定候选集大小\n- 与 Top-P 可以组合使用\n\n**典型配置**：\n| 场景 | Temperature | Top-P | 说明 |\n| --- | --- | --- | --- |\n| 代码生成 | 0.0-0.2 | 0.95 | 低随机性 |\n| 知识问答 | 0.0-0.3 | 0.9 | 准确为主 |\n| 对话 | 0.7-0.9 | 0.9 | 平衡 |\n| 创意写作 | 0.9-1.2 | 0.95 | 高多样性 |\n\n**量化（Quantization）**：\n- 将 FP16 权重压缩为 INT8/INT4\n- 显存减少 2-4 倍，速度提升 1.5-2 倍\n- 常见方法：GPTQ、AWQ、GGUF\n- 精度损失通常在 1-3% 以内\n\n**投机采样（Speculative Decoding）**：\n- 用小模型快速生成候选 Token 序列\n- 大模型一次性验证多个 Token\n- 加速 2-3 倍，输出质量不变\n\n**PagedAttention（vLLM）**：\n- 将 KV Cache 分页管理，减少内存碎片\n- 支持动态批处理，提升吞吐量\n- 是 vLLM 高性能推理的核心技术\n\n**连续批处理（Continuous Batching）**：\n- 不等一个 batch 全部完成再处理下一个\n- 有请求完成就立即插入新请求\n- 显著提升 GPU 利用率和吞吐量"
+      "title": "KV Cache：推理加速的核心，也是显存杀手",
+      "content": "KV Cache 的存在源于自回归计算的冗余：生成第 N 个 Token 时，需要计算它对前面所有 Token 的注意力分数，这需要用到前面每个 Token 的 Key 和 Value 向量。如果不缓存，每生成一个新 Token 都要重新计算所有 Token 的 K/V，时间复杂度是 O(n²)。缓存之后，每次只需要计算新 Token 的 Q 与所有已缓存 K 的点积，已有的 K/V 直接读取即可。\n\n**显存占用公式**：`KV Cache = 2 × num_layers × num_kv_heads × head_dim × seq_len × bytes_per_element`。以 LLaMA-2-70B 为例（80 层、8 KV 头、128 维、FP16），单条 4096 Token 序列的 KV Cache ≈ 2×80×8×128×4096×2B ≈ 1.3GB。128K 上下文直接涨到 ~40GB，单卡放不下。这就是为什么 KV Cache 是长上下文推理的核心瓶颈。\n\n**优化方案**：\n- **GQA（Grouped Query Attention）**：多个 Query 头共享一组 K/V 头（如 LLaMA-2-70B 用 8 个 KV 头而非 64 个），KV Cache 直接缩小 8 倍\n- **MLA（Multi-head Latent Attention）**：DeepSeek-V2 的做法，把 KV 投影到低维潜空间再还原，显存更小但计算略有增加\n- **PagedAttention**：vLLM 的核心思想，把 KV Cache 分成固定大小的页（block），按需分配，解决不同请求长度不一致导致的内存碎片问题，GPU 显存利用率从 ~50% 提升到 ~90%\n- **KV Cache 量化**：将 FP16 的 KV 向量量化到 INT8/INT4，显存再减半或更多，质量损失通常可控"
+    },
+    {
+      "type": "explain",
+      "title": "解码策略：确定性与多样性的工程取舍",
+      "content": "解码策略决定模型如何从输出概率分布中选择 Token。不同策略在确定性、多样性和速度之间做取舍。\n\n**贪心解码（Greedy）**：每步选概率最高的 Token。完全确定、速度最快，但容易陷入重复循环（「我觉得我觉得我觉得…」）。适合代码生成、JSON 结构化输出等需要精确性的场景。\n\n**束搜索（Beam Search）**：维护 K 条候选序列（beam），每步扩展所有可能的下一步，保留总概率最高的 K 条。翻译、摘要等有「正确答案」的任务效果好，但速度慢 K 倍、内存占用高，且对话场景容易产出「安全但无聊」的回复。\n\n**采样（Sampling）**：从概率分布中随机抽一个 Token。多样性高但可能不连贯。纯采样的问题是低概率 Token 也有机会被选中，产生胡说八道的输出。所以需要截断机制：\n\n**Top-K 采样**：只保留概率最高的 K 个 Token，其余概率归零后重新归一化再采样。简单直接，但 K 是固定的——当模型很确定时（概率集中在 1-2 个 Token），K=50 太多；当模型不确定时，K=50 又太少。\n\n**Top-P（Nucleus）采样**：按概率从高到低排序，取累积概率达到 P 的最小 Token 集合。当模型确定时候选集自然很小，不确定时候选集自动扩大。比 Top-K 更自适应，是目前最主流的截断方式。Top-P 和 Top-K 可以组合使用：先 Top-K 缩小范围，再 Top-P 精细截断。"
+    },
+    {
+      "type": "explain",
+      "title": "Temperature 调的是分布形状，不是候选范围",
+      "content": "Temperature 是最常被误解的参数。它控制的是 logits 被缩放后概率分布的「尖锐程度」，公式为 `P(i) = softmax(logit_i / T)`。注意它不截断候选集，而是改变整个分布的形状。\n\n**T → 0**：logits 被极大放大，最大值的 logit 对应概率趋近 1，等价于贪心解码。实际工程中设 T=0 就是贪心。\n\n**T = 1**：原始概率分布，不做任何调整。模型训练时学到的概率形状直接使用。\n\n**T > 1**：logits 被缩小，分布变平坦，低概率 Token 获得更多采样机会。T=2 时几乎所有 Token 的概率都差不多，输出接近随机。通常 T>1.5 已经会产生明显不连贯的输出。\n\n**Temperature 和 Top-P 的关系**：Temperature 改变分布形状（尖或平），Top-P 截断候选范围（大或小）。两者配合的效果：低温+低 Top-P = 高确定性；高温+高 Top-P = 高随机性。实际使用中，Temperature 的调整比 Top-P 更激进——T 从 0.7 到 1.0 的效果差异，比 Top-P 从 0.9 到 1.0 的差异大得多。所以通常先调 Top-P 到合理范围（0.9-0.95），再用 Temperature 微调随机程度。"
+    },
+    {
+      "type": "explain",
+      "title": "量化与投机采样：生产环境的推理成本优化",
+      "content": "**量化（Quantization）**：把模型权重从 FP16（每参数 2 字节）压缩到 INT8（1 字节）或 INT4（0.5 字节）。核心收益是显存减少 2-4 倍、推理速度提升 1.5-2 倍（更少的显存带宽消耗）。主要量化方法：\n- **GPTQ**：逐层量化，需要校准数据集，精度较好但量化过程较慢\n- **AWQ（Activation-aware Weight Quantization）**：保留对激活值敏感的权重通道不量化，INT4 精度优于 GPTQ\n- **GGUF**：llama.cpp 使用的格式，支持多种量化级别（Q4_K_M、Q5_K_M 等），适合 CPU/边缘部署\n\n精度损失方面：INT8 通常 <1%，INT4 约 2-3%。但「精度损失」要看具体任务——简单问答几乎无感知，复杂数学推理可能明显退化。生产环境必须做量化前后的 A/B 评测，不能只看 perplexity。\n\n**投机采样（Speculative Decoding）**：核心思路是「用小模型猜、大模型验」。小模型（draft model）快速生成 K 个候选 Token，大模型一次性验证这 K 个 Token 的概率。如果小模型猜对了（接受率高），等于大模型一次前向传播产出多个 Token，吞吐提升 2-3 倍。输出分布与纯大模型完全一致，数学上保证无损。关键限制：接受率取决于小模型与大模型的分布对齐程度；小模型太弱则大部分 Token 被拒绝，加速效果差。"
+    },
+    {
+      "type": "explain",
+      "title": "连续批处理：从请求级调度到 Token 级调度",
+      "content": "传统批处理（Static Batching）的问题：一个 batch 里如果某个请求提前生成完毕，它的 GPU 算力槽位要等其他请求都完成才能释放。如果 batch 里有一个长请求，其他请求的延迟都被拉高。\n\n**连续批处理（Continuous Batching）**：在 Decode 阶段，每生成一个 Token 就检查一次——有请求完成就立即插入新请求，不需要等整个 batch 结束。这把 GPU 利用率从传统批处理的 30-50% 提升到 80%+。vLLM、TensorRT-LLM、SGLang 等主流推理框架都实现了连续批处理。\n\n连续批处理和 PagedAttention 配合效果最好：PagedAttention 解决不同请求的 KV Cache 长度不一致导致的内存碎片，连续批处理解决请求完成时间不一致导致的算力空转。两者结合是现代 LLM 推理框架高吞吐的基石。"
     },
     {
       "type": "diagram",
@@ -40,7 +60,7 @@
       "format": "mermaid",
       "content": "flowchart LR\nA[Prompt Tokens] --> B[Prefill: 并行计算上下文表示]\nB --> C[写入 KV Cache]\nC --> D[Decode: 读取 KV Cache 预测下一个 Token]\nD --> E{是否达到 EOS / max_tokens}\nE -- 否 --> F[追加新 Token 并更新 KV Cache]\nF --> D\nE -- 是 --> G[返回输出文本]",
       "fallback": "推理时先进入 Prefill 阶段并行处理输入 Token，然后写入 KV Cache；Decode 阶段逐个生成 Token，每生成一个就追加并更新缓存，直到 EOS 或达到 max_tokens。",
-      "caption": "这张图展示自回归推理的真实循环：Prefill 负责上下文，Decode 逐 token 生成，KV Cache 是连接两阶段的关键状态。",
+      "caption": "自回归推理的真实循环：Prefill 并行处理 Prompt 写入 KV Cache，Decode 逐 Token 生成并更新缓存。两阶段的资源瓶颈不同——Prefill 算力密集，Decode 带宽密集。",
       "sources": [
         {
           "kind": "mermaid",
@@ -54,68 +74,137 @@
     },
     {
       "type": "compareTable",
-      "title": "解码策略对比",
+      "title": "解码策略与参数对比",
       "columns": [
-        "策略",
+        "策略/参数",
+        "控制维度",
         "确定性",
         "多样性",
         "速度",
-        "适用场景"
+        "典型场景"
       ],
       "rows": [
         [
-          "贪心",
+          "贪心解码",
+          "直接取 argmax",
           "最高",
           "最低",
           "最快",
-          "代码生成、结构化输出"
+          "代码生成、JSON 输出"
         ],
         [
           "束搜索",
+          "K 条候选全局最优",
           "高",
           "低",
-          "慢",
+          "慢 K 倍",
           "翻译、摘要"
         ],
         [
-          "Top-K",
+          "Top-K 采样",
+          "固定候选集大小",
           "中",
           "中",
           "快",
           "通用对话"
         ],
         [
-          "Top-P",
+          "Top-P 采样",
+          "自适应候选集范围",
           "中",
           "中高",
           "快",
           "创意写作、对话"
         ],
         [
-          "Temperature+Top-P",
+          "Temperature",
+          "概率分布尖锐度",
           "可调",
           "可调",
           "快",
-          "最常用组合"
+          "配合 Top-P 微调"
+        ]
+      ]
+    },
+    {
+      "type": "compareTable",
+      "title": "推理优化技术对比",
+      "columns": [
+        "技术",
+        "优化目标",
+        "核心原理",
+        "加速倍率",
+        "精度影响"
+      ],
+      "rows": [
+        [
+          "INT8 量化",
+          "显存 + 速度",
+          "FP16→INT8 压缩权重",
+          "显存减半，速度 1.5x",
+          "< 1%"
+        ],
+        [
+          "INT4 量化",
+          "显存 + 速度",
+          "FP16→INT4 压缩权重",
+          "显存 1/4，速度 2x",
+          "2-3%"
+        ],
+        [
+          "投机采样",
+          "吞吐",
+          "小模型提案 + 大模型验证",
+          "2-3x",
+          "无损（数学保证）"
+        ],
+        [
+          "PagedAttention",
+          "显存利用率",
+          "KV Cache 分页管理",
+          "吞吐 +2-4x",
+          "无"
+        ],
+        [
+          "连续批处理",
+          "GPU 利用率",
+          "Token 级调度替代请求级",
+          "吞吐 +2-5x",
+          "无"
+        ],
+        [
+          "GQA",
+          "KV Cache 大小",
+          "多 Query 头共享 KV 头",
+          "KV Cache 缩小 N 倍",
+          "取决于设计"
         ]
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：LLM 推理可以拆成 Prefill 和 Decode 两段。Prefill 一次性处理 prompt，主要消耗算力；Decode 每次生成一个 token，反复读取和更新 KV Cache，通常更受显存带宽和调度影响。\n\n机制要点：\n- 面试时我会先讲自回归过程：模型根据已有 token 预测下一个 token，把新 token 追加到上下文，再继续预测。然后解释解码参数：temperature 改变概率分布的尖锐程度，top_p 截断候选集合，top_k 固定候选数量。代码生成和知识问答通常低温，创意写作可以提高 temperature 和 top_p。\n- 最后落到工程优化：长上下文会让 KV Cache 线性增长，vLLM 的 PagedAttention 用分页减少碎片；量化能降低显存，投机采样用小模型提案、大模型验证来提升吞吐。线上要用首 token 延迟、tokens/s、显存占用和输出质量评测来判断参数是否合适。",
+      "content": "LLM 推理是自回归过程，可以拆成 Prefill 和 Decode 两段来讲。\n\n**核心框架**\n- Prefill：一次性处理所有 Prompt Token，计算可以完全并行，瓶颈是算力。主要影响首 Token 延迟（TTFT）\n- Decode：每次生成一个 Token，需要读取之前所有 Token 的 KV Cache，瓶颈是显存带宽。这是 memory-bound 操作，GPU 大量时间在等数据搬运而非计算\n- 为什么「输入长输出短」更便宜：Prefill 一次性完成，成本与输入长度线性；Decode 逐 Token 完成，成本与输出长度线性\n\n**KV Cache 的作用与瓶颈**\n- 作用：缓存已计算的 K/V 向量避免重复计算，把 Decode 的时间复杂度从 O(n²) 降到 O(n)\n- 瓶颈：KV Cache 随序列长度线性增长。70B 模型 128K 上下文，KV Cache 需要 ~40GB\n- 优化：GQA 缩减 KV 头数、MLA 低维压缩、PagedAttention 分页管理减少碎片、KV Cache 量化\n\n**解码参数如何调**\n- Temperature 控制概率分布形状：T 尖锐（确定）→ T 平坦（随机）\n- Top-P 控制候选范围：累积概率阈值，自适应候选集大小\n- 两者配合：先设 Top-P（0.9-0.95），再用 Temperature 微调\n- 典型配置：代码 0.0/0.95、问答 0.2/0.9、对话 0.7/0.9、写作 1.0/0.95\n\n**生产优化手段**\n- 量化：INT8 精度损失 <1%，INT4 约 2-3%，必须 A/B 评测\n- 投机采样：小模型猜、大模型验，吞吐 2-3x，数学上无损\n- PagedAttention + 连续批处理：vLLM 的核心组合，KV 分页减少碎片，Token 级调度减少空转",
       "followUpQuestions": [
         {
-          "question": "Temperature 和 Top-P 分别控制什么？它们如何配合使用？",
-          "answer": "Temperature 控制概率分布的尖锐程度：T 越小分布越尖锐（趋向贪心），T 越大分布越平坦（更随机）。Top-P 控制候选 Token 的范围：从累积概率达到 P 的最小集合中采样。两者配合：Temperature 调整分布形状，Top-P 截断尾部低概率 Token。典型配置是 Temperature=0.7 + Top-P=0.9，平衡质量和多样性。"
+          "question": "Temperature 和 Top-P 分别控制什么？为什么说 Temperature 更激进？",
+          "answer": "Temperature 改变概率分布的形状（尖锐或平坦），Top-P 截断候选 Token 的范围。Temperature 更激进因为它对所有 Token 的概率做全局缩放——T 从 0.7 到 1.0 会让整个分布变平很多；而 Top-P 从 0.9 到 0.95 只是多纳入少量低概率 Token。所以实际调参时通常固定 Top-P 在 0.9-0.95，再用 Temperature 微调。"
         },
         {
-          "question": "KV Cache 为什么是推理瓶颈？有哪些优化方案？",
-          "answer": "KV Cache 缓存每个 Token 的 Key 和 Value 向量避免重复计算，但随序列长度线性增长。128K 上下文的 70B 模型，KV Cache 可能需要 40GB+ 显存。优化方案：GQA 将多个 Query 头共享 K/V 头减少缓存量；MLA 将 KV 压缩到低维空间（DeepSeek 的做法）；PagedAttention 将 KV Cache 分页管理减少碎片；量化 KV Cache 将 FP16 压缩到 INT8。"
+          "question": "KV Cache 的显存占用怎么算？128K 上下文的 70B 模型大概需要多少？",
+          "answer": "公式：2 × num_layers × num_kv_heads × head_dim × seq_len × bytes。LLaMA-2-70B 有 80 层、8 KV 头、128 维 head_dim、FP16（2B），4096 Token 时 ≈ 2×80×8×128×4096×2 ≈ 1.3GB。线性外推到 128K 就是 ~40GB。所以 70B 模型单卡 80GB 显存，光 KV Cache 就占一半，留给权重和激活的空间非常紧张。"
         },
         {
-          "question": "量化对模型质量影响大吗？生产环境如何选择量化方案？",
-          "answer": "INT8 量化精度损失通常在 1% 以内，基本无感知；INT4 量化损失约 2-3%，对简单任务影响不大但复杂推理可能退化。生产环境建议：对质量敏感的场景用 INT8 或不量化；对成本敏感的场景用 INT4 + AWQ/GPTQ；边缘部署用 GGUF 格式配合 llama.cpp。关键是做 A/B 测试量化前后的效果差异。"
+          "question": "投机采样为什么能保证输出质量不变？",
+          "answer": "投机采样用小模型快速生成 K 个候选 Token，然后用大模型一次前向传播验证。验证时按大模型的分布对每个 Token 做接受/拒绝采样——接受的 Token 直接用，拒绝的 Token 从修正分布中重新采样。数学上可以证明最终输出的分布与纯大模型完全一致。关键限制是接受率：小模型与大模型分布差距越大，拒绝率越高，加速效果越差。"
+        },
+        {
+          "question": "vLLM 的 PagedAttention 为什么能大幅提升吞吐？",
+          "answer": "传统实现中，KV Cache 需要为每个请求预分配连续的显存空间（按 max_tokens 分配），导致两个问题：1）实际生成长度远小于 max_tokens 时大量显存浪费；2）不同请求的 KV Cache 长度不一致产生碎片。PagedAttention 把 KV Cache 分成固定大小的页（block），按需分配和释放，就像操作系统的虚拟内存分页。显存利用率从 50% 提升到 90%+，直接支撑更多并发请求。"
+        },
+        {
+          "question": "线上部署 LLM 时，Prefill 慢和 Decode 慢分别怎么优化？",
+          "answer": "Prefill 慢（TTFT 高）：用 Flash Attention 减少计算量和显存；缩短 Prompt 长度（压缩 System Prompt、截断历史）；Prefill 和 Decode 分离部署（PD 分离架构）。Decode 慢（tokens/s 低）：量化降低显存带宽消耗；投机采样一次验证多 Token；用更大 batch size 通过连续批处理摊薄带宽开销；GQA 减少 KV Cache 的读取量。"
         }
       ]
     },
@@ -123,32 +212,55 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "自回归推理的 Prefill 和 Decode 两个阶段的区别",
-        "KV Cache 的作用和内存占用问题",
-        "Temperature、Top-P、Top-K 各自控制什么",
-        "贪心解码 vs 采样的适用场景差异",
-        "量化、投机采样、PagedAttention 的优化原理",
-        "不同业务场景下的解码参数配置建议"
+        "自回归推理的 Prefill 和 Decode 各自的资源瓶颈（算力 vs 带宽）",
+        "KV Cache 的作用、显存占用公式和四种优化方案（GQA/MLA/PagedAttention/KV量化）",
+        "Temperature 改变分布形状、Top-P 截断候选范围、两者如何配合",
+        "贪心/束搜索/Top-K/Top-P 采样的确定性与多样性取舍",
+        "量化的精度-速度权衡（INT8 <1%、INT4 2-3%）和生产选型",
+        "投机采样的「小模型提案+大模型验证」原理和数学无损保证",
+        "PagedAttention + 连续批处理为什么是现代推理框架的基石",
+        "不同业务场景（代码/问答/对话/写作）的解码参数配置"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "agent.llm-foundation.topic-inference-decoding.recall.1",
-      "prompt": "推理机制与解码参数 的技术原理是什么？在实际应用中有哪些关键参数需要调优？",
+      "prompt": "LLM 推理的 Prefill 和 Decode 两阶段各有什么瓶颈？为什么说 Decode 是 memory-bound？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "agent.llm-foundation.topic-inference-decoding.recall.2",
-      "prompt": "Temperature 和 Top-P 分别控制什么？代码生成和创意写作分别应该设置什么参数？",
+      "prompt": "Temperature 和 Top-P 分别控制概率分布的什么维度？代码生成和创意写作分别应该怎么配？",
       "mode": "text",
       "expectedMinutes": 2,
       "difficulty": 3
     },
     {
       "id": "agent.llm-foundation.topic-inference-decoding.recall.3",
+      "prompt": "KV Cache 的显存占用随什么因素增长？GQA、MLA、PagedAttention 各自的优化思路是什么？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.llm-foundation.topic-inference-decoding.recall.4",
+      "prompt": "线上 LLM 服务首 Token 延迟高、生成速度慢，分别可能是什么原因？怎么排查和优化？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.llm-foundation.topic-inference-decoding.recall.5",
+      "prompt": "投机采样为什么能保证输出质量不变？它的加速效果受什么因素影响？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.llm-foundation.topic-inference-decoding.recall.6",
       "prompt": "temperature 和 top_p 同时调高会发生什么？线上客服问答和创意写作分别该怎么配解码参数？",
       "mode": "text",
       "expectedMinutes": 3,
@@ -157,27 +269,29 @@
   ],
   "rubric": {
     "mustHave": [
-      "理解自回归推理的 Token 生成过程",
-      "区分 Prefill 和 Decode 阶段的特点",
-      "解释 Temperature 和 Top-P 的作用",
-      "了解 KV Cache 的作用和优化方案"
+      "准确描述 Prefill 和 Decode 各自的资源瓶颈（算力 vs 显存带宽）",
+      "解释 KV Cache 的作用和线性增长问题，说出至少两种优化方案",
+      "区分 Temperature 改变分布形状与 Top-P 截断候选范围的不同控制维度",
+      "给出代码生成、问答、对话、写作四种场景的合理参数配置"
     ],
     "goodToHave": [
-      "能解释量化、投机采样等优化技术",
-      "能给出不同场景的参数配置建议",
-      "理解 PagedAttention 的分页思想"
+      "能解释量化 INT8/INT4 的精度-速度权衡",
+      "能说明投机采样的数学无损原理和接受率限制",
+      "能解释 PagedAttention 和连续批处理如何配合提升吞吐",
+      "能区分 GQA 和 MLA 的优化思路差异"
     ],
     "commonMistakes": [
-      "混淆 Temperature 和 Top-P 的控制维度",
-      "不理解 KV Cache 为什么随序列长度线性增长",
-      "以为量化一定严重影响模型质量"
+      "混淆 Temperature 和 Top-P 的控制维度，以为 Temperature 也截断候选集",
+      "不理解 KV Cache 为什么随序列长度线性增长，误以为只与 batch size 相关",
+      "以为量化一定严重影响模型质量，忽略 INT8 几乎无损的事实",
+      "认为投机采样会改变输出分布，不理解其数学无损保证"
     ],
     "scoreWeights": {
-      "coverage": 30,
+      "coverage": 25,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 20
+      "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

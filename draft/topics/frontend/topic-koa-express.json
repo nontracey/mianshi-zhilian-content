@@ -4,7 +4,7 @@
   "category": "nodejs",
   "group": "nodejs",
   "title": "Koa/Express 框架原理",
-  "summary": "理解Express和Koa的中间件机制，掌握洋葱模型的工作原理，能够手写compose函数。",
+  "summary": "掌握 Express 线性 next 链与 Koa 洋葱模型的执行差异，理解 compose 递归闭包如何把中间件数组变成嵌套 Promise 链，能手写 compose 并解释 next 多次调用防护、错误冒泡、ctx 委托和短路响应的工程意义。",
   "tags": [
     "前端",
     "Node.js",
@@ -14,20 +14,25 @@
     "洋葱模型"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 28,
   "order": 30,
   "recommendWeight": 72,
   "status": "draft",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Koa/Express 框架原理的主流程与关键机制",
-      "content": "## Express vs Koa\n\n### Express\n- 基于回调的中间件\n- 内置路由、静态文件等\n- 中间件线性执行\n- 错误处理通过err参数\n\n### Koa\n- 基于async/await的中间件\n- 洋葱模型，核心极小\n- 中间件嵌套执行\n- ctx统一上下文对象"
+      "title": "Express 线性 next 链的机制与局限",
+      "content": "Express 4.x 的中间件栈本质是一个回调链表。`app.use(fn)` 把函数 push 进内部 Router 栈；请求到达时框架依次取出，调用 `fn(req, res, next)`。中间件必须自己调 `next()` 才会跳到下一个；不调就短路（响应在这里结束或挂起）；调两次会重复执行后续栈，Express 4 没有防护，结果是响应头被写多次或逻辑错乱。\n\n错误传播靠「四参数中间件」：`(err, req, res, next)`。当下游中间件调 `next(err)` 时，Express 跳过所有普通中间件，直接路由到最近的错误中间件。这个设计灵活但容易遗漏——忘记 `next(err)` 的异步错误会被吞掉，Express 4 不会自动捕获 rejected Promise，所以大量生产 bug 来自 async 里抛错但没 `next(err)`。\n\nExpress 4 的 `req`/`res` 是 Node 原生对象直接增强，没有统一上下文，所以状态传递一般挂在 `req` 上（`req.user`、`req.startTime`），或依赖 res locals（`res.locals.xxx`）。这种设计直观但零散，跨中间件共享数据不如 Koa 的 `ctx` 整洁。"
     },
     {
       "type": "explain",
-      "title": "Koa/Express 框架原理的边界、易错点与取舍",
-      "content": "### 洋葱模型\n```\n请求 → 中间件1前 → 中间件2前 → 中间件3\n       ← 中间件1后 ← 中间件2后 ← 中间件3\n响应 ←\n```"
+      "title": "Koa 洋葱模型的运行机制",
+      "content": "Koa 2 的核心只有 1700 多行代码。`koa.use(fn)` 把中间件存入数组；请求到达时调 `compose(middlewares)(ctx)` 把数组变成一条嵌套 Promise 链。每个中间件签名是 `async (ctx, next) => {}`，`next()` 返回的是下一个中间件执行完的 Promise，所以 `await next()` 意味着「等后续所有中间件都执行完再回来」——这就是洋葱模型的实质：不是框架在反转调用，而是 Promise 链自带的 return 恢复。\n\n洋葱模型带来的工程价值：\n1. 前置/后置逻辑天然对称——计时中间件在 `await next()` 前后各打时间戳即可拿到下游总耗时，Express 要手动算或用 `res.on('finish')`。\n2. 错误冒泡简洁——最外层 try/catch 包 `await next()` 就能捕获任意下游错误，不需要像 Express 那样每层都 `next(err)`。\n3. 统一响应处理——后置逻辑能拿到 `ctx.body` 和 `ctx.status`，方便做统一序列化、日志或 header 注入。\n\nKoa 的 `ctx` 是对 `req`/`res` 的封装加委托（delegate）。`ctx.query` 实际是 `ctx.request.query` 的 getter，`ctx.body` 是 `ctx.response.body` 的 setter。这种设计让中间件只依赖一个 `ctx` 对象，解耦更干净。"
+    },
+    {
+      "type": "explain",
+      "title": "compose 函数的设计要点与防错机制",
+      "content": "Koa 内部的 `koa-compose` 源码约 40 行，核心思想是递归闭包：\n\n1. 外层返回一个 `function(ctx)` 接收请求上下文。\n2. 内部 `dispatch(i)` 取出第 i 个中间件并执行，把 `dispatch(i+1)` 作为 `next` 传入。\n3. 每个中间件是 async 函数，`await next()` 等待后续所有中间件完成后才执行后半段——Promise 链自动实现嵌套。\n4. `index` 变量记录当前执行到哪个中间件；如果某个中间件多次调 `next()`，第二次 dispatch 时 `i <= index` 会抛错，防止后段逻辑被重复执行。\n5. 如果中间件不调 `next()`，`dispatch(i+1)` 不会被触发，后续中间件被短路；如果抛异常，Promise 链 reject，由外层 catch 捕获。\n\n这个设计的正确性依赖一个前提：每个中间件是 async 函数或返回 Promise。如果中间件是同步函数且抛了同步异常，compose 里用 `Promise.resolve(fn(ctx, dispatch.bind(null, i + 1)))` 包装，同步异常会变成 rejected Promise，不会逃逸。"
     },
     {
       "type": "diagram",
@@ -56,49 +61,57 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | Express | Koa |\n| --- | --- | --- |\n| 中间件模型 | 回调（线性） | async/await（洋葱） |\n| 错误处理 | err参数传递 | try/catch |\n| 功能丰富度 | 内置路由、静态文件 | 极简核心 |\n| 上下文 | req/res分离 | ctx统一对象 |\n| 异步支持 | 回调/Promise | async/await原生 |\n| 生态成熟度 | 非常成熟 | 成熟 |\n| 学习曲线 | 低 | 中 |\n| 适用场景 | 快速开发 | 精细控制 |"
+      "title": "Express vs Koa 中间件机制对比",
+      "content": "| 维度 | Express 4.x | Koa 2.x |\n| --- | --- | --- |\n| 中间件签名 | `(req, res, next)` 回调 | `async (ctx, next)` async/await |\n| 执行模型 | 线性链表，调 next 跳下一个 | 洋葱嵌套，await next 等后续全部完成 |\n| next 防护 | 无（调两次会重复执行后续栈） | index 变量，多次调用抛 `next() called multiple times` |\n| 错误传播 | `next(err)` 跳到四参数中间件；async 里忘记 next(err) 错误被吞 | Promise reject 冒泡，最外层 try/catch 统一捕获 |\n| 统一错误处理 | 四参数中间件 `(err, req, res, next)` | 最外层 `try { await next() } catch {}` |\n| 上下文对象 | `req`/`res` 分离，状态挂 `req.xxx` 或 `res.locals` | `ctx` 统一封装 + delegate（`ctx.body`→`ctx.response.body`） |\n| 后置逻辑能力 | 需 `res.on('finish')` 或手动计算 | `await next()` 之后天然执行，可读 `ctx.body` |\n| 内置功能 | 路由、静态文件、模板引擎 | 极简核心，路由/静态等靠中间件 |\n| 异步模型 | 回调/Promise（async 需手动 catch） | 原生 async/await |\n| 适用场景 | 快速搭建 CRUD API、需成熟生态 | 精细控制中间件流、定制化强的 BFF/API 服务 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// Express中间件\nconst express = require('express');\nconst app = express();\n\n// 应用级中间件\napp.use((req, res, next) => {\n  console.log('Time:', Date.now());\n  next(); // 必须调用next\n});\n\n// 路由级中间件\napp.get('/user/:id', (req, res) => {\n  res.send(`User ${req.params.id}`);\n});\n\n// 错误处理中间件（4个参数）\napp.use((err, req, res, next) => {\n  console.error(err.stack);\n  res.status(500).send('Something broke!');\n});\n\n// Koa洋葱模型\nconst Koa = require('koa');\nconst koa = new Koa();\n\nkoa.use(async (ctx, next) => {\n  console.log('1-1');\n  await next();\n  console.log('1-2');\n});\n\nkoa.use(async (ctx, next) => {\n  console.log('2-1');\n  await next();\n  console.log('2-2');\n});\n\nkoa.use(async (ctx) => {\n  console.log('3');\n  ctx.body = 'Hello';\n});\n\n// 输出: 1-1 → 2-1 → 3 → 2-2 → 1-2\n\n// 手写compose（洋葱模型核心）\nfunction compose(middlewares) {\n  return function(ctx) {\n    let index = -1;\n    function dispatch(i) {\n      if (i <= index) return Promise.reject(new Error('next() called multiple times'));\n      index = i;\n      const fn = middlewares[i];\n      if (!fn) return Promise.resolve();\n      try {\n        return Promise.resolve(fn(ctx, () => dispatch(i + 1)));\n      } catch (err) {\n        return Promise.reject(err);\n      }\n    }\n    return dispatch(0);\n  };\n}\n\n// Koa错误处理\napp.use(async (ctx, next) => {\n  try {\n    await next();\n  } catch (err) {\n    ctx.status = err.status || 500;\n    ctx.body = { message: err.message };\n    ctx.app.emit('error', err, ctx);\n  }\n});\n\n// Express vs Koa路由\n// Express: 内置路由\napp.get('/api', handler);\napp.post('/api', handler);\n\n// Koa: 使用koa-router\nconst Router = require('@koa/router');\nconst router = new Router();\nrouter.get('/api', handler);\nkoa.use(router.routes());",
+      "title": "Express 中间件链 vs Koa 洋葱模型 vs 手写 compose",
+      "content": "// ============ Express 4.x 线性中间件链 ============\nconst express = require('express');\nconst app = express();\n\n// 应用级中间件：必须调 next()，不调则短路\napp.use((req, res, next) => {\n  const start = Date.now();\n  res.on('finish', () => {  // Express 没有后置逻辑，需监听 finish\n    console.log(`${req.method} ${req.url} - ${Date.now() - start}ms`);\n  });\n  next();\n});\n\napp.get('/user/:id', (req, res) => {\n  res.send(`User ${req.params.id}`);\n});\n\n// 错误中间件：必须 4 个参数，Express 按参数个数区分\napp.use((err, req, res, next) => {\n  console.error(err.stack);\n  res.status(err.status || 500).json({ message: err.message });\n});\n\n// ============ Koa 2.x 洋葱模型 ============\nconst Koa = require('koa');\nconst koa = new Koa();\n\n// 计时中间件：await next() 前后天然对称\nkoa.use(async (ctx, next) => {\n  const start = Date.now();\n  await next();  // 等所有下游中间件完成\n  const ms = Date.now() - start;\n  ctx.set('X-Response-Time', `${ms}ms`);\n  console.log(`${ctx.method} ${ctx.url} - ${ms}ms`);\n});\n\nkoa.use(async (ctx, next) => {\n  await next();\n  console.log('后置逻辑：ctx.status =', ctx.status, 'ctx.body =', ctx.body);\n});\n\nkoa.use(async (ctx) => {\n  ctx.body = { user: 'demo' };\n});\n\n// ============ 手写 compose（洋葱模型核心） ============\nfunction compose(middlewares) {\n  if (!Array.isArray(middlewares)) {\n    throw new TypeError('middlewares must be an array');\n  }\n  for (const fn of middlewares) {\n    if (typeof fn !== 'function') {\n      throw new TypeError('each middleware must be a function');\n    }\n  }\n\n  return function (ctx) {\n    let index = -1;  // 记录当前执行位置，防止 next 多次调用\n    function dispatch(i) {\n      if (i <= index) {\n        // next() 被多次调用：第二次 dispatch 的 i 不会大于上次的 index\n        return Promise.reject(new Error('next() called multiple times'));\n      }\n      index = i;\n      const fn = middlewares[i];\n      if (!fn) return Promise.resolve();  // 所有中间件执行完毕\n      try {\n        // 把 dispatch(i+1) 作为 next 传入，形成递归 Promise 链\n        return Promise.resolve(fn(ctx, dispatch.bind(null, i + 1)));\n      } catch (err) {\n        // 同步异常包装为 rejected Promise\n        return Promise.reject(err);\n      }\n    }\n    return dispatch(0);\n  };\n}\n\n// 使用 compose 手动构建洋葱\nconst middlewares = [\n  async (ctx, next) => { ctx.state.trace = ['m1-start']; await next(); ctx.state.trace.push('m1-end'); },\n  async (ctx, next) => { ctx.state.trace.push('m2-start'); await next(); ctx.state.trace.push('m2-end'); },\n  async (ctx) => { ctx.state.trace.push('m3'); ctx.body = { trace: ctx.state.trace }; },\n];\nconst handler = compose(middlewares);\n// handler(ctx).then(() => console.log(ctx.body))\n// => { trace: ['m1-start', 'm2-start', 'm3', 'm2-end', 'm1-end'] }",
       "language": "javascript",
       "highlights": [
         {
           "line": 6,
-          "note": "`app.use((req, res, next) => {` 定义了 Koa/Express 框架原理 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "note": "Express 没有后置逻辑钩子，需要 res.on('finish') 监听响应结束才能拿到耗时——这是和 Koa 洋葱模型的核心差异。"
         },
         {
-          "line": 50,
-          "note": "`if (i <= index) return Promise.reject(new Error('next() called multiple times'));` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 24,
+          "note": "Koa 的 await next() 等待所有下游中间件完成，前后的代码天然对称，计时/日志/序列化都能在这里做。"
         },
         {
-          "line": 13,
-          "note": "`res.send(`User ${req.params.id}`);` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+          "line": 43,
+          "note": "index 变量是 compose 的关键防护：多次调 next() 时 i <= index，直接 reject，防止后置逻辑被重复执行。"
         },
         {
-          "line": 47,
-          "note": "`return function(ctx) {` 对应最终输出，检查这里可以确认边界值是否和题意一致。"
+          "line": 48,
+          "note": "Promise.resolve(fn(ctx, next)) 把中间件返回值包装成 Promise，即使中间件是同步函数也不会破坏 Promise 链。"
+        },
+        {
+          "line": 56,
+          "note": "验证用例：dispatch 递归形成的 trace 数组顺序就是洋葱模型的执行顺序。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "Express是基于回调的中间件模型，中间件按注册顺序线性执行，通过next()传递控制权。Express内置路由、静态文件等功能，适合快速开发。\nKoa是基于async/await的洋葱模型。中间件按顺序执行到最内层，然后反向执行后续代码。核心实现是compose函数，将中间件数组组合成嵌套的Promise链。通过next()返回Promise实现await等待下一个中间件完成。\n手写compose的关键是：dispatch函数递归调用，每次执行一个中间件并传入下一次dispatch作为next。用index防止next被多次调用。所有中间件通过Promise链连接，实现异步流程控制。\nExpress适合快速开发，Koa更适合需要精细控制中间件流程的场景。Koa的错误处理也更优雅，用try/catch包裹next()即可捕获下游错误。",
+      "content": "**结论**：Express 是线性回调链，Koa 是洋葱模型（嵌套 Promise 链）；核心区别在于 `next()` 的语义——Express 的 next 只是跳到下一个回调，Koa 的 next 返回后续所有中间件执行完的 Promise。\n\n**Express 线性 next 链**\n- `app.use(fn)` 把中间件入栈，请求到达时依次调用 `fn(req, res, next)`\n- `next()` 把控制权交给栈里下一个中间件；不调则短路\n- Express 4 没有 next 多次调用防护，调两次后续栈会重复执行\n- 错误处理靠四参数中间件 `(err, req, res, next)`；async 里忘记 `next(err)` 错误会被吞\n\n**Koa 洋葱模型**\n- `await next()` 等后续所有中间件执行完再继续，形成前后对称的洋葱结构\n- 前置逻辑在 `await next()` 之前，后置逻辑在之后——计时、日志、统一序列化天然支持\n- 错误通过 Promise reject 冒泡，最外层 try/catch 即可捕获所有下游错误\n- `ctx` 是 `req`/`res` 的统一封装加 delegate（`ctx.body` → `ctx.response.body`）\n\n**手写 compose 要点**\n- `dispatch(i)` 递归取出第 i 个中间件执行，把 `dispatch(i+1)` 作为 next 传入\n- `index` 记录执行位置，`i <= index` 时抛错，防止 next 被多次调用\n- `Promise.resolve(fn(ctx, next))` 包装中间件返回值，同步异常也会变成 rejected Promise\n\n**工程取舍**\n- Express：生态成熟、内置路由/静态文件、快速搭 CRUD API\n- Koa：核心极简、中间件流精细控制、适合 BFF 和需要定制化的场景\n- Express 5（alpha）开始支持 async 错误自动捕获，但中间件模型仍是线性 next",
       "followUpQuestions": [
         {
-          "question": "在实际前端项目中，Koa/Express 框架原理的落地时怎么取舍？有哪些常见坑？",
-          "answer": "Koa/Express 框架原理的核心是理解浏览器/Node.js的运行机制。建议围绕 Koa/Express 框架原理 在 Chrome DevTools 的 Performance、Sources 和 Network 面板里实际复现一次。"
+          "question": "Express 的 next() 如果被调用两次会怎样？Koa 如何防护？",
+          "answer": "Express 4 没有防护，调两次 next() 会导致后续中间件被执行两次，可能出现响应头重复写入或逻辑错乱。Koa 的 compose 用 index 变量记录当前执行位置，第二次 dispatch 时 i <= index 会直接抛出 'next() called multiple times' 错误并 reject Promise。"
         },
         {
-          "question": "Koa/Express框架 的核心原理是什么？和其他方案相比有什么优劣？",
-          "answer": "落地时先明确场景、输入输出、性能和兼容性边界，再用最小示例或线上指标验证；常见坑是把概念当成银弹，忽略失败路径、回滚和可观测性。"
+          "question": "为什么 Koa 的 await next() 能实现洋葱模型，而 Express 不行？",
+          "answer": "本质区别是 next 的返回值。Express 的 next() 是一个普通回调触发器，没有返回值，调用后立即跳到下一个中间件，无法等待后续完成。Koa 的 next() 返回一个 Promise，代表后续所有中间件执行完毕的时机；await next() 会暂停当前中间件直到后续全部完成后才继续执行后半段，自然形成嵌套结构。"
         },
         {
-          "question": "如果 Koa/Express框架 在生产环境出了性能或兼容性问题，你会怎么排查？",
-          "answer": "排查 Koa/Express框架 问题的思路：先看浏览器兼容性数据和用户环境分布，再用 DevTools 的 Network/Performance/Console 面板定位。遇到 Koa/Express 框架原理 的跨平台问题时，要在目标设备、浏览器版本和真实网络条件下复现。Koa/Express 框架原理 的错误日志、性能数据和用户影响范围是优先线索。"
+          "question": "Koa 里某个中间件忘记写 await next() 会怎样？",
+          "answer": "后续中间件不会被执行（短路）。如果这个中间件设置了 ctx.body，响应直接返回；如果没设置，Koa 会返回 404 Not Found。这在排查请求不走某些中间件时是常见原因——检查链路上有没有中间件漏了 await next()。"
+        },
+        {
+          "question": "Express 的四参数错误中间件和 Koa 的统一 try/catch 各有什么坑？",
+          "answer": "Express 的坑：必须是 4 个参数，写 3 个就被当成普通中间件；async 函数里抛错不会自动走错误中间件，必须 catch 后 next(err)；忘记 next(err) 错误会被静默吞掉。Koa 的坑：错误中间件通常只写一个放在最外层，但如果中间件内部有独立的 Promise（没 await），错误也不会冒泡到外层 catch。"
         }
       ]
     },
@@ -106,60 +119,69 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "Express和Koa的中间件模型区别",
-        "洋葱模型的执行流程",
-        "手写compose函数的核心逻辑",
-        "Koa的ctx上下文对象的作用",
-        "Koa的错误处理方式"
+        "能解释 Express 线性 next 链的执行机制和四参数错误中间件的路由规则",
+        "能描述 Koa 洋葱模型的执行顺序：前置 → ... → 最内层 → ... → 后置",
+        "能说清 compose 中 dispatch 递归、index 防护和 Promise.resolve 包装的作用",
+        "能对比 Express 和 Koa 在 next 语义、错误传播、后置逻辑、上下文对象上的差异",
+        "能说明 ctx 委托机制：ctx.body → ctx.response.body 的 getter/setter 代理",
+        "能解释 Express 4 async 函数里忘记 next(err) 错误被吞的原因和 Koa 为什么没有这个问题"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "frontend.nodejs.topic-koa-express.recall.1",
-      "prompt": "解释Koa洋葱模型的执行流程，手写compose函数",
-      "mode": "text",
-      "expectedMinutes": 5,
+      "prompt": "解释 Koa 洋葱模型的执行流程，手写 compose 函数并说明 index 防护机制。",
+      "mode": "code",
+      "expectedMinutes": 8,
       "difficulty": 3
     },
     {
       "id": "frontend.nodejs.topic-koa-express.recall.2",
-      "prompt": "Express和Koa的中间件机制有什么区别？",
+      "prompt": "Express 和 Koa 的中间件机制有什么区别？从 next 语义、错误传播、后置逻辑能力三个角度对比。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "frontend.nodejs.topic-koa-express.recall.3",
-      "prompt": "Koa/Express 框架原理 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "Express 的四参数错误中间件有什么规则？async 函数里抛错但忘记 next(err) 会怎样？Koa 为什么不存在这个问题？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "frontend.nodejs.topic-koa-express.recall.4",
+      "prompt": "Koa 里某个中间件忘记 await next()，会导致什么现象？排查请求不走某些中间件时怎么定位？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
-      "id": "frontend.nodejs.topic-koa-express.recall.scenario",
-      "prompt": "生产环境里 Koa/Express 框架原理 出现异常或效果不达预期时，你会如何定位原因、选择修复方案并验证结果？",
+      "id": "frontend.nodejs.topic-koa-express.recall.5",
+      "prompt": "生产环境的 Koa 服务，日志显示某个请求耗时异常长，但中间件代码没看出问题。你会怎么排查？从中间件模型和洋葱执行顺序的角度分析可能原因。",
       "mode": "text",
-      "expectedMinutes": 4,
+      "expectedMinutes": 5,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能解释Express和Koa的中间件模型区别",
-      "能描述洋葱模型的执行流程",
-      "能手写compose函数",
-      "能解释next()的作用"
+      "能解释 Express 线性 next 链和 Koa 洋葱模型的执行差异",
+      "能描述洋葱模型的前置 → 最内层 → 后置执行顺序",
+      "能手写 compose 函数并说清 dispatch 递归和 index 防护机制",
+      "能对比 Express 和 Koa 在 next 语义、错误传播和上下文对象上的区别"
     ],
     "goodToHave": [
-      "能解释Express的错误中间件（4参数）",
-      "能解释Koa的ctx委托机制",
-      "能解释中间件的执行顺序控制"
+      "能解释 Express 四参数错误中间件的规则和 async 错误被吞的坑",
+      "能说明 Koa ctx 委托机制（ctx.body → ctx.response.body）",
+      "能解释 await next() 实现洋葱模型的技术原理（next 返回 Promise）"
     ],
     "commonMistakes": [
-      "只列出 Node.js、Koa、Express，但说不出触发条件、状态变化和验证证据",
-      "把「Koa/Express 框架原理」的适用场景、失效条件和相邻概念混在一起",
-      "遇到前端工程里的真实问题时，不能说明「Koa/Express 框架原理」应该观察哪些状态、日志或指标"
+      "以为 Express 和 Koa 的 next() 语义相同，忽略 Express next 只是跳到下一个回调而 Koa 的 next 返回后续全部完成的 Promise",
+      "忘记 Koa 中间件必须是 async 函数或返回 Promise，同步中间件不 await next 会短路",
+      "手写 compose 时漏掉 index 防护，导致 next 多次调用时后置逻辑重复执行",
+      "Express 4 里用 async 中间件但忘记 catch 后 next(err)，错误被静默吞掉"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -172,6 +194,6 @@
     "frontend.nodejs.topic-node-modules"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「Koa/Express 框架原理」说清能解释Express和Koa的中间件模型区别、能描述洋葱模型的执行流程，并放到前端工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察是否能从 next 语义差异出发，完整对比 Express 线性链和 Koa 洋葱模型的执行机制、错误传播、后置逻辑能力，并能手写 compose 并解释其递归结构和防错机制。",
+  "updatedAt": "2026-06-22"
 }

@@ -4,7 +4,7 @@
   "category": "redis-cache",
   "group": "redis-cache",
   "title": "缓存穿透、击穿与雪崩",
-  "summary": "区分三类缓存失效的流量形态，给出可落地的防护组合与一致性权衡。",
+  "summary": "区分穿透（无效 key 稳态回源）、击穿（单热点 key 瞬时并发回源）、雪崩（批量 key 或缓存层整体失效）三种流量形态，给出布隆过滤器、互斥重建、逻辑过期、TTL 抖动、多级缓存等防护手段的具体实现、代价与适用边界。",
   "tags": [
     "数据库",
     "Redis",
@@ -19,17 +19,27 @@
   "status": "staging",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否在 30 秒内把穿透、击穿、雪崩落到不同流量形态上，并能写出 SETNX 互斥重建、布隆过滤器位数组、TTL 抖动等具体手段及其代价。",
+  "interviewerFocus": "考察能否在 30 秒内把穿透、击穿、雪崩落到不同流量形态上，并能给出布隆过滤器位数组公式、SETNX 互斥重建 + Lua 释放、TTL 抖动、逻辑过期等具体手段的实现细节、代价与适用边界。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "三类缓存失效的流量形态与边界",
-      "content": "穿透、击穿、雪崩看起来都是「缓存没挡住」，但流量形态完全不同，防护手段也不可互换。\n\n- 缓存穿透：查询的 key 在 DB 里就不存在，比如 -1、已删除的 id、爬虫伪造 id。每次请求都会穿过 Redis 直达 DB；攻击场景下会形成「请求量再大命中率也归零」的稳定回路。\n- 缓存击穿：单个热点 key 突然失效（过期、删除、LRU 淘汰），同一瞬间几百个并发请求一起回源 DB。常见于秒杀商品详情、热点榜单、热搜词。\n- 缓存雪崩：大量 key 在相近时间集中失效（同一批写入的 TTL 相同）或缓存集群/代理层整体不可用，造成 DB QPS 短时陡升。\n\n它们的关键差异：穿透的「不命中」是稳态的，击穿的「不命中」是瞬时的，雪崩的「不命中」是批量的。把这三种形态映射到监控上：穿透看「无效 key 的 QPS 占比」，击穿看「单 key 回源并发」，雪崩看「整体命中率断崖 + DB QPS 尖峰」。常见误区是把「缓存预热」与这三者并列，但预热是预防策略（提前加载热点），不是失效形态本身，混在一起会模糊分类。"
+      "title": "三种失效形态的本质差异",
+      "content": "穿透、击穿、雪崩的共同表象是「缓存没挡住，请求打到 DB」，但触发条件、流量形态和防护思路完全不同，混为一谈会导致方案选错。\n\n**缓存穿透**的特征是稳态不命中：请求的 key 在 DB 中就不存在——可能是爬虫伪造 id、前端传参错误、已删除记录。每次请求都会穿透 Redis 到达 DB，命中率恒定为零。攻击者只要持续发无效 key，DB 就持续承压。\n\n**缓存击穿**的特征是瞬时并发回源：某个访问极高的热点 key（秒杀商品、热搜词、排行榜）突然失效（TTL 到期、被 LRU 淘汰、主动删除），在缓存未重建的窗口内，同一瞬间可能有数百个并发请求一起回源 DB。这个窗口通常只有几十毫秒到几百毫秒，但足以把 DB 单表 QPS 从几百打到几万。\n\n**缓存雪崩**的特征是批量或全局失效：要么大量 key 在相近时间集中过期（同一批写入、TTL 相同），要么缓存集群/代理层整体不可用（网络分区、Redis 主从全挂、代理超时），导致短时间内几乎全部请求回源 DB。雪崩比击穿危险在于它不是单点问题，而是全局流量突变。\n\n把三种形态映射到监控指标：穿透看「不存在 key 的回源 QPS 占比」（可通过 DB 慢查询中的无效 id 频率识别）；击穿看「单 key 回源并发数」（Redis MONITOR 或热点 key 探测）；雪崩看「缓存整体命中率断崖 + DB QPS 和连接数尖峰」。"
     },
     {
       "type": "explain",
-      "title": "防护手段的代价与工程取舍",
-      "content": "防护手段都要付出代价，没有「白嫖」的方案。下面按三类问题给出主流实现与对应代价：\n\n- 穿透 — 空值缓存：对不存在的 key 也写一个短 TTL（30~120s）的占位值（如 \"\" 或 -1），代价是缓存被空值占满、TTL 内新增的真值要等过期；不适用高基数伪造查询。\n- 穿透 — 布隆过滤器：底层是长度为 m 的位数组和 k 个哈希函数，插入时对 key 做 k 次哈希把对应位置 1；查询时只要有一个 bit 为 0 就一定不存在，全部为 1 则「可能存在」（有误判）。RedisBloom 常用 `BF.RESERVE bf:user 0.01 1000000` 创建（误判率 1%、容量 100 万），`BF.ADD` / `BF.MEXISTS` 写入和查询。误判率公式 m = -n·ln p / (ln 2)²，k = (m/n)·ln 2；n=100 万、p=0.01 时 m≈9.6 Mbit≈1.2 MB，k≈7。代价是误判和底层数据变化时需要重建。\n- 击穿 — 互斥重建：失效瞬间只让一个线程回源，其他线程拿锁失败后 sleep 50~100ms 重试或返回旧值。原生 Redis 用 `SET lock:<key> <token> NX PX 5000` 充当互斥锁，Java 侧常用 Redisson `RLock.tryLock(50, 200, TimeUnit.MILLISECONDS)`；解锁时要校验 token 防误删（用 Lua 脚本「if get==token then del」做原子）。代价是请求被串行化、锁 TTL 设置不当会死锁。\n- 击穿 — 逻辑过期：value 里多带一个 expireTime 字段，过期后允许短暂返回旧值并异步重建，配合 `SET NX` 抢锁保证只有一个线程重建；适合可接受秒级延迟的读多写少场景；不适用金额、库存等强一致业务。\n- 击穿 — singleflight：进程内合并对同 key 的并发回源请求，只放行一个到 DB；与分布式互斥锁互为补充，省掉跨实例争锁的开销。\n- 雪崩 — TTL 抖动：`SETEX key base+random(0, n)`，把 n 设到 TTL 的 10%~30% 即可把集中失效打散；不能根治但成本最低。\n- 雪崩 — 多级缓存 + 限流降级：本地 Caffeine（Caffeine.newBuilder().expireAfterWrite(60, SECONDS)）兜底一层，Redis 不可用时走 DB + Sentinel/Hystrix 限流降级，避免 100% 流量直打 DB。\n\n工程取舍上：电商首页适合「布隆 + TTL 抖动 + 互斥重建」三件套；库存/券码这类强一致场景要慎用逻辑过期；缓存集群故障时的兜底不是「再起一个 Redis」而是「让 DB 活下来」，顺序是本地缓存 → 业务降级 → DB 限流。"
+      "title": "穿透防护：从参数校验到布隆过滤器",
+      "content": "穿透防护按成本从低到高排列，每一层解决不同严重程度的问题。\n\n**参数校验**是第一道防线：对 id 做正范围校验（>0）、格式校验（UUID 正则）、权限校验（是否属于当前用户可访问范围）。成本几乎为零，能拦截大量低级无效请求，但无法应对随机生成的合法格式 id。\n\n**空值缓存**是对不存在的 key 也写一个短 TTL 的占位值（如空字符串或 `\"NULL\"`），下次同一 key 来时命中缓存直接返回，避免重复查 DB。典型 TTL 是 30~120 秒。代价有两个：缓存空间被空值占用（高基数伪造查询场景下可能污染缓存），以及 TTL 窗口内新增的真实数据会被空值挡住。对于第一个代价，可以对空值缓存单独使用 LRU 淘汰策略或限制空值 key 数量。\n\n**布隆过滤器**是穿透防护的重武器。底层结构是长度为 m 的位数组和 k 个独立哈希函数：写入时对 key 做 k 次哈希，将对应 bit 置 1；查询时对 key 做同样的 k 次哈希，只要有一个 bit 为 0 就**一定不存在**（无假阴性），全部为 1 则「可能存在」（有假阳性）。误判率公式：m = -n·ln(p) / (ln2)²，k = (m/n)·ln2。以 n=100 万、p=0.01 为例，m≈9.6 Mbit≈1.2 MB，k≈7；p 降到 0.001 时 m 翻倍到约 2.4 MB。RedisBloom 模块提供 `BF.RESERVE bf:ctx 0.01 1000000` 创建过滤器，`BF.ADD` 写入，`BF.MEXISTS` 批量查询。\n\n布隆过滤器的代价：误判率只能压低不能消除，误判会让一次合法请求被错误拦截（可通过白名单或二次确认补救）；底层数据变化时需要重建过滤器（离线全量重建或使用 Counting Bloom Filter 支持删除）；过滤器需要与缓存层一起部署，增加运维复杂度。"
+    },
+    {
+      "type": "explain",
+      "title": "击穿防护：互斥重建、逻辑过期与 singleflight",
+      "content": "击穿防护的核心目标是：热点 key 失效瞬间，把并发回源请求从 N 压到 1。\n\n**互斥重建（Mutex Rebuild）**是最经典的做法。缓存未命中时，先尝试用 Redis 的 `SET lock:rebuild:<key> <token> NX PX 5000` 抢一把分布式锁：拿到锁的请求回源 DB、写回缓存、释放锁；拿不到锁的请求 sleep 50~100ms（加随机抖动避免惊群）后重新读缓存。释放锁必须用 Lua 脚本原子校验 token 再删除（`if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end`），防止持锁超时后锁被其他线程抢走，原线程误删新线程的锁。代价：请求被串行化，回源延迟从 DB RT 变为 DB RT + 等锁时间；锁 TTL 要大于最大 DB 回源时间，否则会死锁。\n\n**逻辑过期（Logical Expiration）**不依赖 Redis 的 TTL 机制，而是在 value 里额外存一个 `expireTime` 字段。读取时如果 `expireTime < now`，说明数据逻辑上已过期，直接返回旧值（用户感知到的是秒级延迟的数据），同时异步触发重建。为防止大量请求同时触发重建，仍需用 `SET NX` 抢锁，只有一个线程真正回源，其他线程直接返回旧值。适用场景：读多写少、能容忍秒级延迟（如用户画像、配置信息）。不适用场景：金额、库存、券码等强一致业务，因为旧值可能导致超卖或金额错误。\n\n**singleflight**是进程内的合并优化。同一进程内对相同 key 的并发回源请求，只放行第一个到 DB，其余等待第一个返回后共享结果。Go 标准库提供 `golang.org/x/sync/singleflight`，Java 可用 Caffeine 的 `AsyncCacheLoader` 或自建 ConcurrentHashMap + CompletableFuture 实现。singleflight 与分布式互斥锁互补：singleflight 解决单实例内的并发，分布式锁解决跨实例的并发。"
+    },
+    {
+      "type": "explain",
+      "title": "雪崩防护：TTL 抖动、多级缓存与限流降级",
+      "content": "雪崩防护的核心是：即使缓存大面积失效，也要保证 DB 不被打穿。\n\n**TTL 抖动**是最简单的预防手段：写入缓存时用 `SETEX key (baseTTL + random(0, jitter))`，把 jitter 设为 baseTTL 的 10%~30%。例如 baseTTL=300s，jitter 取 30~90s，同一批写入的 key 会在 300~390s 的窗口内分散过期，而不是同一瞬间集中失效。这个手段成本极低，几乎所有使用缓存的系统都应该默认开启，但它不能应对缓存集群整体不可用的场景。\n\n**多级缓存**是在 Redis 之前加一层进程内缓存（Java 常用 Caffeine，Go 常用 ristretto）。Caffeine 配置示例：`Caffeine.newBuilder().maximumSize(10_000).expireAfterWrite(60, SECONDS).build()`。当 Redis 不可用或热点 key 失效时，请求先命中本地缓存，本地缓存过期后才回源 DB。代价：本地缓存的容量有限（受 JVM 堆限制），一致性更难保证（本地缓存与 Redis 之间有延迟），多实例间缓存不共享。\n\n**限流降级**是最后一道防线。当 DB QPS 超过阈值时，通过 Sentinel、Hystrix 或 Resilience4j 触发限流（返回默认数据、排队等待、直接拒绝）。降级策略按业务分级：核心接口（下单、支付）走严格限流 + 排队；非核心接口（推荐、评论）返回缓存的旧数据或默认值。顺序是：本地缓存 → 业务降级（返回默认值）→ DB 限流（排队或拒绝），而不是「Redis 挂了就重启 Redis」。\n\n**集群高可用**是基础设施层面的预防：Redis Sentinel 或 Cluster 保证主从自动切换，避免单点故障导致全局缓存不可用。但对于极端场景（如机房断电），集群高可用也不能保证零丢失，限流降级仍然是必要的兜底。"
     },
     {
       "type": "diagram",
@@ -61,82 +71,138 @@
     },
     {
       "type": "compareTable",
-      "title": "穿透、击穿、雪崩对比",
+      "title": "三类失效形态与防护手段对比",
       "columns": [
         "维度",
-        "流量形态",
-        "触发条件",
-        "主流方案",
-        "代价与风险"
+        "缓存穿透",
+        "缓存击穿",
+        "缓存雪崩"
       ],
       "rows": [
         [
-          "缓存穿透",
-          "无效 key 的稳定回路",
-          "DB 中不存在的 key 被反复查询",
-          "参数校验 / 空值缓存 / 布隆过滤器",
-          "空值污染缓存、位数组误判、底层数据变化需重建"
-        ],
-        [
-          "缓存击穿",
+          "流量形态",
+          "无效 key 稳态回路",
           "单 key 瞬时高并发",
-          "热点 key 过期或被删",
-          "互斥重建 / 逻辑过期 / singleflight 合并",
-          "锁等待放大、TTL 太小会死锁、逻辑过期不适用强一致"
+          "批量 key 或集群整体失效"
         ],
         [
-          "缓存雪崩",
-          "批量 key 集中失效或集群不可用",
-          "TTL 相同 / 缓存层整体故障",
-          "TTL 随机抖动 / 多级缓存 / 限流降级 / 集群高可用",
-          "DB 被打穿、本地缓存一致性更难、限流要按业务分级"
+          "触发条件",
+          "DB 中不存在的 key 被反复查询",
+          "热点 key 过期/被删/被 LRU 淘汰",
+          "同批 TTL 相同 / 缓存层整体故障"
+        ],
+        [
+          "监控指标",
+          "无效 key 回源 QPS 占比",
+          "单 key 回源并发数",
+          "整体命中率断崖 + DB QPS 尖峰"
+        ],
+        [
+          "参数校验",
+          "✅ 第一道防线",
+          "❌ 不适用",
+          "❌ 不适用"
+        ],
+        [
+          "空值缓存",
+          "✅ 短 TTL 占位",
+          "❌ 不适用",
+          "❌ 不适用"
+        ],
+        [
+          "布隆过滤器",
+          "✅ 位数组 + k 哈希拦截",
+          "❌ 不适用",
+          "❌ 不适用"
+        ],
+        [
+          "互斥重建",
+          "❌ 不适用",
+          "✅ SETNX + Lua 释放",
+          "❌ 不适用"
+        ],
+        [
+          "逻辑过期",
+          "❌ 不适用",
+          "✅ 读多写少场景",
+          "❌ 不适用"
+        ],
+        [
+          "TTL 抖动",
+          "❌ 不适用",
+          "✅ 辅助手段",
+          "✅ 核心预防手段"
+        ],
+        [
+          "多级缓存",
+          "❌ 不适用",
+          "✅ 辅助手段",
+          "✅ 核心兜底手段"
+        ],
+        [
+          "限流降级",
+          "❌ 不适用",
+          "❌ 不适用",
+          "✅ 最后一道防线"
         ]
       ]
     },
     {
       "type": "code",
-      "title": "互斥重建 + 布隆过滤器代码骨架",
+      "title": "穿透防护 + 击穿防护代码骨架",
       "language": "java",
-      "content": "// 击穿防护：单飞 + TTL 抖动\npublic <T> T getOrLoad(String key, Supplier<T> loader) {\n    String cached = redis.get(key);\n    if (cached != null) return decode(cached);\n\n    // SET lock:rebuild:<key> <token> NX PX 5000\n    String token = UUID.randomUUID().toString();\n    boolean ok = \"OK\".equals(redis.set(\n        \"lock:rebuild:\" + key, token, \"NX\", \"PX\", 5000));\n    if (ok) {\n        try {\n            T v = loader.get();\n            int ttl = 60 + ThreadLocalRandom.current().nextInt(20);\n            redis.setex(key, ttl, encode(v)); // TTL 抖动防雪崩\n            return v;\n        } finally {\n            // Lua 释放：先校验 token 再 DEL，避免误删他人的锁\n            redis.eval(\n                \"if redis.call('get', KEYS[1]) == ARGV[1] then \" +\n                \"return redis.call('del', KEYS[1]) else return 0 end\",\n                1, \"lock:rebuild:\" + key, token);\n        }\n    } else {\n        sleep(50 + ThreadLocalRandom.current().nextInt(50));\n        return getOrLoad(key, loader); // 退避重试\n    }\n}\n\n// 穿透防护：布隆过滤器前置\npublic <T> T getWithBloom(String key, Supplier<T> loader) {\n    // BF.MEXISTS 返回 0 一定不存在，返回 1 才有误判\n    List<Long> res = (List<Long>) redis.execute(\"BF.MEXISTS bf:user \" + key);\n    if (res == null || res.get(0) == 0L) return null;\n    return getOrLoad(key, loader);\n}",
+      "content": "import java.util.*;\nimport java.util.concurrent.*;\nimport java.util.function.Supplier;\n\npublic class CacheProtection {\n    private final RedisClient redis;\n\n    // ==================== 穿透防护：布隆过滤器 + 空值缓存 ====================\n\n    public <T> T getWithBloom(String bloomKey, String cacheKey, Supplier<T> loader) {\n        // BF.MEXISTS 返回 0 → 一定不存在，直接返回 null，不查 DB\n        long exists = redis.bfExists(bloomKey, cacheKey);\n        if (exists == 0) return null;\n\n        return getWithNullCache(cacheKey, loader);\n    }\n\n    private <T> T getWithNullCache(String key, Supplier<T> loader) {\n        String cached = redis.get(key);\n        if (cached != null) {\n            return \"NULL\".equals(cached) ? null : decode(cached);\n        }\n\n        T value = loader.get();\n        if (value == null) {\n            // 空值缓存：短 TTL 防止同一无效 key 重复回源\n            redis.setex(key, 60, \"NULL\");\n            return null;\n        }\n\n        int ttl = 300 + ThreadLocalRandom.current().nextInt(60); // TTL 抖动 20%\n        redis.setex(key, ttl, encode(value));\n        return value;\n    }\n\n    // ==================== 击穿防护：互斥重建 ====================\n\n    public <T> T getWithMutexRebuild(String key, Supplier<T> loader) {\n        String cached = redis.get(key);\n        if (cached != null) return decode(cached);\n\n        String token = UUID.randomUUID().toString();\n        String lockKey = \"lock:rebuild:\" + key;\n\n        // SET lock:rebuild:<key> <token> NX PX 5000\n        // NX 保证只有一个线程拿到锁，PX 防止持锁崩溃后死锁\n        boolean locked = \"OK\".equals(\n            redis.set(lockKey, token, \"NX\", \"PX\", 5000));\n\n        if (locked) {\n            try {\n                // 二次检查：拿到锁后可能其他线程已重建\n                cached = redis.get(key);\n                if (cached != null) return decode(cached);\n\n                T value = loader.get();\n                int ttl = 300 + ThreadLocalRandom.current().nextInt(60);\n                redis.setex(key, ttl, encode(value));\n                return value;\n            } finally {\n                // Lua 原子释放：校验 token 防止误删他人锁\n                redis.eval(\n                    \"if redis.call('get', KEYS[1]) == ARGV[1] then \" +\n                    \"return redis.call('del', KEYS[1]) else return 0 end\",\n                    1, lockKey, token);\n            }\n        } else {\n            // 拿不到锁：退避重试，避免惊群效应\n            try {\n                Thread.sleep(50 + ThreadLocalRandom.current().nextInt(50));\n            } catch (InterruptedException e) {\n                Thread.currentThread().interrupt();\n            }\n            return getWithMutexRebuild(key, loader);\n        }\n    }\n\n    // ==================== 雪崩防护：TTL 抖动已在上面实现 ====================\n    // TTL = base + random(0, base * 0.2)，同批 key 分散过期\n    // 生产中还需配合：Caffeine 本地缓存 + Sentinel 限流降级\n}",
       "highlights": [
         {
-          "line": 9,
-          "note": "SET lock:rebuild:<key> <token> NX PX 5000 是 Redis 推荐的分布式锁原语，PX 防止持锁线程崩溃后死锁"
+          "line": 11,
+          "note": "BF.MEXISTS 返回 0 表示一定不存在，直接拦截，不进入后续缓存和 DB 查询"
         },
         {
-          "line": 14,
-          "note": "SETEX 写入时 TTL 取 base+rand(0, 20)，把同一批 key 的过期时间打散，避免雪崩"
+          "line": 21,
+          "note": "空值缓存用短 TTL（60s）占位，防止同一无效 key 穿透 DB"
         },
         {
-          "line": 19,
-          "note": "Lua 脚本把「校验 token + 删锁」做成原子操作，避免持锁超时后被其它线程误删"
+          "line": 27,
+          "note": "TTL 抖动：baseTTL=300s + random(0, 60)，把同批 key 过期时间打散到 60s 窗口"
         },
         {
-          "line": 25,
-          "note": "拿不到锁时 sleep+rand 后重试而不是无限循环，配合互斥锁把回源并发压到 1"
+          "line": 37,
+          "note": "NX 保证只有一个线程拿到锁，PX=5000ms 防止持锁崩溃后死锁"
         },
         {
-          "line": 32,
-          "note": "BF.MEXISTS 是 RedisBloom 的批量存在查询，返回 0 一定不存在，返回 1 才有误判"
+          "line": 41,
+          "note": "拿到锁后二次检查缓存，避免重复重建（其他线程可能已完成）"
+        },
+        {
+          "line": 49,
+          "note": "Lua 脚本原子执行「校验 token + 删除锁」，防止误删他人持有的锁"
+        },
+        {
+          "line": 55,
+          "note": "拿不到锁时 sleep 50~100ms + 随机抖动后重试，避免惊群效应"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "30 秒结论：穿透、击穿、雪崩不是「缓存挂了」这一件事，而是三种不同的流量形态——查不到、单点失效、批量失效。答题时要先把这三种形态落到具体数字上，再按形态给方案。\n\n按形态展开：\n\n- 穿透：DB 里没有的 key 被反复查，方案按成本从低到高是「参数校验 → 空值缓存（短 TTL 占位）→ 布隆过滤器（位数组 + k 个哈希，m = -n·ln p / (ln 2)²）」，代价是空值污染和误判。\n- 击穿：热点 key 失效瞬间并发回源，方案是「`SET lock:key token NX PX 5000` 互斥重建 + 退避重试」或「逻辑过期 + 异步重建」；互斥锁会串行化请求，逻辑过期不适用强一致。\n- 雪崩：批量 key 同时失效或 Redis 整体不可用，方案是「TTL 抖动（`base+rand(0, n)`，n 取 TTL 的 10%~30%）+ 多级缓存（Caffeine 本地兜底）+ 限流降级（Sentinel/Hystrix）+ 集群高可用」。\n\n追问应对：\n\n- 「逻辑过期和互斥锁怎么选？」答：读多写少且能容忍秒级旧值用逻辑过期；写多或强一致用互斥重建。生产上更稳的是两者叠加：逻辑过期减少锁竞争，互斥锁保证只重建一次。\n- 「布隆过滤器误判怎么办？」答：误判只会造成一次额外 DB 查询，不会让脏数据写进缓存；用 `BF.RESERVE` 调高 m 或降低 p 可以压低误判率，但会消耗更多内存。\n- 「Redis 集群挂了怎么办？」答：DB 不是兜底而是最后一道防线，本地缓存 + 限流 + 业务降级（返回默认数据或提示）才是真正的兜底，顺序是本地缓存 → 限流 → 业务降级 → DB。",
+      "content": "**30 秒结论**：穿透、击穿、雪崩是三种不同的缓存失效形态——穿透是无效 key 稳态回路、击穿是单热点 key 瞬时并发、雪崩是批量 key 或集群全局失效。防护手段不可互换：穿透用布隆过滤器拦截、击穿用互斥锁压到 1 次回源、雪崩用 TTL 抖动 + 多级缓存 + 限流降级兜底。\n\n**按形态展开**\n\n穿透（稳态不命中）：\n- 识别：监控「无效 key 回源 QPS 占比」\n- 防护链：参数校验（成本最低）→ 空值缓存（短 TTL 占位，防重复回源）→ 布隆过滤器（位数组 m = -n·ln(p)/(ln2)²，k = (m/n)·ln2，RedisBloom 的 `BF.RESERVE`/`BF.MEXISTS`）\n- 代价：空值污染缓存空间、布隆有误判且数据变化需重建\n\n击穿（瞬时并发回源）：\n- 识别：监控「单 key 回源并发数」\n- 防护：`SET lock:key token NX PX 5000` 互斥重建 + Lua 脚本原子释放（校验 token 防误删）+ 退避重试\n- 备选：逻辑过期（value 带 expireTime，过期返回旧值 + 异步重建），适合读多写少、可容忍秒级延迟\n- 进程内优化：singleflight 合并同 key 并发回源\n- 代价：互斥锁串行化请求、锁 TTL 要大于最大回源时间否则死锁；逻辑过期不适用强一致\n\n雪崩（批量/全局失效）：\n- 识别：监控「整体命中率断崖 + DB QPS 尖峰 + 连接池耗尽」\n- 预防：TTL 抖动（`base + random(0, base*0.3)`，打散同批 key 过期窗口）\n- 兜底：多级缓存（Caffeine 本地缓存兜底）→ 业务降级（返回默认值）→ DB 限流（Sentinel/Hystrix 排队或拒绝）\n- 基础设施：Redis Sentinel/Cluster 保证主从高可用\n- 代价：本地缓存一致性更难、限流影响用户体验\n\n**追问应对**\n\n- 「逻辑过期和互斥锁怎么选？」→ 读多写少且能容忍秒级旧值用逻辑过期；写多或强一致用互斥重建。两者可叠加：逻辑过期减少锁竞争，互斥锁保证重建只执行一次。\n- 「布隆过滤器误判怎么办？」→ 误判只导致一次合法请求被拦截，不会写入脏数据；可用白名单或 `BF.RESERVE` 调低 p（0.01→0.001）压低误判率，代价是内存翻倍。\n- 「Redis 集群全挂了怎么办？」→ 答案不是重启 Redis，而是让 DB 活下来：本地缓存 → 业务降级 → DB 限流。顺序不能反。",
       "followUpQuestions": [
         {
-          "question": "布隆过滤器的位数组长度 m、哈希函数个数 k 和误判率 p 之间的关系是什么？",
-          "answer": "m = -n·ln p / (ln 2)²，k = (m/n)·ln 2。例如 n=100 万、p=0.01 时，m≈9.6 Mbit≈1.2 MB，k≈7；把 p 降到 0.001 时 m 翻倍。增大 k 不一定能降误判，k 过多反而让位数组更快被填满。"
+          "question": "布隆过滤器的误判率 p、位数组长度 m、哈希函数个数 k 之间是什么关系？",
+          "answer": "m = -n·ln(p) / (ln2)²，k = (m/n)·ln2。n 是预期元素数，p 是期望误判率。例如 n=100万、p=0.01 时，m≈9.6Mbit≈1.2MB，k≈7；p 降到 0.001 时 m 翻倍到约 2.4MB。k 过多会让位数组更快饱和，实际要权衡。"
         },
         {
-          "question": "为什么释放分布式锁要用 Lua 脚本而不是先 GET 再 DEL？",
-          "answer": "先 GET 再 DEL 是两步操作，GET 之后执行业务超时，锁已过期被别人抢走，再 DEL 会把别人的锁误删。Lua 脚本「if get == token then del」在 Redis 单线程模型下是原子的，避免这个 race。"
+          "question": "互斥重建中，为什么释放锁要用 Lua 脚本而不是先 GET 再 DEL？",
+          "answer": "GET 和 DEL 是两步操作，中间有时间窗口：线程 A 持锁超时，锁被 Redis 自动释放，线程 B 抢到锁，线程 A 执行 DEL 会误删线程 B 的锁。Lua 脚本「if get == token then del」在 Redis 单线程模型下是原子的，消除这个 race condition。"
         },
         {
-          "question": "逻辑过期方案下，怎么保证重建完成前读到的不是「已过期但未重建」的脏值？",
-          "answer": "读到 value 里的 expireTime < now 时直接返回旧值，同时异步触发 singleflight 重建；为防止大量请求同时触发重建，用 SET NX 抢锁，只有一个线程真正回源，其它线程直接返回旧值。"
+          "question": "逻辑过期方案下，重建完成前的请求读到的是「过期但未重建」的旧值，这对强一致业务有什么风险？",
+          "answer": "金额、库存、券码等强一致业务不能容忍旧值：用户看到的库存数量可能是已售罄的，导致超卖；用户看到的余额可能是已扣减的，导致重复支付。这类场景必须用互斥重建保证数据一致性，不能用逻辑过期。"
+        },
+        {
+          "question": "TTL 抖动能否彻底解决雪崩问题？",
+          "answer": "不能。TTL 抖动只能预防「同批 key 同时过期」导致的雪崩，但无法应对缓存集群整体不可用（网络分区、Redis 全挂）的场景。这种极端情况下需要多级缓存 + 限流降级作为兜底，TTL 抖动只是第一道预防措施。"
         }
       ]
     },
@@ -144,55 +210,85 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能用一句话区分穿透、击穿、雪崩的流量形态",
-        "能讲清布隆过滤器的位数组 + k 哈希结构与误判公式",
-        "能写出 SET NX PX 互斥锁 + Lua 释放的代码骨架",
-        "能解释 TTL 抖动、逻辑过期、多级缓存各自的适用边界",
-        "能在缓存集群故障时给出限流 + 降级 + 本地缓存的兜底顺序"
+        "能用一句话区分穿透（无效 key 稳态回路）、击穿（单 key 瞬时并发）、雪崩（批量/全局失效）的流量形态",
+        "能写出布隆过滤器的误判公式 m = -n·ln(p)/(ln2)² 和 k = (m/n)·ln2，并举例说明 n=100万、p=0.01 时的 m 和 k 值",
+        "能写出 SET lock:key token NX PX 互斥重建 + Lua 原子释放的代码骨架，并解释为什么不能用 GET+DEL",
+        "能解释逻辑过期不适用强一致业务的原因（旧值可能导致超卖、重复支付等）",
+        "能说明 TTL 抖动的取值范围（base 的 10%~30%）及其不能应对集群整体故障的边界",
+        "能在 Redis 集群故障时给出「本地缓存 → 业务降级 → DB 限流」的兜底顺序",
+        "能区分 singleflight（进程内合并）与分布式互斥锁（跨实例合并）的互补关系"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "database.redis-cache.cache-breakdown-penetration-avalanche.recall.1",
-      "prompt": "缓存穿透、击穿、雪崩分别是什么流量形态？",
+      "prompt": "缓存穿透、击穿、雪崩分别是什么流量形态？各自的监控指标应该看什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "database.redis-cache.cache-breakdown-penetration-avalanche.recall.2",
-      "prompt": "热点 key 失效时，互斥重建和逻辑过期分别有什么代价？",
+      "prompt": "布隆过滤器的位数组长度 m、哈希函数个数 k 和误判率 p 之间是什么关系？请写出公式并举例。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "database.redis-cache.cache-breakdown-penetration-avalanche.recall.3",
-      "prompt": "Redis 集群故障时，DB 之前应该有哪几道兜底防线？",
+      "prompt": "互斥重建方案中，为什么释放锁要用 Lua 脚本而不是先 GET 再 DEL？",
+      "mode": "text",
+      "expectedMinutes": 2,
+      "difficulty": 3
+    },
+    {
+      "id": "database.redis-cache.cache-breakdown-penetration-avalanche.recall.4",
+      "prompt": "逻辑过期和互斥重建分别适合什么场景？为什么逻辑过期不适用库存、金额等强一致业务？",
       "mode": "text",
       "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "database.redis-cache.cache-breakdown-penetration-avalanche.recall.5",
+      "prompt": "Redis 集群整体故障时，DB 之前应该有哪几道兜底防线？请给出优先级顺序。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "database.redis-cache.cache-breakdown-penetration-avalanche.recall.6",
+      "prompt": "请手写一个 Java 方法：缓存未命中时用 SETNX 互斥重建 + Lua 原子释放锁 + TTL 抖动防雪崩。",
+      "mode": "code",
+      "expectedMinutes": 10,
+      "difficulty": 3
+    },
+    {
+      "id": "database.redis-cache.cache-breakdown-penetration-avalanche.recall.7",
+      "prompt": "某电商秒杀场景，热点商品 key 过期后 DB QPS 从 500 飙到 50000，你会怎么排查和解决？",
+      "mode": "text",
+      "expectedMinutes": 5,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "穿透、击穿、雪崩的流量形态差异（无效 key 稳态 / 单 key 瞬时 / 批量 key 或集群）",
-      "布隆过滤器位数组 + k 哈希 + 误判公式 m = -n·ln p / (ln 2)²",
-      "SET lock:key token NX PX 互斥重建与 Lua 原子释放",
-      "TTL 抖动 base+rand 的取值范围（10%~30% TTL）与雪崩打散原理",
-      "逻辑过期不适用强一致业务的边界判断"
+      "能区分穿透（无效 key 稳态回路）、击穿（单 key 瞬时并发）、雪崩（批量/全局失效）的流量形态差异",
+      "能写出布隆过滤器误判公式 m = -n·ln(p)/(ln2)² 和 k = (m/n)·ln2",
+      "能写出 SET lock:key token NX PX 互斥重建与 Lua 原子释放的代码骨架",
+      "能解释 TTL 抖动的取值范围（base 的 10%~30%）及其不能应对集群故障的边界",
+      "能说明逻辑过期不适用强一致业务的原因"
     ],
     "goodToHave": [
-      "Caffeine 本地缓存 + Sentinel/Hystrix 限流降级组合",
-      "singleflight 合并同 key 并发回源",
-      "RedisBloom 命令族 BF.RESERVE / BF.ADD / BF.MEXISTS"
+      "能说明 Caffeine 本地缓存 + Sentinel/Hystrix 限流降级的组合",
+      "能解释 singleflight 与分布式互斥锁的互补关系",
+      "能区分 RedisBloom 命令族 BF.RESERVE / BF.ADD / BF.MEXISTS 的用途"
     ],
     "commonMistakes": [
       "把缓存预热当作与穿透/击穿/雪崩并列的问题类型",
-      "认为布隆过滤器没有误判，把它当强一致判定",
-      "只设随机 TTL 而没有 DB 限流降级兜底",
-      "互斥锁释放时用 GET+DEL 两步导致误删他人锁"
+      "认为布隆过滤器没有误判，误用它做强一致判定",
+      "互斥锁释放时用 GET+DEL 两步操作导致误删他人锁",
+      "只设随机 TTL 而没有 DB 限流降级兜底，无法应对集群整体故障"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -201,5 +297,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

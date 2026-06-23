@@ -4,26 +4,31 @@
   "category": "microservice",
   "group": "microservice",
   "title": "OpenFeign",
-  "summary": "讲清 OpenFeign 的接口代理、命名客户端组件、负载均衡、编解码、超时、CircuitBreaker 和 2026 选型边界。",
+  "summary": "讲清 OpenFeign 的接口代理机制、命名客户端组件、运行期调用链、生产治理（超时/连接池/熔断/观测）、以及 2026 选型边界——为什么新系统要比较 Spring HTTP Service Clients。",
   "tags": [
     "Java",
     "微服务",
     "OpenFeign"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 47,
   "order": 20,
   "recommendWeight": 84,
   "learningCards": [
     {
       "type": "explain",
-      "title": "OpenFeign 的本质：接口代理加同步 HTTP 客户端链",
-      "content": "OpenFeign 把远程 HTTP 调用封装成 Java 接口调用，但它不是 RPC 传输协议，也不会把远程调用变成本地调用。它的核心是：启动期为 `@FeignClient` 接口创建代理 Bean，运行期由代理把方法、参数和注解转换成 HTTP 请求，再交给负载均衡、底层 Client、编解码器、错误处理和可选熔断降级组件。\n\n**2026 维护口径先说准**\n- Spring Cloud OpenFeign 官方仓库已把项目定位为 feature-complete：主要继续维护 bugfix 和少量社区小特性。\n- 官方建议新场景评估 Spring HTTP Service Clients。也就是说，存量 Spring Cloud 微服务里 OpenFeign 仍然常见；新系统如果只是声明式 HTTP 接口，不依赖 Spring Cloud 命名客户端、LoadBalancer、OpenFeign 配置生态，就应比较 RestClient/WebClient + HTTP Service Clients。\n\n**启动期发生什么**\n- `@EnableFeignClients` 扫描客户端接口，`@FeignClient(name=..., url=..., contextId=..., configuration=...)` 生成对应的客户端定义。\n- 每个 named client 有一组组件集合，默认来自 `FeignClientsConfiguration`，包括 `Decoder`、`Encoder`、`Contract`、`Feign.Builder`、`Client`、日志、Micrometer 能力和缓存能力等。\n- 默认 `Contract` 是 `SpringMvcContract`，因此接口方法可以使用 Spring MVC 注解描述 path、method、参数和 body。\n- OpenFeign 4.x 起，`@FeignClient` 属性默认提前解析，利于 AOT；Spring Cloud Contract 等场景可配置懒解析。\n\n**运行期主链路**\n1. 业务调用 `userClient.getUser(7)`，JDK 动态代理拦截接口方法。\n2. `Contract` 根据注解和参数生成 `RequestTemplate`，RequestInterceptor 统一补鉴权、TraceId、租户、灰度标记等 Header。\n3. 如果使用 `name`，Spring Cloud LoadBalancer 根据服务名选择实例；如果使用 `url`，直接访问固定地址。现代 Spring Cloud OpenFeign 支持阻塞模式 LoadBalancer 的能力。\n4. `Client` 负责真正发请求。Spring Cloud LoadBalancer 在 classpath 上时，默认会使用 `FeignBlockingLoadBalancerClient`；HTTP Client 可接入 Apache HC5、HTTP/2 Client 或默认实现。\n5. `Encoder` 序列化请求体，`Decoder` 反序列化响应，`ErrorDecoder` 把非 2xx 响应映射成异常。\n\n面试里不要只说“像调用本地方法一样调用远程服务”。更专业的表达是：OpenFeign 用接口代理隐藏 HTTP 细节，但本质仍是同步远程调用，必须显式治理超时、连接池、重试、降级、日志、观测和版本兼容。"
+      "title": "OpenFeign 本质：接口代理驱动的同步 HTTP 客户端链",
+      "content": "OpenFeign 把远程 HTTP 调用封装成 Java 接口调用，但它不是 RPC 框架，也不是传输协议。核心机制是：启动期为 `@FeignClient` 接口创建 JDK 动态代理 Bean；运行期代理把方法参数和注解转换成 HTTP 请求，再交给负载均衡、底层 Client、编解码器、错误处理和可选熔断组件。本质上仍是同步远程调用，所有 HTTP 层面的超时、连接池、重试、降级和观测都必须显式治理。\n\n**2026 维护口径**：Spring Cloud OpenFeign 官方仓库已定位为 feature-complete，继续维护 bugfix 和少量社区特性。官方建议新场景评估 Spring HTTP Service Clients（Spring Framework 6.2+ 原生支持的声明式 HTTP 接口）。存量 Spring Cloud 微服务中 OpenFeign 仍常见；新系统如果只需声明式 HTTP 调用、不强依赖 Spring Cloud 命名客户端生态，应比较 RestClient/WebClient + HTTP Service Clients。\n\n**启动期的关键动作**：`@EnableFeignClients` 扫描包路径下带 `@FeignClient` 的接口，为每个接口生成客户端定义。`@FeignClient` 的 `name` 用于服务发现，`url` 用于固定地址，`contextId` 解决同名接口冲突，`configuration` 指定客户端级别覆盖。每个 named client 有一组组件集合，默认来自 `FeignClientsConfiguration`，包括 `Decoder`、`Encoder`、`Contract`、`Feign.Builder`、`Client`、`Retryer`、日志、Micrometer 和缓存能力。默认 `Contract` 是 `SpringMvcContract`，接口方法可以使用 Spring MVC 注解描述 path、method、参数和 body。OpenFeign 4.x 起 `@FeignClient` 属性默认提前解析，利于 AOT 编译；Spring Cloud Contract 等场景可配置懒解析。"
     },
     {
       "type": "explain",
-      "title": "生产治理：超时、连接池、熔断和可观测性",
-      "content": "**超时要分层配置**\n- `connectTimeout` 关注 DNS、建连和连接拒绝等前置耗时。\n- `readTimeout` 从连接建立后开始计算，关注服务端处理和响应返回。\n- DNS 查询、连接拒绝、TLS 握手、代理/Istio 行为可能让感知延迟和配置值不完全等价，排查时要结合客户端日志、网关日志和链路追踪。\n\n**连接池和底层 Client 不是细枝末节**\n- 自定义 `Client` bean 应保持 singleton。官方文档明确提醒：如果 Client 不是 singleton，每次 FeignClient 初始化可能创建新的连接池，导致资源泄漏或连接池耗尽。\n- Spring Cloud OpenFeign 4 开始不再支持 Apache HttpClient 4，官方建议使用 Apache HttpClient 5。HC5 依赖、HTTP/2 Client、默认 Client 的能力和连接池参数不同，线上要统一团队配置。\n- Apache HTTP Components 5.4/5.5.1 对 TLS/HTTP 默认行为有过变化，代理、Envoy、Istio 场景要核对协议升级和握手超时。\n\n**CircuitBreaker 和 fallback 有前提**\n- Spring Cloud CircuitBreaker 在 classpath 上且 `spring.cloud.openfeign.circuitbreaker.enabled=true` 时，Feign 方法才会被 CircuitBreaker 包装。\n- `fallback` 和 `fallbackFactory` 需要声明成 Spring Bean；`fallbackFactory` 可以拿到触发原因，更适合打点和区分超时、拒绝、HTTP 错误、解码失败。\n- fallback 不是兜底业务正确性的借口。降级返回默认值可能污染上游决策，核心写链路要更谨慎，常见做法是失败显式化或切到幂等补偿。\n\n**日志和观测要可控**\n- Feign 日志只响应 DEBUG 级别；`Logger.Level.FULL` 会打印 Header 和 Body，可能泄露敏感信息，也可能放大日志成本。\n- Micrometer/Observation 能力存在时可以接入指标和 tracing；排查慢调用时应同时看客户端耗时、服务端耗时、实例选择、重试次数和错误分类。\n\n这类题的高阶考点在“失败放大”。OpenFeign 是阻塞式调用，调用方线程会等待下游响应；如果 timeout、隔离、连接池和熔断边界没有配置好，一个慢下游会把入口线程池、业务线程池和数据库连接一起拖慢。"
+      "title": "运行期调用链：从接口方法到 HTTP 响应的完整路径",
+      "content": "业务代码调用 `userClient.getUser(7)` 后，OpenFeign 的运行期链路如下：\n\n**步骤 1：JDK 动态代理拦截**\nSpring 创建的 Bean 实际是 `@FeignClient` 接口的 JDK Proxy 实例。方法调用被 `InvocationHandler` 拦截，由 Feign 的 `SynchronousMethodHandler` 处理。这里会处理 `Object.class` 的 `toString`/`hashCode`/`equals`，避免误入远程调用。\n\n**步骤 2：Contract 解析注解生成 RequestTemplate**\n`SpringMvcContract` 读取方法上的 `@GetMapping`/`@PostMapping` 等注解，结合 `@PathVariable`、`@RequestParam`、`@RequestBody`、`@RequestHeader` 等参数注解，构建 `RequestTemplate`。RequestTemplate 包含 HTTP method、URL 模板、headers、queries 和 body 模板。参数中的 `{id}` 会被替换为实际值。\n\n**步骤 3：RequestInterceptor 链**\n拦截器按顺序执行，统一补 Header：鉴权 `Authorization`、链路追踪 `X-Trace-Id`、租户标识、灰度标记等。生产系统通常通过自定义 `RequestInterceptor` Bean 实现统一横切关注点。\n\n**步骤 4：LoadBalancer 选实例或固定 URL**\n如果 `@FeignClient` 使用 `name`（不指定 `url` 或 `url` 为空），Spring Cloud LoadBalancer 根据服务名解析实例列表并选择一个。如果指定了 `url`，直接访问固定地址（常用于外部 HTTP 服务或测试直连）。注意：即使指定了 `url`，现代版本仍建议配置 `name` 属性。\n\n**步骤 5：Client 发送 HTTP 请求**\n`Client` 接口负责真正发请求。classpath 上有 Spring Cloud LoadBalancer 时，默认使用 `FeignBlockingLoadBalancerClient`。底层 HTTP 实现可以是 JDK HttpURLConnection（默认）、Apache HttpClient 5 或 OkHttp。自定义 Client bean 必须保持 singleton——官方文档明确提醒：非 singleton 的 Client 会导致每次 FeignClient 初始化创建新连接池，最终连接池耗尽或资源泄漏。\n\n**步骤 6：Encoder/Decoder 和 ErrorDecoder**\n`Encoder` 在有请求体时序列化对象（默认 `SpringEncoder` 使用 Jackson）。`Decoder` 反序列化响应体（默认 `ResponseEntityDecoder` 包装 `SpringDecoder`）。`ErrorDecoder` 把非 2xx 响应映射成异常——默认 `DefaultErrorDecoder` 会抛出 `FeignException`；生产中通常自定义 `ErrorDecoder` 做更精细的错误分类和日志。"
+    },
+    {
+      "type": "explain",
+      "title": "生产治理：超时、连接池、重试、熔断和观测",
+      "content": "OpenFeign 是阻塞式调用，调用方线程会等待下游响应。如果超时、连接池、重试和熔断没有配好，一个慢下游能把入口线程池、业务线程池甚至数据库连接一起拖慢。\n\n**超时分两层**：`connectTimeout` 关注 DNS 解析、TCP 建连和 TLS 握手的前置耗时；`readTimeout` 从连接建立后开始计算，关注服务端处理和响应传输。DNS 查询、连接拒绝、TLS 握手、代理（Envoy/Istio）行为可能让感知延迟和配置值不完全等价——排查时要结合客户端日志、网关日志和链路追踪。\n\n**连接池**：默认 `Client` 使用 JDK HttpURLConnection，每次请求新建连接，性能较差。生产环境应接入 Apache HttpClient 5 或 OkHttp，并配置连接池大小、连接存活时间、每个路由的最大连接数。注意 Spring Cloud OpenFeign 4.x 已不再支持 Apache HttpClient 4，官方建议使用 HC5。Apache HTTP Components 5.4/5.5 对 TLS/HTTP 默认行为有过变化，代理和 Envoy 场景要核对协议升级和握手超时。\n\n**重试**：Feign 默认 `Retryer.NEVER_RETRY`，即不重试。需要重试时可配置 `Retryer` Bean。注意：重试放大下游压力，写操作重试必须确保幂等，且重试策略要配合熔断器避免级联故障。\n\n**熔断降级前提**：Spring Cloud CircuitBreaker 在 classpath 上且 `spring.cloud.openfeign.circuitbreaker.enabled=true` 时，Feign 方法才会被 CircuitBreaker 包装。`fallback` 和 `fallbackFactory` 需要声明为 Spring Bean；`fallbackFactory` 能拿到触发原因（超时、拒绝、HTTP 错误、解码失败），更适合打点和区分异常类型。fallback 不是兜底业务正确性的借口——降级返回默认值可能污染上游决策，核心写链路应更谨慎。\n\n**日志和观测**：Feign 日志只响应 DEBUG 级别；`Logger.Level.FULL` 会打印完整 Header 和 Body，可能泄露敏感信息并放大日志成本。Micrometer/Observation 能力存在时可接入指标和 tracing，排查慢调用时应同时看客户端耗时、服务端耗时、实例选择、重试次数和错误分类。"
     },
     {
       "type": "diagram",
@@ -35,53 +40,57 @@
     },
     {
       "type": "compareTable",
-      "title": "OpenFeign、HTTP Service Clients、RestClient、WebClient 对比",
-      "content": "| 维度 | OpenFeign | Spring HTTP Service Clients | RestClient | WebClient |\n| --- | --- | --- | --- | --- |\n| 编程模型 | `@FeignClient` 接口代理，Spring Cloud 生态集成强 | Spring Framework 原生 HTTP 接口代理，可配 RestClient/WebClient | 命令式同步客户端，显式构造请求 | 响应式客户端，适合非阻塞链路 |\n| 服务发现 | 与 Spring Cloud LoadBalancer、注册中心结合成熟 | 需自己组合服务发现或目标地址策略 | 需自己组合 | 需自己组合 |\n| 熔断降级 | 接 Spring Cloud CircuitBreaker 后支持 fallback/fallbackFactory | 通常自己组合 Resilience4j/Spring Retry 等 | 自己组合 | 自己组合 |\n| 配置粒度 | named client，可按 client 配 timeout、decoder、interceptor | 取决于工厂和底层客户端配置 | 代码或 Bean 配置清晰 | 响应式链路配置更复杂 |\n| 适合场景 | 存量 Spring Cloud 微服务、强依赖声明式服务名调用 | 新系统声明式 HTTP 接口、想减少 Spring Cloud OpenFeign 依赖 | 少量调用、调用逻辑复杂、需要显式控制 | 高并发非阻塞、流式响应、Reactive 栈 |\n| 风险 | 容易忽视阻塞、连接池、超时、fallback 前提和日志泄露 | 生态组合要自行搭建 | 手写样板较多 | 团队需要理解响应式背压和调试成本 |"
+      "title": "OpenFeign 与新一代 HTTP 客户端选型对比",
+      "content": "| 维度 | OpenFeign | Spring HTTP Service Clients | RestClient | WebClient |\n| --- | --- | --- | --- | --- |\n| 编程模型 | `@FeignClient` 接口代理，Spring Cloud 生态集成 | Spring Framework 原生 HTTP 接口代理，底层可选 RestClient/WebClient | 命令式同步客户端，显式构造请求 | 响应式客户端，非阻塞 |\n| 服务发现 | 原生集成 Spring Cloud LoadBalancer + 注册中心 | 需自行组合服务发现或目标地址策略 | 需自行组合 | 需自行组合 |\n| 熔断降级 | 内置接入 Spring Cloud CircuitBreaker + fallback | 需自行组合 Resilience4j / Spring Retry | 需自行组合 | 需自行组合 |\n| 配置粒度 | named client 级别，按客户端配 timeout/interceptor/decoder | 取决于工厂和底层客户端配置 | 代码或 Bean 配置，显式清晰 | 响应式链路配置更复杂 |\n| 阻塞模型 | 同步阻塞，调用线程等待响应 | 同步阻塞（底层 RestClient）或非阻塞（底层 WebClient） | 同步阻塞 | 非阻塞，Reactive 背压 |\n| 适合场景 | 存量 Spring Cloud 微服务，依赖声明式服务名调用 | 新系统声明式 HTTP 接口，减少 OpenFeign 依赖 | 少量调用、逻辑复杂、需显式控制 | 高并发非阻塞、流式响应、Reactive 栈 |\n| 主要风险 | 忽视阻塞连接池、超时、日志泄露、fallback 前提 | 生态组合需自行搭建，文档生态较新 | 手写样板较多 | 团队需理解响应式模型和调试成本 |"
     },
     {
       "type": "code",
-      "title": "可运行代码：JDK Proxy 模拟 Feign 调用链",
+      "title": "可运行代码：JDK Proxy 模拟 OpenFeign 调用链",
       "language": "java",
-      "content": "import com.sun.net.httpserver.HttpServer;\nimport java.io.OutputStream;\nimport java.lang.annotation.*;\nimport java.lang.reflect.*;\nimport java.net.InetSocketAddress;\nimport java.net.URI;\nimport java.net.URLEncoder;\nimport java.net.http.HttpClient;\nimport java.net.http.HttpRequest;\nimport java.net.http.HttpResponse;\nimport java.nio.charset.StandardCharsets;\nimport java.time.Duration;\nimport java.util.*;\n\npublic class Main {\n    @Retention(RetentionPolicy.RUNTIME)\n    @Target(ElementType.METHOD)\n    @interface Get { String value(); }\n\n    @Retention(RetentionPolicy.RUNTIME)\n    @Target(ElementType.PARAMETER)\n    @interface PathVar { String value(); }\n\n    interface UserClient {\n        @Get(\"/users/{id}\")\n        String getUser(@PathVar(\"id\") int id);\n    }\n\n    record Instance(String baseUrl) {}\n\n    interface RequestInterceptor {\n        void apply(RequestTemplate template);\n    }\n\n    static final class RequestTemplate {\n        final String method;\n        String path;\n        final Map<String, String> headers = new LinkedHashMap<>();\n\n        RequestTemplate(String method, String path) {\n            this.method = method;\n            this.path = path;\n        }\n    }\n\n    static final class MiniFeign {\n        static <T> T create(Class<T> api, String serviceId, List<Instance> instances,\n                            Duration timeout, List<RequestInterceptor> interceptors, T fallback) {\n            HttpClient http = HttpClient.newBuilder().connectTimeout(timeout).build();\n            InvocationHandler handler = (proxy, method, args) -> {\n                if (method.getDeclaringClass() == Object.class) {\n                    return switch (method.getName()) {\n                        case \"toString\" -> \"MiniFeign(\" + serviceId + \")\";\n                        case \"hashCode\" -> System.identityHashCode(proxy);\n                        case \"equals\" -> proxy == args[0];\n                        default -> null;\n                    };\n                }\n                try {\n                    Get get = method.getAnnotation(Get.class);\n                    if (get == null) {\n                        throw new IllegalStateException(\"missing @Get on \" + method.getName());\n                    }\n                    RequestTemplate template = new RequestTemplate(\"GET\", get.value());\n                    Annotation[][] parameterAnnotations = method.getParameterAnnotations();\n                    for (int i = 0; i < parameterAnnotations.length; i++) {\n                        for (Annotation annotation : parameterAnnotations[i]) {\n                            if (annotation instanceof PathVar pathVar) {\n                                String encoded = URLEncoder.encode(String.valueOf(args[i]), StandardCharsets.UTF_8);\n                                template.path = template.path.replace(\"{\" + pathVar.value() + \"}\", encoded);\n                            }\n                        }\n                    }\n                    for (RequestInterceptor interceptor : interceptors) {\n                        interceptor.apply(template);\n                    }\n                    Instance instance = instances.get(0);\n                    HttpRequest.Builder builder = HttpRequest.newBuilder()\n                            .uri(URI.create(instance.baseUrl() + template.path))\n                            .timeout(timeout)\n                            .GET();\n                    template.headers.forEach(builder::header);\n                    HttpResponse<String> response = http.send(builder.build(), HttpResponse.BodyHandlers.ofString());\n                    if (response.statusCode() >= 400) {\n                        throw new IllegalStateException(\"http \" + response.statusCode());\n                    }\n                    return response.body();\n                } catch (Throwable failure) {\n                    if (fallback != null) {\n                        return method.invoke(fallback, args);\n                    }\n                    throw failure;\n                }\n            };\n            Object proxy = Proxy.newProxyInstance(api.getClassLoader(), new Class<?>[]{api}, handler);\n            return api.cast(proxy);\n        }\n    }\n\n    public static void main(String[] args) throws Exception {\n        HttpServer server = HttpServer.create(new InetSocketAddress(0), 0);\n        server.createContext(\"/users/7\", exchange -> {\n            String trace = exchange.getRequestHeaders().getFirst(\"X-Trace-Id\");\n            String auth = exchange.getRequestHeaders().getFirst(\"Authorization\");\n            String body = \"user=7,trace=\" + trace + \",auth=\" + auth;\n            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);\n            exchange.sendResponseHeaders(200, bytes.length);\n            try (OutputStream out = exchange.getResponseBody()) {\n                out.write(bytes);\n            }\n        });\n        server.start();\n        try {\n            int port = server.getAddress().getPort();\n            List<RequestInterceptor> interceptors = List.of(template -> {\n                template.headers.put(\"Authorization\", \"Bearer demo\");\n                template.headers.put(\"X-Trace-Id\", \"trace-42\");\n            });\n            UserClient client = MiniFeign.create(\n                    UserClient.class,\n                    \"user-service\",\n                    List.of(new Instance(\"http://127.0.0.1:\" + port)),\n                    Duration.ofSeconds(2),\n                    interceptors,\n                    id -> \"fallback:\" + id\n            );\n            System.out.println(client.getUser(7));\n\n            UserClient unavailable = MiniFeign.create(\n                    UserClient.class,\n                    \"user-service\",\n                    List.of(new Instance(\"http://127.0.0.1:9\")),\n                    Duration.ofMillis(300),\n                    List.of(),\n                    id -> \"fallback:\" + id\n            );\n            System.out.println(unavailable.getUser(7));\n        } finally {\n            server.stop(0);\n        }\n    }\n}",
+      "content": "import com.sun.net.httpserver.HttpServer;\nimport java.io.OutputStream;\nimport java.lang.annotation.*;\nimport java.lang.reflect.*;\nimport java.net.InetSocketAddress;\nimport java.net.URI;\nimport java.net.URLEncoder;\nimport java.net.http.HttpClient;\nimport java.net.http.HttpRequest;\nimport java.net.http.HttpResponse;\nimport java.nio.charset.StandardCharsets;\nimport java.time.Duration;\nimport java.util.*;\n\npublic class Main {\n    @Retention(RetentionPolicy.RUNTIME)\n    @Target(ElementType.METHOD)\n    @interface Get { String value(); }\n\n    @Retention(RetentionPolicy.RUNTIME)\n    @Target(ElementType.PARAMETER)\n    @interface PathVar { String value(); }\n\n    interface UserClient {\n        @Get(\"/users/{id}\")\n        String getUser(@PathVar(\"id\") int id);\n    }\n\n    record Instance(String baseUrl) {}\n\n    interface RequestInterceptor {\n        void apply(RequestTemplate template);\n    }\n\n    static final class RequestTemplate {\n        final String method;\n        String path;\n        final Map<String, String> headers = new LinkedHashMap<>();\n\n        RequestTemplate(String method, String path) {\n            this.method = method;\n            this.path = path;\n        }\n    }\n\n    static final class MiniFeign {\n        static <T> T create(Class<T> api, String serviceId, List<Instance> instances,\n                            Duration timeout, List<RequestInterceptor> interceptors, T fallback) {\n            HttpClient http = HttpClient.newBuilder().connectTimeout(timeout).build();\n            InvocationHandler handler = (proxy, method, args) -> {\n                if (method.getDeclaringClass() == Object.class) {\n                    return switch (method.getName()) {\n                        case \"toString\" -> \"MiniFeign(\" + serviceId + \")\";\n                        case \"hashCode\" -> System.identityHashCode(proxy);\n                        case \"equals\" -> proxy == args[0];\n                        default -> null;\n                    };\n                }\n                try {\n                    Get get = method.getAnnotation(Get.class);\n                    if (get == null) {\n                        throw new IllegalStateException(\"missing @Get on \" + method.getName());\n                    }\n                    // Step 1: Contract 解析注解生成 RequestTemplate\n                    RequestTemplate template = new RequestTemplate(\"GET\", get.value());\n                    Annotation[][] parameterAnnotations = method.getParameterAnnotations();\n                    for (int i = 0; i < parameterAnnotations.length; i++) {\n                        for (Annotation annotation : parameterAnnotations[i]) {\n                            if (annotation instanceof PathVar pathVar) {\n                                String encoded = URLEncoder.encode(\n                                        String.valueOf(args[i]), StandardCharsets.UTF_8);\n                                template.path = template.path.replace(\n                                        \"{\" + pathVar.value() + \"}\", encoded);\n                            }\n                        }\n                    }\n                    // Step 2: RequestInterceptor 链补 Header\n                    for (RequestInterceptor interceptor : interceptors) {\n                        interceptor.apply(template);\n                    }\n                    // Step 3: LoadBalancer 选实例（简化为取第一个）\n                    Instance instance = instances.get(0);\n                    // Step 4: Client 发 HTTP 请求\n                    HttpRequest.Builder builder = HttpRequest.newBuilder()\n                            .uri(URI.create(instance.baseUrl() + template.path))\n                            .timeout(timeout)\n                            .GET();\n                    template.headers.forEach(builder::header);\n                    HttpResponse<String> response = http.send(\n                            builder.build(), HttpResponse.BodyHandlers.ofString());\n                    // Step 5: ErrorDecoder 处理非 2xx\n                    if (response.statusCode() >= 400) {\n                        throw new IllegalStateException(\"http \" + response.statusCode());\n                    }\n                    return response.body();\n                } catch (Throwable failure) {\n                    // Step 6: fallback（需 CircuitBreaker 包装才有真实语义）\n                    if (fallback != null) {\n                        return method.invoke(fallback, args);\n                    }\n                    throw failure;\n                }\n            };\n            Object proxy = Proxy.newProxyInstance(\n                    api.getClassLoader(), new Class<?>[]{api}, handler);\n            return api.cast(proxy);\n        }\n    }\n\n    public static void main(String[] args) throws Exception {\n        HttpServer server = HttpServer.create(new InetSocketAddress(0), 0);\n        server.createContext(\"/users/7\", exchange -> {\n            String trace = exchange.getRequestHeaders().getFirst(\"X-Trace-Id\");\n            String auth = exchange.getRequestHeaders().getFirst(\"Authorization\");\n            String body = \"user=7,trace=\" + trace + \",auth=\" + auth;\n            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);\n            exchange.sendResponseHeaders(200, bytes.length);\n            try (OutputStream out = exchange.getResponseBody()) {\n                out.write(bytes);\n            }\n        });\n        server.start();\n        try {\n            int port = server.getAddress().getPort();\n            List<RequestInterceptor> interceptors = List.of(template -> {\n                template.headers.put(\"Authorization\", \"Bearer demo\");\n                template.headers.put(\"X-Trace-Id\", \"trace-42\");\n            });\n            // 正常调用\n            UserClient client = MiniFeign.create(\n                    UserClient.class, \"user-service\",\n                    List.of(new Instance(\"http://127.0.0.1:\" + port)),\n                    Duration.ofSeconds(2), interceptors,\n                    (UserClient) id -> \"fallback:\" + id\n            );\n            System.out.println(\"正常响应: \" + client.getUser(7));\n            // 超时场景触发 fallback\n            UserClient unavailable = MiniFeign.create(\n                    UserClient.class, \"user-service\",\n                    List.of(new Instance(\"http://127.0.0.1:9\")),\n                    Duration.ofMillis(300), List.of(),\n                    (UserClient) id -> \"fallback:\" + id\n            );\n            System.out.println(\"超时降级: \" + unavailable.getUser(7));\n        } finally {\n            server.stop(0);\n        }\n    }\n}",
       "highlights": [
         {
           "line": 42,
-          "note": "动态代理对应真实 OpenFeign 中接口方法被 InvocationHandler 拦截的核心思路。"
+          "note": "JDK Proxy 拦截接口方法——对应 OpenFeign 的 InvocationHandler/SynchronousMethodHandler。"
         },
         {
-          "line": 64,
-          "note": "把注解和参数转换为 path/header/body 的动作，对应 Feign 的 Contract 与 RequestTemplate 阶段。"
+          "line": 66,
+          "note": "Contract 阶段：解析注解生成 RequestTemplate，包含 method、path 和参数。"
         },
         {
-          "line": 72,
-          "note": "RequestInterceptor 用来统一补 Header，生产里常放鉴权、TraceId、租户、灰度标记。"
+          "line": 75,
+          "note": "RequestInterceptor 链：统一补 Authorization、TraceId、租户等 Header。"
         },
         {
-          "line": 84,
-          "note": "失败后调用 fallback，真实 Spring Cloud OpenFeign 还要求 CircuitBreaker classpath、enabled 开关和 fallback Bean。"
+          "line": 82,
+          "note": "LoadBalancer 选实例后由 Client 发 HTTP 请求，超时通过 HttpClient.connectTimeout + HttpRequest.timeout 控制。"
+        },
+        {
+          "line": 89,
+          "note": "ErrorDecoder 阶段：非 2xx 响应抛异常，真实 OpenFeign 可自定义 ErrorDecoder 做精细错误分类。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "我会先给结论：OpenFeign 是 Spring Cloud 里的声明式同步 HTTP 客户端，它通过 `@FeignClient` 接口代理把方法调用转换成 HTTP 请求；它隐藏了请求构造细节，但远程调用的超时、连接池、负载均衡、熔断、观测和版本兼容仍要显式治理。\n\n我会按两段讲。\n\n第一段是启动期：`@EnableFeignClients` 扫描接口，每个 `@FeignClient` 根据 `name`、`url`、`contextId` 和配置创建 named client 组件集合。默认组件来自 `FeignClientsConfiguration`，包括 `SpringMvcContract`、`SpringEncoder`、`ResponseEntityDecoder`、`FeignCircuitBreaker.Builder`、`Client`、日志和 Micrometer 能力等。OpenFeign 4.x 起属性默认提前解析，有利于 AOT；测试或契约场景才考虑懒解析。\n\n第二段是调用期：业务调用接口方法后，JDK 代理拦截方法；Contract 读取 Spring MVC 注解生成 `RequestTemplate`；RequestInterceptor 补鉴权、TraceId、租户等 Header；如果是服务名，Spring Cloud LoadBalancer 选实例；如果指定 `url`，直接访问固定地址；之后底层 Client 发 HTTP 请求，Encoder/Decoder 处理消息体，ErrorDecoder 处理非 2xx 响应。\n\n生产边界要重点讲：它是阻塞式调用，必须配置 connect/read timeout、连接池、日志级别、重试、熔断和 fallback。fallback/fallbackFactory 依赖 Spring Cloud CircuitBreaker classpath 和 `spring.cloud.openfeign.circuitbreaker.enabled=true`，不是写个属性就生效。自定义 Client 要保持 singleton，避免重复创建连接池导致资源耗尽。2026 年选型上，OpenFeign 更适合维护存量 Spring Cloud 调用链；新系统如果只是声明式 HTTP 接口，要比较 Spring HTTP Service Clients、RestClient 或 WebClient。",
+      "content": "结论先行：OpenFeign 是 Spring Cloud 的声明式同步 HTTP 客户端，通过 `@FeignClient` 接口代理把方法调用转换成 HTTP 请求，隐藏了请求构造细节，但远程调用的超时、连接池、负载均衡、熔断、观测和版本兼容仍需显式治理。\n\n**启动期（组件创建）**\n- `@EnableFeignClients` 扫描包路径下 `@FeignClient` 接口\n- 每个 `@FeignClient` 按 `name`/`url`/`contextId`/`configuration` 创建 named client 组件集合\n- 默认组件来自 `FeignClientsConfiguration`：`SpringMvcContract`（解析 MVC 注解）、`SpringEncoder`、`ResponseEntityDecoder`、`Client`、`Retryer`、日志和 Micrometer 能力\n- OpenFeign 4.x 属性默认提前解析，利于 AOT\n\n**运行期（一次调用的完整路径）**\n1. JDK 动态代理拦截接口方法\n2. `Contract` 读取 `@GetMapping`/`@PathVariable`/`@RequestBody` 等注解生成 `RequestTemplate`\n3. `RequestInterceptor` 链补鉴权、TraceId、租户等 Header\n4. 如果用 `name`，LoadBalancer 选实例；如果用 `url`，直接访问固定地址\n5. 底层 `Client` 发 HTTP 请求（JDK 默认 / Apache HC5 / OkHttp）\n6. `Encoder` 序列化请求体，`Decoder` 反序列化响应体\n7. `ErrorDecoder` 处理非 2xx，映射成异常\n8. 如果启用 CircuitBreaker，整体被熔断器包装；失败后走 `fallback`/`fallbackFactory`\n\n**生产治理要点**\n- 超时分 `connectTimeout`（DNS+建连+TLS）和 `readTimeout`（服务端处理+响应传输），还要考虑代理/Istio 的额外延迟\n- 连接池：自定义 Client 必须保持 singleton，避免重复创建连接池导致资源耗尽\n- 默认 `Retryer.NEVER_RETRY`；写操作重试必须确保幂等\n- CircuitBreaker 需要 classpath 依赖 + `circuitbreaker.enabled=true`，fallback/fallbackFactory 需要是 Spring Bean\n- Feign 日志 `LEVEL.FULL` 打印 Header 和 Body，生产环境注意敏感信息泄露\n\n**2026 选型边界**\n- OpenFeign 定位 feature-complete，存量 Spring Cloud 微服务继续用\n- 新系统如只需声明式 HTTP 接口，应评估 Spring HTTP Service Clients（Spring 6.2+）、RestClient 或 WebClient",
       "followUpQuestions": [
         {
-          "question": "OpenFeign 的 name 和 url 有什么区别？",
-          "answer": "`name` 是 named client 和服务名，会进入 Spring Cloud LoadBalancer/注册中心解析；`url` 是固定目标地址，常用于直连外部 HTTP 服务或测试场景。现代版本仍要求配置 name，即使同时使用 url。"
+          "question": "`@FeignClient` 的 `name` 和 `url` 有什么区别？什么时候用哪个？",
+          "answer": "`name` 是服务名，会通过 Spring Cloud LoadBalancer + 注册中心解析实例列表，实现服务发现和负载均衡；`url` 是固定目标地址，跳过服务发现，常用于直连外部 HTTP 服务、测试或网关地址。即使指定 `url`，现代版本仍建议配置 `name`。二者组合时 `url` 优先，`name` 保留用于 named client 上下文。"
         },
         {
-          "question": "fallback 为什么写了却没有生效？",
-          "answer": "常见原因是没有引入 Spring Cloud CircuitBreaker，或没有开启 `spring.cloud.openfeign.circuitbreaker.enabled=true`，fallback/fallbackFactory 不是 Spring Bean，异常发生在调用链外层，或方法返回值语义不适合被 fallback 接管。排查时先看 classpath、配置、Bean 注册和异常类型。"
+          "question": "为什么写了 `fallback` 属性却没有生效？",
+          "answer": "常见原因有四个：(1) classpath 上没有 Spring Cloud CircuitBreaker 依赖（如 Resilience4j）；(2) 没有开启 `spring.cloud.openfeign.circuitbreaker.enabled=true`；(3) fallback/fallbackFactory 类没有注册为 Spring Bean（没有 @Component 或未在 @FeignClient 的 configuration 中声明）；(4) 异常发生在 CircuitBreaker 包装之外（如序列化阶段）。排查时按 classpath → 配置开关 → Bean 注册 → 异常类型顺序检查。"
         },
         {
-          "question": "OpenFeign 如何做统一鉴权和链路追踪？",
-          "answer": "用 RequestInterceptor 统一写入 Authorization、X-Trace-Id、租户、灰度等 Header；同时用 Micrometer/Observation 接入指标和 trace。注意不要在 FULL 日志中泄露敏感 Header 或请求体。"
+          "question": "OpenFeign 的慢调用如何排查？",
+          "answer": "分层定位：(1) DNS 解析和建连耗时——看 connectTimeout 是否打满；(2) LoadBalancer 实例选择——是否选到了慢实例或跨可用区；(3) 连接池等待——检查连接池大小、活跃连接数和等待队列；(4) TLS 握手和代理层——Envoy/Istio 可能有额外延迟；(5) 服务端处理——通过 trace span 对比客户端和服务器端耗时；(6) 响应读取——大响应体或慢网络；(7) 重试/熔断等待——是否因重试放大耗时。结合 Feign 日志、Micrometer 指标、链路追踪和网关日志综合定位。"
         },
         {
-          "question": "OpenFeign 慢调用怎么排查？",
-          "answer": "先区分 DNS/建连、LoadBalancer 实例选择、连接池等待、TLS/代理、服务端处理、响应读取、重试或熔断等待。再结合 Feign 日志、Micrometer 指标、trace span、网关日志和服务端日志定位是客户端等待还是下游处理慢。"
+          "question": "自定义 Client bean 为什么必须保持 singleton？",
+          "answer": "OpenFeign 在创建每个 FeignClient 代理时会注入 Client bean。如果 Client 不是 singleton，每次 FeignClient 初始化都会创建新实例，进而创建新连接池。当系统中有多个 @FeignClient 时，会导致大量独立连接池，连接资源快速耗尽。官方文档明确提醒这一点。"
         }
       ]
     },
@@ -89,71 +98,89 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 OpenFeign 是接口代理加同步 HTTP 客户端链，而不是传输协议",
-        "能讲清 @EnableFeignClients、@FeignClient、named client、FeignClientsConfiguration 的关系",
-        "能按 JDK proxy、Contract、RequestTemplate、Interceptor、LoadBalancer、Client、Encoder/Decoder、ErrorDecoder 串起调用链",
+        "能说明 OpenFeign 是接口代理 + 同步 HTTP 客户端链，不是 RPC 框架",
+        "能讲清启动期 @EnableFeignClients 扫描、named client 组件集合、FeignClientsConfiguration 默认组件",
+        "能按 JDK Proxy → Contract → RequestTemplate → Interceptor → LoadBalancer → Client → Encoder/Decoder → ErrorDecoder 串起运行期完整链路",
         "能解释 name、url、contextId、configuration 的使用边界",
-        "能说明 connectTimeout、readTimeout、连接池、底层 Client、日志和 Micrometer 的生产意义",
-        "能讲清 CircuitBreaker、fallback、fallbackFactory 的启用前提和误用风险",
-        "能结合 2026 维护口径比较 OpenFeign 与 Spring HTTP Service Clients、RestClient、WebClient"
+        "能说明 connectTimeout 与 readTimeout 的分层含义，以及代理/Istio 场景的超时偏差",
+        "能讲清 CircuitBreaker + fallback/fallbackFactory 的启用前提（classpath、开关、Bean 注册）和常见误用",
+        "能解释自定义 Client 必须保持 singleton 的原因",
+        "能区分 OpenFeign 与 Spring HTTP Service Clients、RestClient、WebClient 的选型差异和适用场景"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "java.microservice.topic-058-72ff8a49.recall.1",
-      "prompt": "OpenFeign 从 @FeignClient 启动扫描到一次 HTTP 请求完成，中间经历哪些组件？",
+      "prompt": "OpenFeign 从 @FeignClient 启动扫描到一次 HTTP 请求完成，中间经历哪些组件？请按顺序讲清楚每一步的职责。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "java.microservice.topic-058-72ff8a49.recall.2",
-      "prompt": "fallback/fallbackFactory 不生效时应该如何排查？",
+      "prompt": "fallback/fallbackFactory 写了却没有生效，你会怎么排查？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "java.microservice.topic-058-72ff8a49.recall.3",
-      "prompt": "2026 年新系统为什么要比较 OpenFeign 与 Spring HTTP Service Clients？",
+      "prompt": "OpenFeign 的 connectTimeout 和 readTimeout 分别关注什么？代理或 Istio 环境下为什么配置值和感知延迟可能不一致？",
       "mode": "text",
       "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "java.microservice.topic-058-72ff8a49.recall.4",
+      "prompt": "2026 年新系统为什么建议比较 OpenFeign 与 Spring HTTP Service Clients、RestClient、WebClient？各自适合什么场景？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "java.microservice.topic-058-72ff8a49.recall.5",
+      "prompt": "OpenFeign 自定义 Client bean 为什么必须保持 singleton？如果不是 singleton 会导致什么问题？",
+      "mode": "text",
+      "expectedMinutes": 2,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明 OpenFeign 的接口代理、Contract、RequestTemplate、Client、Encoder/Decoder 和 ErrorDecoder 主链路",
-      "能解释 name、url、contextId、configuration、LoadBalancer 的边界",
-      "能说明 timeout、连接池、日志、观测、CircuitBreaker 和 fallback 的生产治理要求",
+      "能按顺序说明 OpenFeign 运行期链路：JDK Proxy → Contract → RequestTemplate → Interceptor → LoadBalancer/URL → Client → Encoder/Decoder → ErrorDecoder",
+      "能解释 name、url、contextId、configuration、LoadBalancer 的边界和使用场景",
+      "能说明 connectTimeout 与 readTimeout 的分层含义，以及连接池、重试、日志的生产治理要求",
+      "能讲清 CircuitBreaker + fallback 的启用前提（classpath 依赖、配置开关、Bean 注册）和常见踩坑",
       "能给出 OpenFeign 与 Spring HTTP Service Clients、RestClient、WebClient 的选型差异"
     ],
     "goodToHave": [
-      "能结合 Spring Cloud OpenFeign 4.x 属性提前解析、AOT、HC5、Client singleton、Retryer 默认行为讲版本细节",
-      "能把慢调用排查拆成 DNS、建连、实例选择、连接池等待、服务端处理、响应读取和重试/熔断",
-      "能说明 fallbackFactory 保留异常原因，以及 fallback 在写链路中的业务风险"
+      "能结合 OpenFeign 4.x 属性提前解析、AOT、HC5 迁移、Client singleton、Retryer 默认行为讲版本细节",
+      "能把慢调用排查拆成 DNS、建连、实例选择、连接池等待、TLS/代理、服务端处理、响应读取和重试/熔断等待",
+      "能说明 fallbackFactory 优于 fallback 的原因（保留异常原因便于区分超时/拒绝/HTTP 错误/解码失败）",
+      "能解释 OpenFeign feature-complete 定位对存量系统和新系统的不同影响"
     ],
     "commonMistakes": [
       "把 OpenFeign 说成 RPC 框架，忽略它本质是同步 HTTP 客户端",
-      "以为写了 fallback 属性就会生效，漏掉 CircuitBreaker 依赖、开关和 Bean 注册",
-      "只关注接口注解，不配置超时、连接池和日志级别",
+      "以为写了 fallback 属性就生效，漏掉 CircuitBreaker 依赖、开关和 Bean 注册",
+      "只关注接口注解写法，不配置超时、连接池、日志级别和重试策略",
       "自定义 Client 不是 singleton，导致连接池重复创建和资源泄漏",
+      "生产环境用 Logger.Level.FULL 打印完整 Header/Body，泄露敏感信息",
       "新系统无差别引入 OpenFeign，不比较 Spring HTTP Service Clients 或 RestClient/WebClient"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "java.spring.topic-043-d09a2ea2",
     "java.microservice.topic-055-e51532ee"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能把 OpenFeign 从接口声明讲到代理、命名客户端、负载均衡、HTTP Client、超时、熔断降级、观测和新旧选型边界。"
+  "interviewerFocus": "考察是否能把 OpenFeign 从启动期组件创建讲到运行期完整调用链（Contract → RequestTemplate → Interceptor → LoadBalancer → Client → Encoder/Decoder → ErrorDecoder），并能解释生产治理（超时分层、连接池 singleton、CircuitBreaker 前提、fallback 风险）和 2026 选型边界（OpenFeign vs HTTP Service Clients vs RestClient vs WebClient）。"
 }

@@ -4,7 +4,7 @@
   "category": "concurrent-python",
   "group": "concurrent-python",
   "title": "asyncio 异步编程",
-  "summary": "讲清 asyncio 协程与事件循环的调度机制、并发的正确写法（create_task/gather）、阻塞函数的坑，以及适用 IO 密集而非 CPU 密集。",
+  "summary": "讲清 asyncio 事件循环的单线程调度模型——协程只在 await 点让出、事件循环通过 Selector 回调驱动就绪队列——以及 create_task / gather / TaskGroup 如何实现真正并发、协程内调阻塞函数如何卡死整个循环并给出 run_in_executor / asyncio.to_thread 的解法、async 的传染性与同步代码迁移策略、Semaphore / Queue / shield / timeout 等并发控制原语、取消与异常传播机制，还有 asyncio 在 IO 密集 vs CPU 密集场景下的适用边界。",
   "tags": [
     "Python",
     "asyncio",
@@ -13,24 +13,44 @@
     "事件循环"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 45,
   "order": 140,
   "recommendWeight": 90,
   "learningCards": [
     {
       "type": "explain",
-      "title": "asyncio 异步编程：协程与事件循环、运行协程",
-      "content": "## 一、协程与事件循环\n\n协程是用户态轻量级线程，通过 `async def` 定义。协程通过 `await` 主动让出控制权，事件循环负责调度。\n\n**执行流程**：\n1. 调用 `async def` 函数返回协程对象（不执行）\n2. 协程对象需要被事件循环调度才能执行\n3. 遇到 `await` 协程挂起，事件循环切换到其他就绪的协程\n4. 被 await 的协程完成后恢复\n\n```python\nimport asyncio\n\nasync def hello():\n    print(\"Hello\")\n    await asyncio.sleep(1)  # 模拟 I/O 等待\n    print(\"World\")\n\nawait hello()  # 只能在 async 函数中使用\n```\n\n## 二、运行协程\n\n| 方式 | 说明 |\n| --- | --- |\n| `await coro` | 在另一个协程中等待 |\n| `asyncio.run(main())` | 创建事件循环，运行 main 协程，关闭循环（Python 3.7+） |\n| `asyncio.create_task(coro)` | 将协程包装为 Task 并调度执行 |\n| `asyncio.gather(*coros)` | 并发运行多个协程，返回所有结果 |\n| `asyncio.wait(tasks)` | 等待一组 Task，可设 timeout/first_completed 等 |\n| `asyncio.as_completed(coros)` | 迭代器形式返回已完成的结果 |\n\n```python\nasync def main():\n    # 并发执行\n    results = await asyncio.gather(\n        fetch(\"url1\"),\n        fetch(\"url2\"),\n        fetch(\"url3\"),\n    )\n    return results\n\nasyncio.run(main())\n```"
+      "title": "事件循环的调度模型：Selector 驱动、await 点切换",
+      "content": "asyncio 的核心是一个单线程事件循环，底层依赖操作系统的 I/O 多路复用（Linux 上是 epoll，macOS 是 kqueue，Windows 是 IOCP）。协程不是操作系统线程，也不会被操作系统抢占——调度完全由事件循环在用户态完成。\n\n**执行流程**：\n1. `async def` 函数被调用时返回一个协程对象，内部代码并不执行\n2. 协程对象交给事件循环（`asyncio.run` 或 `loop.run_until_complete`）才开始执行\n3. 协程执行到 `await` 时，如果被 await 的对象尚未就绪（比如 socket 还没收到数据），协程挂起，事件循环把控制权拿回来\n4. 事件循环从就绪队列取下一个可运行的协程继续执行\n5. 当底层 I/O 事件就绪（Selector 通知），事件循环把之前挂起的协程重新放入就绪队列\n\n关键理解：**协程只在 await 点才可能被切换**。两个 await 之间的纯 Python 计算代码是阻塞的——如果这段计算耗时 2 秒，整个事件循环就卡 2 秒，其他协程全部饿死。这是 asyncio 与操作系统线程调度最本质的区别。\n\n`asyncio.run()` 做了三件事：创建新的事件循环 → 运行传入的协程直到完成 → 关闭事件循环并清理。Python 3.10+ 会检查当前线程是否已有运行中的事件循环，有则报错，防止嵌套。一个线程同一时刻只能有一个运行中的事件循环。"
     },
     {
       "type": "explain",
-      "title": "asyncio 异步编程：Task 和 Future、异步上下文管理器",
-      "content": "## 三、Task 和 Future\n\n- **Future**：异步操作的最终结果占位符（类似 concurrent.futures.Future）\n- **Task**：Future 的子类，包装一个协程\n\n```python\nasync def main():\n    task = asyncio.create_task(slow_operation())\n    # task 已开始执行\n    result = await task  # 等待结果\n```\n\n## 四、异步上下文管理器\n\n```python\nclass AsyncResource:\n    async def __aenter__(self):\n        await self.connect()\n        return self\n\n    async def __aexit__(self, *args):\n        await self.close()\n\nasync with AsyncResource() as res:\n    await res.work()\n```"
+      "title": "协程、Task、Future 的关系与 create_task 的真正作用",
+      "content": "三个概念层级不同，混用会导致只理解一半：\n\n**Coroutine（协程）**：`async def` 函数返回的对象。它只是一段可暂停的代码，自己不会被调度——单独 await 一个协程就是顺序执行。\n\n**Future**：表示一个「将来会有结果」的占位符。它有三种状态：pending → done（或 cancelled）。事件循环内部用 Future 跟踪异步操作的完成状态。\n\n**Task**：Future 的子类，包装一个协程并立即调度它。创建 Task 的瞬间，协程就被排入事件循环的就绪队列——这是实现并发的关键。\n\n```python\nasync def main():\n    # 以下三个协程是顺序执行，不是并发\n    r1 = await fetch(url1)   # 阻塞等完成\n    r2 = await fetch(url2)   # url1 完成后才开始\n    r3 = await fetch(url3)\n\n    # 以下才是并发——create_task 立即调度\n    t1 = asyncio.create_task(fetch(url1))  # 立即排入就绪队列\n    t2 = asyncio.create_task(fetch(url2))  # 同上\n    t3 = asyncio.create_task(fetch(url3))  # 同上\n    r1, r2, r3 = await asyncio.gather(t1, t2, t3)  # 等待全部完成\n```\n\n`asyncio.gather(*aws)` 的内部实现就是把每个可等待对象包装成 Task 并发执行，然后等待全部完成。它接受协程或 Task 都行——传协程时 gather 内部会自动 create_task。\n\n`asyncio.gather` 的一个重要特性是 `return_exceptions=False`（默认）：任何一个协程抛异常，gather 会立即把该异常传播给 awaiter，其他协程仍在运行但结果被忽略。改为 `return_exceptions=True` 后，异常会作为结果返回列表，不会中断其他任务。Python 3.11 引入的 `TaskGroup` 更进一步：任一任务失败时自动取消其余任务，并以 `ExceptionGroup` 聚合所有异常。"
     },
     {
       "type": "explain",
-      "title": "asyncio 异步编程：异步迭代器、常用 API",
-      "content": "## 五、异步迭代器\n\n```python\nclass AsyncRange:\n    def __init__(self, n):\n        self.n = n\n        self.i = 0\n\n    def __aiter__(self):\n        return self\n\n    async def __anext__(self):\n        if self.i >= self.n:\n            raise StopAsyncIteration\n        self.i += 1\n        return self.i - 1\n\nasync for x in AsyncRange(5):\n    print(x)\n```\n\n## 六、常用 API\n\n| API | 说明 |\n| --- | --- |\n| `asyncio.sleep()` | 协程版 sleep（释放 GIL） |\n| `asyncio.wait_for(coro, timeout)` | 超时控制 |\n| `asyncio.shield(coro)` | 防止协程被取消 |\n| `asyncio.timeout(delay)` | Python 3.11+ 超时上下文管理器 |\n| `asyncio.Semaphore` | 控制并发度 |\n| `asyncio.Queue` | 异步队列 |\n| `asyncio.Lock` | 异步锁 |"
+      "title": "阻塞函数会卡死事件循环——三种解法",
+      "content": "这是 asyncio 最高频的线上 bug。事件循环是单线程的，一个协程在 await 之前的任何阻塞操作都会卡住整个循环：\n\n```python\nasync def bad():\n    time.sleep(5)          # 阻塞 5 秒，所有协程饿死\n    requests.get(url)      # 同步 HTTP，阻塞事件循环\n    heavy_computation()    # CPU 密集，阻塞事件循环\n```\n\n**解法一：用异步替代品（首选）**\n`time.sleep` → `await asyncio.sleep`；`requests.get` → `aiohttp`；同步数据库驱动 → `asyncpg` / `aiomysql`。这是根本解法，IO 操作本身就应该非阻塞。\n\n**解法二：`asyncio.to_thread()`（Python 3.9+）**\n把同步函数放到线程池执行，协程 await 其结果。底层调用 `loop.run_in_executor(None, func, *args)`。\n```python\nresult = await asyncio.to_thread(blocking_io_function, arg1, arg2)\n```\n适用场景：无法替换的第三方同步库（如某些 SDK、文件操作）。注意：线程池有默认大小限制（`ThreadPoolExecutor` 默认 min(32, os.cpu_count() + 4)），大量并发调用会排队。\n\n**解法三：`loop.run_in_executor()`（Python 3.7+）**\n与 to_thread 类似但可以指定自定义 executor。CPU 密集任务适合用 `ProcessPoolExecutor`：\n```python\nloop = asyncio.get_running_loop()\nresult = await loop.run_in_executor(ProcessPoolExecutor(), cpu_heavy_func)\n```\n注意跨进程时函数和参数必须可 pickle。"
+    },
+    {
+      "type": "explain",
+      "title": "async 的传染性与同步代码迁移策略",
+      "content": "async 的传染性是指：一旦底层函数改为 async def，调用它的函数也必须用 await，再上层也要 async——直到整个调用链都变成异步。这是语言层面的设计特性，目的是让所有可能阻塞的点都显式标注，调用者不会意外阻塞。\n\n**迁移策略**（从底向上）：\n1. **替换底层 IO 驱动**：数据库驱动换 asyncpg/aiomysql，HTTP 换 aiohttp/httpx(async client)\n2. **逐层改造**：从最底层的 IO 调用开始改 async，向上逐层传递\n3. **中间过渡层**：对暂时无法改造的同步代码，用 `asyncio.to_thread()` 包装\n4. **顶层入口**：最终只有 `asyncio.run(main())` 这一个同步入口\n\n**混合调用的注意事项**：\n- 同步代码中不能直接 `await`，也不能直接调用 `asyncio.run()`（会创建新事件循环，已有则报错）\n- 如果必须在同步框架（如 Flask）中调用异步代码：`loop = asyncio.new_event_loop(); loop.run_until_complete(coro); loop.close()`，但这不是真正的并发\n- Django 3.1+ 的 ASGI 模式下可以直接使用 async view\n\n传染性的正面效果：代码中每个 `await` 都是一个潜在的挂起点和并发机会，代码审查时能快速判断哪里有 IO、哪里会阻塞。"
+    },
+    {
+      "type": "explain",
+      "title": "取消、超时与异常传播机制",
+      "content": "asyncio 的取消机制基于 Task.cancel()——它在协程的下一个 await 点注入 `CancelledError`。这不是立即终止，而是等协程执行到下一个 await 时才触发。\n\n**取消的传播**：\n- `await some_task` 时如果 some_task 被取消，CancelledError 会传播给 awaiter\n- `asyncio.gather()` 默认行为：一个任务取消不会取消其他任务（除非设了 `return_exceptions=False` 且取消被当作异常传播）\n- `TaskGroup`（3.11+）：一个任务被取消或失败，会取消组内所有其他任务\n\n**超时控制**：\n```python\n# Python 3.11+ 推荐写法\nasync with asyncio.timeout(5.0):\n    await long_operation()  # 超时后自动取消\n\n# 兼容写法\ntry:\n    result = await asyncio.wait_for(long_operation(), timeout=5.0)\nexcept asyncio.TimeoutError:\n    handle_timeout()\n```\n`asyncio.timeout()` 在 3.11 引入，支持嵌套和相对/绝对时间；`wait_for()` 更早但取消行为略粗暴（直接 cancel task）。\n\n**shield 防取消**：\n`asyncio.shield(coro)` 保护内部协程不被外部取消。外部 task 被取消时，shield 内部的操作仍继续执行，只是 await shield 的调用方收到 CancelledError。适用场景：取消时仍需完成的清理操作（如写日志、发送完成回调）。\n\n**异常传播**：\n- 未被 await 的 Task 如果抛异常，在 Task 被垃圾回收时打印 `Task exception was never retrieved` 警告\n- 建议：对所有 create_task 的返回值做 await 或至少保存引用并在 finally 中检查"
+    },
+    {
+      "type": "explain",
+      "title": "并发控制原语：Semaphore、Queue、Lock",
+      "content": "asyncio 提供了与 threading 模块类似的同步原语，但它们是协程友好的——等待时不阻塞事件循环。\n\n**Semaphore（信号量）**：控制并发度\n```python\nsem = asyncio.Semaphore(10)  # 最多 10 个并发\n\nasync def limited_fetch(url):\n    async with sem:  # acquire 失败时协程挂起，不阻塞循环\n        return await fetch(url)\n```\n典型场景：爬虫限速、数据库连接池、API 限流。Semaphore 内部用 `collections.deque` 维护等待队列。\n\n**Queue（异步队列）**：生产者-消费者模式\n```python\nqueue = asyncio.Queue(maxsize=100)  # 有界队列，满时 put 挂起\nawait queue.put(item)      # 队列满时协程挂起\nitem = await queue.get()   # 队列空时协程挂起\nqueue.task_done()           # 标记任务完成\nawait queue.join()          # 等待所有 task_done\n```\n与 `multiprocessing.Queue` 不同，asyncio.Queue 只在单进程内使用，不能跨进程。`maxsize=0` 表示无界（不推荐，失去背压控制）。\n\n**Lock（异步锁）**：保护共享状态\n```python\nlock = asyncio.Lock()\nasync with lock:\n    # 同一时刻只有一个协程进入\n    shared_resource += 1\n```\n注意：asyncio.Lock 是协程级别的，不能用于线程间同步。如果同时有线程和协程访问共享资源，需要线程锁 + 异步锁配合，或用 `asyncio.to_thread` 隔离。"
+    },
+    {
+      "type": "explain",
+      "title": "asyncio 的适用边界：IO 密集 vs CPU 密集",
+      "content": "asyncio 的价值在于高并发 IO——大量网络请求、数据库查询、文件读写时，单线程就能管理几万个并发连接，每个连接只在等 IO 时让出，线程切换开销为零（用户态函数调用级）。\n\n**适合 asyncio 的场景**：\n- 大量并发 HTTP 请求（爬虫、微服务间调用）\n- WebSocket 长连接服务\n- 数据库连接池管理（用 asyncpg 等异步驱动）\n- 文件 IO 密集（配合 aiofiles）\n- 消息队列消费者（如 aiokafka）\n\n**不适合 asyncio 的场景**：\n- CPU 密集计算（图像处理、加密、矩阵运算）——单线程，GIL 仍存在\n- 需要真正并行的任务——用 multiprocessing\n- 简单脚本、少量 IO——同步写法更清晰，async 反而增加复杂度\n- 已有成熟的同步框架且无性能瓶颈——不值得迁移\n\n**与其他模型的选型**：\n| 场景 | 首选 | 原因 |\n| --- | --- | --- |\n| 高并发网络服务 | asyncio + uvloop | 单线程，连接数可达数万 |\n| CPU 密集计算 | multiprocessing | 绕过 GIL，真正并行 |\n| 混合负载 | asyncio + ProcessPoolExecutor | IO 走协程，CPU 丢进程池 |\n| 简单脚本 | threading 或同步 | 复杂度低，够用即好 |\n\nuvloop 是 libuv 的 Python 绑定，替代默认事件循环后性能提升 2-4 倍。但它不支持 Windows，且某些 Python 特性（如 debug mode）兼容性有限。"
     },
     {
       "type": "diagram",
@@ -52,45 +72,61 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | asyncio | threading | multiprocessing |\n| --- | --- | --- | --- |\n| 并发模型 | 协程（协作式） | 线程（抢占式） | 进程（抢占式） |\n| 调度 | 事件循环（用户态） | 操作系统（内核态） | 操作系统（内核态） |\n| 上下文切换开销 | 极低（函数调用级） | 低 | 高 |\n| 并行性 | 单线程并发 | 单核并发（GIL 限制） | 多核并行 |\n| 适用任务 | 高并发 I/O | 中等 I/O | CPU 密集 |\n| 内存占用 | 极低 | 中 | 高 |\n| 代码复杂度 | 高（async/await 传染） | 中 | 中 |\n| Python 版本 | 3.5+ 引入，3.7+ 完善 | 所有版本 | 所有版本 |"
+      "title": "asyncio 与 threading / multiprocessing 的工程选型",
+      "content": "| 维度 | asyncio | threading | multiprocessing |\n| --- | --- | --- | --- |\n| 并发模型 | 协程（协作式调度） | 线程（抢占式调度） | 进程（抢占式调度） |\n| 调度者 | 事件循环（用户态单线程） | OS 内核 | OS 内核 |\n| 上下文切换开销 | 极低（函数调用级，~ns） | 低（~μs，内核态切换） | 高（~ms，内存隔离） |\n| 并行性 | 无并行（单线程） | 受 GIL 限制，CPU 密集无真正并行 | 真正多核并行 |\n| 最大并发数 | 数万连接（受 fd 和内存限制） | 数百到数千（受 OS 线程栈内存限制） | 受 CPU 核数和内存限制 |\n| 适用任务类型 | 高并发 IO（网络、文件、数据库） | 中等 IO 并发、同步库调用 | CPU 密集（计算、数据处理） |\n| 阻塞影响 | 阻塞整个事件循环 | 只阻塞当前线程 | 只阻塞当前进程 |\n| 代码侵入性 | 高（async/await 传染） | 低（函数级） | 低（函数级） |\n| 共享状态 | 单线程天然安全，无需锁 | 需要 Lock/RLock | 需要 IPC（Queue/共享内存） |\n| Python 版本 | 3.7+（run API）；3.11+（TaskGroup） | 所有版本 | 所有版本 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "# 1. 并发下载\nimport asyncio\nimport aiohttp  # 三方库，HTTP 异步请求\n\nasync def fetch(session, url):\n    async with session.get(url) as response:\n        return await response.text()\n\nasync def main():\n    urls = [\"https://example.com\"] * 10\n    async with aiohttp.ClientSession() as session:\n        tasks = [fetch(session, url) for url in urls]\n        results = await asyncio.gather(*tasks)\n\nasyncio.run(main())\n\n# 2. 超时控制 (Python 3.11+)\nasync def fetch_with_timeout(url):\n    try:\n        async with asyncio.timeout(5.0):\n            return await fetch(session, url)\n    except asyncio.TimeoutError:\n        return None\n\n# 3. 信号量控制并发\nsemaphore = asyncio.Semaphore(10)\n\nasync def limited_fetch(url):\n    async with semaphore:\n        return await fetch(url)\n\n# 4. asyncio.Queue 实现生产者-消费者\nasync def producer(q, n):\n    for i in range(n):\n        await q.put(i)\n        await asyncio.sleep(0.1)\n    await q.put(None)\n\nasync def consumer(q):\n    while True:\n        item = await q.get()\n        if item is None:\n            break\n        print(f\"Consumed: {item}\")\n\nasync def main():\n    q = asyncio.Queue()\n    await asyncio.gather(\n        producer(q, 10),\n        consumer(q),\n    )",
+      "title": "可运行示例：并发爬虫、超时、信号量、生产者-消费者",
       "language": "python",
+      "content": "import asyncio\nimport time\n\n# 模拟异步 IO 操作\nasync def simulated_fetch(url: str, delay: float) -> str:\n    await asyncio.sleep(delay)  # 模拟网络延迟\n    return f\"{url}: done in {delay}s\"\n\n# 1. 并发请求（create_task + gather）\nasync def concurrent_fetch():\n    tasks = [\n        asyncio.create_task(simulated_fetch(f\"url_{i}\", 0.5))\n        for i in range(5)\n    ]\n    results = await asyncio.gather(*tasks)\n    print(f\"concurrent results: {results}\")\n\n# 2. 超时控制（Python 3.11+ timeout 上下文管理器）\nasync def fetch_with_timeout():\n    try:\n        async with asyncio.timeout(1.0):\n            result = await simulated_fetch(\"slow_url\", 3.0)\n            return result\n    except TimeoutError:\n        print(\"fetch timed out\")\n        return None\n\n# 3. Semaphore 控制并发度\nsem = asyncio.Semaphore(2)  # 最多 2 个并发\n\nasync def limited_fetch(url: str, delay: float) -> str:\n    async with sem:\n        print(f\"  starting {url}\")\n        result = await simulated_fetch(url, delay)\n        print(f\"  finished {url}\")\n        return result\n\nasync def semaphore_demo():\n    tasks = [\n        asyncio.create_task(limited_fetch(f\"url_{i}\", 0.5))\n        for i in range(5)\n    ]\n    results = await asyncio.gather(*tasks)\n    print(f\"limited results: {results}\")\n\n# 4. 生产者-消费者（asyncio.Queue）\nasync def producer(queue: asyncio.Queue, count: int):\n    for i in range(count):\n        await asyncio.sleep(0.1)  # 模拟生产间隔\n        await queue.put(i)\n        print(f\"produced: {i}\")\n    await queue.put(None)  # 哨兵值，通知消费者退出\n\nasync def consumer(queue: asyncio.Queue):\n    consumed = []\n    while True:\n        item = await queue.get()\n        if item is None:\n            break\n        consumed.append(item)\n        print(f\"consumed: {item}\")\n        queue.task_done()\n    return consumed\n\nasync def producer_consumer_demo():\n    queue = asyncio.Queue(maxsize=3)  # 有界队列，提供背压\n    prod_task = asyncio.create_task(producer(queue, 6))\n    cons_task = asyncio.create_task(consumer(queue))\n    await prod_task\n    consumed = await cons_task\n    print(f\"consumed items: {consumed}\")\n\n# 5. 阻塞函数的危害演示\nasync def blocking_bad():\n    start = time.monotonic()\n    time.sleep(2)  # 阻塞！整个事件循环卡 2 秒\n    elapsed = time.monotonic() - start\n    print(f\"blocking took {elapsed:.1f}s - all other coroutines were frozen!\")\n\nasync def main():\n    print(\"=== concurrent fetch ===\")\n    await concurrent_fetch()\n\n    print(\"\\n=== timeout ===\")\n    await fetch_with_timeout()\n\n    print(\"\\n=== semaphore ===\")\n    await semaphore_demo()\n\n    print(\"\\n=== producer-consumer ===\")\n    await producer_consumer_demo()\n\n    print(\"\\n=== blocking demo ===\")\n    t1 = asyncio.create_task(blocking_bad())\n    t2 = asyncio.create_task(simulated_fetch(\"concurrent\", 0.1))\n    await asyncio.gather(t1, t2)\n    # t2 的 0.1s sleep 不会与 t1 的 time.sleep 并发，而是被阻塞\n\nif __name__ == \"__main__\":\n    asyncio.run(main())",
       "highlights": [
         {
-          "line": 12,
-          "note": "`tasks = [fetch(session, url) for url in urls]` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+          "line": 15,
+          "note": "create_task 立即把协程排入事件循环就绪队列，5 个 fetch 并发执行，总耗时约 0.5s 而非 2.5s。"
         },
         {
-          "line": 42,
-          "note": "`if item is None:` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 24,
+          "note": "asyncio.timeout() 在超时后自动取消内部协程，抛出 TimeoutError。Python 3.11+ 推荐写法。"
         },
         {
-          "line": 35,
-          "note": "`await q.put(i)` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "line": 33,
+          "note": "Semaphore(2) 限制最多 2 个并发，第 3 个协程在 async with sem 处挂起等待。"
         },
         {
-          "line": 2,
-          "note": "`import asyncio` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+          "line": 55,
+          "note": "asyncio.Queue(maxsize=3) 是有界队列，队列满时 producer 的 put 会挂起，提供背压。"
+        },
+        {
+          "line": 76,
+          "note": "time.sleep(2) 是阻塞调用，会卡死整个事件循环——在此期间其他协程全部饿死。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：asyncio 是 Python 的单线程协程并发框架。协程是用户态轻量级「线程」，用 async def 定义、用 await 主动让出控制权，事件循环负责在协程间调度。它擅长 IO 密集型并发（大量网络请求、连接），但不能加速 CPU 密集任务（单线程、还是受 GIL 限制）。\n\n机制：\n\n1. 调用 async def 函数只返回协程对象、不执行；要被事件循环调度才跑。\n2. 遇到 await 协程挂起，事件循环切到其他就绪协程；被 await 的对象完成后再恢复。所以 await 的必须是「可等待对象」——协程、Task 或 Future。\n3. 入口 asyncio.run(main()) 创建并关闭事件循环；asyncio.create_task() 把协程包成 Task 立即调度（这才是真正并发）；asyncio.gather() 并发跑多个并收集结果。\n\n要点和坑。① 只 await 单个协程是顺序执行，要并发必须 create_task 或 gather。② 协程里绝不能调阻塞函数（time.sleep、同步 requests、重 CPU 计算），会卡死整个事件循环，要用 asyncio.sleep、aiohttp，CPU 活儿丢 run_in_executor。③ async 有「传染性」，一个函数 async 了调用链上都得 async，迁移老同步代码时用 run_in_executor 包同步调用过渡。④ 3.11 的 TaskGroup 管理一组任务、任一失败以 ExceptionGroup 抛出，比裸 gather 更安全。",
+      "content": "**一句话结论**\nasyncio 是 Python 的单线程协程并发框架，通过事件循环 + await 让出实现高并发 IO，但单线程意味着无法并行 CPU 密集任务，且协程内任何阻塞操作都会卡死整个循环。\n\n**事件循环调度模型**\n- 单线程，底层用 OS Selector（epoll/kqueue/IOCP）监听 IO 事件\n- 协程只在 `await` 点让出控制权，两个 await 之间的代码阻塞整个循环\n- `async def` 只返回协程对象不执行，需交给事件循环调度\n\n**实现并发的关键**\n- `await` 单个协程 = 顺序执行\n- `asyncio.create_task(coro)` = 立即调度，并发的关键\n- `asyncio.gather(*tasks)` = 并发运行 + 收集结果\n- Python 3.11 `asyncio.TaskGroup` = 结构化并发，任一失败自动取消其余，ExceptionGroup 聚合异常\n\n**阻塞函数的坑与解法**\n- `time.sleep()` → `await asyncio.sleep()`\n- 同步 IO → 异步库（aiohttp/asyncpg）\n- 无法替换的同步代码 → `asyncio.to_thread()` 或 `run_in_executor()`\n- CPU 密集 → `ProcessPoolExecutor`\n\n**async 传染性**\n- 设计特性：强制标注所有可能阻塞的点\n- 迁移策略：从底层 IO 驱动开始改造，逐层向上，过渡期用 to_thread 包装\n\n**并发控制**\n- Semaphore 限制并发数（爬虫、API 限流）\n- asyncio.Queue 做生产者-消费者（有界队列提供背压）\n- asyncio.Lock 保护协程间共享状态\n\n**取消与超时**\n- `task.cancel()` 在下一个 await 点注入 CancelledError\n- `asyncio.timeout(seconds)` 3.11+ 推荐写法\n- `asyncio.shield(coro)` 防止取消传播\n- 未 await 的 Task 异常会被 GC 时警告\n\n**适用边界**\n- 适合：高并发 IO（网络服务、爬虫、数据库连接池）\n- 不适合：CPU 密集、需要并行的计算任务\n- 混合负载：asyncio 处理 IO + ProcessPoolExecutor 处理 CPU",
       "followUpQuestions": [
         {
-          "question": "协程的 `await` 到底 await 了什么？协程是什么时候被切换的？",
-          "answer": "await 是对可等待对象（协程、Future、Task）的挂起。协程只有在 await 点时才会被切换，其他时间的计算是阻塞的（这很重要——在协程中做 CPU 计算会阻塞整个事件循环）。事件循环通过文件描述符回调、定时器回调等机制在 await 时注册回调，数据就绪后重新调度协程。"
+          "question": "协程只在 await 点切换，那在两个 await 之间做大量计算会怎样？怎么解决？",
+          "answer": "两个 await 之间的纯 Python 计算是阻塞的——会卡死整个事件循环，其他所有协程饿死。解决方案：① 把大计算拆成多步，中间插 `await asyncio.sleep(0)` 让出控制权；② 把 CPU 密集任务用 `asyncio.to_thread()` 或 `loop.run_in_executor(ProcessPoolExecutor(), func)` 丢到线程池/进程池。"
         },
         {
-          "question": "async/await 的传染性怎么处理？已有的同步代码怎么迁移？",
-          "answer": "Async 的传染性是设计特性——它强制标注所有可能阻塞的操作。迁移策略：从底层 I/O 操作开始改造为异步（如数据库驱动换成异步版本），然后向上传递 async 直到调用链顶端。可以用 `asyncio.to_thread()`（Python 3.9+）把同步操作放到线程池中运行以避免阻塞事件循环。对不能改的同步库用 `loop.run_in_executor()` 包装。"
+          "question": "asyncio.create_task 创建的 Task 如果不 await 会怎样？",
+          "answer": "Task 会正常并发执行，但有两个风险：① 如果 Task 内部抛异常，因为没人 await 它，异常不会被传播，只在 Task 被垃圾回收时打印 `Task exception was never retrieved` 警告；② 如果程序退出时 Task 还没完成，它会被静默取消。建议：对所有 create_task 的返回值做 await，或保存引用后在 finally 中检查/取消。"
+        },
+        {
+          "question": "asyncio.gather 和 TaskGroup 有什么区别？什么时候该用哪个？",
+          "answer": "gather 默认 `return_exceptions=False`：一个任务异常时立即传播，其他任务继续运行但结果被忽略；设 `return_exceptions=True` 后异常作为结果返回。TaskGroup（3.11+）更严格：任一任务失败或取消时，自动取消组内所有其他任务，并以 ExceptionGroup 聚合所有异常。TaskGroup 适合「一组任务要么全成功、要么快速失败」的场景；gather 适合「每个任务独立，部分失败不影响其他」的场景。"
+        },
+        {
+          "question": "如果我要迁移一个同步 Flask 应用到 asyncio，有什么注意事项？",
+          "answer": "① 选择 ASGI 框架（FastAPI/Starlette），不用 WSGI；② 数据库驱动换异步版本（asyncpg 替代 psycopg2）；③ HTTP 客户端换 aiohttp 或 httpx async；④ 无法替换的同步库用 asyncio.to_thread 包装；⑤ 注意 async 传染性，从路由层开始改，中间层逐步过渡；⑥ 不要用同步框架+asyncio.run 混合，会导致嵌套事件循环问题。"
+        },
+        {
+          "question": "Semaphore 和限流有什么区别？用了 Semaphore 还需要限流吗？",
+          "answer": "Semaphore 控制的是单进程内的并发协程数（本地并发度），限流控制的是对外部资源的请求速率（如 API QPS）。场景不同：Semaphore(10) 表示同一时刻最多 10 个协程在执行网络请求；但 10 个请求可能在同一秒发出，对外部 API 来说就是 10 QPS。如果外部 API 限 5 QPS，Semaphore 还需配合 rate limiter（如 aiolimiter）控制发送速率。"
         }
       ]
     },
@@ -98,13 +134,14 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释 async/await 的工作原理和事件循环模型",
-        "能使用 asyncio.run()、create_task()、gather()",
-        "能理解协程只有在 await 时才切换",
-        "能实现异步上下文管理器和异步迭代器",
-        "能使用 Semaphore 控制并发度",
-        "能对比 asyncio/threading/multiprocessing 的选型",
-        "能处理超时和取消场景"
+        "能解释事件循环如何通过 OS Selector 调度协程、协程只在 await 点切换",
+        "能区分 await 单协程（顺序）与 create_task/gather（并发）的本质区别",
+        "能说清协程内调阻塞函数会卡死整个事件循环，并给出三种解法（异步替代/to_thread/run_in_executor）",
+        "能解释 async 传染性是设计特性，并描述从底层 IO 驱动开始的迁移策略",
+        "能区分协程、Task、Future 三者的关系",
+        "能使用 Semaphore 控制并发度、Queue 实现生产者-消费者、Lock 保护共享状态",
+        "能解释 cancel/timeout/shield 的行为和 Python 3.11 TaskGroup 的结构化并发",
+        "能根据 IO 密集 vs CPU 密集 vs 混合负载选型 asyncio/threading/multiprocessing"
       ]
     }
   ],
@@ -118,7 +155,7 @@
     },
     {
       "id": "python.concurrent-python.asyncio.recall.2",
-      "prompt": "用 asyncio 实现一个带并发控制的网页爬虫：最多同时 10 个请求。",
+      "prompt": "用 asyncio 实现一个带并发控制的网页爬虫：最多同时 10 个请求，单个请求超时 5 秒。",
       "mode": "code",
       "expectedMinutes": 10,
       "difficulty": 4
@@ -129,24 +166,40 @@
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
+    },
+    {
+      "id": "python.concurrent-python.asyncio.recall.4",
+      "prompt": "asyncio.gather 和 TaskGroup 有什么区别？在什么场景下用哪个？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
+      "id": "python.concurrent-python.asyncio.recall.5",
+      "prompt": "create_task 创建的 Task 如果不 await 会怎样？GC 时会出什么问题？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出协程由事件循环单线程调度、await 主动让出",
+      "能解释事件循环的单线程调度模型：await 点切换、Selector 驱动、非抢占",
       "能区分 await 单协程（顺序）与 create_task/gather（并发）",
-      "能说明协程里调阻塞函数会卡死事件循环",
-      "能指出 asyncio 适合 IO 密集、不适合 CPU 密集"
+      "能说明协程里调阻塞函数会卡死事件循环，并给出至少两种解法",
+      "能指出 asyncio 适合 IO 密集、不适合 CPU 密集，以及混合负载的选型"
     ],
     "goodToHave": [
-      "能区分协程、Task、Future",
-      "能说明 run_in_executor 跑同步或 CPU 任务",
-      "能说出 3.11 TaskGroup 与 ExceptionGroup"
+      "能区分协程、Task、Future 的关系与生命周期",
+      "能解释 async 传染性及同步代码迁移策略",
+      "能说明 cancel/timeout/shield 的行为和 3.11 TaskGroup 的结构化并发",
+      "能解释 Semaphore/Queue/Lock 的异步语义和背压机制"
     ],
     "commonMistakes": [
-      "在协程里调用 time.sleep 或同步 IO 卡死事件循环",
-      "以为 await 多个协程就是并发（其实是顺序）",
-      "用 asyncio 加速 CPU 密集任务"
+      "在协程里调用 time.sleep 或同步 IO 导致整个事件循环卡死",
+      "以为 await 多个协程就是并发——其实顺序 await 是串行执行",
+      "用 asyncio 加速 CPU 密集任务——单线程 + GIL 无法并行",
+      "create_task 后不 await，Task 异常被静默忽略（GC 时才有警告）"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -157,8 +210,8 @@
   },
   "status": "production",
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否解释事件循环调度与 await 让出、区分顺序与并发、知道阻塞函数会卡死循环，并清楚 asyncio 的适用边界。",
-  "updatedAt": "2026-06-18",
+  "interviewerFocus": "考察能否解释事件循环的 Selector 调度模型与 await 点切换机制、区分顺序与并发的代码写法、知道阻塞函数卡死循环的原因和三种解法、理解 async 传染性与迁移策略，并清楚 asyncio 的 IO 密集适用边界和与其他并发模型的选型依据。",
+  "updatedAt": "2026-06-23",
   "prerequisites": [
     "python.concurrent-python.gil-threading"
   ]

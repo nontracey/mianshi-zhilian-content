@@ -4,7 +4,7 @@
   "category": "network-security",
   "group": "network-security",
   "title": "Cookie、Session、Token 与 JWT",
-  "summary": "按『状态放在哪』讲清 Cookie/Session/Token/JWT 的演进、各自有无状态的取舍，以及 JWT 难作废和存储位置的安全权衡。",
+  "summary": "按「状态放在哪」串 Cookie/Session/Token/JWT 演进链：Session 存服务端，Token/JWT 交客户端，JWT 自包含但签发后难作废，常用短效 JWT + refresh token 折中；Cookie 防 XSS 但有 CSRF 风险，localStorage 反之。",
   "tags": [
     "Cookie",
     "Session",
@@ -13,50 +13,63 @@
     "认证"
   ],
   "difficulty": 2,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 23,
   "order": 25,
   "recommendWeight": 85,
   "learningCards": [
     {
       "type": "explain",
-      "title": "Cookie、Session、Token 与 JWT：核心区别",
-      "content": "四者是一条演进链，理解「状态放在哪」就全串起来了。\nCookie 本身只是浏览器的存储与自动携带机制（按域名+路径自动附在请求上），不是认证方案；它是其他方案的「运输工具」之一。\nCookie + Session：会话状态存在服务端（内存/Redis），浏览器只拿一个随机 SessionID。优点是服务端完全可控——改权限、踢人立即生效；代价是有状态：集群环境必须做 Session 共享（粘性路由或集中存储），横向扩展受牵制。\nToken：把凭证整个交给客户端保管、随请求自行携带（通常放 Authorization 头），服务端不再为每个会话存状态，天然跨域、易水平扩展。\nJWT 是自包含 Token 的标准格式：Header.Payload.Signature 三段 Base64Url，服务端用密钥验签即可确认真伪和读取声明（uid、过期时间等），不用查库。代价是签发后无法主动作废——改密码/踢人不能立即生效，只能等过期，或额外维护黑名单（又回到了有状态）。所以工程上常用「短效 JWT（分钟级）+ 长效 refresh token（可撤销、存服务端）」的组合折中。\n安全边界：Cookie 存凭证要配 HttpOnly（防 XSS 读取）、SameSite（防 CSRF）、Secure（仅 HTTPS）；放 localStorage 则任何 XSS 都能直接偷走 token——两种存法是在 CSRF 与 XSS 两类攻击面之间做权衡。"
+      "title": "Cookie 是载体，Session/Token/JWT 才是认证方案",
+      "content": "## Cookie 是什么\nCookie 是浏览器的键值对存储机制，浏览器按域名+路径自动把匹配的 Cookie 附在请求头里。它本身不是认证方案——它是运输工具，SessionID、JWT、甚至随便什么字符串都可以塞进 Cookie 里传递。\n\nCookie 有严格的浏览器安全属性：\n- `HttpOnly`：JS 通过 `document.cookie` 读不到，防 XSS 窃取\n- `Secure`：只在 HTTPS 下发送\n- `SameSite`：控制跨站请求是否携带 Cookie。`Strict` 完全不带（最安全但用户体验差，比如外部链接点进来没有登录态）。`Lax` 允许顶级导航 GET 携带（Chrome 80+ 默认值，能挡大部分 POST 类 CSRF）。`None` 任何请求都带（必须同时设 Secure，用于合法跨站如第三方嵌入）\n- `Domain/Path`：控制 Cookie 的作用域；设了 `Domain=.example.com` 则子域也能访问\n- `Expires/Max-Age`：持久化 Cookie vs 会话 Cookie（浏览器关闭即失效）\n\nCookie 的安全问题主要来自它的自动携带特性：同一域名下所有请求都会带上 Cookie，这是 CSRF 攻击的根源。SameSite=Lax 是当前最实用的 CSRF 防线。"
+    },
+    {
+      "type": "explain",
+      "title": "Session 的代价与 Token/JWT 的取舍",
+      "content": "## Session 的集群代价\nSession 有状态意味着水平扩展受牵制：\n- **单机**没问题，Session 存本机内存或进程内\n- **集群**必须做 Session 共享。两种方案：①粘性会话（Sticky Session）——负载均衡器把同一用户始终路由到同一节点，简单但节点挂了 Session 丢、扩缩容不灵活；②集中存储（Redis/DB）——所有节点共享 Session Store，可靠但引入额外网络开销和单点依赖。Redis 是当前主流方案\n- **水平扩展**受 Session Store 容量和性能限制。无状态服务可以随意加机器，有状态服务每加一台都要考虑 Session 读写瓶颈\n\n## Token 与 JWT\n用户登录后，服务端生成凭证（Token）返回客户端，服务端不保存会话信息。客户端把 Token 存 localStorage 或 Cookie 中，请求时放在 `Authorization: Bearer <token>` 头里发送。天然跨域、易水平扩展。随机字符串 Token 还是需要查库验证。\n\nJWT 是自包含 Token 的标准格式（RFC 7519），三段 Base64Url 编码。**Header** 存算法和类型，**Payload** 存声明 Claims（含 `sub`/`exp`/`iat` 等标准字段和自定义字段），**Signature** 用密钥对 `header.payload` 签名防篡改。HS256 对称密钥，RS256 非对称——微服务场景公钥可公开分发，各服务独立验签。\n\n**JWT 核心优势**：验签就能确认真伪、读取声明，**不用查库**，适合分布式和微服务。\n\n**JWT 核心代价——签发后无法主动作废**：\nJWT 自包含，签发后独立存在，服务端没有存它。实现「踢人」「改密码后旧 Token 失效」需额外机制：\n1. **短效 JWT + Refresh Token**（主流）：Access Token 5-15 分钟过期。Refresh Token 7-30 天存服务端（Redis），可主动撤销\n2. **JWT 黑名单**：Redis 存被作废的 jti，每次验签多查一次——回到有状态\n3. **版本号比对**：JWT 中放 tokenVersion，改密码时递增，验签时查库——也回到有状态\n\n**Payload 不能存敏感信息**：Payload 只是 Base64Url 编码，不是加密。任何人拿到 Token 都能解码读取。"
     },
     {
       "type": "diagram",
       "format": "mermaid",
       "title": "浏览器登录态链路：Cookie、Session、Token 与 JWT 的保存和校验",
-      "content": "sequenceDiagram\nparticipant B as Browser\nparticipant S as Server\nparticipant DB as Session Store or User DB\nB->>S: login credentials\nS->>DB: verify user and create session or token claims\nDB-->>S: user identity\nS-->>B: Set-Cookie sessionId or return access token\nB->>S: subsequent request with Cookie/Authorization\nS->>DB: session lookup or token revocation check when needed\nS-->>B: 200 / 401 / 403\nNote over B,S: Cookie 重在浏览器自动携带和 CSRF 边界；JWT 重在自包含声明和失效治理。",
-      "caption": "浏览器登录态链路：Cookie、Session、Token 与 JWT 的保存和校验",
-      "fallback": "图展示 Cookie/Session/JWT 的差异在登录态保存、请求携带、服务端校验和失效治理，不只是存储位置不同。",
+      "content": "sequenceDiagram\nparticipant B as Browser\nparticipant S as Server\nparticipant DB as Session Store\nparticipant Cache as Token Cache\nB->>S: login credentials\nS->>DB: verify user\nDB-->>S: user identity\nalt Session 模式\nS->>DB: save session\nS-->>B: Set-Cookie sessionId\nB->>S: request with Cookie\nS->>DB: session lookup\nelse JWT 模式\nS->>Cache: save refresh token\nS-->>B: return access token\nB->>S: Authorization Bearer token\nS->>Cache: revocation check when needed\nend",
+      "caption": "浏览器登录态链路：Session 模式 vs JWT 模式的保存和校验流程",
+      "fallback": "图展示 Session（服务端存状态、Cookie 携带）与 JWT（客户端无状态、Authorization 头携带）两种登录态方案的完整链路对比。",
       "sources": [
         {
           "kind": "mermaid",
-          "content": "sequenceDiagram\nparticipant B as Browser\nparticipant S as Server\nparticipant DB as Session Store or User DB\nB->>S: login credentials\nS->>DB: verify user and create session or token claims\nDB-->>S: user identity\nS-->>B: Set-Cookie sessionId or return access token\nB->>S: subsequent request with Cookie/Authorization\nS->>DB: session lookup or token revocation check when needed\nS-->>B: 200 / 401 / 403\nNote over B,S: Cookie 重在浏览器自动携带和 CSRF 边界；JWT 重在自包含声明和失效治理。"
+          "content": "sequenceDiagram\nparticipant B as Browser\nparticipant S as Server\nparticipant DB as Session Store\nparticipant Cache as Token Cache\nB->>S: login credentials\nS->>DB: verify user\nDB-->>S: user identity\nalt Session 模式\nS->>DB: save session\nS-->>B: Set-Cookie sessionId\nB->>S: request with Cookie\nS->>DB: session lookup\nelse JWT 模式\nS->>Cache: save refresh token\nS-->>B: return access token\nB->>S: Authorization Bearer token\nS->>Cache: revocation check when needed\nend"
         },
         {
           "kind": "text",
-          "content": "图展示 Cookie/Session/JWT 的差异在登录态保存、请求携带、服务端校验和失效治理，不只是存储位置不同。"
+          "content": "图展示 Session（服务端存状态、Cookie 携带）与 JWT（客户端无状态、Authorization 头携带）两种登录态方案的完整链路对比。"
         }
       ]
     },
     {
       "type": "compareTable",
-      "title": "认证方案对比",
-      "content": "| 方案 | 状态 | 存储位置 | 跨域 | 服务端压力 |\n| --- | --- | --- | --- | --- |\n| Cookie+Session | 有状态 | 服务端 Session | 受限 | 高（需存储） |\n| Token | 无状态 | 客户端 localStorage | 支持 | 低 |\n| JWT | 无状态 | 客户端 | 支持 | 低（无需查库） |"
+      "title": "认证方案对比：状态、扩展、安全与适用场景",
+      "content": "| 维度 | Cookie + Session | Token（随机字符串） | JWT |\n| --- | --- | --- | --- |\n| 状态 | 有状态（服务端存会话） | 有状态（需查库验证） | 无状态（验签即可） |\n| 凭证存储位置 | SessionID 在 Cookie | localStorage 或 Cookie | localStorage 或 Cookie |\n| 跨域 | 受限（Cookie 同源策略） | 支持（Authorization 头） | 支持（Authorization 头） |\n| 水平扩展 | 需 Session 共享（Redis） | 需 Token 存储查询 | 天然无状态，易扩展 |\n| 主动失效 | 删 Session 记录即可 | 删 Token 记录即可 | 难，需黑名单或版本号 |\n| CSRF 风险 | 高（浏览器自动携带） | 低（手动带头） | 低（手动带头） |\n| XSS 风险 | 低（HttpOnly 阻止 JS 读取） | 高（localStorage JS 可读） | 高（localStorage JS 可读） |\n| 典型场景 | 传统 Web 应用、后台管理 | 简单 API 认证 | 微服务、分布式、第三方 API |"
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：这四个是一条演进链，抓住「状态放在哪」就串起来了。Cookie 是浏览器的存储和自动携带机制（不是认证方案，是运输工具）；Session 把状态存服务端、Cookie 只带 SessionID；Token 把凭证交给客户端自己带；JWT 是自包含 Token 的标准格式。\n\n逐个说：\n\n1. Cookie：按域名加路径自动附在请求上，是其他方案的载体。\n2. Cookie 加 Session：会话状态存服务端（内存、Redis），浏览器只拿随机 SessionID。优点是服务端可控、改权限踢人立即生效；缺点是有状态，集群要做 Session 共享。\n3. Token：凭证整个交给客户端、随请求带（通常放 Authorization 头），服务端不存会话状态，天然跨域、易水平扩展。\n4. JWT：自包含 Token 的标准，Header.Payload.Signature 三段，服务端验签即可确认真伪、读 claims，不用查库。代价是签发后无法主动作废——改密码、踢人不能立即生效，要么等过期、要么维护黑名单（又变回有状态）。\n\n所以工程上常用「短效 JWT（分钟级）加长效 refresh token（可撤销、存服务端）」折中。\n\n安全边界（必问）：Cookie 存凭证配 HttpOnly（防 XSS 读取）、SameSite（防 CSRF）、Secure（仅 HTTPS）；放 localStorage 则任何 XSS 都能偷走 token——两种存法是在 CSRF 和 XSS 两类攻击面之间权衡。",
+      "content": "**30 秒结论**\n四者是一条演进链，核心是「状态放在哪」：Cookie 是浏览器的存储和自动携带机制（载体，不是认证方案）；Session 把会话状态存服务端（可控但有状态）；Token/JWT 把凭证交给客户端（无状态但失效难）。JWT 自包含、验签免查库，但签发后无法主动作废，工程上用短效 JWT + 长效 refresh token 折中。\n\n**机制主线**\n- **Cookie**：浏览器按域名+路径自动附带请求头的键值对存储。配 HttpOnly 防 XSS 读取、SameSite 防 CSRF、Secure 仅 HTTPS。它是运输工具，SessionID 和 JWT 都可以通过 Cookie 传递\n- **Cookie + Session**：服务端存 `{SessionID → 用户信息}`，浏览器只拿随机 SessionID。服务端完全掌控——踢人删 Session、改权限立即生效。代价是集群必须做 Session 共享（粘性路由或 Redis 集中存储），水平扩展受牵制\n- **Token**：凭证整个交给客户端、放在 `Authorization` 头自行携带，服务端不存会话状态。天然跨域、易水平扩展。随机字符串 Token 还是需要查库验证\n- **JWT**：自包含 Token 标准格式（Header.Payload.Signature）。服务端验签即可确认真伪、读取声明，不用查库。签发后无法主动作废，常用「短效 JWT + 长效 Refresh Token」折中\n\n**安全权衡（高频追问）**\n- Cookie 存凭证：防 XSS（HttpOnly）但有 CSRF 风险（SameSite=Lax 是当前最实用防线）\n- localStorage 存 Token：无 CSRF 但 XSS 可直接偷走。两种方案在 CSRF 和 XSS 之间各有权衡",
       "followUpQuestions": [
         {
-          "question": "JWT 和传统 Session 最大的架构差异是什么？",
-          "answer": "Session 状态主要在服务端，便于失效和集中控制；JWT 把声明放在 token 中，便于无状态扩展，但吊销、续期和泄露控制更复杂。"
+          "question": "JWT 的 Payload 为什么不能存敏感信息？",
+          "answer": "JWT 的 Payload 只是 Base64Url 编码，不是加密，任何人拿到 Token 都能直接解码读取所有 Claims（如 uid、role 等）。要加密用 JWE（JSON Web Encryption），但实际项目中很少用，敏感信息（密码、手机号、身份证等）不应该放在 JWT Payload 里。"
         },
         {
-          "question": "Cookie 存 token 时要重点配置哪些安全属性？",
-          "answer": "通常要配置 HttpOnly、Secure、SameSite，并合理设置 Domain、Path、过期时间。跨站场景还要配合 CSRF 防护和 CORS 策略。"
+          "question": "用户改密码后如何让旧 JWT 立即失效？",
+          "answer": "三种方案：①短效 JWT + Refresh Token——Access Token 设 5-15 分钟过期，改密码时撤销 Refresh Token，旧 Access Token 很快自然过期；②JWT 黑名单——把被作废的 jti 存 Redis，每次验签额外查一次（回到有状态）；③JWT 中放 tokenVersion，改密码时递增版本号，验签时查库比对（也回到有状态）。方案①是工程主流。"
+        },
+        {
+          "question": "前后端分离项目中 Token 存 Cookie 还是 localStorage？",
+          "answer": "存 Cookie：配 HttpOnly+SameSite+Secure 能防 XSS 偷取，但有 CSRF 风险（需 SameSite=Lax 或 CSRF Token）。存 localStorage：无 CSRF 风险，但 XSS 可直接读取 token。XSS 防护做得到位（严格 CSP、无 innerHTML）时 localStorage + Authorization 头更简洁；XSS 风险较高（用户输入多、第三方脚本多）时 Cookie + HttpOnly + SameSite 更安全。"
+        },
+        {
+          "question": "Session 共享的两种方案各有什么取舍？",
+          "answer": "①粘性会话（Sticky Session）——负载均衡器把同一用户始终路由到同一节点，简单但节点挂了 Session 丢失、扩缩容不灵活；②集中存储（Redis/DB）——所有节点共享 Session Store，可靠但引入额外网络延迟和单点依赖。Redis 是当前主流方案，读写延迟通常 <1ms。"
         }
       ]
     },
@@ -64,62 +77,90 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "Cookie、Session、Token、JWT 的核心区别",
-        "JWT 的结构和签名验证机制",
-        "Cookie 的安全属性（HttpOnly/SameSite/Secure）",
-        "Token 存储方案的安全权衡"
+        "Cookie 是浏览器自动携带机制（载体），不是认证方案本身",
+        "Cookie + Session 的工作流：服务端存状态、浏览器带 SessionID、集群需 Session 共享（粘性路由 vs Redis）",
+        "JWT 三段结构（Header.Payload.Signature）、验签免查库、Payload 只是 Base64Url 不能存敏感信息",
+        "JWT 签发后难作废的原因和三种失效方案（短效+Refresh Token / 黑名单 / 版本号）",
+        "Cookie 的安全属性：HttpOnly 防 XSS、SameSite 防 CSRF（Strict/Lax/None 区别）、Secure 仅 HTTPS",
+        "Token 存 Cookie vs localStorage 在 CSRF 和 XSS 之间的安全权衡",
+        "短效 JWT + 长效 Refresh Token 的工程折中方案"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "frontend.network-security.auth-mechanisms.recall.1",
-      "prompt": "JWT 的 Payload 部分为什么不能存储敏感信息？如何实现 JWT 的主动失效（如用户登出）？",
+      "prompt": "Cookie、Session、Token、JWT 分别是什么？它们之间的演进关系是什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 2
     },
     {
       "id": "frontend.network-security.auth-mechanisms.recall.2",
-      "prompt": "Cookie 的 SameSite 属性有哪些值？如何防止 CSRF 攻击？",
+      "prompt": "JWT 的三段结构分别是什么？Payload 为什么不能存敏感信息？服务端验签时需要查库吗？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 2
     },
     {
       "id": "frontend.network-security.auth-mechanisms.recall.3",
-      "prompt": "前后端分离项目中，Token 应该存储在 localStorage 还是 Cookie 中？各有什么安全风险？",
+      "prompt": "用户改密码后，如何让旧 JWT 立即失效？三种方案各有什么代价？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 2
+    },
+    {
+      "id": "frontend.network-security.auth-mechanisms.recall.4",
+      "prompt": "Cookie 的 SameSite 属性有哪些值？各自的行为是什么？为什么 SameSite=Lax 是当前最实用的 CSRF 防线？",
       "mode": "text",
       "expectedMinutes": 3,
+      "difficulty": 2
+    },
+    {
+      "id": "frontend.network-security.auth-mechanisms.recall.5",
+      "prompt": "前后端分离项目中，Token 存 localStorage 还是 Cookie？各自的攻击面和适用场景分别是什么？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 2
+    },
+    {
+      "id": "frontend.network-security.auth-mechanisms.recall.6",
+      "prompt": "集群环境下 Session 共享有哪些方案？各自的取舍是什么？为什么很多团队最终选择 JWT 而不是 Session？",
+      "mode": "text",
+      "expectedMinutes": 4,
       "difficulty": 2
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说出 Cookie 是载体而非认证方案",
-      "能区分 Session（服务端有状态）与 Token（客户端无状态）",
-      "能说明 JWT 自包含、验签免查库及难主动作废的代价",
-      "能说出 short JWT 加 refresh token 的折中"
+      "能说出 Cookie 是浏览器自动携带机制（载体），不是认证方案本身",
+      "能区分 Cookie+Session（服务端有状态）与 JWT（客户端无状态验签免查库）的核心差异",
+      "能说明 JWT 签发后无法主动作废的原因，以及短效 JWT + Refresh Token 的工程折中",
+      "能解释 Cookie 的 HttpOnly/SameSite/Secure 安全属性及 SameSite Strict/Lax/None 的区别",
+      "能说明 Token 存 Cookie vs localStorage 在 CSRF 和 XSS 两类攻击面之间的权衡"
     ],
     "goodToHave": [
-      "能说明集群下 Session 共享问题",
-      "能解释 JWT 黑名单又变回有状态",
-      "能说明 Cookie 与 localStorage 在 CSRF/XSS 上的权衡"
+      "能说明集群 Session 共享的粘性路由和 Redis 集中存储两种方案及取舍",
+      "能解释 JWT 黑名单和版本号方案虽然能失效但又变回有状态",
+      "能说出 HS256（对称）vs RS256（非对称）的适用场景（微服务公钥分发）",
+      "能指出 Payload 只是 Base64Url 编码不是加密"
     ],
     "commonMistakes": [
-      "把 Cookie 当成认证方案本身",
-      "以为 JWT 能像 Session 一样随时失效",
-      "JWT 存 localStorage 不防 XSS、或 Cookie 不配 HttpOnly/SameSite"
+      "把 Cookie 当成认证方案本身，而不是传输/存储机制",
+      "以为 JWT 能像 Session 一样随时服务端失效，不知道需要黑名单或 Refresh Token",
+      "存 JWT 在 localStorage 却不防 XSS，或存 Cookie 却不配 HttpOnly/SameSite",
+      "以为 JWT Payload 加密了，不知道只是 Base64Url 编码",
+      "混淆 Token 和 JWT——Token 可以是任意字符串，JWT 是自包含的标准格式"
     ],
     "scoreWeights": {
-      "coverage": 40,
+      "coverage": 30,
       "accuracy": 25,
-      "interviewExpression": 20,
-      "depth": 15
+      "interviewExpression": 25,
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "interviewFrequency": "high",
   "status": "draft",
-  "interviewerFocus": "考察能否用『状态放哪』串起四者、区分有状态与无状态、说清 JWT 难主动作废及 refresh token 折中、Cookie 与 localStorage 的安全权衡。"
+  "interviewerFocus": "考察能否用「状态放哪」串起 Cookie/Session/Token/JWT 四者、区分有状态与无状态、说清 JWT 难主动作废及短效+Refresh Token 折中、Cookie 安全属性（HttpOnly/SameSite/Secure）与 localStorage 的安全权衡（CSRF vs XSS）。"
 }

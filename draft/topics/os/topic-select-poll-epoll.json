@@ -4,7 +4,7 @@
   "category": "io-model",
   "group": "io-model",
   "title": "select/poll/epoll",
-  "summary": "深入理解三种 IO 多路复用机制的实现原理、性能差异和适用场景，掌握 epoll 的事件驱动模型",
+  "summary": "深入理解 select/poll 的全集复制与线性扫描、epoll 的兴趣集合与就绪链表回调、LT/ET/ONESHOT/EXCLUSIVE 边界，以及多路复用在线上空轮询、ET 漏读、ONESHOT 未重激活和普通文件 EPERM 问题中的排查方法。",
   "tags": [
     "操作系统",
     "IO 多路复用",
@@ -21,23 +21,23 @@
     {
       "type": "explain",
       "title": "select/poll 的三个老问题",
-      "content": "三者都是“一个线程同时盯多个 fd”的多路复用，理解 epoll 先得看清 select/poll 差在哪。\n\n## select\n- 用 `fd_set` **位图**表示关注的 fd，每次调用都要把整个位图从用户态**拷到内核**。\n- 内核**遍历所有 fd** 逐个查就绪状态；返回后用户还要**再遍历一遍**才知道哪个就绪。\n- 受 `FD_SETSIZE` 限制，默认只能盯 **1024** 个 fd；且每次调用都要重设位图。\n\n## poll\n- 用 `pollfd` 数组代替位图，**去掉了 1024 的数量限制**。\n- 但本质没变：仍要**整个数组拷进内核**、内核**仍 O(n) 遍历**、返回后**仍要遍历**找就绪。\n\n## 三个共同痛点\n1. 每次调用都重复**拷贝**全部 fd 进内核；2. 内核每次都 **O(n) 遍历**全部 fd；3. 返回后用户还要 **O(n) 扫一遍**。连接数一大、活跃的又少时，绝大部分遍历都白做。"
+      "content": "三者都是「一个线程同时盯多个 fd」的多路复用。要理解 epoll 为什么快，先得看清 select/poll 慢在哪。\n\n**select** 用 `fd_set` 位图表示关注的 fd。每次调用都必须把整个位图从用户态拷贝到内核（`copy_from_user`），内核再逐个检查每个 fd 的状态（O(n)），返回后用户态还要遍历位图才能知道哪些 fd 就绪。此外位图大小由 `FD_SETSIZE` 决定（Linux 默认 1024），超过这个值的 fd 编号根本放不进去；每次调用前还要用 `FD_ZERO`/`FD_SET` 重新构建集合，因为内核会直接在传入的位图上标记就绪状态。\n\n**poll** 用 `pollfd` 数组代替位图，`fd` 字段没有硬上限，去掉了 1024 的数量限制。但底层代价没变：整个数组每次都要拷进内核、内核仍然 O(n) 遍历全部 fd、返回后用户态还要扫一遍 `revents` 找就绪。\n\n**三个共同痛点**：① 每次调用重复拷贝全部关注 fd；② 内核每次都 O(n) 遍历全部 fd；③ 返回后用户态还要 O(n) 扫描。连接数大、活跃比例低时，绝大部分遍历都是白做。"
     },
     {
       "type": "explain",
-      "title": "epoll 为什么高效：红黑树 + 就绪链表 + 回调",
-      "content": "epoll 用三个机制一次性解决上面三个痛点：\n\n- **fd 只注册一次**：`epoll_create` 建实例，`epoll_ctl` 把 fd 注册进内核的一棵**红黑树**（增删改查 O(log n)）。之后 `epoll_wait` 不用再重复传入全部 fd——**避免了每次拷贝**。\n- **回调维护就绪链表**：每个注册的 fd 挂一个回调，当网卡数据到达、该 fd 就绪时，回调把它加入内核的**就绪链表**。`epoll_wait` 只需看这个链表空不空——**不再遍历全部 fd**。\n- **只返回就绪的 fd**：`epoll_wait` 直接把就绪链表里的 fd 拷给用户，用户拿到的就是就绪集合，**不用再自己扫一遍**。\n\n所以 `epoll_wait` 的开销只和**活跃连接数**有关，与总连接数无关。这就是它能撑十万级长连接（C10K）的根本原因。"
+      "title": "epoll 为什么高效：兴趣集合 + 就绪链表 + 回调",
+      "content": "epoll 用三个机制缓解上面三个痛点：\n\n**兴趣集合常驻内核**。`epoll_create1` 创建一个 `eventpoll` 结构体，包含一棵红黑树（维护已注册的 fd 集合）和一个就绪链表（`rdllist`）。`epoll_ctl(EPOLL_CTL_ADD/MOD/DEL)` 增删改 fd 时操作这棵红黑树，开销是 O(log n)，但这些操作只在连接建立/断开时发生，频率远低于每次事件循环的 `epoll_wait`。\n\n**状态变化通过回调进入就绪链表**。`epoll_ctl(ADD)` 除了插入红黑树，还会把一个 `ep_poll_callback` 注册到 fd 的等待队列上。当网卡数据到达、内核 socket 缓冲区可读时，协议栈唤醒等待队列，回调函数把对应的 `epitem` 挂到 `rdllist`。这个过程在 `epoll_wait` 被调用之前就已经发生了——就绪链表是被动积累的。\n\n**`epoll_wait` 只取就绪事件**。调用时检查 `rdllist`，如果有就绪 fd，把它们的事件拷贝到用户空间数组返回；没有就绪就根据 timeout 阻塞或立即返回 0。用户态拿到的就是已就绪的 fd 列表，不需要再扫描全部关注集合。\n\n但 epoll 不是「所有操作 O(1)」。`epoll_ctl` 每次调用有红黑树增删和回调注册开销；`epoll_wait` 返回 k 个就绪事件时要 `copy_to_user`；大量短连接频繁建断（高频 `epoll_ctl`）时维护成本不可忽略。epoll 的优势在「连接多、活跃少」的长连接场景最为显著；如果几乎所有 fd 都同时活跃，select/poll 与 epoll 差距不大。"
     },
     {
       "type": "explain",
-      "title": "LT vs ET 与性能对比",
-      "content": "## 两种触发模式\n- **水平触发 LT（默认）**：只要 fd **还有数据没读完**，每次 `epoll_wait` 都会**重复通知**。编程简单、不容易漏数据，一次没读完下次还会提醒。\n- **边缘触发 ET**：只在 fd **状态发生变化时通知一次**（来了新数据才提醒）。必须**配合非阻塞 IO，并在一次通知里循环读到 `EAGAIN`**（把数据读干净），否则剩下的数据要等下次新数据到达才再被通知，可能“饿死”。性能略高、系统调用更少，但编程更易出错。\n\n## 性能对比一句话\n- select/poll：每次 **O(n)** 遍历全部 fd，n 是监听总数。\n- epoll：`epoll_wait` 约 **O(就绪数)**，注册/删除 fd 是 O(log n)。\n- **结论**：连接多但活跃少（典型长连接服务）时 epoll 碾压；如果只盯少量、且几乎全活跃的 fd，select/poll 差距不大、甚至更省事。这也是 Redis、Nginx 用 epoll 的原因。"
+      "title": "LT vs ET：触发语义与编程约束",
+      "content": "**水平触发 LT（默认）**：只要 fd 上「条件仍满足」（读缓冲区有数据、写缓冲区有空间），每次 `epoll_wait` 都会再次通知。编程简单：没读完下次还会提醒，不容易丢数据。大多数业务首选 LT。\n\n**边缘触发 ET**（`EPOLLET`）：只在 fd 状态发生「变化」的那一刻通知一次（新数据到达、新连接可接受）。如果这次通知没有把数据读干净，剩余数据不会触发新的通知——要等到下一批数据到达才会再次通知，期间这些数据可能长时间无人处理（连接「饿死」）。\n\nET 必须配合两个条件：① fd 设置为非阻塞（`O_NONBLOCK`），否则 `read`/`write` 可能阻塞当前线程；② 在一次通知中循环调用 `read`/`write` 直到返回 `-1` 且 `errno == EAGAIN`，确保本轮数据全部消费完。\n\n**ONESHOT**（`EPOLLONESHOT`）：在 LT 或 ET 上叠加，使得 fd 触发一次事件后自动「失活」，后续 `epoll_wait` 不再通知该 fd。多线程消费同一 fd 时用于防止并发读写竞争——处理完后必须用 `epoll_ctl(EPOLL_CTL_MOD)` 重新激活。忘记重激活是常见的线上 bug：连接永久沉默。\n\n**EXCLUSIVE**（`EPOLLEXCLUSIVE`，Linux 4.5+）：多个 epoll 实例或线程同时 `epoll_wait` 等待同一个共享 fd（典型是 listen socket）时，只唤醒其中一个，缓解 accept 惊群。但它只对 `EPOLL_CTL_ADD` 时有效，且不适用于普通读写 fd 的并发等待场景。"
     },
     {
       "type": "diagram",
-      "title": "select/poll/epoll：机制分支与风险路径",
-      "content": "flowchart TD\nNeo3cp3S[select/poll/epoll 触发入口] --> Neo3cp3M[核心对象或状态: 操作系统]\nNeo3cp3M --> Neo3cp3C{select/poll/epoll 是否走正常路径}\nNeo3cp3C -->|正常| Neo3cp3N[执行 select/poll/epoll 主流程]\nNeo3cp3C -->|异常| Neo3cp3F[处理 select/poll/epoll 边界风险]\nNeo3cp3N --> Neo3cp3O[输出结果或交给下一组件]\nNeo3cp3F --> Neo3cp3R[按 select/poll/epoll 语义降级/重试/报错]\nNeo3cp3O --> Neo3cp3V[验证 select/poll/epoll 日志、指标或测试]\nNeo3cp3R --> Neo3cp3V",
-      "fallback": "select/poll/epoll 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。",
+      "title": "select/poll 线性扫描 vs epoll 就绪链表",
+      "content": "assets/diagrams/os-select-poll-epoll-ready-list.svg",
+      "fallback": "select 用 fd_set 位图、poll 用 pollfd 数组，每轮都要整体拷贝、内核 O(n) 扫描、用户态再 O(n) 扫描。epoll 把关注 fd 注册到内核，fd 就绪时由回调加入 ready list，epoll_wait 只返回就绪事件；ET 模式必须非阻塞读到 EAGAIN。",
       "items": [
         "epoll_create: 创建 eventpoll 结构体（红黑树 + 就绪链表）",
         "epoll_ctl(ADD): 将 fd 插入红黑树，注册回调函数",
@@ -46,60 +46,81 @@
         "LT模式: 未读完数据会重复通知",
         "ET模式: 只通知一次，必须用非阻塞fd一次读完"
       ],
-      "format": "mermaid",
-      "caption": "select/poll/epoll 图中的分支用于区分本题正常机制、异常边界和工程验证路径。",
+      "format": "svg",
+      "caption": "这张图把 epoll 的三个优势落到数据结构上：关注集合常驻内核、状态变化回调进 ready list、wait 只拿活跃 fd；ET 的风险点是漏读会饿死连接。",
       "sources": [
         {
-          "kind": "mermaid",
-          "content": "flowchart TD\nNeo3cp3S[select/poll/epoll 触发入口] --> Neo3cp3M[核心对象或状态: 操作系统]\nNeo3cp3M --> Neo3cp3C{select/poll/epoll 是否走正常路径}\nNeo3cp3C -->|正常| Neo3cp3N[执行 select/poll/epoll 主流程]\nNeo3cp3C -->|异常| Neo3cp3F[处理 select/poll/epoll 边界风险]\nNeo3cp3N --> Neo3cp3O[输出结果或交给下一组件]\nNeo3cp3F --> Neo3cp3R[按 select/poll/epoll 语义降级/重试/报错]\nNeo3cp3O --> Neo3cp3V[验证 select/poll/epoll 日志、指标或测试]\nNeo3cp3R --> Neo3cp3V"
+          "kind": "svg",
+          "path": "assets/diagrams/os-select-poll-epoll-ready-list.svg"
         },
         {
           "kind": "text",
-          "content": "select/poll/epoll 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。"
+          "content": "select 用 fd_set 位图、poll 用 pollfd 数组，每轮都要整体拷贝、内核 O(n) 扫描、用户态再 O(n) 扫描。epoll 把关注 fd 注册到内核，fd 就绪时由回调加入 ready list，epoll_wait 只返回就绪事件；ET 模式必须非阻塞读到 EAGAIN。"
         }
       ]
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | select | poll | epoll |\n| --- | --- | --- | --- |\n| 数据结构 | fd_set 位图 | pollfd 数组 | 红黑树+就绪链表 |\n| fd 数量限制 | FD_SETSIZE(1024) | 无限制 | 无限制 |\n| fd 传递 | 每次拷贝 | 每次拷贝 | 注册一次(epoll_ctl) |\n| 就绪检测 | 遍历 O(n) | 遍历 O(n) | 回调 O(1) |\n| 触发模式 | 水平触发 | 水平触发 | LT 和 ET |\n| 性能(大量连接) | 差 | 差 | 优秀 |\n| 编程复杂度 | 低 | 低 | 中（ET模式高） |"
+      "title": "select/poll/epoll 完整对比",
+      "content": "| 对比项 | select | poll | epoll |\n| --- | --- | --- | --- |\n| 数据结构 | fd_set 位图 | pollfd 数组 | 红黑树（兴趣集合） + rdllist（就绪链表） |\n| fd 传递 | 每次调用拷贝整个位图 | 每次调用拷贝整个数组 | epoll_ctl 注册/修改，wait 不再传全集 |\n| 就绪检测 | 内核 O(n) 遍历全部 fd | 内核 O(n) 遍历并写 revents | 状态变化时回调加入 rdllist，wait 取链表 |\n| 每次返回 | 用户态 O(n) 扫描位图找就绪 | 用户态 O(n) 扫描 revents | 只返回就绪 fd，O(k) 拷贝 |\n| fd 数量上限 | FD_SETSIZE（默认 1024） | 数组长度可扩展 | 系统 fd 上限 + 内存 |\n| 触发模式 | LT | LT | LT / ET / ONESHOT / EXCLUSIVE |\n| 维护成本 | 每轮重建集合 | 每轮传数组 | ctl 有红黑树 + 回调注册开销 |\n| 优势场景 | 少量 fd、跨平台兼容 | 少量到中等 fd | 大量连接 + 少量活跃（长连接服务） |\n| 典型坑 | fd_set 需每轮重置、1024 上限 | 误以为去掉上限就解决扫描成本 | ET 漏读、ONESHOT 未重激活、普通文件 EPERM |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// epoll 服务器示例\n#include <sys/epoll.h>\n#include <fcntl.h>\n#include <stdio.h>\n#include <string.h>\n#include <unistd.h>\n\n#define MAX_EVENTS 1024\n\nvoid set_nonblocking(int fd) {\n    int flags = fcntl(fd, F_GETFL, 0);\n    fcntl(fd, F_SETFL, flags | O_NONBLOCK);\n}\n\nint main() {\n    int epfd = epoll_create1(0);\n    struct epoll_event ev, events[MAX_EVENTS];\n    \n    // 监听标准输入\n    ev.events = EPOLLIN;\n    ev.data.fd = STDIN_FILENO;\n    epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &ev);\n    \n    while (1) {\n        // 等待事件，-1 表示永久阻塞\n        int nfds = epoll_wait(epfd, events, MAX_EVENTS, -1);\n        \n        for (int i = 0; i < nfds; i++) {\n            if (events[i].data.fd == STDIN_FILENO) {\n                char buf[1024];\n                int n = read(STDIN_FILENO, buf, sizeof(buf));\n                if (n > 0) {\n                    buf[n] = '\\0';\n                    printf(\"Read: %s\", buf);\n                }\n            }\n        }\n    }\n    close(epfd);\n    return 0;\n}\n\n// ET 模式设置：EPOLLIN | EPOLLET\n// 必须一次性读完数据\nvoid read_all(int fd) {\n    char buf[4096];\n    while (1) {\n        int n = read(fd, buf, sizeof(buf));\n        if (n < 0) {\n            if (errno == EAGAIN) break; // 数据读完\n            perror(\"read\");\n            break;\n        }\n        if (n == 0) break; // 连接关闭\n        // 处理数据\n    }\n}",
-      "language": "c",
+      "title": "Python 可运行：select 就绪通知与非阻塞读到 EAGAIN",
+      "content": "import select\nimport selectors\nimport socket\n\nreader, writer = socket.socketpair()\nreader.setblocking(False)\nwriter.setblocking(False)\n\n# 写入前，reader 无数据，select 不返回 ready\nready_before, _, _ = select.select([reader], [], [], 0)\nprint(\"ready before write:\", bool(ready_before))\n\n# 写入 6 字节后，reader 变为可读\nwriter.sendall(b\"abcdef\")\nready_after, _, _ = select.select([reader], [], [], 1.0)\nprint(\"ready after write:\", [sock.fileno() for sock in ready_after])\n\n# 用 DefaultSelector 模拟 ET 风格：每次只读 2 字节，循环读到 EAGAIN\nselector = selectors.DefaultSelector()\nselector.register(reader, selectors.EVENT_READ, data=\"read-handler\")\n\nchunks = []\nfor key, mask in selector.select(timeout=1.0):\n    while True:\n        try:\n            data = key.fileobj.recv(2)\n            if not data:\n                break\n            chunks.append(data)\n        except BlockingIOError:\n            # EAGAIN/WOULDBLOCK: 本轮缓冲区已读空\n            print(\"nonblocking recv reached EAGAIN/WOULDBLOCK\")\n            break\n\nmessage = b\"\".join(chunks)\nprint(\"message:\", message.decode())\n\nselector.unregister(reader)\nreader.close()\nwriter.close()\n\nassert not ready_before\nassert ready_after\nassert message == b\"abcdef\"",
+      "language": "python",
       "highlights": [
         {
-          "line": 17,
-          "note": "`struct epoll_event ev, events[MAX_EVENTS];` 定义了 select/poll/epoll 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 10,
+          "note": "写入前 select 无 ready fd，说明多路复用只检查就绪状态，不主动搬运数据。"
+        },
+        {
+          "line": 15,
+          "note": "写入后 fd 变为可读，select 返回就绪集合。"
         },
         {
           "line": 24,
-          "note": "`while (1) {` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+          "note": "非阻塞读循环每次只读 2 字节，模拟 ET 模式下必须循环读到缓冲区空。"
         },
         {
-          "line": 29,
-          "note": "`if (events[i].data.fd == STDIN_FILENO) {` 是分支判断，决定正常路径、边界输入或失败路径走向。"
-        },
-        {
-          "line": 2,
-          "note": "`#include <sys/epoll.h>` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "line": 28,
+          "note": "BlockingIOError 对应 EAGAIN/WOULDBLOCK，是本轮 ET 读循环的正确终止条件。"
         }
       ]
     },
     {
+      "type": "explain",
+      "title": "Reactor 模式与 epoll 的协作关系",
+      "content": "Reactor 是把 I/O 多路复用作为事件分发器的网络编程模式。核心循环是：`epoll_wait` → 遍历就绪事件 → 根据事件类型执行 `accept`/`read`/`write` 或投递给 worker 线程。\n\n**单 Reactor 单线程**：Redis 主线程就是典型——一个线程既做事件循环又做业务处理，靠高效数据结构和内存操作保证单请求极低延迟。瓶颈是业务逻辑不能阻塞，否则整个事件循环卡住。\n\n**单 Reactor 多线程**：主线程做事件循环和 accept，读写完成后的业务处理投递给线程池。Nginx 的 worker 进程内大致是这种模型。关键约束：同一个 fd 的读写要串行，否则 buffer 竞争。`EPOLLONESHOT` 就是为此设计——事件触发后 fd 自动失活，worker 处理完再 `MOD` 重新注册。\n\n**主从 Reactor 多线程**（Netty 模型）：主 Reactor 只负责 accept，子 Reactor 各自负责一组连接的读写事件。连接数大时可以水平扩展子 Reactor。Netty 的 `EventLoopGroup(boss)` 和 `EventLoopGroup(worker)` 对应主从两层。"
+    },
+    {
       "type": "interviewAnswer",
       "title": "标准面试回答",
-      "content": "30 秒结论：select、poll、epoll 都是在一个线程里等待多个 fd 的就绪事件。select/poll 的瓶颈是每轮把关注集合交给内核并线性扫描；epoll 把关注集合注册在内核，fd 状态变化时通过等待队列回调进入就绪队列，所以在大量长连接、少量活跃连接的网络服务里更有优势。\n\n机制要点：\n- select 用 `fd_set` 位图，受 `FD_SETSIZE` 和最大 fd 扫描范围影响，返回后还要重建集合并再次判断哪些 fd 就绪。\n- poll 用 `pollfd` 数组去掉固定 1024 限制，但没有改变每轮拷贝数组、内核线性检查、用户态扫描 `revents` 的模型。\n- epoll 用 `epoll_create1` 创建实例，用 `epoll_ctl` 维护内核中的关注集合，用 `epoll_wait` 只取就绪事件；注册、删除有维护成本，不能简单说所有操作都是 O(1)。\n- LT 是条件满足就重复通知，写法安全；ET 只交付状态变化，必须配合非阻塞 fd 并读到 `EAGAIN`，否则连接可能卡住。\n- Reactor 是把 epoll_wait 所在的事件循环作为分发器：主线程或 IO 线程取事件，再执行 accept、read、write 或投递给 worker。多线程消费同一 fd 时常配 `EPOLLONESHOT`，处理完再 `EPOLL_CTL_MOD` 重新激活。\n- 多个线程或多个 epoll 等同一个 listen socket 时可能出现 accept 惊群，Linux 4.5 后可用 `EPOLLEXCLUSIVE` 缓解部分场景，但它不是普通读写 fd 的万能方案。\n\n边界和排查：\n- epoll 主要适合 socket、pipe、eventfd、timerfd 这类有等待状态变化的 fd；普通文件通常不适合，注册可能返回 `EPERM`，因为普通文件缺少有意义的 poll 等待语义或总是就绪。\n- 如果线上 CPU 高，要用 `strace -tt -T -e epoll_wait,epoll_ctl,accept4,read,write -p <pid>` 看是否空轮询、频繁 `EPOLL_CTL_MOD`、大量 accept 后 `EAGAIN`，再结合 `perf top` 判断时间耗在系统调用、事件循环还是业务处理。\n- 如果 ET 模式连接无响应，优先检查 fd 是否非阻塞、读写循环是否直到 `EAGAIN`、ONESHOT 是否忘了重新激活。",
+      "content": "**30 秒结论**：select、poll、epoll 都是 I/O 多路复用，让一个线程同时等待多个 fd 的就绪事件。select/poll 的瓶颈是每次调用把关注集合拷进内核并线性扫描全集；epoll 把关注集合注册在内核（红黑树），fd 就绪时通过等待队列回调加入就绪链表，`epoll_wait` 只取就绪事件，所以在大量长连接、少量活跃的网络服务里性能优势明显。\n\n**机制要点**：\n- select 用 `fd_set` 位图，受 `FD_SETSIZE`（默认 1024）限制，每次调用前需重建集合，返回后还要再遍历位图找就绪 fd。\n- poll 用 `pollfd` 数组去掉固定上限，但每次调用仍要拷贝整个数组、内核 O(n) 扫描、用户态扫描 `revents`。\n- epoll 用 `epoll_create1` 创建实例、`epoll_ctl` 维护内核兴趣集合（红黑树，O(log n)）、`epoll_wait` 只返回就绪事件。注册和删除有维护开销，不能简单说所有操作都是 O(1)。\n- LT 是条件满足就重复通知，编程安全；ET 只在状态变化时通知一次，必须配合非阻塞 fd 并循环读到 `EAGAIN`，否则连接可能饿死。\n- `EPOLLONESHOT` 在多线程消费同一 fd 时防止并发读写竞争，处理完必须 `EPOLL_CTL_MOD` 重新激活。\n- `EPOLLEXCLUSIVE`（Linux 4.5+）缓解共享 listen socket 的 accept 惊群，只唤醒一个等待线程，但不适用于普通读写 fd。\n\n**边界与排查**：\n- epoll 主要适合 socket、pipe、eventfd、timerfd 等有等待语义的 fd；普通文件（`/dev/zero`、常规文件）注册可能返回 `EPERM`，因为它们总是就绪或缺少有意义的 poll 等待机制。\n- 线上 CPU 高时，用 `strace -tt -T -e epoll_wait,epoll_ctl,accept4,read,write -p <pid>` 看是否空轮询（timeout=0 且返回 0）、频繁 `EPOLL_CTL_MOD`（ONESHOT 重激活风暴）、`accept4` 后紧跟 `EAGAIN`（惊群），结合 `perf top` 判断时间在系统调用、事件循环还是业务逻辑。\n- ET 连接无响应，优先检查：fd 是否非阻塞、读写循环是否直到 `EAGAIN`、ONESHOT 是否忘了重新激活。",
       "followUpQuestions": [
         {
-          "question": "epoll 为什么适合高并发连接？",
-          "answer": "关注集合常驻内核，事件就绪后进入就绪队列，用户态不必每次扫描全部 fd。"
+          "question": "epoll 为什么适合高并发长连接？",
+          "answer": "兴趣集合常驻内核避免每轮复制全集，fd 就绪时由等待队列回调被动加入就绪链表，epoll_wait 只返回就绪 fd，复杂度约 O(就绪数) 而非 O(总连接数)。连接多、活跃少时优势最大。"
         },
         {
-          "question": "select 的 fd 限制来自哪里？",
-          "answer": "来自 fd_set 位图大小，常见默认 FD_SETSIZE 是 1024。"
+          "question": "select 的 FD_SETSIZE 限制来自哪里？能绕过吗？",
+          "answer": "FD_SETSIZE 是编译时 `fd_set` 位图中能容纳的 fd 编号上限（Linux 默认 1024）。可以重新定义 FD_SETSIZE 再重新编译 glibc，但这样做的收益远不如换 epoll。"
+        },
+        {
+          "question": "ET 模式不设非阻塞会怎样？",
+          "answer": "非阻塞 `read` 缓冲区空时返回 -1/EAGAIN，可以安全结束循环；阻塞 `read` 缓冲区空时会阻塞当前线程，事件循环卡死，后续所有 fd 的事件都无法处理。"
+        },
+        {
+          "question": "ONESHOT 处理完后忘了 EPOLL_CTL_MOD 会怎样？",
+          "answer": "fd 永久失活，后续不会再收到任何事件通知。连接表现为客户端发送数据后一直无响应（服务端不再 read），直到连接超时断开。线上常表现为特定连接静默，但 fd 数和线程数正常。"
+        },
+        {
+          "question": "为什么普通文件不能用 epoll？",
+          "answer": "普通文件（如 `/dev/zero` 或磁盘文件）在内核中被认为「总是就绪」，没有有意义的 poll/wait 状态变化机制。`epoll_ctl(ADD)` 对普通文件通常返回 `EPERM`。"
+        },
+        {
+          "question": "EPOLLEXCLUSIVE 能解决所有惊群问题吗？",
+          "answer": "不能。它主要缓解多个 epoll 实例等待同一个 listen socket 的 accept 惊群，对普通读写 fd 的并发等待无效，且要求 Linux 4.5+。"
         }
       ]
     },
@@ -107,17 +128,17 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "select 的 `fd_set` 位图、`FD_SETSIZE` 限制和最大 fd 扫描范围",
-        "poll 的 `pollfd` 数组、`events/revents` 语义和仍需线性扫描的原因",
-        "epoll 的 `epoll_create1`、`epoll_ctl`、`epoll_wait` 三段调用职责",
-        "eventpoll 关注集合、红黑树、等待队列回调和就绪链表之间的关系",
-        "LT 与 ET 的触发条件差异，以及 ET 必须使用非阻塞 IO 并读到 `EAGAIN`",
-        "不能裸说 epoll 全部 O(1)，要区分 `epoll_wait` 返回成本和 `epoll_ctl` 维护成本",
-        "Reactor 模式中事件循环、accept/read/write 分发与业务线程之间的边界",
-        "`EPOLLONESHOT` 在多线程处理同一 fd 时避免并发消费的作用",
-        "`EPOLLEXCLUSIVE` 缓解共享 listen socket accept 惊群的适用范围",
-        "普通文件不适合 epoll 的原因和 `EPERM` 这类错误线索",
-        "使用 strace、perf、错误码和事件标志定位空轮询、ET 漏读、ONESHOT 未重激活、accept 惊群"
+        "select 的 `fd_set` 位图、`FD_SETSIZE` 限制、每轮复制和线性扫描的开销",
+        "poll 的 `pollfd` 数组、`events/revents` 语义，以及去掉 1024 限制后为何仍有线性扫描",
+        "epoll 的 `epoll_create1`、`epoll_ctl`、`epoll_wait` 三段调用各自的职责和开销",
+        "红黑树维护兴趣集合、等待队列回调将 fd 加入就绪链表的触发时机",
+        "LT 与 ET 的触发语义差异，ET 必须用非阻塞 fd 并循环读到 `EAGAIN`",
+        "`epoll_ctl` 有红黑树维护和回调注册开销，不能简单说 epoll 全部 O(1)",
+        "`EPOLLONESHOT` 防止多线程并发消费同一 fd，处理完必须 `MOD` 重新激活",
+        "`EPOLLEXCLUSIVE` 缓解共享 listen socket accept 惊群的适用范围和版本要求",
+        "普通文件注册 epoll 返回 `EPERM` 的原因",
+        "Reactor 模式中事件循环、accept/read/write 分发与 worker 线程的协作边界",
+        "用 strace 定位空轮询、ET 漏读、ONESHOT 未重激活、accept 惊群的具体方法"
       ]
     }
   ],
@@ -131,14 +152,28 @@
     },
     {
       "id": "os.io-model.topic-select-poll-epoll.recall.2",
-      "prompt": "epoll 的 LT 和 ET 模式有什么区别？为什么 ET 要配合非阻塞 IO？",
+      "prompt": "epoll 的 LT 和 ET 模式有什么区别？为什么 ET 必须配合非阻塞 IO？ONESHOT 和 EXCLUSIVE 各自解决什么问题？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "os.io-model.topic-select-poll-epoll.recall.3",
-      "prompt": "epoll 的 ET 和 LT 模式行为差异是什么？ET 模式为什么必须搭配非阻塞 IO？",
+      "prompt": "线上 epoll 服务 CPU 高或连接卡住时，如何用 strace/perf/事件标志排查空轮询、ET 漏读、ONESHOT 未重激活或 accept 惊群？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "os.io-model.topic-select-poll-epoll.recall.4",
+      "prompt": "为什么普通文件（如 /dev/zero 或常规磁盘文件）不能用 epoll？如果尝试注册会得到什么错误？",
+      "mode": "text",
+      "expectedMinutes": 2,
+      "difficulty": 3
+    },
+    {
+      "id": "os.io-model.topic-select-poll-epoll.recall.5",
+      "prompt": "请解释 Reactor 模式中 epoll_wait、accept、read/write 和 worker 线程之间的协作关系。单 Reactor 多线程模型下 EPOLLONESHOT 起什么作用？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
@@ -146,20 +181,25 @@
   ],
   "rubric": {
     "mustHave": [
-      "select fd_set",
-      "pollfd 数组",
-      "epoll_ctl/epoll_wait",
-      "能说明「就绪列表」在「select/poll/epoll」里的作用和判断标准"
+      "select 的 fd_set、FD_SETSIZE、每轮复制和内核/用户态双层线性扫描",
+      "poll 的 pollfd 数组、events/revents 语义，以及去掉 1024 上限后仍需线性扫描",
+      "epoll_create1/epoll_ctl/epoll_wait 三段职责，红黑树兴趣集合、等待队列回调、就绪链表",
+      "LT/ET 差异，ET 必须非阻塞并读到 EAGAIN 否则连接饿死"
     ],
     "goodToHave": [
-      "Reactor",
-      "能说明「非阻塞 IO」在「select/poll/epoll」里的触发条件、收益和失效边界",
-      "EAGAIN"
+      "epoll_ctl 有红黑树维护开销，不能简单说 epoll 全部 O(1)",
+      "EPOLLONESHOT 多线程消费同一 fd 后需要 EPOLL_CTL_MOD 重新激活",
+      "EPOLLEXCLUSIVE 缓解共享 listen socket accept 惊群的版本要求和适用边界",
+      "普通文件注册 epoll 返回 EPERM 的原因",
+      "Reactor 模式中事件循环与 worker 线程的协作模型"
     ],
     "commonMistakes": [
-      "只说 epoll 是 O(1) 不解释条件",
-      "ET 模式不读到 EAGAIN",
-      "认为 poll 解决了所有 select 问题"
+      "只说 epoll 是 O(1)，不区分 epoll_ctl 红黑树维护成本和 epoll_wait 返回成本",
+      "ET 模式不设非阻塞或不读到 EAGAIN，导致连接卡住或饿死",
+      "认为 poll 去掉 1024 限制就解决了 select 的线性扫描成本",
+      "把 EPOLLEXCLUSIVE 当作所有 fd 惊群问题的万能解",
+      "忽略普通文件注册 epoll 可能返回 EPERM",
+      "ONESHOT 处理完后忘记 EPOLL_CTL_MOD 重新激活，导致 fd 永久沉默"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -168,11 +208,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "draft",
   "prerequisites": [
     "os.io-model.topic-io-models"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能围绕「select/poll/epoll」说清select fd_set、pollfd 数组，并放到操作系统与 Linux 排查场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察是否能围绕 select/poll/epoll 说清 fd_set 位图与 FD_SETSIZE、pollfd 数组、兴趣集合红黑树、等待队列回调、就绪链表、LT/ET/ONESHOT/EXCLUSIVE 语义、普通文件 EPERM、Reactor 协作模型，并能用 strace/perf 定位空轮询、ET 漏读、ONESHOT 未重激活、accept 惊群等真实线上问题。"
 }

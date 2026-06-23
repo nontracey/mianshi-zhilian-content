@@ -4,7 +4,7 @@
   "category": "aspnet",
   "group": "aspnet",
   "title": "认证与授权",
-  "summary": "讲清认证与授权的区别和顺序、JWT 与 Cookie 的对比与选型、三种授权模型，以及 JWT 难以主动失效等关键边界。",
+  "summary": "讲清认证（验证身份、生成 ClaimsPrincipal）与授权（基于角色/策略/资源判断权限）的区别和先后顺序；对比 JWT 无状态与 Cookie 有状态认证的机制差异、选型标准和各自防护重点；说明 JWT 难以主动失效的固有短板及 Refresh Token + 短期 Access Token + 黑名单的常见折中；覆盖 OAuth2/OIDC 委托认证、中间件顺序等工程边界。",
   "tags": [
     ".NET",
     "ASP.NET",
@@ -14,20 +14,40 @@
     "OAuth2"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 40,
+  "estimatedMinutes": 49,
   "order": 30,
   "recommendWeight": 90,
   "status": "staging",
   "learningCards": [
     {
       "type": "explain",
-      "title": "认证与授权：认证 vs 授权、JWT 认证",
-      "content": "认证（Authentication）和授权（Authorization）是应用安全的核心，ASP.NET Core 提供了灵活的安全框架。\n\n## 认证 vs 授权\n\n**认证**：验证用户身份（\"你是谁？\"）\n- 验证凭据（用户名/密码、Token、证书）\n- 创建身份标识（ClaimsPrincipal）\n\n**授权**：验证用户权限（\"你能做什么？\"）\n- 基于角色的授权\n- 基于策略的授权\n- 基于资源的授权\n\n## JWT 认证\n\nJSON Web Token 是无状态认证的主流方案：\n```csharp\n// 安装 NuGet 包\n// Microsoft.AspNetCore.Authentication.JwtBearer\n\n// 配置 JWT\nbuilder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)\n    .AddJwtBearer(options =>\n    {\n        options.TokenValidationParameters = new TokenValidationParameters\n        {\n            ValidateIssuer = true,\n            ValidateAudience = true,\n            ValidateLifetime = true,\n            ValidateIssuerSigningKey = true,\n            ValidIssuer = \"your-issuer\",\n            ValidAudience = \"your-audience\",\n            IssuerSigningKey = new SymmetricSecurityKey(\n                Encoding.UTF8.GetBytes(\"your-secret-key\"))\n        };\n    });\n\n// 生成 Token\npublic string GenerateToken(User user)\n{\n    var claims = new[]\n    {\n        new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),\n        new Claim(ClaimTypes.Name, user.Username),\n        new Claim(ClaimTypes.Role, user.Role)\n    };\n\n    var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_secret));\n    var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);\n\n    var token = new JwtSecurityToken(\n        issuer: \"your-issuer\",\n        audience: \"your-audience\",\n        claims: claims,\n        expires: DateTime.UtcNow.AddHours(1),\n        signingCredentials: credentials);\n\n    return new JwtSecurityTokenHandler().WriteToken(token);\n}\n```\n\n## Cookie 认证\n\n适用于传统 Web 应用：\n```csharp\nbuilder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)\n    .AddCookie(options =>\n    {\n        options.LoginPath = \"/Account/Login\";\n        options.LogoutPath = \"/Account/Logout\";\n        options.AccessDeniedPath = \"/Account/AccessDenied\";\n        options.ExpireTimeSpan = TimeSpan.FromHours(1);\n        options.SlidingExpiration = true;\n    });\n\n// 登录\npublic async Task<IActionResult> Login(LoginModel model)\n{\n    // 验证用户\n    var user = await AuthenticateUser(model.Username, model.Password);\n    if (user == null)\n        return Unauthorized();\n\n    var claims = new List<Claim>\n    {\n        new Claim(ClaimTypes.Name, user.Username),\n        new Claim(ClaimTypes.Role, user.Role)\n    };\n\n    var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);\n    var principal = new ClaimsPrincipal(identity);\n\n    await HttpContext.SignInAsync(\n        CookieAuthenticationDefaults.AuthenticationScheme,\n        principal);\n\n    return RedirectToAction(\"Index\", \"Home\");\n}\n```\n\n## 授权策略\n\n**基于角色**：\n```csharp\n[Authorize(Roles = \"Admin\")]\npublic IActionResult AdminOnly() { }\n\n[Authorize(Roles = \"Admin,Manager\")]\npublic IActionResult AdminOrManager() { }\n```\n\n**基于策略**：\n```csharp\n// 定义策略\nbuilder.Services.AddAuthorization(options =>\n{\n    options.AddPolicy(\"AtLeast18\", policy =>\n        policy.Requirements.Add(new MinimumAgeRequirement(18)));\n\n    options.AddPolicy(\"CanEditArticle\", policy =>\n        policy.RequireClaim(\"permission\", \"article.edit\"));\n});\n\n// 使用策略\n[Authorize(Policy = \"AtLeast18\")]\npublic IActionResult AdultContent() { }\n```\n\n**自定义策略处理器**：\n```csharp\npublic class MinimumAgeRequirement : IAuthorizationRequirement\n{\n    public int MinimumAge { get; }\n\n    public MinimumAgeRequirement(int minimumAge)\n    {\n        MinimumAge = minimumAge;\n    }\n}\n\npublic class MinimumAgeHandler : AuthorizationHandler<MinimumAgeRequirement>\n{\n    protected override Task HandleRequirementAsync(\n        AuthorizationHandlerContext context,\n        MinimumAgeRequirement requirement)\n    {\n        var birthDate = context.User.FindFirst(ClaimTypes.DateOfBirth);\n        if (birthDate != null)\n        {\n            var age = DateTime.Today.Year - DateTime.Parse(birthDate.Value).Year;\n            if (age >= requirement.MinimumAge)\n            {\n                context.Succeed(requirement);\n            }\n        }\n\n        return Task.CompletedTask;\n    }\n}\n```"
+      "title": "认证与授权：先后顺序、身份模型和常见误解",
+      "content": "认证（Authentication）回答「你是谁」：验证凭据（用户名密码、Token、证书、第三方回调），成功后构建一个 ClaimsPrincipal——它是一组 Claim 的载体，代表当前请求的身份。授权（Authorization）回答「你能做什么」：拿到 ClaimsPrincipal 之后，按角色、策略或具体资源判断「这个身份是否被允许执行这个操作」。顺序是固定的：先认证、后授权。ASP.NET Core 中间件要求 UseAuthentication 必须在 UseAuthorization 之前，否则授权阶段拿不到身份，所有需要身份的策略都会失败。\n\n一个常见误解是把认证和授权混为一谈：登录是认证，判断「这个用户是否管理员」「这个用户能否编辑这篇文章」是授权。另一个常见误解是以为只要有 Authorize 特性就安全——如果认证中间件没配好、没正确解析 Token 或 Cookie，Authorize 会静默返回 401 而不是报错，排查时以为代码没问题但实际身份根本没建立。\n\nClaimsPrincipal 的设计是整个模型的核心：认证阶段往里填 Claim（用户 ID、角色、邮箱、权限名、自定义字段），授权阶段从里面读 Claim 做判断。自定义授权 handler 的所有输入都来自 ClaimsPrincipal，所以 claim 的结构和命名要统一规划，否则策略写得再精巧也拿不到正确数据。"
     },
     {
       "type": "explain",
-      "title": "认证与授权：基于资源的授权、OAuth2 / OpenID Connect",
-      "content": "## 基于资源的授权\n\n前面的角色和策略授权回答的是「这类用户能不能访问这个接口」，但很多场景要判断「这个用户能不能操作这一条具体数据」，比如只能编辑自己写的文章。这就是基于资源的授权：把当前用户和具体资源一起传给 IAuthorizationService.AuthorizeAsync，在 handler 里比对资源的归属（如 AuthorId）和用户身份，不通过就 Forbid。它必须在拿到资源实例之后、在业务方法里判断，没法只靠声明式的 Authorize 特性。\n\n```csharp\npublic class ArticleAuthorizationHandler :\n    AuthorizationHandler<OperationAuthorizationRequirement, Article>\n{\n    protected override Task HandleRequirementAsync(\n        AuthorizationHandlerContext context,\n        OperationAuthorizationRequirement requirement,\n        Article resource)\n    {\n        if (requirement.Name == \"Edit\")\n        {\n            if (resource.AuthorId == context.User.FindFirst(ClaimTypes.NameIdentifier)?.Value)\n            {\n                context.Succeed(requirement);\n            }\n        }\n\n        return Task.CompletedTask;\n    }\n}\n\n// 使用\npublic class ArticleController : ControllerBase\n{\n    private readonly IAuthorizationService _authorizationService;\n\n    public async Task<IActionResult> Edit(int id, Article article)\n    {\n        var authResult = await _authorizationService.AuthorizeAsync(\n            User, article, new OperationAuthorizationRequirement { Name = \"Edit\" });\n\n        if (!authResult.Succeeded)\n            return Forbid();\n\n        // 更新文章\n    }\n}\n```\n\n## OAuth2 / OpenID Connect\n\nOAuth2 是授权框架，解决「让第三方应用在用户授权下访问其资源」，发的是 access token；OpenID Connect 在 OAuth2 之上加了一层身份认证，多发一个 id token 来表达「用户是谁」。所以「用 GitHub 登录」本质是把认证委托给第三方：用户在第三方完成认证、回调带回授权码，服务端用授权码换取 token 并建立本地登录态，自己不存密码。\n\n集成第三方登录：\n```csharp\nbuilder.Services.AddAuthentication()\n    .AddGoogle(options =>\n    {\n        options.ClientId = \"google-client-id\";\n        options.ClientSecret = \"google-client-secret\";\n    })\n    .AddGitHub(options =>\n    {\n        options.ClientId = \"github-client-id\";\n        options.ClientSecret = \"github-client-secret\";\n    });\n```\n\n## JWT vs Cookie 对比\n\n**JWT 优点**：\n- 无状态，服务端不需要存储\n- 跨域支持好\n- 适合 API 和微服务\n\n**Cookie 优点**：\n- 自动携带，前端简单\n- 支持 HttpOnly，防止 XSS\n- 内置过期和滑动过期\n\n**选择建议**：\n- SPA + API：JWT\n- 传统 MVC：Cookie\n- 移动端：JWT"
+      "title": "JWT 认证：无状态机制、Token 结构和验证流程",
+      "content": "JWT（JSON Web Token）是把身份信息直接编码在 Token 里、由签发方签名、接收方验证签名即可信任内容的无状态认证方案。Token 由三段 Base64URL 编码组成：Header（算法和类型）、Payload（claims，如 sub、name、role、exp）、Signature（用密钥对 header.payload 签名）。\n\nASP.NET Core 集成 JWT 的关键配置：`TokenValidationParameters` 控制是否校验 Issuer、Audience、Lifetime 和签名密钥；`ValidateIssuerSigningKey = true` 确保只接受持有正确密钥的签发方。签发时用 `JwtSecurityToken` 构造 claims 和过期时间，`JwtSecurityTokenHandler.WriteToken` 序列化。验证时同一个 handler 的 `ValidateToken` 方法按配置的参数逐项校验，失败抛 `SecurityTokenException`，成功返回 `ClaimsPrincipal`。\n\nJWT 的无状态意味着服务端不需要存储 Token——签发后客户端自己保管，每次请求带上来，服务端只验签名和过期时间。这是优势（无服务端状态、天然跨服务信任）也是短板（签发后无法主动撤销）。放在 Authorization header 时前端要手动管理存储和刷新；放在 Cookie 里则可以利用浏览器自动携带，但会引入 CSRF 风险。"
+    },
+    {
+      "type": "explain",
+      "title": "Cookie 认证：有状态机制、会话管理和安全配置",
+      "content": "Cookie 认证是传统 Web 应用的默认选择：用户登录成功后调用 `HttpContext.SignInAsync`，框架把 ClaimsPrincipal 序列化加密后写入 Set-Cookie，后续请求浏览器自动携带该 Cookie，框架自动解密还原为 ClaimsPrincipal。核心配置项包括 `LoginPath`（未认证时跳转）、`ExpireTimeSpan`（绝对过期时间）、`SlidingExpiration`（是否在活跃时自动续期）。\n\nCookie 认证是有状态的：虽然默认 Cookie 里直接存加密的票据（不用服务端 Session），但如果配置 `SessionStore` 用分布式缓存存票据，服务端就能主动失效单个会话——这正好弥补了 JWT 的短板。Cookie 的安全重点是防 CSRF：设置 `SameSite = Lax` 或 `Strict`、关键操作加 Anti-Forgery Token；`HttpOnly = true` 防止 JavaScript 读取、`Secure = true` 确保只在 HTTPS 传输。Cookie 不适合纯 API 场景，因为浏览器的同源策略会限制跨域携带。"
+    },
+    {
+      "type": "explain",
+      "title": "JWT 难以主动失效：固有短板和工程折中",
+      "content": "JWT 签发后到过期前，服务端默认认它有效——因为验证只看签名和过期时间，不查任何服务端状态。用户登出、被封禁、改密码后，旧 Token 仍然有效，直到自然过期。这不是 bug，而是无状态设计的必然代价。\n\n工程上的常见折中：① Access Token 设短过期（5-30 分钟），配 Refresh Token（较长过期，存服务端），登出或封禁时只让 Refresh Token 失效，Access Token 很快自然过期；② 维护 Token 黑名单（用 jti 或 token 版本号），认证时查 Redis，命中就拒绝——但这等于引入了服务端状态，丧失部分无状态优势，高并发下 Redis 成为瓶颈；③ 在用户记录里存 token 版本号（或密码哈希），改密码或封禁时自增，校验时比对——粒度粗但实现简单。要实现「即时主动失效」，本质上必须引入某种服务端状态，没有例外。"
+    },
+    {
+      "type": "explain",
+      "title": "OAuth2 与 OIDC：委托第三方认证的本质",
+      "content": "OAuth2 是授权框架，解决「让第三方应用在用户授权下访问其资源」：用户在第三方（如 GitHub）登录授权，第三方回调带授权码，服务端用授权码换取 access token。OpenID Connect 在 OAuth2 之上加了身份认证层：除了 access token 还发一个 id token（JWT 格式），里面有用户的身份信息（sub、email、name）。所以「用 GitHub 登录」本质是认证委托：自己不存密码，靠第三方背书身份。\n\nASP.NET Core 的 `AddGoogle`、`AddGitHub` 等扩展封装了 OAuth2 流程：配置 ClientId 和 ClientSecret，框架自动处理授权码换取、Token 验证和 ClaimsPrincipal 构建。登录成功后通常还需要在本地建立会话（Cookie 或 JWT），因为第三方的 access token 是用来访问第三方 API 的，不是给自己的系统用。"
+    },
+    {
+      "type": "explain",
+      "title": "三种授权模型：角色、策略、资源的递进关系",
+      "content": "基于角色的授权最简单：`[Authorize(Roles = \"Admin\")]`，框架检查 ClaimsPrincipal 里有没有匹配的 Role claim。适合「普通用户 / 管理员」这类粗粒度区分。问题是角色和权限硬绑，业务规则一复杂就力不从心。\n\n基于策略的授权通过 `AddPolicy` 注册一组 requirement 和对应的 handler，把判断逻辑从控制器里抽出来、可组合、可注入依赖。比如「年龄大于 18 且是 VIP 会员」可以拆成两个 requirement，各自有 handler，一个 policy 组合它们。`AuthorizationHandler<TRequirement>` 在 DI 容器中注册，可以注入数据库、缓存或其他服务。没有 handler 调 `context.Succeed`，策略默认失败——这是一个重要细节。\n\n基于资源的授权解决「这个用户能不能操作这条具体数据」：在业务方法里拿到资源实例后，调 `IAuthorizationService.AuthorizeAsync(User, resource, operation)`，handler 拿到资源实例做归属判断（如 `resource.AuthorId == userId`）。它没法用声明式的 `[Authorize]`，必须在代码里显式调用。这是粒度最细的模型，但也是最复杂的——要考虑资源不存在、权限缓存失效、并发修改等边界情况。"
     },
     {
       "type": "diagram",
@@ -49,50 +69,58 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | JWT | Cookie |\n| --- | --- | --- |\n| 状态 | 无状态 | 有状态 |\n| 存储位置 | 客户端（localStorage） | 客户端（浏览器自动管理） |\n| 跨域 | 支持 | 受限（SameSite） |\n| 安全性 | 依赖 HTTPS | HttpOnly 防 XSS |\n| 适用场景 | API、SPA、移动端 | 传统 Web 应用 |\n| Token 管理 | 需要手动刷新 | 自动滑动过期 |\n| 服务端存储 | 不需要 | 需要 Session/Cache |"
+      "title": "JWT vs Cookie 认证选型",
+      "content": "| 维度 | JWT | Cookie |\n| --- | --- | --- |\n| 状态模型 | 无状态：服务端不存 Token，验签名即可 | 有状态：票据可存服务端，可主动失效 |\n| 携带方式 | Authorization header，前端手动管理 | 浏览器自动携带，Set-Cookie 配置 |\n| 跨域 | 天然支持，不受同源限制 | 受 SameSite 策略限制，跨域需特殊配置 |\n| 主动失效 | 难以做到，需黑名单或版本号 | 可清除服务端票据实现即时失效 |\n| 安全重点 | 防 XSS（存 localStorage 可被 JS 读取） | 防 CSRF（SameSite + Anti-Forgery Token） |\n| 刷新机制 | Refresh Token + 短期 Access Token | SlidingExpiration 自动续期 |\n| 适用场景 | SPA + API、微服务间调用、移动端 | 传统 MVC、服务端渲染、需要即时登出 |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | 角色授权 | 策略授权 | 资源授权 |\n| --- | --- | --- | --- |\n| 复杂度 | 低 | 中 | 高 |\n| 灵活性 | 低 | 高 | 最高 |\n| 实现方式 | [Authorize(Roles)] | [Authorize(Policy)] | IAuthorizationService |\n| 适用场景 | 简单角色区分 | 复杂业务规则 | 根据资源状态判断 |\n| 示例 | Admin、User | 年龄要求、权限组合 | 文章作者才能编辑 |"
+      "title": "三种授权模型对比",
+      "content": "| 维度 | 角色授权 | 策略授权 | 资源授权 |\n| --- | --- | --- | --- |\n| 判断粒度 | 用户的角色属性 | 用户属性组合 + 自定义规则 | 用户对具体资源的操作权限 |\n| 声明方式 | [Authorize(Roles=\"Admin\")] | [Authorize(Policy=\"X\")] | 代码中调 IAuthorizationService |\n| 灵活性 | 低：角色硬绑权限 | 高：requirement + handler 可组合 | 最高：拿到资源实例后判断 |\n| 能否注入服务 | 不需要 | 可以：handler 注册在 DI | 可以：handler 注册在 DI |\n| 典型场景 | 管理员/普通用户区分 | 年龄要求、多条件组合、自定义规则 | 文章作者才能编辑、订单归属判断 |\n| 失败响应 | 403 Forbid | 403 Forbid（handler 不调 Succeed 默认失败） | 代码中判断 authResult.Succeeded 返回 Forbid |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Collections.Generic;\nusing System.IdentityModel.Tokens.Jwt;\nusing System.Security.Claims;\nusing System.Text;\nusing Microsoft.AspNetCore.Authentication;\nusing Microsoft.AspNetCore.Authentication.Cookies;\nusing Microsoft.AspNetCore.Authentication.JwtBearer;\nusing Microsoft.AspNetCore.Authorization;\nusing Microsoft.AspNetCore.Mvc;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.IdentityModel.Tokens;\n\nnamespace AuthenticationAuthorizationDemo\n{\n    // 用户模型\n    public class User\n    {\n        public int Id { get; set; }\n        public string Username { get; set; }\n        public string Password { get; set; }\n        public string Role { get; set; }\n        public DateTime BirthDate { get; set; }\n    }\n\n    // JWT 服务\n    public class JwtService\n    {\n        private readonly string _secret;\n        private readonly string _issuer;\n        private readonly string _audience;\n\n        public JwtService(string secret, string issuer, string audience)\n        {\n            _secret = secret;\n            _issuer = issuer;\n            _audience = audience;\n        }\n\n        public string GenerateToken(User user)\n        {\n            var claims = new[]\n            {\n                new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),\n                new Claim(ClaimTypes.Name, user.Username),\n                new Claim(ClaimTypes.Role, user.Role),\n                new Claim(ClaimTypes.DateOfBirth, user.BirthDate.ToString(\"yyyy-MM-dd\"))\n            };\n\n            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_secret));\n            var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);\n\n            var token = new JwtSecurityToken(\n                issuer: _issuer,\n                audience: _audience,\n                claims: claims,\n                expires: DateTime.UtcNow.AddHours(1),\n                signingCredentials: credentials);\n\n            return new JwtSecurityTokenHandler().WriteToken(token);\n        }\n\n        public ClaimsPrincipal ValidateToken(string token)\n        {\n            var tokenHandler = new JwtSecurityTokenHandler();\n            var key = Encoding.UTF8.GetBytes(_secret);\n\n            var validationParameters = new TokenValidationParameters\n            {\n                ValidateIssuer = true,\n                ValidateAudience = true,\n                ValidateLifetime = true,\n                ValidateIssuerSigningKey = true,\n                ValidIssuer = _issuer,\n                ValidAudience = _audience,\n                IssuerSigningKey = new SymmetricSecurityKey(key)\n            };\n\n            return tokenHandler.ValidateToken(token, validationParameters, out _);\n        }\n    }\n\n    // 自定义授权需求和处理器\n    public class MinimumAgeRequirement : IAuthorizationRequirement\n    {\n        public int MinimumAge { get; }\n\n        public MinimumAgeRequirement(int minimumAge)\n        {\n            MinimumAge = minimumAge;\n        }\n    }\n\n    public class MinimumAgeHandler : AuthorizationHandler<MinimumAgeRequirement>\n    {\n        protected override Task HandleRequirementAsync(\n            AuthorizationHandlerContext context,\n            MinimumAgeRequirement requirement)\n        {\n            var birthDateClaim = context.User.FindFirst(ClaimTypes.DateOfBirth);\n            if (birthDateClaim == null)\n            {\n                return Task.CompletedTask;\n            }\n\n            var birthDate = DateTime.Parse(birthDateClaim.Value);\n            var age = DateTime.Today.Year - birthDate.Year;\n            if (birthDate > DateTime.Today.AddYears(-age))\n            {\n                age--;\n            }\n\n            if (age >= requirement.MinimumAge)\n            {\n                context.Succeed(requirement);\n            }\n\n            return Task.CompletedTask;\n        }\n    }\n\n    // 操作授权需求\n    public class ArticleOperationAuthorizationHandler :\n        AuthorizationHandler<OperationAuthorizationRequirement, Article>\n    {\n        protected override Task HandleRequirementAsync(\n            AuthorizationHandlerContext context,\n            OperationAuthorizationRequirement requirement,\n            Article resource)\n        {\n            var userId = context.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;\n\n            switch (requirement.Name)\n            {\n                case \"Edit\":\n                case \"Delete\":\n                    if (resource.AuthorId == userId)\n                    {\n                        context.Succeed(requirement);\n                    }\n                    break;\n\n                case \"View\":\n                    context.Succeed(requirement);\n                    break;\n            }\n\n            return Task.CompletedTask;\n        }\n    }\n\n    public class Article\n    {\n        public int Id { get; set; }\n        public string Title { get; set; }\n        public string Content { get; set; }\n        public string AuthorId { get; set; }\n    }\n\n    public static class ArticleOperations\n    {\n        public static OperationAuthorizationRequirement View =\n            new OperationAuthorizationRequirement { Name = \"View\" };\n        public static OperationAuthorizationRequirement Edit =\n            new OperationAuthorizationRequirement { Name = \"Edit\" };\n        public static OperationAuthorizationRequirement Delete =\n            new OperationAuthorizationRequirement { Name = \"Delete\" };\n    }\n\n    // API 控制器\n    [ApiController]\n    [Route(\"api/[controller]\")]\n    public class AuthController : ControllerBase\n    {\n        private readonly JwtService _jwtService;\n\n        public AuthController(JwtService jwtService)\n        {\n            _jwtService = jwtService;\n        }\n\n        [HttpPost(\"login\")]\n        public IActionResult Login([FromBody] LoginRequest request)\n        {\n            // 简化的用户验证\n            var user = GetUser(request.Username, request.Password);\n            if (user == null)\n            {\n                return Unauthorized(new { Message = \"用户名或密码错误\" });\n            }\n\n            var token = _jwtService.GenerateToken(user);\n            return Ok(new { Token = token });\n        }\n\n        private User GetUser(string username, string password)\n        {\n            // 示例用户\n            if (username == \"admin\" && password == \"password\")\n            {\n                return new User\n                {\n                    Id = 1,\n                    Username = \"admin\",\n                    Role = \"Admin\",\n                    BirthDate = new DateTime(1990, 1, 1)\n                };\n            }\n            return null;\n        }\n    }\n\n    [ApiController]\n    [Route(\"api/[controller]\")]\n    public class ArticlesController : ControllerBase\n    {\n        private readonly IAuthorizationService _authorizationService;\n\n        public ArticlesController(IAuthorizationService authorizationService)\n        {\n            _authorizationService = authorizationService;\n        }\n\n        [HttpGet(\"{id}\")]\n        [Authorize]\n        public async Task<IActionResult> Get(int id)\n        {\n            var article = GetArticle(id);\n            if (article == null)\n            {\n                return NotFound();\n            }\n\n            var authResult = await _authorizationService.AuthorizeAsync(\n                User, article, ArticleOperations.View);\n\n            if (!authResult.Succeeded)\n            {\n                return Forbid();\n            }\n\n            return Ok(article);\n        }\n\n        [HttpPut(\"{id}\")]\n        [Authorize]\n        public async Task<IActionResult> Update(int id, [FromBody] Article article)\n        {\n            var existingArticle = GetArticle(id);\n            if (existingArticle == null)\n            {\n                return NotFound();\n            }\n\n            var authResult = await _authorizationService.AuthorizeAsync(\n                User, existingArticle, ArticleOperations.Edit);\n\n            if (!authResult.Succeeded)\n            {\n                return Forbid();\n            }\n\n            // 更新文章\n            return Ok(article);\n        }\n\n        private Article GetArticle(int id)\n        {\n            return new Article\n            {\n                Id = id,\n                Title = \"示例文章\",\n                Content = \"文章内容\",\n                AuthorId = \"1\"\n            };\n        }\n    }\n\n    public class LoginRequest\n    {\n        public string Username { get; set; }\n        public string Password { get; set; }\n    }\n\n    // 配置服务\n    public static class AuthServiceCollectionExtensions\n    {\n        public static IServiceCollection AddCustomAuthentication(\n            this IServiceCollection services,\n            string jwtSecret,\n            string jwtIssuer,\n            string jwtAudience)\n        {\n            services.AddSingleton(new JwtService(jwtSecret, jwtIssuer, jwtAudience));\n\n            services.AddAuthentication(options =>\n            {\n                options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;\n                options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;\n            })\n            .AddJwtBearer(options =>\n            {\n                options.TokenValidationParameters = new TokenValidationParameters\n                {\n                    ValidateIssuer = true,\n                    ValidateAudience = true,\n                    ValidateLifetime = true,\n                    ValidateIssuerSigningKey = true,\n                    ValidIssuer = jwtIssuer,\n                    ValidAudience = jwtAudience,\n                    IssuerSigningKey = new SymmetricSecurityKey(\n                        Encoding.UTF8.GetBytes(jwtSecret))\n                };\n            })\n            .AddCookie(CookieAuthenticationDefaults.AuthenticationScheme, options =>\n            {\n                options.LoginPath = \"/Account/Login\";\n                options.LogoutPath = \"/Account/Logout\";\n            });\n\n            services.AddAuthorization(options =>\n            {\n                options.AddPolicy(\"AtLeast18\", policy =>\n                    policy.Requirements.Add(new MinimumAgeRequirement(18)));\n\n                options.AddPolicy(\"AdminOnly\", policy =>\n                    policy.RequireRole(\"Admin\"));\n            });\n\n            services.AddSingleton<IAuthorizationHandler, MinimumAgeHandler>();\n            services.AddSingleton<IAuthorizationHandler, ArticleOperationAuthorizationHandler>();\n\n            return services;\n        }\n    }\n}",
+      "title": "JWT 生成与验证、三种授权模型的完整实现",
       "language": "csharp",
+      "content": "using System;\nusing System.Collections.Generic;\nusing System.IdentityModel.Tokens.Jwt;\nusing System.Security.Claims;\nusing System.Text;\nusing System.Threading.Tasks;\nusing Microsoft.AspNetCore.Authentication.Cookies;\nusing Microsoft.AspNetCore.Authentication.JwtBearer;\nusing Microsoft.AspNetCore.Authorization;\nusing Microsoft.AspNetCore.Mvc;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.IdentityModel.Tokens;\n\nnamespace AuthenticationAuthorizationDemo\n{\n    // ==================== JWT 服务 ====================\n    public class JwtService\n    {\n        private readonly string _secret;\n        private readonly string _issuer;\n        private readonly string _audience;\n\n        public JwtService(string secret, string issuer, string audience)\n        {\n            _secret = secret;\n            _issuer = issuer;\n            _audience = audience;\n        }\n\n        public string GenerateToken(int userId, string username, string role)\n        {\n            var claims = new[]\n            {\n                new Claim(ClaimTypes.NameIdentifier, userId.ToString()),\n                new Claim(ClaimTypes.Name, username),\n                new Claim(ClaimTypes.Role, role),\n                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())\n            };\n\n            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_secret));\n            var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);\n\n            var token = new JwtSecurityToken(\n                issuer: _issuer,\n                audience: _audience,\n                claims: claims,\n                expires: DateTime.UtcNow.AddMinutes(15), // 短过期\n                signingCredentials: credentials);\n\n            return new JwtSecurityTokenHandler().WriteToken(token);\n        }\n\n        public ClaimsPrincipal? ValidateToken(string token)\n        {\n            var handler = new JwtSecurityTokenHandler();\n            var parameters = new TokenValidationParameters\n            {\n                ValidateIssuer = true,\n                ValidateAudience = true,\n                ValidateLifetime = true,\n                ValidateIssuerSigningKey = true,\n                ValidIssuer = _issuer,\n                ValidAudience = _audience,\n                IssuerSigningKey = new SymmetricSecurityKey(\n                    Encoding.UTF8.GetBytes(_secret))\n            };\n\n            try\n            {\n                return handler.ValidateToken(token, parameters, out _);\n            }\n            catch (SecurityTokenException)\n            {\n                return null;\n            }\n        }\n    }\n\n    // ==================== 基于策略的授权：最小年龄 ====================\n    public class MinimumAgeRequirement : IAuthorizationRequirement\n    {\n        public int MinimumAge { get; }\n        public MinimumAgeRequirement(int minimumAge) => MinimumAge = minimumAge;\n    }\n\n    public class MinimumAgeHandler : AuthorizationHandler<MinimumAgeRequirement>\n    {\n        protected override Task HandleRequirementAsync(\n            AuthorizationHandlerContext context,\n            MinimumAgeRequirement requirement)\n        {\n            var claim = context.User.FindFirst(ClaimTypes.DateOfBirth);\n            if (claim == null) return Task.CompletedTask; // 没有出生日期，不通过\n\n            var birthDate = DateTime.Parse(claim.Value);\n            var age = DateTime.Today.Year - birthDate.Year;\n            if (birthDate > DateTime.Today.AddYears(-age)) age--;\n\n            if (age >= requirement.MinimumAge)\n                context.Succeed(requirement);\n\n            return Task.CompletedTask;\n        }\n    }\n\n    // ==================== 基于资源的授权：文章操作 ====================\n    public class Article { public int Id { get; set; } public string AuthorId { get; set; } = \"\"; }\n\n    public static class ArticleOperations\n    {\n        public static readonly OperationAuthorizationRequirement Edit =\n            new() { Name = \"Edit\" };\n    }\n\n    public class ArticleAuthorizationHandler :\n        AuthorizationHandler<OperationAuthorizationRequirement, Article>\n    {\n        protected override Task HandleRequirementAsync(\n            AuthorizationHandlerContext context,\n            OperationAuthorizationRequirement requirement,\n            Article resource)\n        {\n            var userId = context.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;\n            if (requirement.Name == \"Edit\" && resource.AuthorId == userId)\n                context.Succeed(requirement);\n\n            return Task.CompletedTask;\n        }\n    }\n\n    // ==================== 控制器：三种授权模型的使用 ====================\n    [ApiController]\n    [Route(\"api/[controller]\")]\n    public class ArticlesController : ControllerBase\n    {\n        private readonly IAuthorizationService _authService;\n\n        public ArticlesController(IAuthorizationService authService)\n            => _authService = authService;\n\n        // 角色授权：只有 Admin 能访问\n        [HttpGet(\"admin\")]\n        [Authorize(Roles = \"Admin\")]\n        public IActionResult AdminOnly() => Ok(\"Admin area\");\n\n        // 策略授权：年龄 >= 18\n        [HttpGet(\"adult\")]\n        [Authorize(Policy = \"AtLeast18\")]\n        public IActionResult AdultContent() => Ok(\"Adult content\");\n\n        // 资源授权：文章作者才能编辑\n        [HttpPut(\"{id}\")]\n        [Authorize]\n        public async Task<IActionResult> Edit(int id)\n        {\n            var article = new Article { Id = id, AuthorId = \"1\" };\n\n            var result = await _authService.AuthorizeAsync(\n                User, article, ArticleOperations.Edit);\n\n            if (!result.Succeeded) return Forbid();\n\n            return Ok(article);\n        }\n    }\n\n    // ==================== DI 注册 ====================\n    public static class AuthExtensions\n    {\n        public static IServiceCollection AddDemoAuth(\n            this IServiceCollection services,\n            string jwtSecret, string issuer, string audience)\n        {\n            services.AddSingleton(new JwtService(jwtSecret, issuer, audience));\n\n            services.AddAuthentication(options =>\n            {\n                options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;\n                options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;\n            })\n            .AddJwtBearer(options =>\n            {\n                options.TokenValidationParameters = new TokenValidationParameters\n                {\n                    ValidateIssuer = true,\n                    ValidateAudience = true,\n                    ValidateLifetime = true,\n                    ValidateIssuerSigningKey = true,\n                    ValidIssuer = issuer,\n                    ValidAudience = audience,\n                    IssuerSigningKey = new SymmetricSecurityKey(\n                        Encoding.UTF8.GetBytes(jwtSecret))\n                };\n            })\n            .AddCookie(CookieAuthenticationDefaults.AuthenticationScheme, options =>\n            {\n                options.LoginPath = \"/Account/Login\";\n                options.ExpireTimeSpan = TimeSpan.FromHours(1);\n                options.SlidingExpiration = true;\n            });\n\n            services.AddAuthorization(options =>\n            {\n                options.AddPolicy(\"AtLeast18\", policy =>\n                    policy.Requirements.Add(new MinimumAgeRequirement(18)));\n            });\n\n            services.AddSingleton<IAuthorizationHandler, MinimumAgeHandler>();\n            services.AddSingleton<IAuthorizationHandler, ArticleAuthorizationHandler>();\n\n            return services;\n        }\n    }\n}",
       "highlights": [
         {
-          "line": 17,
-          "note": "`public class User` 定义了 认证与授权 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 50,
+          "note": "Jti claim 是黑名单方案的基础：每个 Token 有唯一标识，可按 jti 加入黑名单实现部分主动失效。"
         },
         {
-          "line": 101,
-          "note": "`if (birthDateClaim == null)` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 55,
+          "note": "15 分钟短过期是 Refresh Token 模式的核心：Access Token 短命，泄露窗口小，登出时只失效 Refresh Token 即可。"
         },
         {
-          "line": 19,
-          "note": "`public int Id { get; set; }` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "line": 100,
+          "note": "没有调用 context.Succeed 的分支默认不通过——handler 不表态等于拒绝，这是策略授权的重要语义。"
         },
         {
-          "line": 29,
-          "note": "`private readonly string _secret;` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+          "line": 120,
+          "note": "基于资源的授权必须在业务代码中显式调用，不能用声明式 [Authorize] 特性。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：认证（Authentication）解决「你是谁」，验证身份、生成 ClaimsPrincipal；授权（Authorization）解决「你能做什么」，基于角色、策略或资源判断权限。两者顺序固定：先认证、后授权。\n\n要点：\n\n1. 认证方式：JWT（无状态、Token 自带 claims、适合 API 和微服务）、Cookie（服务端会话、自动携带、支持 HttpOnly 防 XSS、适合传统 Web）。\n2. 授权模型：基于角色（Authorize Roles）、基于策略（AddPolicy 加多个 requirement，更灵活）、基于资源（判断「这个用户能不能改这条数据」，用 IAuthorizationService 在业务里判断）。\n3. OAuth2 和 OIDC：集成第三方登录，OAuth2 管授权、OpenID Connect 在其上加身份层。\n\nJWT vs Cookie 选型：SPA 加 API 用 JWT；传统 MVC 用 Cookie；移动端用 JWT。边界和坑。① JWT 无状态意味着难以主动失效——签发后到期前一直有效，要支持登出或封禁得配短过期加 Refresh Token 加黑名单。② Cookie 要防 CSRF（配 SameSite 加 CSRF Token），JWT 放 localStorage 要防 XSS。③ 中间件顺序：UseAuthentication 必须在 UseAuthorization 之前，否则授权时拿不到身份。",
+      "content": "**结论先行**：认证（Authentication）解决「你是谁」——验证凭据、构建 ClaimsPrincipal；授权（Authorization）解决「你能做什么」——基于角色、策略或资源判断权限。顺序固定：先认证、后授权，ASP.NET Core 中间件 UseAuthentication 必须在 UseAuthorization 之前。\n\n**认证方案选型**：\n- JWT：无状态，Token 自带 claims，适合 SPA + API、微服务、移动端；主动失效困难，需 Refresh Token + 短期 Access Token + 黑名单\n- Cookie：有状态，浏览器自动携带，支持 SlidingExpiration 和 HttpOnly 防 XSS，适合传统 MVC；需防 CSRF（SameSite + Anti-Forgery Token）\n- OAuth2 / OIDC：委托第三方认证，OAuth2 管授权、OIDC 加身份层（id token），适合「用 GitHub/Google 登录」\n\n**三种授权模型（递进关系）**：\n- 角色：`[Authorize(Roles=\"Admin\")]`，简单粗粒度\n- 策略：`AddPolicy` + requirement + handler，可组合、可注入依赖，适合多条件规则\n- 资源：`IAuthorizationService.AuthorizeAsync(User, resource, operation)`，判断具体数据的归属，必须在业务代码中调用\n\n**关键边界**：\n- JWT 主动失效本质必须引入服务端状态，没有例外\n- Cookie 存 localStorage 防 XSS，JWT 存 localStorage 同样防 XSS 但防不了 CSRF——两者安全重点不同\n- 策略 handler 不调 `context.Succeed` 等于拒绝\n- OAuth2 登录后通常还需在本地建立自己的会话（Cookie 或 JWT）",
       "followUpQuestions": [
         {
-          "question": "JWT 是无状态的，那用户登出或被封禁时怎么让 Token 立即失效？",
-          "answer": "这正是 JWT 的固有短板：签发后到过期前服务端默认认它有效，没法像 Session 那样删了就失效。常见折中：① 把 access token 设短（几分钟到几十分钟）加 refresh token 续签，登出或封禁时让 refresh token 失效，access token 很快自然过期；② 维护一个黑名单（按 jti 或用户版本号），认证时查 Redis、命中就拒绝，但这等于又引入了状态、牺牲了部分无状态优势；③ 在用户记录里存一个 token 版本号，改密码或封禁时自增、校验时比对。要主动即时失效，本质上必须引入服务端状态。"
+          "question": "JWT 是无状态的，用户登出或被封禁后怎么让 Token 立即失效？",
+          "answer": "JWT 签发后到过期前服务端默认认它有效，没法像 Session 那样删了就失效。工程折中：① Access Token 设短过期（5-30 分钟）配 Refresh Token，登出或封禁时让 Refresh Token 失效，Access Token 很快自然过期；② 维护黑名单（按 jti 或 token 版本号），认证时查 Redis，命中就拒绝——但这引入了服务端状态，牺牲部分无状态优势；③ 用户记录里存 token 版本号，改密码或封禁时自增，校验时比对。要即时主动失效，必须引入某种服务端状态。"
         },
         {
-          "question": "基于角色和基于策略的授权有什么区别？什么时候用策略？",
-          "answer": "基于角色是 Authorize(Roles=Admin) 这种，简单但粗——权限和角色硬绑，规则一复杂（比如「年龄大于 18 且是 VIP」「只能改自己的订单」）就不够用。基于策略是 AddPolicy 注册一组 requirement 加 handler，把判断逻辑抽出来、可组合、可注入依赖，灵活得多。需要多条件组合、动态判断、或基于资源（判断当前用户对具体这条数据的权限）时就用策略，用 IAuthorizationService 在业务里手动调。简单的「某角色才能访问」用角色就够。"
+          "question": "基于角色、策略、资源三种授权怎么选？",
+          "answer": "角色授权最简单但粗——权限和角色硬绑，规则一复杂就不够用。策略授权通过 requirement + handler 组合判断逻辑，可注入服务，灵活得多，适合多条件规则。资源授权是最细粒度——拿到具体资源实例后判断归属（如「只有作者能编辑」），但必须在业务代码里手动调 IAuthorizationService。简单「某角色才能访问」用角色；需要多条件、动态规则用策略；需要判断具体数据归属用资源。"
+        },
+        {
+          "question": "ASP.NET Core 中 UseAuthentication 和 UseAuthorization 的顺序搞反了会怎样？",
+          "answer": "UseAuthorization 在 UseAuthentication 之前时，授权阶段的 ClaimsPrincipal 还没建立（认证中间件没跑），所有需要身份的策略都会失败——用户即使带了有效 Token 或 Cookie 也会被拒。这是常见配置 bug，表现是「所有接口都返回 401」。修复方法：确保 Program.cs 中 UseAuthentication() 在 UseAuthorization() 之前。"
+        },
+        {
+          "question": "Cookie 认证和 JWT 各自要防什么安全问题？",
+          "answer": "Cookie 自动携带，核心风险是 CSRF——攻击者诱导用户浏览器发请求，Cookie 会被自动带上。防护：SameSite = Lax/Strict、关键操作加 Anti-Forgery Token。JWT 放 localStorage 存在 XSS 风险——恶意脚本能读 localStorage 拿走 Token。防护：输入过滤、CSP、避免第三方脚本注入。两者安全重点不同，不能说哪个更安全。"
         }
       ]
     },
@@ -100,33 +128,44 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "认证和授权的区别",
-        "JWT 认证的工作原理和实现方式",
-        "Cookie 认证的配置和使用",
-        "基于角色、策略和资源的授权区别",
-        "如何实现自定义授权策略",
-        "JWT 和 Cookie 的适用场景"
+        "能区分认证（验证身份、构建 ClaimsPrincipal）和授权（基于身份判断权限）及先后顺序",
+        "能解释 JWT 的三段结构（Header、Payload、Signature）和无状态验证流程",
+        "能解释 Cookie 认证的会话管理、SlidingExpiration 和安全配置（HttpOnly、SameSite）",
+        "能对比 JWT 与 Cookie 的适用场景、安全重点和主动失效能力",
+        "能说明基于角色、策略、资源三种授权模型的递进关系和适用场景",
+        "能解释 JWT 难以主动失效的工程折中（短期 Access Token + Refresh Token + 黑名单）",
+        "能说明 OAuth2 和 OIDC 的关系及集成第三方登录的流程",
+        "能记住 UseAuthentication 必须在 UseAuthorization 之前",
+        "能说出策略 handler 不调 context.Succeed 等于默认拒绝",
+        "能解释 OAuth2 登录后还需在本地建立会话的原因"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "dotnet.aspnet.authentication-authorization.recall.1",
-      "prompt": "请说明 认证与授权 的核心机制、典型使用场景和常见坑。",
+      "prompt": "请说明认证与授权的区别、ASP.NET Core 中的实现方式，以及 JWT 和 Cookie 的选型标准。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "dotnet.aspnet.authentication-authorization.recall.2",
-      "prompt": "ASP.NET Core 中有哪些授权方式？如何实现自定义授权策略？",
+      "prompt": "ASP.NET Core 中有哪些授权方式？基于策略的授权怎么实现自定义 handler？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "dotnet.aspnet.authentication-authorization.recall.3",
-      "prompt": "线上有用户反馈登出后旧 Token 仍能调接口，你会怎么排查和解决这个 JWT 失效问题？",
+      "prompt": "线上有用户反馈登出后旧 Token 仍能调接口。请排查并设计一个支持即时失效的 JWT 认证方案。",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 3
+    },
+    {
+      "id": "dotnet.aspnet.authentication-authorization.recall.4",
+      "prompt": "JWT 存 localStorage 还是 HttpOnly Cookie 各有什么安全风险？怎么防？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -135,31 +174,33 @@
   "rubric": {
     "mustHave": [
       "能区分认证（你是谁）和授权（你能做什么）及先后顺序",
-      "能对比 JWT（无状态）与 Cookie（有状态）认证及适用",
-      "能说出基于角色、策略、资源三种授权模型",
-      "能指出 JWT 难以主动失效、需 Refresh Token 或黑名单"
+      "能对比 JWT（无状态、难以主动失效）与 Cookie（有状态、可主动失效）的机制差异和适用场景",
+      "能说出角色、策略、资源三种授权模型及各自的适用场景",
+      "能解释 JWT 主动失效的工程折中：短期 Access Token + Refresh Token + 黑名单或版本号"
     ],
     "goodToHave": [
-      "能说明 OAuth2 与 OpenID Connect 的关系",
-      "能指出 Cookie 防 CSRF、JWT 防 XSS",
-      "能说明 UseAuthentication 要在 UseAuthorization 前"
+      "能说明 OAuth2 与 OpenID Connect 的关系（OAuth2 管授权，OIDC 加身份层）",
+      "能指出 Cookie 防 CSRF（SameSite + Anti-Forgery Token）、JWT 防 XSS（避免 localStorage 被脚本读取）",
+      "能说明策略 handler 不调 context.Succeed 等于默认拒绝的语义",
+      "能记住 UseAuthentication 必须在 UseAuthorization 之前"
     ],
     "commonMistakes": [
-      "混淆认证与授权",
-      "以为 JWT 能像 Cookie 一样随时失效",
-      "UseAuthorization 放在 UseAuthentication 之前导致拿不到身份"
+      "混淆认证与授权，把「登录」和「权限判断」混为一谈",
+      "以为 JWT 能像 Session/Cookie 一样随时服务端删除就失效，忽略了无状态的固有短板",
+      "UseAuthorization 放在 UseAuthentication 之前导致授权阶段拿不到身份",
+      "以为基于策略的授权 handler 什么都不做就会通过——实际上不调 Succeed 等于拒绝"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
   "prerequisites": [
     "dotnet.aspnet.filters-pipeline"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否区分认证与授权、对比 JWT 与 Cookie、说清三种授权模型，并知道 JWT 主动失效和中间件顺序等坑。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察能否区分认证与授权、对比 JWT 与 Cookie 的机制差异和安全重点、说清三种授权模型的递进关系、知道 JWT 主动失效的工程折中和中间件顺序等坑。",
+  "updatedAt": "2026-06-22"
 }

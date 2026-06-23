@@ -4,7 +4,7 @@
   "category": "identity-crypto",
   "group": "identity-crypto",
   "title": "TLS 与 PKI",
-  "summary": "讲清 TLS 1.2 与 1.3 握手差异、证书链与 CA 信任、SNI/ALPN/0-RTT、HSTS 与证书钉扎、mTLS 与内网 PKI 的工程边界。",
+  "summary": "讲清 TLS 1.2 与 1.3 握手消息编排差异（RTT、密钥交换、被砍历史特性）、证书链四要素校验与 CA 信任模型、SNI/ALPN 在网关选证与协议协商中的实际作用、0-RTT 重放风险与幂等约束、HSTS/证书钉扎/mTLS 各自防御的攻击面、内网 PKI 用短期证书 + 自动轮换替代 CRL 的工程落地。",
   "tags": [
     "网络安全",
     "TLS",
@@ -14,28 +14,33 @@
     "mTLS"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 35,
+  "estimatedMinutes": 39,
   "order": 90,
   "recommendWeight": 82,
   "status": "staging",
   "prerequisites": [],
   "interviewFrequency": "medium",
-  "interviewerFocus": "面试官常顺着 TLS 1.2 与 1.3 的握手差异往下问 0-RTT 重放、SNI/ALPN 在网关上的实际行为、证书链与 CA 信任的失败定位，以及 mTLS 在内网零信任里的落地方式，重点看候选人是否能把协议细节和生产事故连起来。",
+  "interviewerFocus": "面试官常顺着 TLS 1.2 与 1.3 的握手差异往下问 0-RTT 重放风险、SNI/ALPN 在网关上的实际行为、证书链四要素校验与 OCSP Stapling、以及 mTLS 在内网零信任里的落地方式（短期证书 + 自动轮换），重点看候选人是否能把协议细节和生产排查/事故经验连起来。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "TLS 1.3 把 1.2 的两轮握手压成一轮",
-      "content": "TLS 1.2 经典握手要两个 RTT：客户端 ClientHello（带支持的协议版本、cipher suite 列表、SNI、ALPN、随机数）→ 服务端 ServerHello + Certificate + ServerKeyExchange + ServerHelloDone（第 1 个 RTT）→ 客户端 ClientKeyExchange + ChangeCipherSpec + Finished（第 2 个 RTT）→ 服务端 Finished，之后才能发应用数据。密钥交换可选 RSA（用证书公钥加密 PreMasterSecret，没有前向保密）或 ECDHE（临时椭圆曲线，PreMasterSecret 不经过证书公钥）。\n\nTLS 1.3 把握手压到 1-RTT：ClientHello 直接带上 key_share（猜服务端会选哪条曲线，比如 X25519、secp256r1），服务端 ServerHello 同样带 key_share，ECDHE 在第一轮就完成；Certificate、CertificateVerify、Finished 全部用握手密钥加密。1.3 还砍掉了 RSA 密钥交换、CBC 模式、压缩、重协商、SHA-1 等历史包袱，cipher suite 简化为 AEAD（AES-GCM、ChaCha20-Poly1305）+ HKDF 组合，强制前向保密。0-RTT 模式更进一步：客户端用上次会话恢复的 PSK 派生 early_data 密钥，在 ClientHello 里就把请求体发出去，但代价是 early_data 没有抗重放保证，服务端必须保证只用在幂等接口上。"
+      "title": "TLS 1.3 把 1.2 的两轮握手压成一轮，砍掉历史包袱强制前向保密",
+      "content": "TLS 1.2 经典握手要两个 RTT：客户端 ClientHello（带支持的协议版本、cipher suite 列表、SNI、ALPN、客户端随机数）→ 服务端 ServerHello（选定 cipher suite + 服务端随机数）+ Certificate + ServerKeyExchange（DHE/ECDHE 公钥或 RSA 加密的 PreMasterSecret）+ ServerHelloDone → 客户端 ClientKeyExchange + ChangeCipherSpec + Finished → 服务端 ChangeCipherSpec + Finished，之后才能发应用数据。密钥交换可选 RSA（用证书公钥加密 PreMasterSecret，没有前向保密：证书私钥泄露后所有历史会话可解密）或 DHE/ECDHE（临时参数协商，PreMasterSecret 不经过证书公钥，有前向保密但 1.2 里不是强制的）。\n\nTLS 1.3 把完整握手压到 1-RTT：ClientHello 直接带上 key_share（客户端猜测服务端会选哪条曲线，比如 X25519 或 secp256r1，一般会塞 2-3 个候选），服务端 ServerHello 带上自己的 key_share，ECDHE 在第一轮就完成——两条 key_share 消息足够双方算出共享密钥。随后 Certificate、CertificateVerify（服务端用证书私钥对握手 transcript 签名，证明持有私钥）、Finished 全部用握手密钥加密传输，攻击者看不到服务端证书内容（在公网场景下能抵御证书指纹分析）。\n\n1.3 同时砍掉了大量历史包袱：RSA 密钥交换（强制前向保密）、CBC 模式（Padding Oracle 攻击面）、TLS 压缩（CRIME 攻击）、重协商（Renegotiation 攻击）、SHA-1、静态 DH。cipher suite 从 1.2 的几百种组合简化为仅 AEAD + HKDF：TLS_AES_128_GCM_SHA256、TLS_AES_256_GCM_SHA384、TLS_CHACHA20_POLY1305_SHA256 等，每个 suite 只描述对称加密 + KDF，密钥交换和签名算法由扩展单独协商。AEAD（Authenticated Encryption with Associated Data）同时提供机密性和完整性，不再需要单独的 MAC 步骤。\n\n0-RTT 更进一步：客户端用上次会话恢复的 PSK（Pre-Shared Key）派生 early_data 密钥，在 ClientHello 里就把第一批应用数据（通常是 HTTP GET 请求）发出去，零等待服务端响应。代价是 early_data 没有抗重放保证——攻击者可以原样重放 ClientHello + early_data，服务端无法通过握手 nonce 区分新旧请求。因此 0-RTT 只能用在幂等接口（GET 查询），写操作（POST 下单、转账）必须走 1-RTT 之后。服务端侧 nginx 的 ssl_early_data 指令、Go 的 tls.Config.MaxEarlyData 控制是否接受 early_data。"
     },
     {
       "type": "explain",
-      "title": "证书链验证、SNI 与 ALPN 在握手里的真实作用",
-      "content": "客户端拿到服务端 Certificate 消息里的叶子证书 + 中间证书后，要做四件事：① 沿着 issuer/subject 一路向上构造到本地受信根（操作系统或浏览器 root store），中间证书必须由服务端补齐，缺一环就 unable to get local issuer certificate；② 校验签名算法、有效期 notBefore/notAfter、Key Usage（digitalSignature、keyEncipherment）、Extended Key Usage（serverAuth）；③ 比对域名只看 SAN（subjectAltName），CN 早已被现代浏览器忽略；④ 校验吊销，OCSP 在线查 + OCSP Stapling 由服务端把 CA 签的吊销响应随握手下发，避免泄露访问轨迹。\n\nSNI（Server Name Indication）解决一个 IP 多个 HTTPS 站点的证书选择：客户端在 ClientHello 明文里写出要访问的 hostname，网关或 nginx 据此挑对应证书。SNI 默认明文会暴露访问目的，1.3 引入 ECH（Encrypted Client Hello）做加密 SNI。ALPN（Application-Layer Protocol Negotiation）让客户端在 ClientHello 里列出 [\"h2\", \"http/1.1\"]，服务端选定后续走 HTTP/2 还是 HTTP/1.1，省一个升级 RTT；HTTP/3 走 QUIC，不再依赖 TLS over TCP，但握手语义来自 TLS 1.3。"
+      "title": "证书链四要素校验：从叶子到根的信任路径，以及 OCSP Stapling 解决吊销隐私问题",
+      "content": "客户端拿到服务端 Certificate 消息（可能含多张证书）后，要完成四步验证：\n\n**① 构造信任路径到本地受信根**：沿 issuer DN 逐级向上，叶子 → 中间 CA → 根 CA，根 CA 必须在本地 trust store（操作系统 keychain、浏览器内置、Java cacerts、Android system store）里。中间证书必须由服务端在握手时补齐（fullchain），客户端没有义务去下载缺失的中间证书——实践中有些客户端会尝试 AIA（Authority Information Access）扩展里的 CA Issuers URL 去拉，但这是不确定行为。nginx 的 ssl_certificate 必须指向 fullchain.pem（leaf + intermediate 合并），只放 leaf 就是网上最常见的证书配置错误。\n\n**② 校验证书本身属性**：有效期 notBefore/notAfter（时钟偏差过大会失败）、签名算法（RSA-SHA256、ECDSA-SHA256，拒绝 SHA-1）、Key Usage（TLS 服务端证书必须有 digitalSignature，RSA 密钥交换还需要 keyEncipherment）、Extended Key Usage（必须有 serverAuth）。CA/Browser Forum 的 Baseline Requirements 规定公开信任证书最长 398 天（2020 年 9 月起生效）。\n\n**③ 域名匹配只看 SAN**：客户端比对的是证书的 subjectAltName（SAN）扩展，CN（Common Name）只是 fallback——Chrome 从 2017 年起忽略 CN 只看 SAN。SAN 支持精确域名（www.example.com）和通配符（*.example.com，只能匹配一级，不匹配 a.b.example.com）。证书没有覆盖目标域名就是 hostname mismatch，不关 CA 信任的事。\n\n**④ 吊销检查**：CRL（Certificate Revocation List）是 CA 签发的吊销列表，越来越大、更新慢；OCSP（Online Certificate Status Protocol）让客户端实时查 CA 的吊销服务器，但会暴露用户访问了哪些站点（隐私泄露）且增加延迟。OCSP Stapling 解决这两个问题：服务端定期向 CA 查询自己证书的吊销状态，把 CA 签名的 OCSP Response 缓存起来，随 TLS 握手一起下发，客户端不需要自己去问 CA。客户端可以验证 OCSP Response 里的 nextUpdate 是否过期、签名是否来自正确的 CA。Chrome/Chromium 现在还推 CRLSets（本地小型吊销列表）和 CRLite（布隆过滤器）作为补充方案。"
     },
     {
       "type": "explain",
-      "title": "HSTS、证书钉扎、mTLS 各自防的是什么攻击",
-      "content": "HTTPS 本身解决传输层窃听和篡改，但解决不了三类问题：用户首次访问被降级到 HTTP（SSL Strip）、CA 被攻破签发恶意证书、服务到服务调用没有客户端身份。HSTS（HTTP Strict-Transport-Security: max-age=31536000; includeSubDomains; preload）让浏览器在 max-age 内强制 HTTPS，preload 把域名硬编码进 Chromium/Firefox 源码，连首次访问都不能降级——代价是写入 preload 后不能临时回退到 HTTP，必须先把 max-age 降到 0 等浏览器更新。\n\n证书钉扎（pinning）用来防 CA 被攻破：早期 HPKP 让浏览器记住公钥指纹，配错就把站点锁死，已被废弃；现在主要在移动 App 里用 Public Key Pinning，把后端公钥或 SubjectPublicKeyInfo 的 SHA-256 内置到 App，握手时除了走系统信任，还要匹配 pin 列表。落地时必须备一份 backup pin（轮换私钥时切过去），否则证书一换 App 就全挂。\n\nmTLS 在 TLS 1.3 里多两条消息：服务端 CertificateRequest，客户端 Certificate + CertificateVerify。客户端用自己证书的私钥对握手 transcript 签名证明持有私钥。落地点是内网零信任、Service Mesh（Istio/Linkerd 用 SPIFFE ID 在 SAN 的 URI 里写 spiffe://td/ns/foo/sa/bar）、Kubernetes Webhook、银行/支付通道。难点全在 PKI 运营：内网搭一套 Root CA + Intermediate CA，用短期证书（小时级）+ 自动签发（cert-manager、SPIRE）替代长期证书，吊销靠到期而不是 CRL。"
+      "title": "SNI 决定网关挑哪张证书，ALPN 协商应用层协议，ECH 加密 SNI 隐私",
+      "content": "SNI（Server Name Indication）解决的问题是：一个 IP 地址上跑多个 HTTPS 站点时，服务端在收到 ClientHello 之前不知道客户端要访问哪个域名，无法选择正确的证书。SNI 让客户端在 ClientHello 的明文扩展里写出目标 hostname，nginx/Apache/CDN 网关据此从 SNI map 里挑选对应证书。缺点是 SNI 明文暴露了访问目的，网络中间人可以看到用户在访问哪个站点。TLS 1.3 引入 ECH（Encrypted Client Hello，前称 ESNI）：客户端用 DNS HTTPS RR 里公布的公钥加密 SNI，服务端用私钥解密，中间人只能看到目标 IP 而看不到域名。ECH 目前（截至 2024 年）在 Cloudflare、Firefox、Chrome 中逐步部署，尚未全面普及。\n\nALPN（Application-Layer Protocol Negotiation）让客户端在 ClientHello 里列出支持的应用层协议（如 [\"h2\", \"http/1.1\"]），服务端选定一个（比如 h2）在 ServerHello 里返回。这样在 TLS 握手阶段就确定了 HTTP/2 还是 HTTP/1.1，省去了 HTTP Upgrade（h2c）额外的一次 RTT。HTTP/3 走 QUIC（UDP-based），握手语义来自 TLS 1.3 但协议协商在 QUIC 层面（alt-svc HTTP header 和 DNS HTTPS RR）。\n\n实际排查时，openssl s_client 的 -servername 和 -alpn 参数可以分别验证 SNI 和 ALPN 是否工作。如果服务端返回的证书 SAN 不匹配你指定的 -servername，说明 SNI map 配错或者缺失该域名的证书。ALPN 协商失败（客户端列出 h2 但服务端不支持）会 fallback 到 http/1.1，不会报错但丢失了 HTTP/2 性能收益。"
+    },
+    {
+      "type": "explain",
+      "title": "HSTS 防 SSL Strip、证书钉扎防 CA 失陷、mTLS 做服务身份认证——三者解决不同层的问题",
+      "content": "HTTPS 本身解决传输层窃听和篡改，但解决不了三类问题：\n\n**HSTS 防降级攻击（SSL Strip）**：攻击者在首次访问时把 HTTPS 降级到 HTTP，后续通过代理注入 HTTP 链接。HSTS（Strict-Transport-Security: max-age=31536000; includeSubDomains; preload）告诉浏览器：在 max-age 秒内，对这个域名的所有请求都必须用 HTTPS，HTTP 请求自动转。preload 列表把域名硬编码进浏览器源码（Chromium 的 HSTS preload list），连首次访问也不能降级。代价是 preload 一旦提交，回退流程复杂：必须先把 max-age 降到 0 发布，等所有浏览器版本更新后才能从 preload list 移除，期间 HTTP 不可用。所以 preload 只适合确定永远不回退 HTTP 的站点。includeSubDomains 会让所有子域名强制 HTTPS，如果子域名有纯 HTTP 服务（内网管理面板、IoT 设备），会直接挂掉。\n\n**证书钉扎防 CA 被攻破签发恶意证书**：假设某个 CA 被攻破或被胁迫给 example.com 签了恶意证书，系统信任链校验仍然通过。HPKP（HTTP Public Key Pinning）让浏览器记住站点声明的公钥指纹，不匹配就拒绝连接。但 HPKP 配错会把站点锁死（pin 了错误的 key 且没有 backup pin），且攻击者可以对首次访问的用户注入恶意 HPKP header，已被 Chrome 72 废弃。现在主要在移动端做 Public Key Pinning：App 内置后端证书的 SubjectPublicKeyInfo（SPKI）SHA-256 指纹，TLS 握手时除系统信任链外还要匹配 pin 列表。落地时必须保留 backup pin（比如同时 pin 当前证书和下一轮证书的公钥），否则证书一换 App 就全挂。Android 的 Network Security Config、iOS 的 ATS、OkHttp 的 CertificatePinner 都支持。\n\n**mTLS 做双向身份认证**：标准 TLS 只认证服务端（客户端验证服务端证书），mTLS 在此基础上，服务端发 CertificateRequest，客户端也返回自己的证书 + CertificateVerify（用客户端私钥对握手 transcript 签名证明持有私钥）。服务端验证客户端证书链到受信根、校验有效期、比对 DN 或 SAN。落地场景：内网零信任（每个服务调用都要证明身份）、Service Mesh（Istio/Linkerd 用 SPIFFE ID 写在 SAN 的 URI 字段 spiffe://trust-domain/ns/foo/sa/bar）、Kubernetes API Server Webhook、银行/支付通道（专线 mTLS）。难点在 PKI 运营：Root CA 私钥放 HSM 或离线机器，Intermediate CA 在线签发，服务端用短期证书（24 小时甚至更短），到期前自动续签，吊销靠过期自然失效而不是 CRL/OCSP。cert-manager（Kubernetes）、SPIRE/SPIFFE（通用 Service Mesh）是主流自动化方案。"
     },
     {
       "type": "diagram",
@@ -76,28 +81,33 @@
         ],
         [
           "密钥交换",
-          "RSA / DHE / ECDHE 可选",
+          "RSA / DHE / ECDHE 可选，RSA 无前向保密",
           "仅 (EC)DHE，强制前向保密"
         ],
         [
           "Cipher Suite",
-          "组合自由（含 CBC、RC4、3DES）",
-          "仅 AEAD（AES-GCM、ChaCha20-Poly1305）+ HKDF"
+          "组合自由（含 CBC、RC4、3DES），数百种",
+          "仅 AEAD（AES-GCM、ChaCha20-Poly1305）+ HKDF，约 5 种"
         ],
         [
-          "证书与扩展",
-          "ServerKeyExchange 在握手中明文",
+          "握手内容可见性",
+          "Certificate / ServerKeyExchange 明文",
           "Certificate / CertificateVerify 用握手密钥加密"
         ],
         [
-          "已删除特性",
+          "被删除特性",
           "保留压缩、重协商、SHA-1、静态 RSA",
-          "全部移除，简化攻击面"
+          "全部移除，压缩攻击面"
         ],
         [
           "0-RTT",
           "不支持",
-          "支持 early_data，但不抗重放，仅幂等接口可用"
+          "支持 early_data，不抗重放，仅幂等接口"
+        ],
+        [
+          "SNI 隐私",
+          "SNI 明文",
+          "ECH 加密 SNI（逐步部署中）"
         ]
       ]
     },
@@ -105,30 +115,42 @@
       "type": "code",
       "title": "握手与证书链排查的 openssl 实战",
       "language": "bash",
-      "content": "# 1. 抓握手过程：协议版本、cipher、SNI、ALPN、证书链\nopenssl s_client -connect api.example.com:443 \\\n  -servername api.example.com \\\n  -alpn h2,http/1.1 \\\n  -tls1_3 -showcerts < /dev/null\n\n# 输出关注点：\n# Protocol  : TLSv1.3\n# Cipher    : TLS_AES_128_GCM_SHA256\n# Server certificate -> 一直到 Verify return code: 0 (ok)\n# 如果是 21 (unable to verify the first certificate) → 多半是中间证书没配全\n\n# 2. 校验证书链是否完整（服务端是否补齐了 intermediate）\nopenssl s_client -connect api.example.com:443 -servername api.example.com -showcerts \\\n  </dev/null 2>/dev/null | awk '/BEGIN CERT/,/END CERT/'\n\n# 3. 检查叶子证书的 SAN、有效期、签名算法\nopenssl s_client -connect api.example.com:443 -servername api.example.com </dev/null 2>/dev/null \\\n  | openssl x509 -noout -subject -issuer -dates -ext subjectAltName,keyUsage,extendedKeyUsage\n\n# 4. mTLS 客户端：用自己的证书发请求\ncurl -v https://internal-api.svc/health \\\n  --cert client.pem --key client.key --cacert internal-root.pem\n\n# 5. 验证 HSTS 头\ncurl -I https://example.com | grep -i strict-transport-security\n# Strict-Transport-Security: max-age=31536000; includeSubDomains; preload",
+      "content": "# 1. 抓握手过程：协议版本、cipher、SNI、ALPN、证书链\nopenssl s_client -connect api.example.com:443 \\\n  -servername api.example.com \\\n  -alpn h2,http/1.1 \\\n  -tls1_3 -showcerts < /dev/null\n# 输出关注点：\n# Protocol  : TLSv1.3\n# Cipher    : TLS_AES_128_GCM_SHA256\n# ALPN negotiated: h2\n# Server certificate -> 一直到 Verify return code: 0 (ok)\n# 如果是 21 (unable to verify the first certificate) → 中间证书没配全\n# 如果是 20 (unable to get local issuer certificate) → 根 CA 不在信任列表\n\n# 2. 查看服务端返回了几张证书（检查 fullchain 是否完整）\nopenssl s_client -connect api.example.com:443 -servername api.example.com -showcerts \\\n  </dev/null 2>/dev/null | awk '/BEGIN CERT/,/END CERT/'\n# 应该至少看到 2 张：leaf + intermediate\n# 只有 1 张说明 nginx 只配了 leaf，缺少 intermediate\n\n# 3. 检查叶子证书的 SAN、有效期、签名算法、Key Usage\nopenssl s_client -connect api.example.com:443 -servername api.example.com </dev/null 2>/dev/null \\\n  | openssl x509 -noout -subject -issuer -dates -ext subjectAltName,keyUsage,extendedKeyUsage\n# SAN 必须覆盖你访问的域名\n# notAfter 不应接近当前时间（证书快过期）\n# extendedKeyUsage 必须包含 TLS Web Server Authentication\n\n# 4. 检查 OCSP Stapling 是否生效\nopenssl s_client -connect api.example.com:443 -servername api.example.com -status </dev/null 2>/dev/null \\\n  | grep -A 5 'OCSP response'\n# OCSP response: ... OCSP Response Status: successful (0x0)\n# 表示服务端返回了 OCSP Stapling Response\n\n# 5. mTLS 客户端：用自己的证书和私钥发请求\ncurl -v https://internal-api.svc/health \\\n  --cert client.pem --key client.key --cacert internal-root.pem\n\n# 6. 验证 HSTS 头\ncurl -I https://example.com | grep -i strict-transport-security\n# Strict-Transport-Security: max-age=31536000; includeSubDomains; preload",
       "highlights": [
         {
-          "line": 10,
-          "note": "`# Server certificate -> 一直到 Verify return code: 0 (ok)` 对应最终输出，检查这里可以确认边界值是否和题意一致。"
+          "line": 6,
+          "note": "Verify return code 是排查证书问题的第一入口：0=成功，21=中间证书缺失，20=根 CA 不受信。"
+        },
+        {
+          "line": 14,
+          "note": "只看到 1 张证书说明 nginx 的 ssl_certificate 没配 fullchain。"
+        },
+        {
+          "line": 22,
+          "note": "SAN 不匹配目标域名会导致 hostname mismatch，跟 CA 信任无关。"
+        },
+        {
+          "line": 27,
+          "note": "OCSP Stapling 生效时，客户端不需要单独查 CA 吊销状态，隐私和延迟都改善。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "30 秒结论 + 机制主线 + 边界追问",
-      "content": "TLS 解决两件事：用证书链 + CA 信任做服务器身份认证，用 ECDHE 协商一次性的会话密钥做应用层加密，二者通过握手粘合。TLS 1.2 是 2 RTT 握手、密钥交换允许 RSA、cipher suite 组合自由；TLS 1.3 压成 1 RTT，强制 ECDHE 前向保密，cipher suite 只剩 AEAD，并新增 0-RTT 用 PSK 把首字节延迟降到 0，但 early_data 不抗重放，只能放在幂等接口上。\n\n机制要点：\n- 证书侧的关键是 SAN 校验、中间证书必须由服务端补齐 fullchain、OCSP Stapling 让 CA 吊销状态随握手下发；SNI 决定网关挑哪张证书，ALPN 协商 h2 还是 http/1.1。防御层面 HSTS 防止 SSL Strip 降级（preload 一旦写入要 max-age=0 才能撤回），证书钉扎（移动 App 用 SPKI SHA-256 + backup pin）防 CA 被攻破签发恶意证书，mTLS 用客户端证书 CertificateVerify 做服务到服务的身份认证，配合内网 Root CA + Intermediate CA + 短期证书 + cert-manager/SPIRE 自动轮换。\n- 排查时按顺序看：openssl s_client 协商上的协议版本和 cipher、Verify return code 是不是 0、证书链是否补齐 fullchain、SAN 是否覆盖访问域名、SNI 在网关是否选对证书、客户端是否信任了正确的根。要警惕业务代码里 InsecureSkipVerify、TrustAllManager、curl -k 等关闭校验的写法被带到生产，HTTPS 仅保护传输和服务器身份，不能替代登录鉴权和接口授权。",
+      "content": "TLS 解决两件事：用证书链 + CA 信任做服务器身份认证，用 ECDHE 协商一次性会话密钥做应用层加密，二者通过握手粘合在一起。TLS 1.2 是 2-RTT 握手、密钥交换允许 RSA（无前向保密）、cipher suite 组合自由；TLS 1.3 压成 1-RTT，强制 ECDHE 前向保密，cipher suite 只剩 AEAD + HKDF，砍掉压缩/重协商/SHA-1/静态 RSA，证书在握手密钥保护下传输。\n\n**机制主线**：\n- **握手**：1.3 的 ClientHello 带 key_share（猜曲线），ServerHello 回 key_share，ECDHE 一轮完成。0-RTT 用 PSK 派生 early_data 密钥，首字节零等待，但不抗重放——只能用在幂等 GET，写操作必须走 1-RTT。\n- **证书链**：四步验证——① 信任路径到根 CA（中间证书必须由服务端补 fullchain）、② 有效期 + 签名算法 + KU/EKU、③ SAN 域名匹配（CN 已被忽略）、④ 吊销检查（OCSP Stapling 随握手下发，客户端不单独查 CA）。SNI 让网关在一个 IP 上挑证书，ALPN 在握手阶段确定 h2 还是 http/1.1。\n- **防御**：HSTS 防 SSL Strip（preload 不可逆，回退需要 max-age=0 等浏览器更新）；证书钉扎在移动端防 CA 失陷（SPKI SHA-256 + backup pin）；mTLS 用客户端 CertificateVerify 做双向认证，内网用短期证书（小时级）+ cert-manager/SPIRE 自动轮换，吊销靠过期而非 CRL。\n\n**排查路径**：\n1. `openssl s_client -servername host -showcerts` 看 Verify return code（0=OK，21=缺中间证书，20=根 CA 不受信）\n2. 看返回证书数量（应该 ≥2：leaf + intermediate）\n3. 检查 SAN 是否覆盖目标域名、有效期是否快过期\n4. 检查 ALPN 协商结果（h2 还是 http/1.1）\n5. 检查 OCSP Stapling 是否生效（-status 参数）\n\n**常见坑**：nginx 只配 leaf 不配 fullchain；InsecureSkipVerify / curl -k 关掉校验带到生产；POST 接口走 0-RTT 被重放重复下单；证书过期没有监控和续期演练。",
       "followUpQuestions": [
         {
-          "question": "TLS 1.3 的 0-RTT 为什么不能用在所有接口上？",
-          "answer": "0-RTT 的 early_data 用上次握手协商的 PSK 派生密钥，攻击者抓到 ClientHello 后可以原样重放，服务端没法靠握手 nonce 区分新旧请求。所以只能用在幂等的 GET 类接口；写操作（下单、转账、登录）必须落到 1-RTT 之后。Cloudflare、nginx 都默认拒绝把 POST 走 0-RTT，应用层也要在网关层加一层路由策略把非幂等方法挡掉。"
+          "question": "TLS 1.3 的 0-RTT 为什么不能用在所有接口上？具体怎么防护？",
+          "answer": "0-RTT 的 early_data 用上次握手的 PSK 派生密钥，攻击者抓到 ClientHello 后可以原样重放，服务端没有握手层面的 nonce 区分新旧请求。防御手段：① 服务端只对幂等 GET 接受 early_data（nginx 的 ssl_early_data + 应用层检查 $ssl_early_data）；② 网关层路由策略把 POST/PUT/DELETE 的 early_data 拒绝；③ 服务端实现单次 token 或 replay cache（记录 PSK identity + client random，在窗口内拒绝重复），但增加了存储和状态管理成本。Cloudflare 等 CDN 默认只对 GET 走 0-RTT。"
         },
         {
-          "question": "服务端配置了证书但浏览器报 NET::ERR_CERT_AUTHORITY_INVALID，怎么定位？",
-          "answer": "九成是中间证书没补齐：CA 签发时给的是 leaf + intermediate，nginx ssl_certificate 必须指向 fullchain.pem 而不是只贴 leaf。用 openssl s_client -connect host:443 -showcerts 看返回的证书数量和顺序，再用 ssllabs.com 的 SSL Test 看 chain issues，看到 Extra download 或 Incomplete chain 就说明缺中间证书；另一种情况是用了私有 CA 但客户端没安装根证书，Linux 要更新 ca-certificates，Java 要进 cacerts keystore，Android 7+ 要在 network_security_config 里声明 trust-anchors。"
+          "question": "浏览器报 NET::ERR_CERT_AUTHORITY_INVALID，你会怎么一步步定位？",
+          "answer": "① 用 `openssl s_client -connect host:443 -servername host -showcerts` 看返回的证书数量和 Verify return code。如果 code=21（unable to verify the first certificate），多半是中间证书没配全——检查 nginx 的 ssl_certificate 是否指向 fullchain.pem。② 如果 code=20（unable to get local issuer certificate），说明根 CA 不在客户端信任列表——私有 CA 需要在客户端安装根证书（Linux 更新 ca-certificates，Java 进 cacerts，Android 7+ 在 network_security_config 里声明 trust-anchors）。③ 检查证书是否过期（notAfter）、签名算法是否被废弃（SHA-1）。④ 用 ssllabs.com 的 SSL Test 看 chain issues，Extra download 或 Incomplete chain 明确指向缺中间证书。"
         },
         {
-          "question": "mTLS 在内网落地时，证书是怎么签发和轮换的？",
-          "answer": "典型方案是搭一套两层 PKI：离线 Root CA 签 Intermediate CA，Intermediate CA 在线签发服务证书。Kubernetes 里用 cert-manager + 私有 Issuer，给每个 Service 签 24h 短期证书，到期前自动轮换；Service Mesh 里用 SPIFFE/SPIRE，每个工作负载拿到 SVID（X.509 证书，SAN 写 spiffe://trust-domain/ns/foo/sa/bar），通过 SDS 推到 Envoy。短期证书天然回避 CRL 和 OCSP 的吊销难题：要废一个身份，停止给它续签即可，最多 1 小时后失效。Root CA 私钥放 HSM 或离线机器，Intermediate 私钥单独放 KMS，签发审计走集中日志。"
+          "question": "mTLS 在内网 Kubernetes 集群里，证书是怎么签发和自动轮换的？",
+          "answer": "典型方案：① 搭两层 PKI——离线 Root CA 签 Intermediate CA，在线的 Intermediate CA 负责签发服务证书。② cert-manager 的 Issuer/ClusterIssuer 资源定义签发策略，Certificate 资源声明证书（SAN 含 DNS 和 SPIFFE URI），cert-manager 自动生成私钥并请求签发，通过 Secret 注入 Pod。③ 短期证书（24h 甚至更短），到期前 cert-manager 自动续签（默认提前 1/3 有效期触发），sidecar 或 kubelet 检测 Secret 变更后 reload。④ SPIFFE/SPIRE 方案更通用：SPIRE Agent 在每个节点上运行，通过 SDS API 把 SVID（X.509 证书，SAN=spiffe://trust-domain/...）推给 Envoy。⑤ 吊销策略：短期证书天然回避 CRL/OCSP——停止给身份续签，最多 1 小时后失效。Root CA 私钥放 HSM，Intermediate 私钥放 KMS，签发审计走集中日志。"
         }
       ]
     },
@@ -136,11 +158,13 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能讲清 TLS 1.2 双 RTT 与 1.3 单 RTT 的消息差异、密钥交换变化和被砍掉的历史特性",
-        "能说明证书链校验（SAN、有效期、KU/EKU、OCSP Stapling）以及 SNI、ALPN 在网关上的实际作用",
-        "能区分 HSTS（含 preload 撤销代价）、证书钉扎（移动端 SPKI + backup pin）、mTLS 各自防御的攻击面",
-        "能用 openssl s_client / x509 按 Verify return code、SAN、链完整性、SNI 选证排查握手错误",
-        "能描述 0-RTT 重放风险与幂等接口约束，以及内网 PKI 用短期证书 + 自动轮换替代 CRL 的落地方式"
+        "能对比 TLS 1.2 双 RTT 与 1.3 单 RTT 的消息编排差异，解释 1.3 强制 ECDHE + AEAD 的设计取舍",
+        "能说明证书链校验四要素：信任路径到根 CA、有效期 + 签名算法 + KU/EKU、SAN 域名匹配、OCSP Stapling 吊销",
+        "能解释 SNI 在多站点共享 IP 时挑选证书、ALPN 协商 HTTP/2 vs HTTP/1.1、ECH 加密 SNI 隐私",
+        "能区分 HSTS（含 preload 不可逆代价）、证书钉扎（移动端 SPKI + backup pin）、mTLS 各自防御的攻击面",
+        "能用 openssl s_client 的 Verify return code、证书数量、SAN、ALPN、OCSP Stapling 排查握手错误",
+        "能解释 0-RTT early_data 的重放风险与幂等接口约束，以及如何在网关层防御",
+        "能描述内网 PKI 用短期证书 + cert-manager/SPIRE 自动轮换替代 CRL 的落地方式"
       ]
     }
   ],
@@ -161,7 +185,7 @@
     },
     {
       "id": "security.identity-crypto.tls-pki.recall.3",
-      "prompt": "解释 0-RTT early_data 的重放风险，以及为什么 POST 接口不能走 0-RTT。",
+      "prompt": "解释 0-RTT early_data 的重放风险，为什么 POST 接口不能走 0-RTT，以及如何在网关层做防御。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -172,25 +196,39 @@
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 4
+    },
+    {
+      "id": "security.identity-crypto.tls-pki.recall.5",
+      "prompt": "证书链校验需要通过哪四步？SAN 和 CN 的关系是什么？OCSP Stapling 解决了什么问题？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "security.identity-crypto.tls-pki.recall.6",
+      "prompt": "HSTS preload、证书钉扎、mTLS 分别防的是什么攻击？各自的落地代价和回退风险是什么？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "TLS 1.2 双 RTT 与 1.3 单 RTT 的握手消息差异，以及 1.3 强制 ECDHE + AEAD 的设计取舍",
-      "证书链验证四要素：到根 CA 的链路、有效期、SAN 域名匹配、KU/EKU",
-      "SNI 在多站点共享 IP 时挑选证书的作用，以及 ALPN 协商 HTTP/2 vs HTTP/1.1",
-      "用 openssl s_client 看 Verify return code、协议版本、cipher suite、证书链完整性的排查路径"
+      "TLS 1.2 双 RTT 与 1.3 单 RTT 的握手消息差异，以及 1.3 强制 ECDHE + AEAD 砍掉历史包袱的设计取舍",
+      "证书链验证四要素：信任路径到根 CA、有效期 + 签名算法 + KU/EKU、SAN 域名匹配、OCSP Stapling 吊销",
+      "SNI 在多站点共享 IP 时挑选证书的作用，ALPN 协商 h2 vs http/1.1 的协议协商",
+      "用 openssl s_client 看 Verify return code、证书数量、SAN、链完整性的排查路径"
     ],
     "goodToHave": [
-      "0-RTT early_data 的重放风险与幂等接口约束",
+      "0-RTT early_data 的重放风险、幂等接口约束和网关层防御策略",
       "HSTS preload 的不可逆代价、证书钉扎的 SPKI + backup pin 设计",
       "mTLS 在 K8s/Service Mesh 中用 cert-manager / SPIFFE 签发短期证书 + 自动轮换替代 CRL",
       "OCSP Stapling 与隐私保护、ECH 加密 SNI 的演进方向"
     ],
     "commonMistakes": [
-      "把 HTTPS 等同于业务安全，忽略 InsecureSkipVerify、curl -k 把校验关掉的代码被带到生产",
-      "nginx 只配 cert.pem 不配 fullchain.pem，导致浏览器拿不到中间证书",
+      "nginx 只配 leaf.pem 不配 fullchain.pem，导致客户端拿不到中间证书，Verify return code=21",
       "把 POST/写操作放到 0-RTT early_data，被攻击者重放后产生重复扣款或下单",
+      "代码里 InsecureSkipVerify / curl -k 关掉证书校验带到生产环境，HTTPS 形同虚设",
       "线上没有证书到期监控和续期演练，证书过期后整站不可用"
     ],
     "scoreWeights": {
@@ -200,5 +238,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

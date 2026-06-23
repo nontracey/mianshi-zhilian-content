@@ -4,7 +4,7 @@
   "category": "engineering",
   "group": "engineering",
   "title": "Go Web 服务与中间件",
-  "summary": "理解 net/http 的 Handler 接口、中间件装饰器链、ResponseWriter 写头时序、Context 透传、Server 三组超时与 graceful shutdown。",
+  "summary": "理解 net/http 的 Handler 接口如何把请求处理统一为 ServeHTTP 一个入口、中间件装饰器链的洋葱模型与顺序语义、ResponseWriter 写头时序的三条铁律、Context 透传必须通过 WithContext 返回新 Request、Server 三组超时各自防什么以及何时用 handler 内 context.WithTimeout 替代、graceful shutdown 为什么要配合 timeout 兜底再 Close 强杀。",
   "tags": [
     "Go",
     "net/http",
@@ -13,7 +13,7 @@
     "graceful shutdown"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 35,
+  "estimatedMinutes": 48,
   "order": 100,
   "recommendWeight": 84,
   "status": "draft",
@@ -22,29 +22,39 @@
     "go.runtime.error-handling"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "重点看候选人能否手写 func(http.Handler) http.Handler 签名、解释 ServeMux 最长前缀匹配与 Go 1.22 方法路由、画清 ResponseWriter 写头一次的时序、区分 Server.ReadTimeout/WriteTimeout/IdleTimeout 与 handler 内 context.WithTimeout 的差异，以及 Server.Shutdown 等待 in-flight 请求的实现。",
+  "interviewerFocus": "重点看候选人能否手写 func(http.Handler) http.Handler 签名、解释 ServeMux 模式匹配与 Go 1.22 方法路由、画清 ResponseWriter 写头一次的时序、区分 Server.ReadTimeout/WriteTimeout/IdleTimeout 与 handler 内 context.WithTimeout 的差异，以及 Server.Shutdown 等待 in-flight 请求的实现。",
   "learningCards": [
     {
       "type": "explain",
       "title": "net/http 处理链：Handler 接口 + ServeMux 路由 + HandlerFunc 适配器",
-      "content": "标准库的核心抽象是 `http.Handler` 接口，只有一个方法 `ServeHTTP(w ResponseWriter, r *Request)`。`http.HandlerFunc` 是把普通函数适配成 Handler 的 type alias（`type HandlerFunc func(ResponseWriter, *Request)`，自带 ServeHTTP 方法），这是 Go 语言层面用「方法绑定到函数类型」实现接口的经典写法。\n\n请求进入后的执行链：\n1. `http.Server.Serve` 在 Accept 循环里为每个 TCP 连接 `go c.serve(ctx)`，每个连接里再循环读 HTTP/1.1 请求（Keep-Alive）。\n2. 每个请求构造 `*Request` 和 `response`（ResponseWriter 的实现），调用 `Server.Handler.ServeHTTP`；`Handler` 为 nil 时 fallback 到 `DefaultServeMux`。\n3. `ServeMux` 是一棵按最长前缀匹配的路由树：`/api/` 这种带尾斜杠的是子树匹配，`/api/users` 是精确匹配；冲突时精确优先、长前缀优先。Go 1.22 起 ServeMux 支持 `GET /users/{id}` 方法和路径参数，参数通过 `r.PathValue(\"id\")` 取。\n4. 匹配到的 Handler.ServeHTTP 才是「业务入口」，中间件就是包在它外面的多层装饰。\n\n面试常被问到的边界：\n- HandlerFunc 不是必需的，只是省去自己定义结构体；任何实现了 ServeHTTP 的类型都是 Handler。\n- ServeMux 在 1.22 之前不区分方法，老代码常在 handler 第一行写 `if r.Method != http.MethodPost { http.Error(...); return }`，1.22 后用 `mux.HandleFunc(\"POST /users\", ...)` 替代。\n- 一个 `*http.Request` 在整条链路里是同一个指针，但 `r.Body` 是 `io.ReadCloser`，**只能读一次**；如果中间件需要预读（签名校验、审计），必须 `body, _ := io.ReadAll(r.Body); r.Body = io.NopCloser(bytes.NewReader(body))` 重置回去，否则下游 handler 读到 EOF。"
+      "content": "标准库把「处理 HTTP 请求」压缩到一个接口：`http.Handler` 只有 `ServeHTTP(w ResponseWriter, r *Request)` 一个方法。`http.HandlerFunc` 是函数类型适配器——`type HandlerFunc func(ResponseWriter, *Request)` 并绑定了 ServeHTTP 方法，把任何签名匹配的函数变成 Handler，这是 Go 用「方法绑定到函数类型」实现接口的经典写法，不是必需的，但省去了为每个路由定义结构体。\n\n请求进入后的执行链：\n1. `http.Server.Serve` 在 Accept 循环里为每个 TCP 连接启动 `go c.serve(ctx)`，每个连接里循环读 HTTP/1.1 请求（Keep-Alive 复用连接）。\n2. 每个请求构造 `*Request` 和内部的 `response`（ResponseWriter 的真实实现），调用 `Server.Handler.ServeHTTP`；如果 Handler 为 nil 则 fallback 到 `DefaultServeMux`。\n3. `ServeMux` 按模式匹配选择最具体的 handler：`/api/` 是子树匹配（所有 `/api/` 开头的路径都走这里），`/api/users` 是更具体的路径优先。Go 1.22 起 ServeMux 原生支持 `GET /users/{id}` 这类带方法和路径参数的模式，参数通过 `r.PathValue(\"id\")` 取，对大多数内部服务来说已经不需要引入 chi 或 gorilla/mux。\n4. 匹配到的 Handler.ServeHTTP 才是业务入口，中间件就是包在它外面的多层装饰。\n\n几个关键边界：\n- ServeMux 在 Go 1.22 之前不区分 HTTP 方法，老代码习惯在 handler 第一行写 `if r.Method != http.MethodPost { return }` 做方法检查；1.22 后直接用 `mux.HandleFunc(\"POST /users\", ...)` 声明。\n- 一个 `*http.Request` 在整条链路里是同一个指针，但 `r.Body` 是 `io.ReadCloser`，**只能读一次**。如果中间件需要预读（签名校验、请求审计），必须 `body, _ := io.ReadAll(r.Body); r.Body = io.NopCloser(bytes.NewReader(body))` 重置回去，否则下游 handler 读到 EOF。这个 `io.NopCloser` 包装是因为 bytes.Reader 没有 Close 方法，需要补一个 no-op 的 Closer 满足 io.ReadCloser 接口。"
     },
     {
       "type": "explain",
       "title": "中间件 = func(http.Handler) http.Handler：装饰器链与 Context 透传",
-      "content": "中间件的标准签名是 `func(next http.Handler) http.Handler`，实现上是返回一个新的 HandlerFunc，里面在调用 `next.ServeHTTP(w, r)` 前后插入逻辑。多个中间件用 `mw1(mw2(mw3(handler)))` 组合，调用顺序是「外→内→外」的洋葱模型——外层 mw1 的「前置」最先执行，「后置」最后执行。chi/echo 的 `Use(...)` 内部也是这个套路，只是把组合写法藏在 Router 里。\n\n顺序是有强语义的，不是审美问题：\n- **recover 必须最外层**：否则它包不住更外层 mw 的 panic（比如 metrics 中间件自己 panic 了，外面没有 recover 进程就挂）。但也不能完全依赖 net/http 自带的 per-conn recover——它只会打日志关连接，不会写自定义 500 响应体。\n- **logging/access log 紧贴 recover 内侧**：要拿到最终 status code 和 duration，必须在响应写完之后才记录；通常包一个 `statusRecorder{ResponseWriter; status int}` 拦截 `WriteHeader`。\n- **认证早于限流还是晚于限流**：如果限流是「按用户配额」必须先认证拿到 user id；如果是「防 DDoS 按 IP 限速」要在认证之前——否则攻击者用错误 token 也能把 auth 服务（Redis/JWT 解析）打爆。生产上一般两层：外层 IP 限流 + 内层用户限流。\n- **超时中间件在认证之后、业务之前**：认证本身一般很快没必要包在超时里；业务才是真正会卡的。\n\nContext 透传是中间件链的另一条主线。请求进来时 `r.Context()` 是 Server 创建的根 ctx（连接关闭/Server.Shutdown 时会被 cancel）。中间件要往后传值或加超时，**必须** `r = r.WithContext(ctx)` 之后再调 `next.ServeHTTP(w, r)`：因为 `*Request` 的 ctx 字段是不导出的，只能通过 WithContext 返回的浅拷贝副本来「附加」新 ctx。常见用法：`ctx := context.WithValue(r.Context(), userKey, user); next.ServeHTTP(w, r.WithContext(ctx))`。下游用 `r.Context().Value(userKey)` 取，**key 必须是私有类型**（`type ctxKey int; const userKey ctxKey = 0`）避免跨包冲突。"
+      "content": "中间件的标准签名是 `func(next http.Handler) http.Handler`，返回一个新的 HandlerFunc 里面在调用 `next.ServeHTTP(w, r)` 前后插入前置/后置逻辑。多个中间件嵌套 `mw1(mw2(mw3(handler)))` 形成洋葱模型——外层 mw1 的「前置」最先执行，「后置」最后执行。chi 的 `r.Use(...)` 和 echo 的 `e.Use(...)` 内部就是这个组合，只是把嵌套写法藏在 Router 的 ServeHTTP 里。\n\n顺序是强语义，不是审美问题：\n- **recover 必须最外层**：defer + recover 的作用范围是当前函数栈。如果 recover 放在更内层，外层中间件自己的 panic（比如 metrics 打点代码空指针）没人兜，进程直接挂。net/http 自带 per-conn 的 recover 只会打日志关闭连接，不会写自定义 500 响应体，也不能打到你的日志系统里，所以不能依赖它。\n- **access log 紧贴 recover 内侧**：要拿到最终 status code 和请求耗时，必须在响应写完之后才记录。做法是包一个 `statusRecorder{ResponseWriter; status int}` 拦截 WriteHeader 拿状态码，后置时写日志。\n- **IP 限流早于 auth**：如果攻击者用无效 token 打接口，auth 层需要查 Redis/JWT 解析，这些计算和网络开销会被白白消耗。外层按 IP 限速先把高频打掉，auth 只处理通过限流的请求。如果限流是「按用户配额」则必须先 auth 拿到 user ID——所以生产常见两层：外层 IP 限流 + 内层用户限流。\n- **ctx timeout 在 auth 之后、业务之前**：auth 本身一般很快（JWT 解析、Redis GET），没必要包在业务超时里；业务才是真正会卡的（SQL、下游 RPC）。\n\nContext 透传是中间件链的另一条主线。请求进来时 `r.Context()` 是 Server 创建的根 ctx，连接关闭或 Server.Shutdown 时会被 cancel。中间件要往后传值或加超时，**必须** `r = r.WithContext(newCtx)` 然后调 `next.ServeHTTP(w, r)`——因为 `*Request` 的 ctx 字段是不导出的，`WithContext` 返回一个浅拷贝副本，新 ctx 嵌在新 Request 里。下游用 `r.Context().Value(userKey)` 取值。**key 必须用私有类型**（`type ctxKey struct{}` 或 `type ctxKey int`）避免跨包 key 冲突——如果用 `string` 做 key，两个包都用 `\"user\"` 就会互相覆盖。"
     },
     {
       "type": "explain",
       "title": "ResponseWriter 写头时序、流式响应与三组 Server 超时",
-      "content": "ResponseWriter 是中间件最容易翻车的地方，因为它的状态机比看起来复杂：\n- `WriteHeader(code)` 只能调用**一次**；第二次调用会触发 `http: superfluous response.WriteHeader call` 警告并被忽略。\n- `Write(p)` 第一次被调时如果还没调 WriteHeader，会**隐式发送 200 OK**——这就是为什么写中间件时 `w.Header().Set(...)` 必须在 WriteHeader 之前调，否则头没发出去。\n- 想拦截状态码做 metrics，标准做法是包一层：`type rw struct{ http.ResponseWriter; status int }`，重写 `WriteHeader(code int) { rw.status = code; rw.ResponseWriter.WriteHeader(code) }`。但要注意如果上游用了 `http.Flusher` / `http.Hijacker` / `http.Pusher` 接口，包装类型必须断言并代理这些接口，否则 SSE / WebSocket 升级会失败——这是中间件链里最常见的坑之一。\n\n流式响应（SSE、长轮询、流式 JSON）：\n- 必须先设 Content-Type 等头，再 `w.(http.Flusher).Flush()` 把已写入的内容真正推到 TCP；否则数据会卡在 net/http 的 bufio.Writer 里。\n- 对端断开通过 `r.Context().Done()` 感知（Go 1.7+），handler 里 `select { case <-r.Context().Done(): return }` 是标准退出方式。\n\n超时控制有三组完全不同的旋钮：\n- `http.Server.ReadTimeout`：从 Accept 到读完整个请求体的时间，防慢速攻击（slowloris）。\n- `http.Server.WriteTimeout`：从读完请求到响应写完的时间，包含 handler 执行 + 数据传输；流式响应必须设为 0 或用 `ResponseController.SetWriteDeadline` 动态调整。\n- `http.Server.IdleTimeout`：Keep-Alive 连接空闲多久后关闭；不设的话 fallback 到 ReadTimeout，长连接客户端会被踢。\n- `http.TimeoutHandler` 或 handler 内 `ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)`：控制业务逻辑超时，到点 ctx.Done() 触发，下游 SQL/RPC 必须用支持 Context 的 API 调用才会真停下。WriteTimeout 是兜底网，业务超时应优先用 ctx 而非常规 WriteTimeout——前者超时可以返回 504 + 业务错误码；后者超时连接直接被 reset，客户端拿不到响应体。"
+      "content": "ResponseWriter 是中间件最容易翻车的地方，因为它的状态比看起来复杂：\n- `WriteHeader(code)` 只能调用**一次**。第二次调用会触发 `http: superfluous response.WriteHeader call` 警告并被忽略——如果 recover 中间件在 panic 后想写 500，但业务 handler 已经写过 200 头了，500 响应体不会发出去，客户端拿到的是截断的 200 响应。这不算 bug，但你必须知道 recover 只能保证日志记录，不能保证「一定返回 500」。\n- `Write(p)` 第一次被调时如果还没调过 WriteHeader，会**隐式发送 200 OK**。这就是为什么 `w.Header().Set(...)` 必须在 WriteHeader 之前——Header() 返回的 map 只是暂存，WriteHeader 时才真正序列化发送；如果先 Write 了，之前 Set 的 Header 没机会发出去。\n- 包装 ResponseWriter 拦截状态码的标准做法是：`type statusRecorder struct{ http.ResponseWriter; status int }`，重写 `WriteHeader(code)` 把 code 存下来再调底层。**但必须同时代理 http.Flusher**（SSE/流式推数据用 `w.(http.Flusher).Flush()`），如果包装类型没实现 Flush，类型断言失败后 Flush 不会执行，消息卡在 net/http 内部的 bufio.Writer 里推不出来。同理如果用 WebSocket 需代理 http.Hijacker，HTTP/2 server push 需代理 http.Pusher。chi 的 `middleware.WrapResponseWriter` 就是把这套全做好的版本。\n\n流式响应（SSE、文件下载、流式 JSON）的特殊处理：\n- 必须先设 Content-Type 等头，然后 `Flush()` 推到 TCP；每写一段都要 Flush。\n- 对端断开通过 `r.Context().Done()` 感知（Go 1.7+），handler 里 `select { case <-r.Context().Done(): return }` 是标准退出方式。\n\n超时控制有三组完全不同的旋钮，语义不能混：\n- `ReadTimeout`：从 Accept 到读完整个请求头和体的时间。防 slowloris 攻击——攻击者慢速发 header/body 但不发完，占用连接资源。一般 5-10s。\n- `WriteTimeout`：从读完请求到响应写完的时间，包含 handler 执行 + 数据传输。流式接口响应「永远写不完」，撞上 WriteTimeout 连接直接被 reset，客户端拿不到任何响应体。要么挂在 WriteTimeout=0 的独立 Server，要么在 handler 内用 `http.NewResponseController(w).SetWriteDeadline(time.Time{})` 清掉（Go 1.20+）。\n- `IdleTimeout`：Keep-Alive 连接空闲多久后关闭。不设的话 fallback 到 ReadTimeout——这意味着 ReadTimeout=5s 的服务，Keep-Alive 连接 5 秒没新请求就被踢，HTTP 客户端的连接池复用率会很低。\n- `context.WithTimeout`：控制业务逻辑超时。到点 ctx.Done() 触发，下游 SQL/RPC 必须用 `context.Context` 参数的 API 才能真正停下。业务超时应优先用 ctx 而非常规 WriteTimeout——前者超时可以返回 504 + 业务错误码；后者超时连接被 reset，客户端拿不到响应体。"
+    },
+    {
+      "type": "explain",
+      "title": "graceful shutdown：关 Listener、等 in-flight、超时强杀",
+      "content": "Graceful shutdown 要解决的核心问题是：收到 SIGTERM 后，正在处理中的请求不能直接被掐断，但也不能无限等下去。\n\n`Server.Shutdown(ctx)` 的完整流程：\n1. 关闭 Listener，不再 Accept 新连接——新请求会收到 connection refused，由上游（LB/K8s）摘除该 Pod。\n2. 关闭所有 idle 的 Keep-Alive 连接——没有 in-flight 请求的连接直接断。\n3. 等待所有 in-flight 请求处理完毕（handler 自然 return）。\n4. 如果 ctx 超时（比如 15s）仍有请求没处理完，Shutdown 返回 ctx.Err()，**但此时卡住的连接仍然没被关**——你必须再调 `srv.Close()` 强杀。不 Close 的话那些死循环或阻塞在下游的 handler 会让进程 hang 住，K8s 的 terminationGracePeriodSeconds 到了会发 SIGKILL，正在处理的请求全部失败且无法优雅返回错误。\n\n`signal.NotifyContext` 是 Go 1.16+ 推荐的写法，替代老的 `signal.Notify(ch)` + select：收到 SIGINT/SIGTERM 时自动 cancel ctx。Shutdown 之后如果需要 flush 日志或关闭数据库连接，可以在 `srv.Shutdown` 和 `os.Exit` 之间做清理。\n\n在 K8s 环境里，graceful shutdown 还要配合 preStop hook 和 readiness probe：收到 SIGTERM 后先让 readiness probe 返回 503，等 kubelet 从 Endpoint 摘掉后再真正 Shutdown，避免在摘除期间还收到新请求。"
+    },
+    {
+      "type": "explain",
+      "title": "中间件顺序的工程考量与常见陷阱",
+      "content": "中间件顺序不是「想怎么排就怎么排」，每一层的位置都有明确的工程原因，排错了会导致功能失效或安全漏洞。\n\n**典型生产顺序（外→内）**：\n1. recover → 2. access log → 3. CORS → 4. IP 限流 → 5. auth → 6. 用户限流 → 7. ctx timeout → 8. 业务 handler\n\n各层位置的逻辑：\n- recover 最外：兜住所有下游中间件的 panic。如果 recover 在 access log 里面，access log 自己 panic 就没人兜了。\n- access log 紧贴 recover 内侧：后置记录 status code 和耗时，必须在所有后续中间件和 handler 执行完之后才写日志。\n- CORS 放在 auth 之前：浏览器 preflight OPTIONS 请求不带 Authorization header，如果 auth 先拦了返回 401，CORS 没机会设响应头，浏览器报 CORS 错误。这是最常见的 CORS+auth 顺序 bug。\n- IP 限流在 auth 之前：防止无 token 的高频请求打爆 auth 层（JWT 解析、Redis 查询都是成本）。\n- 用户限流在 auth 之后：需要 user ID 才能按用户限速。\n- ctx timeout 紧贴业务：auth 本身很快（微秒级 JWT 解析），没必要包在超时里；超时应覆盖真正可能慢的操作（SQL、下游 RPC）。\n\n**常见陷阱**：\n- 忘记调 `next.ServeHTTP(w, r)`：请求会挂起，客户端等到底层 TCP 超时才拿到错误。这是新人写中间件最常犯的错误，尤其在 if-else 分支里容易漏。\n- 中间件 panic 后 WriteHeader 只能写一次：如果业务 handler 已经写了部分数据（200 + body 片段），recover 想写 500 会被忽略，客户端拿到的是半截响应。recover 能做的是记录 panic、关闭连接，不能保证「一定返回 500」。\n- 在 handler 里启动 goroutine 仍引用 `w` 和 `r`：请求结束后 `*Request` 和 ResponseWriter 会被 net/http 连接池复用，后台 goroutine 再写 w 会 panic 或写到别人的响应里。解决：把需要的数据复制出来，用独立的 context 管理生命周期。"
     },
     {
       "type": "diagram",
       "title": "Go Web 中间件链：请求上下文、前置校验、业务处理、后置记录与恢复",
       "format": "mermaid",
       "content": "flowchart TD\nA[\"HTTP Request\"] --> B[\"Recover Middleware\"]\nB --> C[\"Trace/Logger Middleware\"]\nC --> D[\"Auth Middleware\"]\nD --> E[\"Rate Limit / Timeout\"]\nE --> F[\"Router 匹配 Handler\"]\nF --> G[\"业务 Handler\"]\nG --> H[\"ResponseWriter 写响应\"]\nH --> I[\"后置日志和指标\"]\nE --> J{\"ctx.Done\"}\nJ -->|超时/取消| K[\"停止下游工作\"]",
-      "fallback": "图展示 Go Web 中间件按嵌套链执行，常见职责是恢复、追踪、认证、限流、超时和后置指标。",
+      "fallback": "图展示 Go Web 中间件按嵌套链执行，常见职责是恢复、追踪、认证、限流、超时和后置指标。请求从外层 Recover 进入，经过 Logger、Auth、RateLimit/Timeout 到 Router 匹配业务 Handler，写响应后回到后置层记录日志和指标；超时场景通过 ctx.Done 信号停止下游工作。",
       "caption": "Go Web 中间件链：请求上下文、前置校验、业务处理、后置记录与恢复",
       "sources": [
         {
@@ -64,7 +74,7 @@
         "框架",
         "路由实现",
         "中间件签名",
-        "性能基准（参考）",
+        "性能/生态取舍",
         "典型生产理由"
       ],
       "rows": [
@@ -72,28 +82,28 @@
           "net/http + chi",
           "radix tree, 支持 URL 参数和正则",
           "func(http.Handler) http.Handler, 完全兼容标准库",
-          "约 8-10 万 QPS（参数路由），与 gin 同档",
+          "路由开销低，保留标准库 Handler 生态；真实性能取决于业务 handler、JSON、IO 和压测模型",
           "想保留 http.Handler 生态（OpenTelemetry instrumentation、pprof、httptest）选这条；可以无缝替换标准库 ServeMux"
         ],
         [
           "gin",
           "httprouter fork 的 radix tree",
           "func(*gin.Context), 自有抽象不兼容 net/http",
-          "约 10-12 万 QPS, JSON 序列化用 jsoniter 较快",
+          "路由和绑定链路成熟；自有 Context 带来便利，也带来迁移成本",
           "中间件生态最丰富（Sentry/Prometheus 都有官方包），但 Context 自成一派, 想换框架代价大"
         ],
         [
           "echo",
           "radix tree + 分组路由",
           "func(echo.HandlerFunc) echo.HandlerFunc",
-          "和 gin 同档",
+          "路由性能通常不是瓶颈；优势在 API 克制和错误处理模型",
           "API 比 gin 更克制, 错误处理（HTTPErrorHandler）更统一; binding/validator 内置"
         ],
         [
           "标准库 net/http (Go 1.22+)",
           "ServeMux 支持 method + {param}",
           "func(http.Handler) http.Handler",
-          "约 7-8 万 QPS, 略低于 chi/gin",
+          "Go 1.22 后能力覆盖小服务常见路由；少依赖、易审计，但高级中间件需自己补",
           "依赖最少、二进制小、生命周期最稳；内部工具和小服务首选"
         ]
       ]
@@ -106,42 +116,50 @@
       "highlights": [
         {
           "line": 25,
-          "note": "包装 ResponseWriter 必须代理 http.Flusher 接口，否则 SSE/流式响应里 w.(http.Flusher).Flush() 类型断言会失败，消息卡在 bufio.Writer 里推不出去；同理如果业务用到 WebSocket 升级（Hijacker）或 HTTP/2 push（Pusher），都要按需代理。"
+          "note": "包装 ResponseWriter 必须代理 http.Flusher 接口。SSE 依赖 w.(http.Flusher).Flush() 把数据从 bufio.Writer 推到 TCP，如果包装类型没实现 Flush，类型断言失败后数据卡在缓冲区。同理 http.Hijacker（WebSocket 升级）和 http.Pusher（HTTP/2 server push）也要按需代理。"
         },
         {
           "line": 33,
-          "note": "recover 必须放最外层。defer + recover 的位置很关键：必须在 next.ServeHTTP 前 defer，才能兜住下游所有中间件和 handler 的 panic。如果 panic 发生在 Write 已经发出 200 头之后，这里 http.Error(500) 不会生效（WriteHeader 第二次调用被忽略），只能 log + 关连接，由客户端重试。"
+          "note": "recover 必须放最外层。defer + recover 的作用范围是当前函数——在 next.ServeHTTP 前 defer，才能兜住所有下游中间件和 handler 的 panic。如果业务 handler 已经写了 200 头，recover 里的 http.Error(500) 不会生效（WriteHeader 第二次被忽略），但 panic 会被记录、连接会被关闭。"
         },
         {
           "line": 56,
-          "note": "context.WithTimeout 必须搭配 r.WithContext(ctx) 才能传给下游 handler；defer cancel() 不能漏，否则即使 next 提前返回，timer 也要熬到超时点才释放，长时间高并发下会泄漏 context goroutine。"
+          "note": "context.WithTimeout 必须搭配 r.WithContext(ctx) 传给下游。defer cancel() 不能漏——next 提前返回后 timer 和相关资源要等到超时点才释放，短暂的请求会积攒大量未释放的 timer。"
         },
         {
           "line": 78,
-          "note": "WriteTimeout=10s 对流式接口（SSE、文件下载、长轮询）是致命的——会在 10 秒整把连接 reset。流式 handler 要么挂在单独的 Server 实例上（WriteTimeout=0），要么用 http.NewResponseController(w).SetWriteDeadline(time.Time{}) 在 handler 内清掉。"
+          "note": "WriteTimeout=10s 对流式接口是致命的：10s 一到连接被 reset，客户端拿到 connection reset 而不是响应体。流式接口要么挂在 WriteTimeout=0 的独立 Server，要么在 handler 内用 http.NewResponseController(w).SetWriteDeadline(time.Time{}) 清掉。"
         },
         {
           "line": 93,
-          "note": "Server.Shutdown 关闭 Listener 不再 Accept 新连接，但等待已有请求自然结束直到 shutdownCtx 超时；超时后必须再调 srv.Close() 强杀，否则那些卡住的 handler 会让进程 hang 住，K8s 收不到正常退出会发 SIGKILL，造成正在处理的请求失败。"
+          "note": "Server.Shutdown 关 Listener 后等 in-flight 请求自然结束。shutdownCtx 超时后 Shutdown 返回，但卡住的连接没被关——必须再调 srv.Close() 强杀。否则进程 hang 住，K8s terminationGracePeriodSeconds 到了发 SIGKILL，正在处理的请求直接失败。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "Go Web 服务我会从三个层次回答：标准库的 Handler 抽象、中间件装饰器链的顺序语义、连接级 vs 业务级的超时控制。\n\n机制要点：\n- 第一层是 net/http 的接口设计。http.Handler 只有 ServeHTTP 一个方法，HandlerFunc 用 type alias 把普通函数适配成 Handler，是 Go「方法绑定到函数类型」的经典写法。Server 接到连接后用 ServeMux 做最长前缀匹配，Go 1.22 起 ServeMux 也支持 GET /users/{id} 这种方法+参数路由，参数用 r.PathValue 取，对小服务来说基本不需要再引第三方框架。\n- 第二层是中间件链。签名固定是 func(http.Handler) http.Handler，多个中间件嵌套调用形成洋葱模型。顺序我一般这样排：最外层 recover 防止 panic 把进程带崩，紧贴的是 access log（包一个 statusRecorder 拦截 WriteHeader 拿状态码），然后是按 IP 的限流，再做 auth 解析 JWT 注入用户身份到 ctx，最后才是 ctx WithTimeout 包业务 handler。中间件之间用 r.WithContext(ctx) 透传 Context，注入用户信息或链路 ID 都走这条路，key 用私有类型避免跨包冲突。\n- 第三层是超时和优雅关闭。Server 有三组超时——ReadTimeout 防慢速读、WriteTimeout 兜底响应写完、IdleTimeout 控 Keep-Alive 空闲；流式响应必须把 WriteTimeout 设成 0 或在 handler 里 SetWriteDeadline 清掉。Shutdown 收到 SIGTERM 后关 Listener 不再 Accept、等 in-flight 请求自然处理完，配合 context.WithTimeout(15s) 兜底，超时再 srv.Close() 强杀。\n- 几个易错点我会主动提：r.Body 是 io.ReadCloser 只能读一次，预读后要 io.NopCloser(bytes.NewReader(body)) 重置；WriteHeader 只能调一次，第二次会被忽略并报 superfluous 警告；包装 ResponseWriter 要代理 Flusher/Hijacker 接口，否则 SSE/WebSocket 会挂；handler 启动后台 goroutine 不能再引用 r 和 w，请求结束后这两个对象会被 net/http 回收复用。",
+      "content": "**一句话结论**\nGo Web 服务的标准模型是：Handler 接口统一请求处理入口 → 中间件装饰器链做横切关注点 → Server 超时 + context 超时分层控制 → Shutdown 等 in-flight 再强杀。\n\n**Handler 与路由**\n- `http.Handler` 只有 `ServeHTTP(w, r)` 一个方法。`http.HandlerFunc` 是函数→Handler 的适配器（类型定义 + 方法绑定），省去定义结构体。\n- `ServeMux` 做模式匹配：Go 1.22 起支持 `GET /users/{id}` 声明方法和路径参数，参数用 `r.PathValue(\"id\")` 取，小服务不需第三方路由。\n\n**中间件链**\n- 签名固定 `func(http.Handler) http.Handler`，嵌套组合形成洋葱模型（外→内→外）。\n- 典型顺序：recover 最外 → access log 紧贴 → CORS → IP 限流 → auth → 用户限流 → ctx timeout → 业务 handler。\n- 顺序有工程语义：recover 最外兜住所有 panic；IP 限流在 auth 前防打爆认证层；CORS 在 auth 前避免 preflight OPTIONS 被 401 拦截。\n- Context 透传必须 `r = r.WithContext(ctx)` 后再 `next.ServeHTTP`，ctx key 用私有类型避免跨包冲突。\n\n**ResponseWriter 三条铁律**\n- `WriteHeader(code)` 只能调一次，第二次被忽略并报 superfluous 警告。\n- `Write(p)` 首次调用时如果没调 WriteHeader，隐式发送 200 OK——所以 `w.Header().Set()` 必须在 WriteHeader 之前。\n- `r.Body` 只能读一次，预读后必须 `io.NopCloser(bytes.NewReader(body))` 重置。\n- 包装 ResponseWriter 时要代理 `http.Flusher` / `http.Hijacker` / `http.Pusher`，否则 SSE/WebSocket 会挂。\n\n**超时分层**\n- `ReadTimeout` 防 slowloris（慢速读 header/body），一般 5-10s。\n- `WriteTimeout` 是从读完请求到写完响应的总时长兜底，流式接口必须设 0 或在 handler 内清掉。\n- `IdleTimeout` 控 Keep-Alive 空闲连接回收，不设会 fallback 到 ReadTimeout。\n- `context.WithTimeout` 控制业务逻辑超时，下游 SQL/RPC 必须用 ctx 参数的 API 才能真正停。优先用 ctx 超时（可返回 504），WriteTimeout 超时直接 reset 连接。\n\n**Graceful Shutdown**\n- 收到 SIGTERM → `Shutdown(ctx)` 关 Listener + 关 idle 连接 + 等 in-flight 自然结束。\n- ctx 超时后必须 `srv.Close()` 强杀，否则进程 hang、K8s 最终发 SIGKILL。\n- K8s 里还要配合 readiness probe 先返回 503，等 Endpoint 摘除后再 Shutdown。",
       "followUpQuestions": [
         {
           "question": "中间件包装 ResponseWriter 后，SSE 接口推不出消息，可能是什么原因？",
-          "answer": "包装类型只继承了基础 http.ResponseWriter，没有代理 http.Flusher 接口。SSE 依赖 w.(http.Flusher).Flush() 把数据从 bufio.Writer 推到 TCP，类型断言失败后 Flush 不会执行，消息卡在缓冲区里。修法是在包装结构体上加 Flush 方法代理到底层：func (s *statusRecorder) Flush() { if f, ok := s.ResponseWriter.(http.Flusher); ok { f.Flush() } }。同理 http.Hijacker（WebSocket 升级用）和 http.Pusher（HTTP/2 server push）也要按需代理；chi 的 middleware.WrapResponseWriter 就是把这套全代理好了的版本。"
+          "answer": "包装类型只继承了基础 http.ResponseWriter，没有代理 http.Flusher 接口。SSE 依赖 w.(http.Flusher).Flush() 把数据从 bufio.Writer 推到 TCP，类型断言失败后 Flush 不会执行，消息卡在缓冲区里。修法是在包装结构体上加 Flush 方法代理到底层：`func (s *statusRecorder) Flush() { if f, ok := s.ResponseWriter.(http.Flusher); ok { f.Flush() } }`。同理 http.Hijacker（WebSocket 升级）和 http.Pusher（HTTP/2 server push）也要按需代理。"
         },
         {
           "question": "Server.WriteTimeout 设了 10s，为什么 SSE 接口跑了 10 秒就被断开？",
-          "answer": "WriteTimeout 是从读完请求到响应写完的整体时长上限，10s 一到 net/http 会直接给底层 TCP 设 deadline，写操作返回 i/o timeout，连接被关。流式接口本质上响应永远没写完，所以一定会撞这个超时。生产解法有两种：（1）流式接口挂在单独的 *http.Server 实例上、WriteTimeout 设 0（不限）；（2）在 handler 里调 http.NewResponseController(w).SetWriteDeadline(time.Time{}) 清掉本次请求的写 deadline，Go 1.20+ 才支持。业务超时改用 ctx.WithTimeout 控制，超时后能正常返回 504 而不是被 reset。"
+          "answer": "WriteTimeout 是从读完请求到响应写完的整体时长上限，10s 一到 net/http 直接给底层 TCP 设 deadline，写操作返回 i/o timeout，连接被 reset。流式接口的响应本质上「永远写不完」，所以一定会撞这个超时。解法：流式接口挂在 WriteTimeout=0 的独立 Server，或在 handler 内用 `http.NewResponseController(w).SetWriteDeadline(time.Time{})` 清掉本次写 deadline（Go 1.20+）。业务超时改用 `context.WithTimeout` 控制，超时后能正常返回 504 而不是被 reset。"
         },
         {
-          "question": "Server.Shutdown 已经返回了 nil，但日志里还在打这个请求的 access log，怎么解释？",
-          "answer": "这不算异常。Shutdown 的语义是「关 Listener 不再 Accept 新连接 + 等已有 in-flight 请求自然结束 + 等 idle Keep-Alive 连接 close」，它返回 nil 只代表所有连接都已经处理完或被关闭。但 access log 是中间件在 next.ServeHTTP 返回后才写的——如果你的日志走的是 buffered writer 或异步 channel，请求结束和日志落盘之间有延迟，看到的现象就是 Shutdown 后还有日志输出。要严格保证日志落盘，需要在 main 函数里 Shutdown 之后再 flush 日志 sink；如果是 zap/slog 的 buffered handler，调对应的 Sync()。"
+          "question": "Server.Shutdown 返回 nil 后日志还在打 access log，怎么解释？",
+          "answer": "Shutdown 返回 nil 表示所有连接都已处理完或关闭。但 access log 是中间件在 next.ServeHTTP 返回后才写的——如果日志走 buffered writer 或异步 channel，请求结束和日志落盘之间有延迟，现象就是 Shutdown 后还有日志。要严格保证日志落盘，需要在 Shutdown 之后 flush 日志 sink（zap 调 Sync()，slog 看 handler 实现）。"
+        },
+        {
+          "question": "为什么 recover 中间件必须放在最外层？",
+          "answer": "defer + recover 的作用范围是当前函数栈。如果 recover 放在 access log 或 metrics 中间件的内层，那些外层中间件自己的 panic（比如打点代码空指针、日志格式化出错）就没有 recover 兜住，进程直接挂。net/http 自带 per-conn recover 只打日志关连接，不写自定义 500 响应体，也不走你的日志系统，所以不能依赖。"
+        },
+        {
+          "question": "r.Body 只能读一次，中间件预读 body 做签名校验后怎么办？",
+          "answer": "读完后必须把 body 重置回去：`body, _ := io.ReadAll(r.Body); r.Body = io.NopCloser(bytes.NewReader(body))`。这样下游 handler 再读 r.Body 时从头开始读。io.NopCloser 是因为 bytes.Reader 没有 Close 方法，需要包一个 no-op Closer 满足 io.ReadCloser 接口。不重置的话下游读到 EOF，拿不到请求体。"
         }
       ]
     },
@@ -149,14 +167,15 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能手写 func(http.Handler) http.Handler 签名并解释为什么要包装 ResponseWriter（拦截 status、代理 Flusher/Hijacker）",
-        "能画出 ServeMux 最长前缀匹配规则，并说出 Go 1.22 新增的 method + {param} 路径参数",
-        "能解释洋葱模型 + 中间件顺序（recover 最外、access log 紧贴、IP 限流早于 auth、ctx 超时贴近业务）",
-        "能说清 r.Body 只能读一次、WriteHeader 只能调一次、Write 隐式 200 这三条铁律",
-        "能区分 Server.ReadTimeout / WriteTimeout / IdleTimeout 与 handler 内 context.WithTimeout 的语义",
-        "能解释 Server.Shutdown 的实现：关 Listener、等 in-flight、超时后必须 Close 强杀",
-        "能识别在 handler 启动后台 goroutine 仍引用 w/r 的风险（请求结束后对象被复用）",
-        "能说清流式响应（SSE）为什么要单独处理 WriteTimeout 和 Flusher"
+        "能手写 func(http.Handler) http.Handler 签名的中间件，并解释洋葱模型（外→内→外）的执行顺序",
+        "能说出 ServeMux 模式匹配规则和 Go 1.22 新增的 method + {param} 路径参数（r.PathValue）",
+        "能解释 ResponseWriter 三条铁律：WriteHeader 只能调一次、Write 隐式 200、r.Body 只能读一次",
+        "能说明包装 ResponseWriter 时必须代理 http.Flusher / Hijacker / Pusher，否则 SSE/WebSocket 会挂",
+        "能解释 Context 透传必须 r = r.WithContext(ctx) 后再 next.ServeHTTP，ctx key 用私有类型",
+        "能区分 Server.ReadTimeout / WriteTimeout / IdleTimeout 与 handler 内 context.WithTimeout 各自防什么",
+        "能解释 Server.Shutdown 的完整流程：关 Listener → 关 idle 连接 → 等 in-flight → 超时后 Close 强杀",
+        "能说出典型中间件顺序的工程原因：recover 最外、CORS 在 auth 前、IP 限流在 auth 前",
+        "能识别 handler 启动后台 goroutine 仍引用 w/r 的风险（请求结束后对象被复用）"
       ]
     }
   ],
@@ -177,17 +196,38 @@
     },
     {
       "id": "go.engineering.web-middleware.recall.3",
-      "prompt": "解释 Server.Shutdown 的实现：它如何区分新连接和 in-flight 请求？什么场景下需要再调 Close？",
+      "prompt": "解释 Server.Shutdown 的完整流程：它如何区分新连接和 in-flight 请求？什么场景下需要再调 Close？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
+    },
+    {
+      "id": "go.engineering.web-middleware.recall.4",
+      "prompt": "中间件包装 ResponseWriter 后 SSE 消息推不出来，你怎么排查？写出修法代码。",
+      "mode": "code",
+      "expectedMinutes": 5,
+      "difficulty": 3
+    },
+    {
+      "id": "go.engineering.web-middleware.recall.5",
+      "prompt": "r.Body 只能读一次，如果中间件需要预读 body 做签名校验，怎么让下游 handler 还能正常读到 body？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "go.engineering.web-middleware.recall.6",
+      "prompt": "解释 CORS 中间件为什么必须放在 auth 中间件之前？如果顺序反了会出什么问题？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
       "http.Handler 接口（ServeHTTP）+ HandlerFunc 适配器把函数适配成 Handler",
       "中间件签名 func(http.Handler) http.Handler，洋葱模型与外→内→外执行顺序",
-      "ServeMux 最长前缀匹配规则，Go 1.22 起支持 method + {param} 路径参数（r.PathValue）",
+      "ServeMux 模式匹配/最具体匹配规则，Go 1.22 起支持 method + {param} 路径参数（r.PathValue）",
       "Context 透传必须 r = r.WithContext(ctx) 后再 next.ServeHTTP，私有 ctxKey 类型避免冲突",
       "ResponseWriter 三条铁律：WriteHeader 只能调一次、Write 隐式 200、r.Body 只能读一次",
       "Server 三组超时（ReadTimeout/WriteTimeout/IdleTimeout）与 handler 内 context.WithTimeout 的分工",
@@ -195,7 +235,7 @@
     ],
     "goodToHave": [
       "包装 ResponseWriter 时代理 http.Flusher / Hijacker / Pusher 接口（SSE、WebSocket、HTTP/2 push）",
-      "中间件顺序的工程考量：recover 最外、access log 紧贴 recover、IP 限流早于 auth、用户限流晚于 auth",
+      "中间件顺序的工程考量：recover 最外、CORS 在 auth 前、IP 限流早于 auth、用户限流晚于 auth",
       "预读 r.Body 后用 io.NopCloser(bytes.NewReader(body)) 重置回去，否则下游读到 EOF",
       "gin / echo / chi 与标准库 net/http 的中间件签名差异和迁移成本",
       "流式响应单独使用 WriteTimeout=0 的 Server，或 http.NewResponseController.SetWriteDeadline 在 handler 内清掉"
@@ -215,5 +255,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

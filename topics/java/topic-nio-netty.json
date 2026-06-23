@@ -4,7 +4,7 @@
   "category": "java-fundamentals",
   "group": "java-fundamentals",
   "title": "Java IO/NIO 体系与 Netty",
-  "summary": "这篇要把 BIO/NIO/AIO、NIO 三件套、Reactor、Netty EventLoop/Pipeline/ByteBuf、拆包和阻塞隔离串成一条真实请求链路。",
+  "summary": "从 BIO 到 NIO 的阻塞语义分界讲起，串通 Selector 就绪通知、Reactor 线程模型、Netty EventLoop/Pipeline/ByteBuf 的请求链路，落到 FrameDecoder 拆包、EventLoop 阻塞隔离、写缓冲背压和线上可观测指标。",
   "tags": [
     "Java",
     "NIO",
@@ -12,29 +12,39 @@
     "Reactor"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 35,
+  "estimatedMinutes": 44,
   "order": 120,
   "recommendWeight": 86,
   "learningCards": [
     {
       "type": "explain",
-      "title": "BIO、NIO、AIO：先分清阻塞语义",
-      "content": "BIO 是同步阻塞模型，常见写法是一连接一线程，`accept/read/write` 会阻塞当前线程。连接数少、逻辑简单时开发成本低；连接多、长连接多或慢客户端多时，线程数量、内存栈和上下文切换会先成为瓶颈。\n\nNIO 是同步非阻塞 + 多路复用：`Channel` 设为非阻塞，`Selector` 等待多个 Channel 的就绪事件，`Buffer` 承载读写数据。Selector 只告诉应用“可以读/可以写/有新连接”，真正的 `read/write` 仍由应用线程执行，所以 NIO 不是异步 IO。Linux 上常见底层是 epoll，macOS 等平台会有不同实现，Java API 统一抽象为 Selector。\n\nAIO 通过异步 Channel、Future 或 CompletionHandler 表达完成通知，但 Java 网络服务生态里，主流高并发框架仍以 NIO/Reactor 为核心。面试回答不要简单把 AIO 说成 NIO 的升级版，要回到平台实现、框架生态、排障经验和收益验证。"
+      "title": "BIO 到 NIO：阻塞语义是分水岭",
+      "content": "BIO 的核心特征是同步阻塞：`accept`、`read`、`write` 都会阻塞调用线程，连接数少、单次处理快时代码直觉好写；但连接数上升后，每条连接占一个线程，内存栈（默认 512KB～1MB/线程）和上下文切换成本先成为瓶颈，而非 CPU 本身。\n\nNIO 的核心变化是把「等待就绪」和「执行读写」分离。`ServerSocketChannel`/`SocketChannel` 设为非阻塞后，`accept`/`read`/`write` 不再阻塞线程；`Selector` 通过 `epoll_wait`（Linux）或对应平台调用轮询多个 Channel 的就绪事件，一次 `select()` 返回多个就绪 Key；应用线程拿到就绪 Key 后自行执行 `read`/`write`，数据拷贝仍由应用完成。因此 NIO 是同步非阻塞加多路复用，不是异步 IO。\n\nAIO（`AsynchronousSocketChannel`）在语义上接近异步完成通知：提交操作后由系统回调 `CompletionHandler`。但 Linux 上 Java AIO 底层仍基于线程池模拟（`epoll` + `pthread`），不如原生 NIO + epoll 在高并发场景下的开销可控；加上 Netty 生态几乎垄断了 Java 网络框架，AIO 在主流中间件中几乎没有落地。面试时不要把 AIO 说成「NIO 的升级版」，要回到平台实现和框架生态来说明为什么 NIO/Reactor 是主流。"
     },
     {
       "type": "explain",
-      "title": "Reactor 到 Netty：线程模型和事件路径",
-      "content": "Reactor 是 NIO 的工程化范式：事件循环线程等待就绪事件，再分发给 Handler。单 Reactor 模型简单，但 accept、read/write、业务处理都压在少量线程上；主从 Reactor 把 boss 和 worker 拆开，boss 负责接入连接，worker 负责连接上的读写事件，更适合多核和大量长连接。\n\nNetty 把 Reactor 封装成 EventLoopGroup。一个 Channel 注册到一个 EventLoop 后，该 Channel 的 IO 事件在同一个 EventLoop 线程内串行处理，这能减少锁竞争；代价是 EventLoop 不能执行慢 SQL、远程 RPC、阻塞文件 IO、复杂 CPU 任务或长时间同步等待。慢任务要交给业务线程池、DefaultEventExecutorGroup 或异步化组件，完成后再把结果写回 Channel。"
+      "title": "Reactor 模式：从事件循环到 Netty EventLoop",
+      "content": "Reactor 的核心是一个事件循环线程不断调用 `Selector.select()`，拿到就绪事件后分发给对应 Handler。单 Reactor 单线程模型适合低并发原型，但所有 IO 和业务都压在一个线程上，CPU 利用率和吞吐受限。多线程 Reactor 把 accept 和读写分开：boss 线程组专门 `OP_ACCEPT` 接入连接，worker 线程组负责已连接 Channel 的读写事件。两者之间通过 `register` 交接 Channel，worker 内部每个 Channel 只属于一个 EventLoop 线程，IO 操作串行无锁。\n\nNetty 把这个模式工程化。`NioEventLoopGroup` 是线程组，内部每个 `NioEventLoop` 持有一个 `Selector`。`ServerBootstrap` 的 `group(bossGroup, workerGroup)` 把 accept 和读写拆开。新连接接入后，boss EventLoop 创建 `NioSocketChannel`，通过 `EventLoopChooser` 选一个 worker EventLoop 注册。此后这个 Channel 的所有 IO 事件（`OP_READ`、`OP_WRITE`）都在同一个 EventLoop 线程内串行。这样避免了 IO 层加锁；代价是 EventLoop 线程不能阻塞——任何慢任务（DB 查询、RPC 调用、阻塞文件 IO、长 CPU 计算）都会卡住该 EventLoop 管理的所有 Channel。"
     },
     {
       "type": "explain",
-      "title": "Pipeline、ByteBuf 和网络协议边界",
-      "content": "每个 Netty Channel 有一条 ChannelPipeline。入站事件通常从 head 到 tail 传播，出站事件通常反向传播。常见顺序是：FrameDecoder 切出完整消息，协议解码器把 ByteBuf 变成业务对象，鉴权/限流/业务 Handler 处理，出站编码器再把响应写成字节。\n\nTCP 是字节流，没有消息边界。自定义协议必须用固定长度、分隔符、长度字段或更完整的协议编解码器处理粘包和半包。ByteBuf 比 ByteBuffer 更适合网络协议：读写指针分离、直接内存/池化、slice/composite 减少拷贝；但它有引用计数，retain/release 错误会造成内存泄漏，线上要关注 leak detector、直接内存使用和 Handler ownership。"
+      "title": "Pipeline 和编解码：请求穿过 Netty 的完整路径",
+      "content": "每个 Channel 持有一条 `ChannelPipeline`，由双向链表的 `ChannelHandler` 组成。入站事件（`channelRead`、`channelActive` 等）从 head 向 tail 传播；出站事件（`write`、`flush`、`close` 等）从 tail 向 head 传播。`ChannelHandlerContext` 负责在 Handler 之间传递事件和数据。\n\nTCP 是字节流，没有消息边界。Netty 用 `ByteToMessageDecoder` 基类处理累计：每次 `decode` 被调用时，`cumulation` 缓冲区里可能有半包（数据不够一个完整消息）或多包（多条消息粘在一起）。解码器要检查剩余字节数：不够时直接 return，等下次读；够时 `mark` 读指针，切出一条完整消息，`reset` 时保留未消费部分。`LengthFieldBasedFrameDecoder` 是生产最常用方案：按长度字段跳过包头、读取正文长度、等待足够字节后再切；它内部把累计、半包回滚、长度校验都封装好了，不需要自己维护 `mark`/`reset`。\n\n典型 Pipeline 顺序：`IdleStateHandler`（心跳/超时检测）→ `LengthFieldBasedFrameDecoder`（切帧）→ `MessageDecoder`（ByteBuf → 业务对象）→ `AuthHandler`/`RateLimitHandler` → `BusinessHandler`。出站是 `MessageEncoder`（业务对象 → ByteBuf）→ `write`/`flush`。Handler 顺序错误（如业务 Handler 放在 FrameDecoder 前面）会导致收到半包消息就处理，产生不可预期的业务错误。"
     },
     {
       "type": "explain",
-      "title": "线上排查不只背组件名",
-      "content": "Netty 线上问题通常沿着事件路径查：accept 队列和文件描述符是否打满，EventLoop lag 是否升高，是否有 Handler 在 EventLoop 中阻塞，Pipeline 顺序是否把业务 Handler 放在解码前，是否缺少 FrameDecoder，ByteBuf 是否泄漏，写缓冲高水位是否长期不可写。\n\n背压也要说清。写入速度超过对端接收能力时，Channel outbound buffer 会膨胀，Netty 通过高/低水位和 `channelWritabilityChanged` 暴露可写状态。业务层应暂停读、限速、丢弃低优先级消息或降级，而不是持续堆积 ByteBuf。"
+      "title": "ByteBuf 内存管理与泄漏检测",
+      "content": "ByteBuf 相比 `java.nio.ByteBuffer` 有三个关键改进：读写指针分离（不需要 `flip`/`compact` 手动切换模式）、池化分配（`PooledByteBufAllocator` 复用直接内存减少 GC 和系统调用）、`slice`/`composite` 允许零拷贝共享底层内存。\n\nByteBuf 按内存位置分堆内（`heapBuffer`，受 GC 管理但发送时需拷贝到内核缓冲区）和直接内存（`directBuffer`，分配在堆外，IO 时少一次拷贝但不受 GC 直接管理）。Netty 4 默认用池化直接内存。按容量策略分固定容量和动态扩容；按是否池化分 `PooledByteBufAllocator`（高并发推荐）和 `UnpooledByteBufAllocator`。\n\n引用计数是 ByteBuf 的内存回收机制。`retain()` 增加引用计数，`release()` 减少，降到 0 时回收内存。Handler 之间传递 ByteBuf 时，如果多个 Handler 都持有同一个 ByteBuf 且不 `retain`，先 `release` 的 Handler 会导致后续 Handler 读到已回收内存；如果只 `retain` 不 `release`，直接内存永远不会被回收，最终 OOM。线上开启 `-Dio.netty.leakDetection.level=PARANOID`（或 `ADVANCED`）可以在泄漏时打印 ByteBuf 分配的调用栈。`SimpleLeakDetector` 通过弱引用 + GC 队列检测未被正确 `release` 的 ByteBuf。"
+    },
+    {
+      "type": "explain",
+      "title": "EventLoop 阻塞与慢任务隔离",
+      "content": "一个 `NioEventLoop` 线程通常管理几十到上千个 Channel。EventLoop 线程内所有 Channel 的 IO 事件串行处理，如果某个 Handler 执行了慢操作（如 JDBC 查询 200ms），这 200ms 内该 EventLoop 管理的所有其他 Channel 都无法读写，延迟集体飙升。\n\n症状表现：同一批 Channel 的响应时间同步波动、心跳超时、读写积压、`writeBufferWatermark` 触及高水位（写缓冲区满导致 `isWritable()` 返回 false）。排查时先看 Netty 的 `io.netty.eventLoop.task.pending` 指标或自定义 `EventExecutorChooser` 打点；再用 `jstack` 看 EventLoop 线程栈是否卡在 JDBC/HTTP 调用、锁等待或文件 IO。\n\n隔离方案：慢任务交给独立的业务线程池（`DefaultEventExecutorGroup` 或自建 `ExecutorService`），在业务线程里处理完后通过 `eventLoop.execute(() -> ctx.writeAndFlush(response))` 把结果写回 Channel，保证出站操作仍在 EventLoop 线程。或者用 Netty 的 `ChannelHandler.Sharable` + 自定义 `EventExecutorGroup` 让特定 Handler 绑定到业务线程组。"
+    },
+    {
+      "type": "explain",
+      "title": "背压：写缓冲高水位与 channelWritabilityChanged",
+      "content": "TCP 发送窗口、Socket 缓冲区和应用写入速率之间存在背压关系。Netty 在 Channel outbound 端维护一个累计写缓冲（`ChannelOutboundBuffer`），当累计字节数超过 `writeBufferHighWaterMark`（默认 64KB）时 `isWritable()` 变为 false，触发 `channelWritabilityChanged` 事件；降到 `writeBufferLowWaterMark`（默认 32KB）以下时恢复可写。\n\n业务层应监听 `channelWritabilityChanged`：当 `isWritable() == false` 时暂停从上游读取、限速发送、丢弃低优先级消息或触发降级。不做任何处理持续 `write` 会导致 `ChannelOutboundBuffer` 无限膨胀，最终 OOM 或触发 Netty 的 `WriteBufferWaterMark` 硬限（`setWriteBufferWaterMark`）。这是应用级背压，和 TCP 层的窗口控制互补：TCP 背压在内核层面自动流控，Netty 背压在应用层面让你有机会做业务决策。"
     },
     {
       "type": "diagram",
@@ -56,73 +66,76 @@
     },
     {
       "type": "compareTable",
-      "title": "BIO / NIO / AIO 与 Netty 选型",
-      "content": "| 维度 | BIO | NIO | AIO | Netty |\n| --- | --- | --- | --- | --- |\n| 阻塞语义 | 同步阻塞 | 同步非阻塞 + 多路复用 | 异步完成通知 | 基于 NIO/Reactor 的工程化框架 |\n| 线程关系 | 常见一连接一线程 | 少量线程监听大量 Channel | 由异步 ChannelGroup/实现管理 | boss/worker EventLoopGroup |\n| 编程负担 | 简单但扩展差 | Selector、Buffer、状态机复杂 | 平台和生态差异需评估 | 封装编解码、Pipeline、内存管理 |\n| 协议边界 | 仍需处理字节流 | 仍需处理粘包/半包 | 仍需协议解码 | 提供多类 FrameDecoder |\n| 适合场景 | 连接少、简单内部工具 | 高并发网络框架底层 | 特定场景验证后使用 | RPC、网关、长连接、协议服务器 |\n| 常见误区 | 线程池能兜住所有阻塞 | 把 NIO 当异步 IO | 认为 AIO 是 NIO 的升级版 | 只背组件名，不会讲请求路径 |"
+      "title": "BIO / NIO / AIO / Netty 关键对比",
+      "content": "| 维度 | BIO | NIO | AIO | Netty |\n| --- | --- | --- | --- | --- |\n| 阻塞语义 | 同步阻塞 | 同步非阻塞 + 多路复用 | 异步完成通知 | 基于 NIO/Reactor 工程化 |\n| 线程模型 | 一连接一线程 | 少量线程监听多 Channel | 异步线程池回调 | boss/worker EventLoopGroup |\n| 编程复杂度 | 低 | Selector + Buffer + 状态机 | Callback/Future 嵌套 | Pipeline + ByteBuf + Handler |\n| 粘包/半包 | 仍需自行处理 | 仍需自行处理 | 仍需自行处理 | 内置 FrameDecoder 家族 |\n| 内存管理 | JVM 堆 | ByteBuffer（无池化） | 平台相关 | 池化 ByteBuf + 引用计数 + 泄漏检测 |\n| 适用场景 | 连接少、内部工具 | 框架底层 | 特定平台验证后用 | RPC、网关、长连接、协议服务器 |\n| 常见陷阱 | 线程数/栈溢出 | 把 NIO 当异步 IO | 忽略 Linux 下线程池模拟 | EventLoop 阻塞、Handler 顺序错、ByteBuf 泄漏 |"
     },
     {
       "type": "code",
-      "title": "Java 可运行：Selector Echo 与长度字段拆包",
-      "content": "import java.io.IOException;\nimport java.net.InetSocketAddress;\nimport java.nio.ByteBuffer;\nimport java.nio.channels.SelectionKey;\nimport java.nio.channels.Selector;\nimport java.nio.channels.ServerSocketChannel;\nimport java.nio.channels.SocketChannel;\nimport java.nio.charset.StandardCharsets;\nimport java.util.ArrayList;\nimport java.util.Iterator;\nimport java.util.List;\nimport java.util.Locale;\n\npublic class Main {\n    static final class LengthFieldCodec {\n        private final ByteBuffer cumulation = ByteBuffer.allocate(1024);\n\n        static ByteBuffer encode(String text) {\n            byte[] body = text.getBytes(StandardCharsets.UTF_8);\n            ByteBuffer out = ByteBuffer.allocate(Integer.BYTES + body.length);\n            out.putInt(body.length).put(body).flip();\n            return out;\n        }\n\n        List<String> feed(ByteBuffer incoming) {\n            cumulation.put(incoming);\n            cumulation.flip();\n            List<String> messages = new ArrayList<>();\n            while (cumulation.remaining() >= Integer.BYTES) {\n                cumulation.mark();\n                int length = cumulation.getInt();\n                if (length < 0 || length > 512) throw new IllegalArgumentException(\"bad frame length: \" + length);\n                if (cumulation.remaining() < length) {\n                    cumulation.reset();\n                    break;\n                }\n                byte[] body = new byte[length];\n                cumulation.get(body);\n                messages.add(new String(body, StandardCharsets.UTF_8));\n            }\n            cumulation.compact();\n            return messages;\n        }\n    }\n\n    public static void main(String[] args) throws Exception {\n        try (Selector selector = Selector.open();\n             ServerSocketChannel server = ServerSocketChannel.open();\n             SocketChannel client = SocketChannel.open()) {\n\n            server.bind(new InetSocketAddress(\"127.0.0.1\", 0));\n            server.configureBlocking(false);\n            server.register(selector, SelectionKey.OP_ACCEPT);\n            int port = ((InetSocketAddress) server.getLocalAddress()).getPort();\n\n            client.configureBlocking(false);\n            client.connect(new InetSocketAddress(\"127.0.0.1\", port));\n            client.register(selector, SelectionKey.OP_CONNECT);\n\n            LengthFieldCodec serverCodec = new LengthFieldCodec();\n            LengthFieldCodec clientCodec = new LengthFieldCodec();\n            ByteBuffer clientOutbound = LengthFieldCodec.encode(\"ping\");\n            SocketChannel accepted = null;\n            String response = null;\n\n            for (int loops = 0; response == null && loops < 1000; loops++) {\n                selector.select(100);\n                Iterator<SelectionKey> keys = selector.selectedKeys().iterator();\n                while (keys.hasNext()) {\n                    SelectionKey key = keys.next();\n                    keys.remove();\n                    if (!key.isValid()) continue;\n\n                    if (key.isAcceptable()) {\n                        accepted = server.accept();\n                        accepted.configureBlocking(false);\n                        accepted.register(selector, SelectionKey.OP_READ);\n                    }\n                    if (key.isConnectable()) {\n                        SocketChannel ch = (SocketChannel) key.channel();\n                        if (ch.finishConnect()) key.interestOps(SelectionKey.OP_WRITE | SelectionKey.OP_READ);\n                    }\n                    if (key.isWritable()) {\n                        SocketChannel ch = (SocketChannel) key.channel();\n                        ch.write(clientOutbound);\n                        if (!clientOutbound.hasRemaining()) {\n                            key.interestOps((key.interestOps() & ~SelectionKey.OP_WRITE) | SelectionKey.OP_READ);\n                        }\n                    }\n                    if (key.isReadable()) {\n                        SocketChannel ch = (SocketChannel) key.channel();\n                        ByteBuffer chunk = ByteBuffer.allocate(64);\n                        int read = ch.read(chunk);\n                        if (read < 0) throw new IOException(\"channel closed\");\n                        chunk.flip();\n                        if (ch == client) {\n                            List<String> messages = clientCodec.feed(chunk);\n                            if (!messages.isEmpty()) response = messages.get(0);\n                        } else {\n                            for (String msg : serverCodec.feed(chunk)) {\n                                ByteBuffer reply = LengthFieldCodec.encode(msg.toUpperCase(Locale.ROOT));\n                                while (reply.hasRemaining()) ch.write(reply);\n                            }\n                        }\n                    }\n                }\n            }\n            if (accepted != null) accepted.close();\n\n            System.out.println(\"server port: \" + port);\n            System.out.println(\"client response: \" + response);\n            assert \"PING\".equals(response);\n        }\n    }\n}",
+      "title": "Selector Echo 与 LengthField 拆包演示",
+      "content": "import java.io.IOException;\nimport java.net.InetSocketAddress;\nimport java.nio.ByteBuffer;\nimport java.nio.channels.SelectionKey;\nimport java.nio.channels.Selector;\nimport java.nio.channels.ServerSocketChannel;\nimport java.nio.channels.SocketChannel;\nimport java.nio.charset.StandardCharsets;\nimport java.util.ArrayList;\nimport java.util.Iterator;\nimport java.util.List;\nimport java.util.Locale;\n\npublic class Main {\n    static final class LengthFieldCodec {\n        private final ByteBuffer cumulation = ByteBuffer.allocate(1024);\n\n        static ByteBuffer encode(String text) {\n            byte[] body = text.getBytes(StandardCharsets.UTF_8);\n            ByteBuffer out = ByteBuffer.allocate(Integer.BYTES + body.length);\n            out.putInt(body.length).put(body).flip();\n            return out;\n        }\n\n        List<String> feed(ByteBuffer incoming) {\n            cumulation.put(incoming);\n            cumulation.flip();\n            List<String> messages = new ArrayList<>();\n            while (cumulation.remaining() >= Integer.BYTES) {\n                cumulation.mark();\n                int length = cumulation.getInt();\n                if (length < 0 || length > 512)\n                    throw new IllegalArgumentException(\"bad frame length: \" + length);\n                if (cumulation.remaining() < length) {\n                    cumulation.reset();\n                    break;\n                }\n                byte[] body = new byte[length];\n                cumulation.get(body);\n                messages.add(new String(body, StandardCharsets.UTF_8));\n            }\n            cumulation.compact();\n            return messages;\n        }\n    }\n\n    public static void main(String[] args) throws Exception {\n        try (Selector selector = Selector.open();\n             ServerSocketChannel server = ServerSocketChannel.open();\n             SocketChannel client = SocketChannel.open()) {\n\n            server.bind(new InetSocketAddress(\"127.0.0.1\", 0));\n            server.configureBlocking(false);\n            server.register(selector, SelectionKey.OP_ACCEPT);\n            int port = ((InetSocketAddress) server.getLocalAddress()).getPort();\n\n            client.configureBlocking(false);\n            client.connect(new InetSocketAddress(\"127.0.0.1\", port));\n            client.register(selector, SelectionKey.OP_CONNECT);\n\n            LengthFieldCodec serverCodec = new LengthFieldCodec();\n            LengthFieldCodec clientCodec = new LengthFieldCodec();\n            ByteBuffer clientOutbound = LengthFieldCodec.encode(\"ping\");\n            SocketChannel accepted = null;\n            String response = null;\n\n            for (int loops = 0; response == null && loops < 1000; loops++) {\n                selector.select(100);\n                Iterator<SelectionKey> keys = selector.selectedKeys().iterator();\n                while (keys.hasNext()) {\n                    SelectionKey key = keys.next();\n                    keys.remove();\n                    if (!key.isValid()) continue;\n\n                    if (key.isAcceptable()) {\n                        accepted = server.accept();\n                        accepted.configureBlocking(false);\n                        accepted.register(selector, SelectionKey.OP_READ);\n                    }\n                    if (key.isConnectable()) {\n                        SocketChannel ch = (SocketChannel) key.channel();\n                        if (ch.finishConnect())\n                            key.interestOps(SelectionKey.OP_WRITE | SelectionKey.OP_READ);\n                    }\n                    if (key.isWritable()) {\n                        SocketChannel ch = (SocketChannel) key.channel();\n                        ch.write(clientOutbound);\n                        if (!clientOutbound.hasRemaining()) {\n                            key.interestOps(\n                                (key.interestOps() & ~SelectionKey.OP_WRITE) | SelectionKey.OP_READ);\n                        }\n                    }\n                    if (key.isReadable()) {\n                        SocketChannel ch = (SocketChannel) key.channel();\n                        ByteBuffer chunk = ByteBuffer.allocate(64);\n                        int read = ch.read(chunk);\n                        if (read < 0) throw new IOException(\"channel closed\");\n                        chunk.flip();\n                        if (ch == client) {\n                            List<String> messages = clientCodec.feed(chunk);\n                            if (!messages.isEmpty()) response = messages.get(0);\n                        } else {\n                            for (String msg : serverCodec.feed(chunk)) {\n                                ByteBuffer reply = LengthFieldCodec.encode(\n                                    msg.toUpperCase(Locale.ROOT));\n                                while (reply.hasRemaining()) ch.write(reply);\n                            }\n                        }\n                    }\n                }\n            }\n            if (accepted != null) accepted.close();\n\n            System.out.println(\"server port: \" + port);\n            System.out.println(\"client response: \" + response);\n            assert \"PING\".equals(response);\n        }\n    }\n}",
       "language": "java",
       "highlights": [
         {
           "line": 25,
-          "note": "LengthFieldCodec 模拟 Netty LengthFieldBasedFrameDecoder 的核心：先累计字节，再按长度字段切完整消息。"
+          "note": "LengthFieldCodec 模拟 LengthFieldBasedFrameDecoder：累计字节 → mark → 读长度 → 够长则切消息，不够则 reset 回滚。"
         },
         {
           "line": 52,
-          "note": "ServerSocketChannel 注册 OP_ACCEPT，Selector 负责等待连接接入事件。"
+          "note": "ServerSocketChannel 配置非阻塞后注册 OP_ACCEPT，Selector 负责等连接事件。"
         },
         {
           "line": 57,
-          "note": "客户端非阻塞 connect 后先监听 OP_CONNECT，连接完成再切到写/读事件。"
+          "note": "客户端非阻塞 connect，先监听 OP_CONNECT，连接完成后切到 WRITE|READ。"
         },
         {
           "line": 76,
-          "note": "accept 后的新 SocketChannel 也必须配置非阻塞并注册到 Selector。"
+          "note": "accept 后新 Channel 必须 configureBlocking(false) 再注册到同一 Selector。"
         },
         {
           "line": 93,
-          "note": "Selector 只通知可读；真正 read 仍由当前事件循环线程执行，所以 NIO 不是异步 IO。"
+          "note": "Selector 只通知可读；read 由当前线程执行——NIO 是同步非阻塞，不是异步 IO。"
         },
         {
           "line": 102,
-          "note": "服务端收到完整消息后再编码响应；真实 Netty 中这类逻辑通常拆到 Pipeline 的 decoder/handler/encoder。"
+          "note": "服务端收到完整消息后编码响应；Netty 中这类逻辑拆到 Pipeline 的 decoder/handler/encoder。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答与追问",
-      "content": "NIO/Netty 这题按 BIO → NIO → Reactor → Netty 演进讲，再落到请求路径、阻塞边界、粘包和线上排查。\n\n**演进与阻塞语义**\n- BIO：同步阻塞，一连接一线程；连接多时线程数、栈内存、上下文切换先顶不住\n- NIO：同步非阻塞 + 多路复用，`Channel` 非阻塞 + `Selector` 等就绪 + `Buffer` 承载；Linux 底层常用 epoll，Selector 只通知就绪，真正的 `read/write` 仍由应用线程执行，所以 NIO 不是异步 IO\n- AIO：异步完成通知，但 Java 网络生态主流仍是 NIO/Reactor，不要简单说成 NIO 升级版\n- Netty：把主从 Reactor、Pipeline、ByteBuf、编解码、内存管理工程化\n\n**Netty 请求路径**\n- boss EventLoop 负责 `OP_ACCEPT`，接入新连接\n- 新连接分配到 worker EventLoop，注册 `OP_READ`；同一个 Channel 的所有 IO 事件在同一 EventLoop 线程内串行处理，无锁\n- 入站：`FrameDecoder` 切完整帧 → 协议解码器把 ByteBuf 转业务对象 → 鉴权/限流 → 业务 Handler\n- 出站：业务返回 → 编码器写回字节 → 通过 Channel 写出\n- 慢任务（DB、RPC、文件 IO、CPU 密集）必须交给业务线程池或 `DefaultEventExecutorGroup`，结果再写回 Channel\n\n**EventLoop 不能阻塞**\n- 一个 EventLoop 管多个 Channel，一个慢任务会拖慢这批所有连接\n- 现象：同一 EventLoop 上一批 Channel 延迟同时升高、心跳超时、读写积压、写缓冲高水位\n- 排查：EventLoop lag、线程栈（看是否停在慢 SQL/RPC/锁/文件 IO）、任务队列、GC、业务日志时间线\n\n**粘包半包**\n- TCP 是字节流，没有消息边界，自定义协议必须处理\n- 方案：`FixedLengthFrameDecoder`（固定长度）、`DelimiterBasedFrameDecoder`（分隔符）、`LineBasedFrameDecoder`（换行）、`LengthFieldBasedFrameDecoder`（长度字段，生产二进制协议最常用）\n- 长度字段解码器要累计半包，不够长时回滚 `mark`/`reset`，等下一次读再切\n\n**ByteBuf**\n- 读写指针分离（不用 `flip`）、堆内/直接内存可选、池化减少分配、`slice`/`composite` 减少拷贝\n- 引用计数：`retain`/`release` 错误会泄漏直接内存，线上开 `-Dio.netty.leakDetection.level=PARANOID`，关注 `ResourceLeakDetector` 报告\n\n**背压与线上排查**\n- 写速度超过对端接收能力时 outbound buffer 膨胀；Netty 通过高/低水位和 `channelWritabilityChanged` 暴露可写状态，业务层应暂停读、限速、丢弃低优先级消息或降级\n- 线上排查沿着事件路径：accept 队列、文件描述符、EventLoop lag、Pipeline 顺序（业务 Handler 放在解码前会出错）、FrameDecoder 缺失、ByteBuf leak、写缓冲水位\n\n**取舍**\n- BIO 适合连接少、逻辑简单的内部工具，不要为了「先进」上 NIO\n- Netty 适合 RPC、网关、长连接、协议服务器；业务简单时 Servlet 容器更省心\n- 直接内存快但追踪难，堆内内存好排查但有拷贝成本——按吞吐和可观测性权衡",
+      "content": "**结论**：NIO 是同步非阻塞加多路复用，Selector 只通知就绪、真正读写由应用线程执行，所以不是异步 IO。Netty 在 NIO 基础上把主从 Reactor、Pipeline、ByteBuf 内存管理和 FrameDecoder 拆包工程化，是 Java 高并发网络框架的事实标准。\n\n**核心演进线**\n- BIO → NIO：从一连接一线程到少量线程监听大量 Channel，瓶颈从线程数转向事件循环和编码复杂度\n- NIO → Reactor：事件循环 + 事件分发 + Handler 处理，拆分 accept/read-write/业务\n- Reactor → Netty：EventLoopGroup 封装线程组，Pipeline 封装编解码链路，ByteBuf 封装内存管理\n\n**Netty 请求路径**\n- `boss EventLoop`：`OP_ACCEPT` 接入新连接，创建 `NioSocketChannel`\n- `worker EventLoop`：注册 `OP_READ`，同一 Channel 的所有 IO 事件在同一 EventLoop 串行处理，无锁\n- 入站 Pipeline：`FrameDecoder` 切完整帧 → `MessageDecoder` 转业务对象 → `AuthHandler`/`BusinessHandler`\n- 出站 Pipeline：业务返回 → `MessageEncoder` 编码 → `write`/`flush`\n- 慢任务（DB、RPC、文件 IO、CPU 密集）交给 `DefaultEventExecutorGroup` 或独立线程池，完成后 `eventLoop.execute(() -> ctx.writeAndFlush(...))`\n\n**EventLoop 阻塞风险**\n- 一个 EventLoop 管几十～上千 Channel，一个慢任务卡住所有连接\n- 现象：同批 Channel 延迟同步飙升、心跳超时、写缓冲触及高水位\n- 排查：`jstack` 看 EventLoop 线程栈、Netty lag 指标、GC 日志、业务时间线\n\n**粘包/半包**\n- TCP 是字节流，没有消息边界\n- 方案：`FixedLengthFrameDecoder`（固定长度）、`DelimiterBasedFrameDecoder`（分隔符）、`LengthFieldBasedFrameDecoder`（长度字段，生产最常用）\n- 长度字段解码器内部累计半包，`mark`/`reset` 保证未消费数据不丢\n\n**ByteBuf 内存**\n- 读写指针分离、池化分配、`slice`/`composite` 零拷贝\n- 引用计数：`retain`/`release` 错误导致直接内存泄漏，线上开 `-Dio.netty.leakDetection.level=PARANOID`\n\n**背压**\n- 写速度超过对端接收能力 → `ChannelOutboundBuffer` 膨胀 → `isWritable()` 变 false → `channelWritabilityChanged`\n- 业务层应暂停读、限速、丢弃低优先级消息或降级\n\n**取舍**\n- 连接少、逻辑简单 → BIO/Servlet 容器够用\n- 高并发网络 → Netty（但要管理 EventLoop 阻塞、ByteBuf 泄漏、Pipeline 顺序）\n- 直接内存 IO 少拷贝但追踪难，堆内内存好排查但有拷贝成本",
       "followUpQuestions": [
         {
-          "question": "NIO 为什么不是异步 IO？",
-          "answer": "Selector 只告诉应用哪些 Channel 已经就绪，应用线程仍要自己调用 read/write 完成数据拷贝和处理。异步 IO 的关注点是提交操作后由系统或运行时在完成时通知。NIO 更准确地说是同步非阻塞加多路复用。"
+          "question": "NIO 为什么不是异步 IO？两者区别在哪？",
+          "answer": "Selector 调用 `select()` 返回的是就绪的 Channel 列表，应用线程仍然要自己调用 `read`/`write` 完成数据拷贝——这是同步的。异步 IO（如 AIO 或 Windows IOCP）是提交操作后由系统在完成时回调，应用不需要自己执行数据搬运。Linux 上 Java AIO 底层也是线程池模拟 epoll，不是真正的内核异步。"
         },
         {
-          "question": "Netty 如何解决 TCP 粘包和半包？",
-          "answer": "在 Pipeline 前置 FrameDecoder，把字节流切成完整协议帧。常见方案包括 FixedLengthFrameDecoder、DelimiterBasedFrameDecoder、LineBasedFrameDecoder、LengthFieldBasedFrameDecoder，生产自定义二进制协议最常用长度字段。"
+          "question": "LengthFieldBasedFrameDecoder 内部怎么处理半包？",
+          "answer": "每次 `decode` 被调用时，先检查 `in.readableBytes()` 是否大于长度字段偏移 + 长度字段长度；不够则直接 return 等下次读。够的话从长度字段位置读出 `frameLength`，再检查剩余可读字节是否 ≥ `frameLength`；不够则把读指针 `reset` 到长度字段前，等下次累积。够则 `readBytes` 切出完整帧。内部用 `cumulation` 缓冲区累计多次读入的数据。"
         },
         {
-          "question": "EventLoop 被阻塞时线上会看到什么现象？",
-          "answer": "同一个 EventLoop 负责的一批 Channel 延迟同时升高，心跳超时、读写积压、写缓冲水位升高，线程栈可能停在慢 SQL、RPC、锁等待或文件 IO。排查看 EventLoop lag、线程栈、任务队列、GC 和业务日志时间线。"
+          "question": "EventLoop 被阻塞的典型线上症状和排查手段？",
+          "answer": "症状：同一个 EventLoop 负责的一批 Channel 响应时间同步飙升、心跳超时、`isWritable()` 变 false、连接数不变但吞吐下降。排查：`jstack` 看 EventLoop 线程栈卡在哪里（JDBC、RPC、锁、文件 IO）；Netty 自定义 `EventLoopTaskQueueFactory` 打点 task pending 数；GC 日志看是否有长时间 STG；业务时间线对比慢请求是否集中在同一批连接。"
         },
         {
-          "question": "为什么 Netty 要分 boss 和 worker 两组 EventLoop？单 Reactor 不行吗？",
-          "answer": "单 Reactor 把 accept、read/write、业务处理都压在少量线程上，连接数大时 accept 会成为瓶颈。主从 Reactor 让 boss 专门处理 OP_ACCEPT 快速接入，worker 专注已接入连接的读写，利用多核扩展，避免接入和处理互相阻塞。"
+          "question": "为什么 Netty 要分 boss 和 worker 两组 EventLoopGroup？",
+          "answer": "boss 专门处理 `OP_ACCEPT`，快速接入连接不被读写事件阻塞；worker 专门处理已连接 Channel 的读写事件，避免 accept 和处理互相干扰。单 Reactor 把所有事件压在少量线程上，连接数大时 accept 会成为瓶颈。主从拆分后各司其职，worker 组可以按 CPU 核心数扩展。"
         }
       ]
     },
     {
       "type": "checklist",
-      "title": "自查清单",
+      "title": "学完后应能说清楚",
       "items": [
-        "能区分 BIO/NIO/AIO 的阻塞模型、连接线程关系和适用边界",
-        "能说清 Channel、Buffer、Selector 与 Reactor 的关系",
-        "能讲清 Netty 的 boss/worker EventLoop、ChannelPipeline、ByteBuf、FrameDecoder 职责",
-        "能说明 TCP 是字节流，协议必须处理粘包和半包",
-        "能解释 EventLoop 为什么不能阻塞，以及慢任务如何隔离",
+        "能区分 BIO/NIO/AIO 的阻塞语义，能解释为什么 NIO 不是异步 IO",
+        "能说清 Channel、Buffer、Selector 三件套的职责和 Selector 就绪语义",
+        "能讲清主从 Reactor 的 boss/worker 分工及 EventLoop 串行无锁的原因",
+        "能描述 Netty Pipeline 入站/出站传播方向和典型 Handler 顺序",
+        "能解释 ByteBuf 引用计数、池化分配和泄漏检测",
+        "能说明 FrameDecoder 如何处理粘包/半包，长度字段解码器的累计机制",
+        "能解释 EventLoop 阻塞的后果和慢任务隔离方案",
+        "能说明写缓冲高水位、channelWritabilityChanged 和应用层背压",
         "能用 EventLoop lag、写水位、ByteBuf leak、连接数和 Handler 顺序定位线上问题"
       ]
     }
@@ -130,53 +143,69 @@
   "recallPrompts": [
     {
       "id": "java.java-fundamentals.topic-nio-netty.recall.1",
-      "prompt": "请对比 BIO、NIO、AIO 的阻塞模型、连接与线程关系，以及为什么 NIO 不是异步 IO。",
+      "prompt": "请对比 BIO、NIO、AIO 的阻塞模型，说明为什么 NIO 不是异步 IO，以及为什么 Java 主流框架不用 AIO。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "java.java-fundamentals.topic-nio-netty.recall.2",
-      "prompt": "讲清 Netty 的主从 Reactor 线程模型，以及 EventLoop、ChannelPipeline、ByteBuf 各自的职责。",
+      "prompt": "讲清 Netty 的主从 Reactor 线程模型：boss 和 worker EventLoop 各自的职责、Channel 如何与 EventLoop 绑定、为什么 IO 无锁。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "java.java-fundamentals.topic-nio-netty.recall.3",
-      "prompt": "Netty 是怎么解决 TCP 粘包拆包的？长度字段解码器为什么要处理半包累计？",
+      "prompt": "Netty Pipeline 中 Handler 的入站/出站传播顺序是什么？FrameDecoder 放错位置会导致什么问题？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "java.java-fundamentals.topic-nio-netty.recall.4",
-      "prompt": "EventLoop 被慢任务阻塞时会出现哪些线上症状？你会看哪些指标、日志和线程栈？",
+      "prompt": "EventLoop 被慢任务阻塞时会出现哪些线上症状？如何排查和隔离？",
       "mode": "text",
       "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "java.java-fundamentals.topic-nio-netty.recall.5",
+      "prompt": "ByteBuf 的引用计数机制是什么？retain/release 操作不当会导致什么问题？线上怎么检测？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
+      "id": "java.java-fundamentals.topic-nio-netty.recall.6",
+      "prompt": "Netty 如何实现应用层背压？writeBufferHighWaterMark 和 channelWritabilityChanged 的作用是什么？",
+      "mode": "text",
+      "expectedMinutes": 3,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能区分 BIO/NIO/AIO 的阻塞语义和连接线程关系",
-      "能说清 Channel/Buffer/Selector 与 Reactor 的关系",
-      "能讲清 Netty EventLoop、Pipeline、ByteBuf、FrameDecoder 的职责",
-      "能指出 EventLoop 不能阻塞和 TCP 粘包拆包必须处理",
-      "能说明 NIO 不是异步 IO，Selector 只通知就绪"
+      "能区分 BIO/NIO/AIO 的阻塞语义，明确 NIO 是同步非阻塞加多路复用而非异步 IO",
+      "能说清 Channel/Buffer/Selector 三件套职责和 Selector 就绪语义",
+      "能讲清 Netty EventLoop、Pipeline、ByteBuf、FrameDecoder 的职责和请求链路",
+      "能说明 EventLoop 阻塞风险、慢任务隔离方案和 TCP 粘包半包处理",
+      "能解释 ByteBuf 引用计数和泄漏检测机制"
     ],
     "goodToHave": [
-      "能解释主从 Reactor 的 boss/worker 分工",
-      "能说明 ByteBuf 池化、引用计数、slice/composite 和泄漏检测",
-      "能用 EventLoop lag、写水位、连接数、ByteBuf leak、Handler 顺序定位问题",
-      "能说明写缓冲高低水位和 channelWritabilityChanged 的背压意义"
+      "能解释主从 Reactor 的 boss/worker 分工和 EventLoop 串行无锁原理",
+      "能说明 ByteBuf 池化、slice/composite、堆内 vs 直接内存的取舍",
+      "能解释 writeBufferHighWaterMark、channelWritabilityChanged 和应用层背压",
+      "能用 EventLoop lag、写水位、ByteBuf leak、连接数和 Handler 顺序定位问题",
+      "能说明 AIO 在 Linux 上的线程池模拟实现和主流框架不用它的原因"
     ],
     "commonMistakes": [
-      "把 NIO 当成异步 IO",
-      "在 EventLoop 线程里做阻塞操作卡住多个连接",
-      "自定义协议不处理粘包/半包",
-      "只背 Netty 组件名，说不出一条请求如何穿过 Pipeline",
-      "忽略 ByteBuf 引用计数和直接内存泄漏"
+      "把 NIO 当成异步 IO，混淆「就绪通知」和「完成通知」",
+      "在 EventLoop 线程里做 JDBC/RPC/文件 IO 阻塞一批连接",
+      "自定义协议不处理粘包/半包，或把业务 Handler 放在 FrameDecoder 前面",
+      "忽略 ByteBuf 引用计数导致直接内存泄漏，线上 OOM 才发现",
+      "只背 Netty 组件名，说不出一条请求如何从 accept 穿过 Pipeline 到 write",
+      "不了解写缓冲高水位和 channelWritabilityChanged，写入无背压控制"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -185,10 +214,10 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "interviewFrequency": "high",
-  "interviewerFocus": "重点考察候选人能否按 BIO→NIO→Reactor→Netty 讲清演进，并能落到 Selector 就绪语义、EventLoop 阻塞风险、Pipeline 请求路径、ByteBuf 引用计数、FrameDecoder 拆包和线上排查指标。",
+  "interviewerFocus": "重点考察能否按 BIO→NIO→Reactor→Netty 讲清演进，落到 Selector 就绪语义（NIO 不是异步 IO）、EventLoop 阻塞风险和慢任务隔离、Pipeline 入站/出站传播和 Handler 顺序、ByteBuf 引用计数和泄漏检测、FrameDecoder 粘包半包处理、写缓冲背压和线上排查指标。",
   "prerequisites": [
     "os.io-model.topic-select-poll-epoll",
     "java.java-fundamentals.topic-stream-api"

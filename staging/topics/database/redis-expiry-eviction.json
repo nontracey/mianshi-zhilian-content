@@ -4,7 +4,7 @@
   "category": "redis-cache",
   "group": "redis-cache",
   "title": "Redis 过期删除与内存淘汰",
-  "summary": "理解 TTL 过期删除（惰性删除 + 主动采样）、maxmemory 淘汰策略（LRU/LFU/random/ttl），以及近似算法的工程权衡与线上排查方法。",
+  "summary": "理解 Redis 过期删除（惰性 + 主动采样自适应）与 maxmemory 淘汰（LRU/LFU/ttl/random 近似算法）两套独立机制的触发路径、h z/maxmemory-samples 的 CPU-精度权衡、volatile vs allkeys 候选池选型陷阱，以及线上 evicted_keys 飙升和过期 key 积压的排查方法。",
   "tags": [
     "数据库",
     "Redis",
@@ -13,28 +13,33 @@
     "内存"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 32,
   "order": 90,
   "recommendWeight": 85,
   "status": "staging",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察候选人能否区分 TTL 过期删除与 maxmemory 淘汰两套独立机制，能否解释 hz/maxmemory-samples 对 CPU 开销与淘汰精度的影响，能否根据实例用途（纯缓存 vs 混合存储）选型淘汰策略，以及线上 evicted_keys 持续增长时的排查思路。",
+  "interviewerFocus": "考察候选人能否区分 TTL 过期删除（惰性+主动采样）与 maxmemory 淘汰（候选池+近似算法）两套独立机制，能否解释 hz/maxmemory-samples 对 CPU 开销与淘汰精度的影响，能否根据实例用途（纯缓存 vs 混合存储）选型淘汰策略并识别 volatile 候选池不足的陷阱，以及线上 evicted_keys 持续增长时区分碎片和容量不足的排查思路。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Redis 过期删除与内存淘汰的职责边界",
-      "content": "Redis 的 key 过期不是到点立刻删除，而是惰性删除和主动采样配合。内存到达 maxmemory 后才进入淘汰策略，两者解决的问题不同：过期处理的是生命周期，淘汰处理的是容量上限。\n\n**惰性删除**：每次访问 key 时（`expireIfNeeded` 函数，位于 `db.c`），先检查 TTL，发现过期则同步删除并返回 nil。优点是零额外调度开销，缺点是冷 key 永远不被访问就一直占内存。\n\n**主动采样删除**：Redis 的 serverCron 定时任务（周期由 `hz` 配置控制，默认 10 即每秒 10 次）每次调用 `activeExpireCycle`，从每个 DB 中随机抽取 `maxmemory-samples`（Redis 7 默认 5）个带 TTL 的 key 检查。如果过期比例超过 25%（`ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP` 阈值），则继续下一轮采样，直到过期比例低于 25% 或时间片用尽。这个自适应机制保证过期 key 多时多清理，少时少清理，避免 CPU 长时间被占用。\n\n**maxmemory 淘汰**：发生在写入路径（`processCommand` -> `freeMemoryIfNeeded`），当 `used_memory > maxmemory` 时触发。淘汰策略决定从哪个池子里选、用什么算法选。淘汰是同步操作，淘汰成本直接反映到该次写入请求的延迟上。\n\n关键区分点：过期删除是「key 已经该死了，只是还没收尸」；淘汰是「key 还没到死期，但内存不够了必须提前杀」。两者可以叠加——一个 key 设了 TTL 但还没过期，也可能因为内存压力被淘汰掉。"
+      "title": "过期删除与内存淘汰：两条独立链路，解决不同问题",
+      "content": "Redis 对 key 的回收有两套完全独立的机制，很多故障源于混淆两者。\n\n**过期删除**处理的是「key 到了 TTL 期限，该不该回收」——是生命周期管理。惰性删除在访问路径触发（`expireIfNeeded`，位于 `db.c`）：每次读写 key 时先检查是否过期，过期则同步删除并返回 nil，零额外调度开销。主动采样在 `serverCron` 定时任务中触发（周期由 `hz` 控制，默认每秒 10 次），每次调用 `activeExpireCycle` 从每个 DB 随机抽取 `maxmemory-samples`（默认 5）个带 TTL 的 key 检查。关键设计是自适应阈值：如果本轮过期比例超过 25%（`ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP`），继续下一轮采样；低于 25% 则停止。这样过期 key 密集时多清理，稀疏时少清理，避免 CPU 空转。\n\n**内存淘汰**处理的是「内存到顶了，必须提前杀 key 腾空间」——是容量管理。触发点在写入路径（`processCommand` → `freeMemoryIfNeeded`）：当 `used_memory > maxmemory` 时同步淘汰，淘汰成本直接摊到该次写入延迟上。策略决定从哪个候选池（volatile 只选带 TTL / allkeys 选全部）和用什么算法选（LRU/LFU/random/ttl）。\n\n两者可以叠加：一个设了 TTL 但尚未过期的 key，也可能因为内存压力被淘汰。理解这条边界是排查问题的前提——过期删不完说明主动采样效率不够，evicted_keys 飙升说明容量策略或 TTL 分配有误。"
     },
     {
       "type": "explain",
-      "title": "LRU/LFU 近似算法的内部机制与工程权衡",
-      "content": "Redis 的 LRU 和 LFU 都是近似算法，不是精确全局排序，这是内存开销与精度的工程取舍。\n\n**近似 LRU**：每个 key 的 redisObject 结构中有一个 24 位 LRU clock 字段，记录最后访问时间（精度约 1 秒）。淘汰时从候选池（volatile 或 allkeys）随机取 `maxmemory-samples` 个 key，比较 LRU clock，淘汰最久未访问的。`maxmemory-samples` 越大越接近真实 LRU，但每次淘汰的 CPU 开销线性增长。Redis 官方基准：samples=5 时近似 LRU 的准确率约 80%，samples=10 时约 95%。\n\n**近似 LFU**（Redis 4.0+ 引入）：每个 key 的 24 位字段被拆分为两部分——高 16 位存上次衰减时间（`ldt`，以分钟为单位），低 8 位存访问计数器（`counter`）。\n\n计数器增长采用对数概率算法：counter 不是每次访问 +1，而是按公式 `1 / (counter * lfu_log_factor + 1)` 的概率递增（`lfu_log_factor` 默认 10）。counter=255 时表示至少约 1000 万次访问。对数增长避免了高频访问 key 的 counter 快速饱和，同时低频 key 的 counter 增长缓慢，天然区分冷热。\n\n计数器衰减：每次访问时检查 `ldt`，如果距上次访问超过 `lfu-decay-time`（默认 1 分钟），counter 减去经过的衰减周期数。衰减机制保证曾经的热点 key 如果长时间不再被访问，其 counter 会逐步下降，避免「历史热点永久占位」。\n\n**选型建议**：访问模式均匀（无明显热点）用 LRU；有明显冷热分布且热点会迁移（如新闻、商品）用 LFU；数据访问完全随机用 random；需要优先淘汰快过期的用 volatile-ttl。"
+      "title": "LRU/LFU 近似算法：24 位字段的精度-内存取舍",
+      "content": "Redis 的 LRU 和 LFU 都是近似算法，不是全局精确排序。精确 LRU 需要维护所有 key 的访问时间链表，内存和维护成本不可接受；近似算法用随机采样 `maxmemory-samples` 个候选 key，淘汰其中最差的，以 O(samples) 的 CPU 开销换取足够好的精度。\n\n**近似 LRU**：每个 key 的 `redisObject` 有 24 位 LRU clock 字段，记录最后被访问的 Unix 时间戳（精度约秒）。淘汰时从候选池随机取 `maxmemory-samples` 个 key，比较 clock 值，淘汰最久未访问的。`maxmemory-samples=5` 时准确率约 80%，`=10` 时约 95%——这是 Redis 官方基准测试数据，不是理论值。缺点是无法区分「最近 1 分钟访问 1 万次」和「最近 1 分钟访问 1 次」，只要有访问就刷新 clock。\n\n**近似 LFU**（Redis 4.0+ 引入）：把 24 位字段拆成两部分——高 16 位存上次衰减时间 `ldt`（精度约分钟），低 8 位存访问计数器 `counter`（0-255）。\n\n计数器增长采用对数概率算法，不是每次访问 +1。公式是：以 `1 / (counter * lfu_log_factor + 1)` 的概率递增（`lfu_log_factor` 默认 10）。counter=100 时概率约 1/1001，counter=255 时概率约 1/2551。这意味着访问 1000 万次左右 counter 才会涨到 255。对数增长天然区分冷热：冷 key 访问几次 counter 就涨到个位数，热 key 即使访问极多次也不会溢出。\n\n计数器衰减：每次 key 被访问时检查 `ldt`，如果距上次访问超过 `lfu-decay-time`（默认 1 分钟），counter 减去经过的衰减周期数。衰减保证曾经的热点 key 如果不再被访问，counter 逐步下降最终被淘汰——避免「历史热点永久占位」。\n\n**选型判断**：访问模式均匀（如随机读写）→ LRU；有明显冷热分布且热点会迁移（如电商商品、新闻）→ LFU；数据访问完全随机且无所谓保留哪个 → random；需要优先淘汰快过期的 → volatile-ttl。"
     },
     {
       "type": "explain",
-      "title": "线上故障排查：evicted_keys 持续增长与过期 key 积压",
-      "content": "线上常见两类问题：淘汰风暴和过期积压。\n\n**场景一：evicted_keys 持续增长，写入延迟飙升**\n排查步骤：\n1. `INFO memory` 查看 `used_memory`、`maxmemory`、`mem_fragmentation_ratio`。如果碎片率 > 1.5，可能是 `activedefrag` 未开启或大量 key 频繁修改导致碎片，实际可用内存比 used_memory 多，可先尝试 `MEMORY PURGE`（jemalloc）或开启 `activedefrag`。\n2. `INFO stats` 查看 `evicted_keys` 增速。如果每秒淘汰数百个 key，说明写入速度持续超过内存容量。\n3. `MEMORY STATS` 查看 key 数量和平均大小，判断是否有个别大 key 占用过多内存。\n4. 检查淘汰策略是否匹配实例用途：纯缓存用 allkeys-lru/lfu，混合存储用 volatile-lru/lfu。如果用了 volatile 策略但大量 key 没设 TTL，会出现「有 key 可淘汰但策略不允许」的死锁，写入直接返回 OOM 错误。\n5. 短期止血：调大 maxmemory 或扩容；长期治本：分析 key TTL 分布（`redis-cli --bigkeys` 或 `MEMORY USAGE`），给缓存 key 补 TTL，或拆分实例。\n\n**场景二：过期 key 积压，内存不释放**\n排查步骤：\n1. `INFO stats` 查看 `expired_keys` 增速。如果接近 0 但内存持续增长，说明主动采样没清理到这些 key。\n2. 检查 `hz` 配置是否过低（如 hz=1 时每秒只采样一次，大量过期 key 清理速度跟不上写入速度）。\n3. `redis-cli --hotkeys`（需开启 LFU）或 `OBJECT FREQ` 查看是否有大量带 TTL 但从不被访问的冷 key。\n4. 临时调高 `hz`（如从 10 调到 100）加速清理，但注意 CPU 开销；或用 `SCAN` + `TTL` 主动扫描过期 key 触发惰性删除。\n\n**场景三：LFU 策略下冷数据无法被淘汰**\n如果 `lfu-decay-time` 设为 0（不衰减），曾经的热点 key counter 永不下降，新写入的 key counter 很低，导致新 key 被优先淘汰而旧热点占着内存。排查时用 `OBJECT FREQ` 检查各 key 的 counter 值分布，确认衰减是否生效。"
+      "title": "volatile vs allkeys：候选池选型陷阱",
+      "content": "淘汰策略由两部分组成：**候选池**（从哪些 key 里选）和**算法**（用什么标准选）。候选池选错会导致严重线上事故。\n\n**volatile-lru / volatile-lfu / volatile-ttl / volatile-random**：只从带 TTL 的 key 中选候选者。适合缓存和持久数据混放的实例——持久数据（如用户信息、配置）不设 TTL，缓存数据设 TTL，淘汰时只动缓存不动持久数据。\n\n陷阱：如果大量 key 没设 TTL，候选池太小甚至为空。写入触发淘汰时无 key 可杀，`freeMemoryIfNeeded` 无法释放足够内存，写入直接返回 OOM 错误。线上见过的典型事故：用了 volatile-lru 但 90% 的 key 没设 TTL，写入 QPS 一上来就大面积报错。排查方法是 `INFO keyspace` 对比 `keys` 和 `expires` 数量，如果 expires 远小于 keys，候选池大概率不够。\n\n**allkeys-lru / allkeys-lfu / allkeys-random**：从所有 key 中选候选者。适合纯缓存实例，所有 key 都是可牺牲的。风险是可能淘汰业务仍需要的持久 key。\n\n**noeviction**：不淘汰任何 key，内存满了写入直接返回错误。适合不允许丢失任何数据的场景（如消息队列、计数器），但需要业务方处理 OOM 错误。\n\n**volatile-ttl** 的特殊性：优先淘汰 TTL 最小（最快过期）的 key。如果所有 TTL 相近，退化为近似随机淘汰，失去优先级区分意义。适合「某些数据可以提前丢、某些不行」的场景。"
+    },
+    {
+      "type": "explain",
+      "title": "线上排查：evicted_keys 飙升、过期积压与 LFU 失效",
+      "content": "线上最常见的三类问题，排查路径各不相同。\n\n**场景一：evicted_keys 持续增长，写入延迟飙升**\n先确认是真实容量不足还是碎片率高。`INFO memory` 看 `mem_fragmentation_ratio`——如果 > 1.5，可能是 jemalloc 碎片导致 RSS 远大于 `used_memory`，实际可用内存比 `used_memory` 表现的多。`MEMORY PURGE` 可以让 jemalloc 归还碎片内存（jemalloc 专属），或开启 `activedefrag yes` 自动整理。\n\n如果碎片率正常但 evicted_keys 增速不减，说明是真实容量不足。检查淘汰策略是否匹配实例用途：volatile 策略下如果 `expires` 远小于 `keys`，候选池太小；纯缓存实例却用了 noeviction。用 `--bigkeys` 排查是否有单个大 key 占用了过多内存，导致其他 key 被批量淘汰。短期止血：调大 `maxmemory` 或拆分实例；长期：给缓存 key 补 TTL，优化大 key 结构。\n\n**场景二：过期 key 积压，内存持续增长**\n`expired_keys` 增速接近 0 但内存持续增长，说明主动采样清理跟不上写入速度。检查 `hz` 配置——`hz=1` 时每秒只触发一次主动采样，大量过期 key 根本清理不过来。临时调高 `hz`（如 10→50），但注意 CPU 开销线性增长。另外确认冷 key 是否从不被访问——惰性删除靠访问触发，冷 key 只靠主动采样回收。`SCAN` + `TTL` 主动扫描可以加速清理但需控制扫描速度。\n\n**场景三：LFU 策略下新 key 被优先淘汰**\n`lfu-decay-time` 设为 0 时 counter 永不衰减。曾经的热点 key counter 锁定在高位，新写入的 key counter 从 0 开始涨，导致新 key 被优先淘汰而旧热点占着内存。用 `OBJECT FREQ` 抽样检查 counter 分布——如果大量旧 key 的 counter 接近 255 但近期不再被访问，说明衰减没生效。修复：设 `lfu-decay-time` 为热点周期对应的分钟数（如热点生命周期 1 小时则设 60）。"
     },
     {
       "type": "diagram",
@@ -62,86 +67,53 @@
     },
     {
       "type": "compareTable",
-      "title": "过期删除与内存淘汰差异",
-      "columns": [
-        "维度",
-        "核心含义",
-        "适用场景",
-        "常见风险"
-      ],
-      "rows": [
-        [
-          "惰性删除",
-          "访问 key 时 expireIfNeeded 检查 TTL，过期则同步删除",
-          "零额外开销清理被访问的过期 key",
-          "冷 key 永不被访问则一直占内存"
-        ],
-        [
-          "主动采样删除",
-          "serverCron 按 hz 频率调用 activeExpireCycle，每次采样 maxmemory-samples 个带 TTL key",
-          "控制过期 key 积压，hz 越高清理越快但 CPU 开销越大",
-          "hz 过低导致过期 key 清理跟不上写入速度"
-        ],
-        [
-          "volatile-lru/lfu",
-          "只从带 TTL 的 key 中按 LRU/LFU 淘汰",
-          "缓存与持久 key 混用实例",
-          "大量 key 未设 TTL 时无 key 可淘汰，写入返回 OOM"
-        ],
-        [
-          "allkeys-lru/lfu",
-          "从所有 key 中按 LRU/LFU 淘汰",
-          "纯缓存实例，所有 key 都可牺牲",
-          "可能淘汰业务仍需要的非缓存 key"
-        ],
-        [
-          "volatile-ttl",
-          "优先淘汰 TTL 最短（最快过期）的 key",
-          "希望淘汰即将过期的 key 以减少浪费",
-          "TTL 相近时退化为近似随机淘汰"
-        ]
-      ]
+      "title": "淘汰策略候选池与算法对比",
+      "content": "| 维度 | 核心含义 | 适用场景 | 常见风险 |\n| --- | --- | --- | --- |\n| 惰性删除 | 访问 key 时 expireIfNeeded 检查 TTL，过期则同步删除 | 零额外开销清理被访问的过期 key | 冷 key 永不被访问则一直占内存 |\n| 主动采样删除 | serverCron 按 hz 调用 activeExpireCycle，采样 maxmemory-samples 个带 TTL key，过期比例超 25% 继续采样 | 控制过期 key 积压，自适应调整清理力度 | hz 过低时清理速度跟不上写入 |\n| volatile-lru/lfu | 只从带 TTL 的 key 中按 LRU/LFU 近似淘汰 | 缓存与持久 key 混用实例 | 大量 key 未设 TTL 时候选池为空，写入 OOM |\n| allkeys-lru/lfu | 从所有 key 中按 LRU/LFU 近似淘汰 | 纯缓存实例 | 可能淘汰业务仍需要的持久 key |\n| volatile-ttl | 优先淘汰 TTL 最小的 key | 希望优先丢弃即将过期的数据 | TTL 相近时退化为近似随机 |\n| noeviction | 不淘汰，内存满写入返回错误 | 不允许丢失数据（如消息队列） | 业务必须处理 OOM 错误 |\n\n| 维度 | LRU | LFU |\n| --- | --- | --- |\n| 24 位字段用途 | 24 位记录最后访问时间（精度约秒） | 高 16 位存上次衰减时间 ldt，低 8 位存对数计数器 counter |\n| 淘汰标准 | 最久未访问的 key | 访问频率最低的 key |\n| 区分热度 | 不区分，只要访问就刷新 clock | 区分冷热，对数增长避免高频 key 饱和 |\n| 历史热点处理 | 不处理，只看最后访问时间 | 衰减机制保证不再访问的热点 counter 下降 |\n| 适合场景 | 访问模式均匀，无明显热点 | 有冷热分布且热点会迁移（如商品、新闻） |"
     },
     {
       "type": "code",
-      "title": "线上排查过期与淘汰问题的常用命令",
-      "content": "# 1. 查看内存使用与淘汰情况\nredis-cli INFO memory | grep -E 'used_memory_human|maxmemory_human|mem_fragmentation_ratio'\nredis-cli INFO stats | grep -E 'evicted_keys|expired_keys'\n\n# 2. 查看当前淘汰策略与采样配置\nredis-cli CONFIG GET maxmemory-policy\nredis-cli CONFIG GET maxmemory-samples\nredis-cli CONFIG GET hz\nredis-cli CONFIG GET lfu-log-factor\nredis-cli CONFIG GET lfu-decay-time\n\n# 3. 查看单个 key 的空闲时间（LRU）或访问频率（LFU）\nredis-cli OBJECT IDLETIME mykey   # LRU 模式下距上次访问的秒数\nredis-cli OBJECT FREQ mykey        # LFU 模式下的对数计数器值\n\n# 4. 扫描大 key 和热 key\nredis-cli --bigkeys\nredis-cli --hotkeys   # 需 maxmemory-policy 为 LFU\n\n# 5. 动态调整 hz 加速过期清理（不停机）\nredis-cli CONFIG SET hz 50\n\n# 6. 查看各 DB 的 key 数量与带 TTL 的 key 数量\nredis-cli INFO keyspace",
+      "title": "排查过期与淘汰问题的常用命令",
+      "content": "# 1. 查看内存使用与淘汰情况\nredis-cli INFO memory | grep -E 'used_memory_human|maxmemory_human|mem_fragmentation_ratio'\nredis-cli INFO stats | grep -E 'evicted_keys|expired_keys'\n\n# 2. 查看当前淘汰策略与采样配置\nredis-cli CONFIG GET maxmemory-policy\nredis-cli CONFIG GET maxmemory-samples\nredis-cli CONFIG GET hz\nredis-cli CONFIG GET lfu-log-factor\nredis-cli CONFIG GET lfu-decay-time\n\n# 3. 查看单个 key 的空闲时间（LRU 模式）或访问频率（LFU 模式）\nredis-cli OBJECT IDLETIME mykey   # LRU 模式下距上次访问的秒数\nredis-cli OBJECT FREQ mykey        # LFU 模式下的对数计数器值（0-255）\n\n# 4. 扫描大 key 和热 key\nredis-cli --bigkeys\nredis-cli --hotkeys   # 需 maxmemory-policy 为 LFU 策略\n\n# 5. 动态调高 hz 加速过期清理（不停机，止血后应调回）\nredis-cli CONFIG SET hz 50\n\n# 6. 查看各 DB 的 key 数量与带 TTL 的 key 数量（判断 volatile 候选池大小）\nredis-cli INFO keyspace\n\n# 7. 抽样检查 key 是否设了 TTL（排查 volatile 策略下候选池不足）\nredis-cli SCAN 0 COUNT 100\n# 对返回的 key 逐个检查 TTL\nredis-cli TTL someKey  # 返回 -1 表示无 TTL，-2 表示不存在，>0 表示剩余秒数",
       "language": "bash",
       "highlights": [
         {
           "line": 2,
-          "note": "mem_fragmentation_ratio > 1.5 说明碎片严重，实际可用内存可能比 used_memory 多"
+          "note": "mem_fragmentation_ratio > 1.5 说明 jemalloc 碎片严重，RSS 远大于 used_memory"
         },
         {
           "line": 3,
-          "note": "evicted_keys 和 expired_keys 是累计值，需对比两次采样的差值算速率"
+          "note": "evicted_keys 和 expired_keys 是累计值，需对比两次采样差值算速率"
         },
         {
           "line": 10,
-          "note": "OBJECT FREQ 返回 0-255 的对数计数值，255 表示约千万次以上访问"
+          "note": "OBJECT FREQ 返回 0-255 对数计数值，255 表示约千万次以上访问"
         },
         {
           "line": 17,
-          "note": "动态调高 hz 会增加 serverCron 执行频率，CPU 开销线性增长，止血后应调回"
+          "note": "动态调高 hz 止血，CPU 开销线性增长，止血后应调回默认值 10"
+        },
+        {
+          "line": 23,
+          "note": "TTL 返回 -1 表示 key 未设 TTL，volatile 策略下这类 key 不会被淘汰"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "Redis 的过期删除和内存淘汰是两套独立机制，面试时要先划清边界再展开细节。\n\n**第一层：过期删除——key 到期后的清理机制**\n- 惰性删除：访问 key 时 `expireIfNeeded` 检查 TTL，过期则同步删除。零调度开销，但冷 key 不被访问就一直占内存。\n- 主动采样：`serverCron` 按 `hz`（默认 10）频率调用 `activeExpireCycle`，每次抽 `maxmemory-samples`（默认 5）个带 TTL key 检查。过期比例超 25% 则继续采样，自适应控制 CPU 开销。\n- 所以设了 TTL 的 key 不保证到点消失，只保证不会被返回过期值。\n\n**第二层：内存淘汰——maxmemory 触发时的释放机制**\n- 写入路径上 `used_memory > maxmemory` 时触发 `freeMemoryIfNeeded`，同步淘汰 key。\n- 策略分两个维度：候选池（volatile 只选带 TTL 的 / allkeys 选所有）和算法（LRU / LFU / random / ttl）。\n- LRU/LFU 都是近似算法：随机取 `maxmemory-samples` 个候选 key，淘汰其中最差的。samples=5 准确率约 80%，samples=10 约 95%。\n- LFU 用 8 位对数计数器 + 衰减机制（`lfu-decay-time` 默认 1 分钟），能区分冷热且历史热点会自动降温。\n\n**第三层：选型与线上排查**\n- 纯缓存实例用 allkeys-lfu（有冷热分布）或 allkeys-lru（访问均匀）。\n- 缓存与持久数据混放用 volatile-lru/lfu，但必须确保缓存 key 都设了 TTL，否则无 key 可淘汰导致 OOM。\n- 线上 evicted_keys 持续增长：先看 `INFO memory` 确认是真实容量不足还是碎片率高，再看策略是否匹配实例用途，最后用 `--bigkeys` 排查大 key。\n- 过期 key 积压：看 `expired_keys` 增速，如果接近 0 说明主动采样没跟上，临时调高 `hz` 加速清理。",
+      "content": "Redis 的过期删除和内存淘汰是两套独立机制，面试时先划清边界再展开细节。\n\n**第一层：过期删除——key 到期后的清理**\n- 惰性删除：访问 key 时 `expireIfNeeded` 检查 TTL，过期则同步删除。零调度开销，但冷 key 不被访问就一直占内存。\n- 主动采样：`serverCron` 按 `hz`（默认 10）调用 `activeExpireCycle`，每次抽 `maxmemory-samples`（默认 5）个带 TTL key 检查。自适应阈值：过期比例超 25% 则继续采样，低于则停止。\n- 设了 TTL 的 key 不保证到点立刻消失，只保证惰性访问时不会返回过期值。\n\n**第二层：内存淘汰——maxmemory 触发时的释放**\n- 写入路径 `used_memory > maxmemory` 时触发 `freeMemoryIfNeeded`，同步淘汰 key，成本直接反映到写入延迟。\n- 策略由候选池和算法组成：volatile（只选带 TTL）/ allkeys（选全部）× LRU / LFU / random / ttl。\n- 近似算法：随机取 `maxmemory-samples` 个候选 key，淘汰最差的。samples=5 准确率约 80%，samples=10 约 95%。\n- LFU 特有：8 位对数计数器（`1/(counter*lfu_log_factor+1)` 概率增长）+ 衰减机制（`lfu-decay-time` 默认 1 分钟），区分冷热且历史热点自动降温。\n\n**第三层：选型与排查**\n- 纯缓存 → allkeys-lfu（有冷热）或 allkeys-lru（均匀访问）。\n- 混合存储 → volatile-lru/lfu，但必须确保缓存 key 都设了 TTL，否则候选池为空导致 OOM。\n- evicted_keys 持续增长：先看 `mem_fragmentation_ratio` 区分碎片和真实容量不足，再看策略是否匹配，最后用 `--bigkeys` 查大 key。\n- 过期积压：看 `expired_keys` 增速，接近 0 说明采样效率不够，临时调高 `hz`。\n- LFU 下新 key 被优先淘汰：检查 `lfu-decay-time` 是否为 0，用 `OBJECT FREQ` 看 counter 分布。",
       "followUpQuestions": [
         {
-          "question": "线上 Redis evicted_keys 每秒增长数百个，但 used_memory 并没有超过 maxmemory 很多，可能是什么原因？",
-          "answer": "最可能是 mem_fragmentation_ratio 偏高（>1.5），jemalloc 分配器碎片导致 Redis 向 OS 申请的内存远大于 used_memory。虽然 used_memory 没超 maxmemory，但 RSS 可能已接近物理内存上限，触发了操作系统层面的内存压力。排查：`INFO memory` 看 `mem_fragmentation_ratio` 和 `allocator_frag_ratio`；止血：`MEMORY PURGE` 让 jemalloc 归还碎片内存，或开启 `activedefrag yes` 自动碎片整理；长期：分析是否有大量频繁修改的小 key 导致碎片，考虑换 `jemalloc` 的 `MALLOC_CONF` 背景线程配置或拆分实例。"
+          "question": "evicted_keys 每秒增长数百个，但 used_memory 没超 maxmemory 很多，可能是什么原因？",
+          "answer": "最可能是 `mem_fragmentation_ratio` 偏高（>1.5），jemalloc 碎片导致 Redis 向 OS 申请的 RSS 远大于 used_memory。虽然 used_memory 没超 maxmemory，但 RSS 可能已接近物理内存上限。排查：`INFO memory` 看 `mem_fragmentation_ratio` 和 `allocator_frag_ratio`；止血：`MEMORY PURGE` 归还碎片，或开启 `activedefrag yes` 自动整理；长期：分析是否大量频繁修改的小 key 导致碎片，考虑拆分实例。"
         },
         {
-          "question": "LFU 模式下，一个曾经的热点 key 长时间不再被访问，它的 counter 会降下来吗？如果 lfu-decay-time 设为 0 会怎样？",
-          "answer": "会降。LFU 的 8 位 counter 在每次访问时会检查 `ldt`（上次衰减时间），如果距上次访问超过 `lfu-decay-time` 分钟（默认 1），counter 减去经过的衰减周期数。所以热点 key 不再被访问后，counter 会逐步衰减，最终被淘汰。如果 `lfu-decay-time=0`，counter 永不衰减，曾经的热点 key 会永久占位，新写入的 key counter 很低会被优先淘汰，导致缓存命中率下降。线上应保持默认值 1 或根据业务热点周期调整，比如热点周期为 1 小时则设为 60。"
+          "question": "LFU 下曾经的热点 key 长时间不访问，counter 会降下来吗？lfu-decay-time 设为 0 会怎样？",
+          "answer": "会降。每次 key 被访问时检查 ldt，如果距上次访问超过 lfu-decay-time 分钟（默认 1），counter 减去经过的衰减周期数。不再访问的热点 key counter 持续衰减直到被淘汰。如果 lfu-decay-time=0，counter 永不衰减，曾经的热点 key 永久占位，新写入的 key counter 从 0 开始涨会被优先淘汰，缓存命中率下降。应保持默认值 1 或根据热点生命周期调整（如热点周期 1 小时则设 60）。"
         },
         {
-          "question": "如果实例里缓存 key 和持久 key 混放，用了 volatile-lru，但写入频繁报 OOM，怎么排查？",
-          "answer": "核心原因是 volatile 策略只淘汰带 TTL 的 key，如果大量 key 没设 TTL，候选池太小甚至为空，淘汰无法释放足够内存。排查步骤：`INFO keyspace` 看各 DB 的 keys 和 expires 数量，如果 expires 远小于 keys，说明大量 key 没 TTL；用 `SCAN` 遍历抽样检查哪些 key 没设 TTL；确认这些 key 是应该持久的还是漏设了 TTL 的缓存 key。如果是缓存 key 漏设 TTL，批量补 `EXPIRE`；如果确实有大量持久 key，考虑拆分实例——缓存和持久数据分到不同 Redis 实例，缓存实例用 allkeys-lru，持久实例不设 maxmemory 或用 noeviction。"
+          "question": "volatile-lru 策略下写入频繁报 OOM，怎么排查？",
+          "answer": "核心原因：volatile 策略只淘汰带 TTL 的 key，大量 key 没设 TTL 时候选池太小甚至为空，淘汰无法释放足够内存。排查：`INFO keyspace` 看 keys 和 expires 数量，expires 远小于 keys 说明候选池不足；`SCAN` 抽样检查哪些 key 没设 TTL。修复：如果是缓存 key 漏设 TTL，批量补 `EXPIRE`；如果有大量持久 key，拆分实例——缓存用 allkeys-lru，持久数据不设 maxmemory 或用 noeviction。"
         }
       ]
     },
@@ -149,15 +121,16 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "惰性删除在访问路径触发，主动采样在 serverCron 周期触发，二者配合清理过期 key",
-        "hz 控制采样频率，maxmemory-samples 控制每次采样数量，过期比例 25% 是自适应阈值",
-        "maxmemory 淘汰发生在写入路径，淘汰成本直接反映到写入延迟",
-        "LRU 用 24 位 clock 字段记录访问时间，LFU 用 8 位对数计数器 + 衰减机制",
-        "LFU 计数器按 1/(counter*lfu_log_factor+1) 概率增长，lfu-decay-time 控制衰减周期",
-        "volatile 策略只淘汰带 TTL 的 key，allkeys 策略淘汰所有 key",
-        "maxmemory-samples 越大淘汰越精确但 CPU 开销线性增长",
-        "线上排查 evicted_keys 增长需区分容量不足、碎片率高、策略不匹配三种情况",
-        "volatile 策略下大量 key 未设 TTL 会导致无 key 可淘汰，写入返回 OOM"
+        "惰性删除在访问路径由 expireIfNeeded 触发，主动采样在 serverCron 由 activeExpireCycle 触发，二者配合清理过期 key",
+        "hz 控制采样频率，maxmemory-samples 控制每次采样数量，25% 过期比例是自适应阈值",
+        "maxmemory 淘汰发生在写入路径 freeMemoryIfNeeded，成本直接反映到写入延迟",
+        "LRU 用 24 位 clock 记录最后访问时间，LFU 用高 16 位 ldt + 低 8 位对数计数器 counter",
+        "LFU 计数器按 1/(counter*lfu_log_factor+1) 概率增长，counter=255 约需千万次访问",
+        "LFU 衰减机制保证不再访问的热点 counter 下降，lfu-decay-time=0 会导致历史热点永久占位",
+        "volatile 策略只淘汰带 TTL 的 key，allkeys 策略淘汰所有 key，noeviction 不淘汰直接返回 OOM",
+        "volatile 策略下大量 key 未设 TTL 会导致候选池为空、写入 OOM",
+        "线上排查 evicted_keys 增长需区分碎片率高（mem_fragmentation_ratio > 1.5）和真实容量不足",
+        "maxmemory-samples 越大淘汰越精确但 CPU 开销线性增长，Redis 建议默认 5-10 即可"
       ]
     }
   ],
@@ -171,30 +144,37 @@
     },
     {
       "id": "database.redis-cache.redis-expiry-eviction.recall.2",
-      "prompt": "maxmemory 淘汰策略和 TTL 过期删除有什么本质区别？LRU 和 LFU 近似算法的内部机制是什么？",
+      "prompt": "maxmemory 淘汰策略和 TTL 过期删除有什么本质区别？volatile 和 allkeys 候选池的区别是什么？混用实例用了 volatile 策略但频繁 OOM，怎么排查？",
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 3
     },
     {
       "id": "database.redis-cache.redis-expiry-eviction.recall.3",
-      "prompt": "线上 Redis evicted_keys 持续增长，你会如何排查是容量不足、碎片率高还是策略选错？",
+      "prompt": "线上 Redis evicted_keys 持续增长，但 used_memory 没超 maxmemory 很多，可能是什么原因？如何区分碎片率高和真实容量不足？",
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 4
     },
     {
       "id": "database.redis-cache.redis-expiry-eviction.recall.4",
-      "prompt": "LFU 的对数计数器如何增长和衰减？lfu-decay-time 设为 0 会有什么问题？",
+      "prompt": "LFU 的对数计数器如何增长和衰减？lfu-decay-time 设为 0 会导致什么问题？如何用 OBJECT FREQ 排查？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
+    },
+    {
+      "id": "database.redis-cache.redis-expiry-eviction.recall.5",
+      "prompt": "如果一个实例同时存在带 TTL 的缓存 key 和不带 TTL 的持久 key，淘汰策略应该怎么选？选错了会出什么问题？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
       "惰性删除在访问路径由 expireIfNeeded 触发，主动采样在 serverCron 由 activeExpireCycle 触发",
-      "hz 控制采样频率，maxmemory-samples 控制每次采样数量，过期比例 25% 为自适应阈值",
+      "hz 控制采样频率，maxmemory-samples 控制每次采样数量，25% 过期比例为自适应阈值",
       "过期删除处理生命周期，maxmemory 淘汰处理容量上限，二者可叠加",
       "淘汰发生在写入路径 freeMemoryIfNeeded 中，成本反映到写入延迟",
       "LRU 用 24 位 clock 字段近似，LFU 用 8 位对数计数器加衰减机制",
@@ -205,15 +185,18 @@
       "能根据实例用途（纯缓存 vs 混合存储）选型淘汰策略",
       "能解释 LFU 计数器按 1/(counter*lfu_log_factor+1) 概率增长和对数饱和特性",
       "能说明 lfu-decay-time=0 导致历史热点 counter 永不衰减的后果",
-      "能区分碎片率高和真实容量不足的排查路径"
+      "能区分碎片率高（mem_fragmentation_ratio > 1.5）和真实容量不足的排查路径",
+      "能解释 volatile 策略下大量 key 未设 TTL 导致候选池为空、写入 OOM 的故障链路"
     ],
     "commonMistakes": [
-      "认为 key 到期一定立刻从内存删除",
-      "把内存淘汰当成业务数据保护机制",
-      "volatile 策略下忘记给缓存 key 设置 TTL 导致无 key 可淘汰",
-      "认为 LRU/LFU 是精确全局排序而非近似采样",
-      "lfu-decay-time 设为 0 导致历史热点永久占位",
-      "混淆 mem_fragmentation_ratio 高与真实容量不足"
+      "认为 key 到期一定立刻从内存删除（忽略惰性+采样的延迟回收机制）",
+      "把内存淘汰当成业务数据保护机制（淘汰是容量管理，不是 TTL 替代）",
+      "volatile 策略下忘记给缓存 key 设置 TTL 导致候选池为空、写入 OOM",
+      "认为 LRU/LFU 是精确全局排序而非近似采样（samples=5 准确率仅约 80%）",
+      "lfu-decay-time 设为 0 导致历史热点 counter 永不衰减、新 key 被优先淘汰",
+      "混淆 mem_fragmentation_ratio 高（碎片问题）与真实容量不足（需扩容）",
+      "纯缓存实例用了 noeviction 导致写入直接 OOM",
+      "hz 调太高导致 serverCron CPU 开销过大"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -222,5 +205,5 @@
       "depth": 30
     }
   },
-  "updatedAt": "2026-06-17"
+  "updatedAt": "2026-06-22"
 }

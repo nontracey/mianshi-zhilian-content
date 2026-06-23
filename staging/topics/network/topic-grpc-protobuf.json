@@ -4,7 +4,7 @@
   "category": "tcp-udp",
   "group": "tcp-udp",
   "title": "gRPC 协议与 Protobuf 编码",
-  "summary": "理解 Protobuf 的 varint+TLV 紧凑二进制编码与 gRPC 基于 HTTP/2 的四种流式调用，以及与 REST 的取舍。",
+  "summary": "Protobuf 用 field key + wire type 做二进制编码，小整数和高频字段省字节；gRPC 基于 HTTP/2 stream 实现四种流式调用，deadline 链式传递防级联卡死；.proto 兼容性靠 tag 稳定而非字段名；与 REST 的选型需权衡传输效率、浏览器支持和调试成本。",
   "tags": [
     "计算机网络",
     "gRPC",
@@ -13,33 +13,42 @@
     "HTTP/2"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 22,
+  "estimatedMinutes": 35,
   "order": 60,
   "recommendWeight": 76,
   "learningCards": [
     {
       "type": "explain",
-      "title": "Protobuf 编码：varint + TLV，为什么小且快",
-      "content": "Protobuf 是 Google 的 IDL + 二进制序列化。在 .proto 里定义 message 和 service，由 protoc 生成多语言代码。运行时按字段号编码。\n\n线上的每个字段都被压成一个 key-value 对。key = (field_number << 3) | wire_type。wire_type 决定后面怎么读：0=varint、2=length-delimited、5=fixed32、1=fixed64。这就是常说的 TLV（Tag-Length-Value）。整数和变长数据用 varint 表达 length。定长字段直接 4/8 字节。\n\nvarint 用每字节的高位 bit 当作 continuation：1 表示后面还有，0 表示结束。剩下 7 bit 拼出整数。所以 int64 字段值=1 只占 1 字节。比 JSON 里的 \"id\":1 七个字符要短得多。id 越小越省，因此高频字段建议占 1-15 号（key 只占 1 字节）。\n\n**边界信号**：负数用 sint32/sint64 + zigzag 编码。否则会被当作很大的无符号数，浪费 10 字节。\n\nproto3 里所有标量字段默认值 0/空串/false 不上线。解析方拿不到\"是否设过\"的信息。这是 proto2 required/optional 退出后最常见的坑。需要 wrap 类型或 oneof 才能区分\"未设置\"和\"显式 0\"。"
+      "title": "Protobuf 编码：field key、wire type 与 varint 的实际字节开销",
+      "content": "Protobuf 是 Google 的 IDL + 二进制序列化。在 .proto 里定义 message 和 service，由 protoc 生成多语言代码。运行时不传字段名，按字段号编码成 key-value 字节流。\n\n核心公式：key = (field_number << 3) | wire_type。wire_type 决定后续 value 的编码方式：0=varint（int32/int64/bool/enum 等）、1=fixed64（double/固定 64 bit）、5=fixed32（float/固定 32 bit）。2=length-delimited（string/bytes/嵌套 message/proto3 默认 packed 的数值 repeated）。只有 wire_type=2 才有 length 前缀。varint 和 fixed 字段没有 length，因此把所有字段都当 TLV 是错的——排查时以为有 length 段会解析出错。\n\nvarint 编码：把整数按 7 bit 一组切，每字节最高位是 continuation bit（1=后面还有字节，0=这是最后一字节），剩余 7 bit 按小端序拼出原始整数。所以 0-127 只占 1 字节、128-16383 占 2 字节，以此类推。int32 值 1 本身的 value 是 1 字节，加上 1 字节 key，整个字段只要 2 字节。JSON 里的 `\"id\":1` 有字段名文本、冒号分隔符、数字字符，至少 7 字符——字节差距来自字段名冗余和文本数字编码。\n\nfield number 对 key 长度的影响：field_number 1-15 编出的 key 只占 1 字节（4 bit field number + 3 bit wire type，最高位 0）；16-2047 占 2 字节；2048+ 起跳到 3 字节。高频字段应优先占 1-15 号。\n\n**负数陷阱**：proto3 的 int32/int64 对负数按补码 varint 编码，-1 会变成 10 字节（int32 是 5 字节，int64 是 10 字节）。经常出现负数的字段必须用 sint32/sint64。编译器会用 zigzag 编码 `(n << 1) ^ (n >> 31)`，把 -1 映射为 1、1 映射为 2，正负绝对值小的数都只占 1-2 字节。\n\n**presence 语义**：proto3 非 optional 的标量字段默认是 implicit presence——值为 0/空串/false 时不上线，接收方无法区分\"未设置\"和\"显式默认值\"。需要 `optional`、`google.protobuf.*Value` wrapper、oneof 或 FieldMask 才能表达 presence。\n\n**wire type 的硬边界**：varint 只用于 int32/int64/uint/sint/bool/enum。length-delimited 用于 string/bytes/嵌套 message/packed repeated。fixed32 用于 float/sfixed32，fixed64 用于 double/sfixed64。错误的 wire type 声明会导致线上字节解析错位。"
     },
     {
       "type": "explain",
-      "title": "字段兼容：tag 是契约，名字不是",
-      "content": "Protobuf 把字段号写进字节流，字段名只在 .proto 文件里。这意味着：改字段名、调字段在文件里的位置都不影响线上兼容。真正破坏兼容的是 tag 号。\n\n安全操作：\n- 新增字段（用新 tag）。\n- 删除字段时把 tag 加进 reserved，防止后人复用。\n- 把 int32 改成 int64（同为 varint 兼容，反向截断）。\n\n危险操作：\n- 复用已删字段的 tag。\n- 把 string（wire_type=2）改成 int32（wire_type=0），让旧客户端读到乱数据。\n- 把 singular 改成 repeated，但旧端按 singular 解析只拿到最后一个值。\n\n兼容性还有一条隐线：未知字段。proto3 默认在 3.5+ 会保留未知字段并在序列化时回写。gateway/proxy 才能在不升级 proto 的情况下转发新字段。如果中间件用老版本运行时丢弃了未知字段，新增字段在跨服务转发链路上会\"消失\"。这是排查\"我加了字段下游收不到\"时第一个要怀疑的点。"
+      "title": "字段兼容性：tag 是契约，字段名不是",
+      "content": "Protobuf 把 field number 写进线上字节流，字段名只存在于 .proto 文件和生成的代码中。这意味着：改字段名、调整字段在 .proto 里的声明顺序都不会影响线上兼容性。真正决定兼容的是 tag 号和 wire type。\n\n**安全操作**：\n- 新增字段用新 tag，旧客户端遇到未知 tag 会跳过（按 wire type 消费掉字节），新客户端遇到缺失字段用默认值。\n- 删除字段时必须把 tag 和字段名写进 `reserved`，防止后人复用该 tag。复用已删字段的 tag 是最常见的兼容事故。旧数据里该 tag 可能还存着老字段的字节，新代码用错误的 wire type 或语义解读，轻则数据错乱，重则解析崩溃。\n- 同 wire type 内的宽度扩展（int32→int64、string→bytes）通常向前兼容，但旧端可能截断或丢失高位。\n\n**危险操作**：\n- 改 wire type（如 string→int32），旧客户端按旧 wire type 消费字节会导致解析错误。\n- 把 singular 改成 repeated：非 packed repeated（如 string repeated）旧端可能只读到最后一个值。proto3 数值 repeated 默认 packed（wire_type=2），旧端遇到 varint 类型的 singular 字段时 wire type 不匹配会跳过，数据丢失。\n\n**未知字段保留**：现代 proto3 运行时（Go protobuf、Java protobuf、最新 C++ 等）会保留未知字段并在序列化时原样回写。这使得 gateway/proxy 在不升级 .proto 的情况下能透传新字段。但如果中间件用了老版本运行时、做了 JSON 转换或手写映射，未知字段可能被丢弃——这是排查\"我加了字段下游收不到\"时第一个要怀疑的点。\n\n**Protobuf 的固有限制**：(1) 浮点数不保证跨平台精确，涉及金额必须用 int64 + 固定精度（如分而非元）。(2) enum 必须有 0 值且 0 值是默认值，proto3 不上线默认值。如果 enum 的 0 值语义不正确（如 `UNKNOWN = 0`），未设置字段会错误地显示为 UNKNOWN。(3) repeated 字段默认是空列表而非 null。无法区分\"未传\"和\"传了空列表\"，业务需要区分时要包装在 message 里用 optional。\n\n**兼容性的硬边界**：(1) 改 wire type 必然破坏兼容，旧客户端按旧 wire type 解析会直接报错。(2) 删除 required 字段（proto2）或把 optional 改 required 会破坏旧 reader。(3) enum 的 0 值是 proto3 默认值且不上线，把 0 值语义从 UNKNOWN 改成有效值会导致旧数据被错误解读。"
     },
     {
       "type": "explain",
-      "title": "gRPC over HTTP/2：四种流和 deadline",
-      "content": "gRPC 把一次 RPC 映射成一个 HTTP/2 stream。HEADERS 帧带 :method=POST、:path=/UserService/GetUser、content-type=application/grpc、grpc-timeout=5S。DATA 帧承载 5 字节前缀（1 byte 压缩标志 + 4 byte length）+ Protobuf body。最后用 HTTP/2 trailers（grpc-status、grpc-message）表达业务状态码。\n\nHTTP/2 的多路复用让同一条 TCP 连接上可以并发跑几十个 stream。不像 HTTP/1.1 要么排队要么开多连接。\n\n四种调用模式都建立在 stream 之上：\n- Unary：客户端发一个 DATA，服务端回一个 DATA + trailers，最常见。\n- Server streaming：客户端一条请求，服务端连续推 N 条 DATA（订阅、行情推送、长时间任务进度）。\n- Client streaming：客户端连续上传 N 条，服务端聚合后回一条（埋点上传、日志聚合）。\n- Bidirectional：双方各自按自己的节奏读写（聊天、协同编辑、实时控制）。\n\n生产线上必须设 deadline（grpc-timeout）。不设的话上游卡住会让所有下游 stream 一起堆积，把连接和线程池吃满。deadline 会随调用链向下游传递，是 gRPC 比 REST 多出来的关键机制。\n\n**验证指标**：验证一次 gRPC 改造时要看 p95/p99 延迟、单连接并发 stream 数（HTTP/2 SETTINGS_MAX_CONCURRENT_STREAMS）、序列化耗时、是否触发 keepalive 断连，以及 cancel/deadline 是否真的把服务端工作中断。"
+      "title": "gRPC over HTTP/2：字节链路、四种流和 deadline",
+      "content": "gRPC 把一次 RPC 调用映射成一个 HTTP/2 stream。请求的字节链路是：\n\n1. **HEADERS 帧**：带 `:method=POST`、`:path=/Package.Service/Method`、`content-type=application/grpc`。还带 `grpc-timeout=5S`（deadline 编码）以及 HPACK 压缩后的 metadata。\n2. **DATA 帧**：每条 gRPC message 的编码是 5 字节前缀（1 byte 压缩标志 + 4 byte big-endian body length）+ Protobuf 序列化的 body。一个 HTTP/2 DATA 帧可以承载多条 gRPC message（只要长度够）。一条 gRPC message 也可以跨多个 DATA 帧（超过帧大小限制时分片）。\n3. **Trailing HEADERS 帧（trailers）**：携带 `grpc-status`（整数状态码）和 `grpc-message`（人类可读描述），表达业务层面的成功或失败。这是 gRPC 错误模型的核心——不依赖 HTTP 状态码表达业务语义。\n\nHTTP/2 多路复用让同一条 TCP 连接上并发跑多个 stream，避免 HTTP/1.1 的队头阻塞和多连接开销。但并发有上限，服务端通过 `SETTINGS_MAX_CONCURRENT_STREAMS` 控制（默认常见值 100-250），客户端超限会排队或开新连接。\n\n**四种调用模式**：\n- **Unary**：客户端发 1 条 message，服务端回 1 条 message + trailers。最常见，请求-响应模型。\n- **Server streaming**：客户端发 1 条，服务端连续推 N 条 message，最后 trailers。适合订阅、行情推送、长时间任务进度通知。\n- **Client streaming**：客户端连续发 N 条，服务端聚合后回 1 条 + trailers。适合批量上传、日志聚合、埋点收集。\n- **Bidirectional streaming**：双方各自按自己的节奏读写，最后 trailers。适合聊天、协同编辑、实时控制。\n\n**Deadline 是必须设的**。gRPC 的 deadline 编码成 `grpc-timeout` 元数据，随请求发给服务端。不设 deadline 或设得过长，上游卡住时下游 stream、goroutine/线程和连接池资源全部被占满，形成级联故障。deadline 是否真正沿调用链向下游传递，取决于每一跳服务端是否把 context/deadline 继续用于自己的下游调用——这要在代码和分布式 tracing 中验证，不能假设自动传递。\n\n**生产验证指标**：p95/p99 延迟、单连接活跃 stream 数、序列化/反序列化耗时、HTTP/2 流控窗口是否阻塞、keepalive ping 是否触发 GOAWAY、cancel/deadline 是否让服务端真正停止无用计算。\n\n**gRPC 的工程限制**：(1) 浏览器不能直连标准 gRPC，需 gRPC-Web + Envoy/代理做协议转换，且只支持 Unary 和 Server streaming。(2) gRPC 复用单条 TCP 连接上的多个 stream，L4 负载均衡器看到的是一条长连接。所有请求打到同一台后端，需要 L7 负载均衡器（如 Envoy、Linkerd）按 stream 分发。(3) gRPC 错误模型依赖 grpc-status 码，排查时需要记住 UNAVAILABLE/DEADLINE_EXCEEDED/RESOURCE_EXHAUSTED 等码的含义。"
+    },
+    {
+      "type": "explain",
+      "title": "浏览器 gRPC-Web：为什么不能直连，以及边界在哪",
+      "content": "标准 gRPC 依赖 HTTP/2 帧级控制（stream 复用、trailers 帧、gRPC 消息分帧协议）。而浏览器暴露给 JavaScript 的 fetch/XHR API 不提供完整的 HTTP/2 帧级操作能力：不能控制 HEADERS/DATA/TRAILERS 帧的发送时机，不能稳定解析 trailers 帧（部分浏览器实现不暴露 trailers）。因此标准 gRPC 的字节链路在浏览器里跑不通。\n\n**gRPC-Web 的改造**：\n- 把 trailers 内容（grpc-status、grpc-message）序列化进响应 body 的最后一个特殊 DATA 帧（以 `0x80` 标记的 trailers 帧），让浏览器 JS 能读到业务状态码。\n- 支持 Unary 和 Server streaming 两种模式。Client streaming 和 Bidirectional streaming 在浏览器环境下仍需要 WebSocket 或其他机制，gRPC-Web 标准协议本身不支持。\n- 请求编码也有微调（base64 文本模式或 binary 模式），适配浏览器的 Content-Type 限制。\n\n**架构**：浏览器发 gRPC-Web 请求到 Envoy/Envoy-Web/自定义代理，代理做 gRPC-Web ↔ 标准 gRPC 协议转换，再用标准 gRPC 连后端服务。代理这一跳是必须的——它拆 trailers、转帧格式、做 HTTP/1.1 或 HTTP/2 到后端 HTTP/2 的桥接。\n\n**边界**：gRPC-Web 的双向流能力弱于标准 gRPC；如果前端需要真正的双向实时通信，通常用 WebSocket + 自定义协议或 Connect（buf.build 的新一代浏览器 RPC 方案，支持更多模式）。"
     },
     {
       "type": "diagram",
       "title": "gRPC 一次调用的字节链路",
-      "format": "mermaid",
-      "content": "flowchart LR\nPROTO[.proto 契约] --> STUB[protoc 生成 stub]\nSTUB --> ENCODE[客户端: 请求对象 → Protobuf 字节]\nENCODE --> FRAME[gRPC 帧: 1B compressed + 4B length + body]\nFRAME --> H2[HTTP/2 HEADERS + DATA stream]\nH2 --> DISPATCH[服务端反序列化并 dispatch]\nDISPATCH --> MODE{Unary / Server Stream / Client Stream / Bidi}\nMODE --> TRAILER[HTTP/2 trailers: grpc-status + grpc-message]",
+      "format": "svg",
+      "content": "assets/diagrams/network-grpc-protobuf-wire.svg",
       "fallback": "客户端按 .proto 生成的 stub 把请求对象编码成 Protobuf，再加 5 字节 gRPC 帧头，封装进 HTTP/2 stream 的 HEADERS+DATA 帧；服务端解析后按四种调用模式之一处理，结束时通过 HTTP/2 trailers 回传 grpc-status 表达业务结果。",
       "caption": "图解从 .proto 契约到字节流再到 HTTP/2 trailers 的完整链路，强调 gRPC 复用了 HTTP/2 的 stream/trailers 而不是新发明传输协议。",
       "sources": [
+        {
+          "kind": "svg",
+          "path": "assets/diagrams/network-grpc-protobuf-wire.svg"
+        },
         {
           "kind": "mermaid",
           "content": "flowchart LR\nPROTO[.proto 契约] --> STUB[protoc 生成 stub]\nSTUB --> ENCODE[客户端: 请求对象 → Protobuf 字节]\nENCODE --> FRAME[gRPC 帧: 1B compressed + 4B length + body]\nFRAME --> H2[HTTP/2 HEADERS + DATA stream]\nH2 --> DISPATCH[服务端反序列化并 dispatch]\nDISPATCH --> MODE{Unary / Server Stream / Client Stream / Bidi}\nMODE --> TRAILER[HTTP/2 trailers: grpc-status + grpc-message]"
@@ -52,49 +61,53 @@
     },
     {
       "type": "compareTable",
-      "title": "gRPC vs REST/JSON：什么时候选哪个",
-      "content": "| 维度 | gRPC | REST/JSON |\n| --- | --- | --- |\n| 传输 | 强制 HTTP/2，stream 多路复用 | HTTP/1.1 或 HTTP/2，通常一请求一响应 |\n| 编码 | Protobuf 二进制 (varint+TLV) | JSON 文本 |\n| 契约 | .proto 强 schema，protoc 生成代码 | OpenAPI/约定，常靠口头或文档 |\n| 流式 | Unary/Server/Client/Bidi 四种原生 | 需 SSE 或 WebSocket 额外搭一套 |\n| 浏览器 | 不能直连，要 gRPC-Web + Envoy 代理 | 浏览器原生支持 |\n| 错误模型 | grpc-status + 标准 code(UNAVAILABLE/DEADLINE_EXCEEDED 等) | HTTP 状态码 + 自定义 body |\n| 调试 | 二进制需 grpcurl/反射，肉眼不可读 | curl 直接看，hman 友好 |\n| 适用 | 内部微服务、流式、多语言、跨机房调用 | 对外开放 API、浏览器直连、第三方集成 |"
+      "title": "gRPC vs REST/JSON：选型对比",
+      "content": "| 维度 | gRPC | REST/JSON |\n| --- | --- | --- |\n| 传输协议 | HTTP/2，stream 多路复用，一条 TCP 连接并发多调用 | HTTP/1.1 或 HTTP/2，通常一请求一响应 |\n| 编码格式 | Protobuf 二进制，字段号做 key，紧凑且解析路径固定 | JSON 文本，字段名是字符串，人类可读 |\n| Schema 契约 | .proto 强 schema，protoc 生成多语言客户端/服务端代码 | OpenAPI 或口头约定，schema 常常是文档不是代码 |\n| 流式能力 | Unary/Server/Client/Bidi 四种原生调用模式 | 需要 SSE（服务端推）或 WebSocket（双向）额外搭一套 |\n| 浏览器支持 | 标准 gRPC 不能直连浏览器，需 gRPC-Web + 代理 | 浏览器原生 fetch/XHR 直接支持 |\n| 错误模型 | grpc-status 标准码（UNAVAILABLE/DEADLINE\\_EXCEEDED 等）+ grpc-message | HTTP 状态码 + 自定义 error body，格式不统一 |\n| 调试工具 | 二进制不可肉眼读，需 grpcurl/反射/服务端 reflection | curl 直接看，人类友好 |\n| 负载压缩 | Protobuf 天然紧凑；gRPC 支持 gzip/snappy 压缩标志 | JSON 冗余多（字段名重复），gzip 收益大但有 CPU 开销 |\n| 适用场景 | 内部微服务、跨机房调用、流式数据、多语言互通 | 对外开放 API、浏览器直连、第三方集成、快速原型 |"
     },
     {
       "type": "code",
       "title": "Protobuf 契约与四种调用模式声明",
-      "content": "syntax = \"proto3\";\npackage user.v1;\n\nmessage GetUserRequest {\n  int64 id = 1;                 // 1-15 号 key 只占 1 字节，留给高频字段\n  reserved 2, 3;                // 历史删除字段的 tag 必须 reserved\n  reserved \"deprecated_name\";\n}\n\nmessage User {\n  int64 id = 1;\n  string name = 2;\n  repeated string roles = 3;    // repeated 默认 packed，多个值压在一个 length-delimited 块里\n  google.protobuf.Int32Value age = 4; // wrap 类型用来区分\"未设置\"和\"显式 0\"\n}\n\nservice UserService {\n  rpc GetUser(GetUserRequest) returns (User);                 // Unary\n  rpc WatchUsers(GetUserRequest) returns (stream User);       // Server streaming\n  rpc ImportUsers(stream User) returns (GetUserRequest);      // Client streaming\n  rpc Chat(stream User) returns (stream User);                // Bidirectional\n}",
       "language": "protobuf",
+      "content": "syntax = \"proto3\";\npackage user.v1;\n\nimport \"google/protobuf/wrappers.proto\";\n\nmessage GetUserRequest {\n  int64 id = 1;                 // field 1-15 的 key 只占 1 字节，留给高频字段\n  reserved 2, 3;                // 已删除字段的 tag 必须 reserved，防止复用\n  reserved \"deprecated_name\";   // 字段名也要 reserved，防止 JSON/反射语义复用\n}\n\nmessage User {\n  int64 id = 1;\n  string name = 2;\n  repeated string roles = 3;    // string repeated 是多段 length-delimited，不是 packed\n  optional int32 score = 4;     // proto3 optional 生成 has_score，区分\"未传\"和\"显式 0\"\n  google.protobuf.Int32Value age = 5; // wrapper 类型也能区分未设置和默认值\n  repeated int64 role_ids = 6;  // 数值 repeated 在 proto3 默认 packed（wire_type=2）\n}\n\nservice UserService {\n  rpc GetUser(GetUserRequest) returns (User);                 // Unary: 1 请求 → 1 响应\n  rpc WatchUsers(GetUserRequest) returns (stream User);       // Server streaming: 1 → N\n  rpc ImportUsers(stream User) returns (GetUserRequest);      // Client streaming: N → 1\n  rpc Chat(stream User) returns (stream User);                // Bidirectional: N ↔ N\n}",
       "highlights": [
         {
-          "line": 5,
-          "note": "字段号 1-15 的 tag 在线上只占 1 字节 key，高频访问字段一定要抢这段；16-2047 占 2 字节，2048+ 起跳到 3 字节。"
-        },
-        {
           "line": 7,
-          "note": "reserved 把已删除的 tag 和 name 锁死，防止后人复用造成 wire_type 错读、读到陈旧字段语义。"
+          "note": "field number 1-15 编出的 key 只占 1 字节；16-2047 占 2 字节；2048+ 起跳到 3 字节。高频字段一定要抢 1-15 号。"
         },
         {
-          "line": 14,
-          "note": "Int32Value 这种 wrap 类型替代 proto3 标量字段没法区分\"未传\"和\"传 0\"的问题；不想引 wkt 也可以用 oneof。"
+          "line": 8,
+          "note": "reserved 把已删除的 tag 锁死，防止后人复用造成 wire_type 错读或读到陈旧语义的字段。"
         },
         {
-          "line": 18,
-          "note": "stream 关键字决定调用模式：参数侧 stream 是客户端流，返回侧 stream 是服务端流，两侧都加就是双向流。"
+          "line": 16,
+          "note": "proto3 optional 生成 has_score 方法，可区分\"未传\"和\"显式传 0\"；wrapper/oneof/FieldMask 也能实现。"
+        },
+        {
+          "line": 24,
+          "note": "stream 关键字决定调用模式：参数侧 stream=客户端流，返回侧 stream=服务端流，两侧都加=双向流。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "标准面试回答",
-      "content": "结论：gRPC 是基于 HTTP/2 + Protobuf 的高性能 RPC 框架。Protobuf 用 varint+TLV 二进制编码，每个字段是 (tag<<3 | wire_type) 加变长 value，整数和字符串都按需占字节，比 JSON 文本小一半到一个数量级、解析也更快；契约写在 .proto 里由 protoc 生成多语言代码，向后兼容靠 tag 号稳定而不是字段名。\n\n核心机制：\n\n1. **传输层**\n   - gRPC 把一次调用映射成一个 HTTP/2 stream。\n   - 复用 HTTP/2 的多路复用、头部压缩和 trailers。\n   - 业务状态码走 grpc-status。\n2. **四种调用模式**\n   - Unary：请求-响应。\n   - Server streaming：服务端推送。\n   - Client streaming：客户端上传聚合。\n   - Bidirectional：双向实时。\n3. **Deadline 机制**\n   - 每次调用都带 grpc-timeout 作为 deadline。\n   - 沿调用链传递，避免上游卡住把下游线程池吃满。\n\n选型：内部微服务、需要流式、多语言互通、对延迟和带宽敏感时选 gRPC；对外开放 API、要给浏览器或第三方直连、强调可读和调试时选 REST/JSON，浏览器场景必须用 gRPC-Web 配 Envoy 之类的代理桥接。\n\n边界与坑：\n\n- tag 不能复用，删字段要写 reserved。\n- proto3 标量字段没有\"是否设置\"语义，要用 wrap 类型或 oneof。\n- 不设 deadline、连接 keepalive 配错、HTTP/2 SETTINGS_MAX_CONCURRENT_STREAMS 太小都会在高并发下踩坑。",
+      "content": "结论：gRPC 是基于 HTTP/2 + Protobuf 的 RPC 框架，核心卖点是强 schema 契约、紧凑二进制编码、原生流式支持和 deadline 链式传递。\n\n**Protobuf 编码机制**\n- key = (field_number << 3) | wire_type，field number 1-15 的 key 只占 1 字节。\n- varint 用每字节高位 continuation bit 编码，小整数（0-127）只占 1 字节。\n- wire_type=2（length-delimited）才有 length 前缀，varint/fixed 没有——别把所有字段都当 TLV。\n- 负数场景 sint32/sint64 + zigzag 编码比 int32/int64 省 9 字节。\n- proto3 非 optional 标量字段默认不上线默认值，接收方无法区分\"未设置\"和\"显式 0\"。\n\n**兼容性靠 tag 稳定**\n- 改字段名、调字段顺序不影响线上兼容。\n- 删除字段必须 reserved tag + name，复用已删 tag 是最常见的兼容事故。\n- 未知字段会被现代运行时保留并透传，但中间件做 JSON 转换或手写映射时可能丢弃。\n\n**gRPC 传输层**\n- 一次 RPC = 一个 HTTP/2 stream：HEADERS（:path、content-type、grpc-timeout）→ DATA（5 字节 gRPC 帧头 + Protobuf body）→ trailing HEADERS（grpc-status、grpc-message）。\n- 四种模式：Unary（1对1）、Server streaming（1对N）、Client streaming（N对1）、Bidirectional（N对N）。\n- deadline 编码成 grpc-timeout，必须设，否则上游卡住会级联拖垮下游的 stream、线程和连接。每跳服务端要把 context/deadline 传给自己的下游调用。\n\n**选型**\n- 内部微服务、流式、多语言互通、延迟/带宽敏感 → gRPC。\n- 对外 API、浏览器直连、第三方集成、调试友好 → REST/JSON。\n- 浏览器要接 gRPC 需 gRPC-Web + Envoy/代理做协议转换，且只支持 Unary 和 Server streaming。\n\n**边界与坑**\n- HTTP/2 SETTINGS_MAX_CONCURRENT_STREAMS 太小会让客户端 stream 排队。\n- keepalive ping 间隔配错可能被服务端 GOAWAY 强断。\n- 流控窗口阻塞会导致 stream 级暂停。\n- 用 channelz/admin 接口、trace、metrics 和 Wireshark 抓帧定位问题。",
       "followUpQuestions": [
         {
-          "question": "Protobuf 的 varint 编码是怎么做到\"小整数小字节\"的？负数为什么要用 sint？",
-          "answer": "varint 把整数按 7 bit 一组切，每字节最高位作 continuation：1 表示后面还有字节，0 表示结束，所以 0-127 只用 1 字节。但 proto3 的 int32/int64 是把负数当作很大的无符号数编码，-1 会变成 0xFFFFFFFFFFFFFFFF 占满 10 字节。如果字段经常是负数或可正可负，要声明成 sint32/sint64，编译器会用 zigzag 编码：(n << 1) ^ (n >> 31)，把 -1 变成 1、1 变成 2，正负绝对值小都只占 1 字节。"
+          "question": "Protobuf 的 varint 编码是怎么做到\"小整数少字节\"的？负数为什么要用 sint？",
+          "answer": "varint 按 7 bit 一组切，每字节最高位是 continuation bit（1=后续还有，0=结束），剩余 7 bit 小端序拼出整数，所以 0-127 只占 1 字节。但 proto3 的 int32/int64 对负数按补码 varint 编码，-1 会变成 10 字节（int32 是 5 字节）。sint32/sint64 用 zigzag 编码 `(n << 1) ^ (n >> 31)`，把 -1→1、1→2，正负绝对值小的都只占 1-2 字节。"
         },
         {
-          "question": "为什么浏览器不能直接用标准 gRPC？gRPC-Web 解决了什么？",
-          "answer": "标准 gRPC 依赖 HTTP/2 trailers 来回传 grpc-status，并且要求 fetch 能流式读写双向 stream。浏览器的 fetch/XHR 既不能读 trailers，也不能在客户端流式发请求体（双向流尤其做不到），所以直连标准 gRPC 服务端是不通的。gRPC-Web 改造了帧格式：把 trailers 序列化进最后一个 DATA 帧（用 0x80 标志位区分），并且只支持 Unary 和 Server streaming；浏览器把请求发给 Envoy 之类的代理，代理在 gRPC-Web 与标准 gRPC 之间做帧格式转换，再连到后端 gRPC 服务。"
+          "question": "删除一个老字段再加一个同名新字段，怎么操作才不破坏老客户端？",
+          "answer": "把老字段的 tag 号和字段名都写进 reserved，然后用一个全新的 tag 号声明同名新字段。reserved 防止后人或 protoc 复用旧 tag。如果直接复用旧 tag，老数据中该 tag 可能还存着老字段的字节，新旧两端对该 tag 的 wire type 和语义理解不同，会导致解析错乱或数据丢失。"
+        },
+        {
+          "question": "为什么浏览器不能直连标准 gRPC？gRPC-Web 解决了什么？",
+          "answer": "标准 gRPC 依赖 HTTP/2 帧级控制和 trailers 帧，浏览器的 fetch/XHR API 不提供完整的帧操作能力且部分实现不暴露 trailers。gRPC-Web 把 trailers 序列化进响应 body 的最后一个特殊 DATA 帧，让 JS 能读到 grpc-status；支持 Unary 和 Server streaming，Client/Bidi streaming 不支持。浏览器发 gRPC-Web 请求到 Envoy/代理，代理转换成标准 gRPC 再连后端。"
         },
         {
           "question": "线上 gRPC 调用偶发卡住，怎么定位？",
-          "answer": "先看是不是没设 deadline 或 deadline 太长，让上游卡住时下游所有 stream 都挂着；接着看 HTTP/2 层：单连接的 SETTINGS_MAX_CONCURRENT_STREAMS 是不是用满了，新 stream 在客户端排队；再看 keepalive：客户端 keepalive 间隔比服务端 MIN_TIME_BETWEEN_PINGS 还小会被服务端 GOAWAY 强断，触发频繁重连。工具上用 grpc 的 channelz/admin 接口看活跃 stream 和 channel 状态，开 GRPC_GO_LOG_VERBOSITY_LEVEL=99/GRPC_TRACE 抓帧；服务端配合 pprof 看是不是阻塞在某个 unary handler，最后用 Wireshark 解 HTTP/2 帧确认 RST_STREAM 或 GOAWAY 的原因码。"
+          "answer": "先查 deadline 是否设了、是否太长；再看 HTTP/2 层：SETTINGS_MAX_CONCURRENT_STREAMS 是不是用满了导致新 stream 排队；查 keepalive：客户端 ping 间隔如果小于服务端允许的最小间隔，会被 GOAWAY 强断触发重连。工具上用 channelz 看活跃 stream 和 channel 状态，配合 trace/metrics/pprof 看 handler 是否阻塞在序列化或下游调用，必要时 Wireshark 抓 HTTP/2 帧看 RST_STREAM、GOAWAY 或流控阻塞。"
         }
       ]
     },
@@ -102,21 +115,22 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释 Protobuf 的 (tag<<3|wire_type) + varint TLV 编码方式，并说出为什么 1-15 号字段更省",
-        "能区分 int32 与 sint32 在负数场景的字节占用差异，知道 zigzag 的作用",
-        "能说明 Protobuf 兼容性靠 tag 稳定：reserved 的用途、危险改动、未知字段保留机制",
-        "能说出 gRPC 一次调用如何映射到 HTTP/2 HEADERS + DATA + trailers 三段，以及 grpc-status 在哪里",
-        "能讲清 Unary/Server/Client/Bidi 四种调用模式各自适合的场景",
-        "能解释 grpc-timeout 作为 deadline 的链式传递，以及不设 deadline 的故障表现",
-        "能说明浏览器为什么必须用 gRPC-Web + 代理，gRPC-Web 不支持哪些模式",
-        "能给出 gRPC vs REST 的选型理由，而不是只说\"gRPC 更快\""
+        "能解释 Protobuf 的 (field_number << 3 | wire_type) key 结构、varint 的 continuation bit 机制、length-delimited 以外的 wire type 没有 length 前缀。",
+        "能说明 field number 1-15 的 key 只占 1 字节，高频字段应优先占这段编号。",
+        "能区分 int32 vs sint32 在负数场景的字节占用差异，解释 zigzag 编码的映射关系。",
+        "能说明 Protobuf 兼容性靠 tag 稳定：reserved 防复用、未知字段保留与中间件透传。",
+        "能画出 gRPC 一次调用在 HTTP/2 上的 HEADERS → DATA → trailing HEADERS 三段链路。",
+        "能讲清 Unary/Server streaming/Client streaming/Bidirectional 各自适合的业务场景。",
+        "能解释 grpc-timeout 作为 deadline 的链式传递机制，以及不设 deadline 的级联故障表现。",
+        "能说明浏览器为什么必须用 gRPC-Web + 代理，以及 gRPC-Web 不支持 Client/Bidi streaming。",
+        "能给出 gRPC vs REST 的选型理由，涉及传输、编码、流式、浏览器、调试和错误模型维度。"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "network.tcp-udp.topic-grpc-protobuf.recall.1",
-      "prompt": "请讲一下 Protobuf 的编码方式：(tag<<3|wire_type)、varint、TLV 是怎么配合的？为什么 int32 字段值=1 只占两个字节，而 JSON 里 \"id\":1 要七个字符？",
+      "prompt": "请讲一下 Protobuf 的编码方式：(tag<<3|wire_type)、varint、length-delimited 是怎么配合的？为什么 field 1 的 int32 值 1 在线上通常只占两个字节，而 JSON 里 \"id\":1 要七个字符？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
@@ -141,29 +155,44 @@
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
+    },
+    {
+      "id": "network.tcp-udp.topic-grpc-protobuf.recall.5",
+      "prompt": "proto3 的 int32 和 sint32 在编码负数时有什么区别？为什么经常出现负数的字段必须用 sint？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "network.tcp-udp.topic-grpc-protobuf.recall.6",
+      "prompt": "线上 gRPC 调用偶发超时，上游没设 deadline、HTTP/2 MAX_CONCURRENT_STREAMS 可能打满、keepalive 配置可能有冲突——你会按什么顺序排查？用什么工具？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "Protobuf 用 (field_number<<3|wire_type) + varint 的 TLV 二进制编码",
-      "向后兼容的关键是 tag 号稳定且必须 reserved，字段名可改",
-      "gRPC 把一次调用映射到 HTTP/2 stream，业务状态码走 trailers 的 grpc-status",
-      "Unary/Server streaming/Client streaming/Bidirectional 四种调用模式的差别",
-      "grpc-timeout 作为 deadline 沿调用链传递，是 gRPC 防级联卡死的核心机制"
+      "Protobuf 用 (field_number<<3|wire_type) 做 field key，只有 wire_type=2(length-delimited) 才有 length 前缀",
+      "varint 的 continuation bit 机制使小整数少字节；field number 1-15 的 key 只占 1 字节",
+      "向后兼容的核心是 tag 号稳定，删除字段必须 reserved tag+name",
+      "gRPC 把一次 RPC 映射到 HTTP/2 stream，业务状态码走 trailing HEADERS 的 grpc-status",
+      "Unary/Server streaming/Client streaming/Bidirectional 四种调用模式的差异和适用场景",
+      "grpc-timeout 作为 deadline 沿调用链传递，是防止级联卡死的核心机制"
     ],
     "goodToHave": [
-      "varint 对负数低效，sint+zigzag 才省字节",
-      "proto3 标量字段无法区分\"未设置\"和默认值，需要 wrap 类型或 oneof",
-      "gRPC-Web 把 trailers 塞进最后一个 DATA 帧，只支持 Unary 与 Server streaming",
-      "HTTP/2 SETTINGS_MAX_CONCURRENT_STREAMS、keepalive、GOAWAY 对吞吐和稳定性的影响",
-      "未知字段保留与中间件转发的关系"
+      "sint32/sint64 + zigzag 编码解决 int32/int64 对负数编码膨胀的问题",
+      "proto3 非 optional 标量字段无法区分未设置和默认值，需要 optional/wrapper/oneof",
+      "未知字段被现代运行时保留并透传，但中间件 JSON 转换可能丢弃",
+      "gRPC-Web 把 trailers 塞进响应 body，只支持 Unary 和 Server streaming",
+      "HTTP/2 SETTINGS_MAX_CONCURRENT_STREAMS、keepalive、GOAWAY 对吞吐和稳定性的影响"
     ],
     "commonMistakes": [
-      "以为 Protobuf 文本可读，调试时直接拿字节流肉眼看",
-      "复用已删除字段的 tag 号，导致旧客户端按错的 wire_type 解码",
-      "把 int32 用于经常是负数的字段，每次都占满 10 字节",
+      "以为 Protobuf 所有字段都是 TLV，排查时以为有 length 段导致解析错误",
+      "复用已删除字段的 tag 号，导致旧客户端按错误的 wire type 解码",
+      "把 int32 用于经常是负数的字段，-1 每次占满 5-10 字节",
       "认为浏览器能直连标准 gRPC，没接 gRPC-Web 代理就上线",
-      "忘记设 grpc-timeout，上游卡住把下游连接和线程池一起拖垮"
+      "忘记设 grpc-timeout，上游卡住把下游的 stream、线程和连接池一起拖垮"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -172,8 +201,8 @@
       "depth": 20
     }
   },
-  "updatedAt": "2026-06-13",
+  "updatedAt": "2026-06-22",
   "status": "staging",
   "interviewFrequency": "medium",
-  "interviewerFocus": "面试官会让你画出 Protobuf 的字节布局，问你怎么删字段才不破坏老客户端，再追问 gRPC 在 HTTP/2 上是怎么用 trailers 表达业务错误、四种流分别适合什么场景，以及为什么浏览器要用 gRPC-Web。"
+  "interviewerFocus": "考察能否画出 Protobuf 的字节布局（key/wire_type/value）、解释 varint 和 zigzag 的机制、说明删字段必须 reserved 的原因、讲清 gRPC 在 HTTP/2 上的 HEADERS-DATA-trailers 三段链路、四种流各自适合的场景、deadline 链式传递以及浏览器为什么必须用 gRPC-Web + 代理。"
 }

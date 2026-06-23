@@ -4,43 +4,48 @@
   "category": "concurrency",
   "group": "concurrency",
   "title": "设计模式在并发中的应用",
-  "summary": "把 AQS、线程池拒绝策略、并发单例和事件监听放回设计模式语境，重点讲清固定流程、可替换策略、安全发布、同步/异步事件边界以及每种模式保护的并发状态。",
+  "summary": "并发中的设计模式必须落到受保护的共享状态、执行线程和失败路径上：AQS 用 Template Method 固定排队与唤醒骨架、子类定义 state 语义；ThreadPoolExecutor 用 Strategy 把过载行为从主流程中抽离；单例依赖类初始化锁或 volatile+synchronized 保证安全发布；事件监听的同步/异步切换改变事务边界、幂等要求和上下文传播。每种模式解决的核心问题是状态所有权和并发失败语义的显式化。",
   "tags": [
     "Java",
     "并发编程",
     "设计模式"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 35,
+  "estimatedMinutes": 43,
   "order": 105,
   "recommendWeight": 80,
   "learningCards": [
     {
       "type": "explain",
-      "title": "模式名要落到受保护状态",
-      "content": "并发源码里的设计模式不能只背名称。真正要回答的是：固定了哪段流程，开放了哪个变化点，保护了什么共享状态，失败时系统如何退让。AQS、ThreadPoolExecutor、单例、事件监听都可以用模式解释，但每个模式背后都有明确的并发边界。\n\nAQS 体现的是 Template Method：`acquire/release` 固定排队、park、unpark、取消和唤醒传播；子类只实现 `tryAcquire/tryRelease/tryAcquireShared/tryReleaseShared` 来定义 state 语义。ReentrantLock 的 state 是重入次数，Semaphore 的 state 是许可数，CountDownLatch 的 state 是剩余计数。回答时要把“固定骨架”和“状态语义”一起讲。\n\nThreadPoolExecutor 的拒绝处理体现 Strategy：池满和队列满后，`RejectedExecutionHandler` 决定是抛异常、调用者执行、丢弃、丢旧任务还是写补偿队列。这个策略不是装饰品，而是系统过载时的业务契约。"
+      "title": "模式名要落到受保护状态和失败语义",
+      "content": "并发设计模式不能停在“用了 Template Method / Strategy / Singleton / Observer”的命名层面。面试真正要回答的是三个问题：固定了哪段流程，开放了哪个变化点，保护了什么共享状态——以及失败时系统如何退让。\n\nAQS 体现 Template Method：`acquire/release` 固定排队、park、unpark、取消和唤醒传播；子类只实现 `tryAcquire/tryRelease/tryAcquireShared/tryReleaseShared` 来定义 state 语义。ReentrantLock 的 state 是重入次数，Semaphore 的 state 是许可数，CountDownLatch 的 state 是剩余计数。固定骨架和状态语义必须一起讲，否则只是背名称。\n\nThreadPoolExecutor 的拒绝处理体现 Strategy：池满和队列满后，`RejectedExecutionHandler` 决定是抛异常、调用者执行、丢弃还是写补偿队列。这个策略不是装饰品，而是系统过载时的业务契约——任务能否丢、是否幂等、上游能否同步执行、补偿队列本身是否会被打爆，都要在策略选择中体现。\n\n回答时要能把模式落到具体的状态（state、队列、instance、事件对象、任务队列）、具体执行线程（调用线程、worker、listener 线程、消息消费者）和具体失败路径（异常、拒绝、重试、补偿、幂等、死信）。"
     },
     {
       "type": "explain",
-      "title": "AQS：固定骨架和钩子方法",
-      "content": "AQS 把最难写对的部分集中在基类：同步队列、节点状态、阻塞唤醒、取消清理、中断/超时路径。子类不应该自己管理等待队列，而是实现“当前线程能否改变 state”的钩子方法。\n\n这种设计的好处是复用并发协议，降低重复造轮子的风险。坏处是钩子方法写错会破坏整个同步器：`tryRelease` 没检查 owner 会让非持有线程释放锁；共享模式返回值错误会导致等待者无法传播唤醒；Condition 需要依赖 `isHeldExclusively` 判断调用者是否持有独占锁。\n\n因此讲 AQS 时，不要停在“用了某个模式”。要能说出：state 代表什么，CAS 在哪发生，失败线程如何入队，释放时如何唤醒后继，哪些异常路径会导致死等或资源泄漏。"
+      "title": "AQS：固定骨架和钩子方法的边界",
+      "content": "AQS 把并发同步最难写对的部分集中在基类：同步队列（CLH 变体）、节点状态、阻塞唤醒、取消清理、中断/超时路径。子类不应该自己管理等待队列，而是实现“当前线程能否改变 state”的钩子方法。\n\nCLH 队列的核心思路：每个等待者封装为 Node，自旋检查前驱是否释放；AQS 把自旋改为 park/unpark，减少 CPU 空转。`acquire` 主流程是：调用 `tryAcquire` → 失败则创建 Node 加入队尾 → park 当前线程 → 前驱释放时 unpark 后继。释放时如果后继节点是 CONDITION 状态，需要沿队列向前跳过已取消节点找到有效后继。取消节点时要处理节点链接断裂的中间态，避免尾节点丢失。\n\n钩子方法写错会破坏整个同步器：`tryRelease` 没检查 owner 会让非持有线程释放锁；共享模式 `tryAcquireShared` 返回值错误（>0 表示成功、=0 表示无剩余、<0 表示失败）会导致等待者无法传播唤醒；Condition 的 `await` 需要依赖 `isHeldExclusively` 判断调用者是否持有独占锁，否则会产生非法状态转换。\n\n因此讲 AQS 时要说出：state 代表什么，CAS 在哪发生，失败线程如何入队，释放时如何唤醒后继，哪些异常路径会导致死等或资源泄漏。这些才是面试官区分“背过”和“理解”的关键点。"
     },
     {
       "type": "explain",
-      "title": "拒绝策略：过载时的业务选择",
-      "content": "线程池策略模式的变化点是 `RejectedExecutionHandler`。`AbortPolicy` 让调用方明确失败，适合核心业务不能静默丢失；`CallerRunsPolicy` 让提交线程执行任务，降低提交速度，形成反压；`DiscardPolicy` 和 `DiscardOldestPolicy` 只适合可丢弃、可覆盖、可观测的任务。\n\n生产自定义策略应记录线程池名、任务标识、业务主键、activeCount、poolSize、queueSize、拒绝时间，并决定后续是快速失败、写补偿表、投递消息队列还是触发入口限流。策略选择错误会变成并发事故：静默丢核心订单、入口线程被反压拖死、补偿队列也被打爆。\n\n策略模式的价值是把过载行为从线程池主流程中抽离出来，但它不会替业务做正确取舍。任务能否丢、是否可重试、是否幂等、上游是否能承受同步执行，都要在策略中体现。"
+      "title": "拒绝策略：过载时的业务契约",
+      "content": "线程池 Strategy 模式的变化点是 `RejectedExecutionHandler`。池满、队列满后系统已经到达接纳边界，此时的决策不是技术细节而是业务契约。\n\n`AbortPolicy` 抛 `RejectedExecutionException`，让调用方明确失败，适合不能静默丢失的核心业务——调用方可以重试、降级或返回错误码。`CallerRunsPolicy` 让提交线程自己执行任务，降低提交速度形成反压；但如果提交线程是事件循环、Netty IO 线程或调度线程，会把上游拖死。`DiscardPolicy` 静默丢弃新任务，`DiscardOldestPolicy` 丢弃队列头部最旧的任务，两者只适合可丢弃、可覆盖且有指标证明的场景。\n\n生产自定义策略应记录：线程池名、任务标识、业务主键、activeCount、poolSize、queueSize、completedTaskCount、拒绝时间和调用来源。后续决策包括快速失败、写补偿表、投递消息队列或触发入口限流。选择错误会变成并发事故：静默丢核心订单、入口线程被反压拖死、补偿队列也被打爆。\n\n策略模式的价值是把过载行为从线程池主流程中抽离，但它不会替业务做正确取舍。拒绝策略也不能替代限流——线程池保护的是本进程执行资源，数据库连接池、下游接口并发和分布式总 QPS 还需要各自的容量控制。"
     },
     {
       "type": "explain",
-      "title": "单例和事件：发布安全与边界清晰",
-      "content": "并发单例常见三种：枚举单例、静态内部类、DCL。枚举和静态内部类依赖 JVM 类初始化的线程安全，代码更短；DCL 用 synchronized 保护首次创建，用 volatile 保护 instance 的安全发布。DCL 还要检查构造期间是否发生 this 逃逸，例如把未构造完成的对象注册到全局监听器。\n\n观察者和发布订阅解决的是生产者/消费者解耦，但并发问题会转移到边界上。同步监听器在发布线程内执行，要关注事务边界和监听器耗时；异步监听器进入线程池或消息队列，要关注幂等、重试、顺序、死信和上下文传播。事件对象应尽量不可变，避免发布后被生产者继续修改。\n\n所以设计模式在并发里不是“优雅分类”，而是让状态所有权、执行线程、失败语义和生命周期更明确。"
+      "title": "单例：安全发布与 JVM 内存模型保证",
+      "content": "并发单例要解决的核心问题是安全发布：确保一个线程创建的实例，在其他线程观察时已完成初始化、字段可见且引用正确。\n\n枚举单例最简洁：`enum Singleton { INSTANCE; }` 依赖 JVM 类初始化（JLS §12.4.2），类初始化由 JVM 保证线程安全且只执行一次。枚举天然防反射攻击（`newInstance` 对枚举抛异常）和序列化破坏（枚举的 `readResolve` 返回 `INSTANCE`）。这是 Java 并发权威著作（Effective Java Item 3、Java Concurrency in Practice 3.5）推荐的首选方案。\n\n静态内部类（Initialization-on-demand holder）利用同一个类初始化保证：`SingletonHolder` 在第一次被引用时初始化，JVM 的类初始化锁保证只执行一次。比 DCL 简单且无线程可见性问题。\n\nDCL（Double-Checked Locking）用 synchronized 保护首次创建的互斥，用 volatile 保护 instance 的安全发布。volatile 的作用不仅是可见性——Java 5 JSR-133 之后，volatile 的 happens-before 语义保证：写 volatile 变量之前的所有赋值对读 volatile 变量之后的线程可见。没有 volatile 时，`instance = new Singleton()` 的三步操作（分配内存、初始化字段、赋引用）可能被重排序为（分配、赋引用、初始化），另一个线程可能读到半初始化的 instance。DCL 还要检查构造期间是否发生 this 逃逸，例如把未构造完成的对象注册到全局监听器。"
+    },
+    {
+      "type": "explain",
+      "title": "事件监听：同步/异步边界与并发代价",
+      "content": "观察者和发布订阅解决的是生产者/消费者解耦，但并发问题会转移到边界上。模式的固定部分是发布事件和通知订阅者；变化点是同步/异步、重试策略、顺序保证和错误处理。\n\n同步监听器在发布线程内执行，好处是上下文（事务、SecurityContext、MDC）自然可用；风险是监听器耗时会阻塞业务主流程，监听器抛异常可能回滚业务事务，监听器内部做阻塞操作会拉长发布调用。适合轻量、快速、无副作用的通知。\n\n异步监听器进入线程池或消息队列，好处是不阻塞发布方；代价是：(1) 事务边界改变——监听器执行时事务可能已提交或已回滚；(2) 失败需要重试和死信机制；(3) 重复投递要求监听器幂等；(4) 多个事件的顺序可能不再保证；(5) ThreadLocal、MDC、SecurityContext 等上下文不会自动传播，需要显式包装或使用 InheritableThreadLocal / TaskDecorator。\n\n事件对象应尽量不可变（record 或 deep copy），避免发布后被生产者继续修改。发布者在通知前快照状态，消费者拿到的是独立副本，不共享可变状态。Spring 的 `@EventListener` 默认同步，`@Async` 加上后变异步，要额外配置 `@EnableAsync` 和线程池。"
     },
     {
       "type": "diagram",
       "format": "svg",
       "title": "并发设计模式：固定流程、策略、发布与事件边界",
       "content": "assets/diagrams/java-concurrency-design-patterns.svg",
-      "caption": "图中把 AQS 的 Template Method 固定流程与 tryAcquire 钩子、ThreadPoolExecutor 的 Strategy 拒绝策略、单例的安全发布（枚举/静态内部类/DCL volatile）、Observer/Pub-Sub 的同步/异步事件边界放在一起，标注每种模式保护的共享状态。",
+      "caption": "图中把 AQS 的 Template Method 固定流程与 tryAcquire 钩子、ThreadPoolExecutor 的 Strategy 拒绝策略、单例的安全发布（枚举/静态内部类/DCL volatile）、Observer/Pub-Sub 的同步/异步事件边界放在一起，标注每种模式保护的共享状态和失败路径。",
       "fallback": "AQS（JDK 5 引入）体现 Template Method：acquire/release 固定排队、park/unpark、取消、唤醒传播，子类用 tryAcquire/tryRelease 定义 state 语义（ReentrantLock 重入数、Semaphore 许可数、CountDownLatch 计数）。ThreadPoolExecutor（JDK 5）的 RejectedExecutionHandler 是 Strategy：Abort 失败、CallerRuns 反压、Discard 系列丢任务、自定义策略负责指标和补偿。单例：枚举和静态内部类依赖 JVM 类初始化锁（JLS §12.4.2）；DCL 需 synchronized 保护首次创建 + volatile 保护引用发布（Java 5 JSR-133 后安全），避免 this 逃逸。Observer/Pub-Sub：同步监听在发布线程执行（关注事务和耗时），异步监听进入线程池/消息队列（关注幂等、重试、顺序、死信、上下文传播），事件对象应不可变。",
       "sources": [
         {
@@ -56,7 +61,7 @@
     {
       "type": "compareTable",
       "title": "并发模式落地对比",
-      "content": "| 场景 | 体现的模式 | 固定部分 | 变化点 | 并发风险 |\n| --- | --- | --- | --- | --- |\n| AQS 同步器 | Template Method | acquire/release、队列、park/unpark | tryAcquire/tryRelease 解释 state | state 语义错误、释放非法、唤醒丢失 |\n| 线程池拒绝 | Strategy | 提交、排队、扩容主流程 | RejectedExecutionHandler | 静默丢任务、错误反压、无补偿 |\n| 单例创建 | Singleton | 全局唯一实例访问 | 枚举、静态内部类、DCL | 半初始化发布、this 逃逸、反射/序列化破坏 |\n| 事件监听 | Observer/Pub-Sub | 发布事件和通知订阅者 | 同步/异步、重试、顺序 | 事务边界、重复消费、上下文丢失 |\n| 生产消费 | Producer-Consumer | 队列缓冲和工作线程取任务 | 队列类型、容量、消费并发 | 队列堆积、背压缺失、任务顺序错误 |\n\n| 追问方向 | 回答抓手 |\n| --- | --- |\n| 这个模式保护什么状态 | state、队列、instance、事件对象、任务队列 |\n| 失败如何处理 | 异常、拒绝、重试、补偿、幂等、死信 |\n| 谁执行代码 | 调用线程、worker、listener 线程、消息消费者 |\n| 生命周期在哪里结束 | unlock、release、remove、shutdown、ack、事务提交 |"
+      "content": "| 场景 | 体现的模式 | 固定部分 | 变化点 | 保护的并发状态 | 失败语义 |\n| --- | --- | --- | --- | --- | --- |\n| AQS 同步器 | Template Method | acquire/release、CLH 队列、park/unpark | tryAcquire/tryRelease 定义 state | 排队节点链、state、owner | 死等、唤醒丢失、非法释放 |\n| 线程池拒绝 | Strategy | 提交、排队、扩容主流程 | RejectedExecutionHandler | 任务队列、worker 数 | 静默丢任务、错误反压、无补偿 |\n| 单例创建 | Singleton | 全局唯一实例访问 | 枚举、静态内部类、DCL | instance 引用及其字段 | 半初始化发布、this 逃逸、反射破坏 |\n| 事件监听 | Observer/Pub-Sub | 发布事件和通知订阅者 | 同步/异步、重试、顺序 | 事件对象、订阅者列表、上下文 | 事务边界错、重复消费、上下文丢失 |\n| 生产消费 | Producer-Consumer | 队列缓冲和工作线程取任务 | 队列类型、容量、消费并发 | 任务队列、消费偏移量 | 队列堆积、背压缺失、顺序错误 |\n\n| 追问方向 | 回答抓手 | 典型错误答案 |\n| --- | --- | --- |\n| 这个模式保护什么状态 | state、队列、instance、事件对象、任务队列 | 只说模式名称不提状态 |\n| 失败如何处理 | 异常、拒绝、重试、补偿、幂等、死信 | 把拒绝策略当异常分支不看业务语义 |\n| 谁执行代码 | 调用线程、worker、listener 线程、消息消费者 | 不区分同步/异步执行上下文 |\n| 生命周期在哪里结束 | unlock、release、remove、shutdown、ack、事务提交 | 忘记清理/关闭导致资源泄漏 |"
     },
     {
       "type": "code",
@@ -66,42 +71,50 @@
       "highlights": [
         {
           "line": 83,
-          "note": "AQS 固定 acquire 流程，子类只定义 state 从 0 到 1 的获取规则。"
+          "note": "AQS 固定 acquire 流程：CAS 尝试获取 state → 失败则封装 Node 入队 → park 等待唤醒。子类只定义 state 从 0→1 的获取规则。"
         },
         {
           "line": 93,
-          "note": "释放钩子要校验 owner，避免非持有线程破坏同步状态。"
+          "note": "释放钩子要校验 owner，避免非持有线程调用 release 破坏同步状态，这是 AQS 使用者最易犯的错误。"
         },
         {
           "line": 108,
-          "note": "拒绝策略把过载行为抽成可替换策略，这里用计数验证任务被拒绝。"
+          "note": "拒绝策略把过载行为抽成可替换策略，这里用计数验证任务被拒绝。生产自定义策略要记录指标、决定补偿方式。"
         },
         {
           "line": 119,
-          "note": "枚举单例借助类初始化语义，避免手写 DCL 的发布风险。"
+          "note": "枚举单例借助 JVM 类初始化语义（JLS §12.4.2），天然防反射和序列化破坏，无需手写 volatile/synchronized。"
         },
         {
           "line": 142,
-          "note": "事件分发器隐藏执行方式；换成异步 Executor 后要补幂等、重试和上下文传播。"
+          "note": "事件分发器隐藏执行方式；换成异步 Executor 后要补幂等、重试、顺序保证和上下文传播。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "我会先说：并发里的设计模式不能脱离状态和线程边界。AQS 的 Template Method 固定 acquire/release、队列和阻塞唤醒流程，子类用 tryAcquire/tryRelease 定义 state 语义；这让 ReentrantLock、Semaphore、CountDownLatch 复用同一套等待协议。\n\n线程池的 `RejectedExecutionHandler` 是 Strategy。队列满、线程数到上限后，策略决定过载语义：Abort 让调用方失败，CallerRuns 形成反压，Discard 系列丢任务，自定义策略负责指标和补偿。选择策略要看任务能否丢、是否幂等、上游能否同步执行。\n\n单例要讲发布安全：枚举和静态内部类依赖类初始化语义；DCL 需要 synchronized 保证首次创建互斥，需要 volatile 保证引用发布不早于初始化被其他线程观察到，还要避免构造期间 this 逃逸。\n\n观察者/发布订阅用于解耦生产者和消费者，但同步监听要看事务和耗时，异步监听要看幂等、重试、顺序、死信和上下文传播。总结时落到一句：模式是手段，关键是说清它保护的共享状态、执行线程和失败路径。",
+      "content": "并发里的设计模式不能脱离状态和线程边界，我会从三个维度回答：固定流程、变化点和失败语义。\n\n**AQS — Template Method**\n- 固定部分：acquire/release 主流程、CLH 变体队列、park/unpark 阻塞唤醒、取消清理和唤醒传播\n- 变化点：tryAcquire/tryRelease/tryAcquireShared/tryReleaseShared 定义 state 语义\n- 具体落地：ReentrantLock 的 state 是重入次数、Semaphore 是许可数、CountDownLatch 是剩余计数\n- 失败边界：钩子写错（没检查 owner、共享返回值错误）会导致死等或非法释放\n\n**线程池拒绝 — Strategy**\n- 固定部分：提交 → 核心线程 → 入队 → 非核心线程 → 拒绝的主流程\n- 变化点：RejectedExecutionHandler\n- 选择依据：任务能否丢、是否幂等、上游能否同步执行、补偿队列是否会被打爆\n- 具体落地：Abort 让调用方失败、CallerRuns 形成反压、Discard 系列丢任务、自定义策略记录指标和补偿\n\n**单例 — Singleton + 安全发布**\n- 枚举和静态内部类依赖 JVM 类初始化锁（JLS §12.4.2），代码最简单且天然防反射/序列化破坏\n- DCL 需要 synchronized 保护首次创建互斥 + volatile 保证引用发布（Java 5 JSR-133 的 happens-before 语义）\n- 风险：this 逃逸（构造期间对象被其他线程观察到）、半初始化发布\n\n**事件监听 — Observer/Pub-Sub**\n- 固定部分：发布事件和通知订阅者\n- 变化点：同步/异步、重试策略、顺序保证\n- 同步监听：在发布线程内执行，上下文自然可用，但要关注监听器耗时和异常回滚\n- 异步监听：事务边界改变、需要幂等、顺序可能变化、ThreadLocal/MDC 不自动传播\n- 事件对象应不可变，避免发布后被修改\n\n**总结**：模式是手段，关键是说清它保护的共享状态、谁执行代码、失败时怎么退让。",
       "followUpQuestions": [
         {
-          "question": "AQS 为什么可以用 Template Method 来解释？",
-          "answer": "AQS 固定了 acquire/release 的主流程，包括尝试获取、失败入队、park、释放唤醒和取消清理；子类只覆写 tryAcquire、tryRelease、tryAcquireShared 等钩子解释 state。流程稳定、状态语义可变，所以符合 Template Method 的结构。"
+          "question": "AQS 为什么可以用 Template Method 来解释？它固定了什么、开放了什么？",
+          "answer": "AQS 固定了 acquire/release 的主流程：尝试获取 → 失败入队 → park → 前驱释放时 unpark → 取消清理。这些流程被集中在 AbstractQueuedSynchronizer 基类中。子类只覆写 tryAcquire、tryRelease、tryAcquireShared 等钩子方法来解释 state 语义。固定骨架、开放状态语义的钩子，所以是 Template Method。"
         },
         {
-          "question": "线程池拒绝策略怎么选？",
-          "answer": "先判断任务能否丢。不能丢就用 Abort 让调用方感知失败，或用 CallerRuns 形成反压，再配合补偿；可丢任务才考虑 Discard 或 DiscardOldest，并且要有指标和告警。核心业务不要静默丢，入口线程也不能随便被长任务拖住。"
+          "question": "DCL 单例的 volatile 到底保证了什么？没有它会出什么问题？",
+          "answer": "volatile 保证 happens-before：写 volatile 变量之前的所有赋值对读该变量之后的线程可见。没有 volatile 时，`new Singleton()` 的三步（分配内存、初始化字段、赋引用）可能被 JVM/CPU 重排序为（分配、赋引用、初始化），另一个线程可能通过判空检查后拿到一个半初始化的 instance——字段是默认值而非构造器赋值。volatile 在 Java 5 JSR-133 之后可以禁止这种重排序。"
         },
         {
-          "question": "事件监听从同步改成异步后有哪些并发问题？",
-          "answer": "事务边界改变，监听器可能在事务提交前或后执行；失败需要重试和死信；重复投递要求幂等；多个事件的顺序可能变化；ThreadLocal/MDC 等上下文不会自动传播。事件对象也应尽量不可变，避免发布后再修改。"
+          "question": "事件监听从同步改成异步后，有哪些并发问题需要处理？",
+          "answer": "(1) 事务边界改变：异步监听器执行时事务可能已提交或已回滚，需要用 `TransactionSynchronizationManager.registerSynchronization` 或 `@TransactionalEventListener(phase=AFTER_COMMIT)`。(2) 失败重试和死信：同步失败直接抛异常，异步需要重试机制和死信队列。(3) 幂等：消息队列可能重复投递，监听器要幂等。(4) 顺序：异步后事件顺序不再保证。(5) 上下文传播：ThreadLocal/MDC/SecurityContext 不会自动传到异步线程，需要 TaskDecorator 或 InheritableThreadLocal 显式包装。"
+        },
+        {
+          "question": "AQS 的 CLH 队列和普通 FIFO 队列有什么区别？为什么不用简单队列？",
+          "answer": "CLH 是基于链表的自旋锁变体，每个节点自旋检查前驱节点的状态。AQS 把自旋改为 park/unpark 减少 CPU 空转，但仍保留了“节点等待前驱释放”的链式结构。这比简单队列的好处是：(1) 入队用 CAS 只修改尾节点，减少锁竞争；(2) 唤醒时只需看后继节点，不遍历全队列；(3) 取消节点时可以跳过被取消节点链接到有效后继，处理中间态不丢失节点。"
+        },
+        {
+          "question": "如果面试官让你手写一个最小 AQS 同步器，你会怎么写？",
+          "answer": "继承 AbstractQueuedSynchronizer，覆写 tryAcquire：用 CAS 把 state 从 0 设为 1，成功则 setExclusiveOwnerThread，返回 true；失败返回 false。覆写 tryRelease：检查 owner 是当前线程且 state 非 0，setExclusiveOwnerThread(null)，setState(0)，返回 true。对外暴露 lock/unlock 方法调用 acquire(1)/release(1)。acquire/release 的队列管理、park/unpark、取消清理都由 AQS 基类负责。"
         }
       ]
     },
@@ -109,13 +122,14 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 AQS 固定流程和子类钩子方法的关系",
-        "能把 ReentrantLock、Semaphore、CountDownLatch 的 state 语义讲清",
-        "能按任务能否丢、是否反压、是否补偿选择线程池拒绝策略",
-        "能解释枚举单例、静态内部类和 DCL 的安全发布边界",
-        "能指出 DCL 的 volatile、synchronized 和 this 逃逸风险",
-        "能说明事件监听同步/异步后的事务、幂等、顺序和上下文问题",
-        "能把模式名称落到共享状态、执行线程和失败路径上"
+        "能说明 AQS 的 Template Method 结构：固定 acquire/release/队列/park-unpark，子类定义 state 语义",
+        "能把 ReentrantLock、Semaphore、CountDownLatch 的 state 语义分别讲清",
+        "能解释 CLH 队列的节点链、CAS 入队、park 等待、unpark 唤醒和取消清理机制",
+        "能按任务能否丢、是否反压、是否幂等、是否补偿选择线程池拒绝策略",
+        "能解释枚举单例和静态内部类依赖 JVM 类初始化锁（JLS §12.4.2）的原因",
+        "能说明 DCL 的 volatile 作用（happens-before 禁止重排序）、synchronized 作用和 this 逃逸风险",
+        "能指出事件监听同步/异步后的事务边界、幂等、顺序、死信和上下文传播问题",
+        "能把模式名称落到共享状态、执行线程和失败路径上，而不是只背名称"
       ]
     }
   ],
@@ -141,35 +155,56 @@
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
+    },
+    {
+      "id": "java.middleware.topic-093-f2a3b4c5.recall.4",
+      "prompt": "AQS 的 CLH 队列是怎么工作的？节点入队、park 等待和唤醒后继分别是怎么实现的？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "java.middleware.topic-093-f2a3b4c5.recall.5",
+      "prompt": "事件监听从同步改成异步后，哪些问题必须在架构层面解决？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
+      "id": "java.middleware.topic-093-f2a3b4c5.recall.6",
+      "prompt": "手写一个基于 AQS 的互斥锁：tryAcquire、tryRelease 和对外 lock/unlock 方法。",
+      "mode": "code",
+      "expectedMinutes": 8,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能解释 AQS 的固定流程与 CLH 队列/state 的关系",
-      "能按业务语义选择线程池拒绝策略，而不是只背四个类名",
-      "能分析 DCL 为什么需要 volatile、synchronized 和避免 this 逃逸",
-      "能说明观察者/事件监听在同步、异步、幂等、顺序上的边界"
+      "能解释 AQS 的 Template Method 结构以及 acquire/release 固定流程与 CLH 队列/state 的关系",
+      "能按业务语义（任务能否丢、是否反压、是否幂等）选择线程池拒绝策略，而不是只背四个类名",
+      "能分析 DCL 为什么需要 volatile（happens-before 禁止重排序保证安全发布）、synchronized 作用和 this 逃逸风险",
+      "能说明观察者/事件监听在同步、异步、事务边界、幂等、顺序和上下文传播上的边界"
     ],
     "goodToHave": [
-      "能结合 JDK 并发包源码说明 Template Method、Strategy、Singleton、Observer 的落地",
+      "能结合 JDK 并发包源码说明 Template Method、Strategy、Singleton、Observer 的具体落地点",
+      "能解释 CLH 队列的 CAS 入队、park/unpark 唤醒、取消节点清理机制",
       "能指出模式滥用导致的复杂度、吞吐下降或数据丢失风险",
-      "能把设计模式和线程安全状态绑定起来讲",
-      "能给出同步转异步后的事务和上下文传播方案"
+      "能给出同步转异步后的事务（TransactionSynchronization/after-commit）和上下文传播（TaskDecorator）方案"
     ],
     "commonMistakes": [
-      "只背设计模式名称，不说明它保护了哪类并发状态",
-      "把 DCL 的 volatile 简化成只保证可见性，漏掉安全发布",
+      "只背设计模式名称，不说明它保护了哪类并发状态和失败语义",
+      "把 DCL 的 volatile 简化成只保证可见性，漏掉禁止重排序的安全发布语义",
       "拒绝策略不区分任务能否丢弃，或用静默丢弃处理核心业务任务",
-      "把事件异步化后忽略幂等、顺序、重试和上下文传播"
+      "把事件异步化后忽略幂等、顺序、重试和上下文传播，导致重复消费或状态丢失"
     ],
     "scoreWeights": {
-      "coverage": 30,
+      "coverage": 25,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 20
+      "depth": 25
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "java.concurrency.topic-017-df4531b1",
@@ -177,5 +212,5 @@
     "java.concurrency.topic-015-45bf8ebd"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察候选人是否能把设计模式放回并发源码和业务状态里：AQS 固定流程、线程池拒绝策略、DCL 安全发布、事件监听的同步/异步边界。"
+  "interviewerFocus": "考察候选人是否能把设计模式放回并发源码和业务状态里：AQS 的 Template Method 固定流程与 CLH 队列机制、线程池拒绝策略的 Strategy 语义、DCL 安全发布与 JVM 内存模型、事件监听的同步/异步边界。"
 }

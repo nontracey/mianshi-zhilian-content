@@ -4,7 +4,7 @@
   "category": "process-thread",
   "group": "process-thread",
   "title": "进程间通信方式",
-  "summary": "讲清 IPC 的传数据（管道/消息队列/共享内存/Socket）和同步通知（信号量/信号）两类机制、特点与选型，以及共享内存要自己同步。",
+  "summary": "讲清 IPC 的两大类机制——传数据（管道/消息队列/共享内存/Socket）和同步通知（信号量/信号），各自的数据拷贝路径、消息边界、内核持久性、同步责任，以及 System V 与 POSIX API 差异和选型取舍。",
   "tags": [
     "操作系统",
     "IPC",
@@ -12,95 +12,119 @@
     "共享内存"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 36,
   "order": 40,
   "recommendWeight": 88,
   "learningCards": [
     {
       "type": "explain",
-      "title": "为什么要 IPC，传数据的三种方式",
-      "content": "## 为什么需要\n进程的虚拟地址空间彼此隔离，一个进程里的指针值在另一个进程里没有相同含义。要交换数据、转交文件描述符、通知状态变化，必须经过内核提供的 IPC 对象或内核授权的共享映射。面试里不要只背名称，要按“数据是否经过内核缓冲、是否保留消息边界、对象生命周期、是否需要额外同步”来比较。\n\n## 管道 Pipe/FIFO —— 内核缓冲里的字节流\n- **匿名管道 pipe**：`pipe(int fd[2])` 创建一对 fd，通常由 `fork()` 后父子进程继承；Linux 上普通 pipe 是半双工字节流，`fd[0]` 读、`fd[1]` 写。\n- **命名管道 FIFO**：`mkfifo()` 创建文件系统路径，无亲缘关系的进程可通过 `open()` 连接；路径只是名字，数据仍在内核缓冲里，不落普通文件。\n- **关键边界**：管道没有消息边界，接收方只能读到字节序列；缓冲容量有限，Linux 可用 `fcntl(fd, F_GETPIPE_SZ/F_SETPIPE_SZ)` 查看或调整，默认容量依内核版本和限制而变，不应死记固定值。若写端全部关闭，读端 `read()` 返回 0；若读端全部关闭，写端触发 `SIGPIPE` 或 `write()` 返回 `EPIPE`。\n\n## 消息队列 Message Queue —— 内核对象保存一条条消息\n消息队列由内核维护消息边界，接收方一次取一条消息；System V 消息队列还支持按 `mtype` 选择性接收，POSIX 消息队列支持消息优先级和异步通知。它比管道更像“轻量消息总线”，但数据仍要在用户态和内核态之间复制，单条消息大小和队列总容量受内核参数限制。\n\n消息队列还有一个容易被漏掉的差异：**内核持久性**。System V 消息队列通过 `msgget()` 创建后会一直存在，直到 `msgctl(..., IPC_RMID, ...)` 删除或系统重启；POSIX 消息队列通过 `mq_open()` 创建命名对象，进程退出不会自动清空，通常要 `mq_unlink()` 删除。这个特性让它区别于匿名管道：发送进程退出后，队列对象和已入队消息仍可由其他进程读取，但也可能因为忘删而残留资源。\n\n## 共享内存 Shared Memory —— 共享物理页，自己解决并发\n共享内存把同一批物理页映射到多个进程的虚拟地址空间，读写数据不再经过“发送到内核缓冲、接收方再拷回”的路径，是本机大块数据交换的高性能方案。POSIX 共享内存常用 `shm_open()` + `ftruncate()` + `mmap(..., MAP_SHARED, ...)`，System V 共享内存使用 `shmget()` + `shmat()` + `shmdt()`。\n\n它的失败路径也最典型：共享内存只提供可见性，不提供互斥、顺序和消息边界。多个进程同时写同一结构体字段时会产生数据竞争；生产上常见现象是偶发脏读、消费者读到半包、进程崩溃后锁未释放。工程上通常把共享内存和 POSIX 信号量、`pthread_mutexattr_setpshared()` 的进程间互斥锁、futex 或事件通知 fd 配合使用。"
+      "title": "进程隔离是 IPC 的根本动机",
+      "content": "进程拥有独立的虚拟地址空间，用户态指针在另一个进程里指向完全不同的物理页（或根本无效），内核也不会让一个进程随意读写另一个进程的内存。这意味着：进程要交换数据、转交文件描述符或通知状态变化，必须经过内核提供的 IPC 对象或内核授权的共享映射。\n\n理解 IPC 选型的关键不是背名字，而是问清四个问题：\n\n1. **数据是否经过内核缓冲**：管道和消息队列都要写进内核再读出来，至少两次拷贝；共享内存把同一物理页映射到多个进程地址空间，读写直接落在页上，内核只负责建立映射。\n2. **是否保留消息边界**：管道和 Socket 流模式只提供字节流，接收方要自己切包；消息队列按条交付，天然有边界。\n3. **对象生命周期**：匿名管道随 fd 关闭消失；命名 FIFO 路径留在文件系统但数据不过夜；System V 消息队列和共享内存创建后内核持久保存，直到显式删除或系统重启；POSIX 命名对象同理，需要 `mq_unlink`/`shm_unlink`。\n4. **谁负责同步**：内核替管道和消息队列做生产者-消费者排队；共享内存只提供可见性，互斥、顺序、发布语义必须自己用信号量、进程间锁或无锁协议解决。"
     },
     {
       "type": "explain",
-      "title": "同步/通知方式与选型",
-      "content": "## 用于同步和通知的机制\n- **信号量 Semaphore**：只同步、不承载业务数据。POSIX 信号量分为**命名信号量**和**未命名信号量**：命名信号量用 `sem_open()` 创建，适合无亲缘进程通过名字协作；未命名信号量用 `sem_init()` 放在共享内存中，`pshared` 非 0 时可用于进程间同步。System V 信号量使用 `semget()` 创建集合、`semop()` 执行原子增减，适合需要一次操作多个信号量的老系统或兼容场景。\n- **信号 Signal**：异步通知机制，例如 `SIGTERM` 请求退出、`SIGCHLD` 通知子进程状态变化。普通信号不适合传业务数据，且相同普通信号可能合并；实时信号可排队并带少量值，但也受资源限制。信号处理函数里只能调用 async-signal-safe 的函数，不能随意加锁或打印复杂日志。\n- **Socket**：既能跨机器，也能本机通信。TCP/UDP Socket 经过网络协议栈；Unix Domain Socket 用文件路径或抽象命名空间作为本机端点，能传字节流、数据报，还能通过 `SCM_RIGHTS` 传递文件描述符。\n\n## System V 与 POSIX IPC 的选择\n- **System V IPC**：消息队列 `msgget/msgsnd/msgrcv`，共享内存 `shmget/shmat/shmdt`，信号量 `semget/semop/semctl`。对象由 key/id 标识，常用 `ipcs -q/-m/-s` 查看、`ipcrm` 删除；历史包袱重，但在老代码和数据库、中间件里仍常见。\n- **POSIX IPC**：消息队列 `mq_open/mq_send/mq_receive`，共享内存 `shm_open/mmap`，信号量 `sem_open/sem_init/sem_wait/sem_post`。命名对象通常出现在 `/dev/mqueue` 或 `/dev/shm` 相关视图中，接口更贴近 fd/文件模型，和 `poll`、权限控制、资源限制结合更自然。\n- **面试结论**：不是“System V 已淘汰、POSIX 一定更好”。如果项目要兼容历史组件、依赖 `ipcs` 运维视图或需要 System V 信号量集合语义，System V 仍合理；新项目通常优先 POSIX/Unix Domain Socket，因为接口更清晰、可组合性更好。\n\n## 选型时真正影响线上结果的因素\n- 父子进程少量顺序日志或命令输出：匿名管道足够，关注读写端关闭、阻塞和 `SIGPIPE`。\n- 无亲缘本机进程的简单字节流：FIFO 或 Unix Domain Socket；如果要保留消息边界、优先级或进程退出后消息仍保存在内核对象里，可考虑消息队列。\n- 本机大块数据、低延迟：共享内存 + 信号量/进程间锁。要设计元数据、版本号、环形队列索引、崩溃恢复，否则“最快”会换来最难排查的数据损坏。\n- 只通知生命周期或中断事件：信号；不要把它当数据通道。\n- 跨机器、需要连接管理、拥塞控制或服务治理：TCP/UDP Socket；本机高吞吐 RPC 或守护进程控制面优先看 Unix Domain Socket。\n\n性能排序只能作为粗略判断：共享内存通常最快，因为数据不经过内核中转；管道、消息队列、UDS 受拷贝、调度和缓冲限制；TCP 回环比 UDS 多协议栈成本；真正线上还要看消息大小、批量、阻塞模型、缓存局部性和系统调用次数。"
+      "title": "管道和 FIFO：内核缓冲区里的字节流",
+      "content": "**匿名管道 pipe** 由 `pipe(int fd[2])` 创建，得到一对 fd：`fd[0]` 读、`fd[1]` 写，Linux 上是半双工。它的典型用法是 `fork()` 之后父子进程各关一端，靠 fd 继承建立通道。无亲缘关系的进程无法直接使用匿名管道，因为没有路径让对方打开同一个对象。\n\n**命名管道 FIFO** 由 `mkfifo()` 在文件系统上创建一个路径名，任意有权限的进程都可以 `open()` 连接。路径只是 rendezvous 点，数据仍然存在内核缓冲区中，不会写入文件系统。\n\n管道的核心边界：\n\n- **没有消息边界**：`write()` 写入多少字节就只是字节流的一部分，`read()` 返回的是当前缓冲区里可用的字节，可能比写入的少，也可能更多。接收方必须自行切包。\n- **缓冲容量有限**：Linux 可用 `fcntl(fd, F_GETPIPE_SZ)` 查看当前管道缓冲区大小（默认通常 64KB，可通过 `/proc/sys/fs/pipe-max-size` 调整上限）。写满时 `write()` 阻塞（非阻塞模式返回 `EAGAIN`）。\n- **读写端关闭语义**：写端全部关闭后，读端 `read()` 返回 0 表示 EOF；读端全部关闭后，写端触发 `SIGPIPE` 信号（默认终止进程），或者 `write()` 返回 `EPIPE`。生产代码要处理这两种情况。\n- **原子写入保证**：`write()` 写入字节数不超过 `PIPE_BUF`（POSIX 要求至少 512 字节，Linux 上是 4096 字节）时保证原子性，不会和其他写入交错；超过 `PIPE_BUF` 的写入可能被拆分。"
+    },
+    {
+      "type": "explain",
+      "title": "消息队列：保留消息边界、按类型或优先级选择",
+      "content": "消息队列由内核维护，每条消息独立存储，接收方一次取一条，天然保留消息边界。这是它和管道最本质的区别。\n\n**System V 消息队列**用 `msgget()` 创建，`msgsnd()` 发送，`msgrcv()` 接收。一个关键特性是 `mtype` 字段：接收方可以指定只取某种类型的消息，实现简单的消息路由。对象通过 key（通常是 `ftok()` 生成）标识，由 id 操作。\n\n**POSIX 消息队列**用 `mq_open()` 创建命名对象，`mq_send()`/`mq_receive()` 操作，支持消息优先级。高优先级消息先被取出。还能通过 `mq_notify()` 注册异步通知，队列从空变非空时通知进程。\n\n容易被忽略的特性——**内核持久性**：\n\n- System V 消息队列 `msgget()` 创建后一直存在于内核中，进程退出、崩溃都不会自动消失，必须 `msgctl(..., IPC_RMID, ...)` 显式删除，或者系统重启。\n- POSIX 消息队列同理，`mq_open()` 创建的命名对象持续存在，进程退出后队列和已入队消息仍然可被其他进程读取，需要 `mq_unlink()` 删除名字。未 unlink 的对象会残留，用 `ls /dev/mqueue` 或 `ipcs -q` 可以看到。\n\n消息队列的局限：数据仍要经过用户态→内核→用户态的拷贝；单条消息大小（System V 的 `MSGMAX`）和队列总字节数（`MSGMNB`）受内核参数限制。它不是高吞吐大数据通道，而是可靠的「轻量消息总线」。"
+    },
+    {
+      "type": "explain",
+      "title": "共享内存：同一物理页映射，性能最高但同步自理",
+      "content": "共享内存把同一批物理页映射到多个进程的虚拟地址空间，读写直接落在页面上，不经过「发送方写入内核缓冲→接收方从内核读出」的两次拷贝路径，是本机大块数据交换最快的方案。\n\n**创建方式**：\n- POSIX：`shm_open()` 创建命名共享内存对象 → `ftruncate()` 设置大小 → `mmap(..., MAP_SHARED, ...)` 映射到进程地址空间。对象出现在 `/dev/shm`（或 tmpfs 挂载点）。\n- System V：`shmget()` 创建或获取共享内存段 → `shmat()` 附着到进程地址空间 → `shmdt()` 分离。对象通过 `ipcs -m` 查看，`ipcrm -m id` 删除。\n\n**共享内存只提供可见性，不提供任何并发保证**。这是它最常见的失败模式：\n\n- 多进程同时写同一结构体字段 → 数据竞争、撕裂写。\n- 生产者写到一半消费者就读了 → 半包/脏读。\n- 进程崩溃时持有锁 → 锁永远不释放，其他进程死锁。\n- 共享区残留旧数据 → 启动时误读到上一次的残留。\n\n工程上必须配套：\n- **POSIX 未命名信号量**（`sem_init(pshared=1)` 放在共享内存中）或**命名信号量**（`sem_open()`）做互斥和同步。\n- **pthread mutex** 设置 `PTHREAD_PROCESS_SHARED` 属性，放在共享内存中使用。\n- **无锁环形队列**配合内存屏障（`__atomic_store/load` 或 `stdatomic`）实现单生产者-单消费者无锁通信。\n- 共享区头部设计版本号、序列号、魔数字段，启动时校验并清零残留。"
+    },
+    {
+      "type": "explain",
+      "title": "信号量、信号和 Socket：同步与跨机器通信",
+      "content": "**信号量 Semaphore** 只做同步，不承载业务数据。POSIX 信号量分两类：命名信号量 `sem_open()` 用名字标识，适合无亲缘进程通过名字协作；未命名信号量 `sem_init()` 放在共享内存中，`pshared` 参数非 0 时可用于进程间同步。System V 信号量 `semget()` 创建信号量集合，`semop()` 一次操作多个信号量（原子增减），适合需要「同时锁定多个资源」的老系统或兼容场景，但 API 复杂且容易出错。\n\n**信号 Signal** 是异步通知机制，由内核在进程调度边界投递。典型用途：`SIGTERM` 通知优雅退出、`SIGCHLD` 通知子进程状态变化、`SIGPIPE` 通知管道断开。普通信号不排队，多次投递只触发一次处理；实时信号（`SIGRTMIN` 到 `SIGRTMAX`）可排队并携带 `sigval`，但信号处理函数中只能调用 async-signal-safe 的函数（不能 `malloc`、`printf`、加普通锁），通常只设标志由主循环检查。信号不适合传业务数据，也不适合做互斥。\n\n**Socket** 是跨机器通信的基础，也可本机使用。TCP 提供有序字节流，UDP 提供数据报。**Unix Domain Socket (UDS)** 用文件路径或 Linux 抽象命名空间作为端点，不走 TCP/IP 协议栈，只在内核里复制数据，通常比 TCP 回环延迟更低。UDS 还能通过 `SCM_RIGHTS` 辅助消息传递文件描述符，以及通过文件系统权限控制访问。本机进程间高吞吐 RPC 或守护进程控制面通常优先 UDS。"
+    },
+    {
+      "type": "explain",
+      "title": "System V 与 POSIX IPC 的实际差异",
+      "content": "面试常问「System V 过时了吗」——答案不是简单的是或否。两者的关键差异：\n\n**标识方式**：System V 用 `ftok()` 生成 key，再由 `msgget/semget/shmget` 转为 id；POSIX 用路径名或名字（如 `/my_queue`），更贴近文件系统模型。\n\n**接口风格**：System V 操作函数独立（`msgsnd`、`semop`、`shmat`），参数多、语义复杂；POSIX 接口更贴近 fd 模型，和 `poll`/`select`/权限控制结合更自然。\n\n**运维视图**：System V 对象用 `ipcs -q/-m/-s` 查看、`ipcrm` 删除，是老运维工具链的一部分；POSIX 对象通过 `/dev/mqueue`、`/dev/shm` 或 `lsof` 查看。\n\n**信号量差异**：System V 信号量是集合模型，一次操作可以同时增减多个信号量（适合需要原子锁多个资源的场景）；POSIX 信号量是独立对象，接口简单但不支持集合原子操作。\n\n**实际选择**：如果项目要兼容历史组件（如 Oracle、老中间件）、依赖 `ipcs` 运维工具、或需要 System V 信号量集合语义，System V 仍合理。新项目通常优先 POSIX + Unix Domain Socket，接口更清晰、可组合性更好、和现代 Linux API 协作更自然。"
     },
     {
       "type": "diagram",
-      "format": "mermaid",
+      "format": "svg",
       "title": "IPC 的两类机制",
-      "content": "flowchart TD\nA[\"进程虚拟地址空间隔离\"] --> B{\"通信目标是什么\"}\nB -->|\"顺序字节流\"| C[\"匿名 pipe：fork 继承 fd\"]\nB -->|\"无亲缘字节流\"| D[\"FIFO 或 Unix Domain Socket\"]\nB -->|\"保留消息边界/优先级\"| E[\"消息队列：内核保存消息，进程退出后对象可继续存在\"]\nB -->|\"大块本机数据\"| F[\"共享内存：同一物理页映射到多进程\"]\nF --> G{\"是否有并发读写\"}\nG -->|\"是\"| H[\"信号量/进程间互斥锁保护元数据和数据区\"]\nG -->|\"否\"| I[\"只读映射或单写者协议\"]\nB -->|\"生命周期事件\"| J[\"信号：异步通知，普通信号可能合并\"]\nB -->|\"跨机器\"| K[\"TCP/UDP Socket\"]\nE --> L{\"API 族选择\"}\nL -->|\"历史组件/ipcs 运维\"| M[\"System V：msgget/shmget/semget\"]\nL -->|\"新项目/文件模型\"| N[\"POSIX：mq_open/shm_open/sem_open\"]",
-      "caption": "图中按通信目标分支：字节流、消息边界、大块共享、事件通知和跨机器通信会导向不同 IPC；共享内存分支必须再补同步设计，消息队列和共享内存还要区分 System V/POSIX API。",
-      "fallback": "IPC 选型先看目标：字节流用 pipe/FIFO/UDS，消息边界用消息队列，大块本机数据用共享内存并配同步，事件通知用信号，跨机器用 Socket；System V 与 POSIX 是常见 API 族差异。",
+      "content": "assets/diagrams/os-ipc-data-paths.svg",
+      "caption": "图中把管道/消息队列的「用户态→内核缓冲→用户态」两次拷贝路径、共享内存的同一物理页映射零中转路径、Socket/UDS 的端点通信模型放在一起，并标注同步责任归属和生命周期差异。",
+      "fallback": "IPC 选型先看目标：字节流用 pipe/FIFO/UDS，消息边界用消息队列，大块本机数据用共享内存并配同步，事件通知用信号，跨机器用 Socket。管道和消息队列经内核缓冲至少两次拷贝，共享内存映射同一物理页但必须自己处理互斥、消息边界和崩溃恢复。",
       "sources": [
         {
-          "kind": "mermaid",
-          "content": "flowchart TD\nA[\"进程虚拟地址空间隔离\"] --> B{\"通信目标是什么\"}\nB -->|\"顺序字节流\"| C[\"匿名 pipe：fork 继承 fd\"]\nB -->|\"无亲缘字节流\"| D[\"FIFO 或 Unix Domain Socket\"]\nB -->|\"保留消息边界/优先级\"| E[\"消息队列：内核保存消息，进程退出后对象可继续存在\"]\nB -->|\"大块本机数据\"| F[\"共享内存：同一物理页映射到多进程\"]\nF --> G{\"是否有并发读写\"}\nG -->|\"是\"| H[\"信号量/进程间互斥锁保护元数据和数据区\"]\nG -->|\"否\"| I[\"只读映射或单写者协议\"]\nB -->|\"生命周期事件\"| J[\"信号：异步通知，普通信号可能合并\"]\nB -->|\"跨机器\"| K[\"TCP/UDP Socket\"]\nE --> L{\"API 族选择\"}\nL -->|\"历史组件/ipcs 运维\"| M[\"System V：msgget/shmget/semget\"]\nL -->|\"新项目/文件模型\"| N[\"POSIX：mq_open/shm_open/sem_open\"]"
+          "kind": "svg",
+          "path": "assets/diagrams/os-ipc-data-paths.svg"
         },
         {
           "kind": "text",
-          "content": "IPC 选型先看目标：字节流用 pipe/FIFO/UDS，消息边界用消息队列，大块本机数据用共享内存并配同步，事件通知用信号，跨机器用 Socket；System V 与 POSIX 是常见 API 族差异。"
+          "content": "IPC 选型先看目标：字节流用 pipe/FIFO/UDS，消息边界用消息队列，大块本机数据用共享内存并配同步，事件通知用信号，跨机器用 Socket；管道和消息队列经内核缓冲，共享内存映射同一物理页但必须自己处理互斥、消息边界和崩溃恢复。"
         }
       ]
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| IPC 方式 | 数据传输 | 适用范围 | 性能 | 是否需要同步 |\n| --- | --- | --- | --- | --- |\n| 匿名管道 | 无消息边界的字节流，内核缓冲转发 | 父子或有共同祖先且继承 fd 的进程 | 中；受缓冲大小、阻塞读写和系统调用次数影响 | 不需要额外互斥，但要正确关闭读写端处理 EOF/EPIPE |\n| 命名管道 | 无消息边界的字节流，路径只负责 rendezvous | 同机任意有权限访问 FIFO 路径的进程 | 中；比共享内存慢，适合简单生产者消费者 | 不需要保护内核缓冲，但要处理 open 阻塞和读写端退出 |\n| 消息队列 | 一条条消息，System V 可按类型取，POSIX 支持优先级 | 同机任意有权限访问队列对象的进程 | 中；有用户态/内核态拷贝和队列容量限制 | 队列入队出队由内核同步；业务层仍要处理满队列、超时和残留对象 |\n| 共享内存 | 原始内存页映射，多进程直接读写 | 同机任意拿到共享内存对象/id 的进程 | 最高；大块数据少拷贝，但受缓存一致性和锁竞争影响 | 必须配信号量、进程间互斥锁或无锁协议保护共享结构 |\n| 信号量 | 不传业务数据，只维护计数或互斥语义 | 同机进程；POSIX 命名/未命名，System V 集合 | 高；操作很轻，但竞争时会阻塞/唤醒调度 | 本身就是同步机制，常保护共享内存或限制资源并发数 |\n| 信号 | 只通知信号编号，实时信号可带少量附加值 | 同机进程、进程组、会话，受权限约束 | 高；异步但语义受合并和处理函数限制 | 不适合作互斥；处理函数中只能做极少量安全操作 |\n| Socket | TCP 字节流、UDP 数据报、UDS 字节流/数据报和 fd 传递 | TCP/UDP 可跨机器，UDS 仅本机 | 跨机器最低；本机 UDS 通常低于 TCP 回环开销 | 协议栈保证传输语义，业务仍要处理粘包、半包、重连和背压 |"
+      "title": "六种 IPC 方式对比",
+      "content": "| IPC 方式 | 数据路径 | 消息边界 | 适用范围 | 性能特征 | 同步责任 |\n| --- | --- | --- | --- | --- | --- |\n| 匿名管道 | 用户态→内核缓冲→用户态，两次拷贝 | 无，纯字节流 | 有共同祖先、可继承 fd 的进程（通常父子） | 中等，受缓冲大小和系统调用次数限制 | 内核做排队；需正确关闭读写端、处理 EOF/EPIPE/SIGPIPE |\n| 命名管道 FIFO | 同上 | 无 | 同机任意有权限访问路径的进程 | 中等，和匿名管道类似 | 同上；额外注意 open 可能阻塞 |\n| 消息队列 | 用户态→内核队列→用户态，两次拷贝 | 有，按条交付 | 同机任意有权限的进程 | 中等，受单条消息大小和队列总容量限制 | 内核做入队出队排队；业务层要处理满队列超时和残留对象清理 |\n| 共享内存 | 同一物理页直接映射，零内核中转 | 无，原始内存 | 同机大块数据、高吞吐场景 | 最高，受缓存一致性和锁竞争影响 | 必须配信号量、进程间锁或无锁协议 |\n| 信号量 | 不传数据，只做计数/互斥 | 不适用 | 同机进程间同步 | 操作轻量，竞争时阻塞/唤醒调度开销 | 本身就是同步机制 |\n| 信号 | 只投递信号编号和少量附加值 | 不适用 | 同机进程/进程组/会话 | 异步投递，处理受 async-signal-safe 限制 | 不适合作互斥，只作通知 |\n| Unix Domain Socket | 内核内端点通信，不经 IP 协议栈 | 流模式无边界，数据报模式有 | 本机任意有权限进程 | 通常低于 TCP 回环，可传 fd | 协议栈保证传输语义；业务仍要处理粘包/半包 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// 1. 匿名管道示例：父子进程通过继承 fd 通信\n#include <unistd.h>\n#include <stdio.h>\n#include <string.h>\n#include <sys/wait.h>\n\nint main() {\n    int fd[2];\n    if (pipe(fd) == -1) {\n        perror(\"pipe\");\n        return 1;\n    }\n\n    pid_t pid = fork();\n    if (pid == -1) {\n        perror(\"fork\");\n        return 1;\n    }\n\n    if (pid == 0) {\n        close(fd[0]);\n        const char *msg = \"Hello from child\";\n        write(fd[1], msg, strlen(msg));\n        close(fd[1]);\n        return 0;\n    }\n\n    close(fd[1]);\n    char buf[100];\n    ssize_t n = read(fd[0], buf, sizeof(buf) - 1);\n    if (n > 0) {\n        buf[n] = '\\0';\n        printf(\"Parent received: %s\\n\", buf);\n    }\n    close(fd[0]);\n    waitpid(pid, NULL, 0);\n    return 0;\n}\n\n// 2. 共享内存示例（POSIX）：真实工程还要配 sem_open/sem_wait 保护写入\n#include <sys/mman.h>\n#include <sys/stat.h>\n#include <fcntl.h>\n#include <unistd.h>\n\nint fd = shm_open(\"/myshm\", O_CREAT | O_RDWR, 0600);\nftruncate(fd, 4096);\nint *ptr = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);\n*ptr = 42;\nmunmap(ptr, 4096);\nclose(fd);\n\nint fd2 = shm_open(\"/myshm\", O_RDONLY, 0600);\nint *ptr2 = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd2, 0);\nprintf(\"Value: %d\\n\", *ptr2);\nmunmap(ptr2, 4096);\nclose(fd2);\nshm_unlink(\"/myshm\");",
+      "title": "C 可运行：pipe 传字节流 + POSIX shared memory 共享同一页",
+      "content": "#include <fcntl.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <sys/mman.h>\n#include <sys/stat.h>\n#include <sys/wait.h>\n#include <unistd.h>\n\nstatic void fail(const char *what) {\n    perror(what);\n    exit(1);\n}\n\nint main(void) {\n    /* ---- pipe: 父子进程间字节流 ---- */\n    int pipefd[2];\n    if (pipe(pipefd) == -1) fail(\"pipe\");\n\n    /* ---- POSIX shared memory: 同一物理页映射 ---- */\n    char shm_name[64];\n    snprintf(shm_name, sizeof(shm_name), \"/ipc_demo_%ld\", (long)getpid());\n    int shmfd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);\n    if (shmfd == -1) fail(\"shm_open\");\n    if (ftruncate(shmfd, 4096) == -1) fail(\"ftruncate\");\n    char *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, shmfd, 0);\n    if (shared == MAP_FAILED) fail(\"mmap\");\n    snprintf(shared, 4096, \"parent initialized shared page\");\n\n    pid_t pid = fork();\n    if (pid == -1) fail(\"fork\");\n\n    if (pid == 0) {\n        /* 子进程写 pipe: 只是写入字节流，无消息边界 */\n        close(pipefd[0]);\n        const char *msg = \"child wrote bytes via pipe\";\n        if (write(pipefd[1], msg, strlen(msg)) == -1) fail(\"write\");\n        close(pipefd[1]);\n\n        /* 子进程直接改 shared 映射区; 父进程稍后能看到同一物理页的新内容\n         * 这里是单写者演示，真实工程必须加同步 */\n        snprintf(shared, 4096, \"child updated the same mapped page\");\n\n        munmap(shared, 4096);\n        close(shmfd);\n        return 0;\n    }\n\n    /* 父进程读 pipe: 读到的是字节流片段，需手动补 '\\0' */\n    close(pipefd[1]);\n    char pipe_buf[128];\n    ssize_t n = read(pipefd[0], pipe_buf, sizeof(pipe_buf) - 1);\n    if (n == -1) fail(\"read\");\n    pipe_buf[n] = '\\0';\n\n    /* 等子进程结束后读 shared 内容（同一页映射） */\n    if (waitpid(pid, NULL, 0) == -1) fail(\"waitpid\");\n    printf(\"pipe got: %s\\n\", pipe_buf);\n    printf(\"shm got:  %s\\n\", shared);\n\n    close(pipefd[0]);\n    munmap(shared, 4096);\n    close(shmfd);\n    shm_unlink(shm_name);  /* 清理命名共享内存对象，避免残留 */\n    return 0;\n}",
       "language": "c",
       "highlights": [
         {
-          "line": 9,
-          "note": "pipe 创建内核管道缓冲区和一读一写两个文件描述符；后续 fork 后父子进程各自关闭不用的一端。"
+          "line": 17,
+          "note": "pipe 创建内核缓冲区和一读一写两个 fd；fork 后父子各自关闭不用的一端。"
         },
         {
-          "line": 22,
-          "note": "子进程关闭读端后只保留写端，避免父进程因为仍有写端引用而迟迟读不到 EOF。"
+          "line": 28,
+          "note": "MAP_SHARED 把 POSIX shared memory 对象映射到父子进程各自的虚拟地址空间，物理页相同。"
         },
         {
-          "line": 31,
-          "note": "父进程读取时预留 1 字节放字符串结束符；管道本身只提供字节流，不会自动补消息边界或结束符。"
+          "line": 40,
+          "note": "write(pipefd[1], ...) 只是把字节写入内核缓冲区，管道不保留消息边界。"
         },
         {
           "line": 44,
-          "note": "shm_open 创建 POSIX 命名共享内存对象，权限 0600 避免其他用户进程误连。"
+          "note": "子进程直接改 shared 映射区内容，父进程 waitpid 后能读到同一物理页上的新数据——但这是单写演示，多进程并发必须加同步。"
         },
         {
-          "line": 46,
-          "note": "MAP_SHARED 让写入映射页的修改对映射同一对象的其他进程可见；这里没有提供互斥，只适合演示单写场景。"
+          "line": 52,
+          "note": "pipe 读到的只是字节片段，需手动补 '\\0'——说明管道本质是字节流而非消息。"
         },
         {
-          "line": 60,
-          "note": "shm_unlink 删除命名对象，避免进程退出后共享内存名字继续残留在系统中。"
+          "line": 59,
+          "note": "shm_unlink 删除命名共享内存对象，防止进程退出后对象残留在 /dev/shm。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "30 秒结论：IPC 的本质是让相互隔离的进程通过内核对象或共享映射交换信息。传数据看管道、消息队列、共享内存、Socket；做同步/通知看信号量和信号。高性能不是只背“共享内存最快”，还要补一句：共享内存省掉内核中转拷贝，但同步、崩溃恢复和一致性要自己设计。\n\n机制要点：\n\n- 管道/FIFO：内核缓冲区里的字节流。匿名管道依赖 `fork()` 继承 fd，FIFO 用路径让无亲缘进程连接；二者都没有消息边界，要处理缓冲满、读写端关闭、`EOF/EPIPE/SIGPIPE`。\n- 消息队列：内核维护一条条消息，保留消息边界；System V 支持按类型接收，POSIX 支持优先级和通知。队列对象和已入队消息具有内核持久性，进程退出后不一定消失，需要显式 `IPC_RMID` 或 `mq_unlink()` 清理。\n- 共享内存：`shm_open/mmap` 或 `shmget/shmat` 把同一物理页映射给多个进程，数据不走内核缓冲拷贝；必须配命名/未命名信号量、进程间互斥锁或无锁环形队列协议。\n- 信号量：只表达资源计数或互斥，不传业务数据。POSIX 有命名信号量和放在共享内存里的未命名信号量；System V 信号量是集合模型。\n- 信号：适合生命周期和异常事件通知，例如优雅退出、子进程回收；普通信号可能合并，信号处理函数限制多，不适合作业务消息通道。\n- Socket：跨机器用 TCP/UDP；本机进程通信可用 Unix Domain Socket，通常比 TCP 回环少协议栈开销，还能传文件描述符。\n\n边界/追问应对：\n\n- 如果场景是本机大对象高吞吐，我会选共享内存，但同时说明元数据布局、互斥/通知、进程崩溃后锁恢复和清理策略；否则这不是完整方案。\n- 如果场景是可靠保留一条条小消息，消息队列比管道合适，因为它有消息边界和内核持久性，但要关注容量限制、满队列阻塞或超时、残留对象导致的资源泄漏。\n- 如果面试官问 System V 与 POSIX，我不会简单说谁新谁旧，而会按 API、命名方式、运维工具和历史兼容性选择：老系统常见 System V，新项目更常用 POSIX/UDS。",
+      "content": "**30 秒结论**：IPC 本质是让隔离的进程通过内核对象或内核授权的共享映射交换信息。传数据看管道、消息队列、共享内存、Socket；做同步/通知看信号量和信号。共享内存最快（零内核中转拷贝），但同步、消息边界和崩溃恢复全靠自己。\n\n**机制主线（按数据路径分组）**\n\n- **经内核缓冲（两次拷贝）**：管道/FIFO 是字节流、无消息边界，缓冲容量有限，需处理 EOF/EPIPE/SIGPIPE。消息队列按条交付、保留边界，System V 支持按 mtype 选择接收，POSIX 支持优先级和异步通知。两者都有内核持久性——进程退出后对象和已入队消息不消失，必须显式 `IPC_RMID` 或 `mq_unlink()` 清理。\n- **同一物理页直接映射（零中转）**：共享内存通过 `shm_open/mmap` 或 `shmget/shmat` 建立映射，读写直接落在物理页上。不提供互斥、顺序和消息边界，必须配套 POSIX 信号量（命名或未命名 pshared）、进程间 pthread mutex（`PTHREAD_PROCESS_SHARED`）或无锁协议。\n- **同步和通知**：信号量只做计数/互斥不传数据。信号是异步事件通知（`SIGTERM`/`SIGCHLD`），普通信号可能合并，处理函数受 async-signal-safe 限制。\n- **跨机器/本机端点通信**：TCP/UDP 走协议栈可跨机器。UDS 是本机内核端点通信，不经 IP 路由，延迟通常低于 TCP 回环，还能通过 `SCM_RIGHTS` 传文件描述符。\n\n**System V vs POSIX**：不是谁淘汰谁。System V 用 key/id 标识、`ipcs`/`ipcrm` 管理、信号量支持集合原子操作；老代码和数据库/中间件仍常见。POSIX 接口更贴近 fd 模型，和 poll/权限控制结合更自然，新项目优先。\n\n**边界追问应对**\n- 本机大块数据高吞吐 → 共享内存 + 信号量/无锁环形队列，同时说明元数据布局、版本号、崩溃恢复策略。\n- 可靠保留小消息 → 消息队列（有边界、有持久性），关注容量限制和残留清理。\n- 本机进程高频 RPC → UDS 优于 TCP 回环，可传 fd、用文件权限控制访问。",
       "followUpQuestions": [
         {
           "question": "共享内存为什么是最快的 IPC？它和管道在拷贝路径上差在哪？",
-          "answer": "管道和消息队列的典型路径是发送方从用户空间写入内核缓冲区，接收方再从内核缓冲区读回自己的用户空间，至少有两次数据拷贝和两边系统调用。共享内存是把同一批物理页映射到多个进程的虚拟地址空间，进程直接读写映射区，内核只参与建立映射和权限管理，不在每次传输时中转数据。因此大块本机数据交换通常最快。代价是内核不替你定义消息边界，也不保证互斥和发布顺序，必须用信号量、进程间锁或无锁协议解决并发问题。"
+          "answer": "管道的典型路径是发送方从用户态写入内核缓冲区，接收方再从内核缓冲区读回用户态，至少两次数据拷贝加两边系统调用。共享内存把同一物理页映射到多个进程的虚拟地址空间，进程直接读写映射区，内核只参与建立映射和权限管理，不在每次传输时中转数据。因此大块本机数据交换通常最快。代价是内核不替你定义消息边界，也不保证互斥和发布顺序，必须用信号量、进程间锁或无锁协议解决并发。"
         },
         {
-          "question": "线上发现共享内存消费者偶发读到半包或旧数据，你会从哪些 IPC 专属线索排查？",
-          "answer": "先看共享区协议有没有长度、版本号、序列号或 ready 标志，确认生产者是否在写完数据后再发布可见状态；再看互斥手段是否真是进程间共享，例如 POSIX 未命名信号量的 `pshared` 是否为非 0、pthread mutex 是否设置 `PTHREAD_PROCESS_SHARED`。如果进程崩溃过，要检查锁是否可能永远占用、共享内存对象是否残留旧内容、启动时是否清零或校验魔数。系统侧可用 `ipcs -m/-s` 或查看 `/dev/shm`、`lsof`、进程 fd，确认是否连到了同一个对象以及对象是否被错误复用。"
+          "question": "线上发现共享内存消费者偶发读到半包或旧数据，从哪些 IPC 专属线索排查？",
+          "answer": "先看共享区协议有没有长度字段、版本号、序列号或 ready 标志，确认生产者是否在写完数据后再发布可见状态（store-release 语义）。再看互斥手段是否真正在进程间共享：POSIX 未命名信号量的 `pshared` 是否非 0、pthread mutex 是否设置了 `PTHREAD_PROCESS_SHARED` 属性。如果进程崩溃过，检查锁是否可能永远占用（进程带锁崩溃未释放）、共享内存对象是否残留旧内容（启动时未清零或未校验魔数）。系统侧用 `ipcs -m/-s`、查看 `/dev/shm`、`lsof` 确认是否连到同一个对象以及对象是否被错误复用。"
         },
         {
-          "question": "消息队列和管道都经过内核，为什么有时仍选择消息队列？",
-          "answer": "选择消息队列通常不是为了更快，而是为了语义：消息队列保留消息边界，System V 可按消息类型接收，POSIX 可用优先级，还具备内核持久性，进程退出后队列对象和已入队消息可继续存在，适合小消息、控制命令、异步解耦。管道只是字节流，接收方要自己切包，也不能按类型选择消息；匿名管道还依赖 fd 继承。消息队列的风险是容量和单条消息大小受限，忘记 `IPC_RMID` 或 `mq_unlink()` 会留下内核对象。"
+          "question": "消息队列和管道都经过内核，为什么有时仍选消息队列？",
+          "answer": "选消息队列通常不是为了更快，而是为了语义。消息队列保留消息边界，System V 可按消息类型选择接收，POSIX 支持优先级和异步通知，还具备内核持久性——进程退出后队列对象和已入队消息可继续存在。适合小消息、控制命令、异步解耦。管道只是字节流，接收方要自己切包，匿名管道还依赖 fd 继承。消息队列的风险是容量和单条消息大小受内核参数限制，忘记 `IPC_RMID` 或 `mq_unlink()` 会留下内核对象。"
         },
         {
-          "question": "本机两个进程通信，用 Unix Domain Socket 和用 TCP 回环有什么区别？",
-          "answer": "TCP 回环虽然不出物理网卡，但仍走 TCP/IP 协议栈，包含端口、连接状态、拥塞/流控、报文处理等开销。Unix Domain Socket 是本机内核里的端点通信，常用文件路径或抽象命名空间寻址，不走 IP 路由和 TCP 封装，通常延迟更低；它还能通过 `SCM_RIGHTS` 传递文件描述符，并可利用文件系统权限做访问控制。需要跨机器或统一网络协议时选 TCP，本机守护进程控制面和高频 RPC 常优先 UDS。"
+          "question": "本机两个进程用 Unix Domain Socket 和用 TCP 回环有什么区别？",
+          "answer": "TCP 回环虽然不出物理网卡，但仍走完整 TCP/IP 协议栈——端口、连接状态管理、拥塞控制、流控、报文封装和解析都有开销。Unix Domain Socket 是本机内核里的端点通信，用文件路径或 Linux 抽象命名空间寻址，不走 IP 路由和 TCP 封装，通常延迟更低、吞吐更高。UDS 还能通过 `SCM_RIGHTS` 辅助消息传递文件描述符，并可用文件系统权限控制访问。需要跨机器或统一网络协议时选 TCP，本机守护进程控制面和高频 RPC 通常优先 UDS。"
+        },
+        {
+          "question": "System V 信号量和 POSIX 信号量的核心区别是什么？",
+          "answer": "System V 信号量是集合模型，`semget()` 创建一个包含多个信号量的集合，`semop()` 可以一次操作中同时对多个信号量做增减，语义是原子的——适合需要同时锁定多个资源的场景，但 API 复杂且容易出错。POSIX 信号量是独立对象，命名信号量用 `sem_open()` 创建、未命名信号量用 `sem_init()` 初始化，接口简洁（`sem_wait/sem_post`），但不支持集合原子操作。新代码通常优先 POSIX 信号量，需要集合语义或兼容老系统时用 System V。"
         }
       ]
     },
@@ -108,37 +132,51 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "IPC 源于进程虚拟地址空间隔离和内核权限边界",
-        "匿名管道依赖 fd 继承，命名管道通过 FIFO 路径连接无亲缘进程",
-        "管道是字节流且无消息边界，需要处理 EOF、EPIPE、SIGPIPE 和缓冲阻塞",
-        "消息队列保留消息边界，并具备进程退出后对象和消息仍可存在的内核持久性",
-        "System V 与 POSIX 的消息队列、共享内存、信号量 API 名称和对象管理方式不同",
-        "共享内存通过同一物理页映射减少数据拷贝，但必须额外设计同步、消息边界和崩溃恢复",
-        "信号量只做同步不传数据，POSIX 信号量分命名信号量和未命名信号量",
-        "信号适合异步事件通知，普通信号可能合并，处理函数受 async-signal-safe 限制",
-        "Socket 是跨机器通信基础，本机 Unix Domain Socket 可减少协议栈开销并传递文件描述符",
-        "能按亲缘关系、是否跨机器、消息大小、是否需要持久消息、同步复杂度选择 IPC 方案"
+        "能解释 IPC 的根本原因是进程虚拟地址空间隔离和内核权限边界",
+        "能区分经内核缓冲（管道/消息队列）和直接物理页映射（共享内存）两条数据路径",
+        "能说明管道是字节流无消息边界，以及 EOF/EPIPE/SIGPIPE 和 PIPE_BUF 原子写入保证",
+        "能解释消息队列的消息边界语义、System V 按 mtype 选择和 POSIX 优先级/通知",
+        "能说清消息队列和共享内存的内核持久性，以及为什么必须显式 unlink/RMID",
+        "能说明共享内存必须配套信号量/进程间锁/无锁协议，并能列举常见数据竞争和崩溃恢复问题",
+        "能区分 POSIX 命名信号量与未命名信号量的创建方式和适用场景",
+        "能说明信号是异步通知机制、普通信号可能合并、处理函数受 async-signal-safe 限制",
+        "能比较 Unix Domain Socket 与 TCP 回环的拷贝路径、延迟和 fd 传递能力",
+        "能按亲缘关系、是否跨机器、消息大小/边界需求、同步复杂度和对象清理选型"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "os.process-thread.topic-ipc.recall.1",
-      "prompt": "请比较管道、消息队列、共享内存、信号量、信号和 Socket 这些 IPC 方式的机制、适用场景与主要坑点。",
+      "prompt": "请比较管道、消息队列、共享内存、信号量、信号和 Socket 的机制、适用场景与主要坑点。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "os.process-thread.topic-ipc.recall.2",
-      "prompt": "如果本机两个高吞吐进程要传大块数据，你会在共享内存、消息队列和 Unix Domain Socket 之间如何取舍？请说明同步、拷贝和故障恢复成本。",
+      "prompt": "本机两个高吞吐进程要传大块数据，你会在共享内存、消息队列和 Unix Domain Socket 之间如何取舍？请说明拷贝路径、同步成本和故障恢复。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "os.process-thread.topic-ipc.recall.3",
-      "prompt": "线上出现消息队列或共享内存对象残留、消费者读到旧数据，你会用哪些命令、对象生命周期和同步线索定位？",
+      "prompt": "线上出现共享内存消费者偶发读到半包或旧数据，你会从哪些 IPC 专属线索排查？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "os.process-thread.topic-ipc.recall.4",
+      "prompt": "消息队列和管道都经过内核缓冲，为什么有时仍选消息队列？请从消息边界、内核持久性和接收选择性三个方面回答。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "os.process-thread.topic-ipc.recall.5",
+      "prompt": "System V 和 POSIX 两套 IPC 的 API 风格、对象管理和运维工具有什么差异？新项目应该怎么选？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -146,43 +184,43 @@
   ],
   "rubric": {
     "mustHave": [
-      "进程虚拟地址空间隔离",
-      "匿名管道 fd 继承与 FIFO 路径连接",
-      "管道字节流无消息边界",
-      "消息队列消息边界与内核持久性",
-      "共享内存同一物理页映射与零中转拷贝",
-      "共享内存需要信号量或进程间锁同步",
-      "Socket 跨机器与 Unix Domain Socket 本机通信",
-      "信号异步通知而非大数据通道"
+      "能解释进程虚拟地址空间隔离是 IPC 的根本原因",
+      "能区分经内核缓冲（管道/消息队列/Socket）和直接物理页映射（共享内存）两条数据路径",
+      "能说明管道是字节流无消息边界，以及读写端关闭的 EOF/EPIPE/SIGPIPE 语义",
+      "能解释消息队列的消息边界语义和内核持久性（进程退出后对象不消失、需显式清理）",
+      "能说明共享内存同一物理页映射实现零中转拷贝，但必须配套信号量/进程间锁/无锁协议",
+      "能区分 POSIX 命名信号量与未命名信号量的创建方式和 pshared 参数",
+      "能说明信号是异步通知而非数据通道，处理函数受 async-signal-safe 限制",
+      "能说明 Unix Domain Socket 与 TCP 回环的路径差异和 fd 传递能力"
     ],
     "goodToHave": [
-      "System V 与 POSIX IPC 的 API 族差异",
-      "POSIX 命名信号量与未命名信号量",
-      "System V 对象可用 ipcs 查看并用 ipcrm 删除",
-      "POSIX 共享内存和消息队列需要 shm_unlink 或 mq_unlink 清理",
-      "Unix Domain Socket 可通过 SCM_RIGHTS 传递文件描述符",
-      "管道读写端关闭导致 EOF、EPIPE 或 SIGPIPE"
+      "能说出 System V 与 POSIX IPC 在标识方式、接口风格和运维工具上的差异",
+      "能解释 System V 消息队列按 mtype 选择接收和 POSIX 优先级机制",
+      "能说明 System V 对象用 ipcs/ipcrm 管理、POSIX 对象用 /dev/mqueue 和 /dev/shm 查看",
+      "能解释 PIPE_BUF 的原子写入保证及其对管道编程的影响",
+      "能说明共享内存场景下版本号/魔数/序列号的设计和崩溃恢复策略",
+      "能说出 UDS 通过 SCM_RIGHTS 传递文件描述符的能力"
     ],
     "commonMistakes": [
-      "以为共享内存自带互斥和消息边界",
-      "以为匿名管道能直接用于无亲缘进程",
-      "忽略消息队列和共享内存对象的残留清理",
-      "把信号当作可靠业务消息队列使用",
-      "混淆 System V 与 POSIX IPC 的创建和删除方式",
-      "只按速度选型而不考虑崩溃恢复、容量限制和运维可观测性"
+      "以为共享内存自带互斥和消息边界，不加同步就使用",
+      "以为匿名管道能直接用于无亲缘进程通信",
+      "忽略消息队列和共享内存对象的残留清理（忘记 IPC_RMID/shm_unlink/mq_unlink）",
+      "把信号当作可靠业务消息队列使用（普通信号可能合并、不排队）",
+      "混淆 System V 与 POSIX IPC 的创建标识方式和删除方式",
+      "只按性能排序选型而不考虑消息边界、崩溃恢复、容量限制和运维可观测性"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-17",
+  "updatedAt": "2026-06-22",
   "status": "draft",
   "prerequisites": [
     "os.process-thread.topic-process-vs-thread"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "重点看候选人能否把 IPC 选型落到进程地址空间隔离、内核对象生命周期、数据拷贝路径和同步责任上；能否说出消息队列持久性、System V/POSIX API 差异、POSIX 命名/未命名信号量，以及共享内存线上脏读或残留对象的排查线索。"
+  "interviewerFocus": "重点看候选人能否把 IPC 选型落到进程地址空间隔离、内核对象生命周期、数据拷贝路径和同步责任上；能否说出消息队列的内核持久性和边界语义、System V/POSIX API 差异、POSIX 命名/未命名信号量的区别，以及共享内存线上脏读或残留对象的排查线索。"
 }

@@ -4,7 +4,7 @@
   "category": "project-design",
   "group": "project-design",
   "title": "多租户 SaaS 架构设计",
-  "summary": "讲清多租户三种数据隔离方案的取舍、租户路由与 ThreadLocal 上下文、拦截器自动注入 tenant_id 防越权，以及混合模式。",
+  "summary": "讲清多租户 SaaS 三种数据隔离方案（独立库/独立 Schema/共享表）的隔离性、成本与运维取舍；请求层租户识别与 ThreadLocal 上下文传递机制；MyBatis 拦截器自动注入 tenant_id 防越权的原理与风险；ThreadLocal 跨线程丢失问题；混合模式按客户分层落地策略；以及配额管理和租户级缓存/定时任务等横向关注点。",
   "tags": [
     "架构设计",
     "项目设计",
@@ -13,25 +13,40 @@
     "数据隔离"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 42,
   "order": 10,
   "recommendWeight": 90,
   "status": "staging",
   "learningCards": [
     {
       "type": "explain",
-      "title": "多租户 SaaS 架构设计：数据隔离方案、独立数据库",
-      "content": "## 一、数据隔离方案\n\n### 1.1 独立数据库\n- 每个租户一个独立数据库\n- **优点**：隔离性最好，数据安全\n- **缺点**：成本高，维护复杂\n- **适用**：大客户、金融行业\n\n### 1.2 共享数据库+独立Schema\n- 同一个数据库，每个租户一个Schema\n- **优点**：中等隔离，成本适中\n- **缺点**：Schema管理复杂\n- **适用**：中等规模租户\n\n三种隔离方案本质是在「隔离性、成本、运维复杂度」三者间取舍：越独立越安全但越贵、越共享越便宜但越容易串数据。选型不是非此即彼，大多数成熟 SaaS 用混合模式——按客户付费等级和合规要求分配不同隔离级别。"
+      "title": "三种数据隔离方案的本质是隔离性与成本的取舍",
+      "content": "多租户 SaaS 的核心矛盾是：一套系统服务多个租户，但每个租户的数据不能互相串。这个矛盾在数据库层体现为三种隔离方案，本质是「隔离性、成本、运维复杂度」三者之间的权衡。\n\n**独立数据库**：每个租户一个独立的数据库实例。隔离性最强——物理级别隔离，数据库崩溃只影响一个租户，备份恢复可以按租户独立操作。代价是成本最高（每个租户一个数据库实例，连接池、监控、备份都是独立的），运维复杂度高（几十个租户还好，几百上千个就是灾难）。适合大客户、金融行业、合规要求严格（如 GDPR 数据主权要求数据存在特定区域）的场景。\n\n**共享数据库 + 独立 Schema**：所有租户共享一个数据库实例，每个租户一个 Schema（可以理解为一组独立的表空间）。隔离性介于独立库和共享表之间——不同 Schema 的表互不可见，一个 Schema 的误操作不会直接影响另一个。成本比独立库低很多，但 Schema 数量上千后数据库本身的元数据管理会变重（PostgreSQL 的 Schema 性能开销比 MySQL 小，选型时要考虑）。适合中等规模租户。\n\n**共享数据库 + 共享表（行级隔离）**：所有租户的数据在同一张表里，靠 tenant_id 字段区分。成本最低——一份数据库、一套表结构、一个连接池。但隔离性完全依赖应用层：每一条 SQL 都必须正确带上 tenant_id 条件，一旦某个查询漏了，就是跨租户数据泄露。适合小租户、免费版、租户数量极大的场景（几十万租户不可能每个建一个库）。\n\n选型不是非此即彼。成熟 SaaS 通常用混合模式：大客户给独立库，中等客户共享库独立 Schema，小客户共享表。按客户付费等级和合规要求分配隔离级别。"
     },
     {
       "type": "explain",
-      "title": "多租户 SaaS 架构设计：共享数据库 + 共享表（行级隔离）、混合模式",
-      "content": "### 1.3 共享数据库+共享表（行级隔离）\n- 所有租户共享表，用tenant_id区分\n- **优点**：成本最低，维护简单\n- **缺点**：隔离性最差\n- **适用**：小租户、免费版\n\n### 1.4 混合模式\n- 大客户独立数据库\n- 中等客户独立Schema\n- 小客户共享表\n\n行级隔离（共享表）成本最低，但它把「隔离」的责任从数据库挪到了应用层：每条 SQL 都必须正确带上 tenant_id，一旦某个查询漏了，就是跨租户数据泄露的安全事故。所以行级隔离方案必须配统一的 SQL 拦截器强制注入租户条件，绝不能靠开发记得手写。"
+      "title": "行级隔离的风险：隔离责任从数据库层转移到应用层",
+      "content": "行级隔离（共享表）成本最低，但它把「数据隔离」的责任从数据库层完全转移到了应用层。这意味着：\n\n**每条 SQL 都必须正确带上 tenant_id**。不是「大部分带就行」，是「一条漏了就是安全事故」。常见的遗漏场景包括：\n- 开发手写 SQL 忘了加 WHERE tenant_id = ?\n- 联表查询只在主表加了 tenant_id，关联表没加\n- 子查询、CTE、UNION 中某一段漏了\n- 存储过程/函数里的查询没带租户条件\n- 定时任务、批处理脚本直接操作数据库没走应用层\n\n所以行级隔离方案必须配统一的 SQL 拦截器，在数据库访问层强制注入 tenant_id 条件，绝不能靠开发记得手写。拦截器应该做到：只要 SQL 涉及带 tenant_id 的表，就自动追加 WHERE 条件；如果某个查询拿不到当前租户上下文，直接拒绝执行而不是静默放行。\n\n另一个风险是**数据库管理员或拥有直接数据库访问权限的人能看到所有租户数据**。行级隔离下所有数据在一张表里，DBA 的 SELECT * 就能看到全部租户。这对合规要求高的场景（如金融、医疗）可能不满足审计要求。"
     },
     {
       "type": "explain",
-      "title": "多租户 SaaS 架构设计：租户路由、配额管理",
-      "content": "## 二、租户路由\n- 请求中携带租户标识（Header/域名/Token）\n- 路由到对应的数据源\n- MyBatis拦截器自动注入tenant_id\n\n## 三、配额管理\n- API调用次数限制\n- 存储空间限制\n- 用户数限制\n- 功能开关\n\n## 四、租户上下文\n- ThreadLocal存储当前租户信息\n- 拦截器从请求中提取租户\n- 所有数据操作自动带上租户条件\n\n租户上下文用 ThreadLocal 存，是因为它要贯穿整个请求链路、又不想在每个方法参数里传租户 ID。但 ThreadLocal 的坑是跨线程会丢——用线程池、异步任务、@Async 时子线程拿不到父线程的租户上下文，必须显式传递或用可继承的上下文方案，否则会出现「异步任务里租户为空、操作错库」的隐患。"
+      "title": "租户识别：请求从哪里来、怎么知道是哪个租户",
+      "content": "每个请求进来，第一步就是识别它属于哪个租户。常见方案有三种：\n\n**域名解析（子域名）**：租户有自己的子域名，如 tenant1.saas.com、tenant2.saas.com。优点是安全性好（DNS 天然隔离）、用户体验清晰、可以配合 CDN 和证书做租户级隔离。缺点是需要泛域名解析、HTTPS 证书管理（通配符证书或按租户签发）。这是 SaaS 产品最常见的方案。\n\n**HTTP Header 传递**：请求头带 X-Tenant-Id。实现简单，适合内部系统或 API 网关层统一注入。缺点是安全性依赖传输层（Header 可以被篡改），不能单独靠 Header 做安全隔离，需要配合认证 token 校验租户身份。\n\n**JWT Token 携带**：租户信息编码在 token 里。安全性最好（token 签名防篡改），适合移动端和第三方集成。缺点是 token 过期/刷新时租户信息可能变化，需要处理 token 里租户和实际租户不一致的边界情况。\n\n实际项目中通常是组合使用：外部请求通过域名或 token 识别租户，网关层验证后把 tenant_id 注入 Header 传给下游服务，内部服务只读 Header。无论哪种方式，**租户识别必须在认证之后**，不能让未认证的请求携带伪造的租户标识访问数据。"
+    },
+    {
+      "type": "explain",
+      "title": "ThreadLocal 租户上下文：贯穿请求链路但有跨线程陷阱",
+      "content": "租户识别完成后，需要在整个请求链路中传递 tenant_id——从 Controller 到 Service 到 DAO 到 SQL 拦截器。最常用的方式是用 ThreadLocal 存储当前租户上下文，因为不想在每个方法签名里都加 tenantId 参数。\n\n**标准流程**：请求进入 → Spring 拦截器（HandlerInterceptor）从 Header/域名/Token 提取 tenant_id → 存入 TenantContext（ThreadLocal）→ 整个请求链路通过 TenantContext.getTenantId() 获取 → 请求结束时在 afterCompletion 中 clear，防止线程池复用时上下文泄漏。\n\n**跨线程陷阱**：ThreadLocal 绑定的是当前线程，用线程池、@Async、CompletableFuture、RxJava 时，子线程拿不到父线程的租户上下文。后果是子线程里 tenant_id 为 null，轻则查询报错，重则不带租户条件导致跨租户数据泄露。\n\n解决方案：\n- **手动传递**：在提交异步任务时显式捕获父线程的 tenant_id，子线程入口处 set 回去，结束时 clear。最可靠但侵入性强。\n- **InheritableThreadLocal**：子线程创建时自动继承父线程的值。但线程池复用线程时，继承只在线程创建时发生一次，后续任务可能拿到上一个任务的租户信息，反而更危险。\n- **阿里 TTL（TransmittableThreadLocal）**：包装 Runnable/Callable，在任务提交时捕获上下文、执行前 set、执行后 restore，支持线程池场景。生产级方案。\n- **Spring Security 的 SecurityContextHolder**：如果用 Spring Security，它本身就有类似的上下文传播问题，策略设置为 MODE_INHERITABLETHREADLOCAL 或用 SecurityContext 代理。"
+    },
+    {
+      "type": "explain",
+      "title": "MyBatis 拦截器自动注入 tenant_id 的机制",
+      "content": "行级隔离的安全兜底是 SQL 拦截器。以 MyBatis 为例，核心机制是通过 Interceptor 拦截 Executor 的 query/update 方法，在 SQL 执行前自动追加 tenant_id 条件。\n\n**工作原理**：\n1. 定义 @Intercepts 注解，拦截 Executor 的 query 和 update 方法\n2. 在 intercept 方法中，获取原始 SQL（MappedStatement → BoundSql → getSql）\n3. 解析 SQL 的 AST（抽象语法树），找到所有需要加租户条件的表\n4. 在 WHERE 子句中追加 `AND tenant_id = ?`，并把 tenant_id 值加入参数映射\n5. 重新构建 MappedStatement，用新 SQL 替换原始 SQL\n6. 调用 invocation.proceed() 继续执行\n\n**关键细节**：\n- 只对配置了需要租户隔离的表生效（不能所有表都加，有些表如系统配置表是全局共享的）\n- INSERT 语句要自动填充 tenant_id 字段值\n- UPDATE/DELETE 要在 WHERE 条件里加 tenant_id（防止误更新其他租户数据）\n- SELECT 要在 WHERE 条件里加 tenant_id\n- 联表查询要给每个表都加 tenant_id 条件\n- 如果 TenantContext.getTenantId() 为空，应该拒绝执行（fail-fast）而不是静默放行\n\n如果用 JPA/Hibernate，可以用 @Filter 注解 + Session.enableFilter 实现类似效果，或者用 Hibernate 的 multi-tenancy 原生支持（支持 DATABASE、SCHEMA、DISCRIMINATOR 三种策略）。"
+    },
+    {
+      "type": "explain",
+      "title": "混合模式落地策略与租户级横向关注点",
+      "content": "**混合模式落地**：按客户分层分配隔离级别。核心实现是 AbstractRoutingDataSource——Spring 提供的动态数据源路由基类，重写 determineCurrentLookupKey() 方法，从 TenantContext 返回当前租户标识，Spring 据此选择对应的数据源。每个数据源独立配置连接池、数据库地址、Schema。\n\n数据迁移是混合模式的隐性成本：客户从免费版升级到企业版，需要把数据从共享表迁移到独立库。这个迁移过程要做到在线不停机——先同步数据到新库、切换路由、验证、清理旧数据。回滚方案也要提前设计好。\n\n**租户级缓存**：Redis 缓存 key 必须包含 tenant_id，否则租户 A 的缓存数据会被租户 B 读到。常见做法是 key 格式为 `tenant:{tenant_id}:module:key`。如果用本地缓存（Caffeine/Guava），多租户共享一个 Cache 实例时同样要在 key 里带 tenant_id，或者每个租户一个 Cache 实例。\n\n**定时任务**：定时任务不是 HTTP 请求，没有拦截器自动设置 TenantContext。必须在任务入口处遍历所有租户（或按租户分片执行），每个租户的处理逻辑里显式设置 TenantContext。消息队列消费者同理——消息体里要带 tenant_id，消费时 set 到上下文。\n\n**配额管理**：按租户限制资源使用——API 调用次数、存储空间、用户数、功能开关。配额检查应该在业务逻辑入口处做，超出时返回明确错误（HTTP 429 或业务错误码），而不是静默降级。功能开关配合租户套餐等级：免费版只能用基础功能，企业版全开。"
     },
     {
       "type": "diagram",
@@ -53,58 +68,62 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | 独立数据库 | 独立Schema | 共享表 |\n| --- | --- | --- | --- |\n| 隔离性 | 最好 | 好 | 一般 |\n| 成本 | 高 | 中 | 低 |\n| 维护复杂 | 高 | 中 | 低 |\n| 扩展性 | 差 | 中 | 好 |\n| 适用 | 大客户/金融 | 中等租户 | 小租户/免费版 |"
+      "title": "三种数据隔离方案对比",
+      "content": "| 维度 | 独立数据库 | 共享库 + 独立 Schema | 共享库 + 共享表 |\n| --- | --- | --- | --- |\n| 隔离性 | 最强：物理隔离 | 较强：Schema 级隔离 | 最弱：依赖应用层 |\n| 成本 | 最高：每租户独立实例 | 中等：共享实例，独立 Schema | 最低：一套表结构 |\n| 运维复杂度 | 高：大量实例管理 | 中：Schema 数量管理 | 低：统一管理 |\n| 跨租户泄露风险 | 极低 | 低 | 高：漏写 tenant_id 即泄露 |\n| 扩展性（租户数） | 差：千租户成本爆炸 | 中：Schema 数有上限 | 好：表结构不变 |\n| 数据迁移难度 | 高 | 中 | 低 |\n| 适用场景 | 大客户、金融、合规 | 中等租户、B2B | 小租户、免费版、2C |"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | Header传递 | 域名解析 | JWT Token |\n| --- | --- | --- | --- |\n| 实现复杂 | 低 | 中 | 中 |\n| 安全性 | 一般 | 好 | 好 |\n| 适用 | 内部系统 | SaaS产品 | 移动端 |"
+      "title": "租户识别方式对比",
+      "content": "| 维度 | 子域名解析 | HTTP Header | JWT Token |\n| --- | --- | --- | --- |\n| 实现复杂度 | 中：需泛域名解析和通配符证书 | 低：读 Header 即可 | 中：需要 token 解析和验证 |\n| 安全性 | 高：DNS 天然隔离 | 低：Header 可被篡改，需配合认证 | 高：签名防篡改 |\n| 用户体验 | 好：URL 直观 | 无感 | 无感 |\n| 适用场景 | SaaS 产品、面向外部客户 | 内部系统、API 网关 | 移动端、第三方集成 |\n| 关键风险 | 证书过期导致全租户不可用 | Header 注入攻击 | Token 租户与实际不一致 |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// 1. 租户上下文\npublic class TenantContext {\n    private static final ThreadLocal<String> TENANT_ID = new ThreadLocal<>();\n\n    public static void setTenantId(String tenantId) {\n        TENANT_ID.set(tenantId);\n    }\n\n    public static String getTenantId() {\n        return TENANT_ID.get();\n\n    public static void clear() {\n        TENANT_ID.remove();\n    }\n}\n\n// 2. 租户拦截器 - 从请求中提取租户\n@Component\npublic class TenantInterceptor implements HandlerInterceptor {\n    @Override\n    public boolean preHandle(HttpServletRequest request,\n            HttpServletResponse response, Object handler) {\n        // 从Header获取\n        String tenantId = request.getHeader(\"X-Tenant-Id\");\n        // 或从域名获取: tenant1.saas.com\n        // 或从JWT Token获取\n        if (tenantId == null) {\n            throw new UnauthorizedException(\"缺少租户标识\");\n        }\n        TenantContext.setTenantId(tenantId);\n        return true;\n    }\n\n    @Override\n    public void afterCompletion(HttpServletRequest request,\n            HttpServletResponse response, Object handler, Exception ex) {\n        TenantContext.clear();\n    }\n}\n\n// 3. MyBatis自动注入tenant_id\n@Intercepts({@Signature(type = Executor.class,\n    method = \"query\", args = {MappedStatement.class, Object.class,\n        RowBounds.class, ResultHandler.class})})\npublic class TenantInterceptor implements Interceptor {\n    @Override\n    public Object intercept(Invocation invocation) throws Throwable {\n        MappedStatement ms = (MappedStatement) invocation.getArgs()[0];\n        // 修改SQL，自动加上 tenant_id = ? 条件\n        String sql = ms.getBoundSql(invocation.getArgs()[1]).getSql();\n        String newSql = addTenantCondition(sql);\n        // 重新构建MappedStatement\n        // ...\n        return invocation.proceed();\n    }\n}\n\n// 4. 多数据源路由\npublic class TenantDataSource extends AbstractRoutingDataSource {\n    @Override\n    protected Object determineCurrentLookupKey() {\n        return TenantContext.getTenantId();\n    }\n}\n\n// 5. 配额管理\n@Service\npublic class QuotaService {\n    @Autowired\n    private TenantConfigMapper configMapper;\n\n    public void checkQuota(String tenantId, QuotaType type) {\n        TenantConfig config = configMapper.findByTenantId(tenantId);\n        switch (type) {\n            case API_CALL:\n                if (config.getApiCallCount() >= config.getApiCallLimit()) {\n                    throw new QuotaExceededException(\"API调用次数超限\");\n                }\n                break;\n            case STORAGE:\n                if (config.getStorageUsed() >= config.getStorageLimit()) {\n                    throw new QuotaExceededException(\"存储空间超限\");\n                }\n                break;\n            case USER_COUNT:\n                if (config.getUserCount() >= config.getUserLimit()) {\n                    throw new QuotaExceededException(\"用户数超限\");\n                }\n                break;\n        }\n    }\n}\n\n// 6. 功能开关\npublic boolean hasFeature(String tenantId, String feature) {\n    TenantConfig config = configMapper.findByTenantId(tenantId);\n    return config.getFeatures().contains(feature);\n}",
+      "title": "核心实现：租户上下文、拦截器与动态数据源路由",
       "language": "java",
+      "content": "// ===== 1. 租户上下文（ThreadLocal） =====\npublic class TenantContext {\n    // 推荐使用阿里 TTL 替代原生 ThreadLocal，支持线程池场景\n    private static final ThreadLocal<String> TENANT_ID = new ThreadLocal<>();\n\n    public static void setTenantId(String tenantId) {\n        TENANT_ID.set(tenantId);\n    }\n\n    public static String getTenantId() {\n        return TENANT_ID.get();\n    }\n\n    public static void clear() {\n        TENANT_ID.remove(); // 必须在请求结束时清理，防止线程池复用时上下文泄漏\n    }\n}\n\n// ===== 2. Spring 拦截器：从请求提取租户 =====\n@Component\npublic class TenantWebInterceptor implements HandlerInterceptor {\n    @Override\n    public boolean preHandle(HttpServletRequest request,\n            HttpServletResponse response, Object handler) {\n        // 方案1: 从 Header 获取（内部系统）\n        String tenantId = request.getHeader(\"X-Tenant-Id\");\n\n        // 方案2: 从子域名获取（SaaS 产品）\n        // String host = request.getServerName(); // tenant1.saas.com\n        // String tenantId = host.split(\"\\\\.\")[0];\n\n        // 方案3: 从 JWT Token 获取（移动端）\n        // String token = request.getHeader(\"Authorization\");\n        // String tenantId = JwtUtil.parseTenantId(token);\n\n        if (tenantId == null || tenantId.isEmpty()) {\n            response.setStatus(HttpServletResponse.SC_FORBIDDEN);\n            throw new UnauthorizedException(\"缺少租户标识\");\n        }\n        TenantContext.setTenantId(tenantId);\n        return true;\n    }\n\n    @Override\n    public void afterCompletion(HttpServletRequest request,\n            HttpServletResponse response, Object handler, Exception ex) {\n        TenantContext.clear(); // 请求结束必须清理\n    }\n}\n\n// ===== 3. MyBatis 拦截器：自动注入 tenant_id =====\n@Intercepts({\n    @Signature(type = Executor.class, method = \"query\",\n        args = {MappedStatement.class, Object.class, RowBounds.class, ResultHandler.class}),\n    @Signature(type = Executor.class, method = \"update\",\n        args = {MappedStatement.class, Object.class})\n})\npublic class TenantSqlInterceptor implements Interceptor {\n    // 需要租户隔离的表列表（从配置读取）\n    private Set<String> tenantTables;\n\n    @Override\n    public Object intercept(Invocation invocation) throws Throwable {\n        String tenantId = TenantContext.getTenantId();\n        if (tenantId == null) {\n            throw new IllegalStateException(\"租户上下文为空，拒绝执行SQL，防止跨租户泄露\");\n        }\n\n        MappedStatement ms = (MappedStatement) invocation.getArgs()[0];\n        Object parameter = invocation.getArgs()[1];\n        BoundSql boundSql = ms.getBoundSql(parameter);\n        String originalSql = boundSql.getSql();\n\n        // 解析 SQL AST，对 tenantTables 中的表追加 WHERE tenant_id = ?\n        String modifiedSql = SqlParser.addTenantCondition(originalSql, tenantId, tenantTables);\n\n        // 重新构建 BoundSql 和 MappedStatement\n        BoundSql newBoundSql = new BoundSql(ms.getConfiguration(), modifiedSql,\n                boundSql.getParameterMappings(), parameter);\n        MappedStatement newMs = copyFromMappedStatement(ms, newBoundSql);\n        invocation.getArgs()[0] = newMs;\n\n        return invocation.proceed();\n    }\n}\n\n// ===== 4. 动态数据源路由（独立库模式） =====\npublic class TenantRoutingDataSource extends AbstractRoutingDataSource {\n    @Override\n    protected Object determineCurrentLookupKey() {\n        return TenantContext.getTenantId(); // 根据租户选择数据源\n    }\n}\n\n// ===== 5. 异步场景的租户上下文传递 =====\npublic class TenantAwareRunnable implements Runnable {\n    private final String tenantId;\n    private final Runnable delegate;\n\n    public TenantAwareRunnable(Runnable delegate) {\n        this.tenantId = TenantContext.getTenantId(); // 提交时捕获\n        this.delegate = delegate;\n    }\n\n    @Override\n    public void run() {\n        TenantContext.setTenantId(tenantId); // 执行前设置\n        try {\n            delegate.run();\n        } finally {\n            TenantContext.clear(); // 执行后清理\n        }\n    }\n}",
       "highlights": [
         {
-          "line": 2,
-          "note": "`public class TenantContext {` 定义了 多租户 SaaS 架构设计 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 4,
+          "note": "ThreadLocal 存储当前请求的租户 ID，贯穿整个请求链路。推荐生产环境用阿里 TTL 替代原生 ThreadLocal 支持线程池。"
         },
         {
-          "line": 27,
-          "note": "`if (tenantId == null) {` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 31,
+          "note": "tenantId 为空时直接返回 403 拒绝请求，绝不能让没有租户标识的请求进入业务逻辑。"
         },
         {
-          "line": 5,
-          "note": "`public static void setTenantId(String tenantId) {` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "line": 48,
+          "note": "MyBatis 拦截器必须同时拦截 query 和 update，否则 UPDATE/DELETE 不带 tenant_id 会误操作其他租户数据。"
         },
         {
-          "line": 3,
-          "note": "`private static final ThreadLocal<String> TENANT_ID = new ThreadLocal<>();` 体现运行时或系统调用边界，适合用来说明阻塞、并发或资源释放语义。"
+          "line": 56,
+          "note": "fail-fast 策略：租户上下文为空时拒绝执行 SQL，防止跨租户泄露。这是行级隔离的安全底线。"
+        },
+        {
+          "line": 84,
+          "note": "异步场景必须手动传递租户上下文：提交时捕获、执行前设置、执行后清理，防止线程池复用导致上下文错乱。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：多租户 SaaS 的核心是「一套系统服务多个租户，且租户间数据和资源相互隔离」。最关键的设计决策是数据隔离级别，它直接决定隔离性、成本和复杂度的取舍。\n\n三种数据隔离方案（隔离性递减、成本递减）：\n\n1. 独立数据库：每租户一个库。隔离最好、最安全，但成本高、运维复杂，适合大客户、金融。\n2. 共享库加独立 Schema：一个库、每租户一个 Schema。中等隔离和成本，但 Schema 多了管理复杂。\n3. 共享库加共享表（行级）：所有租户共表、用 tenant_id 区分。成本最低、最简单，但隔离最差、有数据串的风险，适合小租户、免费版。\n4. 混合模式：大客户独立库、中客户独立 Schema、小客户共享表，按客户分层。\n\n实现要点：\n\n1. 租户路由：请求带租户标识（域名、Header、Token），路由到对应数据源。\n2. 自动隔离：用 ThreadLocal 存当前租户上下文，拦截器从请求提取，MyBatis 拦截器给所有 SQL 自动注入 tenant_id 条件，避免漏写导致越权。\n3. 配额管理：按租户限 API 次数、存储、用户数、功能开关。\n\n边界和坑。① 行级隔离最大的风险是「忘了带 tenant_id」导致租户 A 看到 B 的数据，必须靠统一拦截器强制注入、不能依赖开发自觉。② ThreadLocal 在异步线程、线程池里会丢上下文，要手动传递。③ 大租户和小租户混在共享表会互相影响，所以才有混合模式。",
+      "content": "结论：多租户 SaaS 的核心是「一套系统服务多个租户，且租户间数据和资源相互隔离」。最关键的设计决策是数据隔离级别，它直接决定隔离性、成本和运维复杂度的取舍。\n\n**三种数据隔离方案（隔离性递减、成本递减）：**\n\n1. **独立数据库**：每租户一个库。隔离最好、物理级别安全，但成本高、运维复杂，适合大客户、金融、合规场景。\n2. **共享库 + 独立 Schema**：一个库实例、每租户一个 Schema。中等隔离和成本，Schema 数量上千后管理变重。适合中等规模租户。\n3. **共享库 + 共享表（行级隔离）**：所有租户共表、用 tenant_id 区分。成本最低、最简单，但隔离性完全依赖应用层，适合小租户和免费版。\n4. **混合模式**：按客户分层——大客户独立库、中客户独立 Schema、小客户共享表。成熟 SaaS 的常见实践。\n\n**实现关键点：**\n\n- **租户识别**：请求进入时从域名/HTTP Header/JWT Token 提取 tenant_id，必须在认证之后做。\n- **上下文传递**：用 ThreadLocal 存当前租户，拦截器从请求提取后 set，整个链路通过 TenantContext.getTenantId() 获取，请求结束 clear。\n- **自动隔离**：MyBatis 拦截器对所有涉及租户表的 SQL 自动追加 WHERE tenant_id = ?，INSERT 自动填充 tenant_id。tenant_id 为空时拒绝执行（fail-fast）。\n- **配额管理**：按租户限 API 次数、存储、用户数、功能开关，配合套餐等级。\n\n**关键风险和坑：**\n\n1. **行级隔离漏带 tenant_id**：一条 SQL 漏了就是跨租户泄露。必须靠统一拦截器强制注入，不能依赖开发自觉。\n2. **ThreadLocal 跨线程丢失**：线程池、@Async、CompletableFuture 里子线程拿不到租户上下文。需要手动传递或用 TTL。\n3. **定时任务和消息队列**：没有 HTTP 请求上下文，必须显式设置 TenantContext。\n4. **缓存 key 要带 tenant_id**：Redis/本地缓存都要在 key 里包含租户标识，防止缓存串数据。",
       "followUpQuestions": [
         {
-          "question": "在你的项目中，多租户 SaaS 架构设计是怎么落地的？遇到了什么权衡取舍？",
-          "answer": "多租户架构三种方案：\n1. 独立数据库（隔离最好、成本最高）\n2. 共享数据库独立Schema（中等隔离）\n3. 共享数据库共享Schema（tenant_id字段）。数据隔离：Hibernate Filter、MyBatis Interceptor、Spring全局查询过滤器。注意：定时任务、消息队列、缓存都要考虑租户隔离。"
+          "question": "行级隔离下，如何保证所有 SQL 都带了 tenant_id？如果拦截器漏了怎么办？",
+          "answer": "第一道防线是 MyBatis/JPA 统一拦截器，在 SQL 执行前自动注入 tenant_id 条件。拦截器应该对所有涉及租户隔离表的 query 和 update 生效，且 tenant_id 为空时 fail-fast 拒绝执行。第二道防线是集成测试：写一个租户 A 插入数据、租户 B 查询的测试用例，验证查不到。第三道防线是上线前做租户隔离的 SQL 审计，用 SQL 日志扫描工具检查是否有不带 tenant_id 的查询。如果生产发现漏了，先评估数据泄露范围，再补拦截规则。"
         },
         {
-          "question": "多租户SaaS架构 在高并发（万级 QPS）和数据一致性要求高的场景下，有哪些关键设计决策？",
-          "answer": "多租户 SaaS 架构设计 在高并发场景下要先识别核心约束，再拆成容量、延迟、一致性、故障隔离和可观测性几个维度设计。回答 多租户 SaaS 架构设计 时，要说明 架构设计、项目设计 的关键瓶颈、可异步或降级的链路、必须一致的数据以及积压或超时时的恢复方式。"
+          "question": "ThreadLocal 在异步场景丢失租户上下文，你们项目里怎么解决的？",
+          "answer": "三种方案：1）手动包装，在提交异步任务时用 TenantAwareRunnable 包装，提交时捕获 tenant_id，子线程执行前 set、执行后 clear，可靠但侵入性强。2）用阿里 TTL（TransmittableThreadLocal），它会在任务提交到线程池时自动捕获和恢复上下文，对业务代码无侵入，生产推荐。3）如果用 Spring @Async，配置自定义 TaskDecorator，在 beforeExecute 里从父线程拷贝上下文、afterExecute 里清理。不推荐 InheritableThreadLocal，线程池复用时会拿到上一个任务的租户信息。"
         },
         {
-          "question": "如果现有系统需要引入 多租户SaaS架构，你会怎么评估改造风险和制定迁移计划？",
-          "answer": "引入 多租户SaaS架构 的评估维度：先梳理现有架构的痛点和目标，再评估改造范围、团队能力、业务影响。引入 多租户 SaaS 架构设计 时建议分阶段推进：先选择 架构设计、项目设计、多租户 中风险较低的链路试点，验证 降级策略 后再推广。多租户 SaaS 架构设计 迁移时要先灰度小流量，再绑定回滚条件、监控指标和业务验收口径。"
+          "question": "混合模式下，客户升级（比如从共享表迁移到独立库）怎么做数据迁移？",
+          "answer": "在线迁移分四步：1）在目标库建好表结构，启动数据同步（双写或 CDC 把共享表里该租户的数据复制到新库）。2）切换路由：TenantRoutingDataSource 里把该租户的 lookupKey 指向新数据源。3）验证新库数据完整性和业务功能。4）确认无误后清理旧库数据。关键是切换路由要原子化（配置中心推送或数据库标记位），回滚方案是切回旧路由。迁移期间要暂停该租户的写操作或做双写保证一致性。"
         },
         {
-          "question": "生产环境里的 多租户 SaaS 架构设计 你会怎么排查？",
-          "answer": "排查 多租户 SaaS 架构设计 时，我会先量化影响范围，再沿输入、状态变化、依赖组件和输出结果逐步定位。确认修复后，用同一批样例、日志指标和回滚条件验证，避免只证明正常路径"
+          "question": "多租户系统里，Redis 缓存怎么做租户隔离？",
+          "answer": "缓存 key 必须包含 tenant_id，格式如 `tenant:{tenantId}:order:{orderId}`。如果用 Redisson 或 Spring Cache，自定义 KeyGenerator 在 key 前缀自动拼 tenantId。本地缓存（Caffeine）同理，要么每个租户一个 Cache 实例，要么 key 里带 tenantId。另一个坑是：如果某个查询漏了 tenant_id，缓存命中时会把租户 A 的数据返回给租户 B，而且比数据库查询更难发现。所以缓存层的 key 设计要和 SQL 拦截器一样严格。"
         }
       ]
     },
@@ -112,53 +131,73 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "三种数据隔离方案的区别和适用场景",
-        "租户路由的实现：拦截器+ThreadLocal",
-        "MyBatis拦截器自动注入tenant_id的原理",
-        "配额管理的设计：API/存储/用户数/功能开关",
-        "混合模式的设计思路"
+        "能对比独立库、独立 Schema、共享表三种隔离方案的隔离性、成本和适用场景",
+        "能说明混合模式按客户分层的落地策略",
+        "能描述租户识别的三种方式（域名/HTTP Header/JWT Token）及各自适用场景",
+        "能解释 ThreadLocal 存储租户上下文的机制及跨线程丢失问题和解决方案",
+        "能说明 MyBatis 拦截器自动注入 tenant_id 的工作原理和 fail-fast 策略",
+        "能识别行级隔离漏带 tenant_id 的安全风险和防护措施",
+        "能说出定时任务、消息队列、缓存等场景下的租户隔离注意事项",
+        "能描述配额管理的设计思路（API 次数/存储/用户数/功能开关）"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "architecture.project-design.topic-multi-tenant.recall.1",
-      "prompt": "多租户SaaS系统的三种数据隔离方案各有什么优缺点？如何选择？",
+      "prompt": "多租户 SaaS 系统的三种数据隔离方案各有什么优缺点？在什么场景下选择哪种？混合模式怎么设计？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "architecture.project-design.topic-multi-tenant.recall.2",
-      "prompt": "如何在共享表模式下实现租户数据的自动隔离？MyBatis拦截器如何工作？",
+      "prompt": "共享表（行级隔离）模式下，如何防止跨租户数据泄露？MyBatis 拦截器是怎么自动注入 tenant_id 的？tenant_id 为空时怎么办？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "architecture.project-design.topic-multi-tenant.recall.3",
-      "prompt": "独立库、独立 Schema、共享表三种租户隔离方案怎么选型？共享表模式下怎么防止跨租户数据越权？",
+      "prompt": "你项目里的多租户是怎么做的？ThreadLocal 存租户上下文在异步场景有什么坑？怎么解决的？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "architecture.project-design.topic-multi-tenant.recall.4",
+      "prompt": "现有单租户系统要改造为多租户 SaaS，你会怎么评估风险、制定迁移计划？分几步做？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "architecture.project-design.topic-multi-tenant.recall.5",
+      "prompt": "多租户系统里，定时任务、消息队列消费者、Redis 缓存分别怎么做租户隔离？常见的坑有哪些？",
+      "mode": "text",
+      "expectedMinutes": 4,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能对比独立库/独立 Schema/共享表三种隔离的隔离性与成本",
-      "能说明租户路由和 ThreadLocal 租户上下文",
-      "能讲清拦截器自动注入 tenant_id 防越权",
-      "能说出混合模式按客户分层"
+      "能对比独立库/独立 Schema/共享表三种方案的隔离性、成本、运维复杂度和适用场景",
+      "能说明混合模式按客户分层（大客户独立库、中客户独立 Schema、小客户共享表）的设计策略",
+      "能描述租户识别方式（域名/Header/Token）和 ThreadLocal 上下文传递机制",
+      "能讲清 MyBatis 拦截器自动注入 tenant_id 防越权的原理，以及 tenant_id 为空时 fail-fast 的策略"
     ],
     "goodToHave": [
-      "能指出行级隔离漏带 tenant_id 是数据泄露风险",
-      "能说明 ThreadLocal 跨线程丢上下文的坑",
-      "能说明配额管理（API/存储/用户数）"
+      "能指出行级隔离漏带 tenant_id 是数据泄露的核心风险，并给出多层防护（拦截器 + 集成测试 + SQL 审计）",
+      "能说明 ThreadLocal 跨线程丢失问题及 TTL 等解决方案",
+      "能说出定时任务、消息队列、缓存等横向场景的租户隔离注意事项",
+      "能描述配额管理和功能开关配合租户套餐等级的设计"
     ],
     "commonMistakes": [
-      "行级隔离靠开发手写 tenant_id 而非统一拦截",
-      "ThreadLocal 在异步/线程池里丢租户上下文",
-      "一刀切选隔离方案、不按客户分层"
+      "行级隔离靠开发手写 tenant_id 而不配统一 SQL 拦截器，一条漏了就是安全事故",
+      "用 InheritableThreadLocal 做异步场景的租户传递，线程池复用时会拿到上一个租户的信息",
+      "一刀切选隔离方案，不按客户分层，导致大客户不满足安全要求或小客户成本过高",
+      "Redis 缓存 key 不带 tenant_id，缓存命中时跨租户返回数据且比数据库查询更难发现",
+      "定时任务和消息队列消费时忘记设置 TenantContext，导致租户上下文为空或串租户"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -168,9 +207,9 @@
     }
   },
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否对比三种隔离方案、说清租户路由与自动注入 tenant_id 防越权，并意识到行级隔离漏注入和 ThreadLocal 跨线程的坑。",
+  "interviewerFocus": "考察能否从数据隔离方案选型、租户识别与上下文传递、SQL 拦截器防越权、ThreadLocal 跨线程陷阱、混合模式分层策略到定时任务/缓存等横向关注点完整覆盖多租户 SaaS 架构设计，并能识别行级隔离漏注入和线程池上下文丢失等关键风险。",
   "prerequisites": [
     "architecture.system-design.topic-seckill"
   ],
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

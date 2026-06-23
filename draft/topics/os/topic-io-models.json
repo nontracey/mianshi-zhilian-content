@@ -4,7 +4,7 @@
   "category": "io-model",
   "group": "io-model",
   "title": "阻塞/非阻塞/同步/异步",
-  "summary": "用「数据准备 + 数据拷贝」两阶段讲清阻塞、非阻塞、多路复用、异步四种 IO 模型，并辨明同步与异步的本质判定。",
+  "summary": "用「数据准备 + 数据拷贝」两阶段讲清阻塞、非阻塞、多路复用、信号驱动、异步五种 IO 模型的等待与通知差异，辨明同步与异步的本质判定只看数据拷贝阶段，并对比 select/poll/epoll 工程差异、Reactor vs Proactor 语义、io_uring 的提交/完成模型和实际边界。",
   "tags": [
     "操作系统",
     "IO模型",
@@ -12,67 +12,93 @@
     "异步IO"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 27,
   "order": 10,
   "recommendWeight": 96,
   "learningCards": [
     {
       "type": "explain",
       "title": "理解的钥匙：一次 IO 的两个阶段",
-      "content": "理解 IO 模型不要先背名词，先把一次网络 `read/recvfrom` 拆成两个阶段：\n1. **数据准备**：网卡收到报文后经协议栈处理，数据进入 socket 接收缓冲区；如果缓冲区为空，读操作没有可返回的数据。\n2. **数据拷贝**：内核把 socket 接收缓冲区中的数据复制到用户态 buffer，系统调用才能返回给应用。\n\n## 五种常见 IO 模型\n- **阻塞 IO**：`recvfrom` 进入内核后，数据准备和数据拷贝两个阶段都可能让线程睡眠。优点是编程简单；缺点是连接数上来后线程栈、上下文切换和调度延迟会成为成本。\n- **非阻塞 IO**：通过 `fcntl(fd, F_SETFL, O_NONBLOCK)` 设置后，数据未准备好时 `recv/accept/connect` 立即返回 `-1`，`errno` 常见为 `EAGAIN` 或 `EWOULDBLOCK`。准备阶段不睡眠，但如果应用自己 while 轮询，会消耗 CPU；就绪后那次 `recv` 的拷贝阶段仍由调用线程完成。\n- **IO 多路复用**：`select/poll/epoll_wait` 让一个线程等待多个 fd 的就绪事件；被通知后应用再调用 `recv`。它解决的是“一个线程如何等待很多连接”，不是让内核替用户完成数据拷贝，所以仍是同步 IO。\n- **信号驱动 IO（SIGIO）**：对 fd 设置 `O_ASYNC`、`F_SETOWN` 后，数据就绪时内核向进程/线程发送 `SIGIO`，应用在信号处理或主循环中再读数据。它把“数据准备完成”的通知交给信号机制，但数据拷贝仍要用户线程调用 `recv`，因此也是同步 IO；生产网络服务较少使用，因为信号处理上下文受限、调试困难、事件合并和丢失语义不如 epoll 清晰。\n- **异步 IO**：应用提交请求后立即返回，内核在数据准备和数据拷贝都完成后通知应用。例如 Linux `io_uring` 通过 SQ/CQ 共享环提交和收割完成事件；POSIX AIO 的 `aio_read` 更常用于文件场景，对 socket 并不是 Linux 高性能网络编程的主流选择。\n\n一个可靠的判断法：**阻塞/非阻塞主要看数据准备阶段调用方是否睡眠；同步/异步看数据拷贝阶段是否还要调用方亲自发起并等待完成**。"
+      "content": "理解 IO 模型不要先背名词，先把一次网络 `read/recvfrom` 拆成两个阶段：\n\n1. **数据准备**：网卡收到报文后经协议栈处理，数据进入 socket 接收缓冲区；如果缓冲区为空，读操作没有可返回的数据。\n2. **数据拷贝**：内核把 socket 接收缓冲区中的数据复制到用户态 buffer，系统调用才能返回给应用。\n\n这两个阶段把所有 IO 模型的差异串起来：**阻塞/非阻塞描述第一阶段怎么等**（调用线程会不会睡眠）；**同步/异步描述第二阶段谁来完成**（数据拷贝是否还要用户线程发起并等待）。用这个框架，五个名词不再是孤立定义，而是同一个问题的不同工程决策点。\n\n理解了这一点，后面每种模型的特征、优点和陷阱都能从这两个阶段推导出来，而不是硬记。"
     },
     {
       "type": "explain",
-      "title": "同步 vs 异步的本质，与 io_uring",
-      "content": "## 同步和异步到底差在哪\n判定标准只看**第二阶段（数据拷贝）要不要用户线程参与等待**：\n- **同步 IO**：拷贝阶段必须由用户线程发起 `recvfrom` 并等它完成——阻塞 IO、非阻塞 IO、IO 多路复用**全都是同步的**（很多人误以为多路复用是异步，其实就绪后那次 recvfrom 仍要自己等拷贝）。\n- **异步 IO**：用户线程只管发起，准备和拷贝都由内核完成、完事再回调通知，全程不等。\n\n所以“阻塞/非阻塞”和“同步/异步”是两个维度：前者说**第一阶段**等不等，后者说**第二阶段**要不要自己参与。\n\n## Linux 的现状\nLinux 原生 AIO（`aio_read`）只支持文件、对网络 socket 支持差，长期没成主流，所以高并发实际靠的是“多路复用（epoll）+ 非阻塞”这套同步方案。**io_uring** 是 2019 年后的新一代异步接口，用共享内存的提交/完成队列大幅减少系统调用，正在成为真正可用的 Linux 异步 IO。"
+      "title": "五种 IO 模型：等待方式与拷贝归属",
+      "content": "## 阻塞 IO\n`recvfrom` 进入内核后，数据未准备好时线程睡眠让出 CPU；数据就绪后内核执行拷贝，拷贝完成才唤醒线程并返回。优点是编程模型最简单；缺点是每个连接占用一个线程，连接数上来后线程栈内存、上下文切换和调度延迟成为成本。\n\n## 非阻塞 IO\n通过 `fcntl(fd, F_SETFL, O_NONBLOCK)` 设置后，数据未准备好时 `recv/accept/connect` 立即返回 `-1`，`errno` 为 `EAGAIN` 或 `EWOULDBLOCK`。第一阶段不睡眠，但**单独使用**时应用必须 while 轮询，空转烧 CPU。就绪后那次 `recv` 的拷贝阶段仍由调用线程完成——所以非阻塞 IO 仍是同步 IO。\n\n工程上非阻塞 fd 几乎不单独使用，而是配合 IO 多路复用：`epoll_wait` 负责高效等通知，非阻塞保证事件循环不被单个 fd 的最后一次 read 卡死。\n\n## IO 多路复用\n`select/poll/epoll_wait` 让一个线程等待多个 fd 的就绪事件。被通知后应用再对就绪 fd 调 `recv`——**就绪通知不等于数据已拷贝到用户态**。因此多路复用是同步 IO，不是异步。它解决的问题是「一个线程如何高效等待大量连接」，不是「让内核替用户搬数据」。\n\n## 信号驱动 IO（SIGIO）\n对 fd 设置 `O_ASYNC` 和 `F_SETOWN` 后，数据就绪时内核向进程/线程发送 `SIGIO`。应用在信号处理或主循环中再读数据。信号只通知第一阶段完成，拷贝仍靠用户线程调 `recv`，所以也是同步 IO。生产网络服务很少用它做主路径：信号处理上下文受限（只能调 async-signal-safe 函数）、事件合并和丢失语义不如 epoll 清晰、调试困难。\n\n## 异步 IO\n应用提交请求后不在当前调用里等就绪和拷贝，内核完成两阶段后投递完成事件。典型代表是 Linux `io_uring`：提交队列（SQ）放请求，完成队列（CQ）收结果，应用消费的是 CQE（完成队列条目），不是就绪 fd。但 `io_uring` 不等于所有场景零拷贝或必然比 epoll 快——要看 opcode、文件类型、内核/驱动支持和安全策略（`/proc/sys/kernel/io_uring_disabled`）。"
+    },
+    {
+      "type": "explain",
+      "title": "同步 vs 异步的本质判定",
+      "content": "判定标准只看**第二阶段（数据拷贝）要不要用户线程参与等待**：\n- **同步 IO**：拷贝阶段必须由用户线程发起 `recvfrom` 并等它完成——阻塞 IO、非阻塞 IO、IO 多路复用、信号驱动 IO **全部是同步的**。\n- **异步 IO**：用户线程提交请求后先返回，内核或运行时在操作完成后投递完成事件；应用消费的是「完成结果」，不是单纯的「可读就绪」。\n\n所以「阻塞/非阻塞」和「同步/异步」是两个正交维度：前者说**第一阶段**等不等，后者说**第二阶段**要不要自己参与。两者可以自由组合——同步阻塞（传统 `read`）、同步非阻塞（`epoll` + 非阻塞 fd）、异步非阻塞（`io_uring`）都是真实存在的工程模式。\n\n常见误区是把「非阻塞」和「异步」画等号。非阻塞只是第一阶段不睡眠，第二阶段还是自己搬；异步是两阶段都不用自己等，只收完成通知。"
+    },
+    {
+      "type": "explain",
+      "title": "Linux 异步 IO 的现状与 io_uring",
+      "content": "## 传统路径的局限\nPOSIX AIO（`aio_read` 等）接口存在，但 glibc 实现依赖用户态线程池模拟异步，维护大量线程会昂贵且扩展性差，实际上仍是同步执行的包装。传统 Linux AIO（`io_submit` 等）更偏文件/块设备场景，对 socket 的支持有限，不是 TCP 服务的主路径。\n\n## io_uring 的工程语义\n`io_uring` 从 Linux 5.1（2019）引入，用共享内存的 SQ/CQ 环减少系统调用，能覆盖 `read/write/accept/recv/send` 等多类 opcode。它的核心价值是：\n- 提交和完成解耦，应用不阻塞在任何单个 IO 上\n- SQ/CQ 共享环可批量提交、批量收割，减少用户态/内核态切换\n- 支持 fixed files、registered buffers 等优化路径\n\n但工程选型要注意：\n- 低版本内核对 opcode 的支持不全，升级后才有 `IORING_OP_SEND/RECV` 等\n- `/proc/sys/kernel/io_uring_disabled` 可被安全策略禁用\n- 文件系统、块设备和网络 socket 的完成行为不同，不能统一假设\n- 与现有 epoll 代码的迁移成本不低，观测工具链（`bpftrace`、`io_uring-sqpoll`）也需要适配\n- 零拷贝要看是否用了 `IORING_OP_READ_FIXED` 或 splice，不是 io_uring 自带的\n\n一句话：io_uring 是 Linux 上最接近真正异步 IO 的工程实现，但不是魔法，需要结合内核版本、场景和观测能力选型。"
     },
     {
       "type": "diagram",
-      "format": "mermaid",
-      "title": "阻塞/非阻塞/同步/异步：机制分支与风险路径",
-      "content": "flowchart TD\nNvmjrldS[阻塞/非阻塞/同步/异步 触发入口] --> NvmjrldM[核心对象或状态: 操作系统]\nNvmjrldM --> NvmjrldC{阻塞/非阻塞/同步/异步 是否走正常路径}\nNvmjrldC -->|正常| NvmjrldN[执行 阻塞/非阻塞/同步/异步 主流程]\nNvmjrldC -->|异常| NvmjrldF[处理 阻塞/非阻塞/同步/异步 边界风险]\nNvmjrldN --> NvmjrldO[输出结果或交给下一组件]\nNvmjrldF --> NvmjrldR[按 阻塞/非阻塞/同步/异步 语义降级/重试/报错]\nNvmjrldO --> NvmjrldV[验证 阻塞/非阻塞/同步/异步 日志、指标或测试]\nNvmjrldR --> NvmjrldV",
-      "caption": "阻塞/非阻塞/同步/异步 图中的分支用于区分本题正常机制、异常边界和工程验证路径。",
-      "fallback": "阻塞/非阻塞/同步/异步 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。",
+      "format": "svg",
+      "title": "一次 IO 的两阶段与五种模型分界",
+      "content": "assets/diagrams/os-io-models-two-stage.svg",
+      "caption": "五种模型按两阶段时间线排列：阻塞/非阻塞/多路复用/信号驱动都在第二阶段由用户线程完成拷贝（同步）；异步模型（io_uring）两阶段都由内核推进，用户消费完成事件。",
+      "fallback": "一次 IO 分数据准备和数据拷贝两阶段。阻塞 IO 在准备阶段睡眠，拷贝由调用线程完成；非阻塞未就绪返回 EAGAIN，就绪后仍由调用线程拷贝；select/poll/epoll 和 SIGIO 只通知就绪，之后仍要应用 recv 拷贝；异步 IO（io_uring）提交请求后由内核完成两阶段，应用通过 CQE 获取结果。",
       "sources": [
         {
-          "kind": "mermaid",
-          "content": "flowchart TD\nNvmjrldS[阻塞/非阻塞/同步/异步 触发入口] --> NvmjrldM[核心对象或状态: 操作系统]\nNvmjrldM --> NvmjrldC{阻塞/非阻塞/同步/异步 是否走正常路径}\nNvmjrldC -->|正常| NvmjrldN[执行 阻塞/非阻塞/同步/异步 主流程]\nNvmjrldC -->|异常| NvmjrldF[处理 阻塞/非阻塞/同步/异步 边界风险]\nNvmjrldN --> NvmjrldO[输出结果或交给下一组件]\nNvmjrldF --> NvmjrldR[按 阻塞/非阻塞/同步/异步 语义降级/重试/报错]\nNvmjrldO --> NvmjrldV[验证 阻塞/非阻塞/同步/异步 日志、指标或测试]\nNvmjrldR --> NvmjrldV"
+          "kind": "svg",
+          "path": "assets/diagrams/os-io-models-two-stage.svg"
         },
         {
           "kind": "text",
-          "content": "阻塞/非阻塞/同步/异步 的图示按本题触发入口、核心状态、正常路径、失败路径和验证手段展开，重点看分支关系。"
+          "content": "一次 IO 分数据准备和数据拷贝两阶段。阻塞 IO 在准备阶段睡眠；非阻塞未就绪返回 EAGAIN；select/poll/epoll 和 SIGIO 只通知就绪，之后仍要应用 recv 拷贝；异步 IO 是提交请求后通过 CQE/回调获取完成结果。"
         }
       ]
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| IO 模型 | 数据准备 | 数据拷贝 | 是否同步 | 线程利用率 |\n| --- | --- | --- | --- | --- |\n| 阻塞 IO | 调用线程在内核睡眠，直到 socket 缓冲区有数据 | 调用线程等待 `recv` 拷贝完成 | 同步 | 低，连接数大时线程和调度成本高 |\n| 非阻塞 IO | 未就绪立即返回 `EAGAIN/EWOULDBLOCK`，单独轮询会空转 | 就绪后仍由调用线程执行 `recv` | 同步 | 单独使用低；配合事件通知才高效 |\n| 信号驱动 IO | 就绪时内核发送 `SIGIO`，应用收到信号后再读 | 信号只通知就绪，拷贝仍靠 `recv` | 同步 | 理论上减少轮询，工程上受信号语义和可调试性限制 |\n| IO 多路复用 | `select/poll/epoll_wait` 等多个 fd 就绪，epoll 返回就绪列表 | 事件循环对就绪 fd 调用 `recv` | 同步 | 高，尤其适合大量长连接低活跃场景 |\n| 异步 IO | 请求提交后由内核继续推进 | 内核完成拷贝后投递完成事件 | 异步 | 最高潜力，但依赖内核、驱动和框架支持 |"
+      "title": "五种 IO 模型对比",
+      "content": "| IO 模型 | 第一阶段（数据准备） | 第二阶段（数据拷贝） | 同步/异步 | 线程利用特点 |\n| --- | --- | --- | --- | --- |\n| 阻塞 IO | 调用线程睡眠，直到缓冲区有数据 | 调用线程等待 `recv` 完成 | 同步 | 简单但每连接一线程，大连接数成本高 |\n| 非阻塞 IO | 未就绪立即返回 `EAGAIN` | 就绪后仍由调用线程 `recv` | 同步 | 单独用空转烧 CPU；配合事件通知才有价值 |\n| 信号驱动 IO | 内核发 `SIGIO` 通知就绪 | 应用在信号/主循环中 `recv` | 同步 | 理论减少轮询，工程上受信号语义限制 |\n| IO 多路复用 | `select/poll/epoll_wait` 等多 fd 就绪 | 事件循环对就绪 fd 调 `recv` | 同步 | 高效，大量长连接低活跃场景首选 |\n| 异步 IO | 内核推进（用户不参与） | 内核完成后投递 CQE/回调 | 异步 | 最高潜力，依赖内核版本、驱动和框架 |\n\n| 多路复用实现 | fd 集合表示 | 就绪检测 | fd 数量限制 | 触发模式 |\n| --- | --- | --- | --- | --- |\n| select | `fd_set` 位图 | 每次调用线性扫描全集 | `FD_SETSIZE`（默认 1024） | 仅 LT |\n| poll | `pollfd` 数组 | 每次调用线性扫描全集 | 突破位图限制，仍受内存 | 仅 LT |\n| epoll | 内核红黑树 + 就绪链表 | 回调驱动，只返回活跃 fd | 受进程 `rlimit` 和内存 | LT 和 ET |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// 1. 阻塞 IO\nchar buf[1024];\nint n = recv(sockfd, buf, sizeof(buf), 0); // 阻塞直到数据到达\n// 线程在这里一直等待\n\n// 2. 非阻塞 IO\n#include <fcntl.h>\n#include <errno.h>\n\n// 设置非阻塞\nint flags = fcntl(sockfd, F_GETFL, 0);\nfcntl(sockfd, F_SETFL, flags | O_NONBLOCK);\n\nwhile (1) {\n    int n = recv(sockfd, buf, sizeof(buf), 0);\n    if (n > 0) {\n        // 数据就绪\n        break;\n    } else if (n < 0 && errno == EAGAIN) {\n        // 数据未就绪，继续轮询\n        continue;\n    }\n}\n\n// 3. IO 多路复用（select）\nfd_set readfds;\nFD_ZERO(&readfds);\nFD_SET(sockfd, &readfds);\n\nint ready = select(sockfd + 1, &readfds, NULL, NULL, NULL);\nif (ready > 0 && FD_ISSET(sockfd, &readfds)) {\n    int n = recv(sockfd, buf, sizeof(buf), 0);\n}\n\n// 4. 异步 IO（Linux aio）\n#include <aio.h>\n\nstruct aiocb cb;\ncb.aio_fildes = sockfd;\ncb.aio_buf = buf;\ncb.aio_nbytes = sizeof(buf);\ncb.aio_sigevent.sigev_notify = SIGEV_THREAD;\ncb.aio_sigevent.sigev_notify_function = completion_handler;\n\naio_read(&cb); // 立即返回\n// completion_handler 在数据就绪并拷贝完成后被调用",
-      "language": "c",
+      "title": "Python 可运行：selector 只通知就绪，数据仍要 recv",
+      "content": "import selectors\nimport socket\nimport threading\nimport time\n\ndef delayed_send(peer, payload, delay=0.05):\n    time.sleep(delay)\n    peer.sendall(payload)\n\ndef blocking_recv():\n    reader, writer = socket.socketpair()\n    sender = threading.Thread(target=delayed_send, args=(writer, b\"blocking\"))\n    sender.start()\n    data = reader.recv(1024)\n    print(\"blocking recv returns:\", data.decode())\n    sender.join()\n    reader.close()\n    writer.close()\n\ndef nonblocking_recv():\n    reader, writer = socket.socketpair()\n    reader.setblocking(False)\n    try:\n        reader.recv(1024)\n    except BlockingIOError as exc:\n        print(\"nonblocking before ready:\", exc.errno)\n    writer.sendall(b\"ready\")\n    data = reader.recv(1024)\n    print(\"nonblocking after ready:\", data.decode())\n    reader.close()\n    writer.close()\n\ndef selector_recv():\n    selector = selectors.DefaultSelector()\n    a_reader, a_writer = socket.socketpair()\n    b_reader, b_writer = socket.socketpair()\n    for name, sock in [(\"a\", a_reader), (\"b\", b_reader)]:\n        sock.setblocking(False)\n        selector.register(sock, selectors.EVENT_READ, data=name)\n    b_writer.sendall(b\"only-b-is-ready\")\n    events = selector.select(timeout=1)\n    for key, _ in events:\n        data = key.fileobj.recv(1024)\n        print(f\"selector ready {key.data}, app recv:\", data.decode())\n    for sock in [a_reader, a_writer, b_reader, b_writer]:\n        sock.close()\n    selector.close()\n\nblocking_recv()\nnonblocking_recv()\nselector_recv()",
+      "language": "python",
       "highlights": [
         {
-          "line": 30,
-          "note": "这里通过多路等待处理并发分支，重点说明不同事件到达时的状态变化。"
+          "line": 14,
+          "note": "阻塞 recv 会一直等到对端写入数据并完成拷贝后才返回。"
+        },
+        {
+          "line": 25,
+          "note": "非阻塞 fd 未就绪时抛出 BlockingIOError（对应 EAGAIN/EWOULDBLOCK）。"
+        },
+        {
+          "line": 41,
+          "note": "selector/select/epoll 返回的是就绪事件，不是已经读好的数据。"
+        },
+        {
+          "line": 43,
+          "note": "应用仍要对就绪 fd 调 recv——这就是多路复用仍属于同步 IO 的关键证据。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "30 秒结论：一次网络 IO 要拆成“等数据进入内核 socket 缓冲区”和“把数据从内核拷到用户 buffer”两步。阻塞/非阻塞主要描述第一步怎么等；同步/异步描述第二步是不是还要用户线程自己调用 `recv` 等结果。按这个标准，阻塞 IO、非阻塞 IO、信号驱动 IO、select/poll/epoll 都是同步 IO，只有内核完成拷贝后再通知的模型才是异步 IO。\n\n机制要点：\n- 阻塞 IO：`recv` 后两个阶段都可能阻塞，简单但连接数高时线程成本大。\n- 非阻塞 IO：未就绪返回 `EAGAIN/EWOULDBLOCK`，单独轮询会烧 CPU；配合事件通知时用于保证事件循环不被单个 fd 卡住。\n- 多路复用：`select/poll/epoll_wait` 等待多个 fd 的就绪事件，返回后应用还要调用 `recv`，因此是同步非阻塞 Reactor 的基础。\n- 信号驱动 IO：内核用 `SIGIO` 通知 fd 就绪，读数据仍靠应用；由于信号上下文限制、语义不如 epoll 清晰，服务端网络框架很少作为主路径。\n- `select/poll/epoll`：`select` 有 `FD_SETSIZE` 位图限制且要扫描；`poll` 用数组突破固定限制但仍线性传递和扫描；`epoll` 把关注集合留在内核，通过就绪列表返回活跃 fd，并支持 LT/ET。\n- Reactor 与 Proactor：epoll Reactor 是“就绪通知 + 用户线程读写”；io_uring/真正 AIO 更像 Proactor，是“提交操作 + 完成通知”。\n\n边界和追问应对：\n- 如果面试官问“epoll 为什么不是异步”，回答落到 `epoll_wait` 返回后仍需 `recv`，完成事件不是数据已拷贝完成。\n- 如果问“ET 为什么必须非阻塞”，说明 ET 只在状态变化时通知，必须循环读到 `EAGAIN`；阻塞 fd 会在最后一次无数据可读时挂死事件循环。\n- 如果问线上现象，可以说用 `strace` 看 `epoll_wait/recvfrom` 是否大量 `EAGAIN` 或超时返回，用 `ss -tinp` 看收发队列，用 `perf top` 看 CPU 是否耗在空轮询、协议解析或内核网络栈。",
+      "content": "**30 秒结论**\n一次网络 IO 分「数据进入内核 socket 缓冲区」和「内核数据拷贝到用户 buffer」两步。阻塞/非阻塞描述第一步怎么等（调用线程是否睡眠）；同步/异步描述第二步谁做（用户线程是否还要亲自 recv 等结果）。按这个标准，阻塞 IO、非阻塞 IO、信号驱动 IO、select/poll/epoll 都是同步 IO，只有提交后由内核投递完成结果的模型（如 io_uring）才是异步 IO。\n\n**机制主线**\n- 阻塞 IO：两阶段都可能让线程睡眠，简单但连接数大时线程成本高\n- 非阻塞 IO：未就绪返回 `EAGAIN`，单独轮询烧 CPU；工程上配合 epoll 使用，保证事件循环不被单个 fd 卡死\n- IO 多路复用：`select/poll/epoll_wait` 一个线程等多 fd 就绪，返回后仍要 `recv`，所以是同步\n- 信号驱动 IO：`SIGIO` 通知就绪，拷贝仍靠用户；信号上下文受限、语义不如 epoll 清晰，服务端少用\n- 异步 IO（io_uring）：SQ/CQ 共享环提交请求、收割完成事件（CQE），两阶段都不用用户等\n\n**select/poll/epoll 差异**\n- `select`：`fd_set` 位图、`FD_SETSIZE` 限制（默认 1024）、每次线性扫描全集、仅 LT\n- `poll`：`pollfd` 数组突破位图限制、仍线性扫描和传递、仅 LT\n- `epoll`：关注集合留在内核（红黑树）、回调驱动就绪链表只返回活跃 fd、支持 LT 和 ET\n\n**Reactor vs Proactor**\n- Reactor（epoll）：就绪通知 + 用户线程读写\n- Proactor（io_uring）：提交操作 + 完成通知\n\n**边界和追问应对**\n- 「epoll 为什么不是异步」→ `epoll_wait` 返回后仍需 `recv`，就绪不是拷贝完成\n- 「ET 为什么必须非阻塞」→ ET 只在状态变化时通知，必须循环读到 `EAGAIN`；阻塞 fd 会在最后一次无数据时挂死\n- 「线上排查」→ `strace` 看 `epoll_wait/recvfrom` 是否大量 `EAGAIN` 或超时；`ss -tinp` 看收发队列；`perf top` 看 CPU 热点",
       "followUpQuestions": [
         {
-          "question": "很多人说 IO 多路复用是‘异步’，为什么其实它是同步 IO？",
-          "answer": "因为判定同步/异步只看第二阶段——数据拷贝要不要用户线程亲自参与并等待。IO 多路复用里，select/epoll 只帮你在第一阶段‘等哪个 fd 就绪’上做到一个线程盯多个连接，但当某个 fd 就绪后，真正把数据从内核缓冲区搬到用户缓冲区，还是要你自己调 recvfrom 并等它返回，这一步是阻塞的、由用户线程完成。所以它在‘等数据’上很高效，但在‘搬数据’上仍是同步的。真正的异步 IO 是连搬数据都由内核做完再通知你，比如 io_uring。"
+          "question": "很多人说 IO 多路复用是'异步'，为什么其实它是同步 IO？",
+          "answer": "判定同步/异步只看第二阶段——数据拷贝要不要用户线程亲自参与并等待。IO 多路复用里，select/epoll 只帮你在第一阶段「等哪个 fd 就绪」上做到一个线程盯多个连接；某个 fd 就绪后，真正把数据从内核缓冲区搬到用户缓冲区，还是要你自己调 `recvfrom` 并等它返回。它在「等数据」上很高效，但在「搬数据」上仍是同步的。异步完成模型消费的是完成结果（如 io_uring 的 CQE），不是单纯的就绪 fd。"
         },
         {
           "question": "既然非阻塞 IO 轮询很费 CPU，为什么高并发服务器还要把 socket 设成非阻塞？",
-          "answer": "因为它要配合 IO 多路复用用，而不是单独轮询。Reactor/epoll 模型里，epoll_wait 负责高效地告诉你哪些 fd 就绪，你只对就绪的 fd 调一次 read；把 fd 设为非阻塞是为了——边缘触发(ET)下要一次把数据读到 EAGAIN 为止，非阻塞保证最后那次没数据的 read 立即返回 EAGAIN 而不是把线程卡住；同时也防止某个 fd 数据不完整时 read 阻塞整个事件循环、拖垮其他连接。所以这里的非阻塞不是用来轮询的，而是保证事件循环永不被单个 fd 阻塞。"
+          "answer": "因为这里的非阻塞不是用来轮询的，而是配合 IO 多路复用使用。Reactor/epoll 模型里，`epoll_wait` 负责高效告诉你哪些 fd 就绪，你只对就绪的 fd 调一次 read。把 fd 设为非阻塞是为了：边缘触发(ET)下要一次把数据读到 `EAGAIN` 为止，非阻塞保证最后那次没数据的 read 立即返回而不是把线程卡住；同时防止某个 fd 数据不完整时 read 阻塞整个事件循环、拖垮其他连接。所以非阻塞的意义是保证事件循环永不被单个 fd 阻塞。"
+        },
+        {
+          "question": "io_uring 比 epoll 快吗？",
+          "answer": "不一定。io_uring 的优势是提交/完成解耦、共享环减少系统调用、支持批量操作；对大量随机读写的文件 IO 提升明显。但对纯 TCP 网络服务，epoll + 非阻塞 fd 的方案已经很成熟，io_uring 的网络 opcode 在低版本内核支持不全，实际吞吐差距要看 workload、连接模式和内核版本。io_uring 还受安全策略限制（`io_uring_disabled`），在容器环境中可能被禁用。选型要基于压测和观测，不是理论推导。"
         }
       ]
     },
@@ -80,21 +106,22 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "区分一次 IO 的数据准备阶段和数据拷贝阶段",
-        "描述阻塞 IO、非阻塞 IO、多路复用、信号驱动 IO、异步 IO 的等待与通知差异",
-        "解释 IO 多路复用为什么属于同步 IO",
-        "区分阻塞/非阻塞与同步/异步两个正交维度",
-        "说清 select、poll、epoll 在 fd 集合表示、扫描方式、fd 数量限制和触发模式上的差异",
-        "解释 epoll ET 模式为什么要求非阻塞并读到 EAGAIN",
-        "区分 Reactor 的就绪通知和 Proactor 的完成通知",
-        "给出 strace、ss、perf 等定位 IO 空转、队列堆积和事件循环停顿的证据"
+        "能区分一次 IO 的数据准备阶段和数据拷贝阶段",
+        "能描述阻塞 IO、非阻塞 IO、多路复用、信号驱动 IO、异步 IO 的等待与通知差异",
+        "能用「第二阶段是否要用户线程参与」判定同步/异步",
+        "能区分阻塞/非阻塞与同步/异步两个正交维度",
+        "能说清 select/poll/epoll 在 fd 集合表示、扫描方式、fd 数量限制和触发模式上的差异",
+        "能解释 epoll ET 模式为什么要求非阻塞并读到 EAGAIN",
+        "能区分 Reactor 的就绪通知和 Proactor 的完成通知",
+        "能说明 io_uring 的 SQ/CQ 模型及其工程边界",
+        "能给出 strace、ss、perf 等定位 IO 空转、队列堆积和事件循环停顿的证据"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "os.io-model.topic-io-models.recall.1",
-      "prompt": "请用“等待就绪”和“拷贝数据”两个阶段解释阻塞、非阻塞、同步和异步 IO 的区别。",
+      "prompt": "请用「等待就绪」和「拷贝数据」两个阶段解释阻塞、非阻塞、同步和异步 IO 的区别。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
@@ -108,38 +135,47 @@
     },
     {
       "id": "os.io-model.topic-io-models.recall.3",
-      "prompt": "同步非阻塞和异步 IO 的本质区别在哪一步？为什么说 epoll 本质上仍是同步 IO？",
+      "prompt": "select、poll、epoll 三个实现分别怎么管理 fd 集合、检测就绪和处理触发模式？为什么高并发场景首选 epoll？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "os.io-model.topic-io-models.recall.4",
+      "prompt": "io_uring 的提交/完成队列模型和 epoll Reactor 的就绪通知模型有什么本质区别？io_uring 在哪些场景有优势、哪些场景未必？",
+      "mode": "text",
+      "expectedMinutes": 4,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
       "能说出一次读取分数据准备和数据拷贝两个阶段",
-      "能描述阻塞/非阻塞/多路复用/异步四种模型的区别",
-      "能解释为什么多路复用仍是同步 IO（第二阶段仍要自己等）",
-      "能区分阻塞/非阻塞（阶段1）与同步/异步（阶段2）两个维度"
+      "能描述阻塞/非阻塞/多路复用/信号驱动/异步五种模型的区别",
+      "能用「第二阶段是否要用户线程参与」解释为什么多路复用仍是同步 IO",
+      "能区分阻塞/非阻塞（阶段1）与同步/异步（阶段2）两个正交维度"
     ],
     "goodToHave": [
-      "能说明 Linux 原生 AIO 对 socket 支持差",
-      "能解释 io_uring 用提交/完成队列减少系统调用",
-      "能说出 epoll 加非阻塞是高并发主流方案"
+      "能说清 select/poll/epoll 在 fd 表示、扫描方式、数量限制和触发模式上的工程差异",
+      "能解释 epoll ET 模式为什么要求非阻塞并读到 EAGAIN",
+      "能说明 io_uring 的 SQ/CQ 模型、支持的 opcode 和工程边界",
+      "能区分 Reactor（就绪通知）和 Proactor（完成通知）两种架构模式"
     ],
     "commonMistakes": [
-      "误以为 IO 多路复用是异步 IO",
-      "混淆阻塞/非阻塞与同步/异步两个维度",
-      "以为 select 和 epoll 没区别"
+      "误以为 IO 多路复用是异步 IO——忽略就绪后仍要 recv 拷贝",
+      "混淆阻塞/非阻塞与同步/异步两个维度——把非阻塞等同于异步",
+      "以为 select 和 epoll 没区别——忽略 fd 集合留在内核、就绪链表、ET 模式等关键差异",
+      "把 io_uring 等同于所有场景零拷贝或必然更快——忽略内核版本、opcode 支持和安全策略限制"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "draft",
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否用两阶段模型区分四种 IO、说清多路复用为何仍是同步、分清阻塞/非阻塞与同步/异步两个维度，并了解 io_uring。"
+  "interviewerFocus": "考察能否用两阶段模型区分五种 IO 模型、说清多路复用为何仍是同步、分清阻塞/非阻塞与同步/异步两个维度，并能对比 select/poll/epoll 工程差异、Reactor vs Proactor 语义和 io_uring 的提交/完成模型及其边界。"
 }

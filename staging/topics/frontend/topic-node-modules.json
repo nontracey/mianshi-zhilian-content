@@ -4,7 +4,7 @@
   "category": "nodejs",
   "group": "nodejs",
   "title": "Node.js 模块系统与包管理",
-  "summary": "讲清 CommonJS 与 ESM 的区别（运行时/编译时、Tree Shaking）、npm/yarn/pnpm 的 node_modules 组织，以及幽灵依赖和 monorepo。",
+  "summary": "Node.js 存在两套模块系统（CommonJS 运行时动态加载、ES Modules 编译时静态分析）和三个主流包管理器（npm/yarn/pnpm 的 node_modules 组织方式不同），核心考点是 CJS/ESM 互操作边界、Tree Shaking 前提、幽灵依赖与 pnpm 严格隔离、package.json exports 条件导出，以及 monorepo workspace 的工程实践。",
   "tags": [
     "前端",
     "Node.js",
@@ -14,23 +14,28 @@
     "monorepo"
   ],
   "difficulty": 2,
-  "estimatedMinutes": 12,
+  "estimatedMinutes": 30,
   "order": 20,
   "recommendWeight": 74,
   "status": "staging",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Node.js 模块系统与包管理：模块系统",
-      "content": "## 模块系统\n\n### CommonJS (CJS)\n- `require()`导入，`module.exports`导出\n- 同步加载，运行时确定依赖\n- Node.js原生支持\n\n### ES Modules (ESM)\n- `import/export`语法\n- 静态分析，编译时确定依赖\n- 支持Tree Shaking\n- 需要.mjs扩展名或package.json中type:module\n\n### 包管理器对比\n**npm**：Node.js默认，v7+支持workspace\n**yarn**：速度快，yarn berry(pnP)无node_modules\n**pnpm**：硬链接+符号链接，节省磁盘空间，严格依赖隔离\n\n### monorepo\n- 单仓多包，代码共享方便\n- pnpm workspace / yarn workspace / nx / turborepo\n- 统一版本管理、依赖管理"
+      "title": "CJS 与 ESM 的加载机制差异",
+      "content": "## CommonJS（CJS）\n\n`require()` 是一个普通函数调用，发生在代码运行时。Node 遇到 `require('./math')` 时，会同步读取文件、编译执行、缓存 `module.exports` 的返回值。下次再 require 同一路径直接返回缓存对象——所以 CJS 导出的是**值的拷贝**（对象类型是引用的拷贝），模块内部后续修改 exports 不会影响已拿到的变量。\n\nCJS 的关键特性：\n- **同步阻塞**：require 时文件必须已存在于磁盘，执行到 require 才加载\n- **运行时确定**：require 可以写在 if 里、可以拼路径字符串，依赖图要跑起来才知道\n- **this 指向**：模块顶层 `this` 等于 `module.exports`，不是 `undefined`\n- 只能在模块顶层使用 `require`（不能在 ESM 的顶层 await 里用），但可以把 require 调用放在函数里延迟执行\n\n## ES Modules（ESM）\n\n`import` 语句是声明式的静态语法，不是函数调用。Node 在执行代码前会先解析所有 import 语句，构建完整的依赖图，然后按拓扑序深度优先加载。ESM 导出的是**活绑定（live binding）**——import 拿到的是对导出变量的引用，导出方修改值后导入方立刻可见（但导入方不能直接赋值修改，是只读的）。\n\nESM 的关键特性：\n- **异步加载**：import 在解析阶段完成，执行前已确定依赖图，不阻塞主线程\n- **编译时静态分析**：import/export 必须在模块顶层、路径必须是字符串字面量（不能拼接），这让打包器和运行时都能提前分析依赖\n- **this 指向**：模块顶层 `this` 是 `undefined`\n- 支持 `await` 在模块顶层（top-level await），CJS 不支持\n- 浏览器原生也支持 `<script type=\"module\">`，是 Web 标准\n\n## 为什么 ESM 能 Tree Shaking 而 CJS 不能\n\nTree Shaking 的前提是打包器能知道「某个导出到底有没有被别的模块用到」。ESM 的 import/export 是静态声明，打包器只需扫描源码文本就能画出精确的依赖图和使用关系，安全删除未引用的导出。CJS 的 require 可以动态拼接、条件执行，打包器无法在编译期确定哪些导出被用过，强行删除会破坏运行时逻辑。"
+    },
+    {
+      "type": "explain",
+      "title": "CJS 与 ESM 互操作和 package.json 条件导出",
+      "content": "## 互操作的坑\n\nCJS 和 ESM 是两套不同的模块执行上下文，Node 需要明确知道一个 .js 文件到底按哪种方式加载：\n\n1. **判定规则**：如果 package.json 有 `\"type\": \"module\"`，该包下所有 .js 文件默认按 ESM 加载；没有则默认 CJS。.mjs 强制 ESM，.cjs 强制 CJS，不受 type 字段影响。\n2. **ESM 中引用 CJS**：可以用 `import` 语法，但只能用 default import（因为 CJS 没有命名导出的静态结构），如 `import pkg from './cjs-module.cjs'`。Node 会对 CJS 模块的 `module.exports` 对象做静态分析尝试提取命名导出，但这种提取是 best-effort、不保证稳定。\n3. **CJS 中引用 ESM**：**不能用 require()**——因为 ESM 是异步解析的，而 require 是同步的，两者生命周期不兼容。唯一的方式是用动态 `import()`（返回 Promise），但 require 本身是同步的，所以调用处必须是 async 函数或 `.then()` 链。\n4. **常见报错**：`ERR_REQUIRE_ESM`——一个 CJS 文件试图 require 一个 ESM-only 的包。修复：要么把自身改成 ESM，要么用动态 `import()`，要么让包作者发双格式（CJS + ESM）。\n\n## package.json exports 字段（条件导出）\n\nNode 12.11+ 引入的 `exports` 字段取代了旧的 `main`/`module`/`types`，成为包的「入口路由」：\n\n```json\n{\n  \"exports\": {\n    \".\": {\n      \"types\": \"./dist/index.d.ts\",\n      \"import\": \"./dist/index.mjs\",\n      \"require\": \"./dist/index.cjs\",\n      \"default\": \"./dist/index.js\"\n    },\n    \"./utils\": {\n      \"import\": \"./dist/utils.mjs\",\n      \"require\": \"./dist/utils.cjs\"\n    }\n  }\n}\n```\n\n- 条件按顺序匹配：`types`（TypeScript 优先）→ `import`（ESM 环境）→ `require`（CJS 环境）→ `default`（兜底）\n- 子路径导出：`\"./utils\"` 限制消费者只能 import 这个路径，不在 exports 列表中的子路径会被 Node 拒绝（封装性好）\n- 旧 `main` 字段在 exports 不存在时作为 fallback；两者共存时 exports 优先\n- **坑**：如果 exports 没列全子路径，用户 `import 'pkg/some-internal-file'` 会报 `ERR_PACKAGE_PATH_NOT_EXPORTED`，这是有意为之的封装，但升级时可能 breaking change"
     },
     {
       "type": "diagram",
       "format": "mermaid",
       "title": "Node 模块解析：CJS/ESM、exports、条件导出、包管理与锁文件",
       "content": "flowchart TD\nA[\"import/require 语句\"] --> B{\"specifier 类型\"}\nB -->|相对/绝对路径| C[\"按路径和扩展解析\"]\nB -->|包名| D[\"查找 node_modules 和 package.json\"]\nD --> E{\"exports/imports 字段\"}\nE -->|存在| F[\"按条件导出解析\nimport/require/node/browser\"]\nE -->|不存在| G[\"main/module/types 等传统字段\"]\nF --> H[\"加载 ESM 或 CJS\"]\nG --> H\nI[\"包管理器锁文件\"] --> D\nJ[\"peerDependencies\"] --> D",
-      "caption": "Node 模块解析：CJS/ESM、exports、条件导出、包管理与锁文件",
-      "fallback": "图展示 Node 模块系统要理解 specifier、package exports、CJS/ESM 互操作、条件导出和包管理锁文件。",
+      "caption": "Node 模块解析流程：specifier 类型 → package.json exports 条件导出 → CJS/ESM 加载",
+      "fallback": "流程图展示 Node 模块解析路径：import/require 根据 specifier 类型（路径或包名）解析，包名通过 node_modules 查找并优先读取 package.json 的 exports 条件导出字段，按 import/require/types/default 条件顺序匹配，最终加载对应格式的模块文件。",
       "sources": [
         {
           "kind": "mermaid",
@@ -44,33 +49,92 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | CommonJS | ES Modules |\n| --- | --- | --- |\n| 语法 | require/module.exports | import/export |\n| 加载方式 | 同步 | 异步 |\n| 确定时机 | 运行时 | 编译时（静态分析） |\n| Tree Shaking | 不支持 | 支持 |\n| this指向 | module.exports | undefined |\n| 顶层await | 不支持 | 支持 |\n| 使用场景 | Node.js服务端 | 前端+现代Node.js |\n| 文件扩展名 | .js/.cjs | .js/.mjs |"
+      "title": "CJS 与 ESM 核心差异",
+      "content": "| 维度 | CommonJS (CJS) | ES Modules (ESM) |\n| --- | --- | --- |\n| 语法 | require() / module.exports | import / export |\n| 加载时机 | 运行时，遇到 require 才加载 | 编译时，执行前先构建依赖图 |\n| 加载方式 | 同步阻塞 | 异步非阻塞 |\n| 导出语义 | 值的拷贝（对象是引用拷贝） | 活绑定（live binding，只读引用） |\n| 静态分析 | 不能（require 可动态拼接） | 能（import 必须字面量路径） |\n| Tree Shaking | 不支持 | 支持（打包器可安全删除未引用导出） |\n| this（模块顶层） | module.exports | undefined |\n| 顶层 await | 不支持 | 支持 |\n| 文件标识 | .cjs 或无 type:module 的 .js | .mjs 或 type:module 下的 .js |"
+    },
+    {
+      "type": "compareTable",
+      "title": "包管理器 node_modules 组织对比",
+      "content": "| 维度 | npm (v3+) | yarn (v1) | pnpm |\n| --- | --- | --- | --- |\n| 结构策略 | 扁平化平铺到顶层 | 扁平化平铺到顶层 | 全局 store 硬链接 + 符号链接 |\n| 幽灵依赖 | 有（子依赖被提升到顶层，未声明也能 require） | 有（同 npm） | 无（只暴露声明的依赖） |\n| 磁盘占用 | 每个项目独立副本 | 每个项目独立副本，有全局缓存 | 全局 store 只存一份内容，项目通过硬链接引用 |\n| 同包多版本 | 提升一个版本到顶层，其余嵌套 | 提升一个版本到顶层，其余嵌套 | 各版本独立链接，互不干扰 |\n| workspace | v7+ 支持 workspaces | v1 支持 workspaces | 原生 pnpm-workspace.yaml |\n| lockfile | package-lock.json | yarn.lock | pnpm-lock.yaml |\n| 严格模式 | 无（默认可 require 未声明的包） | 无 | 有（PnP 模式或默认严格结构） |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// CommonJS\n// math.js\nconst add = (a, b) => a + b;\nmodule.exports = { add };\n\n// app.js\nconst { add } = require('./math');\nconsole.log(add(1, 2));\n\n// ES Modules\n// math.mjs\nexport const add = (a, b) => a + b;\nexport default function multiply(a, b) { return a * b; }\n\n// app.mjs\nimport multiply, { add } from './math.mjs';\nconsole.log(add(1, 2));\n\n// CJS和ESM互操作\n// 在CJS中使用ESM（Node 14+）\nasync function main() {\n  const { add } = await import('./math.mjs'); // 动态import\n}\n\n// package.json配置\n// {\n//   \"type\": \"module\",  // 全局ESM\n//   \"exports\": {\n//     \".\": {\n//       \"import\": \"./dist/index.mjs\",\n//       \"require\": \"./dist/index.cjs\"\n//     }\n//   }\n// }\n\n// pnpm workspace配置\n// pnpm-workspace.yaml\n// packages:\n//   - 'packages/*'\n//   - 'apps/*'\n\n// package.json\n// {\n//   \"name\": \"my-monorepo\",\n//   \"private\": true,\n//   \"workspaces\": [\"packages/*\", \"apps/*\"]\n// }\n\n// pnpm常用命令\n// pnpm add <pkg> -w          安装到根目录\n// pnpm add <pkg> --filter @my/lib  安装到指定包\n// pnpm -r run build          递归执行build\n// pnpm --filter @my/app dev  运行指定包的dev\n\n// 依赖管理对比\n// npm install          → node_modules扁平结构（幽灵依赖）\n// yarn install         → node_modules扁平结构（幽灵依赖）\n// pnpm install         → .pnpm硬链接+符号链接（严格隔离）\n\n// exports字段的条件导出\n// {\n//   \"exports\": {\n//     \".\": {\n//       \"types\": \"./dist/index.d.ts\",\n//       \"import\": \"./dist/index.mjs\",\n//       \"require\": \"./dist/index.cjs\",\n//       \"default\": \"./dist/index.js\"\n//     }\n//   }\n// }",
+      "title": "CJS/ESM 语法、互操作与 exports 条件导出",
+      "content": "// ===== CommonJS =====\n// math.cjs\nconst add = (a, b) => a + b;\nmodule.exports = { add };\n\n// app.cjs\nconst { add } = require('./math.cjs');\nconsole.log(add(1, 2)); // 3\n\n// ===== ES Modules =====\n// math.mjs\nexport const add = (a, b) => a + b;\nexport default function multiply(a, b) { return a * b; }\n\n// app.mjs\nimport multiply, { add } from './math.mjs';\nconsole.log(add(1, 2)); // 3\nconsole.log(multiply(3, 4)); // 12\n\n// ===== 互操作：CJS 中引用 ESM 只能用动态 import() =====\n// app.cjs\nasync function main() {\n  // require('./math.mjs') 会报 ERR_REQUIRE_ESM\n  const { add } = await import('./math.mjs');\n  console.log(add(1, 2));\n}\nmain();\n\n// ===== package.json exports 条件导出 =====\n// 假设的 @my/lib 包\n// {\n//   \"name\": \"@my/lib\",\n//   \"exports\": {\n//     \".\": {\n//       \"types\": \"./dist/index.d.ts\",\n//       \"import\": \"./dist/index.mjs\",\n//       \"require\": \"./dist/index.cjs\",\n//       \"default\": \"./dist/index.js\"\n//     },\n//     \"./utils\": {\n//       \"import\": \"./dist/utils.mjs\",\n//       \"require\": \"./dist/utils.cjs\"\n//     }\n//   }\n// }\n// import { add } from '@my/lib'      → 匹配 \"import\" → ./dist/index.mjs\n// const { add } = require('@my/lib') → 匹配 \"require\" → ./dist/index.cjs\n// import { helper } from '@my/lib/utils' → 匹配 \"./utils\" 子路径\n// import { x } from '@my/lib/internal'  → 报 ERR_PACKAGE_PATH_NOT_EXPORTED",
       "language": "javascript",
       "highlights": [
         {
-          "line": 13,
-          "note": "「export default function multiply(a, b) { return a *...」 是「Node.js 模块系统与包管理」示例里最值得追问的一行；回答时要说明它连接了哪个输入、状态和可观测结果。"
+          "line": 6,
+          "note": "CJS 的 require 是运行时函数调导出的是值的拷贝。"
+        },
+        {
+          "line": 16,
+          "note": "ESM 的 import/export 是编译时静态声明，导出的是活绑定（live binding）。"
+        },
+        {
+          "line": 24,
+          "note": "CJS 中引用 ESM 必须用动态 import()（返回 Promise），不能用 require。"
+        },
+        {
+          "line": 30,
+          "note": "exports 字段按条件顺序匹配：types → import → require → default，控制不同环境加载不同文件。"
+        }
+      ]
+    },
+    {
+      "type": "explain",
+      "title": "pnpm 的硬链接机制与幽灵依赖",
+      "content": "## 幽灵依赖是什么\n\nnpm（v3+）和 yarn（v1）使用扁平化（hoisting）策略：把所有依赖（包括子依赖）提升到 node_modules 顶层。这意味着即使你的 package.json 没有声明 `lodash`，只要你的某个依赖依赖了 lodash，lodash 就会出现在顶层 node_modules 里，你的代码 `require('lodash')` 能正常运行——这就是**幽灵依赖（phantom dependency）**。\n\n幽灵依赖的风险：你的依赖升级后不再依赖 lodash，lodash 从顶层消失，你的代码瞬间崩溃，而你的 package.json 里根本没有任何关于 lodash 的记录，排查非常痛苦。\n\n## pnpm 如何解决\n\npnpm 的 node_modules 结构和 npm 完全不同：\n\n1. **全局 content-addressable store**：所有下载的包按内容哈希存储在 `~/.pnpm-store`（或项目级 `.pnpm-store`），同一版本同一内容全局只存一份。\n\n2. **硬链接（hard link）**：项目 node_modules 中的文件不复制，而是硬链接到全局 store。多个项目用同一版本的包，磁盘上只有一份实际文件，节省大量空间。\n\n3. **符号链接（symlink） + 严格结构**：项目 node_modules 顶层只出现你在 package.json 中显式声明的依赖的符号链接。子依赖藏在 `node_modules/.pnpm/<包名>@<版本>/node_modules/` 内部，项目代码无法直接 require 到未声明的包。\n\n效果：`require('lodash')` 在你没声明 lodash 的情况下直接报 `MODULE_NOT_FOUND`——从结构层面杜绝幽灵依赖。\n\n## pnpm 的边界\n\n- **严格隔离的副作用**：有些包依赖「提升后才能用」的隐式依赖（比如某些 webpack 插件期望 loader 被提升），pnpm 下会报找不到模块。可以用 `shamefully-hoist=true`（.npmrc）放宽限制，但这会重新引入幽灵依赖。\n- **PnP（Plug'n'Play）模式**：yarn berry 和 pnpm 都支持 PnP——彻底取消 node_modules，依赖信息全部写在 .pnp.cjs 里，解析速度更快但生态兼容性差，部分工具（IDE、原生模块）需要适配。"
+    },
+    {
+      "type": "compareTable",
+      "title": "pnpm node_modules 结构与 npm 对比",
+      "content": "| 特征 | npm 扁平化 | pnpm 严格结构 |\n| --- | --- | --- |\n| 顶层 node_modules | 所有依赖（含子依赖）平铺 | 只有 package.json 声明的直接依赖（符号链接） |\n| 子依赖位置 | 提升到顶层或嵌套 | 隐藏在 .pnpm/<pkg>@<ver>/node_modules/ 内 |\n| 幽灵依赖 | 存在（未声明的包也能 require 到） | 不存在（结构上隔离） |\n| 同包多版本 | 顶层一个版本，其余嵌套 | 各版本独立存在于 .pnpm 内部 |\n| 磁盘占用 | 每个项目独立复制 | 全局 store + 硬链接，多项目共享同一份文件 |\n| 升级风险 | 子依赖变化可能导致幽灵依赖消失/出现 | 依赖关系显式、确定性高 |"
+    },
+    {
+      "type": "code",
+      "title": "monorepo workspace 配置与常用命令",
+      "content": "// ===== pnpm-workspace.yaml =====\n// packages:\n//   - 'packages/*'\n//   - 'apps/*'\n\n// ===== 根 package.json =====\n// {\n//   \"name\": \"my-monorepo\",\n//   \"private\": true,\n//   \"scripts\": {\n//     \"build\": \"pnpm -r run build\",\n//     \"dev\": \"pnpm --filter @my/app dev\",\n//     \"lint\": \"pnpm -r run lint\"\n//   }\n// }\n\n// ===== packages/lib/package.json =====\n// {\n//   \"name\": \"@my/lib\",\n//   \"version\": \"1.0.0\",\n//   \"main\": \"./dist/index.cjs\",\n//   \"module\": \"./dist/index.mjs\",\n//   \"exports\": {\n//     \".\": {\n//       \"import\": \"./dist/index.mjs\",\n//       \"require\": \"./dist/index.cjs\"\n//     }\n//   }\n// }\n\n// ===== apps/app/package.json =====\n// {\n//   \"name\": \"@my/app\",\n//   \"dependencies\": {\n//     \"@my/lib\": \"workspace:*\",   // workspace 协议：引用本地包\nn//     \"react\": \"^18.2.0\"\n//   }\n// }\n\n// ===== 常用 pnpm 命令 =====\n// pnpm add <pkg> -w                  安装到根目录\n// pnpm add <pkg> --filter @my/app    安装到指定包\n// pnpm add @my/lib --filter @my/app  monorepo 内部包互相引用\n// pnpm -r run build                  递归执行所有包的 build\n// pnpm --filter @my/app... run build 只构建 @my/app 及其依赖\n// pnpm -r --changed run test         只测试自上次发布以来有变更的包\n\n// ===== turborepo turbo.json 配置示例 =====\n// {\n//   \"pipeline\": {\n//     \"build\": {\n//       \"dependsOn\": [\"^build\"],   // 先构建依赖包\n//       \"outputs\": [\"dist/**\"]\n//     },\n//     \"test\": {\n//       \"dependsOn\": [\"build\"],\n//       \"outputs\": []\n//     }\n//   }\n// }\n// turborepo 的价值：任务编排（拓扑排序并行构建）+ 远程缓存（CI 间共享构建产物）",
+      "language": "javascript",
+      "highlights": [
+        {
+          "line": 28,
+          "note": "workspace:* 协议让 monorepo 内部包引用始终指向本地版本，publish 时自动替换为实际版本号。"
+        },
+        {
+          "line": 36,
+          "note": "pnpm --filter @my/app... 的三点语法表示「该包及其所有依赖」，用于增量构建。"
+        },
+        {
+          "line": 47,
+          "note": "turbo.json 的 ^build 表示「先构建依赖包再构建自身」，实现拓扑排序的并行构建。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：Node 模块系统有两套——老的 CommonJS（CJS）和标准的 ES Modules（ESM）；包管理器有 npm/yarn/pnpm，核心差异在 node_modules 的组织方式。\n\n模块系统：\n\n1. CommonJS：require() 导入、module.exports 导出，同步加载、运行时确定依赖，Node 原生。\n2. ES Modules：import/export，静态分析、编译时确定依赖，支持 Tree Shaking（摇掉没用的导出），需要 .mjs 或 package.json 里 type:module。\n关键区别：CJS 是动态、运行时、值拷贝；ESM 是静态、编译时、导出的是引用（live binding），ESM 的静态结构是 Tree Shaking 的前提。\n\n包管理器：\n\n1. npm：默认，扁平化 node_modules，v7+ 支持 workspace。\n2. yarn：早期靠 lockfile 和缓存比 npm 快，berry 的 PnP 甚至不要 node_modules。\n3. pnpm：用硬链接加符号链接，全局只存一份、各项目软链过去，省磁盘、且严格依赖隔离（装了才能 require，杜绝幽灵依赖）。\n\nmonorepo：单仓多包，用 pnpm/yarn workspace 加 turborepo/nx 做统一版本和依赖管理、代码共享。\n\n边界和坑。① CJS 和 ESM 互操作有坑——ESM 里 require 不能直接用、CJS 里 import ESM 要动态 import()，混用要看 package.json 的 exports 字段。② npm 扁平化会产生幽灵依赖（没声明却能 require 到），pnpm 的严格结构能杜绝。③ lockfile 要提交保证可复现。",
+      "content": "**30 秒结论**\nNode.js 有两套模块系统——CommonJS（运行时同步加载、导出值拷贝）和 ES Modules（编译时静态分析、导出活绑定、支持 Tree Shaking）；包管理器的核心差异在 node_modules 组织方式，pnpm 用硬链接加严格结构解决了幽灵依赖和磁盘浪费问题。\n\n**模块系统主线**\n- CJS：require/module.exports，运行时同步加载，导出值拷贝，this 指向 module.exports\n- ESM：import/export，编译时静态分析构建依赖图，导出活绑定，this 是 undefined，支持 top-level await\n- ESM 能 Tree Shaking 的原因：import/export 是静态声明，打包器能在编译期精确知道哪些导出未被使用，安全删除\n- 互操作：ESM import CJS 只能 default import；CJS require ESM 会报 ERR_REQUIRE_ESM，必须用动态 import()\n- 判定方式：package.json 的 type:module 决定 .js 按 ESM 加载；.mjs 强制 ESM，.cjs 强制 CJS\n\n**包管理器主线**\n- npm/yarn（v1）：扁平化平铺，幽灵依赖风险\n- pnpm：全局 store + 硬链接省盘，符号链接严格隔离杜绝幽灵依赖\n- 幽灵依赖：未在 package.json 声明的包因为被提升到顶层而能 require 到，升级后可能消失导致崩溃\n- exports 字段：条件导出（types/import/require/default），控制不同环境加载不同文件，可限制子路径访问\n\n**monorepo 主线**\n- pnpm workspace 或 yarn workspace 管理多包，workspace:* 协议引用本地包\n- turborepo/nx 做任务编排（拓扑排序并行）+ 远程缓存\n\n**高频追问边界**\n- CJS 动态 require 能拼字符串、写在 if 里，ESM import 不行——这是 Tree Shaking 的代价\n- pnpm shamefully-hoist=true 可以放宽严格隔离，但会重新引入幽灵依赖\n- lockfile 必须提交到 Git，保证团队和 CI 可复现安装\n- ESM 包在 CJS 项目里报 ERR_REQUIRE_ESM 时，修复方案：改用动态 import()、让包作者发双格式、或自身切换 ESM",
       "followUpQuestions": [
         {
           "question": "CommonJS 和 ES Modules 最本质的区别是什么？为什么 ESM 能 Tree Shaking 而 CJS 不能？",
-          "answer": "本质区别在依赖关系什么时候确定。CJS 的 require 是运行时执行的函数调用，可以写在 if 里、可以拼字符串，依赖到运行时才知道，导出的是值的拷贝快照。ESM 的 import/export 是语言层的静态声明，必须在模块顶层、编译时就能分析出完整依赖图和每个模块导出/用了什么，导出的是 live binding。正因为 ESM 编译时就知道哪些导出没被用到，打包器才能安全摇掉它们做 Tree Shaking；CJS 动态、分析不出来，摇了可能出错，所以不能。"
+          "answer": "本质区别在依赖关系确定的时机。CJS 的 require 是运行时执行的函数调用，可以写在 if 里、可以拼字符串，依赖图要跑起来才知道，导出的是值的拷贝快照。ESM 的 import/export 是语言层的静态声明，必须在模块顶层、路径必须是字符串字面量，编译时就能分析出完整依赖图和每个模块导出/使用了什么，导出的是活绑定。正因为 ESM 编译时就知道哪些导出没被用到，打包器才能安全摇掉它们；CJS 动态、分析不出来，摇了可能破坏运行时逻辑。"
         },
         {
           "question": "pnpm 相比 npm 解决了什么问题？什么是幽灵依赖？",
-          "answer": "npm 把所有依赖（含子依赖）扁平化平铺到 node_modules 顶层，带来两个问题：① 幽灵依赖——你的代码能 require 到一个 package.json 里没声明、只因是别的包的子依赖被提到顶层的包，那个包一升级删了它你就崩。② 同包多版本重复占盘。pnpm 用内容寻址的全局 store 加硬链接加符号链接：全局只存一份、项目 node_modules 软链过去省盘；而且只把显式声明的依赖放顶层、子依赖藏在 .pnpm 里，require 没声明的包直接报错，从结构上杜绝幽灵依赖。"
+          "answer": "npm 把所有依赖（含子依赖）扁平化平铺到 node_modules 顶层，带来两个问题：①幽灵依赖——你的代码能 require 到一个 package.json 里没声明、只因是别的包的子依赖被提升到顶层的包，那个包升级后不再被依赖就从顶层消失，你的代码崩溃且 package.json 里没有任何记录可排查。②同包多版本重复占盘。pnpm 用全局 content-addressable store 加硬链接加符号链接：全局只存一份文件、项目通过硬链接引用省盘；只把显式声明的依赖放顶层（符号链接）、子依赖藏在 .pnpm 内部，require 没声明的包直接报 MODULE_NOT_FOUND，从结构上杜绝幽灵依赖。"
+        },
+        {
+          "question": "CJS 引用 ESM 报 ERR_REQUIRE_ESM 怎么办？",
+          "answer": "三个修复方案：①把自身从 CJS 改成 ESM（package.json 加 type:module 或文件改 .mjs）。②用动态 import() 代替 require——import() 返回 Promise，需要 async/await 或 .then()。③让 ESM 包的作者发布双格式版本（同时提供 .cjs 和 .mjs），通过 exports 字段的 require/import 条件分别指向不同文件。方案③最稳妥，方案②是项目侧不改模块格式时的通用解法。"
+        },
+        {
+          "question": "package.json 的 exports 字段和 main 字段有什么关系？exports 字段有什么坑？",
+          "answer": "exports 是 Node 12.11+ 引入的包入口路由，优先级高于 main/module/types 等传统字段。两者共存时 exports 生效，exports 不存在时 fallback 到 main。exports 的坑：①子路径封装——如果 exports 没列 `\"./internal\"`，用户 import 'pkg/internal' 会报 ERR_PACKAGE_PATH_NOT_EXPORTED，这是有意为之的封装但升级时可能 breaking change。②条件顺序很重要——types 必须放在 import/require 前面，否则 TypeScript 找不到类型声明。③\".\" 对应主入口，其他子路径要显式声明，漏了消费者就访问不了。"
+        },
+        {
+          "question": "monorepo 用 turborepo/nx 做任务编排的核心价值是什么？",
+          "answer": "两个核心价值：①拓扑排序并行构建——turborepo 的 dependsOn: [\"^build\"] 表示先构建依赖包再构建自身，无依赖关系的包并行执行，比串行快得多。②远程缓存——turborepo 根据文件内容哈希判断任务是否可跳过，CI 间共享构建产物，同一个 commit 在不同 CI runner 上不重复构建。还有增量执行（--filter --changed）只跑变更的包及其下游。"
         }
       ]
     },
@@ -78,65 +142,93 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "CommonJS和ESM的区别",
-        "npm、yarn、pnpm的差异",
-        "pnpm如何解决幽灵依赖问题",
-        "monorepo的组织方式和工具选择",
-        "package.json的exports字段用法"
+        "能对比 CJS（运行时同步、值拷贝）和 ESM（编译时静态分析、活绑定）的加载机制和导出语义",
+        "能解释 ESM 静态 import/export 是 Tree Shaking 的前提，CJS 的动态 require 为什么不行",
+        "能说明 CJS 与 ESM 互操作的限制：ESM 中 import CJS 只能 default import，CJS 中 require ESM 报 ERR_REQUIRE_ESM 需用动态 import()",
+        "能描述 package.json exports 条件导出的匹配顺序（types → import → require → default）和子路径封装",
+        "能对比 npm/yarn 扁平化（幽灵依赖）和 pnpm（硬链接 + 符号链接严格隔离）的 node_modules 组织方式",
+        "能解释幽灵依赖的产生原因（子依赖被提升到顶层）和 pnpm 如何从结构层面杜绝",
+        "能说明 monorepo 用 workspace 管理多包、workspace:* 协议引用本地包、turborepo/nx 做拓扑并行构建和远程缓存",
+        "能指出 lockfile 必须提交、pnpm shamefully-hoist 的权衡、exports 漏子路径导致的 breaking change 等工程坑"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "frontend.nodejs.topic-node-modules.recall.1",
-      "prompt": "CommonJS和ESM有什么区别？为什么ESM支持Tree Shaking？",
+      "prompt": "CommonJS 和 ESM 的加载时机、导出语义和 this 指向分别是什么？为什么 ESM 支持 Tree Shaking 而 CJS 不支持？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 2
     },
     {
       "id": "frontend.nodejs.topic-node-modules.recall.2",
-      "prompt": "pnpm相比npm/yarn有什么优势？什么是幽灵依赖？",
+      "prompt": "pnpm 的 node_modules 结构和 npm 有什么不同？硬链接和符号链接分别起什么作用？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 2
     },
     {
-      "id": "frontend.nodejs.topic-node-modules.recall.scenario",
-      "prompt": "生产环境里 Node.js 模块系统与包管理 出现异常或效果不达预期时，你会如何定位原因、选择修复方案并验证结果？",
+      "id": "frontend.nodejs.topic-node-modules.recall.3",
+      "prompt": "什么是幽灵依赖？它是怎么产生的？pnpm 如何从结构层面杜绝？如果项目里有包依赖幽灵依赖怎么办？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 2
+    },
+    {
+      "id": "frontend.nodejs.topic-node-modules.recall.4",
+      "prompt": "package.json 的 exports 字段按什么顺序匹配条件导出？exports 和 main 的关系是什么？exports 漏掉子路径会导致什么问题？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 2
+    },
+    {
+      "id": "frontend.nodejs.topic-node-modules.recall.5",
+      "prompt": "一个 CJS 项目引用了一个只有 ESM 版本的包，报 ERR_REQUIRE_ESM。有哪些修复方案？各自的优缺点？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 2
+    },
+    {
+      "id": "frontend.nodejs.topic-node-modules.recall.6",
+      "prompt": "线上 CI 构建突然失败，排查发现是某个间接依赖升级导致幽灵依赖消失，或 ESM-only 包被 CJS 项目 require。你会如何定位根因、选择修复方案并验证结果？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能区分 CommonJS（运行时、动态）和 ESM（编译时、Tree Shaking）",
-      "能说明 ESM 静态分析是 Tree Shaking 前提",
-      "能区分 npm/yarn/pnpm 的 node_modules 组织",
-      "能说明 pnpm 硬链接省盘和严格依赖隔离"
+      "能区分 CJS（运行时同步加载、require/module.exports、值拷贝）和 ESM（编译时静态分析、import/export、活绑定）的加载机制和导出语义",
+      "能解释 ESM 静态声明是 Tree Shaking 的前提，CJS 的动态 require 为什么不能做 Tree Shaking",
+      "能对比 npm/yarn 扁平化和 pnpm 硬链接加符号链接的 node_modules 组织方式",
+      "能解释幽灵依赖的产生原因和 pnpm 如何从结构层面杜绝",
+      "能说明 package.json exports 条件导出的匹配顺序和子路径封装"
     ],
     "goodToHave": [
-      "能说明 CJS 与 ESM 互操作的坑",
-      "能解释幽灵依赖及 pnpm 如何杜绝",
-      "能说明 monorepo 用 workspace 加 turborepo"
+      "能说明 CJS 与 ESM 互操作的限制和 ERR_REQUIRE_ESM 的修复方案",
+      "能解释 pnpm shamefully-hoist=true 的权衡",
+      "能说明 monorepo workspace 协议和 turborepo 任务编排",
+      "能指出 lockfile 必须提交、exports 漏子路径导致 breaking change 等工程实践"
     ],
     "commonMistakes": [
-      "CJS 和 ESM 混用不看 exports 字段",
-      "依赖幽灵依赖（npm 扁平化的副作用）",
-      "不提交 lockfile 导致环境不可复现"
+      "以为 CJS 的 require 和 ESM 的 import 可以随意混用，不知道 ERR_REQUIRE_ESM 的限制",
+      "不了解幽灵依赖，以为 npm 扁平化 node_modules 没有副作用",
+      "以为 Tree Shaking 是打包器的通用能力，不知道它依赖 ESM 的静态声明",
+      "用 pnpm 时遇到隐式依赖报错就直接 shamefully-hoist=true，不理解严格隔离的价值",
+      "不提交 lockfile，导致团队和 CI 安装结果不一致"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
   "prerequisites": [
     "frontend.nodejs.topic-node-core"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察能否区分 CJS 与 ESM、解释 Tree Shaking 前提、对比 npm/pnpm，并说清幽灵依赖和 lockfile。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察能否对比 CJS 与 ESM 的加载机制和导出语义、解释 Tree Shaking 前提、对比 npm/pnpm 的 node_modules 组织、说清幽灵依赖和 pnpm 严格隔离、理解 exports 条件导出和 monorepo workspace 实践。",
+  "updatedAt": "2026-06-23"
 }

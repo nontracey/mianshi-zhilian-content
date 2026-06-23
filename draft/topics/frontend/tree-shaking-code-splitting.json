@@ -4,7 +4,7 @@
   "category": "engineering",
   "group": "engineering",
   "title": "Tree Shaking 与代码分割",
-  "summary": "Tree Shaking 通过 ES Module 的静态分析移除未使用代码，代码分割通过动态 import 和路由懒加载拆分包体积，两者是前端构建优化的核心手段。",
+  "summary": "Tree Shaking 通过 ESM 静态结构在编译期标记并删除未使用导出，代码分割通过动态 import()、SplitChunks 等策略将 bundle 拆成按需加载的 chunk；两者配合控制首屏体积，但需处理 sideEffects 声明、chunk 命名缓存、加载瀑布等工程细节。",
   "tags": [
     "Tree Shaking",
     "代码分割",
@@ -13,14 +13,19 @@
     "性能"
   ],
   "difficulty": 2,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 28,
   "order": 30,
   "recommendWeight": 85,
   "learningCards": [
     {
       "type": "explain",
-      "title": "Tree Shaking 与代码分割：Tree Shaking 原理",
-      "content": "Tree Shaking 依赖 ES Module 的静态结构（import/export 在编译时确定）。打包工具分析模块依赖图，标记未被引用的 export，然后在压缩阶段删除。CommonJS 的 require 是动态的，无法做 Tree Shaking。Webpack 5 在 production 模式下自动开启，需配合 sideEffects 配置。"
+      "title": "Tree Shaking 的静态分析原理与副作用陷阱",
+      "content": "## 为什么只有 ESM 能摇树\n\nTree Shaking 的核心依赖是**编译期静态分析**——打包器在不执行代码的前提下，就能确定每个模块导出了什么、谁在用谁。ES Module 的 `import` 和 `export` 是语法级声明，位置和绑定在解析阶段就固定了，打包器可以构建完整的依赖图并标记每个 export 的引用情况。\n\nCommonJS 的 `require()` 是普通函数调用，路径可以是变量、条件分支里可以动态 require、甚至可以 `require(variable + '.js')`。打包器无法在不执行代码的情况下知道哪些模块被实际加载，哪些导出被实际使用——所以 CommonJS 本质上无法做精确的 Tree Shaking（一些工具如 Webpack 的 CommonJS parsing 能处理简单场景，但不可靠）。\n\n## 打包器实际怎么做\n\n以 Webpack 5 production 模式为例，流程分两步：\n\n1. **标记阶段**（ESLint-like 分析）：遍历模块图，给每个 export 打上 used/unused 标记。如果模块 A 的 `foo` 没有任何导入方引用，foo 被标为 unused。\n2. **删除阶段**（Terser 压缩器）：used=false 的代码在 minify 时被当作 dead code 删除。注意——是压缩器删的，不是打包器本身直接删的。\n\n## sideEffects：打包器不敢删的保命符\n\n有些模块虽然没有被显式 import 的 export，但**引入就会执行副作用**——典型的如全局 polyfill（`import 'core-js/stable'`）、全局 CSS（`import './reset.css'`）、或在模块顶层修改全局变量。如果打包器错误地删了这些模块，程序行为就变了。\n\n`package.json` 的 `sideEffects` 字段就是告诉打包器：「这个包里哪些文件有副作用，哪些没有」。设为 `false` 表示整个包没有副作用，打包器可以放心删未使用的模块；设为数组 `['*.css', './polyfill.js']` 表示只有这些文件有副作用。\n\n**常见坑**：\n- 没设 `sideEffects`，打包器默认保留所有模块，Tree Shaking 形同虚设\n- 第三方库没提供 ESM 产物（只有 CJS），即使你写了 ESM import，打包器拿到的还是 CJS，无法摇树\n- Babel 把 ESM 转成 CJS（`@babel/preset-env` 的 `modules: 'commonjs'`），直接废掉 Tree Shaking——所以 Babel 配置里必须 `modules: false`，让打包器自己处理模块格式\n- Vite 在开发模式用原生 ESM，Tree Shaking 由 esbuild 在生产构建时处理，原理相同但更快（Go 实现）"
+    },
+    {
+      "type": "explain",
+      "title": "代码分割：何时拆、怎么拆、拆完怎么加载",
+      "content": "## 代码分割解决什么问题\n\n一个 SPA 把所有页面、所有依赖打进一个 bundle.js，首次加载就要下载整个文件——用户只看了首页，但 About 页、管理后台、图表库全下载了。代码分割把 bundle 拆成多个 chunk，按需加载，减少首屏传输量。\n\n## 三种核心分割策略\n\n**1. 入口分割（Entry Points）**：多 entry 配置，每个入口生成一个 chunk。适用于多页应用（MPA），每个页面只加载自己的 chunk。缺点是公共依赖会在每个入口 chunk 中重复出现。\n\n**2. 公共依赖提取（SplitChunksPlugin）**：Webpack 4+ 默认的 `optimization.splitChunks`，把多个 chunk 共用的模块提取到独立 chunk。核心参数：\n- `minSize`：模块体积超过这个值才提取（默认 20000 字节），太小的模块提取反而多一个请求\n- `minChunks`：被多少个 chunk 引用才提取（默认 1），设大一点可以只提取真正的公共依赖\n- `chunks: 'async'`（默认）只分割异步 chunk，`'all'` 对同步和异步都分割\n- `cacheGroups`：自定义分组规则，比如把 `node_modules` 里的库统一提到 `vendors` chunk\n\n**3. 动态 import()**：代码中写 `import('./Module')`，打包器自动把该模块及其依赖拆成独立 chunk，运行时按需加载。这是路由懒加载的基础。\n\n## chunk 命名与缓存\n\nWebpack 的 `output.filename` 和 `output.chunkFilename` 支持 `[contenthash]`：内容不变则 hash 不变，浏览器命中缓存不用重新下载。这是代码分割的缓存收益——公共依赖提取后单独一个 chunk，业务代码改了但 lodash 没变，lodash 的 chunk hash 不变，浏览器直接用缓存。\n\n## chunk 加载优化\n\nchunk 太多会带来请求瀑布：用户点一个路由 → 发现需要新 chunk → 开始下载 → 下载完才渲染。优化手段：\n- **webpackPrefetch**：`import(/* webpackPrefetch: true */ './Chart')`，在浏览器空闲时预加载，用户真正点到时已缓存\n- **webpackPreload**：与当前 chunk 并行加载，优先级更高但会和父 chunk 竞争带宽\n- **Suspense + fallback**：React 18 的 Suspense 在 chunk 加载期间显示 loading，避免白屏\n- 控制分割粒度：路由级分割是收益最大的一刀，不要对小组件也做动态 import（请求开销 > 代码体积节省）"
     },
     {
       "type": "diagram",
@@ -42,33 +47,57 @@
     },
     {
       "type": "compareTable",
-      "title": "代码分割方式",
-      "content": "| 方式 | 触发方式 | 适用场景 |\n| --- | --- | --- |\n| 动态 import() | 代码中写 import() | 路由懒加载 |\n| SplitChunksPlugin | 配置 chunks 选项 | 公共依赖提取 |\n| 入口分割 | 多 entry 配置 | 多页应用 |\n| React.lazy | 配合 Suspense | 组件级懒加载 |"
+      "title": "代码分割方式对比",
+      "content": "| 方式 | 触发方式 | 适用场景 | 优势 | 注意事项 |\n| --- | --- | --- | --- | --- |\n| 动态 import() | 代码中 `import('./X')` | 路由/组件级懒加载 | 粒度最细，按需触发 | chunk 多会增加请求；需 Suspense 或 loading 兜底 |\n| SplitChunksPlugin | `optimization.splitChunks` 配置 | 公共依赖提取 | 自动去重，减少重复打包 | minSize/minChunks 调优不当会提取过细或漏提 |\n| 入口分割 | 多 entry 配置 | 多页应用（MPA） | 每页独立 chunk，互不干扰 | 公共依赖会在入口 chunk 中重复，需配合 SplitChunks |\n| React.lazy + Suspense | `React.lazy(() => import('./X'))` | React 组件级懒加载 | API 简洁，与 Suspense 天然配合 | 只支持 default export；SSR 需配合 `@loadable/component` |"
     },
     {
       "type": "code",
-      "title": "路由懒加载",
-      "content": "// React 路由懒加载\nconst Home = React.lazy(() => import('./pages/Home'));\nconst About = React.lazy(() => import('./pages/About'));\n\nfunction App() {\n  return (\n    <Suspense fallback={<Loading />}>\n      <Routes>\n        <Route path='/' element={<Home />} />\n        <Route path='/about' element={<About />} />\n      </Routes>\n    </Suspense>\n  );\n}",
+      "title": "路由懒加载与 SplitChunks 配置",
+      "content": "// 1. React 路由懒加载（Vite / Webpack 均适用）\nimport { lazy, Suspense } from 'react';\nimport { Routes, Route } from 'react-router-dom';\n\n// 每个路由对应一个独立 chunk，contenthash 命名\nconst Home = lazy(() => import(/* webpackChunkName: \"home\" */ './pages/Home'));\nconst About = lazy(() => import(/* webpackChunkName: \"about\" */ './pages/About'));\nconst Dashboard = lazy(() => import(/* webpackPrefetch: true */ './pages/Dashboard'));\n\nfunction App() {\n  return (\n    <Suspense fallback={<div>Loading...</div>}>\n      <Routes>\n        <Route path=\"/\" element={<Home />} />\n        <Route path=\"/about\" element={<About />} />\n        <Route path=\"/dashboard\" element={<Dashboard />} />\n      </Routes>\n    </Suspense>\n  );\n}\n\n// 2. Webpack SplitChunksPlugin 配置\n// webpack.config.js\nmodule.exports = {\n  optimization: {\n    splitChunks: {\n      chunks: 'all',           // 同步和异步 chunk 都分割\n      minSize: 20000,          // 模块 > 20KB 才提取\n      minChunks: 1,            // 被 1 个以上 chunk 引用就提取\n      cacheGroups: {\n        vendors: {\n          test: /[\\/]node_modules[\\/]/,\n          name: 'vendors',\n          priority: -10,       // 优先级，数字大优先\n          chunks: 'all',\n        },\n        common: {\n          minChunks: 2,        // 至少 2 个 chunk 共用才提取\n          name: 'common',\n          priority: -20,\n          reuseExistingChunk: true, // 已有 chunk 包含该模块则复用\n        },\n      },\n    },\n  },\n  output: {\n    filename: '[name].[contenthash:8].js',\n    chunkFilename: '[name].[contenthash:8].js', // 异步 chunk 命名\n  },\n};",
       "language": "javascript",
       "highlights": [
         {
-          "line": 6,
-          "note": "「return (」 是「Tree Shaking 与代码分割」示例的输出边界；说明时要交代这个值来自哪一步处理，以及失败或空结果时应该如何降级。"
+          "line": 7,
+          "note": "webpackPrefetch: true 让浏览器空闲时预加载 Dashboard chunk，用户点击时已缓存。"
+        },
+        {
+          "line": 15,
+          "note": "Suspense fallback 是 chunk 加载期间的兜底 UI，避免白屏。"
+        },
+        {
+          "line": 25,
+          "note": "chunks: 'all' 对同步和异步 chunk 都做分割，通常收益最大。"
+        },
+        {
+          "line": 33,
+          "note": "reuseExistingChunk: true 避免重复提取已在其他 chunk 中存在的模块。"
+        },
+        {
+          "line": 40,
+          "note": "contenthash 确保内容不变则 hash 不变，浏览器命中缓存。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论先行：Tree Shaking 解决「打进来但没用到」的代码，代码分割解决「用得到但不必现在加载」的代码，两者配合控制包体积。Tree Shaking 的前提是 ES Module——import/export 是静态结构，编译期即可确定依赖图，打包器据此标记未被引用的 export，由压缩器在压缩阶段删除；CommonJS 的 require 是运行时动态行为，无法静态分析。所以第三方库需要提供 ESM 产物。还要配合 package.json 的 sideEffects 声明，否则打包器不敢删可能有副作用的模块（如引入即生效的 polyfill、全局 CSS）。代码分割方面，路由级动态 import() 懒加载是收益最大的一刀，公共依赖用 SplitChunks 提取避免重复打包。副作用是 chunk 增多带来请求瀑布和加载闪烁，所以要配 prefetch/preload 和 Suspense 的 loading 兜底。",
+      "content": "**30 秒结论**\nTree Shaking 解决「打进来但没用到」的代码，代码分割解决「用得到但不必现在加载」的代码，两者配合控制首屏 bundle 体积。\n\n**Tree Shaking 机制主线**\n- 前提：ES Module 的 import/export 是静态声明，打包器能在编译期构建依赖图、标记未使用的 export\n- 流程：打包器标记 used/unused → 压缩器（Terser/esbuild）在 minify 时删除 dead code\n- 关键配置：`package.json` 的 `sideEffects` 声明有副作用的文件（polyfill、全局 CSS），否则打包器不敢删\n- 常见陷阱：Babel 的 `modules: 'commonjs'` 会把 ESM 转 CJS 直接废掉摇树，必须设 `modules: false`；第三方库没提供 ESM 产物也无法被摇树\n\n**代码分割机制主线**\n- 动态 `import()` 生成独立 async chunk，是路由/组件懒加载的基础\n- SplitChunksPlugin 提取公共依赖避免重复打包，核心调参 `minSize`（提取阈值）和 `minChunks`（引用次数）\n- `[contenthash]` 命名确保内容不变则缓存命中，公共依赖单独 chunk 后业务更新不影响其缓存\n- chunk 加载优化：`webpackPrefetch` 空闲预加载、`webpackPreload` 并行加载、Suspense loading 兜底\n\n**边界与取舍**\n- 过度分割：chunk 太多增加 HTTP 请求和加载瀑布，首屏路径拆分不当反而更慢\n- Tree Shaking 不是万能的：有副作用的代码（修改原型、全局注册）必须保留；动态 import 内部的分支无法被摇树\n- Vite 生产构建用 esbuild + Rollup，Tree Shaking 原理相同但更快（esbuild 是 Go 实现）",
       "followUpQuestions": [
         {
-          "question": "Tree Shaking 为什么要求 ES Module 更友好？",
-          "answer": "ES Module 的 import/export 是静态结构，打包器能在编译期分析未使用导出；CommonJS 是运行时 require，静态分析难度更高。"
+          "question": "为什么 CommonJS 不能 Tree Shaking？esbuild 和 Rollup 对 CJS 做了什么处理？",
+          "answer": "CommonJS 的 require() 是运行时函数调用，路径可以是变量、可以条件分支、可以动态拼接，打包器无法在不执行代码的前提下确定依赖关系和导出使用情况。esbuild 有 CommonJS 的静态分析启发式（能处理简单场景如 `const x = require('foo')`），但对动态用法无能为力；Rollup 配合 `@rollup/plugin-commonjs` 会把 CJS 包装成 ESM wrapper，但本质是运行时适配，不是真正的静态分析，Tree Shaking 效果有限。"
         },
         {
-          "question": "代码分割会带来什么副作用？",
-          "answer": "分割过细会增加请求数量和加载瀑布，首屏路径如果拆分不当反而更慢。需要结合路由、首屏资源、预加载和缓存策略综合设计。"
+          "question": "SplitChunksPlugin 的 minSize 和 minChunks 怎么调优？调错了会怎样？",
+          "answer": "minSize 太小（如 1000 字节）会导致提取大量微小 chunk，HTTP 请求开销 > 代码体积节省；太大（如 100000）会导致公共依赖没被提取，在多个 chunk 中重复。minChunks=1 意味着只被一个 chunk 引用的模块也会被提取，通常应该设为 2 以上。实际调优要看 bundle analyzer 的分析结果：如果 vendors chunk 过大（>200KB），可以拆分 cacheGroups 按库分组；如果 common chunk 出现频率低的模块，提高 minChunks。"
+        },
+        {
+          "question": "动态 import() 生成的 chunk 文件名和缓存策略是什么？",
+          "answer": "Webpack 的 `output.chunkFilename` 控制异步 chunk 的命名，支持 `[name]`、`[id]`、`[contenthash]` 等占位符。生产环境用 `[name].[contenthash:8].js`：内容不变则 hash 不变，浏览器直接命中缓存。webpackChunkName 注释可以指定 chunk 名（如 `import(/* webpackChunkName: \"home\" */ './Home')`），否则按数字 id 命名。Vite 使用 Rollup 的 `output.chunkFileNames`，默认也是 contenthash。"
+        },
+        {
+          "question": "SSR 场景下 React.lazy + Suspense 做代码分割有什么问题？",
+          "answer": "React.lazy 依赖浏览器的动态 import 和 Suspense，Node.js 环境下无法直接使用。SSR 需要同步知道所有组件路径来预渲染，解决方案是 `@loadable/component`（支持 SSR + code splitting）或 Next.js 的内置 dynamic import（内部做了 SSR 适配）。React.lazy 在 SSR 中会直接报错，所以混合渲染应用不能只依赖 React.lazy。"
         }
       ]
     },
@@ -76,31 +105,49 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "Tree Shaking 的静态分析原理",
-        "CommonJS 和 ES Module 的区别",
-        "代码分割的多种方式和适用场景",
-        "路由懒加载的实现"
+        "能解释 Tree Shaking 依赖 ESM 静态结构（import/export 编译期确定），CJS 的 require 是运行时动态行为无法精确摇树",
+        "能说明 Tree Shaking 两步流程：打包器标记 used/unused exports → 压缩器删除 dead code",
+        "能解释 sideEffects 字段的作用——告诉打包器哪些文件有副作用不能删，不声明则默认保留所有模块",
+        "能指出 Babel `modules: 'commonjs'` 会废掉 Tree Shaking，必须配 `modules: false`",
+        "能区分三种代码分割方式：动态 import()（路由/组件级）、SplitChunksPlugin（公共依赖提取）、入口分割（MPA）",
+        "能解释 contenthash 命名的缓存收益——内容不变则 hash 不变，浏览器命中缓存",
+        "能说明 chunk 加载优化：webpackPrefetch 空闲预加载、webpackPreload 并行加载、Suspense loading 兜底",
+        "能指出过度分割的副作用：chunk 太多增加请求数和加载瀑布，分割粒度要和业务路由对齐"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "frontend.engineering.tree-shaking-code-splitting.recall.1",
-      "prompt": "为什么 CommonJS 不能做 Tree Shaking？ES Module 的静态特性体现在哪里？",
+      "prompt": "为什么 CommonJS 不能做 Tree Shaking？ES Module 的静态特性具体体现在哪些方面？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 2
     },
     {
       "id": "frontend.engineering.tree-shaking-code-splitting.recall.2",
-      "prompt": "Webpack 的 SplitChunksPlugin 如何配置才能有效提取公共依赖？minSize 和 minChunks 如何调优？",
+      "prompt": "package.json 的 sideEffects 字段不设会怎样？设为 false 和设为数组有什么区别？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 2
     },
     {
       "id": "frontend.engineering.tree-shaking-code-splitting.recall.3",
-      "prompt": "动态 import() 的 chunk 是如何命名和加载的？如何预加载关键 chunk？",
+      "prompt": "SplitChunksPlugin 的 minSize 和 minChunks 如何调优？配置不当会导致什么问题？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 2
+    },
+    {
+      "id": "frontend.engineering.tree-shaking-code-splitting.recall.4",
+      "prompt": "动态 import() 生成的 chunk 如何命名和缓存？webpackPrefetch 和 webpackPreload 有什么区别？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 2
+    },
+    {
+      "id": "frontend.engineering.tree-shaking-code-splitting.recall.5",
+      "prompt": "代码分割过度会导致什么问题？如何确定合理的分割粒度？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 2
@@ -108,30 +155,33 @@
   ],
   "rubric": {
     "mustHave": [
-      "Tree Shaking 的静态分析原理",
-      "CommonJS 和 ES Module 的区别",
-      "代码分割的多种方式和适用场景",
-      "路由懒加载的实现"
+      "能解释 Tree Shaking 依赖 ESM 静态结构，CJS 的 require 是运行时动态行为无法精确摇树",
+      "能说明 sideEffects 字段的作用和不设的后果",
+      "能区分动态 import()、SplitChunksPlugin、入口分割三种代码分割方式的适用场景",
+      "能解释 contenthash 命名的缓存收益"
     ],
     "goodToHave": [
-      "能解释 Tree Shaking 的静态分析原理",
-      "能区分 CommonJS 和 ES Module",
-      "能描述代码分割的多种方式"
+      "能说明 Babel `modules: 'commonjs'` 会废掉 Tree Shaking，需配 `modules: false`",
+      "能解释 SplitChunksPlugin 的 minSize/minChunks 调优和 cacheGroups 自定义分组",
+      "能说明 webpackPrefetch vs webpackPreload 的区别和 Suspense 兜底",
+      "能指出 Vite 生产构建用 esbuild + Rollup 的 Tree Shaking 原理"
     ],
     "commonMistakes": [
-      "以为 CommonJS 也能 Tree Shaking",
-      "SplitChunksPlugin 配置不当导致重复打包",
-      "过度分割导致 HTTP 请求过多"
+      "以为 CommonJS 也能做 Tree Shaking，不知道 require 是运行时动态行为",
+      "不设 sideEffects，导致打包器不敢删有副作用的模块，Tree Shaking 形同虚设",
+      "Babel 配置没设 `modules: false`，ESM 被转成 CJS 废掉摇树",
+      "SplitChunksPlugin minSize 设太小导致过度分割，chunk 太多增加 HTTP 请求",
+      "以为 React.lazy + Suspense 能直接用于 SSR，不知道需要 @loadable/component 或 Next.js 适配"
     ],
     "scoreWeights": {
-      "coverage": 40,
-      "accuracy": 25,
+      "coverage": 25,
+      "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "interviewFrequency": "medium",
   "status": "draft",
-  "interviewerFocus": "考察是否能围绕「Tree Shaking 与代码分割」说清Tree Shaking 的静态分析原理、CommonJS 和 ES Module 的区别，并放到前端工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察是否能围绕 Tree Shaking 与代码分割说清 ESM 静态分析原理、sideEffects 副作用声明、Babel modules 配置陷阱，以及动态 import()、SplitChunksPlugin、contenthash 缓存、chunk 加载优化（prefetch/preload/Suspense）等代码分割核心机制和工程取舍。"
 }

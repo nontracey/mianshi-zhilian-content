@@ -4,31 +4,46 @@
   "category": "middleware",
   "group": "middleware",
   "title": "Kafka 原理",
-  "summary": "讲清 Kafka 4.x 的 KRaft 控制面、Topic/Partition 日志、副本与 ISR、acks/min.insync.replicas、Consumer Group、offset 提交和高吞吐来源。",
+  "summary": "讲清 Kafka 4.x 的 KRaft 控制面、Topic/Partition 日志结构与日志段生命周期、副本与 ISR 一致性模型、acks/min.insync.replicas 可靠性组合、Producer 幂等与事务边界、Consumer Group 分配与 offset 提交语义、Rebalance 调优，以及高吞吐的完整来源链。",
   "tags": [
     "Java",
     "中间件",
     "Kafka"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 36,
+  "estimatedMinutes": 47,
   "order": 80,
   "recommendWeight": 100,
   "learningCards": [
     {
       "type": "explain",
-      "title": "先按 4.x 口径校准：KRaft 是默认控制面",
-      "content": "Apache Kafka 下载页显示 4.3.0 于 2026-05-22 发布。4.x 的关键口径是：Kafka 不再把 ZooKeeper 作为运行模式，元数据管理由 KRaft controller quorum 承担。面试里如果还把 ZooKeeper 画在核心架构里，要说明那是老集群或迁移阶段，不是 4.x 主线。\n\nKafka 架构可以拆成控制面和数据面。控制面管理 broker 注册、topic/partition 元数据、partition leader 选举和集群配置；数据面负责 Producer 写入、Broker 存储日志、副本复制、Consumer 拉取和 offset 提交。这样拆开后，KRaft、Partition、ISR、Consumer Group 就不会混成一团。\n\nTopic 是逻辑主题，Partition 是物理追加日志。每条 record 只进入一个 Partition，Partition 内按 offset 有序；不同 Partition 之间没有全局顺序。并行度、顺序性和扩容成本都落在 Partition 上：Partition 太少吞吐和消费者并行度不够，Partition 太多会增加 leader、文件句柄、元数据和 rebalance 成本。"
+      "title": "4.x 架构校准：KRaft 控制面与数据面分离",
+      "content": "Kafka 4.x 的关键口径：ZooKeeper 不再是默认运行模式，元数据管理由 KRaft controller quorum 承担。KRaft 本身基于 Raft 共识协议，由若干 controller 节点组成 quorum，负责 broker 注册、topic/partition 元数据管理、partition leader 选举和集群配置变更。controller 不承担数据读写，数据面完全由 broker 上的 partition replica 负责。\n\n把控制面和数据面拆开理解有助于记忆：控制面回答「这个 partition 的 leader 在哪、ISR 是谁、broker 哪些活着」；数据面回答「record 怎么写入日志、follower 怎么复制、consumer 怎么拉取和提交 offset」。面试时画架构图应以这两个平面为主线，不要把 KRaft 和 Partition 日志混在一起讲。\n\n一个 Topic 是逻辑命名空间，对应若干 Partition。每条 record 进入且仅进入一个 Partition，Partition 内按 offset 单调递增有序，不同 Partition 之间没有全局顺序。Partition 数决定了消费并行度上限和横向扩展能力，但也影响 leader 选举开销、文件句柄数、元数据量和 rebalance 耗时。Partition 数通常在创建 Topic 时确定，扩容需要 repartition 或新建 Topic 并迁移生产者，不能像某些存储系统那样透明扩分片。"
     },
     {
       "type": "explain",
-      "title": "写入链路：分区、批量、日志段和 ISR",
-      "content": "Producer 发送 record 时，先由 partitioner 决定目标 Partition。有 key 时通常按 key 的哈希稳定路由，同一业务 key 会落到同一 Partition；无 key 时使用 sticky 分区策略，把一个 batch 尽量攒在同一 Partition，提高批量效果。自定义分区器只适合有明确业务规则的场景，否则容易造成热点。\n\nLeader 负责该 Partition 的读写，Follower 从 Leader 拉取复制。ISR 是当前跟得上 Leader 的副本集合。`acks=all` 表示写入要等待 ISR 副本确认；`min.insync.replicas` 是 acks=all 写入能成功的最低同步副本数。常见生产组合是 replication.factor=3、acks=all、min.insync.replicas=2，它能在一个副本不可用时继续写入，但 ISR 低于 2 时应拒绝写入并让 Producer 感知异常。\n\nKafka 高吞吐来自几个组合拳：Partition 并行、顺序追加写日志段、批量发送、压缩、页缓存复用和 sendfile 零拷贝读取。不要把“顺序写磁盘”说成唯一原因；Kafka 依赖操作系统页缓存，读热点命中时并不等于每次都从磁盘读。"
+      "title": "Partition 日志结构：段、索引、清理与保留",
+      "content": "每个 Partition 在磁盘上是一个日志目录，核心由若干日志段（log segment）组成。正在写入的叫 active segment，写满后滚动为 inactive segment。每个 segment 有对应的 `.log`（数据文件）、`.index`（偏移量到文件位置的稀疏索引）和 `.timeindex`（时间戳索引）文件。查找某个 offset 时，先在 `.index` 中二分找到最近的物理位置，再在 `.log` 中顺序扫描，时间复杂度近似 O(1)。\n\n日志段过期和清理由 broker 的 `log.cleanup.policy` 控制：`delete` 策略按 `log.retention.ms` 或 `log.retention.bytes` 删除过期段；`compact` 策略保留每个 key 的最新值，适合需要最新状态快照的 changelog 场景。也可以 `delete,compact` 同时启用。Kafka 4.x 默认 `log.cleanup.policy=delete`，保留时间默认 7 天。\n\n这条链路是理解 Kafka 高吞吐和回放能力的基础：写入是 append-only 不做随机修改，所以顺序写；过期是整段删除而非逐条删除，所以清理成本低；compaction 是后台线程对 segment 做合并，不影响 active segment 的写入延迟。"
     },
     {
       "type": "explain",
-      "title": "消费链路：Consumer Group、offset 和 Rebalance",
-      "content": "Consumer Group 是 Kafka 的消费扩展模型。同一个 group 内，一个 Partition 同一时刻只分配给一个 Consumer；一个 Consumer 可以持有多个 Partition。消费者数量超过 Partition 数时，多出的消费者没有分区可消费。因此，提升 group 并行度的上限通常是 Partition 数，而不是消费者实例数。\n\nOffset 是消费者在 Partition 日志里的位置。先处理业务再提交 offset，是 at-least-once，崩溃后可能重复处理，需要幂等；先提交 offset 再处理业务，是 at-most-once，崩溃会跳过未处理消息。Kafka 事务可以把 consume-transform-produce 中的输出 record 和消费位移原子提交，但只覆盖 Kafka 内部读写链路，外部数据库、HTTP 调用和邮件短信这类副作用仍要业务幂等。\n\nRebalance 由成员加入/离开、订阅变化、Partition 数变化、心跳或 poll 超时等触发。经典 eager rebalance 会较多暂停，cooperative sticky assignor 能减少一次性撤销的 Partition；static membership 可降低滚动发布时的抖动。真正的调优不是背参数，而是控制单条处理耗时、合理设置 `max.poll.interval.ms`、观察 rebalance 次数、lag、commit latency 和重复消费。"
+      "title": "写入链路：分区路由、acks、ISR 与可靠性",
+      "content": "Producer 发送 record 时，先由 partitioner 决定目标 Partition。有 key 时按 key hash 取模路由，同一业务 key 稳定落在同一 Partition，这是 Partition 内有序的前提。无 key 时默认 sticky partitioner，把一个 batch 内的 record 攒在同一 Partition 以提高批量效果，跨 batch 切换 Partition 以均衡负载。自定义 partitioner 需要谨慎，热点 key 可能导致 Partition 数据倾斜。\n\nLeader 负责该 Partition 的读写，Follower 从 Leader 拉取（fetch）并复制到本地日志。跟得上 Leader 的 Follower 留在 ISR 中，跟不上的被踢到 OSR（out-of-sync replicas），追上后可重新进入 ISR。判断「跟得上」的阈值由 `replica.lag.time.max.ms` 控制（默认 30 秒）。\n\n可靠性组合拳：`replication.factor` 决定副本总数；`acks=all`（即 acks=-1）表示 Leader 要等 ISR 全部确认后才返回；`min.insync.replicas` 是 acks=all 下允许写入的最低 ISR 数。常见生产配置 replication.factor=3、acks=all、min.insync.replicas=2。含义是：正常时 3 副本全确认；一个副本不可用时 ISR=2 仍满足 minISR，写入继续；ISR 降到 1 时低于 minISR，broker 拒绝写入，Producer 收到 NotEnoughReplicasException 并重试或告警。这个设计的取舍是：ISR 不足时宁可拒绝写入也不丢数据，牺牲可用性保护一致性。\n\nacks=0 表示 Producer 不等任何确认，吞吐最高但丢消息风险最大；acks=1 表示 Leader 写入本地日志即返回，Leader 崩溃时可能丢未复制的数据。只说 acks=all 不配 min.insync.replicas 是常见误区：如果 minISR=1，acks=all 退化为 acks=1 的语义（ISR 只剩 Leader 一个就返回成功）"
+    },
+    {
+      "type": "explain",
+      "title": "Producer 幂等、事务与 exactly-once 边界",
+      "content": "Producer 开启幂等（`enable.idempotence=true`，Kafka 3.0+ 默认开启）后，broker 通过 Producer ID（PID）和序列号（sequence number）去重，保证单 partition 内不因重试产生重复 record。幂等 Producer 只保证单 session、单 partition 内的幂等，跨 partition 或跨 session 需要事务。\n\nKafka 事务（`transactional.id`）支持原子地向多个 partition 写入 record 并提交消费 offset，实现 consume-transform-produce 链路的 exactly-once semantics（EOS）。开启事务的 Producer 需要配置 `transactional.id`，重启后用相同 ID 恢复状态。事务对 read_committed 隔离级别的 Consumer 可见。\n\n但 EOS 的边界很重要：它只覆盖 Kafka-to-Kafka 的内部链路。如果 consume-transform-produce 过程中有外部副作用（写数据库、调 HTTP 接口、发邮件），Kafka 事务无法覆盖这些操作，崩溃时可能内部偏移已提交但外部操作未执行，或反之。业务仍需幂等设计或 saga 补偿。"
+    },
+    {
+      "type": "explain",
+      "title": "消费链路：Consumer Group、Rebalance 与 offset 语义",
+      "content": "Consumer Group 是 Kafka 的消费扩展模型。同一个 group 内，每个 Partition 同一时刻只分配给一个 Consumer；一个 Consumer 可以持有多个 Partition。消费者数超过 Partition 数时，多出的消费者空闲。因此并行度上限是 Partition 数，而不是消费者实例数。\n\noffset 提交时机决定语义：先处理业务再提交 offset 是 at-least-once，崩溃后可能从旧 offset 重新消费，需要业务幂等；先提交 offset 再处理业务是 at-most-once，崩溃会跳过未处理消息。自动提交（`enable.auto.commit=true`）是按间隔定时提交 poll 时的最新位移，处理中途崩溃可能重复或跳过。生产上推荐手动同步或异步提交，并在处理完成后 commit。\n\nRebalance 触发条件：成员加入/离开（消费者启动、崩溃、被踢出）、订阅 Topic 变化、Partition 数变化、session.timeout.ms 心跳超时、max.poll.interval.ms poll 间隔超时。经典 eager rebalance 会先撤销所有分区再重新分配，期间消费完全暂停；cooperative sticky assignor 只撤销需要转移的分区，减少暂停范围。static membership 通过 `group.instance.id` 让消费者重启后快速恢复原分区，避免不必要的 rebalance。\n\n调优要点不是背参数：控制单条处理耗时（别在 poll 里做重逻辑），设置合理的 `max.poll.records`（一次 poll 返回的条数）和 `max.poll.interval.ms`，观察 rebalance 次数、consumer lag、commit latency 和重复消费率。"
+    },
+    {
+      "type": "explain",
+      "title": "高吞吐的完整来源链，不只顺序写",
+      "content": "Kafka 高吞吐是多层机制的组合：\n\n**并行层**：Partition 数决定 Broker 侧和 Consumer 侧的并行度。多 Partition 在多核和多磁盘上可以并行写入和复制。\n\n**Producer 侧**：batching（`batch.size`、`linger.ms`）攒够一批再发一次请求，减少网络往返；compression（`compression.type=lz4/zstd/snappy/gzip`）减少网络和磁盘 IO，Kafka 支持端到端压缩，broker 直接存储压缩后的字节不做解压重压缩。\n\n**Broker 侧**：顺序追加写日志段，操作系统对顺序写做预读和合并，磁盘吞吐接近内存；不需要随机写 WAL，append-only 本身就是成本最低的持久化模式。`log.segment.bytes` 控制段大小，段越大滚动频率越低，但段过大会影响清理粒度。\n\n**Consumer 侧**：零拷贝（`sendfile` 系统调用），数据从页缓存或磁盘直接送到 socket 缓冲区，不经过用户态内存拷贝。这是 Kafka 读取吞吐高于传统 MQ 的重要原因。\n\n**操作系统层**：页缓存复用。写入先进入 OS 页缓存，由 OS 异步刷盘（`log.flush.interval.messages` 和 `log.flush.interval.ms` 通常不设，让 OS 管理）。Consumer 读取的数据通常还在页缓存中（特别是尾部消费），命中页缓存时不需要磁盘 IO。所以 Kafka 的读写吞吐高度依赖可用内存和 IO 调度器。\n\n所以面试时别说「因为顺序写磁盘」一句话就完了。顺序写是必要条件但不是充分条件，batching + compression + 页缓存 + 零拷贝 + Partition 并行共同构成高吞吐。"
     },
     {
       "type": "diagram",
@@ -50,54 +65,53 @@
     },
     {
       "type": "compareTable",
-      "title": "Kafka 与 RabbitMQ 的边界",
-      "content": "| 维度 | Kafka | RabbitMQ |\n| --- | --- | --- |\n| 核心模型 | Partitioned append log，consumer 拉取并提交 offset | Exchange 路由到 Queue，consumer ack 后删除 delivery |\n| 顺序性 | 同一 Partition 内有序 | 同一 Queue 内通常按投递顺序处理，受并发和 nack 影响 |\n| 回放能力 | 按 offset、时间或保留策略回放 | 普通队列消费后删除，不适合历史回放 |\n| 高吞吐来源 | 分区并行、批量、压缩、页缓存、零拷贝 | 路由灵活、确认和队列模型成熟 |\n| 可靠性抓手 | replication、ISR、acks、minISR、幂等 Producer、事务、offset | publisher confirm、durable/quorum queue、manual ack、DLX |\n| 适合场景 | 事件流、日志、数据管道、流处理、回放分析 | 业务任务、复杂路由、RPC 异步化、死信补偿 |\n| 主要风险 | 分区热点、rebalance 抖动、offset 提交错误、ISR 不足 | 自动 ack、不可路由、无限 requeue、DLQ 无治理 |"
+      "title": "Kafka 与 RabbitMQ 边界对比",
+      "content": "| 维度 | Kafka | RabbitMQ |\n| --- | --- | --- |\n| 核心模型 | Partitioned append log，consumer pull + offset | Exchange 路由到 Queue，consumer push/pull + ack 删除 delivery |\n| 顺序性 | 同一 Partition 内严格有序 | 同一 Queue 内按投递序处理，受并发 consumer 和 nack 影响 |\n| 回放与保留 | 按 offset/时间保留，可回放历史 | 普通队列消费 ack 后删除，不适合回放（Streams 插件例外）|\n| 吞吐来源 | Partition 并行、batching、compression、页缓存、零拷贝 | Erlang actor 模型、单队列多消费者、prefetch 控制 |\n| 可靠性机制 | replication/ISR、acks、minISR、幂等 Producer、事务 | publisher confirm、durable/quorum queue、manual ack、DLX |\n| 消费模型 | pull（Consumer 主动拉），offset 由 Consumer 控制 | push/pull，broker 侧 delivery tag 与 ack 管理 |\n| 典型场景 | 事件流、日志、数据管道、流处理、回放分析 | 业务任务、RPC 异步化、复杂路由、死信补偿 |\n| 主要风险 | 分区热点、rebalance 抖动、offset 提交错误、ISR 不足 | 自动 ack 丢任务、不可路由丢消息、无限 requeue、DLQ 无治理 |"
     },
     {
       "type": "code",
-      "title": "可运行代码：模拟 key 分区、ISR 拒写、消费组分配和 offset",
+      "title": "可运行代码：分区路由、ISR 拒写、Consumer Group 分配与 offset 语义",
       "language": "java",
-      "content": "import java.util.*;\n\npublic class Main {\n    static final class Record {\n        final String key;\n        final String value;\n        final long offset;\n        Record(String key, String value, long offset) {\n            this.key = key;\n            this.value = value;\n            this.offset = offset;\n        }\n    }\n\n    static final class Partition {\n        final int id;\n        final int replicationFactor;\n        int inSyncReplicas;\n        final List<Record> log = new ArrayList<>();\n        Partition(int id, int replicationFactor) {\n            this.id = id;\n            this.replicationFactor = replicationFactor;\n            this.inSyncReplicas = replicationFactor;\n        }\n        long append(String key, String value, boolean acksAll, int minInSyncReplicas) {\n            if (acksAll && inSyncReplicas < minInSyncReplicas) {\n                throw new IllegalStateException(\"NotEnoughReplicas for partition \" + id);\n            }\n            long offset = log.size();\n            log.add(new Record(key, value, offset));\n            return offset;\n        }\n    }\n\n    static final class Topic {\n        final List<Partition> partitions;\n        Topic(int partitionCount, int replicationFactor) {\n            partitions = new ArrayList<>();\n            for (int i = 0; i < partitionCount; i++) partitions.add(new Partition(i, replicationFactor));\n        }\n        int partitionFor(String key) {\n            return Math.floorMod(key.hashCode(), partitions.size());\n        }\n        long send(String key, String value, boolean acksAll, int minInSyncReplicas) {\n            return partitions.get(partitionFor(key)).append(key, value, acksAll, minInSyncReplicas);\n        }\n    }\n\n    static final class ConsumerGroup {\n        static Map<String, List<Integer>> assign(int partitionCount, List<String> members) {\n            Map<String, List<Integer>> result = new LinkedHashMap<>();\n            for (String member : members) result.put(member, new ArrayList<>());\n            for (int p = 0; p < partitionCount; p++) {\n                result.get(members.get(p % members.size())).add(p);\n            }\n            return result;\n        }\n    }\n\n    static final class OffsetStore {\n        final Map<Integer, Long> committed = new HashMap<>();\n        long committedOffset(int partition) { return committed.getOrDefault(partition, 0L); }\n        void commit(int partition, long nextOffset) { committed.put(partition, nextOffset); }\n    }\n\n    public static void main(String[] args) {\n        Topic topic = new Topic(3, 3);\n        String key = \"order-42\";\n        int partition = topic.partitionFor(key);\n        long firstOffset = topic.send(key, \"created\", true, 2);\n        long secondOffset = topic.send(key, \"paid\", true, 2);\n        assert topic.partitionFor(key) == partition;\n        assert firstOffset == 0 && secondOffset == 1;\n\n        boolean rejected = false;\n        Partition unhealthy = topic.partitions.get(1);\n        unhealthy.inSyncReplicas = 1;\n        try {\n            unhealthy.append(\"order-9\", \"created\", true, 2);\n        } catch (IllegalStateException ex) {\n            rejected = ex.getMessage().contains(\"NotEnoughReplicas\");\n        }\n        assert rejected;\n\n        List<String> members = List.of(\"c1\", \"c2\", \"c3\", \"c4\", \"c5\");\n        Map<String, List<Integer>> assignment = ConsumerGroup.assign(3, members);\n        long idleConsumers = assignment.values().stream().filter(List::isEmpty).count();\n        assert idleConsumers == 2;\n\n        OffsetStore offsets = new OffsetStore();\n        Record delivery = topic.partitions.get(partition).log.get(0);\n        boolean redeliveredAfterCrash = offsets.committedOffset(partition) == delivery.offset;\n        offsets.commit(partition, delivery.offset + 1);\n        assert redeliveredAfterCrash;\n        assert offsets.committedOffset(partition) == 1;\n\n        System.out.println(\"keyPartition=\" + partition + \", offsets=\" + firstOffset + \"/\" + secondOffset);\n        System.out.println(\"acksAllRejected=\" + rejected + \", idleConsumers=\" + idleConsumers);\n        System.out.println(\"redeliveredBeforeCommit=\" + redeliveredAfterCrash + \", committedOffset=\" + offsets.committedOffset(partition));\n    }\n}",
+      "content": "import java.util.*;\n\npublic class Main {\n    static final class Record {\n        final String key;\n        final String value;\n        final long offset;\n        Record(String key, String value, long offset) {\n            this.key = key;\n            this.value = value;\n            this.offset = offset;\n        }\n    }\n\n    static final class Partition {\n        final int id;\n        final int replicationFactor;\n        int inSyncReplicas;\n        final List<Record> log = new ArrayList<>();\n        Partition(int id, int replicationFactor) {\n            this.id = id;\n            this.replicationFactor = replicationFactor;\n            this.inSyncReplicas = replicationFactor;\n        }\n        long append(String key, String value, boolean acksAll, int minInSyncReplicas) {\n            if (acksAll && inSyncReplicas < minInSyncReplicas) {\n                throw new IllegalStateException(\"NotEnoughReplicas for partition \" + id);\n            }\n            long offset = log.size();\n            log.add(new Record(key, value, offset));\n            return offset;\n        }\n    }\n\n    static final class Topic {\n        final List<Partition> partitions;\n        Topic(int partitionCount, int replicationFactor) {\n            partitions = new ArrayList<>();\n            for (int i = 0; i < partitionCount; i++) partitions.add(new Partition(i, replicationFactor));\n        }\n        int partitionFor(String key) {\n            return Math.floorMod(key.hashCode(), partitions.size());\n        }\n        long send(String key, String value, boolean acksAll, int minInSyncReplicas) {\n            return partitions.get(partitionFor(key)).append(key, value, acksAll, minInSyncReplicas);\n        }\n    }\n\n    static final class ConsumerGroup {\n        static Map<String, List<Integer>> assign(int partitionCount, List<String> members) {\n            Map<String, List<Integer>> result = new LinkedHashMap<>();\n            for (String member : members) result.put(member, new ArrayList<>());\n            for (int p = 0; p < partitionCount; p++) {\n                result.get(members.get(p % members.size())).add(p);\n            }\n            return result;\n        }\n    }\n\n    static final class OffsetStore {\n        final Map<Integer, Long> committed = new HashMap<>();\n        long committedOffset(int partition) { return committed.getOrDefault(partition, 0L); }\n        void commit(int partition, long nextOffset) { committed.put(partition, nextOffset); }\n    }\n\n    public static void main(String[] args) {\n        Topic topic = new Topic(3, 3);\n        String key = \"order-42\";\n        int partition = topic.partitionFor(key);\n        long firstOffset = topic.send(key, \"created\", true, 2);\n        long secondOffset = topic.send(key, \"paid\", true, 2);\n        assert topic.partitionFor(key) == partition : \"same key must route to same partition\";\n        assert firstOffset == 0 && secondOffset == 1 : \"offset within partition is monotonically increasing\";\n\n        boolean rejected = false;\n        Partition unhealthy = topic.partitions.get(1);\n        unhealthy.inSyncReplicas = 1;\n        try {\n            unhealthy.append(\"order-9\", \"created\", true, 2);\n        } catch (IllegalStateException ex) {\n            rejected = ex.getMessage().contains(\"NotEnoughReplicas\");\n        }\n        assert rejected : \"acks=all with ISR below minISR must reject\";\n\n        List<String> members = List.of(\"c1\", \"c2\", \"c3\", \"c4\", \"c5\");\n        Map<String, List<Integer>> assignment = ConsumerGroup.assign(3, members);\n        long idleConsumers = assignment.values().stream().filter(List::isEmpty).count();\n        assert idleConsumers == 2 : \"consumers beyond partition count are idle\";\n\n        OffsetStore offsets = new OffsetStore();\n        Record delivery = topic.partitions.get(partition).log.get(0);\n        boolean redeliveredAfterCrash = offsets.committedOffset(partition) == delivery.offset;\n        offsets.commit(partition, delivery.offset + 1);\n        assert redeliveredAfterCrash : \"before commit, crash causes redelivery (at-least-once)\";\n        assert offsets.committedOffset(partition) == 1;\n\n        System.out.println(\"keyPartition=\" + partition + \", offsets=\" + firstOffset + \"/\" + secondOffset);\n        System.out.println(\"acksAllRejected=\" + rejected + \", idleConsumers=\" + idleConsumers);\n        System.out.println(\"redeliveredBeforeCommit=\" + redeliveredAfterCrash + \", committedOffset=\" + offsets.committedOffset(partition));\n    }\n}",
       "highlights": [
         {
-          "line": 24,
-          "note": "acks=all 时 ISR 数低于 min.insync.replicas，要拒绝写入而不是假装成功。"
+          "line": 26,
+          "note": "acks=all 时 ISR 数低于 min.insync.replicas，broker 拒绝写入，保护数据不丢。"
         },
         {
-          "line": 40,
-          "note": "同一 key 稳定路由到同一 Partition，这是 Partition 内有序的前提。"
+          "line": 42,
+          "note": "同一 key 的 hashCode 取模后稳定路由到同一 Partition，是 Partition 内有序的前提。"
         },
         {
-          "line": 51,
-          "note": "同一个 Consumer Group 内，Partition 会分配给成员；成员数超过 Partition 数时会出现空闲消费者。"
+          "line": 53,
+          "note": "Consumer Group 内成员数超过 Partition 数时，多出的消费者空闲，并行度上限是 Partition 数。"
         },
         {
-          "line": 91,
-          "note": "崩溃前没提交 offset，接管者会从旧 committed offset 重新消费，形成 at-least-once。"
+          "line": 81,
+          "note": "崩溃前未提交 offset，接管者从旧 committed offset 重新消费，形成 at-least-once 重复。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "我会先给全局图：Kafka 4.x 用 KRaft controller quorum 管元数据和 leader 选举；数据面由 Producer、Broker、Topic/Partition、Replica、Consumer Group 组成。Topic 是逻辑主题，Partition 是追加日志和并行单位，每个 Partition 有 Leader 和 Follower，消费者按 offset 拉取。\n\n再讲写入：Producer 有 key 时按 key 稳定路由，无 key 时通常走 sticky batch，提高批量效果。写入先到 Partition Leader，Follower 复制形成 ISR。`acks=all` 要等待 ISR 确认；`min.insync.replicas` 决定写入成功的最低同步副本数。生产上常见 replication.factor=3、acks=all、min.insync.replicas=2。这样在一个副本不可用时仍可写，但 ISR 再低就应该报错，牺牲可用性保护数据。\n\n高吞吐不要只说顺序写。完整答案是：Partition 并行带来横向扩展；Producer batching、linger、压缩减少请求和网络；Broker 顺序追加日志段并利用页缓存；Consumer fetch 可走 sendfile 零拷贝路径；保留策略让 Kafka 能回放历史数据。\n\n消费端重点是 Consumer Group 和 offset。同组内一个 Partition 同时只给一个 Consumer；并行度上限由 Partition 数限制。先处理后提交 offset 是 at-least-once，可能重复，需要幂等；先提交后处理是 at-most-once，可能跳过消息。Rebalance 会造成短暂停顿，生产上用 static membership、cooperative sticky assignor、合理的 `max.poll.interval.ms` 和处理耗时控制来降低抖动。\n\n最后补边界：Kafka 只保证 Partition 内有序，不保证全局有序；Kafka 事务的 exactly-once 主要覆盖 Kafka 内 consume-transform-produce，外部数据库和接口副作用仍要幂等。"
-      ,
+      "content": "**开篇给全局图**：Kafka 4.x 分控制面和数据面。控制面用 KRaft controller quorum 管理元数据和 leader 选举，不再依赖 ZooKeeper。数据面是 Producer 写 Partition Leader → Follower 复制 → Consumer 按 offset 拉取。\n\n**写入链路**：Producer 按 key hash 稳定路由到 Partition（无 key 用 sticky batch）。写入到 Leader 后，Follower 从 Leader fetch 复制，形成 ISR。`acks=all` 要等 ISR 确认，`min.insync.replicas` 是写入成功的最低 ISR 数。常见配置 replication.factor=3、acks=all、min.insync.replicas=2：一个副本挂了仍能写；ISR 降到 1 就拒绝写入，牺牲可用性保护数据。只说 acks=all 不配 minISR 是常见错误——minISR=1 时 acks=all 退化为 acks=1。\n\n**Producer 可靠性递进**：幂等 Producer（PID + sequence number 去重）保证单 partition 内不重复；事务（transactional.id）支持跨 partition 原子写入和 consume-transform-produce 的 EOS。但 EOS 只覆盖 Kafka 内部链路，外部副作用仍需业务幂等。\n\n**Partition 日志**：每个 Partition 是磁盘上的日志目录，由若干 segment 组成。写入是 append-only，segment 过期后整段删除（delete 策略）或后台 compact（保留每个 key 最新值）。查找 offset 用稀疏索引 + 顺序扫描，近似 O(1)。\n\n**高吞吐完整答案**：不只顺序写。Partition 并行 → Producer batching 和 compression → Broker 顺序追加日志段 → OS 页缓存异步刷盘 → Consumer fetch 走 sendfile 零拷贝。五层共同构成吞吐优势。\n\n**消费端**：同组内一个 Partition 只给一个 Consumer，并行度上限是 Partition 数。先处理再提交 offset 是 at-least-once（需幂等），先提交再处理是 at-most-once（可能跳过消息）。Rebalance 由成员变化、心跳超时、poll 间隔超时触发。用 cooperative sticky assignor 减少暂停范围，static membership 减少滚动发布时的抖动，控制单条处理耗时和合理设置 max.poll.interval.ms 降低 rebalance 频率。\n\n**收尾讲边界**：Kafka 只保证 Partition 内有序，全局有序需单 Partition 或业务层排序；Partition 数在创建 Topic 时确定，扩容不能透明扩分片；Kafka 事务的 EOS 有明确的 Kafka 内部边界，外部副作用不在覆盖范围内。",
       "followUpQuestions": [
         {
-          "question": "Kafka 4.x 里 ZooKeeper 和 KRaft 怎么讲？",
-          "answer": "Kafka 4.x 主线是 KRaft，由 controller quorum 管理元数据和选举；ZooKeeper 是老集群或迁移阶段的话题。面试中可以提迁移背景，但核心架构图不要再把 ZooKeeper 当默认依赖。"
+          "question": "acks=all 不配 min.insync.replicas 有什么问题？",
+          "answer": "min.insync.replicas 默认是 1。如果 acks=all 但 minISR=1，当 ISR 只剩 Leader 一个时写入仍然成功——此时 acks=all 退化为 acks=1 的语义，Leader 崩溃可能丢数据。必须显式设置 minISR=2 配合 replication.factor=3，才能在一个副本不可用时保护数据。"
         },
         {
-          "question": "acks=all 和 min.insync.replicas 的关系是什么？",
-          "answer": "acks=all 要等待 ISR 副本确认；min.insync.replicas 是写入成功所需的最低 ISR 数。ISR 数低于 minISR 时，写入应失败，让 Producer 重试或告警。"
+          "question": "Kafka 的 EOS（exactly-once semantics）覆盖范围是什么？",
+          "answer": "Kafka 事务的 EOS 覆盖 Kafka 内部的 consume-transform-produce 链路：原子地消费 input topic、写入 output topic、提交消费 offset，配合 read_committed 隔离级别的 Consumer。但它不覆盖外部系统（数据库、HTTP 接口等），崩溃时可能内部 offset 已提交但外部操作未执行，业务仍需幂等或 saga 补偿。"
         },
         {
-          "question": "Kafka 如何保证顺序？",
-          "answer": "只保证同一 Partition 内按 offset 有序。需要同一订单或同一账户的事件有序，就用稳定业务 key 路由到同一 Partition；如果追求全局有序，只能牺牲并行度使用单 Partition 或在业务层排序。"
+          "question": "Rebalance 调优有哪些关键手段？",
+          "answer": "cooperative sticky assignor 减少一次性撤销的分区；static membership 降低重启时的 rebalance；控制单条处理耗时别让 max.poll.interval.ms 超时；合理设置 max.poll.records 控制单次 poll 的数据量；监控 rebalance 次数、lag 和 commit latency。核心原则是让 poll 调用间隔稳定在 max.poll.interval.ms 以内。"
         },
         {
-          "question": "Rebalance 为什么会影响线上消费？",
-          "answer": "Rebalance 会重新分配 Partition，期间相关消费者会暂停或撤销分区，可能拉高 lag 和重复处理。常用缓解手段是 cooperative sticky assignor、static membership、控制单条处理时长和合理设置 poll/heartbeat 参数。"
+          "question": "Partition 数量怎么权衡？",
+          "answer": "Partition 多则并行度高、吞吐上限大，但 leader 选举开销、文件句柄数、元数据量和 rebalance 耗时也增加。生产上通常按 peak throughput / per-partition-throughput 估算，留出 headroom，但避免过度分片（上千 Partition 在小集群上可能导致 controller 压力）。Partition 数在创建 Topic 时确定，后续扩容需 repartition。"
         }
       ]
     },
@@ -105,58 +119,83 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 Kafka 4.x 的 KRaft 控制面与数据面职责",
-        "能解释 Topic、Partition、offset、Leader/Follower、ISR 的关系",
-        "能说明 key 分区、sticky 分区、Partition 内有序和全局无序的边界",
-        "能讲清 acks=0/1/all、min.insync.replicas、replication.factor 的取舍",
-        "能解释 Kafka 高吞吐来自分区并行、批量、压缩、页缓存、顺序追加和零拷贝",
-        "能说明 Consumer Group 分配、offset 提交、at-least-once/at-most-once 和 Rebalance 抖动",
-        "能把 Kafka 与 RabbitMQ 的消息模型、回放能力和适用场景区分开"
+        "能说明 Kafka 4.x 的 KRaft 控制面职责和与 ZooKeeper 的迁移边界",
+        "能解释 Topic、Partition、日志段、offset、Leader/Follower、ISR 的关系和存储结构",
+        "能说明 key hash 分区、sticky 分区、Partition 内有序和全局无序的边界",
+        "能讲清 acks=0/1/all、min.insync.replicas、replication.factor 的配合取舍和常见配置",
+        "能区分幂等 Producer、事务 Producer 和 EOS 的覆盖范围与边界",
+        "能解释高吞吐来自五层组合：Partition 并行、batching+compression、顺序追加、页缓存、零拷贝",
+        "能说明 Consumer Group 分配模型、offset 提交时机与 at-least-once/at-most-once 语义",
+        "能说明 Rebalance 触发条件、cooperative sticky assignor 和 static membership 的作用"
       ]
     }
   ],
   "recallPrompts": [
     {
-      "prompt": "Kafka 4.x 的 KRaft、Broker、Topic、Partition、Replica、ISR 分别承担什么职责？",
+      "prompt": "Kafka 4.x 的 KRaft 控制面和数据面分别承担哪些职责？ZooKeeper 在什么场景还会出现？",
       "mode": "text",
-      "expectedMinutes": 4,
+      "expectedMinutes": 3,
       "difficulty": 4,
       "id": "java.middleware.topic-080-3c934d6a.recall.1"
     },
     {
-      "prompt": "acks=all、min.insync.replicas、replication.factor 如何配合降低丢消息风险？ISR 不足时会发生什么？",
+      "prompt": "acks=all、min.insync.replicas、replication.factor 如何配合保证可靠性？只配 acks=all 不配 minISR 有什么风险？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4,
       "id": "java.middleware.topic-080-3c934d6a.recall.2"
     },
     {
-      "id": "java.middleware.topic-080-3c934d6a.recall.3",
-      "prompt": "Kafka 的 Consumer Group、offset 提交和 Rebalance 如何影响消息语义、顺序性和吞吐？",
+      "prompt": "Kafka 的 Consumer Group、offset 提交和 Rebalance 如何影响消息语义和吞吐？线上 rebalance 抖动怎么排查和调优？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4,
+      "id": "java.middleware.topic-080-3c934d6a.recall.3"
+    },
+    {
+      "prompt": "Kafka 的高吞吐来源有哪些？只说顺序写磁盘为什么不够完整？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4,
+      "id": "java.middleware.topic-080-3c934d6a.recall.4"
+    },
+    {
+      "prompt": "Kafka 的 Partition 日志结构是什么？日志段、稀疏索引、compaction 和 delete 策略分别怎么工作？",
       "mode": "text",
       "expectedMinutes": 4,
-      "difficulty": 4
+      "difficulty": 4,
+      "id": "java.middleware.topic-080-3c934d6a.recall.5"
+    },
+    {
+      "prompt": "Kafka 幂等 Producer、事务和 exactly-once semantics 分别保证什么？覆盖范围的边界在哪里？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4,
+      "id": "java.middleware.topic-080-3c934d6a.recall.6"
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明 Kafka 4.x KRaft 控制面和 ZooKeeper 迁移边界",
-      "能解释 Topic/Partition/Replica/ISR/offset 的关系",
-      "能说明高吞吐来源：分区并行、批量、压缩、页缓存、顺序追加、零拷贝",
-      "能讲清 acks、min.insync.replicas、ISR 和可靠写入的关系",
+      "能说明 Kafka 4.x KRaft 控制面职责和 ZooKeeper 迁移边界",
+      "能解释 Topic/Partition/日志段/ISR/offset 的关系和存储结构",
+      "能讲清 acks、min.insync.replicas、ISR 和可靠写入的配合取舍",
+      "能说明幂等 Producer、事务和 EOS 的覆盖范围与边界",
+      "能解释高吞吐来自五层组合：Partition 并行、batching+compression、顺序追加、页缓存、零拷贝",
       "能说明 Partition 内有序、Consumer Group 分配和 offset 提交语义"
     ],
     "goodToHave": [
-      "能指出 Partition 数量对并行度、文件句柄、元数据和 rebalance 的影响",
-      "能说明 sticky partitioner、idempotent producer 和 Kafka 事务的适用边界",
-      "能给出 cooperative sticky assignor、static membership、max.poll.interval.ms 的调优思路"
+      "能解释 Partition 日志段结构、稀疏索引和 compaction/delete 策略",
+      "能说明 cooperative sticky assignor、static membership 和 max.poll.interval.ms 的调优思路",
+      "能区分 Kafka 事务与外部系统幂等的边界",
+      "能解释 Partition 数量对并行度、文件句柄、元数据和 rebalance 的影响"
     ],
     "commonMistakes": [
       "把 ZooKeeper 当成 Kafka 4.x 默认控制面",
+      "只说 acks=all 不配 min.insync.replicas，minISR=1 时 acks=all 退化为 acks=1",
       "以为 Kafka 保证全局有序",
-      "Consumer 数超过 Partition 数还期待更高并行",
-      "只说 acks=all，不配 min.insync.replicas 和 replication.factor",
-      "offset 提交时机错误，导致丢消息或重复处理"
+      "只说高吞吐因为顺序写，忽略 batching、compression、页缓存和零拷贝",
+      "以为 Kafka 事务的 EOS 覆盖外部数据库和接口副作用",
+      "Consumer 数超过 Partition 数还期待更高并行"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -165,12 +204,12 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "java.middleware.topic-077-0f4a426f",
     "java.middleware.topic-078-0195276a"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否用 Kafka 4.x 口径讲清 KRaft、Partition 日志、ISR/acks/minISR、高吞吐来源、Consumer Group、offset 语义和 Rebalance 边界。"
+  "interviewerFocus": "考察能否用 Kafka 4.x 口径完整讲清 KRaft 控制面、Partition 日志结构与生命周期、ISR/acks/minISR 可靠性模型、Producer 幂等与事务边界、高吞吐五层来源、Consumer Group 分配、offset 语义和 Rebalance 调优。"
 }

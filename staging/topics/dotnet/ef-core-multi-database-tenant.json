@@ -4,7 +4,7 @@
   "category": "ef-core",
   "group": "ef-core",
   "title": "EF Core 多租户与 Provider 兼容",
-  "summary": "理解 EF Core 如何通过 Provider、DbContext 工厂、全局查询过滤器和迁移策略支持多租户应用。",
+  "summary": "EF Core 多租户的核心挑战不是加一个 TenantId 字段，而是在 Provider 兼容边界、租户解析管线、全局 QueryFilter 防绕过、SaveChanges 自动注入、迁移批处理和后台任务租户上下文之间形成完整防线。",
   "tags": [
     ".NET",
     "EF Core",
@@ -13,7 +13,7 @@
     "租户隔离"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 35,
+  "estimatedMinutes": 39,
   "order": 40,
   "recommendWeight": 80,
   "status": "staging",
@@ -21,17 +21,27 @@
     "dotnet.ef-core.basics"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能把 EF Core 的 Provider 差异、DbContext 生命周期和多租户隔离策略讲清楚，而不是泛泛讨论数据库选型。",
+  "interviewerFocus": "考察是否能把 Provider 差异、租户解析管线、QueryFilter 防线和后台任务租户上下文讲清楚，而不是泛泛讨论数据库选型或只说加 TenantId 字段。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "Provider 兼容是 EF Core 抽象边界",
-      "content": "EF Core 通过 Provider 把 LINQ、模型配置和迁移转换成具体数据库的 SQL 与能力调用。SQL Server、PostgreSQL、MySQL、SQLite 都有各自 Provider，但这不代表所有行为完全一致。\n面试里要把它讲成 EF Core 框架边界：同一套实体模型可以适配多个 Provider，但数据库函数、分页语法、JSON 字段、事务特性、迁移 SQL 和执行计划仍可能不同。生产系统如果要跨 Provider，应该避免大量原生 SQL 和数据库特有函数，或者把差异封装在仓储、查询服务或适配层里。\n常见误区是把 Provider 兼容理解成“随便切数据库”。实际切换前要验证迁移脚本、字段类型、索引、事务隔离、SQL 翻译和性能。"
+      "title": "Provider 是 EF Core 的抽象边界，不是数据库万能适配器",
+      "content": "EF Core 把实体模型、LINQ 查询、变更跟踪和迁移抽象成与数据库无关的管线，具体执行由 Provider 负责翻译成目标数据库的 SQL、类型映射、函数和迁移 DDL。SQL Server 用 `UseSqlServer()`，PostgreSQL 用 `UseNpgsql()`，MySQL 用 `UseMySql()`，SQLite 用 `UseSqlite()`，各 Provider 的 NuGet 包独立维护。\n\n这意味着同一套模型代码可以跑在不同 Provider 上，但实际差异远不止连接串。SQL Server 的 `IDENTITY` 与 PostgreSQL 的 `SERIAL`/`IDENTITY` 语义不同；JSON 列映射在 SQL Server 2016+ 和 PostgreSQL 的 `jsonb` 上行为不一致；分页方言、`OFFSET-FETCH` vs `LIMIT`、窗口函数、全文索引、空间类型、序列和事务隔离级别都有 Provider 特有实现。\n\n迁移脚本是另一个高风险区域。同一 `OnModelCreating` 配置在不同 Provider 下生成的 DDL 不同：默认值 SQL、索引包含列、表提示、Collation、触发器支持都可能缺失或有差异。EF Core 8 引入的 `HierarchyId` 支持目前只在 SQL Server Provider 生产可用；`DateOnly`/`TimeOnly` 在 EF Core 6+ 可用但各 Provider 的数据库列类型映射不同。\n\n所以 Provider 兼容的工程建议是：核心领域模型和 LINQ 查询可以跨 Provider，但数据库特有函数、存储过程、JSON/空间列、迁移脚本和性能调优必须逐 Provider 验证和封装。用 Repository 或 Query Service 隔离 Provider 差异，用集成测试矩阵验证关键查询在目标数据库上的 SQL 和结果。"
     },
     {
       "type": "explain",
-      "title": "多租户隔离要先选数据边界",
-      "content": "EF Core 多租户的核心不是写一个 TenantId 字段，而是选择隔离边界。常见三种方案：独立数据库、独立 Schema、共享表行级隔离。\n独立数据库隔离强，适合大客户、强合规或可单独迁移备份的场景，但连接、迁移和运维成本最高。独立 Schema 成本居中，但不同数据库对 Schema 的支持和迁移方式不同。行级隔离成本最低，常用全局查询过滤器自动加 TenantId 条件，但必须防止绕过过滤器、原生 SQL 漏条件和后台任务串租户。\nEF Core 落地时通常需要 TenantProvider、DbContextFactory、全局 QueryFilter、SaveChanges 自动写 TenantId、租户连接串管理和迁移批处理。\n把 EF Core 多租户与 Provider 兼容 放到真实场景里看，重点是框架管线、运行时机制、配置边界和诊断证据。先确认触发条件，再看状态或数据怎样变化，最后用指标、日志、测试结果或复杂度证明判断"
+      "title": "多租户的第一决策是数据隔离边界，不是 TenantId 在哪",
+      "content": "EF Core 多租户的核心问题不是在实体上加 `TenantId` 字段，而是选择隔离边界——这决定了连接管理、Schema 设计、迁移策略、查询安全和运维复杂度。\n\n**独立数据库**：每个租户一个数据库，连接串按租户选择。隔离强度最高：物理隔离，天然无法跨租户查询，备份恢复粒度到单租户，合规审计最简单。代价是连接池管理和迁移运维：N 个租户就需要 N 套迁移执行，数据库连接总数受限于连接池大小和数据库实例上限。适合大客户、强合规（金融/医疗）或需要独立备份/恢复的场景。\n\n**独立 Schema**：同一数据库实例，每个租户一个 Schema（如 `tenant_abc.Orders`）。隔离强度中高：Schema 级权限隔离，跨 Schema 查询可控但不隔离连接和实例资源。迁移要为每个 Schema 执行，不同数据库对 Schema 的支持差异大：SQL Server 的 Schema 是命名空间，PostgreSQL 的 Schema 类似但权限模型不同，MySQL 的 Schema 就是数据库，SQLite 没有 Schema 概念。这是 Provider 兼容问题直接影响多租户设计的典型案例。\n\n**共享表行级隔离**：所有租户共享同一套表，每张表加 `TenantId` 列，EF Core 全局 QueryFilter 自动附加过滤条件。成本最低，迁移只跑一次，连接池共享，弹性扩缩最方便。但风险也最高：必须保证所有查询路径（包括 Include、子查询、投影、原始 SQL、后台任务）都携带 TenantId 条件，一旦遗漏就造成跨租户数据泄露。适合 SaaS 标准版、中小租户、对隔离强度要求不极端的场景。\n\n实际系统常用混合策略：大客户独立数据库，中小客户共享表，按租户等级动态路由。"
+    },
+    {
+      "type": "explain",
+      "title": "租户解析管线：从请求到 DbContext 的完整路径",
+      "content": "多租户系统必须在每个请求开始时解析租户身份，然后用这个身份创建或配置 DbContext。整个管线包括：\n\n**租户解析（Tenant Resolution）**：从 HTTP 请求中提取租户标识。常见方式：子域名（`tenant1.app.com`）、路由前缀（`/api/tenant1/...`）、请求头（`X-Tenant-Id`）、JWT Claim、Cookie。解析器通常在 ASP.NET Core 中间件或 `ITenantResolver` 服务里实现，解析结果存入 `HttpContext` 或 scoped 服务中。\n\n**TenantInfo / TenantProvider**：解析结果封装成 `TenantInfo`（包含 TenantId、连接串、Schema 名等），注册为 scoped 服务，后续 DbContext 通过依赖注入获取。\n\n**DbContextFactory 与连接串选择**：独立数据库模式下，`IDbContextFactory<TContext>` 或 DbContext 的 `OnConfiguring` 根据 `TenantInfo.ConnectionString` 动态选择连接串。注意：DbContext 注册为 scoped，每个请求一个实例，连接串在构造时确定。不能在请求中途切换租户——这会导致同一 DbContext 混合不同租户数据。\n\n**EF Core 8+ 的 `IDbContextFactory` 增强**：EF Core 8 修复了工厂模式下 pooled DbContext 的连接管理，建议在多租户场景优先使用 `AddDbContextFactory` 配合自定义工厂，而非直接 `AddDbContext`。\n\n**全局 QueryFilter 注入**：行级隔离模式下，`OnModelCreating` 里用 `HasQueryFilter(e => e.TenantId == _tenantId)` 附加全局过滤器。`_tenantId` 从注入的 `ITenantProvider` 获取。关键约束：QueryFilter 是模型级的，同一个 DbContext 实例的 QueryFilter 参数值在实例生命周期内不变——这再次印证不能在请求中途切换租户。"
+    },
+    {
+      "type": "explain",
+      "title": "QueryFilter 的防御深度与绕过风险",
+      "content": "全局 QueryFilter 是 EF Core 行级多租户的核心防线，但它的保护范围和绕过风险必须理解清楚。\n\n**QueryFilter 生效的范围**：所有通过 LINQ 的 `DbSet<T>` 查询（包括 `First`、`Single`、`Any`、`Count`、投影、Include 关联实体）都会自动附加过滤器条件。导航属性加载（Lazy Loading、Eager Loading、Explicit Loading）也会受过滤器约束。\n\n**QueryFilter 不保护的路径**：\n- `FromSqlRaw` / `FromSqlInterpolated`：原生 SQL 不经过 QueryFilter 管线，必须手动加 `WHERE TenantId = @tenantId`\n- `ExecuteSqlRaw` / `ExecuteSqlInterpolated`：执行命令（INSERT/UPDATE/DELETE/DDL）不受 QueryFilter 约束\n- `IgnoreQueryFilters()`：显式调用会跳过过滤器，常用于管理后台查询全量数据，但必须有权限控制\n- 数据库视图（View）映射的实体：如果 View 没有在定义时包含 TenantId 过滤，QueryFilter 条件可能被优化器消除\n- 存储过程映射：EF Core 的存储过程映射不走 LINQ 管线\n\n**SaveChanges 自动注入 TenantId**：仅靠 QueryFilter 不够——新增实体如果没有赋 TenantId，插入后就查不到了。需要在 `SaveChanges` / `SaveChangesAsync` 的 override 中遍历 `ChangeTracker.Entries()`，对 `Added` 状态的实体自动设置 TenantId。修改和删除实体时 QueryFilter 已经生效，但要注意：如果实体的 TenantId 被修改，更新后的数据可能\"消失\"（对当前租户不可见）。\n\n**后台任务与租户上下文**：Hangfire、Quartz、BackgroundService 等后台任务没有 HTTP 请求上下文，租户解析器无法工作。必须在任务入队时携带 TenantId，执行时手动注入租户上下文再创建 DbContext。常见 bug：后台任务用默认 DbContext（没有 TenantId），写入的数据没有租户归属，或读到所有租户数据。"
     },
     {
       "type": "diagram",
@@ -55,51 +65,48 @@
     {
       "type": "compareTable",
       "title": "多租户隔离策略对比",
-      "columns": [
-        "策略",
-        "隔离强度",
-        "成本",
-        "EF Core 落点"
-      ],
-      "rows": [
-        [
-          "独立数据库",
-          "最高",
-          "连接、迁移和运维成本高",
-          "按租户选择连接串和 DbContext"
-        ],
-        [
-          "独立 Schema",
-          "中高",
-          "迁移和 Provider 差异较复杂",
-          "模型配置默认 Schema 或动态映射"
-        ],
-        [
-          "共享表行级隔离",
-          "中",
-          "成本低但越权风险高",
-          "全局 QueryFilter + 自动写 TenantId"
-        ],
-        [
-          "混合隔离",
-          "按租户分级",
-          "治理复杂",
-          "大客户独库，普通租户共享表"
-        ]
+      "content": "| 策略 | 隔离强度 | 连接/迁移成本 | EF Core 实现要点 | 适用场景 |\n| --- | --- | --- | --- | --- |\n| 独立数据库 | 最高：物理隔离 | N 套连接池 + N 次迁移 | `IDbContextFactory` 按租户选连接串 | 大客户、强合规、独立备份恢复 |\n| 独立 Schema | 中高：命名空间隔离 | 连接共享 + N 次迁移 | `HasDefaultSchema()` 动态映射，Provider 差异大 | 中大客户、需要 Schema 级权限 |\n| 共享表行级隔离 | 中：逻辑隔离 | 连接和迁移共享 | 全局 QueryFilter + SaveChanges 注入 TenantId | SaaS 标准版、中小租户 |\n| 混合隔离 | 按租户分级 | 治理复杂 | 路由层判断租户等级再选策略 | 大客户独库、普通租户共享表 |\n\n| 绕过路径 | 风险 | 防御措施 |\n| --- | --- | --- |\n| `FromSqlRaw` 原生 SQL | 无自动 TenantId 过滤 | 封装基类方法强制拼 TenantId 条件 |\n| `IgnoreQueryFilters()` | 显式跳过过滤器 | 管理后台接口加权限控制，审计日志 |\n| 后台任务无 HTTP 上下文 | 写入数据无租户归属 | 任务入队携带 TenantId，执行时手动注入 |\n| `ExecuteSqlRaw` 命令 | INSERT/UPDATE 不受过滤器约束 | 统一审计 + 存储过程替代 |\n| 导航属性跨聚合 | 关联实体可能来自其他租户 | 配置级联删除/查询时显式 Include |"
+    },
+    {
+      "type": "code",
+      "title": "行级多租户核心实现：TenantProvider、QueryFilter 与 SaveChanges 注入",
+      "language": "csharp",
+      "content": "using Microsoft.EntityFrameworkCore;\nusing Microsoft.EntityFrameworkCore.ChangeTracking;\n\n// 1. 租户信息与解析服务\npublic interface ITenantProvider\n{\n    string TenantId { get; }\n    string ConnectionString { get; }\n}\n\npublic class HttpTenantProvider : ITenantProvider\n{\n    private readonly IHttpContextAccessor _accessor;\n    public HttpTenantProvider(IHttpContextAccessor accessor) => _accessor = accessor;\n\n    public string TenantId => _accessor.HttpContext?.Request.Headers[\"X-Tenant-Id\"].FirstOrDefault()\n        ?? throw new InvalidOperationException(\"Missing X-Tenant-Id header\");\n\n    public string ConnectionString => $\"Server=.;Database=tenant_{TenantId};Trusted_Connection=true;\";\n}\n\n// 2. DbContext：QueryFilter + SaveChanges 自动注入\npublic class MultiTenantDbContext : DbContext\n{\n    private readonly ITenantProvider _tenantProvider;\n\n    public MultiTenantDbContext(DbContextOptions<MultiTenantDbContext> options,\n        ITenantProvider tenantProvider) : base(options)\n    {\n        _tenantProvider = tenantProvider;\n    }\n\n    public DbSet<Order> Orders => Set<Order>();\n    public DbSet<Product> Products => Set<Product>();\n\n    protected override void OnModelCreating(ModelBuilder modelBuilder)\n    {\n        // 全局 QueryFilter：所有查询自动附加 TenantId 条件\n        modelBuilder.Entity<Order>().HasQueryFilter(o => o.TenantId == _tenantProvider.TenantId);\n        modelBuilder.Entity<Product>().HasQueryFilter(p => p.TenantId == _tenantProvider.TenantId);\n\n        // 组合唯一索引：防止同租户内重复数据\n        modelBuilder.Entity<Order>().HasIndex(o => new { o.TenantId, o.OrderNo }).IsUnique();\n    }\n\n    public override int SaveChanges()\n    {\n        InjectTenantId();\n        return base.SaveChanges();\n    }\n\n    public override async Task<int> SaveChangesAsync(CancellationToken ct = default)\n    {\n        InjectTenantId();\n        return await base.SaveChangesAsync(ct);\n    }\n\n    private void InjectTenantId()\n    {\n        // 新增实体自动写入 TenantId\n        foreach (EntityEntry entry in ChangeTracker.Entries()\n            .Where(e => e.State == EntityState.Added))\n        {\n            if (entry.Entity is ITenantEntity tenantEntity)\n            {\n                tenantEntity.TenantId = _tenantProvider.TenantId;\n            }\n        }\n\n        // 可选：禁止修改 TenantId（防止实体\"漂移\"到其他租户）\n        foreach (EntityEntry entry in ChangeTracker.Entries()\n            .Where(e => e.State == EntityState.Modified))\n        {\n            if (entry.Entity is ITenantEntity)\n            {\n                entry.Property(\"TenantId\").IsModified = false;\n            }\n        }\n    }\n}\n\n// 3. 租户实体接口\npublic interface ITenantEntity\n{\n    string TenantId { get; set; }\n}\n\npublic class Order : ITenantEntity\n{\n    public int Id { get; set; }\n    public string TenantId { get; set; } = string.Empty;\n    public string OrderNo { get; set; } = string.Empty;\n    public decimal Amount { get; set; }\n}\n\npublic class Product : ITenantEntity\n{\n    public int Id { get; set; }\n    public string TenantId { get; set; } = string.Empty;\n    public string Name { get; set; } = string.Empty;\n}\n\n// 4. DI 注册（ASP.NET Core）\npublic static class MultiTenantServiceCollectionExtensions\n{\n    public static IServiceCollection AddMultiTenantEfCore(this IServiceCollection services)\n    {\n        services.AddScoped<ITenantProvider, HttpTenantProvider>();\n        services.AddDbContext<MultiTenantDbContext>((sp, options) =>\n        {\n            var tenant = sp.GetRequiredService<ITenantProvider>();\n            options.UseSqlServer(tenant.ConnectionString);\n        });\n        return services;\n    }\n}",
+      "highlights": [
+        {
+          "line": 28,
+          "note": "全局 QueryFilter：所有 LINQ 查询自动附加 TenantId == _tenantProvider.TenantId 条件。"
+        },
+        {
+          "line": 47,
+          "note": "SaveChanges 遍历 ChangeTracker，自动为新增实体注入 TenantId。"
+        },
+        {
+          "line": 56,
+          "note": "禁止修改 TenantId，防止实体\"漂移\"到其他租户。"
+        },
+        {
+          "line": 70,
+          "note": "ITenantEntity 接口统一租户字段，QueryFilter 和 SaveChanges 通过接口判断。"
+        }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "EF Core 的多数据库和多租户问题，我会先限定在 EF Core 框架层面回答：Provider 负责把模型、LINQ 和迁移适配到具体数据库，但不同数据库能力并不完全一致。\n1. Provider 兼容方面，要关注 SQL 翻译、字段类型、迁移脚本、事务行为和数据库特有函数，不能认为换一个 UseSqlServer/UseNpgsql 就完成迁移。\n2. 多租户方面，先选隔离策略：独立数据库隔离最强但成本高，独立 Schema 居中，共享表行级隔离成本最低但最容易出现越权。\n3. EF Core 落地时，要用 TenantProvider 解析租户，用 DbContextFactory 或连接串选择创建上下文，用全局 QueryFilter 自动过滤 TenantId，并在 SaveChanges 时自动写入租户字段。\n边界上，行级隔离要特别防止原生 SQL 绕过过滤器、后台任务没有租户上下文，以及 IgnoreQueryFilters 被误用。",
+      "content": "**结论**：EF Core 多租户要解决三个层面的问题——数据隔离边界选择、Provider 兼容适配、查询安全防线。\n\n**1. 数据隔离边界（核心决策）**\n- **独立数据库**：隔离最强，每租户一套库和连接串，迁移运维成本最高。适合大客户和强合规场景。\n- **独立 Schema**：同库不同 Schema，迁移复杂且 Provider 对 Schema 支持差异大（SQL Server vs PostgreSQL vs MySQL）。\n- **共享表行级隔离**：成本最低，全局 QueryFilter 自动过滤 TenantId，但绕过风险最高。\n- **混合策略**：大客户独库，中小租户共享表，按等级路由。\n\n**2. Provider 兼容边界**\n- Provider 负责把 LINQ、模型和翻译成具体数据库 SQL，但字段类型、函数、迁移 DDL、JSON/空间列、事务行为都不完全一致。\n- 跨 Provider 切换前必须验证：迁移脚本、类型映射、索引包含列、分页方言、数据库特有函数。\n- 工程建议：核心模型和 LINQ 可跨 Provider，数据库特有功能要封装隔离。\n\n**3. 行级隔离的安全防线**\n- **QueryFilter 生效范围**：所有 LINQ 查询、Include 导航属性、聚合函数。\n- **QueryFilter 不保护**：`FromSqlRaw`、`ExecuteSqlRaw`、`IgnoreQueryFilters()`、存储过程映射。\n- **SaveChanges 注入**：新增实体自动写 TenantId，修改实体禁止改 TenantId。\n- **后台任务**：无 HTTP 上下文，任务入队时携带 TenantId，执行时手动注入。\n\n**4. 追问应对**\n- Schema 差异：MySQL 的 Schema 就是数据库，SQLite 没有 Schema，独立 Schema 方案在这些 Provider 上不可行。\n- 性能影响：共享表模式下复合索引 `(TenantId, ...)` 是必须的，否则 QueryFilter 退化为全表扫描。\n- 测试策略：必须有跨租户安全测试，模拟一个租户用原生 SQL 访问另一个租户数据。",
       "followUpQuestions": [
         {
           "question": "EF Core 支持多个 Provider 是否意味着可以无成本切换数据库？",
-          "answer": "不是。Provider 只提供抽象适配，具体数据库的字段类型、函数、迁移 SQL、事务行为和性能计划都可能不同，切换前必须做兼容测试和压测。"
+          "answer": "不是。Provider 只提供 LINQ/模型的抽象适配层，具体数据库的字段类型映射（如 `string`→`NVARCHAR` vs `VARCHAR` vs `TEXT`）、数据库特有函数（`GETDATE()` vs `NOW()` vs `CURRENT_TIMESTAMP`）、迁移 DDL（`IDENTITY` vs `SERIAL` vs `AUTO_INCREMENT`）、索引语法、JSON/空间列支持、事务隔离默认值都可能不同。切换前必须跑迁移脚本对比、集成测试矩阵和性能基准。"
         },
         {
-          "question": "行级多租户隔离最容易出什么问题？",
-          "answer": "最容易在原生 SQL、后台任务、IgnoreQueryFilters 或手写查询里漏掉 TenantId 条件，导致跨租户数据访问。需要统一封装查询入口并做安全测试。"
+          "question": "行级多租户的 QueryFilter 最容易在哪些场景被绕过？",
+          "answer": "`FromSqlRaw` 原生 SQL 不经过 QueryFilter 管线；`IgnoreQueryFilters()` 显式跳过；`ExecuteSqlRaw` 的 INSERT/UPDATE 不受过滤器约束；后台任务（Hangfire/BackgroundService）没有 HTTP 上下文无法解析租户；导航属性跨聚合边界可能加载其他租户的关联数据。防御方式：封装原生 SQL 基类方法强制拼条件、`IgnoreQueryFilters` 加权限控制、SaveChanges 审计、后台任务入队携带 TenantId。"
+        },
+        {
+          "question": "独立数据库方案下，如何管理 N 个租户的数据库迁移？",
+          "answer": "遍历所有租户的连接串，对每个连接串创建独立 DbContext 实例并执行 `Migrate()`。可以用 `IDbContextFactory` 或自定义迁移服务，并行执行（注意数据库连接数上限），失败重试和死信队列。EF Core 8 的 `IHostedService` 模式可以在应用启动时批量迁移，但生产环境建议用 CI/CD 管线提前迁移，启动时只做兼容性检查。"
         }
       ]
     },
@@ -107,10 +114,14 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能说明 EF Core Provider 兼容的能力和边界",
-        "能比较独立数据库、独立 Schema、共享表行级隔离",
-        "能解释 TenantProvider、DbContextFactory、QueryFilter 的职责",
-        "能指出原生 SQL、后台任务和 IgnoreQueryFilters 的串租户风险"
+        "能解释 EF Core Provider 兼容的边界：字段类型、函数、迁移 DDL、JSON/空间列、事务行为差异",
+        "能比较独立数据库、独立 Schema、共享表行级隔离的隔离强度、成本和适用场景",
+        "能描述从租户解析到 DbContext 创建的完整管线：TenantProvider → DbContextFactory → QueryFilter → SaveChanges 注入",
+        "能列出 QueryFilter 的保护范围和所有绕过路径（FromSqlRaw、IgnoreQueryFilters、ExecuteSqlRaw、后台任务）",
+        "能解释 SaveChanges 中自动注入 TenantId 和禁止修改 TenantId 的实现",
+        "能说明混合隔离策略下路由层如何按租户等级选择隔离模型",
+        "能说明后台任务（Hangfire/BackgroundService）的租户上下文传递方案",
+        "能说明跨 Provider 切换的验证清单：迁移脚本、类型映射、索引、函数、性能"
       ]
     }
   ],
@@ -135,31 +146,55 @@
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
+    },
+    {
+      "id": "dotnet.ef-core.multi-database-tenant.recall.4",
+      "prompt": "行级多租户模式下，SaveChanges 时需要做什么来保证数据隔离？有哪些边界情况？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "dotnet.ef-core.multi-database-tenant.recall.5",
+      "prompt": "后台任务（Hangfire / BackgroundService）没有 HTTP 请求上下文，如何正确传递租户身份并创建 DbContext？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "dotnet.ef-core.multi-database-tenant.recall.6",
+      "prompt": "线上收到报警：一个租户在管理后台查询时看到了另一个租户的订单数据。请排查可能的原因和修复方案。",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "Provider 兼容边界",
-      "三种租户隔离策略",
-      "TenantProvider",
-      "DbContextFactory"
+      "能解释 Provider 兼容的边界：类型映射、函数、迁移 DDL、事务行为差异",
+      "能比较三种隔离策略的隔离强度、成本和 EF Core 实现要点",
+      "能描述租户解析管线：TenantProvider → DbContextFactory → QueryFilter → SaveChanges 注入",
+      "能列出 QueryFilter 的保护范围和所有绕过路径（FromSqlRaw、IgnoreQueryFilters、ExecuteSqlRaw、后台任务）"
     ],
     "goodToHave": [
-      "迁移脚本差异",
-      "原生 SQL 绕过风险",
-      "后台任务租户上下文"
+      "能说明独立 Schema 方案在不同 Provider 上的差异（MySQL=Database、SQLite 无 Schema）",
+      "能解释 SaveChanges 中自动注入和禁止修改 TenantId 的实现",
+      "能说明混合隔离策略的路由层设计",
+      "能说明跨 Provider 切换的验证清单和测试矩阵"
     ],
     "commonMistakes": [
-      "认为更换 Provider 就能无成本切换数据库",
-      "行级隔离只加 TenantId 字段但没有统一过滤和写入机制",
-      "忽略原生 SQL、后台任务和 IgnoreQueryFilters 的越权风险"
+      "认为更换 Provider 就能无成本切换数据库，忽略类型映射、函数和迁移 DDL 差异",
+      "行级隔离只加 TenantId 字段但没有统一 QueryFilter 和 SaveChanges 注入机制",
+      "忽略 FromSqlRaw、IgnoreQueryFilters 和后台任务的绕过风险",
+      "后台任务用默认 DbContext 写入数据没有 TenantId，或读到所有租户数据",
+      "忽略 Schema 在不同数据库上的语义差异，独立 Schema 方案在 MySQL/SQLite 上不可行"
     ],
     "scoreWeights": {
-      "coverage": 30,
-      "accuracy": 25,
+      "coverage": 25,
+      "accuracy": 30,
       "interviewExpression": 20,
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

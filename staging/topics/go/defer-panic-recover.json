@@ -4,7 +4,7 @@
   "category": "runtime",
   "group": "runtime",
   "title": "defer、panic 与 recover",
-  "summary": "掌握 defer 注册到 G._defer 链表的 LIFO 执行、open-coded defer 优化、参数立即求值与命名返回值修改、panic 沿栈展开与 recover 直接调用条件。",
+  "summary": "讲清 defer 在 runtime 层的 _defer 链表与 open-coded 栈帧 bitmap 两条路径、参数立即求值与 Go 1.22 循环变量语义边界、panic 沿 g._defer 链展开与 recover 直接调用的 sp 校验条件、以及 concurrent map writes / stack overflow / OOM 等 runtime fatal 不可 recover 的硬边界。",
   "tags": [
     "Go",
     "defer",
@@ -12,7 +12,7 @@
     "recover"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 26,
+  "estimatedMinutes": 35,
   "order": 80,
   "recommendWeight": 84,
   "status": "staging",
@@ -20,17 +20,22 @@
     "go.basics.types"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "重点是能不能讲出 defer 在 runtime 层的链表 + open-coded 两条路径、参数立即求值与闭包延迟求值的差异、panic 沿 _defer 链展开与 recover 必须直接位于 deferred 函数才生效，以及哪些 runtime fatal 不可 recover。",
+  "interviewerFocus": "重点考察：defer 在 runtime 层的 _defer 链表与 open-coded 两条路径、参数立即求值与 Go 1.22 循环变量语义边界、panic 沿 _defer 链展开与 recover 的 sp 校验条件、以及 runtime fatal 不可 recover 的硬边界。",
   "learningCards": [
     {
       "type": "explain",
       "title": "runtime 视角：defer 链表 + open-coded 两条执行路径",
-      "content": "defer 不是语法糖，runtime 给每个 G 维护一个 _defer 单链表（runtime/runtime2.go 里的 g._defer 字段）。每执行到一条 defer 语句，runtime.deferproc 会把函数指针、参数副本、sp/pc 包成 _defer 节点，头插到 g._defer；函数返回时编译器插入的 runtime.deferreturn 从链表头依次弹出执行，这就是 LIFO 的来源。\n\nGo 1.13 把 _defer 改成栈分配（deferprocStack）减少堆压力；Go 1.14 又上了 open-coded defer：当一个函数里 defer 数量 ≤8 且不在循环里出现时，编译器直接把 defer 信息编码成栈帧上的 bitmap，函数返回时按 bit 位决定是否执行，完全跳过链表和堆分配，性能从过去 defer 比直接调用慢 30~40ns 降到几乎无开销。这也是为什么 \"循环里写 defer\" 是个典型反模式——一旦在循环里，就回退到 deferproc 慢路径，且每次循环都往链表挂节点，资源要等外层函数返回才释放。\n\n动机层面要先抓清楚：defer 真正解决的是 \"无论从哪条返回路径退出都要保证清理\"，等价于 try/finally；它不是为了减少代码量。判断要不要用 defer，看这个清理动作是不是 \"无论成功失败、是否提前 return、是否 panic 都必须执行\"。"
+      "content": "Go 的 defer 不是编译期语法糖，而是 runtime 在每个 goroutine 上实打实维护的一套清理调度机制。理解 defer 的开销、优化条件和踩坑点，必须从 runtime 数据结构出发。\n\n每条 defer 语句在运行时对应一个 `_defer` 结构体（定义在 runtime/runtime2.go），包含函数指针、参数副本、栈指针 sp、程序计数器 pc 等字段。执行到 defer 语句时，runtime.deferproc 把这个结构体头插到当前 G 的 `g._defer` 单链表；函数返回时编译器插入的 runtime.deferreturn 从链表头依次弹出执行——这就是 LIFO 的来源，也是为什么多条 defer 的执行顺序和注册顺序相反。\n\n这条链表路径存在两个性能问题：每条 defer 都要在堆上分配 _defer 节点，函数返回后还要等 GC 回收；panic 展开时也要逐个遍历链表。Go 1.13 的优化是把 _defer 改为栈上分配（deferprocStack），减少堆压力。Go 1.14 更进一步引入 open-coded defer：当一个函数内 defer 数量不超过 8 个且不在循环路径中出现时，编译器直接把每条 defer 的执行信息编码成栈帧上的一个 bitmap 位，函数返回时按 bit 位决定是否执行对应的清理逻辑。这条路径完全跳过 _defer 链表和堆分配，开销接近于普通函数调用，是当前 Go 短函数中 defer 的最快路径。\n\nopen-coded 的条件不满足时（defer 超过 8 个、出现在循环体中），编译器回退到 deferproc 链表路径。这解释了为什么「循环里写 defer」是典型反模式：每次迭代都往链表挂一个新节点，且所有节点要等外层函数返回才一起执行，中间过程的资源（文件句柄、锁、数据库连接）一直不释放。正确做法是把循环体抽成子函数，让 defer 在子函数边界就生效并释放资源。"
     },
     {
       "type": "explain",
-      "title": "参数立即求值、命名返回值与 recover 的真正生效条件",
-      "content": "defer 最容易踩的两个机制点：\n\n一、参数立即求值。`defer f(x, g())` 在 deferproc 那一刻就把 x 的当前值和 g() 的返回值拷进 _defer 节点，函数指针 f 也同时绑定。所以经典输出题 `for i := 0; i < 3; i++ { defer fmt.Println(i) }` 输出 2 1 0，因为每次注册都把当时的 i 值拷走。但写成 `defer func() { fmt.Println(i) }()` 就是闭包延迟求值，闭包通过引用捕获 i，等真正执行时 i 已经是 3，输出三个 3。这两种形态在面试题里几乎必考。\n\n二、defer 修改命名返回值。函数签名写成 `func f() (err error)` 时，return 在编译期被拆成 \"赋值给 err → 调用 deferreturn → ret\"，所以 defer 里 `err = wrap(err)` 能改返回值；如果签名是 `func f() error` 这种匿名返回，return 表达式的值已经存到调用方栈位，defer 里改局部变量没用。这是 errors.Wrap、http handler 兜底、事务 commit/rollback 这类模式的底层机制。\n\nrecover 的硬规则只有一条：必须**直接**出现在 deferred 函数体里被调用，不能包一层。`defer func() { helper() }()` 里 helper 中 `recover()` 直接返回 nil，因为 runtime.recover 检查调用栈：调用者的 sp 必须等于当前展开的 _defer 节点的 sp。这个规则在 runtime/panic.go 的 gorecover 里实现。所以 middleware 模板永远是 `defer func() { if r := recover(); r != nil { ... } }()`，不能拆成函数。\n\n再补几条工程上经常吃亏的边界：\n- panic/recover 只覆盖当前 goroutine。`go work()` 里 panic 直接让进程崩，必须在 work 入口自己 `defer recover()`。\n- runtime fatal 不可 recover：concurrent map writes、stack overflow、out of memory、`-race` 检测到的数据竞争，runtime 直接走 fatalthrow，跳过 _defer 链。所以 recover 不是 \"万能兜底\"。\n- `defer file.Close()` 会吞 Close 返回的错误，写文件场景容易掩盖磁盘满；正确写法是 `defer func() { if cerr := file.Close(); cerr != nil && err == nil { err = cerr } }()`，配合命名返回值。"
+      "title": "参数立即求值、命名返回值与 Go 1.22 循环变量语义",
+      "content": "defer 有两个机制点直接影响写出来的代码行为，踩到就是生产 bug。\n\n**参数立即求值**。`defer f(x, g())` 中的 x 和 g() 都在 deferproc 注册的那一刻求值，结果拷进 _defer 节点保存；函数指针 f 也同时绑定。所以经典的 `for i := 0; i < 3; i++ { defer fmt.Println(i) }` 输出 2、1、0，因为每条 defer 注册时把当时的 i 值拷走，LIFO 弹出时自然是倒序。\n\n闭包形式的情况更微妙。`defer func() { fmt.Println(i) }()` 中的匿名函数捕获的是变量 i 的地址，执行时才读取。在 Go 1.21 及更早版本的语义下，for 循环的 `:=` 声明只创建一次变量，三次 defer 都指向同一个 i，函数返回时 i 已经是 3，所以输出三个 3。但 Go 1.22（基于 Go 1.22 的 for-range loopvar 提案）改变了这个语义：`:=` 声明的循环变量在每次迭代中是独立的，闭包捕获的是每轮自己的 i，所以 Go 1.22+ 模块下闭包形式也输出 2、1、0。go.mod 中的 go 指令决定编译器采用哪套语义——所以同一个代码文件在 1.21 和 1.22 模块下行为可以不同。面试时如果被问到老题，主动说出这个版本边界比死背输出更能区分水平。\n\n**命名返回值与 defer 的协作**。当函数签名是 `func f() (err error)` 这种命名返回值时，return 在编译期被拆成三步：先把表达式的值赋给命名变量 err → 调用 deferreturn 执行所有 defer → 最后执行 RET 指令把 err 的值传给调用方。因为 defer 发生在赋值之后、RET 之前，defer 里对 err 的修改会直接覆盖调用方拿到的值。这是 errors.Wrap、事务 commit/rollback、HTTP handler 错误兜底等模式的底层基础。反过来，`func f() error` 这种匿名返回值，return 表达式的值已经存到调用方的栈槽，defer 里改局部变量不会影响调用方看到的返回值。"
+    },
+    {
+      "type": "explain",
+      "title": "recover 的直接调用条件与 runtime fatal 不可 recover 的边界",
+      "content": "recover 是 Go 里唯一的 panic 拦截手段，但它的生效条件极其严格，而且存在多类完全不可拦截的场景。\n\n**recover 必须直接出现在 deferred 函数体中**。当 panic 发生时，runtime.gopanic 沿当前 G 的 _defer 链逐个执行 deferred 函数。如果某个 deferred 函数体内直接调用了 recover()，runtime.gorecover 会检查：调用 recover 的函数的栈指针 sp 是否等于当前正在展开的 _defer 节点记录的 sp。匹配则标记 _panic.recovered = true，panic 展开终止，函数转为正常返回。如果把 recover 包到一个 helper 函数里（`defer func() { helper() }()`），helper 中调用 recover 时，gorecover 发现调用方的 sp 是 helper 的栈帧而非 _defer 节点的 sp，直接返回 nil，panic 继续向上展开。所以 middleware/框架的标准写法只能是 `defer func() { if r := recover(); r != nil { ... } }()`，不能为了复用把 recover 搬到单独的函数里。\n\n**panic 不跨 goroutine**。_defer 链和 _panic 结构都挂在具体的 G 上，一个 goroutine 的 panic 只会沿自己的 _defer 链展开。如果子 goroutine panic 时自己没有 defer recover，panic 会一路展开到该 goroutine 的栈顶，调用 runtime.fatalpanic 终止整个进程——父 goroutine 的 defer recover 看不到也管不了。所以每个 `go func()` 入口都必须自己写 defer recover，这是 Go 并发编程的基本卫生要求。\n\n**runtime fatal 不可 recover**。以下场景 runtime 认为程序内部状态已经损坏，直接调用 throw/fatalthrow 终止进程，完全不走 _defer 链：\n- concurrent map writes：Go 的 map 不是并发安全的，写冲突检测到后直接 fatal\n- stack overflow：递归过深导致栈空间耗尽\n- out of memory：runtime 无法分配内存\n- `-race` 检测到的数据竞争：竞争检测器报告的严重竞争直接 fatal\n- 部分调度器内部不变量违反\n\n这些场景下写了 defer recover 也没有任何作用。所以 recover 不是万能兜底，正确的并发控制（sync.RWMutex、sync.Map）和资源限制才是根本。"
     },
     {
       "type": "diagram",
@@ -52,100 +57,104 @@
     },
     {
       "type": "compareTable",
-      "title": "defer/panic/recover 易错边界对照",
+      "title": "defer/panic/recover 易错边界与底层机制",
       "columns": [
         "场景",
         "实际行为",
         "底层机制",
-        "踩坑写法"
+        "典型踩坑"
       ],
       "rows": [
         [
           "defer 参数 vs 闭包",
-          "参数在 deferproc 立即拷贝；闭包通过引用捕获、执行时再读",
-          "_defer 节点保存参数副本；闭包是函数值 + 捕获指针",
-          "for i := range items { defer fmt.Println(i) } 输出全是 register 时的值，不是循环结束时"
+          "参数在 deferproc 注册时立即拷贝；闭包捕获变量地址、执行时再读",
+          "_defer 节点保存参数值副本；闭包是函数值 + 捕获变量指针",
+          "Go 1.22 前闭包捕获循环变量会看到最终值，Go 1.22+ per-iteration 语义改变此行为，面试时不讲版本边界容易答错"
         ],
         [
           "defer 改返回值",
           "命名返回值能改；匿名返回值改不动",
-          "命名返回值 return 拆成赋值 + deferreturn + ret，defer 改的是栈上同一个槽",
-          "func f() error 签名下在 defer 里赋值 err，调用方拿到的还是原值"
+          "命名返回值 return 编译期拆成 赋值 → deferreturn → ret，defer 改的是同一个栈槽",
+          "func f() error 签名下在 defer 里改 err，调用方拿到的还是 return 表达式的原值"
         ],
         [
           "recover 位置",
           "必须直接在 deferred 函数体；包一层 helper 失效",
-          "gorecover 比对调用方 sp 与当前 _defer 节点 sp",
-          "defer logRecover() 把 recover 封装进函数，看似复用实则永远拿到 nil"
+          "gorecover 比对调用方 sp 与当前 _defer 节点 sp，不匹配返回 nil",
+          "把 recover 抽到 logRecover() helper 想复用，看似优雅实则永远返回 nil"
         ],
         [
           "跨 goroutine panic",
           "子 goroutine panic 不会冒到父 goroutine",
-          "_defer 和 _panic 都挂在 g 上，runtime 找不到外层 G 的 defer 链",
+          "_defer 和 _panic 都挂在 G 上，panic 只沿自己的链展开",
           "go handle(req) 没有入口 defer recover，单个请求 panic 直接干掉整个进程"
         ],
         [
           "runtime fatal",
-          "recover 拦不住",
-          "concurrent map writes / stack overflow / OOM 走 throw → fatalthrow，跳过 _defer",
-          "用 defer recover 想兜住并发写 map，线上仍然 crash 还以为 recover 失效"
+          "recover 拦不住，进程直接终止",
+          "concurrent map writes / stack overflow / OOM / -race 数据竞争走 throw → fatalthrow，跳过 _defer 链",
+          "用 defer recover 想兜住并发写 map，线上仍然 crash 后误以为 recover 代码写错了"
         ],
         [
-          "循环 defer",
-          "open-coded 优化失效，资源延迟到外层返回",
-          "Go 1.14 open-coded 要求 defer ≤8 且非循环路径，否则回退 deferproc 链表慢路径",
-          "for _, f := range files { defer f.Close() } 在大批量场景 fd 一直不释放"
+          "循环里 defer",
+          "open-coded 失效回退链表路径，资源延迟到外层返回才释放",
+          "Go 1.14 open-coded 要求 defer ≤8 且非循环路径；循环里每轮 deferproc 挂节点到链表",
+          "for _, f := range files { defer f.Close() } 批量场景 fd 持续增长直到函数返回"
         ]
       ]
     },
     {
       "type": "code",
-      "title": "立即求值 vs 闭包、命名返回值、helper 包一层 recover 失效",
+      "title": "参数立即求值、命名返回值、recover 失效与正确写法",
       "language": "go",
-      "content": "package main\n\nimport (\n\t\"errors\"\n\t\"fmt\"\n)\n\n// 1) 参数立即求值 vs 闭包延迟求值\nfunc loopDefer() {\n\tfor i := 0; i < 3; i++ {\n\t\tdefer fmt.Println(\"arg:\", i)              // 注册时拷贝 i：输出 2,1,0\n\t\tdefer func() { fmt.Println(\"clo:\", i) }() // 闭包捕获引用：循环结束 i=3，输出三个 3\n\t}\n}\n\n// 2) 命名返回值 + defer 包装错误\nfunc readConfig() (cfg string, err error) {\n\tdefer func() {\n\t\tif err != nil {\n\t\t\terr = fmt.Errorf(\"readConfig: %w\", err) // 命名返回值才能在 defer 里改\n\t\t}\n\t}()\n\treturn \"\", errors.New(\"file not found\")\n}\n\n// 3) recover 包一层就失效\nfunc badRecover() {\n\tdefer logRecover() // helper 里 recover() 永远返回 nil\n\tpanic(\"won't be caught\")\n}\nfunc logRecover() {\n\tif r := recover(); r != nil {\n\t\tfmt.Println(\"caught:\", r)\n\t}\n}\n\n// 4) 正确写法：recover 必须直接在 deferred 函数体\nfunc safeRun(fn func()) (err error) {\n\tdefer func() {\n\t\tif r := recover(); r != nil {\n\t\t\terr = fmt.Errorf(\"panic: %v\", r) // 直接调用 recover，sp 匹配才生效\n\t\t}\n\t}()\n\tfn()\n\treturn nil\n}\n\n// 5) 跨 goroutine panic 必须各自 defer recover\nfunc spawn() {\n\tgo func() {\n\t\tdefer func() { _ = recover() }() // 没这一行，子 goroutine panic 直接 crash 整个进程\n\t\tpanic(\"in child\")\n\t}()\n}\n",
+      "content": "package main\n\nimport (\n\t\"errors\"\n\t\"fmt\"\n)\n\n// 1) 参数立即求值 vs 闭包捕获：Go 1.22 per-iteration 语义\nfunc loopDefer() {\n\tfor i := 0; i < 3; i++ {\n\t\tdefer fmt.Println(\"arg:\", i)              // 参数立即求值，注册时拷贝：输出 2,1,0\n\t\tdefer func() { fmt.Println(\"clo:\", i) }() // Go 1.22+ per-iteration：也输出 2,1,0\n\t}\n\t// Go 1.21 及更早 go.mod 下闭包形式输出三个 3\n\n\tvar j int\n\tfor ; j < 3; j++ {\n\t\tdefer func() { fmt.Println(\"outer:\", j) }() // 捕获循环外变量，j 不受 per-iteration 影响\n\t}\n}\n\n// 2) 命名返回值：defer 里能修改返回值\nfunc readConfig() (cfg string, err error) {\n\tdefer func() {\n\t\tif err != nil {\n\t\t\terr = fmt.Errorf(\"readConfig: %w\", err) // 命名返回值，改的是同一个栈槽\n\t\t}\n\t}()\n\treturn \"\", errors.New(\"file not found\")\n}\n\n// 3) recover 包一层 helper 就失效\ntype appError struct{ msg string }\n\nfunc (e *appError) Error() string { return e.msg }\n\nfunc badRecover() {\n\tdefer logRecover() // helper 里 recover() 的 sp 跟 _defer.sp 不匹配，永远返回 nil\n\tpanic(&appError{msg: \"won't be caught\"})\n}\nfunc logRecover() {\n\tif r := recover(); r != nil {\n\t\tfmt.Println(\"caught:\", r)\n\t}\n}\n\n// 4) 正确模板：recover 直接在 deferred 函数体，sp 匹配才生效\nfunc safeRun(fn func()) (err error) {\n\tdefer func() {\n\t\tif r := recover(); r != nil {\n\t\t\terr = fmt.Errorf(\"panic: %v\", r)\n\t\t}\n\t}()\n\tfn()\n\treturn nil\n}\n\n// 5) 跨 goroutine panic：每个 go func() 必须自己 defer recover\nfunc spawn() {\n\tgo func() {\n\t\tdefer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\tfmt.Println(\"child caught:\", r)\n\t\t\t}\n\t\t}() // 没这一行，子 goroutine panic 直接 fatalpanic 终止进程\n\t\tpanic(\"in child\")\n\t}()\n}\n\n// 6) 循环里 defer 的正确替代：抽子函数\nfunc closeAll(files []string) error {\n\tfor _, name := range files {\n\t\tif err := openAndClose(name); err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n\treturn nil\n}\nfunc openAndClose(name string) (err error) {\n\t// defer 在子函数返回时执行，fd 及时释放\n\tf, err := osOpen(name)\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer func() {\n\t\tif cerr := f.Close(); cerr != nil && err == nil {\n\t\t\terr = cerr\n\t\t}\n\t}()\n\treturn nil\n}\n\nfunc osOpen(name string) (*osFile, error) { return &osFile{name: name}, nil }\n\ntype osFile struct{ name string }\n\nfunc (f *osFile) Close() error { return nil }\n\nfunc main() {\n\tloopDefer()\n\t_, _ = readConfig()\n\tbadRecover()\n\t_ = safeRun(func() { panic(\"recovered\") })\n\tspawn()\n}",
       "highlights": [
         {
           "line": 11,
-          "note": "loopDefer 第一行是参数立即求值：deferproc 把 i 当时的值拷进 _defer 节点，所以输出 2、1、0。第二行是闭包延迟求值，循环结束时 i 已经是 3，三个 defer 看到的是同一个 i，输出三个 3——这是 Go 面试输出题最经典的二选一。"
+          "note": "参数形式在 deferproc 注册时求值并拷贝。闭包形式在 Go 1.22+ 的 for i := ... 中，每轮 i 是独立变量，闭包也看到各轮值；捕获循环外变量或旧 go.mod 语义才出现三个 3。"
         },
         {
-          "line": 19,
-          "note": "命名返回值 (cfg string, err error) 让 return 在编译期拆成『赋值 → deferreturn → ret』，defer 里改 err 改的是调用方将要读的栈槽。换成 func readConfig() error 这种匿名签名，defer 里赋值就改不到调用方拿到的值。"
+          "line": 25,
+          "note": "命名返回值 (cfg string, err error) 让 return 编译期拆成 赋值 → deferreturn → ret，defer 里改 err 改的是调用方读的同一个栈槽。换成 func f() error 匿名签名，defer 里赋值就改不到调用方值。"
         },
         {
-          "line": 27,
-          "note": "badRecover 是真实生产里反复出现的坑：把 recover 抽成 helper 想复用日志逻辑，结果 runtime.gorecover 校验调用方 sp 跟 _defer.sp 不一致直接返回 nil，panic 继续往上展开。要复用就把日志函数作为参数传进 deferred 闭包，而不是把 recover 移走。"
+          "line": 37,
+          "note": "badRecover 是生产中反复出现的坑：把 recover 抽成 helper 想复用，runtime.gorecover 校验调用方 sp 跟 _defer.sp 不一致直接返回 nil，panic 继续向上展开。"
         },
         {
-          "line": 41,
-          "note": "safeRun 是 HTTP middleware / 任务调度器入口的标准模板：直接在 deferred 匿名函数里调 recover，配合命名返回 err，把 panic 转成可观测的 error 抛出去。注意只能兜业务级 panic，concurrent map writes/stack overflow/OOM 这类 runtime fatal 走 fatalthrow，这里也拦不住。"
+          "line": 50,
+          "note": "safeRun 是 HTTP middleware / 任务调度器入口的标准模板：recover 直接在 deferred 匿名函数里调用，配合命名返回 err 把 panic 转成 error。注意只能兜业务级 panic，runtime fatal 拦不住。"
         },
         {
-          "line": 51,
-          "note": "spawn 提醒：panic 只在当前 G 的 _defer 链上展开，父 goroutine 的 defer recover 看不到子 goroutine 的 panic。生产上每个 go func() 入口都要自己 defer recover()，否则一个请求处理 panic 就把整个进程带走。"
+          "line": 60,
+          "note": "panic 只在当前 G 的 _defer 链上展开，父 goroutine 的 defer recover 看不到子 goroutine 的 panic。每个 go func() 入口都要自己 defer recover。"
+        },
+        {
+          "line": 71,
+          "note": "循环里 defer 的正确替代：抽子函数让 defer 在子函数边界执行，资源及时释放。配合命名返回值回写 Close 错误。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
-      "title": "面试三层回答：runtime 机制 → 易错点 → 工程边界",
-      "content": "一句话先给结论：defer 是 runtime 给每个 G 维护的 _defer 链表 + Go 1.14 起的 open-coded 栈帧 bitmap 两条路径，panic 沿这条链 LIFO 展开，recover 必须直接位于 deferred 函数体内才能截停。\n\n机制要点：\n- 顺着展开讲：\n- 机制层：每条 defer 由 deferproc 把函数指针、参数副本、sp/pc 头插到 g._defer 链表；函数返回时编译器插入的 deferreturn 从头依次弹出，这就是 LIFO 由来。Go 1.13 改栈分配减少堆压力；Go 1.14 上 open-coded：函数内 defer ≤8 个且不在循环路径上时，直接用栈帧位图标记，跳过链表和堆分配，性能基本等同直接调用。循环里写 defer 会退回慢路径，资源还要等外层返回才释放。\n- 语义层：defer 参数在注册时立即求值，闭包则延迟到执行时按引用读——这就是 `defer fmt.Println(i)` 输出 2 1 0 而 `defer func() { fmt.Println(i) }()` 输出三个 3 的根源。命名返回值场景下，return 在编译期拆成『赋值 → deferreturn → ret』，所以 defer 里能改返回值，errors.Wrap、事务回滚都是这个机制。\n- panic/recover 层：panic 调用 runtime.gopanic 沿当前 G 的 _defer 链遍历执行，遇到 deferred 函数体里直接调用的 recover，runtime.gorecover 校验调用方 sp 与 _defer.sp 匹配后标记 recovered，函数转为正常返回。三条硬边界：（一）recover 包一层 helper 就失效，必须写在匿名函数里直接调；（二）panic 不跨 goroutine，每个 go func() 入口都要自己 defer recover；（三）concurrent map writes、stack overflow、OOM 这类 runtime fatal 走 fatalthrow，不进入 _defer 链，recover 拦不住。\n- 工程层：业务可预期错误一律返回 error，recover 只在框架边界（HTTP handler、消息消费、定时任务入口）做兜底，捕获后必须落 panic value + 堆栈 + 请求 id，否则只是把故障吞掉。`defer file.Close()` 在写文件场景会吞 Close 错误，正确做法是把 Close 错误赋回命名返回值。",
+      "title": "面试回答思路：runtime 机制 → 语义细节 → panic/recover 边界",
+      "content": "**一句话结论**：defer 是 runtime 给每个 G 维护的 _defer 链表（deferproc 头插、deferreturn LIFO 弹出）与 Go 1.14 open-coded 栈帧 bitmap 两条路径；panic 沿当前 G 的 _defer 链展开，recover 必须直接在 deferred 函数体中调用且 gorecover 通过 sp 校验才生效。\n\n**机制主线**\n\n- defer 注册路径：每条 defer 语句由 runtime.deferproc 把函数指针、参数副本、sp/pc 包成 _defer 节点，头插到 g._defer 单链表。函数返回时编译器插入的 runtime.deferreturn 从头弹出执行，LIFO 就是这么来的。\n- open-coded 优化（Go 1.14）：函数内 defer ≤8 个且不在循环路径时，编译器直接把 defer 信息编码成栈帧 bitmap，函数返回时按 bit 执行，完全跳过链表和堆分配。不满足条件（defer 超 8 个或出现在循环体）回退到 deferproc 链表慢路径。循环里写 defer 既退化到慢路径，又导致资源延迟到外层函数返回才释放。\n- 栈分配改进（Go 1.13）：_defer 改为栈分配减少堆压力，是 open-coded 之前的中间优化。\n\n**语义细节**\n\n- 参数立即求值：defer f(x, g()) 中 x 和 g() 在注册时求值拷贝，执行时读的是副本。闭包捕获变量地址、延迟到执行时读取。\n- Go 1.22 循环变量语义：`:=` 声明的 for/range 循环变量改为 per-iteration 作用域，闭包捕获的是每轮独立的变量。go.mod 的 go 指令决定采用哪套语义——同一个代码在 1.21 和 1.22 模块下行为不同。\n- 命名返回值：`func f() (err error)` 签名下 return 编译期拆成 赋值给 err → deferreturn → ret，defer 里改 err 会覆盖调用方拿到的返回值。匿名返回值签名做不到这一点。\n\n**panic/recover 边界**\n\n- recover 直接调用条件：gorecover 检查调用方 sp 是否等于当前 _defer 节点的 sp。直接在 deferred 函数体中调用，sp 匹配；包一层 helper 后 sp 不匹配，返回 nil，panic 继续展开。\n- panic 不跨 goroutine：_defer 和 _panic 都挂在 G 上，子 goroutine panic 只沿自己的链展开。每个 go func() 入口必须自己 defer recover。\n- runtime fatal 不可 recover：concurrent map writes、stack overflow、OOM、-race 数据竞争走 throw/fatalthrow，跳过 _defer 链，recover 拦不住。\n\n**工程建议**\n\n- recover 只在框架边界（HTTP handler、消息消费、定时任务入口）做兜底，捕获后记录 panic value + 堆栈 + 请求 id。\n- `defer file.Close()` 吞错误，写文件场景应改为 `defer func() { if cerr := f.Close(); cerr != nil && err == nil { err = cerr } }()` 配合命名返回值。\n- 循环里批量打开资源应抽子函数，让 defer 在子函数边界释放资源。",
       "followUpQuestions": [
         {
           "question": "Go 1.14 的 open-coded defer 优化在什么条件下生效？为什么循环里 defer 会让性能掉下去？",
-          "answer": "条件是函数内 defer 数量 ≤8 且不出现在循环路径上；满足时编译器把每条 defer 编码成栈帧上的 bitmap，函数返回时按 bit 决定是否执行，完全跳过 deferproc + g._defer 链表 + 堆分配，开销基本等于直接调用。循环里 defer 不满足该条件，回退到 deferproc 慢路径，每轮迭代都要往链表挂节点，且这些节点要等外层函数返回才一起执行，资源不会随循环 iteration 释放——所以批量打开文件应改成显式 Close 或抽出子函数让 defer 在子函数边界生效。"
+          "answer": "条件是函数内 defer 数量 ≤8 且不出现在循环路径上。满足时编译器把每条 defer 编码成栈帧上的 bitmap，函数返回时按 bit 决定是否执行，完全跳过 deferproc + g._defer 链表 + 堆分配，开销接近直接调用。循环里 defer 不满足该条件，回退到 deferproc 慢路径，每轮迭代都要往链表挂 _defer 节点，且这些节点要等外层函数返回才一起执行——资源不会随循环 iteration 释放。正确做法是把循环体抽成子函数，让 defer 在子函数返回时就执行。"
         },
         {
           "question": "为什么把 recover 抽到一个 helper 函数里调用就失效？runtime 是怎么判定的？",
-          "answer": "runtime.gorecover 检查调用方的 sp 是否等于当前正在展开的 _defer 节点保存的 sp。直接写在 deferred 函数体里时，recover 的调用栈帧就是这个 deferred 函数，sp 匹配；包一层 helper 后，recover 的调用方变成 helper 自己，sp 跟 _defer.sp 不一致，gorecover 直接返回 nil，panic 继续往上展开。所以 middleware 写法只能是 `defer func() { if r := recover(); r != nil { ... } }()`，不能为了复用把 recover 搬进函数。"
+          "answer": "runtime.gorecover 检查调用 recover 的函数的 sp 是否等于当前正在展开的 _defer 节点保存的 sp。直接写在 deferred 函数体里时，recover 的调用栈帧就是这个 deferred 函数，sp 匹配；包一层 helper 后，recover 的调用方变成 helper 函数，sp 跟 _defer.sp 不一致，gorecover 直接返回 nil，panic 继续往上展开。middleware 写法只能是 `defer func() { if r := recover(); r != nil { ... } }()`。"
         },
         {
-          "question": "哪些场景的 panic 即使写了 defer recover 也兜不住？",
-          "answer": "凡是 runtime 直接调用 throw / fatalthrow 的都不进入 _defer 链：concurrent map writes（map 并发读写检测）、stack overflow（栈递归到上限）、out of memory、`-race` 检测到的数据竞争、以及部分调度器内部不变量违反。这些场景 runtime 认为程序状态已损坏，跳过所有 defer 直接终止进程。所以 recover 不能替代正确的并发控制——map 并发写就该用 sync.Map 或 RWMutex，而不是指望兜底。"
+          "question": "哪些场景即使写了 defer recover 也兜不住？为什么？",
+          "answer": "凡是 runtime 直接调用 throw/fatalthrow 的场景都不进入 _defer 链：concurrent map writes（map 并发写检测）、stack overflow（栈空间耗尽）、out of memory、-race 检测到的数据竞争、以及部分调度器内部不变量违反。这些场景 runtime 认为程序状态已经损坏，跳过所有 defer 直接终止进程。所以 recover 不能替代正确的并发控制——map 并发写就该用 sync.RWMutex 或 sync.Map。"
         },
         {
-          "question": "为什么 `defer fmt.Println(i)` 在 for 循环里输出的是注册时的 i，而 `defer func(){ fmt.Println(i) }()` 输出循环结束后的 i？",
-          "answer": "前者参数在 deferproc 调用时立即求值，把当前 i 的值拷贝到 _defer 节点的参数槽，三次注册分别拷走 0、1、2，LIFO 执行所以输出 2、1、0。后者 defer 的是闭包，闭包通过引用捕获外层 i，三个 _defer 节点保存的是同一个函数值和同一个 i 的指针；等到函数返回开始执行 defer 时循环已经结束，i = 3，三次输出都是 3。要让闭包形态也保留每轮的值，要么 `i := i` 在循环体内重新声明，要么改成立即求值的参数形式。"
+          "question": "Go 1.22 的循环变量语义变化对 defer 闭包有什么影响？面试时怎么答才不掉坑？",
+          "answer": "Go 1.22 起 `:=` 声明的 for/range 循环变量改为 per-iteration 作用域，每次迭代创建独立变量。`defer func() { fmt.Println(i) }()` 捕获的是每轮自己的 i，LIFO 输出 2、1、0——跟参数形式行为一致了。旧语义（Go 1.21 及更早 go.mod）下循环变量只创建一次，闭包看到的是循环结束后的最终值 3，输出三个 3。面试时应主动说出 go.mod 的 go 指令决定编译器采用哪套语义，而不是死背老题的输出。"
         }
       ]
     },
@@ -153,59 +162,68 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能讲出 defer 在 runtime 层的两条路径：g._defer 链表（deferproc/deferreturn）与 Go 1.14 open-coded 栈帧 bitmap，以及 ≤8 + 非循环的触发条件",
-        "能用 `defer fmt.Println(i)` vs `defer func(){ fmt.Println(i) }()` 解释参数立即求值与闭包延迟求值的差异",
-        "能解释命名返回值场景下 defer 为什么能修改返回值（return 拆成赋值→deferreturn→ret），以及 errors.Wrap 与 file.Close 错误回写的写法",
-        "能说出 recover 必须直接位于 deferred 函数体的原因（gorecover 比对 sp）以及包一层 helper 失效的根因",
+        "能讲出 defer 的两条 runtime 路径：g._defer 链表（deferproc 头插 / deferreturn LIFO 弹出）与 Go 1.14 open-coded 栈帧 bitmap（≤8 且非循环）",
+        "能用 defer fmt.Println(i) vs defer func(){ fmt.Println(i) }() 解释参数立即求值与 Go 1.22 循环变量 per-iteration 语义，并说明 go.mod go 指令决定哪套语义",
+        "能解释命名返回值下 defer 能修改返回值的编译期拆解（赋值 → deferreturn → ret），以及匿名返回值做不到",
+        "能说出 recover 必须直接位于 deferred 函数体的原因（gorecover 通过 sp 校验）以及包 helper 失效的根因",
         "能列出至少三类 runtime fatal 不可 recover 的场景：concurrent map writes、stack overflow、OOM、-race 数据竞争",
-        "能解释 panic 不跨 goroutine 的原因（_panic/_defer 都挂在 G 上）以及 go func() 入口必须自己 defer recover",
-        "能说清楚循环里 defer 的两个代价：open-coded 失效 + 资源延迟到外层函数返回才释放"
+        "能解释 panic 不跨 goroutine 的原因（_defer/_panic 都挂在 G 上）以及 go func() 入口必须自己 defer recover",
+        "能说清循环里 defer 的两个代价：open-coded 失效回退链表慢路径 + 资源延迟到外层函数返回才释放",
+        "能写出 file.Close 错误回写的正确模式（命名返回值 + defer 中 cerr 回写）"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "go.runtime.defer-panic-recover.recall.1",
-      "prompt": "讲清 defer 在 runtime 的两条路径：g._defer 链表与 Go 1.14 open-coded 优化分别在什么条件下走，以及循环里 defer 为什么慢。",
+      "prompt": "讲清 defer 在 runtime 层的两条路径：g._defer 链表与 Go 1.14 open-coded 优化分别在什么条件下走，以及循环里 defer 为什么既慢又危险。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "go.runtime.defer-panic-recover.recall.2",
-      "prompt": "用 `defer fmt.Println(i)` 和 `defer func(){ fmt.Println(i) }()` 在 for 循环里的输出差异，解释参数立即求值 vs 闭包延迟求值，并说出命名返回值如何让 defer 改返回值。",
+      "prompt": "分别用参数形式和闭包形式的 defer 说明参数立即求值行为，并解释 Go 1.22 循环变量语义变化对闭包 defer 的影响。再说明命名返回值为什么能让 defer 修改返回值。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "go.runtime.defer-panic-recover.recall.3",
-      "prompt": "为什么 recover 包一层 helper 函数就失效？哪些 runtime fatal（举三个）即使 defer recover 也兜不住？",
+      "prompt": "为什么 recover 包一层 helper 函数就失效？runtime 是通过什么条件判定的？再举出至少三个 runtime fatal 场景，说明为什么 defer recover 兜不住。",
       "mode": "text",
       "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "go.runtime.defer-panic-recover.recall.4",
+      "prompt": "Go 1.22 循环变量语义变化后，`for i := 0; i < 3; i++ { defer func() { fmt.Println(i) }() }` 的输出是什么？如果 go.mod 声明的是 go 1.21 呢？为什么会不同？",
+      "mode": "text",
+      "expectedMinutes": 3,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "g._defer 链表 + Go 1.14 open-coded 栈帧 bitmap 两条路径与触发条件",
-      "defer 参数立即求值 vs 闭包延迟求值（for 循环输出题）",
-      "命名返回值让 defer 能修改返回值的编译期拆解（赋值→deferreturn→ret）",
-      "recover 必须直接位于 deferred 函数体，gorecover 通过 sp 校验",
-      "panic 不跨 goroutine，每个 go func() 入口需自己 defer recover"
+      "能讲出 _defer 链表（deferproc/deferreturn）与 open-coded 栈帧 bitmap 两条路径及触发条件（≤8 + 非循环）",
+      "能解释参数立即求值 vs 闭包延迟求值，以及 Go 1.22 循环变量 per-iteration 语义变化与 go.mod 版本边界",
+      "能说明命名返回值让 defer 改返回值的编译期拆解机制（赋值→deferreturn→ret）",
+      "能说出 recover 必须直接在 deferred 函数体中调用，gorecover 通过 sp 校验判定",
+      "能解释 panic 不跨 goroutine（_defer/_panic 挂在 G 上），go func() 入口需自己 defer recover"
     ],
     "goodToHave": [
-      "循环里 defer 退回慢路径且资源延迟释放的问题",
-      "concurrent map writes / stack overflow / OOM / -race 等 runtime fatal 不可 recover",
-      "defer file.Close() 吞错误的修复（命名返回值 + cerr 回写）",
-      "framework 边界（HTTP middleware、消息消费、定时任务）recover 模板与日志要素"
+      "能列出 concurrent map writes / stack overflow / OOM / -race 等 runtime fatal 不可 recover 的场景及原因",
+      "能说明循环里 defer 退回慢路径且资源延迟释放的问题及正确替代（抽子函数）",
+      "能写出 defer file.Close() 错误回写的正确模式（命名返回值 + cerr 回写）",
+      "能说明 recover 只在框架边界（HTTP handler、消息消费）做兜底，捕获后需记录 panic value + 堆栈"
     ],
     "commonMistakes": [
       "把 recover 抽成 helper 函数复用，导致 sp 不匹配永远返回 nil",
-      "用匿名返回值签名却在 defer 里改 err，调用方拿到原值",
-      "go func() 入口未 defer recover，子 goroutine panic 直接打挂整个进程",
-      "用 defer recover 兜并发写 map / 栈溢出，仍然 crash 后误以为 recover 失效",
-      "在大循环里 defer f.Close()，文件句柄堆到外层返回才释放"
+      "用匿名返回值签名却在 defer 里改 err，调用方拿到的还是原值",
+      "go func() 入口未 defer recover，子 goroutine panic 直接 fatalpanic 终止进程",
+      "用 defer recover 想兜住并发写 map / 栈溢出，仍然 crash 后误以为 recover 代码写错",
+      "在大批量循环里 defer f.Close()，fd 堆积到外层返回才释放",
+      "死背 Go 1.21 的闭包输出题，不知道 Go 1.22 循环变量语义已改变"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -214,5 +232,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

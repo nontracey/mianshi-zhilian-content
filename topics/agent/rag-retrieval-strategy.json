@@ -4,7 +4,7 @@
   "category": "rag",
   "group": "rag",
   "title": "RAG 召回策略",
-  "summary": "RAG 召回策略决定了如何从向量库中检索最相关的文档片段，直接影响生成质量，面试中常考察混合检索、重排序和多路召回的设计。",
+  "summary": "RAG 召回策略解决的是「怎样把正确、可用、有权限的证据片段送进 LLM 上下文」这一工程问题。它覆盖 query rewrite（改写/扩展/HyDE）、多路召回（向量 + BM25 + metadata filter）、重排序（cross-encoder / LLM reranker）和上下文构建（去重/压缩/引用/权限）四个阶段，面试重点考察每一层的原理、选型和失败归因。",
   "tags": [
     "RAG",
     "召回策略",
@@ -13,19 +13,34 @@
     "查询改写"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 25,
+  "estimatedMinutes": 23,
   "order": 25,
   "recommendWeight": 85,
   "learningCards": [
     {
       "type": "explain",
-      "title": "RAG 召回策略：核心策略",
-      "content": "讲 RAG 召回策略时，要先区分召回、重排和生成三个阶段的责任。召回侧关注切片粒度、embedding 模型、关键词混合、metadata filter 和 TopK；重排侧解决“语义相近但证据不足”的排序问题；生成侧只消费被选中的证据，不能替召回补事实。\n\n调优不能只看一次回答是否顺眼。应该把失败样本拆成四类：没有召回正确证据、召回到了但排序靠后、证据进入上下文但模型没用、证据本身过期或权限不匹配。对应动作分别是调 chunk、换 embedding/混合检索、加 reranker/引用约束、修数据治理和权限过滤。\n\n指标上，召回看 Recall@K、MRR、nDCG、证据覆盖率；生成看忠实度、引用一致性和拒答质量；线上还要看延迟、token 成本、无答案率和人工纠错率。"
+      "title": "召回阶段：向量检索、BM25 和 metadata filter 各管什么",
+      "content": "召回阶段的目标是在百万级文档库中快速缩小候选集。向量检索把 query 和 document chunk 都编码成 embedding 后做近似最近邻（ANN），对语义改写天然鲁棒，例如「如何重置密码」能召回「忘记密码怎么办」；但对错误码、API 名称、配置键、版本号这类精确 token，embedding 模型可能把它们映射到相近向量空间，导致精确匹配不稳定。\n\nBM25 是经典的词袋 TF-IDF 变体，对精确短语、代码符号、FAQ 标题、日志关键字非常有效；但它几乎不做语义泛化，「退款」搜不到「退货」。生产环境中二者通常并行执行，各自返回 TopK 候选后做融合。\n\nmetadata filter 在召回侧就完成权限、租户、文档类型、时间和语言等硬约束，避免后续环节处理越权或过期内容。filter 可以前置（先过滤再检索，如 Pinecone / Weaviate 的 pre-filter）或后置（检索后过滤），前置延迟低但索引设计要求高，后置灵活但可能浪费检索配额。三者配合才能让候选集既语义相关又精确、又有权限边界。"
     },
     {
       "type": "explain",
-      "title": "RAG 召回策略的边界、坑点与答题抓手",
-      "content": "讲 RAG 召回策略时，要先区分召回、重排和生成三个阶段的责任。召回侧关注切片粒度、embedding 模型、关键词混合、metadata filter 和 TopK；重排侧解决“语义相近但证据不足”的排序问题；生成侧只消费被选中的证据，不能替召回补事实。\n\n排查要按失败样本归因：标准证据没有进 TopK，优先看分块、索引、query rewrite 和混合检索；证据进了 TopK 但排名靠后，优先看 reranker；证据进入上下文但答案仍错，检查 prompt、冲突证据和引用约束；证据过期或越权，则回到数据治理和权限过滤。\n\n指标上，召回看 Recall@K、MRR、nDCG 和证据覆盖率；生成看忠实度、引用一致性和拒答质量；线上还要看延迟、token 成本、无答案率和人工纠错率。"
+      "title": "多路融合与重排序：从候选集到确信证据",
+      "content": "多路召回后需要把向量分数和 BM25 分数统一到可比较的排序空间。倒数排名融合（RRF）不依赖原始分值，只看各路排名的倒数求和，实现简单且对不同量纲鲁棒，适合快速上线。如果两条路的分数校准较好（例如都归一化到 0-1），也可以加权线性融合，但需要开发集调参。\n\n重排序（reranker）解决的是「语义相近但证据不足」的排序问题。cross-encoder 将 query 和候选 chunk 拼接后过 Transformer，能捕捉 token 级交互，排序精度远高于 bi-encoder 的向量余弦；代价是每个 query-candidate pair 都要过一次模型，延迟和成本随候选数线性增长。常见做法是先用向量 + BM25 取 Top 50-100 候选，再用 cross-encoder rerank 到 Top 5-10 送入上下文。LLM-based reranker（如用 GPT 打分或 listwise 排序）精度更高但成本更大，适合高价值场景。\n\n如果 reranker 之后正确证据仍不在 Top-K，问题可能在上游——chunk 切得太细导致关键信息被切断，或 embedding 模型对领域术语泛化不足。"
+    },
+    {
+      "type": "explain",
+      "title": "查询改写：让用户的模糊问题变成检索友好的表达",
+      "content": "用户的原始问题经常口语化、省略关键上下文或包含多意图，直接检索效果差。查询改写（query rewrite）在召回之前把问题变换成更适合检索的形式。\n\n最简单的方式是让 LLM 做一步改写：把口语问题转换成正式查询、补全省略的实体或条件。多查询（multi-query）策略让 LLM 对同一问题生成 2-5 个不同表述，各自独立检索后合并候选，能提高召回多样性。HyDE（Hypothetical Document Embeddings）让 LLM 先生成一个「假想答案」，再用这个答案的 embedding 做检索——因为假想答案和真实文档的语义分布更接近，对某些概念性问题召回率显著提升；但 HyDE 在专有名词、错误码场景可能生成误导性假想文档，反而降低召回质量，需要和 BM25 混合使用或仅对概念性问题开启。\n\n路由（routing）是另一层优化：根据 query 类型决定走向量检索、关键词检索还是直接查结构化数据库（SQL/API），避免把简单精确查询硬塞进语义检索流程。"
+    },
+    {
+      "type": "explain",
+      "title": "上下文构建：证据进入 prompt 之前的最后关口",
+      "content": "reranker 输出的 Top-K 候选还需要经过上下文构建才送入 LLM。这一步包括去重（同一文档不同 chunk 可能高度相似）、压缩（提取关键句或用 LLM 做 extractive 摘要以控制 token）、引用标记（给每段证据加 source ID 方便答案溯源）和权限再校验（二次确认当前用户对该证据有读权限）。\n\n上下文长度是硬约束。即使 Top-K 选了 10 段证据，总 token 超过模型上下文窗口就必须截断或压缩。此时要优先保留 reranker 排名最高、来源最新的证据。冲突证据（两段文档对同一事实说法矛盾）需要在 prompt 中显式标注，让 LLM 识别并说明不一致，而不是随机选一条。\n\n这一层也是最后的数据治理关卡：过期文档、未审核草稿、已撤回公告不应出现在最终 prompt 中。如果证据来源有版本号或时间戳，应优先选最新版本。"
+    },
+    {
+      "type": "explain",
+      "title": "评估与归因：用指标和失败样本驱动优化",
+      "content": "RAG 召回优化不能靠「试了几个问题觉得还行」来判断。必须建立系统化的评估体系。\n\n召回侧核心指标：Recall@K 衡量正确证据是否在 Top-K 中出现；MRR（Mean Reciprocal Rank）关注正确证据的排名位置；nDCG 考虑排序质量的增益衰减。证据覆盖率衡量「问题所需的所有关键证据片段都被召回」的比例，比单条 Recall 更严格。\n\n生成侧指标：忠实度（faithfulness）衡量答案是否基于证据而非幻觉；引用一致性衡量答案中的引用标注是否真的对应支持该句的证据；拒答质量衡量模型在证据不足时是否正确拒答而非胡说。\n\n线上指标：端到端延迟、token 成本、无答案率、人工纠错率。\n\n失败归因必须拆到具体环节：正确证据没进 Top-K → 调 chunk / embedding / 混合检索 / metadata filter；进了 Top-K 但排名靠后 → 调 reranker 或融合权重；进了上下文但答案仍错 → 调 prompt 约束、冲突处理或引用格式；证据过期/越权 → 数据治理和权限。不拆环节的优化都是盲调。"
     },
     {
       "type": "diagram",
@@ -47,25 +62,38 @@
     },
     {
       "type": "compareTable",
-      "title": "召回策略对比",
-      "content": "| 策略 | 优势 | 局限 | 适用场景 |\n| --- | --- | --- | --- |\n| 向量检索 | 语义相似、抗同义改写 | 编号/错误码/专名不稳 | 概念问答、相似语义查询 |\n| BM25/关键词 | 精确短语、代码符号、错误码稳定 | 语义泛化弱 | FAQ、日志、规章条款 |\n| 混合检索 | 兼顾语义与精确匹配 | 融合权重和重排复杂 | 生产 RAG 默认优先评估 |\n| Reranker | 更细粒度判断 query-doc 相关性 | 延迟和成本更高 | TopK 噪声多、正确证据靠后 |\n| Metadata filter | 权限、租户、时间、来源可控 | 过早/过严过滤会漏召回 | 企业知识库与多租户 |"
+      "title": "召回与排序技术对比",
+      "content": "| 技术 | 原理 | 擅长场景 | 不擅长场景 | 典型延迟 |\n| --- | --- | --- | --- | --- |\n| 向量检索（bi-encoder + ANN） | query/doc 各自编码，余弦或内积近邻 | 语义相近、同义改写、概念问答 | 错误码、API 名、版本号等精确 token | 毫秒级（ANN 索引） |\n| BM25 | 词袋 TF-IDF 变体，基于词频和文档频率 | 精确短语、代码符号、FAQ 标题 | 语义泛化（退款 ≠ 退货） | 毫秒级（倒排索引） |\n| RRF 融合 | 各路排名倒数求和，不依赖原始分值 | 多路分数量纲不同、快速上线 | 需要精细权重调优时 | 毫秒级 |\n| Cross-encoder reranker | query+doc 拼接过 Transformer，token 级交互 | TopK 噪声多、正确证据靠后 | 候选数大时延迟线性增长 | 数十毫秒~数百毫秒 |\n| Metadata filter | 基于属性字段硬过滤 | 权限、租户、时间、文档类型 | 过严过滤会漏召回 | 毫秒级 |\n| HyDE | LLM 生成假想答案，用其 embedding 检索 | 概念性、泛化性问题 | 专有名词、精确查询可能生成误导文档 | 生成 LLM 调用 + 检索 |"
+    },
+    {
+      "type": "compareTable",
+      "title": "RAG 失败归因与对应动作",
+      "content": "| 失败现象 | 环节 | 常见原因 | 优化动作 |\n| --- | --- | --- | --- |\n| 正确证据不在 Top-K | 召回 | chunk 太细切碎信息、embedding 不识别领域术语、缺少关键词召回、filter 过严 | 调 chunk 粒度、换/微调 embedding、加 BM25 混合、放宽 filter |\n| 正确证据在 Top-K 但排名靠后 | 重排 | reranker 缺失或弱、融合权重不合理 | 加 cross-encoder reranker、调 RRF/融合权重 |\n| 证据进入上下文但答案仍错 | 生成 | prompt 未约束基于证据回答、冲突证据未处理、引用格式不对 | 加引用约束 prompt、标注冲突证据、修引用格式 |\n| 证据过期或越权 | 数据治理 | 文档版本旧、权限过滤遗漏 | 加版本时间校验、前置 metadata filter、数据清洗 |"
     },
     {
       "type": "interviewAnswer",
       "title": "标准面试回答",
-      "content": "30 秒结论：RAG 召回策略的目标不是“多塞文档”，而是在可控延迟和成本下，把能支撑答案的证据放进上下文。我的回答会按“切片与索引 -> 混合召回 -> 重排 -> 上下文构建 -> 评估归因”展开。\n\n机制要点：\n- 机制上，向量召回适合语义相近，BM25 适合专有名词、编号、错误码和精确短语；metadata filter 负责权限、租户、时间和文档类型边界；reranker 用更重的 cross-encoder 或 LLM 判断候选证据与问题的相关性。chunk 太大稀释相似度，太小丢上下文，需要结合标题、段落、表格和 overlap 调整。\n- 排查时我会看 trace：query 改写是什么、TopK 召回了哪些片段、正确证据排第几、最终 prompt 放了哪些证据、答案引用是否一致。这样才能判断问题在索引、召回、重排还是生成。",
+      "content": "**30 秒结论**：RAG 召回策略的目标不是「多塞文档」，而是在可控延迟和成本下，把能支撑答案的证据放进上下文。我会按「查询改写 → 混合召回 → 重排序 → 上下文构建 → 评估归因」这条链路展开。\n\n**机制主线**\n- **查询改写**：口语化问题先经 LLM 改写或生成多查询变体提升召回多样性；概念性问题可尝试 HyDE（用假想答案的 embedding 检索），但精确查询和专有名词场景 HyDE 可能生成误导性文档，需配合 BM25 或仅对特定意图开启。\n- **多路召回**：向量检索适合语义近似，BM25 适合错误码、API 名、配置键等精确 token；metadata filter 前置完成权限、租户、时间和文档类型硬约束。两路各自返回 Top-K 候选后融合。\n- **融合与重排**：多路分数量纲不同时用 RRF（排名倒数求和）融合最简单稳健；需要精细调优时可用加权线性融合。cross-encoder reranker 对 query-candidate pair 做 token 级交互排序，解决「语义相近但证据不足」的排序问题，典型做法是先取 Top 50-100 候选再 rerank 到 Top 5-10。\n- **上下文构建**：去重、压缩（extractive 摘要或关键句提取）、引用标记、权限再校验。总 token 超上下文窗口时优先保留 reranker 排名最高、来源最新的证据。\n- **评估与归因**：召回看 Recall@K、MRR、nDCG、证据覆盖率；生成看忠实度、引用一致性、拒答质量；线上看延迟、token 成本、无答案率、人工纠错率。失败样本必须拆到具体环节再调优，不盲调。\n\n**排查举例**：如果正确证据没进 Top-K，先看 chunk 是否切碎了关键信息、embedding 是否覆盖领域术语、是否有 BM25 路补充、metadata filter 是否过严。如果进了 Top-K 但答案仍错，看 reranker 是否生效、证据是否进了最终上下文、prompt 是否约束了基于证据回答。",
       "followUpQuestions": [
         {
-          "question": "向量召回和 BM25 为什么常常要混合？",
-          "answer": "向量召回擅长语义近似，但对错误码、API 名称、配置键、版本号这类精确 token 可能不稳定；BM25 正好擅长关键词匹配。混合检索可以先扩大候选，再用 reranker 统一排序。"
+          "question": "向量检索和 BM25 为什么常常要混合？",
+          "answer": "向量检索擅长语义近似，但对错误码、API 名称、配置键、版本号这类精确 token 可能不稳定；BM25 正好擅长关键词匹配。混合检索先各自扩大候选集，再用 RRF 或加权融合 + reranker 统一排序，兼顾语义和精确。"
         },
         {
-          "question": "正确文档被召回但答案仍然错，怎么排查？",
-          "answer": "先看正确证据在 TopK 中的排名和是否进入最终上下文；如果进入了，再看 prompt 是否要求基于证据回答、是否有冲突证据、模型是否引用错误。问题可能在重排、上下文拼接或生成约束，不一定是召回。"
+          "question": "HyDE 适合什么场景？什么场景不该用？",
+          "answer": "HyDE 适合概念性、泛化性问题——假想答案的语义分布和真实文档接近，能提升召回率。不适合精确查询（错误码、API 名）、专有名词多的场景，因为 LLM 生成的假想文档可能包含错误 token，反而干扰检索。此时应依赖 BM25 + metadata filter。"
         },
         {
-          "question": "chunk size 怎么调？",
-          "answer": "用失败样本驱动。答案跨段落时 chunk 太小会丢上下文，命中大量无关内容时 chunk 可能太大。结构化文档优先按标题、段落、表格切，再用 Recall@K、证据覆盖率和延迟成本一起验证。"
+          "question": "正确证据被召回但答案仍然错，怎么排查？",
+          "answer": "先看 trace：正确证据在 TopK 中排第几、是否进入最终上下文。如果进了上下文但答案仍错，问题在生成侧——检查 prompt 是否要求基于证据回答、是否有冲突证据让模型混淆、引用格式是否让模型知道哪句对应哪段证据。问题可能在重排、上下文拼接或生成约束，不一定是召回。"
+        },
+        {
+          "question": "RRF 融合的原理是什么？什么时候该换成加权融合？",
+          "answer": "RRF（Reciprocal Rank Fusion）把每路召回结果的排名取倒数后求和：score = Σ 1/(k+rank)，k 通常取 60。它不依赖原始分值，适合多路分数量纲不同的快速上线场景。当两路分数已校准（如都归一化到 0-1）且有开发集可调参时，加权线性融合能更精细地平衡语义和关键词权重，但需要标注数据驱动调参。"
+        },
+        {
+          "question": "Top-K 的 K 值怎么选？太大太小分别有什么问题？",
+          "answer": "K 太小（如 3-5）可能遗漏正确证据，特别是需要综合多段证据回答时；K 太大（如 50+）送入 reranker 或上下文的噪声增加，延迟和 token 成本线性增长，还可能引入冲突证据干扰 LLM。典型做法是召回阶段取较大 K（50-100），reranker 后缩小到 5-10，再根据上下文窗口和证据密度微调。用 Recall@K 曲线找到召回率趋于平稳的拐点作为召回 K 的参考。"
         }
       ]
     },
@@ -73,31 +101,56 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "向量检索和关键词检索的区别",
-        "混合检索的实现方式",
-        "Reranker 的原理和作用",
-        "Top-K 参数的调优"
+        "能区分召回、重排、上下文构建和生成四阶段各自的责任",
+        "能说明向量检索、BM25、metadata filter 和 reranker 各自的原理与适用场景",
+        "能解释 RRF 和加权融合的区别及选型依据",
+        "能说明查询改写、多查询和 HyDE 的原理、收益和失效边界",
+        "能用 Recall@K、MRR、nDCG、证据覆盖率和引用一致性定位问题",
+        "能根据失败样本判断该调 chunk、embedding、融合权重、reranker 还是数据权限",
+        "能说清 cross-encoder reranker 为什么比 bi-encoder 排序更准但延迟更高",
+        "能描述上下文构建阶段的去重、压缩、引用标记和权限再校验"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "agent.rag.rag-retrieval-strategy.recall.1",
-      "prompt": "请比较向量检索、BM25、混合检索、重排序和查询改写在 RAG 召回中的作用。",
+      "prompt": "请比较向量检索、BM25、混合检索、重排序和查询改写在 RAG 召回中的作用，并说明它们之间的关系。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "agent.rag.rag-retrieval-strategy.recall.2",
-      "prompt": "当用户问题召回不到答案时，你会按什么顺序排查？",
+      "prompt": "当用户问题召回不到答案时，你会按什么顺序排查？请按召回、重排、生成、数据治理四层展开。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "agent.rag.rag-retrieval-strategy.recall.3",
-      "prompt": "Top-K 的 K 值如何选择？太大和太小分别有什么问题？",
+      "prompt": "Top-K 的 K 值如何选择？太大和太小分别有什么问题？召回 K 和送入 LLM 的 K 要不要一样？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.rag.rag-retrieval-strategy.recall.4",
+      "prompt": "向量检索适合语义查询，BM25 适合精确匹配。请说明 RRF 融合的原理，以及什么时候该换成加权线性融合。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.rag.rag-retrieval-strategy.recall.5",
+      "prompt": "HyDE（Hypothetical Document Embeddings）的原理是什么？它适合什么场景，不适合什么场景？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.rag.rag-retrieval-strategy.recall.6",
+      "prompt": "正确证据进入了 Top-K 甚至进入了最终上下文，但 LLM 仍然回答错误。你会怎么排查？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -106,29 +159,32 @@
   "rubric": {
     "mustHave": [
       "能区分召回、重排、上下文构建和生成各自责任",
-      "能说明向量检索、BM25、metadata filter、reranker 的适用场景",
+      "能说明向量检索、BM25、metadata filter、reranker 的原理和适用场景",
       "能用 Recall@K、MRR、nDCG、证据覆盖率和引用一致性定位问题",
       "能根据失败样本判断该调 chunk、embedding、TopK、reranker 还是数据权限"
     ],
     "goodToHave": [
-      "能说明「RRF」在「RAG 召回策略」里的触发条件、收益和失效边界",
-      "Multi-query",
-      "能说明「HyDE」在「RAG 召回策略」里的触发条件、收益和失效边界"
+      "能说明 RRF 的原理、收益和失效边界，以及何时切换到加权融合",
+      "能说明多查询和 HyDE 的触发条件、收益和失效边界",
+      "能说明 cross-encoder reranker 为什么比 bi-encoder 排序更准但延迟更高",
+      "能描述上下文构建阶段的去重、压缩、引用标记和权限再校验"
     ],
     "commonMistakes": [
       "只看最终回答好不好，不看 trace 中召回和重排证据",
       "把 TopK 调大当万能优化，忽略延迟、token 成本和噪声",
-      "没有区分召回不到、排序靠后、上下文没放入和模型没用证据"
+      "没有区分召回不到、排序靠后、上下文没放入和模型没用证据四个环节",
+      "在精确查询场景盲目使用 HyDE，生成误导性假想文档反而降低召回质量",
+      "过严的 metadata filter 在召回侧就漏掉了正确证据却不自知"
     ],
     "scoreWeights": {
-      "coverage": 40,
-      "accuracy": 25,
+      "coverage": 30,
+      "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "interviewFrequency": "high",
   "status": "production",
-  "interviewerFocus": "考察是否能围绕「RAG 召回策略」说清向量检索、BM25，并放到Agent/RAG/LLM 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察是否能围绕 RAG 召回策略完整说清查询改写、多路召回（向量 + BM25 + metadata filter）、融合与重排序（RRF、cross-encoder）、上下文构建和失败归因四层链路，并能用指标和 trace 驱动优化而非盲调。"
 }

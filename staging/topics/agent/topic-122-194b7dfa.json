@@ -4,26 +4,41 @@
   "category": "rag",
   "group": "rag",
   "title": "文档分块策略",
-  "summary": "固定大小、递归字符、语义、Markdown标题分块方法对比与选择",
+  "summary": "讲清 RAG 场景下文档分块策略的核心矛盾（召回精度 vs 上下文完整性 vs 成本）、按文档类型选择切分边界的方法、chunk size/overlap 的调参逻辑、Parent-Child Retrieval 的分工机制、多格式文档的特殊处理、以及用检索指标归因失败的评估闭环。",
   "tags": [
     "Agent",
     "RAG",
     "分块"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 26,
   "order": 30,
   "recommendWeight": 78,
   "learningCards": [
     {
       "type": "explain",
-      "title": "文档分块策略：为什么分块重要、关键参数",
-      "content": "## 为什么分块重要\nRAG 的检索单元通常不是整篇文档，而是 chunk。分块太大容易带入噪声并浪费上下文；分块太小容易丢失语义边界，让模型拿不到完整依据。\n\n## 关键参数\n主要关注 chunk size、overlap、切分边界、元数据保留和父子关系。面试中要说明这些参数服务于召回质量，而不是机械背一个固定数值。\n\n## 好分块的标准\n一个好的 chunk 应该能独立表达一个相对完整的信息点，同时保留标题、来源、层级、时间和权限等元数据，便于后续过滤和溯源。\n\n## 常见策略\n固定长度切分快但容易切断语义；递归字符切分会按段落、句子、标点逐层兜底；Markdown/HTML 结构切分能保留标题层级；语义切分更关注主题变化但成本更高。\n\n## Parent-Child Retrieval\n可以用较小 child chunk 做召回，用较大 parent chunk 提供生成上下文。这样兼顾精确召回和完整上下文，适合规章制度、技术文档和长报告。"
+      "title": "分块的真正矛盾：召回精度、上下文完整性和成本的三角博弈",
+      "content": "RAG 系统的检索单元是 chunk，不是整篇文档。分块大小直接决定三个问题：\n\n**召回精度**：chunk 越小，embedding 向量的语义越聚焦，和 query 的匹配越精确。但小块容易丢失前提条件——比如一段规范的适用范围写在标题里，正文 chunk 召回后没有标题，LLM 就可能给出错误适用结论。\n\n**上下文完整性**：chunk 越大，单块包含的上下文越完整。但大块的 embedding 向量被多个主题稀释，和 query 的相似度下降；同时大块塞进 prompt 的噪声更多，浪费上下文窗口，也增加推理成本。\n\n**计算与存储成本**：chunk 数量 = 文档总 token / chunk size。chunk 越小，向量库条目越多，索引和检索成本越高；chunk 越大，embedding 和检索便宜，但 topK 个大块拼进 prompt 的总 token 涨得快。\n\n所以分块没有「最佳 token 数」这个通用答案。策略选择的本质是在这三个约束之间找到当前文档和业务场景的平衡点，然后用评估指标验证。"
     },
     {
       "type": "explain",
-      "title": "文档分块策略：多格式文档、如何评估",
-      "content": "## 多格式文档\nPDF、表格、代码和图片说明不能只按纯文本切。表格要保留表头，代码要保留函数或类边界，扫描件还要考虑 OCR 质量。\n\n## 如何评估\n用一组真实问题评估 hit rate、recall@k、上下文覆盖率、答案引用准确率和无关上下文比例。只看最终答案分数，很难定位是分块、检索还是生成出了问题。\n\n## 调参顺序\n先保证解析正确和元数据完整，再调 chunk size、overlap、topK 和 rerank。对长文档可优先尝试结构化切分与 parent-child，而不是盲目增大 chunk。\n\n## 线上排查\n如果答案经常缺关键条件，检查 chunk 是否切断标题或表格；如果答案混入无关内容，检查 chunk 是否过大、topK 是否过高或 rerank 是否缺失。"
+      "title": "切分边界决定质量：结构优先、字符兜底",
+      "content": "分块的第一决策不是 chunk size，而是**在哪个边界切**。切分边界选错，再调参数也救不回来。\n\n**结构化边界（优先级最高）**：Markdown/HTML 按标题层级切分，保留标题路径（如 `H1 > H2 > H3`）作为 chunk metadata 或前缀。代码按函数、类、模块的 AST 边界切分，不要在函数体中间硬切。表格保留完整行+表头，不在行中间断开。\n\n**自然语言边界（次优）**：段落 `\\n\\n` > 句子 `.`/`。` > 逗号/分号 > 空格。递归字符分割器（如 LangChain 的 `RecursiveCharacterTextSplitter`）就是按这个优先级逐层尝试：先找段落边界，找不到再找句子，最后退到字符级硬切。这比固定长度切分好，但对结构化文档仍然不够——它不认 Markdown 标题或 HTML 标签。\n\n**字符级硬切（兜底）**：纯文本、无结构、长段落没有自然断句时，按 token/字符数硬切。这是最粗暴的策略，只在格式极简单时作为基线。\n\n核心原则：**能按结构切就不按段落切，能按段落切就不按字符切**。每退一级，语义完整性损失就大一分。"
+    },
+    {
+      "type": "explain",
+      "title": "chunk size 和 overlap 的调参逻辑",
+      "content": "**chunk size 的起点**：没有万能值，但有经验区间。FAQ/短问答场景 200-400 token，通用文档 400-800 token，长规范/论文 800-1500 token。这些只是起点，必须用真实问题集验证。\n\n**chunk size 偏小的信号**：答案需要的条件分散在多个 chunk 中，topK 召回了但拼不出完整答案；LLM 回答经常缺前提、缺限定词、张冠李戴。此时要么增大 chunk，要么用 overlap 或 parent-child 补上下文。\n\n**chunk size 偏大的信号**：topK 个 chunk 拼进 prompt 后 token 超限或成本飙升；embedding 相似度下降导致相关 chunk 掉出 topK；答案混入大量无关内容。此时减小 chunk 或加 rerank。\n\n**overlap 的作用和边界**：overlap 让相邻 chunk 共享一部分内容，减少边界处信息断裂。典型值是 chunk size 的 10%-20%。但 overlap 太大会制造重复证据（同一个事实在多个 chunk 中出现，干扰 LLM 判断），并增加存储和检索成本。\n\n**更稳的替代方案**：与其靠 overlap 兜底，不如优先保留结构边界和标题路径。如果一个 chunk 的标题路径是 `公司制度 > 考勤管理 > 加班规则`，即使 chunk 本身不含「考勤管理」四个字，LLM 也能从路径中获得上下文。Parent-Child 结构是更系统化的解决方案。"
+    },
+    {
+      "type": "explain",
+      "title": "Parent-Child Retrieval：小块召回、大块生成",
+      "content": "Parent-Child Retrieval 的核心思想是**把召回和生成的粒度解耦**。\n\n**工作方式**：索引时把文档切成两种粒度——较小的 child chunk（如 200-400 token）用于 embedding 和检索，较大的 parent chunk（如 1000-2000 token，通常是 child 的父级标题或章节）存储但不单独 embedding。检索时用 child chunk 的相似度召回，命中后把对应 parent chunk 喂给 LLM 生成答案。\n\n**为什么有效**：小块 embedding 语义聚焦，召回精度高；大块包含完整上下文（标题、前提条件、表格表头、相邻条款），LLM 生成时不会缺前提。这解决了「块小召回准但缺上下文，块大上下文全但召回差」的矛盾。\n\n**代价**：存储翻倍（同时存 child 和 parent），实现复杂度增加（需要维护 child→parent 映射），parent chunk 塞进 prompt 的 token 更多。所以不是所有场景都需要——FAQ、短问答、结构简单的文档用普通分块就够；规章制度、合同条款、技术规范、长报告才值得上 parent-child。\n\n**实现注意**：child chunk 的 metadata 必须包含 parent chunk 的 ID 或标题路径，否则命中后找不到对应大块。LlamaIndex 的 `SentenceWindowNodeParser` 和 `HierarchicalNodeParser` 就是这个思路的框架实现。"
+    },
+    {
+      "type": "explain",
+      "title": "多格式文档的特殊处理",
+      "content": "不同格式的文档有不同的切分陷阱，不能都当纯文本处理：\n\n**表格**：在行中间硬切会导致检索命中半个表格，LLM 看到缺失表头的行列数据无法正确理解。处理方式：保留完整表格为一个 chunk（适合小表格），或按行切分但把表头作为每个 chunk 的前缀重复注入（适合大表格）。\n\n**代码**：按函数、类、模块的 AST 边界切分，不要在函数体中间断开。每个 chunk 应包含函数签名、docstring 和完整实现。代码注释和 docstring 是重要的语义信号，不能丢。\n\n**PDF/扫描件**：依赖版面解析质量。两栏排版如果按阅读顺序硬切，可能把左栏尾部和右栏头部混成一个 chunk。表格跨页、页眉页脚混入正文、脚注和正文分离都是常见问题。先保证解析正确，再谈分块。\n\n**FAQ/问答对**：问题和答案必须在同一个 chunk 中，不能把问题切到上一个 chunk、答案切到下一个。可以用 `Q:` 和 `A:` 作为分隔符，按问答对切分。\n\n**元数据保留**：无论什么格式，每个 chunk 都应保留来源文档名、章节标题路径、创建/更新时间、权限标签。这些 metadata 用于检索过滤（如「只搜最近半年的文档」「只搜我有权限的文档」）和答案溯源。"
     },
     {
       "type": "diagram",
@@ -45,37 +60,45 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 策略 | 优势 | 风险 | 适用场景 |\n| --- | --- | --- | --- |\n| 固定长度 | 实现快、成本低 | 容易切断语义和结构 | 快速基线、格式简单文本 |\n| 递归字符/句段 | 尽量保留段落句子 | 对表格/代码仍可能破坏结构 | 通用文本、FAQ、文档段落 |\n| Markdown/HTML 标题 | 保留层级和上下文路径 | 依赖文档结构干净 | 技术文档、产品手册 |\n| 语义分块 | 按主题变化切 | 计算成本高，边界不稳定 | 长报告、主题跨度大文本 |\n| Parent-Child | 小块精确召回，大块补上下文 | 存储和拼接复杂 | 规章、合同、技术长文 |"
+      "title": "分块策略对比：适用条件、风险和工程取舍",
+      "content": "| 策略 | 切分依据 | 优势 | 风险/代价 | 适用场景 |\n| --- | --- | --- | --- | --- |\n| 固定长度 | token/字符数硬切 | 实现最简单，成本最低 | 容易切断表格、代码、标题和语义边界 | 格式极简单的纯文本基线 |\n| 递归字符/句段 | 段落→句子→字符逐层退 | 尽量保留自然语言边界 | 不认 Markdown/HTML 标签，对结构化文档仍不够 | 通用文本、FAQ、无结构文档 |\n| Markdown/HTML 标题 | 标题层级和标签 | 保留层级路径，chunk 自带上下文 | 依赖文档结构干净；标题缺失或层级混乱时退化 | 技术文档、产品手册、知识库 |\n| AST 代码边界 | 函数/类/模块定义 | 保留完整代码语义单元 | 依赖语言 parser；跨语言需要不同方案 | 代码仓库、API 文档 |\n| 语义分块 | embedding 相似度变化点 | 按主题变化切，理论上最精准 | 计算成本高；边界不稳定，依赖 embedding 质量 | 长报告、主题跨度大的文档 |\n| Parent-Child | 小块检索+大块生成 | 兼顾精确召回和完整上下文 | 存储翻倍，实现复杂，parent 块 token 更多 | 规章制度、合同、技术规范、长报告 |\n| 表格感知切分 | 表头+行列边界 | 保留表格完整性 | 需要表格检测能力，嵌套表格处理复杂 | 财务报表、数据手册、对比表 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "# LangChain递归字符分割\nfrom langchain.text_splitter import RecursiveCharacterTextSplitter\n\nsplitter = RecursiveCharacterTextSplitter(\n    chunk_size=512,\n    chunk_overlap=50,\n    separators=[\"\\n\\n\", \"\\n\", \"。\", \"，\", \" \"]\n)\nchunks = splitter.split_documents(docs)",
+      "title": "LangChain 递归字符分割与 Parent-Child 示例",
       "language": "python",
+      "content": "from langchain.text_splitter import RecursiveCharacterTextSplitter\nfrom langchain.schema import Document\n\n# 递归字符分割：按段落→句子→字符逐层退\nsplitter = RecursiveCharacterTextSplitter(\n    chunk_size=512,\n    chunk_overlap=64,\n    separators=[\"\\n\\n\", \"\\n\", \"。\", \"，\", \" \"]\n)\nchunks = splitter.split_documents(docs)\n\n# 为每个 chunk 添加标题路径 metadata\ndef add_title_path(chunk, doc_metadata):\n    # 假设 doc_metadata 有 section_path 字段\n    chunk.metadata[\"title_path\"] = doc_metadata.get(\"section_path\", \"\")\n    chunk.metadata[\"source\"] = doc_metadata.get(\"source\", \"\")\n    return chunk\n\n# Parent-Child 索引示例（概念代码）\nparent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)\nchild_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)\n\nfor doc in docs:\n    parents = parent_splitter.split_documents([doc])\n    for parent in parents:\n        children = child_splitter.split_documents([parent])\n        for child in children:\n            child.metadata[\"parent_id\"] = parent.metadata.get(\"chunk_id\")\n            # child 用于 embedding 和检索\n            # parent 用于 LLM 生成上下文\n            # 检索命中 child 后，取 parent 喂给 LLM",
       "highlights": [
         {
-          "line": 2,
-          "note": "这里选择递归分隔器，是为了先按段落、句子等自然边界切分，再退到字符级，减少语义被硬切断的概率。"
+          "line": 3,
+          "note": "separators 按优先级排列：先段落，再句子，再字符，逐层退保证尽量在自然边界切分。"
+        },
+        {
+          "line": 14,
+          "note": "标题路径 metadata 是 chunk 上下文的重要来源，即使 chunk 本身不含标题，LLM 也能从路径获得层级信息。"
+        },
+        {
+          "line": 22,
+          "note": "parent chunk 用更大粒度保留完整上下文，child chunk 用更小粒度提高召回精度，检索命中 child 后取 parent 生成。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**问题1：RAG 分块方法怎么选？**\n\n先看文档结构，不先背固定 chunk size。Markdown/HTML 优先按标题层级，代码按函数/类边界，表格保留表头和行列关系，普通文本再用段落/句子递归切分。\n\n**问题2：分块大小怎么调？**\n\n用真实问题集调，而不是固定 256/512/1024。块太小会缺条件、缺标题、缺表头；块太大会带入噪声、稀释相似度并浪费上下文。调参时同时看 Recall@K、答案引用准确率、无关上下文比例和 token 成本。\n\n**问题3：overlap 为什么需要？**\n\noverlap 是为了减少边界处信息断裂，但过大会制造重复证据和成本。更稳的做法是优先保留结构边界、标题路径和 parent-child 关系，再小幅 overlap 兜底。",
+      "content": "**核心矛盾**：分块是召回精度、上下文完整性和成本的三角博弈。块小召回准但缺前提，块大上下文全但噪声多成本高，没有通用最佳值。\n\n**策略选择（按文档类型）**\n- Markdown/HTML：按标题层级切分，保留标题路径作为 metadata\n- 代码：按函数/类/AST 边界切，不切断函数体\n- 表格：保留表头，完整表格或行+表头前缀\n- FAQ：按问答对切分，Q 和 A 同块\n- PDF/扫描件：先保证版面解析正确，再分块\n- 普通文本：递归字符分割（段落→句子→字符逐层退）\n\n**chunk size 和 overlap 调参**\n- 没有万能值，用真实问题集调参\n- 块太小的信号：答案缺前提、条件分散在多个 chunk\n- 块太大的信号：embedding 相似度下降、成本飙升、噪声多\n- overlap 典型值 10%-20%，太大会制造重复证据\n- 更稳的替代：优先保留结构边界和标题路径\n\n**Parent-Child Retrieval**\n- 小块（200-400 token）用于 embedding 检索，语义聚焦、召回精度高\n- 大块（1000-2000 token）用于 LLM 生成，包含完整上下文\n- 检索命中 child 后取对应 parent 喂给 LLM\n- 适合规章制度、合同、技术规范、长报告\n- 代价：存储翻倍、实现复杂\n\n**评估和排查**\n- 指标：hit rate、Recall@K、答案引用准确率、无关上下文比例\n- 缺关键条件 → 检查 chunk 是否切断标题/表头/前提\n- 噪声太多 → 检查 chunk 是否过大、topK 是否过高、rerank 是否缺失\n- 完全没召回 → 检查 embedding 质量、query rewrite、metadata 过滤",
       "followUpQuestions": [
         {
-          "question": "chunk size 怎么决定？",
-          "answer": "由文档结构、答案跨度和模型上下文共同决定。FAQ 可小块，规范/论文要按标题层级和段落保留上下文；如果答案常跨段落，需要 overlap 或 parent-child chunk。最终用 Recall@K、证据覆盖率和延迟成本验证。"
+          "question": "如果一个文档既有 Markdown 标题又有嵌套表格和代码块，怎么切分？",
+          "answer": "按文档结构分层处理：先按 Markdown 标题层级切分顶层结构，对表格子区域用表格感知切分（保留表头），对代码块子区域用 AST 边界切分。每个 chunk 的 metadata 包含标题路径和文档类型标签，检索时可以用 metadata 过滤（如 `doc_type=code`）提高精度。"
         },
         {
-          "question": "固定长度切分有什么风险？",
-          "answer": "可能切断表格、代码、标题和语义边界，导致检索命中片段缺少前提。结构化文档更适合按标题、段落、列表、表格和代码块切分，再补充 metadata。"
+          "question": "Parent-Child 和 overlap 都能解决边界断裂，什么时候用哪个？",
+          "answer": "overlap 是局部兜底，适合相邻 chunk 有少量内容重叠的场景，实现简单但容易制造重复证据。Parent-Child 是系统化方案，用不同粒度分别优化召回和生成，适合长文档、规范、合同等需要完整上下文的场景。优先级：结构化边界 > Parent-Child > overlap。"
         },
         {
-          "question": "分块策略上线后如何排查效果下降？",
-          "answer": "看失败问题的标准证据是否被切散、是否进入 TopK、命中片段是否包含答案前提。若召回到了但证据不完整，调整 chunk/overlap/parent-child；若完全没召回，检查 embedding、query rewrite 和 metadata。"
+          "question": "线上发现答案经常引用了错误的 chunk，怎么排查？",
+          "answer": "分三步：(1) 看召回是否正确——标准证据是否在 topK 中，不在说明 embedding 或 query 不匹配，需要调 embedding 模型或加 query rewrite；(2) 看召回的 chunk 是否完整——如果标准证据被切散到多个 chunk，需要调 chunk size、overlap 或换 parent-child；(3) 看是否是 rerank 问题——相关 chunk 进了 topK 但排名靠后，被无关 chunk 挤掉了，需要加 reranker。"
         }
       ]
     },
@@ -83,66 +106,84 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能按 Markdown/HTML、PDF、表格、代码、普通文本选择分块策略",
-        "能说明 chunk size 和 overlap 没有固定最佳值，要用问题集评估",
-        "能解释 parent-child retrieval 的召回与生成上下文分工",
-        "能用 hit rate、Recall@K、引用准确率、无关上下文比例归因问题",
-        "能指出表格表头、代码函数边界、标题层级和权限元数据不能丢"
+        "能按文档类型（Markdown、PDF、表格、代码、FAQ、纯文本）选择切分边界和策略",
+        "能解释 chunk size 和 overlap 没有固定最佳值，要用真实问题集评估",
+        "能说明 Parent-Child Retrieval 的召回与生成粒度解耦机制及适用场景",
+        "能用 hit rate、Recall@K、引用准确率、无关上下文比例归因分块问题",
+        "能指出表格表头、代码函数边界、标题层级路径和权限元数据不能丢",
+        "能解释分块的三角博弈：召回精度、上下文完整性、计算与存储成本",
+        "能在面试中按「策略选择→调参逻辑→评估归因」主线组织回答"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "agent.rag.topic-122-194b7dfa.recall.1",
-      "prompt": "请讲一下 文档分块策略 的核心机制、适用场景和常见误区。",
+      "prompt": "请完整讲一下 RAG 中文档分块策略的选择逻辑、关键参数调优和评估方法。",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "agent.rag.topic-122-194b7dfa.recall.2",
-      "prompt": "如果面试官问你\"分块大小应该怎么选择\"，你会怎么回答？",
+      "prompt": "如果面试官问你「分块大小应该怎么选择」，你会怎么回答？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "agent.rag.topic-122-194b7dfa.recall.3",
-      "prompt": "文档分块策略 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "Parent-Child Retrieval 解决了什么问题？和普通 overlap 有什么区别？什么场景值得用？",
       "mode": "text",
       "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.rag.topic-122-194b7dfa.recall.4",
+      "prompt": "一个文档既有 Markdown 标题又有嵌套表格和代码块，分块策略怎么设计？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.rag.topic-122-194b7dfa.recall.5",
+      "prompt": "线上 RAG 系统答案质量下降，你怎么判断是分块问题、embedding 问题还是 rerank 问题？",
+      "mode": "text",
+      "expectedMinutes": 5,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能说明 chunk size、overlap、结构化切分、parent-child chunk 的取舍",
-      "能根据文档类型选择标题/段落/表格/代码块等切分粒度",
-      "能用 Recall@K、证据覆盖率、引用一致性和成本验证分块效果",
-      "能通过失败样本判断是切分、embedding、metadata 还是重排问题"
+      "能按文档类型选择切分边界（标题层级、AST、表格表头、段落递归）",
+      "能说明 chunk size/overlap 没有万能值，要用问题集评估并按信号调参",
+      "能解释 Parent-Child Retrieval 的小块召回+大块生成机制及适用场景",
+      "能用 Recall@K、引用准确率、无关上下文比例归因分块失败"
     ],
     "goodToHave": [
-      "能说明小块高精度但缺上下文、大块保上下文但噪声和成本高",
-      "能处理表格、代码、FAQ、长规范等不同文档结构",
-      "能把分块 metadata 用于权限、时间、章节和来源过滤"
+      "能解释分块的三角博弈：召回精度、上下文完整性、成本",
+      "能处理表格、代码、FAQ、PDF 等多格式文档的特殊切分需求",
+      "能把 chunk metadata（标题路径、权限、时间）用于检索过滤和答案溯源",
+      "能区分 overlap 和 Parent-Child 的适用边界"
     ],
     "commonMistakes": [
-      "固定字符数切所有文档",
-      "只看最终答案，不看标准证据是否被切散",
-      "无限增大 chunk 导致召回噪声和 token 成本上升"
+      "固定字符数切所有文档，不区分格式和结构",
+      "只看最终答案分数，不看标准证据是否被切散或缺失",
+      "无限增大 chunk 导致召回噪声、embedding 稀释和 token 成本飙升",
+      "把 Parent-Child 当万能方案，不考虑存储翻倍和实现复杂度"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "prerequisites": [
     "agent.embedding-retrieval.topic-121-15a0b1b4"
   ],
   "status": "staging",
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「文档分块策略」说清分块方法对比、分块大小选择，并放到Agent/RAG/LLM 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察是否能围绕「文档分块策略」说清按文档类型选切分边界、chunk size/overlap 调参逻辑、Parent-Child Retrieval 机制、多格式文档特殊处理，并放到 RAG 工程场景中解释评估指标和失败归因。"
 }

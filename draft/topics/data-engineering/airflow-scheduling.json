@@ -4,7 +4,7 @@
   "category": "platform",
   "group": "platform",
   "title": "Airflow 调度与任务编排",
-  "summary": "讲清 DAG/Task/Operator、Scheduler 触发模型、execution_date 与 data_interval、补数 backfill、SLA 与 retry 的工程含义。",
+  "summary": "讲清 DAG/Task/Operator 的实例化链条、Scheduler 触发模型（heartbeat → DagRun → TI 状态机）、execution_date 与 data_interval 的语义陷阱、catchup/backfill 的并发爆炸与幂等要求、retries/SLA/execution_timeout/Trigger Rule 的职责边界，以及与 DolphinScheduler/Dagster 的选型差异。",
   "tags": [
     "数据工程",
     "Airflow",
@@ -14,13 +14,13 @@
     "SLA"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 34,
   "order": 120,
   "recommendWeight": 82,
   "status": "draft",
   "prerequisites": [],
   "interviewFrequency": "medium",
-  "interviewerFocus": "重点考察 schedule_interval 与 data_interval 的差异、catchup/backfill 的语义、Task 幂等与 retry/SLA 策略、Scheduler 与 Executor（Local/Celery/Kubernetes）的分工，以及与 DolphinScheduler/Dagster 的边界对比。",
+  "interviewerFocus": "重点考察 schedule_interval 与 data_interval 的差异、catchup/backfill 的语义、Task 幂等与 retry/SLA 策略、Scheduler 与 Executor（Local/Celery/Kubernetes）的分工，Scheduler HA 与解析瓶颈排查，以及与 DolphinScheduler/Dagster 的边界对比。",
   "learningCards": [
     {
       "type": "explain",
@@ -36,6 +36,11 @@
       "type": "explain",
       "title": "失败处理：retries、Trigger Rule、SLA 与告警怎么搭",
       "content": "生产 Airflow 的可靠性靠三层：Task 级 retry、DAG 级 Trigger Rule、平台级 SLA/告警。\n\nTask 重试：每个 Operator 都能配 `retries`（默认 0）、`retry_delay`（timedelta，默认 5min）、`retry_exponential_backoff=True`、`max_retry_delay`、`execution_timeout`。注意 retry 只在 TI 失败（state=failed）时触发，被 SIGKILL 的 zombie task 由 Scheduler 的 `scheduler_zombie_task_threshold` 检测后置成 up_for_retry。retries 不是越多越好——下游是外部 API 时，超过 3 次基本就是真挂了，盲目重试会放大压力。\n\nTrigger Rule 控制下游何时触发，默认 `all_success`（所有上游成功才跑）。常用的还有：`all_done`（不管上下游成功失败都跑，做清理）、`one_failed`（任一失败才跑，做告警）、`none_failed_min_one_success`（容许 skipped 但至少一个成功）。配合 BranchPythonOperator 做条件分支时，下游必须用 `none_failed_min_one_success` 之类，否则会被默认规则跳过。\n\nSLA：在 Task 上设 `sla=timedelta(hours=2)` 表示「相对 data_interval_end，2 小时内必须跑完」，超时不会杀任务，只会写一条 SLA Miss 记录并触发 `sla_miss_callback`。SLA 是「数据按时产出」的承诺，不是「任务超时杀掉」——后者要用 `execution_timeout`。告警通道一般用 `on_failure_callback` / `on_retry_callback` 接钉钉/飞书 webhook，比 Airflow 自带 SMTP 更可控。\n\n常见误区：把 SLA 当 timeout 用、retry_delay 设成 1 秒疯狂打外部接口、on_failure_callback 里抛异常把告警吃了（callback 失败不会再触发）。"
+    },
+    {
+      "type": "explain",
+      "title": "Scheduler 高可用与性能瓶颈",
+      "content": "Airflow 2.0+ 引入了 Scheduler HA：可以起多个 Scheduler 实例，它们通过数据库行锁竞争来分配 DagRun/TI 处理权，不会重复创建 Run。但 Scheduler 的核心瓶颈不在并发实例数，而在 DAG 文件解析——每个 Scheduler heartbeat 都要扫描 DAG 文件夹、import 每个 Python 文件、执行顶层代码、序列化写入 SerializedDAG 表。\n\n解析瓶颈的典型症状：`dag_processing.total_parse_time` 持续升高、DAG 出现在 UI 里要几十秒、Scheduler heartbeat 拉长导致 TI 调度延迟。根因通常是：DAG 文件里写了 `pd.read_csv()`、调外部 API、import 重库、一个文件里塞了几百个 DAG。解法：把 IO 从 DAG 顶层移到 Operator execute 里、拆分 DAG 文件（一个文件一个 DAG）、调 `min_file_process_interval` 和 `parsing_processes`（DagFileProcessorManager 的子进程数）。\n\n元数据库也是瓶颈点：Airflow 的 TI 状态更新是高频的（每个 TI 从 scheduled→queued→running→success/failed 都要写一次），加上 Scheduler 每次循环要查依赖、锁行、写日志。生产建议：Postgres 开 `max_connections` 到 200+、用 SSD、监控 `dag_run` 和 `task_instance` 表大小（过大的表要定期 `airflow db clean`）。Scheduler 挂了不会丢任务（状态在 DB 里），但会停止触发新 Run，恢复后 Scheduler 会补上缺失的 Run（取决于 catchup 配置）。"
     },
     {
       "type": "diagram",
@@ -143,6 +148,10 @@
         {
           "question": "Airflow、DolphinScheduler、Dagster 该怎么选？",
           "answer": "看团队和场景。工程师团队、Python 栈深、要复杂依赖和动态 DAG（dynamic task mapping），Airflow 最稳；任务以 SQL/Shell 为主、要 UI 拖拽、运维偏国产化，DolphinScheduler 上手快、Master/Worker 架构对元数据库压力小；做数据平台、强调 asset/血缘/类型化和数据测试（dbt 风格），Dagster 的 software-defined asset 模型更贴合，但运行时开销大、生态比 Airflow 小。三者不是替代关系，很多团队用 Airflow/DolphinScheduler 跑调度，再用 Dagster/dbt 管资产层。"
+        },
+        {
+          "question": "Scheduler 重启或挂掉后，已经排队的 Task 会丢吗？恢复后会发生什么？",
+          "answer": "不会丢。所有 TI 状态都写在元数据库的 task_instance 表里，Scheduler 重启后会重新扫描 DB，把之前状态为 scheduled 或 queued 的 TI 重新纳入调度循环。恢复后 Scheduler 会继续推进这些 TI 的状态机。但如果 catchup=True 且期间有缺失的 DagRun，Scheduler 可能会补创建这些 Run——这正是生产上 catchup=False + backfill 显式补数的原因。"
         }
       ]
     },
@@ -154,8 +163,9 @@
         "Scheduler、Executor（Local/Celery/Kubernetes）、Worker、Metadata DB 各自的职责和故障域",
         "schedule_interval、data_interval_start/end、logical_date、execution_date 的差异",
         "catchup=True/False 的行为差异，backfill 命令语义和幂等要求",
-        "retries + retry_exponential_backoff、Trigger Rule、SLA、execution_timeout 各管什么",
+        "retries + retry_exponential_backoff、Trigger Rule、SLA、execution_timeout 各管什么，配错会出什么事故",
         "为什么 DAG 顶层不能放重 IO，Operator __init__ 在哪个进程跑",
+        "Scheduler HA 的实现机制、DAG 解析瓶颈的排查方法",
         "Airflow 与 DolphinScheduler、Dagster 的核心选型差异"
       ]
     }
@@ -188,6 +198,13 @@
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
+    },
+    {
+      "id": "data-engineering.platform.airflow-scheduling.recall.5",
+      "prompt": "线上 Airflow Scheduler heartbeat 延迟升高、DAG 出现在 UI 要几十秒。你会排查哪些指标？根因通常是什么？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
     }
   ],
   "rubric": {
@@ -201,7 +218,7 @@
       "讲清 LocalExecutor / CeleryExecutor / KubernetesExecutor 的部署差异和故障域",
       "Trigger Rule（all_success/all_done/one_failed/none_failed_min_one_success）配合 BranchPythonOperator 的写法",
       "用 Pool、Queue、max_active_tasks_per_dag 控制并发，避免对外部系统造成击穿",
-      "用 sla_miss_callback / on_failure_callback 接钉钉飞书 webhook，比 SMTP 更可控",
+      "Scheduler HA 实现机制（DB 行锁竞争）和 DAG 解析瓶颈的排查方法",
       "动态 DAG（dynamic task mapping，2.3+ 的 .expand()）和 TaskGroup 的使用场景"
     ],
     "commonMistakes": [
@@ -218,5 +235,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

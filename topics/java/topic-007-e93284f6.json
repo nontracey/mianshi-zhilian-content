@@ -4,31 +4,41 @@
   "category": "jvm",
   "group": "jvm",
   "title": "垃圾收集器",
-  "summary": "垃圾收集器选型要从业务 SLO 出发，结合 JDK 版本、堆规模、CPU/内存余量、GC 日志和压测结果，在 Serial、Parallel、G1、ZGC、Shenandoah 等方案之间做取舍。",
+  "summary": "垃圾收集器选型要从业务 SLO 出发，结合 JDK 版本、堆规模、CPU/内存余量、GC 日志和压测结果，在 Serial、Parallel、G1、ZGC、Shenandoah 等方案之间做取舍；核心是把收集器的目标语义、并发边界和失败信号串成可观测的决策链。",
   "tags": [
     "Java",
     "JVM",
     "垃圾收集器"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 31,
   "order": 90,
   "recommendWeight": 93,
   "learningCards": [
     {
       "type": "explain",
-      "title": "收集器先按目标分层",
-      "content": "垃圾收集器不是按名字背一遍，而是按目标分层。Serial/Serial Old 是单线程 STW，适合显式选择的小堆工具、启动敏感程序或受限环境；Parallel/Parallel Old 用多线程 STW 换吞吐，适合批处理、离线计算和可接受较长停顿的任务。\n\nCMS 曾经是老年代低停顿方案，核心是并发标记清除，但碎片、浮动垃圾、CPU 敏感和 concurrent mode failure 都很典型。它在 JDK 9 被废弃、JDK 14 被移除，现在应该作为旧系统迁移知识，而不是现代选型建议。\n\nG1 是多数服务端场景的默认基线：JDK 9 起 server 配置默认选择 G1，但受约束环境、发行版和未来版本都要以实际 JVM flags 为准。G1 把堆切成 Region，通过并发标记、Remembered Set、Young/Mixed GC 和 Region evacuation，在吞吐与可预测停顿之间取平衡。\n\nZGC 和 Shenandoah 面向极低停顿、大堆和严苛 P99/P999。ZGC 在 JDK 15 转为产品特性，JDK 21 引入 Generational ZGC，JDK 23 起使用 ZGC 时默认分代，JDK 24 移除非分代模式。Shenandoah 也在 JDK 15 转为产品特性，但实际可用性要看 JDK 发行版和平台支持。"
+      "title": "收集器按目标和堆管理方式分层",
+      "content": "垃圾收集器不是按名字背一遍就完了，而是按目标分层选型。Serial/Serial Old 是单线程 STW，适合小堆工具、启动敏感程序或受限环境。Parallel/Parallel Old 用多线程 STW 换吞吐，适合批处理、离线计算和可接受较长停顿的任务。这两种都是「停止整个应用再回收」的简单模型，区别只在并行度和吞吐目标。\n\nCMS 曾经是老年代低停顿方案，核心是并发标记清除，但碎片、浮动垃圾、CPU 敏感和 concurrent mode failure 都很典型。它在 JDK 9 被废弃（`-XX:+UseConcMarkSweepGC` 仍可用但会告警），JDK 14 被移除，现在应该作为旧系统迁移知识，而不是现代选型建议。\n\nG1 是多数服务端场景的默认基线：JDK 9 起 server 配置默认选择 G1（具体受 `-XX:+UseG1GC` 和 `ActiveProcessorCount` 等约束，不同发行版可能有差异，要以实际 `PrintCommandLineFlags` 为准）。G1 把堆切成大小相等的 Region（通常 1MB–32MB，由 `-XX:G1HeapRegionSize` 控制），每个 Region 在任一时刻是 Eden、Survivor、Old 或 Humongous，通过并发标记、Remembered Set、Young/Mixed GC 和 Region evacuation，在吞吐与可预测停顿之间取平衡。\n\nZGC 和 Shenandoah 面向极低停顿、大堆和严苛 P99/P999。ZGC 在 JDK 15 转为产品特性，JDK 21 引入 Generational ZGC，JDK 23 起使用 ZGC 时默认分代，JDK 24 移除非分代模式（`-XX:+UseZGC` 即分代 ZGC，不再需要 `-XX:+ZGenerational`）。Shenandoah 也在 JDK 15 转为产品特性，但实际可用性要看 JDK 发行版和平台支持（Red Hat 发行版默认包含，OpenJDK 需手动构建或选择包含 Shenandoah 的构建）。"
     },
     {
       "type": "explain",
-      "title": "G1 与低延迟收集器的关键机制",
-      "content": "G1 的核心不是“回收垃圾最多的 Region”这么简单，而是用 Region 作为成本模型单位：Young GC 回收 Eden/Survivor，Mixed GC 在并发标记后挑选收益高的 Old Region，Remembered Set 记录跨 Region 引用，evacuation 把存活对象迁移到新 Region。它能减少碎片并控制停顿预算，但 Humongous 对象、to-space exhausted、Remembered Set 成本和过高分配速率仍可能让停顿失控。\n\nZGC/Shenandoah 的共同方向是把标记和对象移动并发化。ZGC 使用着色指针和 load barrier，Shenandoah 使用转发指针/屏障思路；应用线程读写引用时通过屏障协助修正或维护状态。这样 STW 阶段主要集中在根处理等短暂停顿，但代价是 CPU、内存余量、屏障开销和版本支持复杂度。\n\n因此不能简单说“低延迟 GC 更好”或“G1 足够覆盖所有场景”。如果堆不大、吞吐更关键，G1 或 Parallel 可能更合适；如果大堆服务的尾延迟被 Full GC 或 evacuation 拖垮，才应该用同样压测评估 ZGC/Shenandoah。"
+      "title": "G1 的 Region 模型与停顿预算",
+      "content": "G1 的核心不是「回收垃圾最多的 Region」这么简单，而是用 Region 作为成本模型单位：Young GC 回收 Eden/Survivor Region，Mixed GC 在并发标记后挑选收益高的 Old Region，Remembered Set 记录跨 Region 引用，evacuation 把存活对象迁移到新 Region。它能减少碎片并控制停顿预算，但 Humongous 对象、to-space exhausted、Remembered Set 成本和过高分配速率仍可能让停顿失控。\n\nRegion 切分带来的直接好处是：每次 GC 不需要回收整个老年代，而是按「回收价值 / 预估停顿」排序选一批 Region。G1 维护每个 Region 的回收价值快照，Mixed GC 阶段按价值从高到低挑选，直到达到 `-XX:MaxGCPauseMillis`（默认 200ms）预算或没有更多值得回收的 Region。但这个模型有两个前提：并发标记必须先完成（否则无法准确知道哪些 Region 垃圾多），Remembered Set 必须维护跨 Region 引用链（写屏障有 CPU 开销）。\n\nHumongous 对象（超过 Region 大小 50%）直接分配到连续的 Humongous Region，不参与正常的 Young/Mixed GC evacuation。大量 Humongous 对象会导致 Region 碎片、提前触发并发标记、甚至因找不到连续空间而退化成 Full GC。to-space exhausted 意味着 evacuation 目标 Survivor/Old Region 不够用，G1 退化成单线程 Full GC。这两种信号在 GC 日志里明确可见，是 G1 调优的核心关注点。"
+    },
+    {
+      "type": "explain",
+      "title": "ZGC/Shenandoah 的并发边界与代价",
+      "content": "ZGC/Shenandoah 的共同方向是把标记和对象移动并发化。ZGC 使用着色指针（colored pointer）和 load barrier：指针的高位编码了 GC 状态（marked0/marked1/remapped/finalizable），应用线程读引用时 load barrier 检查指针颜色，必要时协助修正引用或触发并发标记/重定位。Shenandoah 使用 Brooks 转发指针（每个对象头部多一个 forward pointer）和读/写屏障，对象移动时设置转发指针，后续引用通过屏障修正。\n\n这样 STW 阶段主要集中在根处理（root processing）等短暂停顿（通常 <1ms），但代价是：CPU 余量（并发线程与业务线程竞争）、内存余量（ZGC 需要额外空间做重定位，Shenandoah 需要 Brooks 指针的空间开销和并发压缩的 to-space）、屏障本身的开销（load barrier 有 5%–15% 的性能开销，取决于访问引用的频率）、以及版本支持复杂度。\n\n因此不能简单说「低延迟 GC 更好」或「G1 足够覆盖所有场景」。如果堆不大、吞吐更关键，G1 或 Parallel 可能更合适；如果大堆服务的尾延迟被 Full GC 或 evacuation 拖垮，才应该用同样压测评估 ZGC/Shenandoah。选低延迟 GC 不是为了「停顿时间更短」这个标签，而是为了解决具体的尾延迟问题——如果 G1 的 `MaxGCPauseMillis` 和 Mixed GC 已经能满足 SLO，切换到 ZGC 只会增加 CPU 和内存成本。"
     },
     {
       "type": "explain",
       "title": "选型必须用日志和压测闭环",
-      "content": "选收集器先写清业务目标：吞吐、P99/P999、最大停顿、堆规模、容器 limit、CPU 核数和可接受资源成本。然后打印实际启动 flags，确认 JVM 真正选了哪个收集器，而不是凭 JDK 大版本猜。\n\n上线前看四类证据。第一，GC 日志：Young/Mixed/Full GC 频率、触发原因、回收前后水位、暂停分解。第二，对象分布：分配速率、晋升速率、Full/Old GC 后 live set、Humongous 或大数组。第三，资源余量：GC 线程是否抢业务 CPU，RSS 是否逼近容器 limit，直接内存和线程栈是否被漏算。第四，业务指标：P99/P999、超时、吞吐和错误率是否与 GC 事件同频。\n\n常见判断：Parallel 长停顿但吞吐达标时未必需要换；G1 出现 to-space exhausted 或 Humongous 堆积时要看 Region、堆余量和大对象来源；ZGC/Shenandoah 出现 allocation stall 或 CPU 被抢时，说明并发回收可能追不上分配速率。"
+      "content": "选收集器先写清业务目标：吞吐、P99/P999、最大停顿、堆规模、容器 limit、CPU 核数和可接受资源成本。然后打印实际启动 flags（`-XX:+PrintCommandLineFlags -version`），确认 JVM 真正选了哪个收集器，而不是凭 JDK 大版本猜。\n\n上线前看四类证据。第一，GC 日志：Young/Mixed/Full GC 频率、触发原因、回收前后各 Region 水位、暂停时间分解（root scanning、evacuation、remark 等各阶段耗时）。第二，对象分布：分配速率（young allocation rate）、晋升速率（promotion rate）、Full/Old GC 后 live set、Humongous 对象数量和大小。第三，资源余量：GC 线程是否抢业务 CPU（`-XX:ConcGCThreads` 和 `-XX:ParallelGCThreads` 配置）、RSS 是否逼近容器 limit、直接内存和线程栈是否被漏算。第四，业务指标：P99/P999、超时、吞吐和错误率是否与 GC 事件同频。\n\n常见判断：Parallel 长停顿但吞吐达标时未必需要换；G1 出现 to-space exhausted 或 Humongous 堆积时要看 Region 大小、堆余量和大对象来源；ZGC/Shenandoah 出现 allocation stall（分配停顿，GC 并发回收追不上分配速率）或 CPU 被抢时，说明并发回收可能追不上分配速率。关键是把 GC 事件和业务指标对齐——P99 飙高时如果没有对应的 GC 暂停，问题不在收集器。"
+    },
+    {
+      "type": "explain",
+      "title": "分代语义在不同收集器中的演变",
+      "content": "传统分代假设（大多数对象短命、少数长命）在 Serial、Parallel、CMS 里是硬性的：年轻代用复制算法，老年代用标记清除或标记整理，通过年龄阈值晋升。G1 虽然保留了 Eden/Survivor/Old 的分代概念，但粒度是 Region 而不是连续内存块，每个 Region 的角色可以动态变化，Mixed GC 也会回收 Old Region，所以分代边界比传统方案更灵活。\n\nZGC 在 JDK 21 引入分代模式（Generational ZGC），JDK 23 起默认分代，JDK 24 移除非分代模式。分代 ZGC 把堆分成年轻代和老年代，年轻代使用较高频率的 minor GC（对象分配快、回收快），老年代使用较低频率的 major GC，整体提高了吞吐并降低了内存占用。Shenandoah 也在 JDK 21 引入了分代模式（JEP 404，实验性），但生产成熟度要结合具体版本和压测验证。\n\n这意味着：面试里说「ZGC 不分代」已经过时；说「G1 严格分代」也不准确（G1 的 Region 可以跨代回收）；说「所有收集器都是分代的」更错（ZGC 早期版本不分代，Shenandoah 分代还在实验阶段）。正确说法是：分代语义在不同收集器里的粒度、灵活性和默认行为都不同，要按版本和实际 flags 讲。"
     },
     {
       "type": "diagram",
@@ -50,13 +60,13 @@
     },
     {
       "type": "compareTable",
-      "title": "收集器对比",
-      "content": "| 收集器 | 目标 | 关键机制 | 适用场景 | 边界 |\n| --- | --- | --- | --- | --- |\n| Serial | 简单、小足迹 | 单线程 STW，复制/整理 | 小堆工具、受限环境、显式选择 | 服务端高并发通常不合适 |\n| Parallel | 吞吐优先 | 多线程 STW，吞吐目标和自适应策略 | 批处理、离线计算 | 停顿可能较长 |\n| CMS | 历史低停顿 | 老年代并发标记清除 | 旧 JDK 系统识别和迁移 | JDK 14 已移除，有碎片和浮动垃圾 |\n| G1 | 通用低停顿基线 | Region、RSet、并发标记、Mixed GC、evacuation | 多数在线服务、较大堆 | Humongous/to-space/RSet 成本要看日志 |\n| ZGC | 极低停顿 | 着色指针、load barrier、并发重定位、分代 ZGC | 大堆、尾延迟严格服务 | 需要 CPU/内存余量，JDK 版本要确认 |\n| Shenandoah | 极低停顿 | 屏障、转发/并发压缩 | 特定发行版/平台低延迟服务 | 支持矩阵和生产经验要核实 |"
+      "title": "收集器定位、机制与失败信号对比",
+      "content": "| 收集器 | 目标 | 关键机制 | 适用场景 | 失败信号 |\n| --- | --- | --- | --- | --- |\n| Serial | 简单、小足迹 | 单线程 STW，复制/整理 | 小堆工具、受限环境、显式选择 | 停顿与堆大小线性增长，服务端不适合 |\n| Parallel | 吞吐优先 | 多线程 STW，吞吐目标和自适应策略 | 批处理、离线计算 | Full GC 停顿可能很长，但吞吐达标未必需换 |\n| CMS | 历史低停顿 | 老年代并发标记清除 | 旧 JDK 系统识别和迁移 | JDK 14 已移除，碎片、浮动垃圾、concurrent mode failure |\n| G1 | 通用低停顿基线 | Region、RSet、并发标记、Mixed GC、evacuation | 多数在线服务、较大堆 | to-space exhausted、Humongous 堆积、Mixed GC 后 old 不降 |\n| ZGC | 极低停顿 | 着色指针、load barrier、并发重定位、分代 ZGC | 大堆、尾延迟严格服务 | allocation stall、CPU 被 GC 抢占、RSS 增长 |\n| Shenandoah | 极低停顿 | Brooks 转发指针、读/写屏障、并发压缩 | 特定发行版/平台低延迟服务 | allocation stall、屏障开销、支持矩阵要核实 |"
     },
     {
       "type": "code",
       "title": "可运行命令：确认实际收集器和日志口径",
-      "content": "#!/usr/bin/env bash\nset -eu\n\necho \"Default collector selected by this JVM:\"\njava -XX:+PrintCommandLineFlags -version 2>&1 \\\n  | tr ' ' '\\n' \\\n  | grep -E 'Use(Serial|Parallel|G1|Shenandoah)GC|UseZGC' || true\n\necho\necho \"Force G1 and show GC init line:\"\njava -Xms64m -Xmx64m -XX:+UseG1GC -Xlog:gc -version 2>&1 \\\n  | sed -n '1,8p'\n\necho\necho \"Force Serial and show GC init line:\"\njava -Xms64m -Xmx64m -XX:+UseSerialGC -Xlog:gc -version 2>&1 \\\n  | sed -n '1,8p'",
+      "content": "#!/usr/bin/env bash\nset -eu\n\necho \"=== 1. Default collector selected by this JVM ===\"\njava -XX:+PrintCommandLineFlags -version 2>&1 \\\n  | tr ' ' '\\n' \\\n  | grep -iE 'Use(Serial|Parallel|G1|Shenandoah)GC|UseZGC' || echo \"(no explicit collector flag found)\"\n\necho\necho \"=== 2. Force G1 with GC unified logging ===\"\njava -Xms64m -Xmx64m -XX:+UseG1GC \\\n  -Xlog:gc*::time,uptime,level,tags \\\n  -version 2>&1 | sed -n '1,12p'\n\necho\necho \"=== 3. Force ZGC (requires JDK 15+) ===\"\njava -Xms64m -Xmx64m -XX:+UseZGC \\\n  -Xlog:gc*::time,uptime,level,tags \\\n  -version 2>&1 | sed -n '1,12p' || echo \"(ZGC not available on this JVM)\"\n\necho\necho \"=== 4. Force Serial for comparison ===\"\njava -Xms64m -Xmx64m -XX:+UseSerialGC \\\n  -Xlog:gc*::time,uptime,level,tags \\\n  -version 2>&1 | sed -n '1,12p'",
       "language": "bash",
       "highlights": [
         {
@@ -64,11 +74,15 @@
           "note": "生产排查先打印实际 flags，别只按 JDK 版本猜默认收集器。"
         },
         {
-          "line": 11,
-          "note": "用小堆强制 G1 并开启 GC 日志，可以确认当前 JVM 是否支持该收集器和统一日志语法。"
+          "line": 12,
+          "note": "用小堆强制 G1 并开启 GC unified logging，可以确认当前 JVM 是否支持该收集器和日志语法。"
         },
         {
-          "line": 16,
+          "line": 18,
+          "note": "ZGC 需要 JDK 15+，命令失败说明当前 JVM 不支持。"
+        },
+        {
+          "line": 24,
           "note": "Serial 命令用于对比 STW 单线程收集器的启动口径；真实服务端不要只凭命令可用就选它。"
         }
       ]
@@ -76,19 +90,23 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "按业务目标讲收集器，而不是按名单背。\n\n**收集器选型**\n- Parallel：吞吐优先、可接受较长停顿的批处理\n- G1：常规在线服务基线，Region + 并发标记 + Mixed GC + evacuation，停顿与吞吐平衡\n- ZGC：大堆、P99/P999 敏感，染色指针 + 读屏障 + 并发重定位，停顿 <10ms\n- Shenandoah：Brooks 转发指针 + 并发整理，停顿 <10ms\n- Serial：小堆、工具、显式选择\n- CMS：JDK 14 已移除，仅历史知识和迁移背景\n\n**版本边界**\n- G1：JDK 9 起为 server 默认（实际看 JVM flags）\n- ZGC：JDK 15 转正，JDK 21 引入分代，JDK 23 起默认分代，JDK 24 移除非分代\n- Shenandoah：可用性看发行版和平台\n\n**验证（换收集器不凭感觉）**\n- G1：Mixed GC、Humongous、to-space exhausted、回收后 old 水位\n- ZGC/Shenandoah：allocation stall、并发周期是否追上分配速率、CPU/RSS 余量\n- Parallel：Full GC 停顿、吞吐是否达标\n- 同一压测比较：P99/P999、吞吐、CPU、RSS、GC pause、allocation stall\n\n**选型失败信号**\n- G1：to-space exhausted / Humongous 堆积 / Mixed GC 后 old 不降 → 空间或对象分布不适配\n- ZGC/Shenandoah：allocation stall / CPU 被 GC 抢占 → 并发回收追不上\n- Parallel：Full GC 停顿长但吞吐达标 → 非最优延迟但未必影响批处理\n- 把 SLO、机制和日志证据连起来，才算会选收集器",
+      "content": "按业务目标讲收集器，而不是按名单背。\n\n**收集器选型（目标导向）**\n- Parallel：吞吐优先、可接受较长停顿的批处理\n- G1：常规在线服务基线，Region + 并发标记 + Mixed GC + evacuation，停顿与吞吐平衡\n- ZGC：大堆、P99/P999 敏感，染色指针 + 读屏障 + 并发重定位，停顿 <10ms\n- Shenandoah：Brooks 转发指针 + 并发压缩，停顿 <10ms\n- Serial：小堆、工具、显式选择\n- CMS：JDK 14 已移除，仅历史知识和迁移背景\n\n**版本边界**\n- G1：JDK 9 起为 server 默认（实际看 `PrintCommandLineFlags`）\n- ZGC：JDK 15 转正，JDK 21 引入分代，JDK 23 起默认分代，JDK 24 移除非分代\n- Shenandoah：可用性看发行版和平台\n\n**G1 的关键机制**\n- Region 切分，每个 Region 角色动态变化（Eden/Survivor/Old/Humongous）\n- Remembered Set 维护跨 Region 引用，写屏障有 CPU 开销\n- Mixed GC 按回收价值排序选 Region，受 `MaxGCPauseMillis` 预算控制\n- Humongous 对象（>Region 50%）不参与正常 evacuation，大量时会退化成 Full GC\n- to-space exhausted 意味着 evacuation 目标空间不够，退化成单线程 Full GC\n\n**ZGC/Shenandoah 的并发边界**\n- 着色指针 + load barrier / Brooks 转发指针 + 读/写屏障\n- STW 主要在根处理，通常 <1ms\n- 代价：CPU 余量、内存余量、屏障开销（5%–15%）、版本复杂度\n- 不是所有低延迟服务都需要 ZGC——G1 的 MaxGCPauseMillis 已能满足 SLO 时，切换只增加成本\n\n**验证（换收集器不凭感觉）**\n- G1：Mixed GC、Humongous、to-space exhausted、回收后 old 水位\n- ZGC/Shenandoah：allocation stall、并发周期是否追上分配速率、CPU/RSS 余量\n- Parallel：Full GC 停顿、吞吐是否达标\n- 同一压测比较：P99/P999、吞吐、CPU、RSS、GC pause、allocation stall\n\n**分代语义演变**\n- 传统收集器（Serial/Parallel/CMS）：硬性分代，连续内存块\n- G1：保留分代概念但粒度是 Region，跨代回收更灵活\n- ZGC：JDK 21 引入分代，JDK 23 起默认，JDK 24 移除非分代\n- Shenandoah：JDK 21 引入实验性分代（JEP 404），成熟度要验证",
       "followUpQuestions": [
         {
           "question": "CMS 和 G1 的核心差异是什么？",
-          "answer": "CMS 是历史老年代并发标记清除方案，停顿较短但有碎片、浮动垃圾和 concurrent mode failure，且 JDK 14 已移除。G1 是面向整个堆的 Region 收集器，通过并发标记、Remembered Set、Young/Mixed GC 和 evacuation 控制停顿与碎片，更适合作为现代在线服务基线，但也要关注 Humongous、to-space exhausted 和 RSet 成本。"
+          "answer": "CMS 是历史老年代并发标记清除方案，停顿较短但有碎片、浮动垃圾和 concurrent mode failure，且 JDK 14 已移除。G1 是面向整个堆的 Region 收集器，通过并发标记、Remembered Set、Young/Mixed GC 和 evacuation 控制停顿与碎片，更适合作为现代在线服务基线。G1 的 Region 模型让 Mixed GC 可以按回收价值选择性回收老年代，而不是整个老年代一起清理。"
         },
         {
           "question": "为什么不是所有低延迟服务都直接上 ZGC？",
-          "answer": "ZGC 用屏障、并发标记和并发重定位换低停顿，但会消耗 CPU、内存余量，并且对 JDK 版本和观测体系有要求。如果业务堆不大、吞吐更关键、几十毫秒停顿可接受，G1 可能更省资源。是否切换要用同一压测比较 P99/P999、吞吐、CPU、RSS、GC pause 和 allocation stall。"
+          "answer": "ZGC 用屏障、并发标记和并发重定位换低停顿，但会消耗 CPU 余量（并发线程与业务线程竞争）、内存余量（重定位需要额外空间），并且 load barrier 有 5%–15% 的性能开销。如果业务堆不大（几 GB）、吞吐更关键、几十毫秒停顿可接受，G1 可能更省资源。是否切换要用同一压测比较 P99/P999、吞吐、CPU、RSS、GC pause 和 allocation stall。"
         },
         {
-          "question": "线上选型失败通常从哪里看出来？",
-          "answer": "看 GC 日志和业务指标是否同频。G1 如果出现 to-space exhausted、Humongous Region 堆积或 Mixed GC 后 old 水位不降，说明空间或对象分布不适配。ZGC/Shenandoah 如果有 allocation stall 或 CPU 被 GC 抢占，说明并发回收追不上。Parallel 如果 Full GC 停顿很长但吞吐达标，可能不是最优延迟方案但未必影响批处理目标。"
+          "question": "G1 的 to-space exhausted 和 Humongous 问题分别怎么排查？",
+          "answer": "to-space exhausted 意味着 evacuation 目标 Region 不够用，G1 退化成单线程 Full GC。排查方向：增大堆（`-Xmx`）、降低 `MaxGCPauseMillis` 使 Mixed GC 更频繁、检查分配速率是否过高、检查存活对象是否超出预期。Humongous 问题要查大对象来源（大数组、序列化缓冲区），尝试拆分大对象或调整 `-XX:G1HeapRegionSize`（增大 Region 以减少 Humongous 对象，但会降低 Region 粒度）。"
+        },
+        {
+          "question": "ZGC 的分代版本和非分代版本有什么区别？",
+          "answer": "JDK 21 引入 Generational ZGC，JDK 23 起默认分代，JDK 24 移除非分代模式。分代 ZGC 把堆分成年轻代和老年代，年轻代使用较高频率的 minor GC（对象分配快、回收快），老年代使用较低频率的 major GC，整体提高了吞吐并降低了内存占用（非分代模式需要更多空间做并发重定位）。现在说「ZGC 不分代」已经过时。"
         }
       ]
     },
@@ -99,9 +117,11 @@
         "能按吞吐、P99/P999、堆规模、CPU/内存余量和 JDK 版本选择收集器",
         "能说明 Serial、Parallel、CMS、G1、ZGC、Shenandoah 的定位和边界",
         "能解释 CMS 的历史地位、JDK 14 移除和迁移口径",
-        "能讲清 G1 的 Region、Remembered Set、Mixed GC、Humongous 和 evacuation 风险",
-        "能说明 ZGC/Shenandoah 通过屏障和并发重定位降低停顿的代价",
-        "能用 GC 日志和压测指标验证收集器是否满足业务 SLO"
+        "能讲清 G1 的 Region 模型、Remembered Set、Mixed GC 选 Region 的价值排序、Humongous 和 to-space exhausted",
+        "能说明 ZGC/Shenandoah 通过屏障和并发重定位降低停顿的代价（CPU、内存、屏障开销）",
+        "能解释分代语义在不同收集器中的演变（G1 的 Region 灵活性、ZGC 的分代版本边界）",
+        "能用 GC 日志和压测指标验证收集器是否满足业务 SLO",
+        "能区分「收集器不满足 SLO」和「问题不在收集器」（GC 事件与业务指标是否同频）"
       ]
     }
   ],
@@ -126,6 +146,27 @@
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 4
+    },
+    {
+      "id": "java.jvm.topic-007-e93284f6.recall.4",
+      "prompt": "ZGC 的分代版本（JDK 21+）和非分代版本有什么区别？为什么 JDK 24 移除了非分代模式？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "java.jvm.topic-007-e93284f6.recall.5",
+      "prompt": "线上 G1 出现 to-space exhausted，你会从哪些方向排查？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "java.jvm.topic-007-e93284f6.recall.6",
+      "prompt": "为什么说「ZGC 停顿更短所以所有服务都该用 ZGC」是错误的选型思路？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
     }
   ],
   "rubric": {
@@ -136,15 +177,17 @@
       "能用 GC 日志和压测结果验证收集器是否满足停顿和吞吐目标"
     ],
     "goodToHave": [
-      "能解释 G1 的 Region、Remembered Set、Mixed GC、Humongous Object 和 evacuation failure",
+      "能解释 G1 的 Region 模型、Remembered Set、Mixed GC 选 Region 的价值排序、Humongous 和 to-space exhausted",
       "能说明 ZGC 的分代版本口径和 JDK 24 非分代移除边界",
-      "能区分默认收集器、显式参数和发行版支持差异"
+      "能区分默认收集器、显式参数和发行版支持差异",
+      "能说明屏障开销和 CPU/内存余量对低延迟 GC 选型的约束"
     ],
     "commonMistakes": [
       "只背收集器名称，不结合业务 SLO、JDK 版本和 GC 日志做选择",
       "把 CMS 当成现代 JDK 可用的推荐方案",
       "把 G1 默认、ZGC 分代、Shenandoah 支持说成不分环境的固定结论",
-      "遇到线上 GC 问题只说换收集器，不能解释停顿、吞吐、内存和对象分布证据"
+      "遇到线上 GC 问题只说换收集器，不能解释停顿、吞吐、内存和对象分布证据",
+      "说「ZGC 不分代」（已过时）或「G1 严格分代」（Region 粒度可跨代回收）"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -153,7 +196,7 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "java.jvm.topic-005-af0a37c3",
@@ -161,5 +204,5 @@
     "java.jvm.topic-001-ebcc71cb"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察候选人能否从业务 SLO、JDK 版本、堆规模、CPU/内存余量和 GC 日志出发选择收集器，并能解释 G1、ZGC/Shenandoah、CMS 历史迁移的真实边界。"
+  "interviewerFocus": "考察候选人能否从业务 SLO、JDK 版本、堆规模、CPU/内存余量和 GC 日志出发选择收集器，并能解释 G1 的 Region 模型与失败信号、ZGC/Shenandoah 的并发边界与代价、CMS 历史迁移和分代语义演变的真实边界。"
 }

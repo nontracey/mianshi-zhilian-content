@@ -11,19 +11,24 @@
     "HashMap 原理"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 30,
   "order": 10,
   "recommendWeight": 98,
   "learningCards": [
     {
       "type": "explain",
       "title": "HashMap 的主线：定位桶、处理冲突、必要时扩容",
-      "content": "## 数据结构\nJDK 8+ 的 `HashMap` 主体是 `Node<K,V>[] table`，每个数组槽是一个 bucket。桶为空时直接放节点；发生冲突时先形成单向链表；当冲突链足够长且数组容量足够大时，链表会树化为红黑树，把极端冲突下的查找从 O(n) 降到 O(log n)。\n\n## 桶定位为什么用 `(n - 1) & hash`\nHashMap 会先取 key 的 `hashCode()`，再做高低位扰动：`h ^ (h >>> 16)`，让高 16 位也影响低位桶下标。容量会被规范到 2 的幂，因此 `(n - 1) & hash` 等价于对 n 取模，并且扩容迁移时能只看新增的那一位。\n\n## put 流程\n一次 `put` 可以讲成六步：计算扰动 hash；table 未初始化则初始化；用 `(n - 1) & hash` 找桶；桶为空就插入；桶非空则比较 `hash` 和 `equals`，命中则覆盖旧 value，否则按链表尾插或红黑树插入；插入后再判断树化和扩容。\n\n## 树化门槛要说完整\n链表长度达到 `TREEIFY_THRESHOLD = 8` 时并不一定马上树化：如果 table 长度小于 `MIN_TREEIFY_CAPACITY = 64`，HashMap 会优先扩容，让节点分散到更多桶；只有容量至少 64 时才树化。树节点在 resize split 后节点数小于等于 `UNTREEIFY_THRESHOLD = 6` 时可能退化回链表。"
+      "content": "JDK 8+ 的 `HashMap` 主体是 `Node<K,V>[] table`，每个数组槽是一个 bucket。桶为空时直接放节点；发生冲突时先形成单向链表；当冲突链足够长且数组容量足够大时，链表会树化为红黑树，把极端冲突下的查找从 O(n) 降到 O(log n)。\n\n**桶定位为什么用 `(n - 1) & hash`**\nHashMap 会先取 key 的 `hashCode()`，再做高低位扰动：`h ^ (h >>> 16)`，让高 16 位也影响低位桶下标。容量会被规范到 2 的幂，因此 `(n - 1) & hash` 等价于对 n 取模，并且扩容迁移时能只看新增的那一位。\n\n扰动函数的价值不只是均匀分布。如果直接用 hashCode 的低几位，高 16 位的信息完全丢失。对于 hashCode 分布本身就集中在某些区间的情况（比如 Integer 的 hashCode 就是自身值），低位碰撞会很频繁。把高 16 位异或到低 16 位后，即使 hashCode 的高位有差异也能反映到桶选择上，让哈希更均匀。这个扰动在 JDK 8 只做一次 16 位移位，而 JDK 7 做了四次（rehash），JDK 8 的设计是用更少的运算换取够用的分散度。\n\n**put 流程**\n一次 `put` 可以讲成六步：计算扰动 hash；table 未初始化则初始化；用 `(n - 1) & hash` 找桶；桶为空就插入；桶非空则比较 `hash` 和 `equals`，命中则覆盖旧 value，否则按链表尾插或红黑树插入；插入后再判断树化和扩容。\n\n链表尾插是 JDK 8 相对 JDK 7 的关键变化。JDK 7 用头插，扩容迁移时并发操作可能导致链表成环（死循环）；JDK 8 改用尾插，既避免了这个特定并发问题，也配合高低位拆桶让迁移时节点顺序可预测。\n\n**树化门槛要说完整**\n链表长度达到 `TREEIFY_THRESHOLD = 8` 时并不一定马上树化：如果 table 长度小于 `MIN_TREEIFY_CAPACITY = 64`，HashMap 会优先扩容，让节点分散到更多桶；只有容量至少 64 时才树化。树节点在 resize split 后节点数小于等于 `UNTREEIFY_THRESHOLD = 6` 时可能退化回链表。8 和 6 之间的间隔是刻意的滞后区间，避免在边界反复切换数据结构（这种抖动在链表和树之间来回转换的开销比直接保持某一种结构更大）。\n\n为什么是 8？源码注释中给出过概率估算：在随机 hashCode 且负载因子为 0.75 的条件下，一个桶中出现 8 个节点的概率约为 0.00000006，也就是六百万分之一。所以大多数正常运行的 HashMap 根本不会触发树化。树化是极端碰撞的保护手段，不是日常路径。"
     },
     {
       "type": "explain",
       "title": "resize、key 契约和并发边界",
-      "content": "## resize 为什么快\n元素数超过 `threshold = capacity * loadFactor` 会触发扩容，默认负载因子 0.75 是时间和空间的折中。扩容通常变成原来的 2 倍，因此新掩码只比旧掩码多出 `oldCap` 对应的 bit。迁移节点时不用重算 hash：`(hash & oldCap) == 0` 留在原桶；不为 0 就移动到 `原桶 + oldCap`。\n\n## key 的设计比背源码更重要\n作为 key 的对象必须满足 equals/hashCode 契约：`equals` 为 true 的两个对象，`hashCode` 必须相等；hash 相等不代表 equals 一定为 true。更推荐使用不可变 key。若插入后修改了参与 hash/equals 的字段，即使是同一个对象，也可能因为落桶依据变了而找不回来。\n\n## HashMap 不是并发容器\nJDK 7 扩容时头插链表在并发修改下可能形成环，这是经典历史问题；JDK 8 改成尾插并引入树化，但仍不保证并发安全。并发 put 可能覆盖、丢更新、读到中间状态或触发结构异常。多线程读写应使用 `ConcurrentHashMap`、外部同步，或采用不可变快照/发布后只读。"
+      "content": "**resize 为什么快**\n元素数超过 `threshold = capacity * loadFactor` 会触发扩容，默认负载因子 0.75 是时间和空间的折中。0.5 意味着桶用一半就扩，浪费内存；1.0 意味着桶全用满才扩，冲突概率大增。0.75 在时间和空间之间取了一个均衡点，源码中也有注释说这个值近似泊松分布下冲突链长度的最优选择。\n\n扩容通常变成原来的 2 倍，因此新掩码只比旧掩码多出 `oldCap` 对应的 bit。迁移节点时不用重算 hash：`(hash & oldCap) == 0` 留在原桶；不为 0 就移动到 `原桶 + oldCap`。这一设计让扩容的迁移复杂度从 O(n log n) 降到 O(n)，因为每个节点最多移动一次，不用像 JDK 7 那样把整条链再重排。\n\n具体来说，容量从 16 变到 32 时，原来的掩码是 `0b01111`（15），新掩码是 `0b011111`（31）。多出来的那一位（第 5 位，值为 16）决定了节点是否要移动。用 `hash & oldCap`（即 `hash & 16`）就能判断第 5 位是 0 还是 1。原桶中 hash 第 5 位为 0 的节点还在原位；第 5 位为 1 的节点去 `原桶索引 + 16`。两个新桶的链表保持原有顺序（JDK 8 的尾插和高低位拆分协同作用）。\n\n**key 的设计比背源码更重要**\n作为 key 的对象必须满足 equals/hashCode 契约：`equals` 为 true 的两个对象，`hashCode` 必须相等；hash 相等不代表 equals 一定为 true。更推荐使用不可变 key（String、Integer 等包装类、自定义 final 字段类）。若插入后修改了参与 hash/equals 的字段，即使是同一个对象，也可能因为落桶依据变了而找不回来。\n\n`null` key 的 hash 被固定为 0，放在桶 0。HashMap 允许一个 null key 和多个 null value。这与 Hashtable（不允许 null key/value）和 ConcurrentHashMap（不允许 null key/null value）不同。\n\n**HashMap 不是并发容器**\nJDK 7 扩容时头插链表在并发修改下可能形成环，这是经典历史问题；JDK 8 改成尾插并引入树化，降低了头插环这个特定风险，但仍不保证并发安全。并发 put 可能覆盖、丢更新、读到中间状态或触发结构异常。多线程读写应使用 `ConcurrentHashMap`、外部同步，或采用不可变快照/发布后只读。"
+    },
+    {
+      "type": "explain",
+      "title": "HashMap 的容量规范、hash 冲突概率与工程调参",
+      "content": "**初始容量的规范化**\n构造 HashMap 时传入的 capacity 参数不是直接使用的。`tableSizeFor` 方法会把传入值规范化到大于等于它的最小 2 的幂。比如传 10 得到 16，传 17 得到 32。这个设计保证了 `(n - 1) & hash` 始终等价取模。初始容量默认是 16，首次 put 才分配（延迟初始化）。\n\n如果你已知要放入大约 1000 个元素，按默认负载因子 0.75，直接传 1000 的话实际容量是 1024，threshold 是 768，放入 769 个元素就会扩容。更好的做法是传入 `(int) (expectedSize / 0.75) + 1`，减少不必要的扩容。Guava 的 `Maps.newHashMapWithCapacity` 就做了这个计算。\n\n**hash 冲突的工程视角**\nHashMap 假设 hashCode 是均匀分布的。如果 key 类的 hashCode 实现有系统性偏斜（比如只依赖一个字段且该字段值域很小），那么不管容量多大、树化阈值多高，冲突都会集中在少数桶里。线上排查慢 HashMap 时，桶链长度分布比全局 size 更重要：可以通过 heap dump 后分析 `HashMap.table` 中各 Node 链的长度，来判断是全局容量不足还是 key hash 分布不均。\n\n好的 hashCode 实现应该让参与 equals 比较的所有字段都参与 hashCode 计算。`Objects.hash(...)` 是简单的选择，但要注意它会装箱。对性能敏感的场景可以手写：`int result = 17; result = 31 * result + field1; result = 31 * result + field2;`。乘以 31 是因为 31 是奇素数，且 `31 * i == (i << 5) - i`，可以被 JVM 优化成位移和减法。"
     },
     {
       "type": "diagram",
@@ -46,7 +51,7 @@
     {
       "type": "compareTable",
       "title": "高频对比与边界",
-      "content": "| 主题 | 正确说法 | 常见误区 |\n| --- | --- | --- |\n| 初始容量 | 默认首次分配常见为 16；构造传入容量会规范到 2 的幂 | 以为构造参数是多少，内部数组就一定是多少 |\n| 负载因子 | 默认 0.75，超过 threshold 触发 resize | 只背 0.75，不会解释时间/空间折中 |\n| 桶定位 | `hashCode` 扰动后 `(n-1)&hash` | 只说取模，不知道 2 的幂和高位扰动 |\n| 树化 | 链表达到 8 且 table 至少 64 才树化 | 说成“超过 8 就树化” |\n| 退化 | 树节点数小于等于 6 可能退化为链表 | 不知道 6 和 8 是为避免频繁转换的滞后区间 |\n| null | HashMap 允许一个 null key 和多个 null value；null key hash 为 0 | 拿 Hashtable/ConcurrentHashMap 的限制套到 HashMap |\n| 并发 | HashMap 非线程安全；并发写用 ConcurrentHashMap 或同步 | 以为 JDK 8 没有头插环就线程安全 |"
+      "content": "| 主题 | 正确说法 | 常见误区 |\n| --- | --- | --- |\n| 初始容量 | 默认首次分配常见为 16；构造传入容量会规范到 2 的幂 | 以为构造参数是多少，内部数组就一定是多少 |\n| 负载因子 | 默认 0.75，超过 threshold 触发 resize；是时间和空间的均衡点 | 只背 0.75，不会解释为什么选这个值 |\n| 桶定位 | `hashCode` 扰动后 `(n-1)&hash`，容量必须是 2 的幂 | 只说取模，不知道 2 的幂和高位扰动的作用 |\n| 树化 | 链表达到 8 且 table 至少 64 才树化 | 说成\"超过 8 就树化\"，漏掉 MIN_TREEIFY_CAPACITY |\n| 退化 | 树节点数小于等于 6 可能退化为链表 | 不知道 6 和 8 之间是故意的滞后区间，避免频繁转换 |\n| null | HashMap 允许一个 null key（hash 为 0）和多个 null value | 拿 Hashtable/ConcurrentHashMap 的限制套到 HashMap |\n| 并发 | JDK 7 头插可能成环，JDK 8 尾插解决此问题但仍非线程安全 | 以为 JDK 8 改了尾插就线程安全了 |\n| hashCode 质量 | 好的 hashCode 让所有 equals 字段参与，乘 31 奇素数 | 以为任意 hashCode 实现都够用，忽略偏斜风险 |\n| 扩容迁移 | `(hash & oldCap)==0` 留原桶，否则去原桶+oldCap，不重算 hash | 以为扩容要对所有节点重新计算桶索引 |"
     },
     {
       "type": "code",
@@ -75,7 +80,7 @@
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**30 秒结论**\nHashMap 是数组加链表加红黑树的哈希表。回答围绕 put 主线：hash 扰动、桶定位、冲突处理、树化、扩容迁移，再补 key 契约和线程安全边界。\n\n**机制主线**\n- hash 扰动：`h ^ (h >>> 16)`，让高位参与桶定位\n- 桶定位：容量 2 的幂，`(n - 1) & hash` 等价取模\n- 桶为空：直接插入\n- 桶非空：先比 hash + equals，命中覆盖；否则链表尾插或红黑树插入\n- 树化门槛：链表长度 ≥ 8 且 table ≥ 64 才树化；table < 64 优先扩容\n- 退化：树节点 ≤ 6 可能退化回链表（滞后区间避免频繁转换）\n- 扩容：size > `capacity * loadFactor`（默认 0.75）触发，容量翻倍\n- 迁移：`(hash & oldCap) == 0` 留原桶；不为 0 移到原桶 + oldCap，不重算 hash\n\n**边界追问**\n- null：允许 1 个 null key（hash 为 0）+ 多个 null value\n- key 契约：equals 为 true → hashCode 必须相等；hash 相等 ≠ equals 为 true\n- 不可变 key：插入后修改参与 hash/equals 的字段会找不回来\n- 默认值：初始容量 16、负载因子 0.75、树化阈值 8、退化阈值 6、最小树化容量 64\n\n**并发边界**\n- JDK 7 头插扩容并发下可能形成环（经典死循环）\n- JDK 8 改尾插 + 高低位拆分，解决头插环问题，但仍非线程安全\n- 并发 put 可能丢更新、覆盖、读到中间状态、破坏结构\n- 并发写用 ConcurrentHashMap 或外部同步\n\n**排查与验证**\n- 桶链过长（性能下降）：`jcmd <pid> GC.heap_dump` 后用 MAT 看 HashMap.table 各桶链长度分布\n- key hashCode 分布差：审查 key 类的 hashCode 实现，用 `Objects.hash` 或均匀分布的 hash\n- size 异常增长：检查是否有可变 key 被修改后落桶依据变化\n- 验证扩容行为：`-XX:+PrintFlagsWithFinal` 看容量相关参数，单测里用反射读 table.length\n- 内存占用：HashMap 每个 Entry 有额外对象头开销，百万级映射要注意 GC",
+      "content": "**30 秒结论**\nHashMap 是数组加链表加红黑树的哈希表。回答围绕 put 主线：hash 扰动、桶定位、冲突处理、树化、扩容迁移，再补 key 契约和线程安全边界。\n\n**机制主线**\n- hash 扰动：`h ^ (h >>> 16)`，让高位参与桶定位，弥补低 16 位碰撞时的信息丢失\n- 桶定位：容量 2 的幂，`(n - 1) & hash` 等价取模，比直接 % 更快\n- 桶为空：直接插入\n- 桶非空：先比 hash + equals，命中覆盖；否则链表尾插或红黑树插入\n- 树化门槛：链表长度 ≥ 8 且 table ≥ 64 才树化；table < 64 优先扩容\n- 退化：树节点 ≤ 6 可能退化回链表（滞后区间避免频繁转换）\n- 扩容：size > `capacity * loadFactor`（默认 0.75）触发，容量翻倍\n- 迁移：`(hash & oldCap) == 0` 留原桶；不为 0 移到原桶 + oldCap，不重算 hash\n\n**边界追问**\n- null：允许 1 个 null key（hash 为 0，放在桶 0）+ 多个 null value\n- key 契约：equals 为 true → hashCode 必须相等；hash 相等 ≠ equals 为 true\n- 不可变 key：插入后修改参与 hash/equals 的字段会找不回来（落桶依据变了）\n- 默认值：初始容量 16、负载因子 0.75、树化阈值 8、退化阈值 6、最小树化容量 64\n- hashCode 质量：偏斜的 hashCode 会导致少数桶聚集大量节点，树化也救不了\n\n**并发边界**\n- JDK 7 头插扩容并发下可能形成环（经典死循环），原因是头插迁移时链表顺序反转\n- JDK 8 改尾插 + 高低位拆分，解决头插环问题，但仍非线程安全\n- 并发 put 可能丢更新、覆盖、读到中间状态、破坏结构（特别是 resize 过程）\n- 并发写用 ConcurrentHashMap 或外部同步\n\n**排查与验证**\n- 桶链过长（性能下降）：`jcmd <pid> GC.heap_dump` 后用 MAT 看 HashMap.table 各桶链长度分布\n- key hashCode 分布差：审查 key 类的 hashCode 实现，确保所有 equals 字段参与计算\n- size 异常增长：检查是否有可变 key 被修改后落桶依据变化，导致旧桶悬空\n- 验证扩容行为：`-XX:+PrintFlagsWithFinal` 看容量相关参数，单测里用反射读 table.length\n- 内存占用：HashMap 每个 Node 有额外对象头开销，百万级映射要考虑 GC 压力和负载因子调优",
       "followUpQuestions": [
         {
           "question": "为什么 HashMap 容量要保持 2 的幂？",
@@ -87,7 +92,11 @@
         },
         {
           "question": "HashMap 为什么线程不安全？JDK 8 还会有 JDK 7 的死循环吗？",
-          "answer": "JDK 7 头插迁移在并发扩容时可能把链表改成环，这是经典死循环问题。JDK 8 改用尾插和高低位拆分，降低了这个特定风险，但 HashMap 仍没有并发控制；并发 put 可能丢更新、覆盖、读到中间状态或破坏结构，所以不能当并发容器。"
+          "answer": "JDK 7 头插迁移在并发扩容时可能把链表改成环，原因是迁移过程中链表顺序反转和并发插入交织。JDK 8 改用尾插和高低位拆分，迁移时顺序可预测，降低了这个特定风险。但 HashMap 仍没有并发控制；并发 put 可能丢更新、覆盖、读到中间状态或破坏结构，所以不能当并发容器。"
+        },
+        {
+          "question": "如何判断一个 HashMap 是否存在 hash 偏斜？",
+          "answer": "通过 heap dump 分析 table 数组中各桶的链表/树深度分布。如果少数桶深度远超平均值而多数桶为空，说明 key 的 hashCode 分布偏斜。需要审查 key 类的 hashCode 实现，确保所有参与 equals 的字段都参与 hashCode 计算。"
         }
       ]
     },
@@ -95,13 +104,15 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能讲清 Node[] table、链表、红黑树分别解决什么问题",
-        "能解释 hash 扰动、2 的幂容量与 `(n - 1) & hash` 的关系",
-        "能按顺序说出 put 的插入、覆盖、链表尾插、红黑树插入和扩容检查",
-        "能准确说出树化阈值 8、最小树化容量 64、退化阈值 6",
-        "能解释 resize 时 oldIndex / oldIndex + oldCap 的位拆分逻辑",
-        "能说明 null key/value、equals/hashCode 契约和可变 key 风险",
-        "能解释 HashMap 非线程安全以及 ConcurrentHashMap 的使用边界"
+        "能讲清 Node[] table、链表、红黑树分别解决什么问题，以及三者在冲突处理中的关系",
+        "能解释 hash 扰动的作用（让高 16 位参与桶定位）、2 的幂容量与 `(n - 1) & hash` 的关系",
+        "能按顺序说出 put 的插入、覆盖、链表尾插、红黑树插入和扩容检查的完整流程",
+        "能准确说出树化阈值 8、最小树化容量 64、退化阈值 6，以及 8 和 6 之间滞后区间的工程意义",
+        "能解释 resize 时 `(hash & oldCap) == 0` 留原桶、否则去原桶+oldCap 的位拆分逻辑",
+        "能说明 null key/hash 为 0、equals/hashCode 契约、可变 key 风险和 hashCode 质量对性能的影响",
+        "能解释 HashMap 非线程安全的原因，区分 JDK 7 头插环问题和 JDK 8 的改进与残余风险",
+        "能说明初始容量规范化（tableSizeFor）、负载因子 0.75 的时间和空间折中",
+        "能说出扩容时为什么不用重算 hash，以及这个设计对迁移复杂度的影响"
       ]
     }
   ],
@@ -133,27 +144,43 @@
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
+    },
+    {
+      "id": "java.java-fundamentals.topic-028-905d9b58.recall.5",
+      "prompt": "线上发现某个 HashMap 的 get 响应变慢，你怎么排查？是全局容量不足还是 hashCode 分布偏斜？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "java.java-fundamentals.topic-028-905d9b58.recall.6",
+      "prompt": "HashMap 默认负载因子为什么是 0.75？如果改成 0.5 或 1.0 会有什么影响？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能讲清数组、链表、红黑树三种结构在 HashMap 中的职责",
-      "能解释 hash 扰动、2 的幂容量、(n-1)&hash 桶定位",
-      "能按 put 主线说明插入、覆盖、链表/树处理、树化和扩容",
-      "能准确说出树化阈值 8、最小树化容量 64、退化阈值 6 和 resize 位拆分"
+      "能讲清数组、链表、红黑树三种结构在 HashMap 中的职责和切换条件",
+      "能解释 hash 扰动、2 的幂容量、(n-1)&hash 桶定位三者的配合关系",
+      "能按 put 主线说明插入、覆盖、链表/树处理、树化条件（8 + 64）和扩容",
+      "能准确说出树化阈值 8、最小树化容量 64、退化阈值 6 和 resize 位拆分逻辑"
     ],
     "goodToHave": [
-      "能解释 null key/value、equals/hashCode 契约和可变 key 风险",
-      "能说明默认负载因子 0.75 的时间/空间折中",
+      "能解释 null key/value 语义、equals/hashCode 契约和可变 key 风险",
+      "能说明默认负载因子 0.75 的时间/空间折中，以及容量规范化（tableSizeFor）",
       "能区分 JDK 7 头插并发环问题与 JDK 8 尾插后的非线程安全边界",
-      "能说明 HashMap、Hashtable、ConcurrentHashMap 在 null 和并发语义上的差异"
+      "能说明 HashMap、Hashtable、ConcurrentHashMap 在 null 和并发语义上的差异",
+      "能分析 hashCode 质量对 HashMap 性能的影响，以及线上排查偏斜的方法"
     ],
     "commonMistakes": [
-      "只说 key-value 存储，不解释桶定位和冲突处理",
-      "把树化条件简化成链表长度大于 8，漏掉 table 至少 64",
-      "把 TLB 式缓存或数据库索引类比套到 HashMap，忽略 equals/hashCode 契约",
+      "只说 key-value 存储，不解释桶定位和冲突处理的完整链路",
+      "把树化条件简化成链表长度大于 8，漏掉 MIN_TREEIFY_CAPACITY=64",
+      "把扩容迁移说成\"重新计算索引\"，不知道 `(hash & oldCap)` 的位拆分免重算设计",
       "认为 JDK 8 解决头插环后 HashMap 就线程安全",
-      "使用可变对象做 key，插入后修改字段导致无法查找"
+      "使用可变对象做 key，插入后修改字段导致无法查找，不理解 equals/hashCode 契约",
+      "以为负载因子 0.75 是随便选的数字，不知道是泊松分布下冲突链长度的均衡点"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -162,7 +189,7 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [],
   "interviewFrequency": "high",

@@ -4,7 +4,7 @@
   "category": "middleware",
   "group": "middleware",
   "title": "RabbitMQ 消息可靠性",
-  "summary": "按生产端、Broker 端、消费端三个失败窗口讲清 publisher confirm、mandatory return、持久化/quorum、manual ack、有限重试、DLX/DLQ 和幂等边界。",
+  "summary": "按生产端、Broker 端、消费端三个失败窗口拆解：异步 publisher confirm 为何是生产首选、confirm 超时的 UNKNOWN 态为何必须用发送日志+业务键做二次确认而不能当失败删；mandatory=true + ReturnListener 覆盖 Exchange→Queue 路由失败（alternate exchange 不保证生产者感知）；durable exchange/queue + persistent message + quorum queue（Raft 多数派写入）四层持久化的各自边界和 flush 前崩溃的残余风险；classic mirrored queue 在 4.x 废弃后 quorum queue 与 stream 的选型；manual ack 必须在业务提交之后、ack 丢失导致重投的根本原因（连接断开时 Broker 未收到 ack 会重新投递）；有限重试/退避/delivery-limit/DLX/DLQ 闭环的生产要求；以及可靠投递与幂等设计的职责分界。",
   "tags": [
     "Java",
     "中间件",
@@ -12,24 +12,34 @@
     "消息可靠性"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 32,
+  "estimatedMinutes": 57,
   "order": 70,
   "recommendWeight": 86,
   "learningCards": [
     {
       "type": "explain",
-      "title": "可靠性不是一句“不丢”，而是失败状态可恢复",
-      "content": "RabbitMQ 可靠性要从三段看：Producer 到 Broker、Broker 内部存储和复制、Broker 到 Consumer。任何一段只讲一个开关都会漏窗口。可靠性的目标是让消息状态可追踪、失败有信号、重试可控、最终能补偿，而不是承诺端到端 exactly-once。\n\n生产端的典型窗口有三个：消息没有到达 Broker；消息到达 Exchange 但没有路由到任何队列；生产者没有收到 confirm，进入未知态。未知态最危险，因为消息可能已经写入，也可能没有到达。工程上应给消息写发送日志或 outbox，用业务键重试，并让消费端具备幂等能力。\n\n消费端也有反直觉窗口：消费者处理业务成功后，还没 ack 就断开连接，RabbitMQ 会把未确认消息重新入队。此时不是丢消息，而是重复投递。可靠性和幂等必须配套；这篇聚焦可靠投递，具体幂等方案在后面的《消息队列重试消费与幂等设计》展开。"
+      "title": "可靠性不是一句\"不丢\"，而是三段链路的状态可恢复",
+      "content": "RabbitMQ 可靠性要拆成三段看：Producer → Broker、Broker 内部存储与复制、Broker → Consumer。任何一段只讲一个开关都会留窗口。可靠性的目标不是承诺端到端 exactly-once（RabbitMQ 不支持分布式事务级 exactly-once），而是让消息状态可追踪、失败有信号、重试可控、最终能补偿。\n\n三个失败窗口各有独立机制覆盖：\n- **Producer → Broker**：消息没到达 Broker（网络超时、连接断开）、confirm nack（Broker 因磁盘满/资源限制拒绝）、confirm 超时进入 UNKNOWN 态（可能已写入也可能没写入）\n- **Exchange → Queue**：消息到达了 Exchange 但 routing key 匹配不到任何 binding，不可路由\n- **Broker 内部存储**：队列未设 durable、消息未设 persistent、单节点故障时内存消息丢失、镜像/副本配置不足\n- **Broker → Consumer**：业务处理失败、ack 在发送途中连接断开、ack 丢失导致重投\n\nUNKNOWN 态是最容易被忽略的工程陷阱：confirm 超时不代表消息没到达，也不代表它一定到达了。工程上必须给消息写发送日志（outbox pattern），用业务键做幂等重试，让消费端具备幂等能力。可靠性保证「不丢」但不消除重复，幂等保证「重复不伤」但不保证不丢——两者互补，面试时边界要分清。"
     },
     {
       "type": "explain",
-      "title": "生产端：Confirm、Return 和发送日志分别管不同失败",
-      "content": "Publisher Confirm 是 Broker 给生产者的确认，说明发布动作已经被 RabbitMQ 处理到相应的节点、队列或 stream leader replica。Confirm 成功不代表消费者处理成功；Confirm 超时也不代表消息没写入。生产者要把 correlation id、业务键、payload 摘要、发送状态、重试次数和最后错误记录下来，超时按 UNKNOWN 处理。\n\nReturn callback 处理的是另一类问题：Exchange 收到了消息，但按当前 binding 无法路由到队列。AMQP 0-9-1 默认 `mandatory=false`，不可路由消息会被丢弃或交给 alternate exchange；设置 `mandatory=true` 后，生产者可以收到 returned message，再记录补偿、修正 routing key 或修复 binding。\n\n生产端重试要用业务键去重，而不是盲目重发新事件。常见做法是：本地发送表记录 `NEW -> SENDING -> CONFIRMED/RETURNED/UNKNOWN/FAILED`，定时任务扫描 UNKNOWN 和可重试失败；超过阈值后告警，不让重试风暴把 Broker 或下游拖垮。"
+      "title": "生产端：Confirm 三种模式、Return 与 UNKNOWN 态的工程处理",
+      "content": "**Publisher Confirm** 是 Broker 给生产者的发布确认，语义是「消息已被 Broker 持久化到相应队列的 leader 节点」。RabbitMQ 支持三种确认模式，吞吐和复杂度依次递增：\n\n**单条同步 confirm**（`channel.waitForConfirms()`）：每条消息阻塞等确认后再发下一条。吞吐最低（每条一个 RTT），只适合极低吞吐场景或测试。\n\n**批量同步 confirm**（`channel.waitForConfirmsOrDie()`）：一批消息统一等一次确认。吞吐优于单条，但一批中只要有一条 nack 整批都要重发——如果消息间没有幂等键做去重，重发会导致重复处理。batch size 越大，重发范围越大。\n\n**异步 confirm**（`channel.addConfirmListener(ackCallback, nackCallback)`）：Broker 按 delivery tag 序号异步回调，生产者维护 unconfirmed 集合（通常用 SortedSet 或 ConcurrentSkipListSet），收到 ack 时移除，收到 nack 时标记重试。吞吐最高，是生产首选。实现时注意：confirm 回调在 Publisher 的 IO 线程执行，不能做阻塞操作；unconfirmed 集合要有上限监控，积压说明 Broker 处理变慢或网络拥塞。\n\n**confirm 超时的 UNKNOWN 态**：网络分区、Broker GC、flow control 阻塞都可能导致 confirm 迟迟不来。此时消息状态是 UNKNOWN——不能当 CONFIRMED（可能没到）、不能当 FAILED（可能已到），必须标记为 UNKNOWN 后交给定时扫描任务处理。扫描逻辑用业务键查询 Broker 或下游，判断消息是否已到达；到达则标记 CONFIRMED，未到达则重试（注意用同一 business key 而不是生成新的 message id，否则消费端无法去重）。\n\n**Return callback** 处理的是另一类问题：消息到了 Exchange，但按当前 binding 无法路由到任何队列。AMQP 0-9-1 默认 `mandatory=false`，不可路由消息会被静默丢弃（如果有配置 alternate exchange 则交给 AE）。设置 `mandatory=true` 后，生产者通过 `ReturnListener`（或 `channel.addReturnListener()`）收到 returned message，可以记录补偿、修正 routing key 或修复 binding。Alternate exchange 是 Broker 侧的兜底路由，不保证生产者感知到，所以关键场景必须 mandatory + ReturnListener。\n\n两者覆盖不同失败路径：confirm 覆盖「Broker 是否收到并持久化」，return 覆盖「Exchange 能否路由到队列」。"
     },
     {
       "type": "explain",
-      "title": "Broker 和消费端：持久化、复制、Ack、DLQ 一起闭环",
-      "content": "Broker 端至少要同时考虑 durable exchange、durable queue、persistent message 和 publisher confirm。只设置 delivery mode 不够；如果队列不存在、消息不可路由、磁盘告警、内存水位、节点故障或副本配置不当，仍然可能进入失败路径。RabbitMQ 4.x 下，关键持久队列优先考虑 quorum queue；classic mirrored queues 已退出 4.x，streams 更适合大 backlog 和回放。\n\n消费端要使用 manual ack，并在业务事务成功后 ack。失败时不要无限 `requeue=true`，否则毒消息会热循环。更稳的策略是按异常分类：临时错误进入有限重试和退避，业务不可恢复错误直接 `nack(requeue=false)` 进 DLX/DLQ，超过 delivery-limit 的 quorum queue 消息也可死信化。\n\nDLQ 不是垃圾桶。生产上要定义 owner、告警阈值、失败原因、重放前校验、修复脚本和审计记录。真正能支撑面试深度的回答，是把 confirm latency、unroutable、ready、unacked、redelivered、retry、DLQ 数量、磁盘/内存水位都纳入观测。"
+      "title": "Broker 端：四层持久化、Quorum Queue 与水位监控",
+      "content": "持久化要同时满足四层才算到位——缺任何一层都可能丢消息：\n1. **exchange 声明为 durable**：Broker 重启后 exchange 元数据不丢\n2. **queue 声明为 durable**：队列定义在 Broker 重启后保留\n3. **message delivery mode = 2（PERSISTENT）**：消息本体写入磁盘（注意：RabbitMQ 不是每条消息立刻 fsync，而是攒一批后 flush，极端情况如 Broker 在 flush 前崩溃仍会丢少量已 confirm 消息）\n4. **队列所在节点磁盘健康、容量充足**：磁盘满会触发 flow control 阻塞发布\n\n**Quorum Queue 取代 classic mirrored queue**：RabbitMQ 3.8 引入 quorum queue，基于 Raft 共识协议，每条消息写入多数节点才算 confirm 给生产者。节点故障后剩余多数节点仍持有所有已确认消息。RabbitMQ 4.0+ 已废弃 classic mirrored queue（不再维护），4.x 下关键持久队列必须用 quorum queue。代价是写入延迟高于 classic mirror（每条消息多一次 fsync + Raft 日志复制），吞吐略低，不适合极低延迟场景。\n\nQuorum queue 支持 `delivery-limit` 参数（classic queue 不支持），超过投递次数的消息自动死信化——这是消费端重试闭环的关键能力。Quorum queue 还支持 Consumer Priority、Poison Message Handling（内置）等特性。\n\n**Streams**（RabbitMQ 3.9+）是另一种持久化模型：类似 Kafka 的 append-only log，支持多消费者回放、不删除消息（按保留策略过期）。适合大 backlog、广播、回溯消费场景，但不提供 quorum queue 的 per-message ack 语义和 dead-lettering，不能替代 quorum queue 的事务型可靠性。\n\n**水位和容量监控**：RabbitMQ 有内存高水位（`vm_memory_high_watermark`，默认物理内存 40%）和磁盘低水位（`disk_free_limit`，默认 50MB）。触发内存水位后 Broker 阻塞所有发布连接（connection-level flow control），触发磁盘低水位后发布也被阻塞。flow control 不会丢消息，但会导致 publisher confirm 超时/延迟飙升，生产者侧 UNKNOWN 态积累。\n\n监控关键指标：ready（待消费）、unacked（已投递未确认）、publish rate、deliver rate、disk free、mem used、file descriptors、channel/connection 数、unroutable 消息计数、confirm latency P99、queue leader 分布。"
+    },
+    {
+      "type": "explain",
+      "title": "消费端：Manual Ack 时机、重试策略与 DLQ 闭环",
+      "content": "**Manual ack 时机**：必须在业务事务成功提交之后调用 `channel.basicAck(deliveryTag, false)`。如果先 ack 再处理业务，处理失败时消息已从队列移除无法重试。如果 ack 发送途中连接断开，RabbitMQ 因为没收到 ack 会把消息重新投递，消费者看到 `redelivered=true`——这不是 bug，而是可靠性机制的正常表现，消费端幂等要能处理。\n\n**批量 ack 的陷阱**：`basicAck(deliveryTag, true)` 会 ack 该 tag 及之前所有未确认消息。如果中间有消息处理失败，成功消息和失败消息一起被 ack，失败消息无法重试。生产上更安全的做法是逐条 ack，或者在确认没有遗漏时才用批量 ack。\n\n**prefetch（QoS）**：`channel.basicQos(n)` 控制 Broker 在一个 Channel 上最多发 n 条未确认消息。prefetch 过大 → 大量消息堆积在客户端内存，客户端崩溃时重投范围大；prefetch 过小 → 网络 RTT 主导，吞吐受限。生产常见做法是 prefetch 设为消费者并发线程数的 1-2 倍。\n\n**无限 requeue 的毒消息问题**：如果对所有失败都 `nack(requeue=true)`，毒消息（格式错误、业务规则无法处理）会在队列和消费者之间高速循环——消费者 nack → Broker 重投 → 消费者再 nack → 循环。后果：消费线程被毒消息占满、Broker 网络/IO 资源被消耗、正常消息被饿死。无限 requeue 在生产上是严重反模式。\n\n**稳态重试设计（按异常分类）**：\n- 临时错误（网络闪断、数据库连接池耗尽、下游超时）→ `nack(requeue=false)` + 有限次数退避重试（实现方式一：通过 retry exchange 重新 publish 带延迟；方式二：Spring AMQP 的 `RetryInterceptor`）\n- 业务不可恢复错误（格式校验失败、业务规则拒绝）→ 直接 `nack(requeue=false)` 进 DLX/DLQ\n- quorum queue 的 `delivery-limit` 参数：超过投递次数的消息自动死信化，不需要应用层计数\n\n**DLX/DLQ 设计要求**：Dead Letter Exchange 绑定 Dead Letter Queue，被 nack(requeue=false) 或超限的消息自动路由过去。DLQ 不是垃圾桶，生产上必须有：\n- owner 和处理流程（谁看、谁修、SLA）\n- 告警阈值（DLQ 积压超过 N 条 / M 分钟触发告警）\n- 失败原因记录（原队列名、routing key、exception、retry count，可通过 x-death header 获取）\n- 修复和重放流程（校验后重新 publish 到原队列，人工确认后 ack 掉 DLQ 消息）\n- 审计记录（谁重放了、什么时候、放了多少条）\n\n**幂等边界**：即使可靠投递三段全做对，重复投递仍不可避免——ack 丢失、消费者崩溃重启、网络重连、Broker failover 都会导致消息被重投。消费端幂等是可靠性方案的闭环部分，但设计逻辑（去重键、状态机、唯一约束）和投递保障不同，面试时要分清职责边界。"
+    },
+    {
+      "type": "explain",
+      "title": "Classic Mirrored Queue 退出后的选型：Quorum Queue vs Stream",
+      "content": "Classic Mirrored Queue（CMQ）通过 HA policy 在主节点和镜像节点之间做异步复制。它的问题包括：主节点故障后镜像提升为新主时有数据丢失窗口（未复制的消息丢）、脑裂场景下同步策略配置不当会导致不一致、消息级别持久化在镜像间没有 Raft 共识保证。RabbitMQ 3.8 引入 quorum queue 后，CMQ 逐步被取代，4.0+ 正式废弃不再维护。\n\n**Quorum Queue 的优势**：\n- Raft 共识协议：每条消息写入多数派才返回 confirm，节点故障不丢已确认消息\n- 内置 poison message handling 和 delivery-limit\n- Consumer Priority（高优先级消费者优先收到消息）\n- leader 选举自动完成，无需手动干预\n\n**Quorum Queue 的代价**：\n- 每条消息必须 fsync 到 Raft 日志后才算写入，延迟高于 CMQ（多一次磁盘 fsync + 网络复制）\n- 吞吐受限于 leader 磁盘 IO 和 Raft 心跳间隔\n- 不支持 priority queue（消息优先级排序，quorum queue 只支持 consumer priority）\n- 不支持某些 CMQ 特性（如 per-message TTL 在某些版本有差异）\n\n**Stream 的适用场景**：\n- 大 backlog、广播、回溯消费（类似 Kafka 的 consumer group offset 管理）\n- append-only log，消息按保留策略过期而非 ack 后删除\n- 不提供 per-message ack 和 dead-lettering，不能替代 quorum queue 的事务型可靠性\n\n**选型原则**：关键业务队列（订单、支付、库存）必须用 quorum queue；大吞吐广播/回放场景考虑 stream；4.x 下不应再使用 classic queue（mirror 不可用，classic queue 仅适合非持久化临时队列）。"
     },
     {
       "type": "diagram",
@@ -51,58 +61,70 @@
     },
     {
       "type": "compareTable",
-      "title": "失败窗口与治理动作",
-      "content": "| 失败窗口 | 典型信号 | 处理动作 | 剩余风险 |\n| --- | --- | --- | --- |\n| Producer 到 Broker 失败 | confirm nack、confirm timeout、连接异常 | 发送日志标 UNKNOWN，按业务键重试，超过阈值告警 | 超时消息可能已写入，重试会带来重复 |\n| Exchange 不可路由 | mandatory return、unroutable 指标 | 修 binding/routing key，落库补偿，或接 alternate exchange | 没开 mandatory/AE 时可能静默丢弃 |\n| Broker 数据安全不足 | 非 durable、磁盘/内存告警、副本不可用 | durable topology、persistent message、quorum queue、容量监控 | 配置错误或容量打满仍会拒绝发布 |\n| Consumer 处理失败 | exception、nack、redelivered 增长 | 临时错误退避重试，不可恢复错误进 DLQ | 无限 requeue 会形成热循环 |\n| Ack 丢失或连接断开 | unacked 回到 ready，重复投递 | 业务幂等、消费日志、状态机 | Confirm/Ack 不能消除重复，只能暴露状态 |"
+      "title": "失败窗口、覆盖机制与工程处理",
+      "content": "| 失败窗口 | 关键机制 | 工程处理 | 剩余风险 |\n| --- | --- | --- | --- |\n| Producer→Broker：消息未到达或 Broker 拒绝 | 异步 publisher confirm + 发送日志 | 超时标 UNKNOWN，定时扫描用业务键重试 | 重试产生重复，需消费端幂等 |\n| Exchange→Queue：不可路由 | mandatory=true + ReturnListener | 记录 returned message，修 binding/routing key | mandatory=false 时静默丢弃 |\n| Broker 存储：节点故障丢消息 | durable + persistent + quorum queue | 四层全配，Raft 多数派写入 | flush 前崩溃可能丢少量已 confirm 消息 |\n| Broker 存储：容量打满 | 内存/磁盘水位 + flow control | 监控水位指标、容量规划 | flow control 导致 confirm 延迟/超时 |\n| Broker→Consumer：业务处理失败 | manual ack + 有限退避重试 + DLX/DLQ | 临时错误退避重试，不可恢复进 DLQ，delivery-limit 自动死信化 | DLQ 积压不处理会掩盖问题 |\n| Broker→Consumer：ack 丢失 | 连接断开 → 未 ack 消息回到队列重投 | 消费端幂等 + redelivered 标记检查 | 可靠性机制无法消除重复 |\n| 毒消息热循环 | 无限 requeue + 无 DLQ | delivery-limit + DLX + 告警阈值 | 没有限流时 DLQ 也会被灌满 |"
+    },
+    {
+      "type": "compareTable",
+      "title": "Quorum Queue vs Classic Mirrored Queue vs Stream",
+      "content": "| 维度 | Quorum Queue | Classic Mirrored Queue | Stream |\n| --- | --- | --- | --- |\n| 引入版本 | 3.8 | 2.x（HA policy） | 3.9 |\n| 复制机制 | Raft 共识，多数派写入 | 主从异步复制 | append-only log，多副本 |\n| 故障不丢 | 多数派存活则不丢 | 主节点故障有丢窗口 | 保留策略内不丢 |\n| 确认语义 | per-message ack，支持 nack/requeue | per-message ack | 按 offset 管理，无 per-message nack |\n| Dead Letter | 支持 delivery-limit + DLX | 支持 | 不支持 |\n| 写入延迟 | 高（fsync + Raft 复制） | 低（异步复制） | 低（追加写入） |\n| 吞吐 | 中等 | 中-高 | 高（批量消费） |\n| 适用场景 | 关键业务队列（订单/支付） | 4.x 已废弃，不推荐 | 广播/回溯/大 backlog |\n| 4.x 状态 | 推荐 | 已废弃 | 可用 |"
     },
     {
       "type": "code",
-      "title": "可运行代码：模拟 Confirm 未知态、Return、Ack 丢失和 DLQ",
+      "title": "可运行代码：Confirm 异步模式、Return、Ack 丢失与 DLQ 闭环",
       "language": "java",
-      "content": "import java.util.*;\n\npublic class Main {\n    enum SendStatus { CONFIRMED, RETURNED, UNKNOWN }\n    record Message(String id, String businessKey, String routingKey, String body) {}\n    record PublishOutcome(SendStatus status, boolean routed) {}\n\n    static final class QueueBox {\n        final String name;\n        final Deque<Message> ready = new ArrayDeque<>();\n        final Deque<Message> unacked = new ArrayDeque<>();\n        QueueBox dlq;\n        QueueBox(String name) { this.name = name; }\n        Message deliver() {\n            Message msg = ready.removeFirst();\n            unacked.addLast(msg);\n            return msg;\n        }\n        void ack(Message msg) { unacked.remove(msg); }\n        void nack(Message msg, boolean requeue) {\n            unacked.remove(msg);\n            if (requeue) ready.addFirst(msg);\n            else dlq.ready.addLast(msg);\n        }\n        void closeChannelAndRequeueUnacked() {\n            while (!unacked.isEmpty()) ready.addFirst(unacked.removeLast());\n        }\n    }\n\n    static final class Broker {\n        final QueueBox orderQueue = new QueueBox(\"order.q\");\n        final QueueBox deadLetterQueue = new QueueBox(\"order.dlq\");\n        Broker() { orderQueue.dlq = deadLetterQueue; }\n        PublishOutcome publish(Message msg, boolean mandatory, boolean confirmTimeout) {\n            if (confirmTimeout) return new PublishOutcome(SendStatus.UNKNOWN, false);\n            if (!\"order.created\".equals(msg.routingKey())) {\n                return new PublishOutcome(mandatory ? SendStatus.RETURNED : SendStatus.CONFIRMED, false);\n            }\n            orderQueue.ready.addLast(msg);\n            return new PublishOutcome(SendStatus.CONFIRMED, true);\n        }\n    }\n\n    static final class Consumer {\n        final Set<String> processedBusinessKeys = new HashSet<>();\n        int applied;\n        int duplicateSkipped;\n        void handle(Broker broker, Message msg, boolean businessFails, boolean ackLost) {\n            if (businessFails) {\n                broker.orderQueue.nack(msg, false);\n                return;\n            }\n            if (processedBusinessKeys.add(msg.businessKey())) applied++;\n            else duplicateSkipped++;\n            if (!ackLost) broker.orderQueue.ack(msg);\n        }\n    }\n\n    public static void main(String[] args) {\n        Broker broker = new Broker();\n        Consumer consumer = new Consumer();\n\n        PublishOutcome ok = broker.publish(new Message(\"m1\", \"order-1001\", \"order.created\", \"create\"), true, false);\n        PublishOutcome returned = broker.publish(new Message(\"m2\", \"order-404\", \"order.missing\", \"bad route\"), true, false);\n        PublishOutcome unknown = broker.publish(new Message(\"m3\", \"order-1002\", \"order.created\", \"timeout\"), true, true);\n\n        Message firstDelivery = broker.orderQueue.deliver();\n        consumer.handle(broker, firstDelivery, false, true);\n        broker.orderQueue.closeChannelAndRequeueUnacked();\n        Message redelivery = broker.orderQueue.deliver();\n        consumer.handle(broker, redelivery, false, false);\n\n        broker.publish(new Message(\"m4\", \"order-1003\", \"order.created\", \"poison\"), true, false);\n        Message poison = broker.orderQueue.deliver();\n        consumer.handle(broker, poison, true, false);\n\n        assert ok.status() == SendStatus.CONFIRMED && ok.routed();\n        assert returned.status() == SendStatus.RETURNED && !returned.routed();\n        assert unknown.status() == SendStatus.UNKNOWN;\n        assert consumer.applied == 1;\n        assert consumer.duplicateSkipped == 1;\n        assert broker.orderQueue.ready.isEmpty();\n        assert broker.deadLetterQueue.ready.size() == 1;\n\n        System.out.println(\"ok=\" + ok.status() + \", returned=\" + returned.status() + \", timeout=\" + unknown.status());\n        System.out.println(\"applied=\" + consumer.applied + \", duplicateSkipped=\" + consumer.duplicateSkipped + \", dlq=\" + broker.deadLetterQueue.ready.size());\n    }\n}",
+      "content": "import java.util.*;\nimport java.util.concurrent.*;\nimport java.util.concurrent.atomic.*;\n\npublic class Main {\n    enum SendStatus { NEW, SENDING, CONFIRMED, RETURNED, UNKNOWN, FAILED }\n    record Message(long seq, String id, String businessKey, String routingKey, String body) {}\n    record ConfirmResult(SendStatus status, boolean routed) {}\n\n    // 模拟 Broker 队列（含 delivery-limit 和 DLQ 绑定）\n    static final class QueueBox {\n        final String name;\n        final Deque<Message> ready = new ArrayDeque<>();\n        final Deque<Message> unacked = new ArrayDeque<>();\n        final Map<String, Integer> deliveryCount = new HashMap<>();\n        int deliveryLimit = 3;\n        QueueBox dlq;\n        QueueBox(String name) { this.name = name; }\n\n        Message deliver() {\n            if (ready.isEmpty()) return null;\n            Message msg = ready.removeFirst();\n            unacked.addLast(msg);\n            deliveryCount.merge(msg.businessKey(), 1, Integer::sum);\n            return msg;\n        }\n        void ack(Message msg) {\n            unacked.remove(msg);\n            deliveryCount.remove(msg.businessKey());\n        }\n        void nack(Message msg, boolean requeue) {\n            unacked.remove(msg);\n            int count = deliveryCount.getOrDefault(msg.businessKey(), 0);\n            if (count >= deliveryLimit) {\n                // 超过 delivery-limit → 自动死信化\n                if (dlq != null) dlq.ready.addLast(msg);\n            } else if (requeue) {\n                ready.addFirst(msg);\n            } else {\n                if (dlq != null) dlq.ready.addLast(msg);\n            }\n        }\n        void closeChannelAndRequeueUnacked() {\n            while (!unacked.isEmpty()) ready.addFirst(unacked.removeLast());\n        }\n    }\n\n    // 模拟 Broker：Exchange 路由 + 队列存储\n    static final class Broker {\n        final QueueBox orderQueue = new QueueBox(\"order.q\");\n        final QueueBox deadLetterQueue = new QueueBox(\"order.dlq\");\n        Broker() { orderQueue.dlq = deadLetterQueue; }\n\n        ConfirmResult publish(Message msg, boolean mandatory, boolean confirmTimeout) {\n            if (confirmTimeout) return new ConfirmResult(SendStatus.UNKNOWN, false);\n            if (!\"order.created\".equals(msg.routingKey())) {\n                // 不可路由：mandatory=true 返回 RETURNED；mandatory=false 静默丢弃\n                return new ConfirmResult(mandatory ? SendStatus.RETURNED : SendStatus.CONFIRMED, false);\n            }\n            orderQueue.ready.addLast(msg);\n            return new ConfirmResult(SendStatus.CONFIRMED, true);\n        }\n    }\n\n    // 模拟消费者：幂等 + 分类重试 + DLQ\n    static final class Consumer {\n        final Set<String> processedKeys = new HashSet<>();\n        int applied, duplicateSkipped, dlqCount;\n\n        void handle(Broker broker, Message msg, String failureType) {\n            switch (failureType) {\n                case \"business_fail\" -> {\n                    broker.orderQueue.nack(msg, false);  // 不可恢复 → DLQ\n                    dlqCount++;\n                }\n                case \"temp_fail\" -> {\n                    broker.orderQueue.nack(msg, true);   // 临时错误 → requeue 重试\n                }\n                default -> {\n                    if (processedKeys.add(msg.businessKey())) applied++;\n                    else duplicateSkipped++;\n                    broker.orderQueue.ack(msg);            // 业务成功后 ack\n                }\n            }\n        }\n    }\n\n    public static void main(String[] args) {\n        Broker broker = new Broker();\n        Consumer consumer = new Consumer();\n\n        // 1. confirm 正常 + 路由成功\n        ConfirmResult ok = broker.publish(\n            new Message(1, \"m1\", \"order-1001\", \"order.created\", \"create\"), true, false);\n        // 2. mandatory + 不可路由 → RETURNED\n        ConfirmResult returned = broker.publish(\n            new Message(2, \"m2\", \"order-404\", \"order.missing\", \"bad route\"), true, false);\n        // 3. confirm 超时 → UNKNOWN\n        ConfirmResult unknown = broker.publish(\n            new Message(3, \"m3\", \"order-1002\", \"order.created\", \"timeout\"), true, true);\n\n        // 4. ack 丢失 → Channel 关闭 → 重投 → 幂等跳过\n        Message firstDelivery = broker.orderQueue.deliver();\n        consumer.handle(broker, firstDelivery, null);\n        broker.orderQueue.closeChannelAndRequeueUnacked(); // ack 未到达 → 回到 ready\n        Message redelivery = broker.orderQueue.deliver();\n        consumer.handle(broker, redelivery, null);          // 幂等跳过\n\n        // 5. 不可恢复错误 → nack 到 DLQ\n        broker.publish(new Message(4, \"m4\", \"order-1003\", \"order.created\", \"poison\"), true, false);\n        Message poison = broker.orderQueue.deliver();\n        consumer.handle(broker, poison, \"business_fail\");\n\n        assert ok.status() == SendStatus.CONFIRMED && ok.routed();\n        assert returned.status() == SendStatus.RETURNED && !returned.routed();\n        assert unknown.status() == SendStatus.UNKNOWN;\n        assert consumer.applied == 1;\n        assert consumer.duplicateSkipped == 1;\n        assert consumer.dlqCount == 1;\n        assert broker.orderQueue.ready.isEmpty();\n        assert broker.deadLetterQueue.ready.size() == 1;\n\n        System.out.println(\"ok=\" + ok.status() + \", returned=\" + returned.status()\n            + \", timeout=\" + unknown.status());\n        System.out.println(\"applied=\" + consumer.applied + \", dup=\" + consumer.duplicateSkipped\n            + \", dlq=\" + broker.deadLetterQueue.ready.size());\n    }\n}",
       "highlights": [
         {
-          "line": 36,
-          "note": "confirm timeout 被标成 UNKNOWN，而不是直接当成功或失败；后续要靠发送日志和业务键重试收口。"
+          "line": 24,
+          "note": "deliveryCount 跟踪每个 businessKey 的投递次数，超过 deliveryLimit 自动死信化。"
         },
         {
-          "line": 38,
-          "note": "mandatory=true 的不可路由消息进入 RETURNED 状态，和 confirm 是不同问题。"
+          "line": 55,
+          "note": "confirm timeout 返回 UNKNOWN——不能当 CONFIRMED 也不能当 FAILED。"
         },
         {
-          "line": 70,
-          "note": "业务成功但 ack 丢失后，Channel 关闭会让未确认消息回到队列并重投。"
+          "line": 58,
+          "note": "mandatory=true 的不可路由消息返回 RETURNED，和 confirm 是不同失败路径。"
         },
         {
-          "line": 74,
-          "note": "重复投递通过业务键跳过；这是可靠投递和幂等设计的交界处。"
+          "line": 82,
+          "note": "ack 丢失后 Channel 关闭 → 未确认消息回到队列 → redelivered=true。"
         },
         {
-          "line": 78,
-          "note": "不可恢复失败 nack 到 DLQ，避免无限 requeue 形成热循环。"
+          "line": 86,
+          "note": "幂等检查：同一 businessKey 只应用一次。"
+        },
+        {
+          "line": 90,
+          "note": "不可恢复错误 nack(requeue=false) 进 DLQ，避免毒消息无限循环。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "我会先给结论：RabbitMQ 消息可靠性不是单点配置，而是三段链路一起治理。生产端用 publisher confirm 和 mandatory return 知道消息有没有被 Broker 接收、有没有路由到队列；Broker 端用 durable topology、persistent message、quorum queue 和容量监控保证消息有存储和复制基础；消费端用 manual ack、有限重试、DLX/DLQ 和幂等处理失败与重复。\n\n生产端我会强调 confirm 和 return 的区别。Confirm 是发布确认，不代表消费成功；return 是不可路由信号，只有 mandatory 或 alternate exchange 相关配置才能兜住。Confirm 超时是未知态，不能直接删除发送记录，要按业务键重试并防重复。\n\nBroker 端我会说清持久化边界：exchange durable、queue durable、message persistent 要一起配，但这仍不等于端到端可靠。关键业务要考虑 quorum queue，监控磁盘、内存、水位和副本健康；RabbitMQ 4.x 里 classic mirrored queue 已不是可选路线。\n\n消费端我会强调 manual ack 必须在业务处理成功之后。临时错误做有限次数和退避重试，不可恢复错误或超限消息进 DLQ。DLQ 要有人处理、有告警、有修复和回放流程。最后补一句：重复投递不可避免，消费者幂等是可靠性方案的闭环部分。"
-      ,
+      "content": "**一句话结论**\nRabbitMQ 消息可靠性不是单点配置，而是生产端、Broker 端、消费端三段链路一起治理——任何一段缺失都会留下丢失或重复投递的窗口。\n\n**生产端（消息发布到 Broker）**\n- 用异步 publisher confirm 模式（`ConfirmListener`，按 delivery tag 序号回调），吞吐最高、是生产首选\n- confirm 成功只代表 Broker 持久化了，不代表消费者处理成功\n- confirm 超时是 UNKNOWN 态——消息可能已写入也可能未写入，不能直接删除发送记录，要用发送日志 + 业务键核对并重试\n- 用 mandatory=true + ReturnListener 覆盖「Exchange 能否路由到队列」；alternate exchange 是 Broker 侧兜底，不保证生产者感知\n\n**Broker 端（消息存储与复制）**\n- 四层持久化缺一不可：durable exchange + durable queue + persistent message（delivery mode 2）+ 节点磁盘健康\n- 关键队列用 quorum queue（Raft 共识，写入多数节点才 confirm），替代已废弃的 classic mirrored queue（4.0+）\n- quorum queue 支持 delivery-limit，是消费端重试闭环的关键能力\n- streams 适合大 backlog 和回放（类似 Kafka log），不替代 quorum queue 的 per-message ack 语义\n- 监控内存高水位和磁盘低水位——触发后 flow control 阻塞发布，导致 confirm 超时\n\n**消费端（消息消费与确认）**\n- manual ack 必须在业务事务成功提交之后调用，不能先 ack 再处理\n- 批量 ack（`basicAck(tag, true)`）会 ack 该 tag 及之前所有消息，中间有失败消息会漏重试\n- 临时错误 → 有限次数退避重试；不可恢复错误 → nack(requeue=false) 进 DLX/DLQ\n- quorum queue 的 delivery-limit 可自动限制投递次数后死信化\n- DLQ 不是垃圾桶：要有 owner、告警阈值、修复脚本、重放校验、审计记录\n- 无限 requeue 是生产反模式——毒消息热循环会拖垮消费线程和 Broker 资源\n\n**幂等边界**\n- 即使三段全做对，ack 丢失、消费者崩溃、网络重连、Broker failover 仍会导致重复投递\n- 消费端幂等是可靠性方案的闭环部分，设计逻辑和投递保障不同，面试时要分清职责\n\n**关键监控指标**\n- confirm latency P99、unroutable 计数、ready/unacked 队列深度、redelivered 比例\n- DLQ 积压量、磁盘/内存水位、file descriptors、publish/deliver rate",
       "followUpQuestions": [
         {
           "question": "Confirm 成功后消息还会不会丢？",
-          "answer": "Confirm 只覆盖生产者到 RabbitMQ 的发布路径，不覆盖消费者处理。后续仍可能遇到消费者失败、ack 丢失、业务异常和 DLQ 积压，所以还要 manual ack、重试、死信和幂等。"
+          "answer": "Confirm 只覆盖生产者到 Broker 的发布路径。后续可能遇到：消费者处理失败、ack 丢失导致重投、消费者崩溃重启、Broker failover（quorum queue 多数派存活则不丢）。持久化层面，RabbitMQ 不是每条消息立刻 fsync，而是攒批后 flush，极端情况（flush 前 Broker 崩溃）可能丢少量已 confirm 消息。所以还要 manual ack、重试策略、DLQ 闭环和消费端幂等。"
         },
         {
           "question": "Confirm 超时应该怎么处理？",
-          "answer": "按 UNKNOWN 状态处理。消息可能已写入也可能未写入，不能直接删除发送记录。应记录 correlation id 和业务键，后续重试或人工核对，并让消费者用业务键幂等。"
+          "answer": "按 UNKNOWN 状态处理——消息可能已写入也可能未写入，不能直接删除发送记录或盲目重发。应记录 correlation id 和业务键到发送日志，定时任务扫描后用业务键查询 Broker 或下游判断是否已到达；到达则标记 CONFIRMED，未到达则用同一 business key 重试（消费端幂等防重复）。"
         },
         {
           "question": "为什么不能无限 requeue？",
-          "answer": "毒消息会在队列和消费者之间高速循环，占满消费线程和 Broker 资源，拖垮正常消息。应该设置重试上限、退避策略、delivery-limit 或 DLX，超限后进入 DLQ 告警。"
+          "answer": "毒消息（格式错误、业务规则无法处理）会在队列和消费者之间高速循环：消费者 nack(requeue=true) → Broker 重新投递 → 消费者再 nack → 无限循环。后果是消费线程被占满、Broker 网络和 IO 资源被消耗、正常消息被饿死。应该设 delivery-limit（quorum queue 支持）或重试次数上限，超限后进 DLQ 告警人工处理。"
         },
         {
-          "question": "RabbitMQ 可靠性和 MQ 幂等专题怎么分工？",
-          "answer": "可靠性专题回答消息如何可确认、可存储、可重试、可死信；幂等专题回答重复投递出现时业务如何不重复生效。两者相互依赖，但面试回答时边界要分清。"
+          "question": "quorum queue 和 classic mirrored queue 有什么区别？怎么选？",
+          "answer": "Quorum queue 基于 Raft 共识，每条消息写入多数节点才 confirm，节点故障不丢已确认消息；支持 delivery-limit 和 consumer priority。Classic mirrored queue 在 3.x 通过 HA policy 实现主从同步，存在脑裂风险和数据不一致窗口。RabbitMQ 4.0+ 已废弃 classic mirrored queue。选型：关键持久化队列用 quorum queue；大 backlog / 回放场景考虑 streams；极低延迟场景评估 quorum queue 的 fsync 开销是否可接受。"
+        },
+        {
+          "question": "RabbitMQ 可靠性和幂等专题怎么分工？",
+          "answer": "可靠性回答「消息如何可确认、可存储、可重试、可死信」——覆盖三段链路的失败检测和恢复路径。幂等回答「重复投递出现时业务如何不重复生效」——覆盖消费端的去重逻辑。两者相互依赖：可靠性保证消息不丢但不消除重复，幂等保证重复不伤但不保证消息不丢；面试时边界要分清，回答时互相引用。"
         }
       ]
     },
@@ -110,11 +132,14 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能按生产端、Broker 端、消费端拆解 RabbitMQ 消息丢失和重复投递窗口",
-        "能说明 publisher confirm、confirm timeout、mandatory return、alternate exchange 的不同含义",
-        "能解释 durable exchange、durable queue、persistent message、quorum queue 的作用和边界",
-        "能说明 manual ack 为什么要放在业务成功之后，以及 ack 丢失为什么会重投",
-        "能设计有限重试、退避、delivery-limit、DLX/DLQ、告警和人工修复流程",
+        "能按生产端、Broker 端、消费端三段拆解 RabbitMQ 消息丢失和重复投递窗口",
+        "能区分异步 confirm / 同步 confirm / 批量 confirm 的语义和吞吐差异，说出为什么异步是生产首选",
+        "能说明 confirm timeout 的 UNKNOWN 态为什么不能当成功或失败处理，以及发送日志 + 业务键的处理闭环",
+        "能解释 mandatory=true + ReturnListener 与 alternate exchange 的区别，以及为什么关键场景需要 mandatory",
+        "能说出 durable exchange + durable queue + persistent message + quorum queue 四层持久化缺一不可",
+        "能说明 RabbitMQ 4.x 下 classic mirrored queue 退出后 quorum queue 的优势和代价，以及 stream 的适用场景",
+        "能解释 manual ack 为什么必须在业务成功之后、批量 ack 的陷阱、ack 丢失为什么会重投",
+        "能设计有限重试 / 退避 / delivery-limit / DLX / DLQ 闭环，能说出 DLQ 的生产要求（owner / 告警 / 修复 / 审计）",
         "能把可靠投递和消费幂等的职责边界讲清楚"
       ]
     }
@@ -122,57 +147,72 @@
   "recallPrompts": [
     {
       "id": "java.middleware.topic-078-0195276a.recall.1",
-      "prompt": "RabbitMQ 消息从 Producer 到 Broker，再到 Consumer，分别有哪些丢失或重复投递窗口？",
+      "prompt": "RabbitMQ 消息从 Producer 到 Broker，再到 Consumer，分别有哪些丢失或重复投递窗口？对应什么机制覆盖？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "java.middleware.topic-078-0195276a.recall.2",
-      "prompt": "publisher confirm、confirm timeout、mandatory return、alternate exchange 分别解决什么问题？",
+      "prompt": "publisher confirm 的三种模式（单条同步、批量同步、异步）有什么区别？生产上为什么首选异步模式？confirm 超时为什么不能直接当失败处理？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "java.middleware.topic-078-0195276a.recall.3",
-      "prompt": "manual ack、有限重试、DLX/DLQ 和消费幂等应该如何配合？为什么不能无限 requeue？",
+      "prompt": "mandatory return 和 alternate exchange 分别解决什么问题？两者有什么区别？为什么关键场景必须用 mandatory？",
       "mode": "text",
-      "expectedMinutes": 4,
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "java.middleware.topic-078-0195276a.recall.4",
+      "prompt": "manual ack、有限重试、DLX/DLQ 和消费幂等应该如何配合？为什么不能无限 requeue？DLQ 在生产上要满足什么要求？quorum queue 的 delivery-limit 起什么作用？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 3
+    },
+    {
+      "id": "java.middleware.topic-078-0195276a.recall.5",
+      "prompt": "线上出现：publisher confirm latency P99 飙高、队列 ready 堆积、DLQ 积压上涨。你怎么排查？分别对应什么根因？",
+      "mode": "text",
+      "expectedMinutes": 5,
       "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "能按生产端、Broker 端、消费端三段说明 RabbitMQ 消息可靠性",
-      "能解释 publisher confirm、confirm timeout、mandatory return 和路由失败处理",
-      "能说明 durable topology、persistent message、quorum queue 的作用边界",
-      "能说明 manual ack、有限重试、DLX/DLQ 和幂等之间的关系"
+      "能按生产端、Broker 端、消费端三段说明 RabbitMQ 消息可靠性，每段有具体机制覆盖",
+      "能解释 publisher confirm 三种模式的区别和异步首选理由，confirm timeout 的 UNKNOWN 态处理，mandatory return 与路由失败",
+      "能说明 durable + persistent + quorum queue 四层持久化的作用和边界，以及 classic mirrored queue 在 4.x 退出的事实",
+      "能说明 manual ack 时机（业务成功后）、批量 ack 陷阱、ack 丢失重投、有限重试、delivery-limit、DLX/DLQ 闭环和幂等边界"
     ],
     "goodToHave": [
-      "能把 UNKNOWN 发送状态、发送日志、业务键重试和幂等联系起来",
-      "能说明 RabbitMQ 4.x 下 classic mirrored queues 退出后的 quorum/stream 取舍",
-      "能给出 ready、unacked、redelivered、unroutable、confirm latency、DLQ、水位等监控指标"
+      "能把 UNKNOWN 发送状态、发送日志、业务键重试和消费端幂等联系起来形成闭环",
+      "能说明 quorum queue vs classic mirrored queue vs stream 的技术差异和选型依据",
+      "能给出 confirm latency、unroutable、ready、unacked、redelivered、DLQ、水位等监控指标并说明排查思路"
     ],
     "commonMistakes": [
-      "只说开启持久化就端到端可靠",
-      "把 publisher confirm 当成消费者处理成功",
-      "confirm 超时直接删除发送记录",
-      "先 ack 再处理业务，或业务成功后不考虑 ack 丢失重投",
-      "无限 requeue 毒消息，不设 DLQ、告警和人工修复"
+      "只说「开启持久化就端到端可靠」，忽略 durable exchange、persistent message、节点容量和 flow control",
+      "把 publisher confirm 成功当成消费者处理成功",
+      "confirm 超时直接删除发送记录或当失败处理，忽略 UNKNOWN 态",
+      "先 ack 再处理业务，或用批量 ack 中间有失败消息漏重试",
+      "无限 requeue 毒消息不设 DLQ、告警和人工修复",
+      "认为 alternate exchange 等于 mandatory return，实际 AE 不保证生产者感知到不可路由"
     ],
     "scoreWeights": {
-      "coverage": 35,
+      "coverage": 30,
       "accuracy": 30,
       "interviewExpression": 20,
-      "depth": 15
+      "depth": 20
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-23",
   "status": "production",
   "prerequisites": [
     "java.middleware.topic-077-0f4a426f"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能把 RabbitMQ 消息可靠性拆成 confirm/return、持久化/quorum、manual ack、有限重试、DLX/DLQ 和幂等边界来分析，而不是只背配置项。"
+  "interviewerFocus": "考察是否能把 RabbitMQ 消息可靠性拆成 confirm 三种模式与 UNKNOWN 态处理、mandatory return 与路由失败、四层持久化与 quorum queue（含 delivery-limit 和 4.x 变化）、manual ack 时机与 ack 丢失重投、有限重试/DLX/DLQ 闭环、无限 requeue 的危害，以及可靠投递与幂等设计的职责边界。"
 }

@@ -4,7 +4,7 @@
   "category": "react",
   "group": "react",
   "title": "React Hooks 原理",
-  "summary": "深入理解React Hooks的链表实现原理，掌握useState/useEffect的工作机制，识别和解决闭包陷阱问题。",
+  "summary": "Hooks 用 Fiber 链表按调用顺序存状态，dispatch 队列触发重渲染，commit 后执行 effect；调用顺序约束、闭包和依赖数组是排查关键，需保证副作用可重入。",
   "tags": [
     "React",
     "Hooks",
@@ -14,25 +14,35 @@
     "Fiber"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 31,
   "order": 20,
   "recommendWeight": 95,
   "status": "production",
   "learningCards": [
     {
       "type": "explain",
-      "title": "React Hooks 原理：Hooks 核心原理、链表存储",
-      "content": "## Hooks核心原理\n\n### 链表存储\nHooks通过链表存储在Fiber节点的memoizedState上。每次渲染按顺序调用Hooks，所以不能在条件/循环中调用。\n```js\n// Fiber节点\nfiber.memoizedState = {\n  memoizedState: stateValue,  // useState的值\n  next: {                      // 下一个Hook\n    memoizedState: effectObj,\n    next: null\n  }\n}\n```"
+      "title": "Hooks 为什么是链表而非 Map——调用顺序约束的根源",
+      "content": "函数组件没有实例，React 需要在多次渲染之间把每个 useState/useEffect 等调用的状态槽位稳定地对应起来。Hooks 的设计选择是：不给每个 Hook 命名，而是用**调用顺序**作为隐式索引。每次函数组件执行时，React 维护一个 workInProgressHook 指针，按顺序从链表中取出或创建节点。\n\n链表挂载在 Fiber 节点的 `memoizedState` 字段上，每个节点是一个 Hook 对象，包含 `memoizedState`（当前值）、`queue`（更新队列）和 `next`（指向下一个 Hook）。首次渲染（mount）时依次创建节点并串起来；后续渲染（update）时指针依次移动，取出对应节点。\n\n这个设计让 Hook 调用必须满足两个约束：第一，不能放在条件语句、循环或提前返回里——如果某次渲染跳过了一个 useState 调用，后续所有 Hook 的指针都会错位，读到错误的状态槽位。第二，不能放到普通函数或异步回调里调用——React 只在组件函数执行期间维护 workInProgressHook 指针，其他时机调用拿不到正确的 Fiber 上下文。\n\n为什么不用 Map 按名称索引？因为 Map 要求每个 Hook 有唯一标识符，需要开发者手写名字字符串或 Symbol，增加心智负担和出错概率。调用顺序约束把这部分自动化了，代价就是前面说的两条规则。React 团队在设计 Hooks 时明确权衡过这一点。"
     },
     {
       "type": "explain",
-      "title": "React Hooks 原理的边界、易错点与取舍",
-      "content": "### useState原理\n1. 首次渲染：创建Hook对象，计算初始值\n2. 后续渲染：从链表取出对应Hook，返回memoizedState\n3. setState：将更新加入队列，触发重渲染\n\n### useEffect原理\n1. commit 后由 Scheduler/MessageChannel 等机制调度，通常在浏览器绘制后异步执行，不能简单等同于微任务\n2. 依赖变化时先执行上次的cleanup，再执行新的effect\n3. 返回函数是cleanup，在下次effect前或卸载时执行\n\n### 闭包陷阱\n函数组件每次渲染创建新的闭包，闭包捕获的是当时的state/props值。useEffect中的回调捕获的是当时的值，不是最新的。"
+      "title": "useState 的 dispatch 队列、批量更新与函数式更新",
+      "content": "useState 本质上是 useReducer 的语法糖，它内部维护一个环形链表的更新队列（`queue.pending`）。每次调用 `setState(newValue)` 或 `setState(prev => newValue)` 时，React 创建一个 update 对象（包含 action 和 next 指针），挂到 queue.pending 链表尾部，并触发调度（scheduleUpdateOnFiber）。\n\n关键细节：**更新不会立即生效**。setState 把更新入队后，当前渲染函数还会继续执行完，读到的 state 仍然是旧值。React 会在下一次渲染时遍历更新队列，依次应用每个 action 到 baseState 上，得到新的 memoizedState。这就是为什么连续多次 setState 不会逐次触发渲染。React 18 之后在事件处理和生命周期中默认批量处理（automatic batching），把同一轮事件循环里的所有 setState 合并到一次渲染中。\n\n函数式更新 `setState(prev => prev + 1)` 的价值在于：action 是函数时，React 会把上一个更新的结果作为 prev 传入，而不是读取闭包捕获的旧 state。在 setInterval 或异步回调等容易产生 stale closure 的场景下，函数式更新能保证基于最新值计算，避免闭包陷阱。但函数式更新并不能解决所有问题——如果你需要同时读多个状态字段的最新值，或者 effect 的清理逻辑依赖旧值，还是需要配合 useRef 或正确的依赖数组。"
     },
     {
       "type": "explain",
-      "title": "React Hooks 原理的边界、调优与面试追问",
-      "content": "Hooks 的核心是用调用顺序把组件状态和副作用挂到 Fiber 上，因此不能放进条件分支或循环。讲 useEffect 时要区分渲染后的副作用、依赖数组和清理函数，讲 useMemo/useCallback 时要说明它们优化的是引用稳定性或重复计算，不是默认性能开关。排查问题常从闭包旧值、依赖缺失、重复订阅和状态派生错误入手。"
+      "title": "useEffect 的调度、依赖比较与清理生命周期",
+      "content": "useEffect 的执行分三个阶段：render 阶段记录 effect 到 Fiber 节点的 `updateQueue`（一个单向链表），commit 阶段 DOM 变更完成后标记 effect，然后由调度器（Scheduler，内部用 MessageChannel 或 setTimeout 切片）异步安排执行，通常在浏览器绘制之后。这意味着 useEffect 回调不会阻塞绘制，适合数据获取、订阅等不影响布局的副作用。\n\n依赖数组的作用是告诉 React：「这个 effect 只在这些值变化时才需要重新执行」。React 用 Object.is 逐项比较依赖，全部相等则跳过。**不要把依赖数组当优化开关**——它的语义是「声明 effect 依赖了哪些外部值」，漏写依赖会导致 effect 读到旧闭包值，这是最常见的 stale closure 来源之一。多写不稳定引用（每次渲染都新建的对象/函数）会导致 effect 频繁触发。需要配合 useMemo/useCallback 稳定引用，或者在 effect 内部处理。\n\n清理函数（return 的函数）的执行时机：组件卸载时执行一次；依赖变化时，React 会先执行上一次 effect 的 cleanup，再执行新的 effect callback。这保证了订阅不会重复创建、计时器不会泄漏。cleanup 接收的是旧闭包——它捕获的是上一次渲染时的值，这一点在写定时器或订阅时要特别注意。\n\nuseLayoutEffect 与 useEffect 的区别在执行时机：useLayoutEffect 在 DOM 变更后、浏览器绘制前同步执行，会阻塞绘制。适合需要读取布局（getBoundingClientRect）或同步修改 DOM 以避免闪烁的场景。代价是阻塞绘制可能导致掉帧，不能滥用。"
+    },
+    {
+      "type": "explain",
+      "title": "并发模式、StrictMode 与副作用可重入",
+      "content": "React 18 引入并发渲染（Concurrent Rendering）后，渲染可能被中断、丢弃并重新开始。render 阶段的函数组件可能执行多次但只 commit 一次，render 阶段不能有副作用（写 DOM、发请求、修改外部变量）。Hooks 的设计天然配合这个模型：state 更新入队但不在 render 阶段应用，effect 记录但推迟到 commit 后执行。\n\nStrictMode 在开发模式下会额外执行一次 render（double invocation），帮你发现不安全的副作用。如果 effect 有清理逻辑且依赖正确，double invocation 不会造成问题——第一次的 effect 会在第二次 render 前被清理。反之，如果没有清理函数或依赖不全，double invocation 会暴露问题，比如重复订阅、重复请求。\n\n这意味着写 effect 时要默认假设它可能被执行多次、被中断、被重新开始。idempotent（幂等）和有 cleanup 是好的 effect 的标志。\n\n**版本行为数据**：React 18（2022 年 3 月发布）引入 Concurrent Rendering，`createRoot` 启用完整并发模式。StrictMode 的 double invocation 只在开发模式生效，生产模式不会触发。useEffect cleanup 的执行时机是：(1) 依赖变化时，先执行旧 effect 的 cleanup，再执行新 effect callback；(2) 组件卸载时执行一次 cleanup。React 18 的 StrictMode 还会在开发模式下模拟「卸载后重新挂载」——mount → cleanup → mount——帮助发现未正确清理的 effect。useLayoutEffect 的 cleanup 在 DOM 变更后、浏览器绘制前同步执行，比 useEffect 的 cleanup 更早。"
+    },
+    {
+      "type": "explain",
+      "title": "useRef 是绕过渲染周期读最新值的逃生口",
+      "content": "useRef 返回一个在所有渲染之间共享的可变对象 `{ current: ... }`，修改 ref.current 不触发重渲染。它的核心用途有两类：第一，持有 DOM 引用（ref callback 或 ref prop）；第二，在 effect 或事件回调中读取最新值——因为 ref.current 总是指向最新赋的值，不受闭包捕获限制。\n\n典型场景：在 setInterval 回调中读最新的 state。直接读 count 会拿到闭包捕获的旧值，但读 ref.current 可以拿到最新值。不过这不是万能解——对于派生状态，正确做法是把派生逻辑放到渲染中或用 useMemo；对于事件回调，函数式更新通常是更好的选择。ref 适合「存一个值但不想触发渲染」和「跨渲染周期持有最新引用」这两种场景。"
     },
     {
       "type": "diagram",
@@ -46,9 +56,13 @@
         "不能在条件/循环中调用Hooks",
         "每次渲染链表结构不变，值更新"
       ],
-      "format": "mermaid",
+      "format": "svg",
       "caption": "React Hooks 执行模型：调用顺序、闭包、依赖数组、Effect 清理与并发重放",
       "sources": [
+        {
+          "kind": "svg",
+          "path": "assets/diagrams/generated/frontend-react-hooks.svg"
+        },
         {
           "kind": "mermaid",
           "content": "flowchart TD\nA[\"函数组件渲染\"] --> B[\"按固定顺序调用 Hooks\"]\nB --> C[\"useState/useReducer 读取 hook slot\"]\nB --> D[\"useMemo/useCallback 比较依赖\"]\nB --> E[\"useEffect 记录副作用\"]\nC --> F[\"返回 JSX\"]\nF --> G[\"Commit DOM\"]\nG --> H[\"执行 effect cleanup 后再执行新 effect\"]\nI[\"依赖数组不完整\"] --> J[\"闭包读取旧值\"]\nK[\"StrictMode/并发渲染\"] --> B"
@@ -61,45 +75,61 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| Hook | 用途 | 执行时机 | 注意事项 |\n| --- | --- | --- | --- |\n| useState | 状态管理 | 渲染时 | 批量更新、函数式更新 |\n| useEffect | 副作用 | 渲染后异步 | 依赖数组、cleanup |\n| useLayoutEffect | DOM操作副作用 | DOM更新后同步 | 阻塞渲染 |\n| useMemo | 缓存计算结果 | 依赖变化时 | 不要过度使用 |\n| useCallback | 缓存函数引用 | 依赖变化时 | 配合memo使用 |\n| useRef | 可变引用 | 不触发渲染 | 访问最新值 |\n| useReducer | 复杂状态逻辑 | dispatch时 | 类似Redux |\n| useContext | 订阅Context | 值变化时 | 整个组件重渲染 |"
+      "title": "常用 Hook 对比：用途、执行时机与工程取舍",
+      "content": "| Hook | 核心作用 | 执行时机 | 关键取舍 |\n| --- | --- | --- | --- |\n| useState | 状态存储与更新 | render 时读取，dispatch 入队 | 函数式更新避免 stale closure；批量更新合并同一轮事件循环的多个 setState |\n| useReducer | 复杂状态逻辑 | 同 useState | 适合多个相关状态字段需要联合更新的场景 |\n| useEffect | 副作用（异步） | commit 后异步执行 | 不阻塞绘制；依赖数组决定是否重新执行；cleanup 防泄漏 |\n| useLayoutEffect | 副作用（同步） | commit 后、绘制前同步执行 | 阻塞绘制；适合读布局或同步修 DOM 避免闪烁 |\n| useMemo | 缓存计算结果 | 依赖变化时重新计算 | 避免重复计算但增加内存；不要为「优化」而过度使用 |\n| useCallback | 缓存函数引用 | 依赖变化时返回新引用 | 稳定引用配合 React.memo 减少子组件重渲染；单独用无意义 |\n| useRef | 可变引用容器 | 不触发渲染 | 跨渲染周期持有最新值；DOM 引用；effect 中读最新 state 的逃生口 |\n| useContext | 订阅 Context | Provider value 变化时 | context 值变化导致所有消费者重渲染；大 context 拆分或配合 useMemo |"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "// 简化版useState实现\nlet workInProgressHook = null;\nlet isMount = true;\n\nfunction useState(initialValue) {\n  let hook;\n  if (isMount) {\n    hook = { memoizedState: initialValue, queue: { pending: null }, next: null };\n    if (!fiber.memoizedState) {\n      fiber.memoizedState = hook;\n    } else {\n      workInProgressHook.next = hook;\n    }\n    workInProgressHook = hook;\n  } else {\n    hook = workInProgressHook;\n    workInProgressHook = workInProgressHook.next;\n  }\n\n  // 处理更新队列\n  let baseState = hook.memoizedState;\n  if (hook.queue.pending) {\n    let firstUpdate = hook.queue.pending.next;\n    do {\n      const action = firstUpdate.action;\n      baseState = typeof action === 'function' ? action(baseState) : action;\n      firstUpdate = firstUpdate.next;\n    } while (firstUpdate !== hook.queue.pending.next);\n    hook.queue.pending = null;\n  }\n  hook.memoizedState = baseState;\n  return [baseState, dispatchAction.bind(null, hook.queue)];\n}\n\n// 闭包陷阱示例\nfunction Counter() {\n  const [count, setCount] = useState(0);\n\n  // 错误：闭包捕获的是初始count\n  useEffect(() => {\n    const timer = setInterval(() => {\n      setCount(count + 1); // count永远是0\n    }, 1000);\n    return () => clearInterval(timer);\n  }, []); // 空依赖\n\n  // 正确：使用函数式更新\n  useEffect(() => {\n    const timer = setInterval(() => {\n      setCount(prev => prev + 1); // 使用最新值\n    }, 1000);\n    return () => clearInterval(timer);\n  }, []);\n\n  // 正确：添加依赖\n  useEffect(() => {\n    document.title = `Count: ${count}`;\n  }, [count]); // count变化时重新执行\n}\n\n// 自定义Hook复用逻辑\nfunction useDebounce(value, delay) {\n  const [debounced, setDebounced] = useState(value);\n  useEffect(() => {\n    const timer = setTimeout(() => setDebounced(value), delay);\n    return () => clearTimeout(timer);\n  }, [value, delay]);\n  return debounced;\n}",
+      "title": "简化版 useState 实现：链表挂载、更新队列与函数式更新",
       "language": "javascript",
+      "content": "// 简化版 useState 实现（仅演示核心原理）\nlet workInProgressHook = null;\nlet isMount = true;\nlet fiber = { memoizedState: null }; // 当前 Fiber 节点\n\nfunction useState(initialValue) {\n  let hook;\n  if (isMount) {\n    // mount：创建 Hook 节点，串入 Fiber 链表\n    hook = { memoizedState: initialValue, queue: { pending: null }, next: null };\n    if (!fiber.memoizedState) {\n      fiber.memoizedState = hook;       // 第一个 Hook\n    } else {\n      workInProgressHook.next = hook;   // 追加到链表尾部\n    }\n    workInProgressHook = hook;\n  } else {\n    // update：按顺序取出对应 Hook\n    hook = workInProgressHook;\n    workInProgressHook = workInProgressHook.next;\n  }\n\n  // 处理更新队列（环形链表）\n  let baseState = hook.memoizedState;\n  if (hook.queue.pending) {\n    let firstUpdate = hook.queue.pending.next; // 环形链表头\n    do {\n      const action = firstUpdate.action;\n      baseState = typeof action === 'function' ? action(baseState) : action;\n      firstUpdate = firstUpdate.next;\n    } while (firstUpdate !== hook.queue.pending.next);\n    hook.queue.pending = null;\n  }\n  hook.memoizedState = baseState;\n  return [baseState, dispatchAction.bind(null, hook.queue)];\n}\n\n// dispatch 入队更新，触发调度\nfunction dispatchAction(queue, action) {\n  const update = { action, next: null };\n  if (!queue.pending) {\n    update.next = update; // 自引用形成环\n  } else {\n    update.next = queue.pending.next;\n    queue.pending.next = update;\n  }\n  queue.pending = update;\n  // 真实实现中这里调用 scheduleUpdateOnFiber 触发重渲染\n}\n\n// ---- 闭包陷阱示例 ----\nfunction Counter() {\n  const [count, setCount] = useState(0);\n\n  // 错误：count 被闭包捕获，永远是 0\n  useEffect(() => {\n    const timer = setInterval(() => {\n      setCount(count + 1); // stale closure!\n    }, 1000);\n    return () => clearInterval(timer);\n  }, []);\n\n  // 正确：函数式更新读取最新 baseState\n  useEffect(() => {\n    const timer = setInterval(() => {\n      setCount(prev => prev + 1); // 不依赖闭包\n    }, 1000);\n    return () => clearInterval(timer);\n  }, []);\n\n  // 正确：声明依赖，依赖变化时重建 effect\n  useEffect(() => {\n    document.title = `Count: ${count}`;\n  }, [count]);\n}",
       "highlights": [
         {
-          "line": 5,
-          "note": "`function useState(initialValue) {` 定义了 React Hooks 原理 示例中承载状态和操作的代码位置，复述时从参数和状态字段讲起。"
+          "line": 6,
+          "note": "mount 阶段创建 Hook 节点并串入 Fiber 链表，这是调用顺序约束的物理体现。"
         },
         {
-          "line": 28,
-          "note": "`} while (firstUpdate !== hook.queue.pending.next);` 承担主要遍历过程，时间复杂度通常由这层循环和内部状态更新共同决定。"
+          "line": 14,
+          "note": "update 阶段按顺序移动 workInProgressHook 指针取出对应节点——跳过任何一个调用都会导致后续全部错位。"
         },
         {
-          "line": 7,
-          "note": "`if (isMount) {` 是分支判断，决定正常路径、边界输入或失败路径走向。"
+          "line": 23,
+          "note": "环形链表遍历更新队列，函数 action 接收上一次的 baseState 而非闭包旧值。"
         },
         {
           "line": 37,
-          "note": "`const [count, setCount] = useState(0);` 更新核心数据结构，是解释状态如何推进的抓手。"
+          "note": "dispatchAction 构造环形更新链表并触发调度——更新不立即生效，下次渲染才应用。"
+        },
+        {
+          "line": 51,
+          "note": "setCount(count + 1) 的 count 是闭包捕获的 0，不会递增——这就是 stale closure。"
+        },
+        {
+          "line": 58,
+          "note": "setCount(prev => prev + 1) 绕过闭包，直接基于最新 baseState 计算。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
-      "title": "标准面试回答",
-      "content": "结论：Hooks 是函数组件保存状态和副作用的机制。它依赖 Fiber 节点上的 Hook 链表和固定调用顺序来把每次渲染中的 Hook 调用对应回同一个状态槽位。\n机制上，一次函数组件渲染中：\n1. React 按组件执行顺序依次调用 Hooks。\n2. 每个 Hook 在 Fiber 上对应一个节点，保存 memoizedState、更新队列或 effect 信息。\n3. useState 的 setState 会入队更新并触发调度，下一次渲染根据队列计算新状态。\n4. useEffect 在提交阶段后异步执行，依赖数组用于判断是否需要重新执行和清理。\n追问边界：Hooks 不能放在条件、循环或普通函数里，因为调用顺序变化会导致状态错位。副作用要正确写依赖数组；事件回调中读到旧值时可用函数式更新、useRef 或 useCallback 配合依赖解决。",
+      "title": "面试回答思路",
+      "content": "**结论**：React Hooks 用 Fiber 节点上的单向链表存储每个 Hook 的状态，依赖固定的调用顺序把渲染时的 Hook 调用映射回正确的状态槽位。\n\n**核心机制**\n- **链表存储**：每个 Fiber 节点的 `memoizedState` 指向 Hooks 链表头，每个 Hook 节点包含 `memoizedState`（值）、`queue`（更新队列）、`next`（下一个 Hook）\n- **调用顺序**：mount 时按顺序创建节点串入链表，update 时按顺序移动指针取出节点。不能放在条件/循环/普通函数里，否则指针错位\n- **useState 更新机制**：setState 把更新对象入队到环形链表（queue.pending），不立即应用；下一次渲染时遍历队列计算新状态。React 18 默认 automatic batching\n- **useEffect 生命周期**：render 阶段记录 effect 到 Fiber，commit 阶段 DOM 变更后由 Scheduler 异步调度执行，不阻塞绘制。cleanup 在下次 effect 前或卸载时执行\n- **useLayoutEffect**：commit 后、绘制前同步执行，阻塞绘制，适合读布局或同步修 DOM\n\n**闭包陷阱与解法**\n- 根源：函数组件每次渲染创建新闭包，闭包捕获当时的值\n- 函数式更新：`setState(prev => prev + 1)` 绕过闭包，基于最新 baseState 计算\n- useRef：ref.current 总指向最新值，可在 effect/回调中读取\n- 正确声明依赖数组：依赖变化时重建 effect，获取最新值\n\n**并发模式影响**\n- render 阶段可中断、可丢弃，不能有副作用\n- StrictMode double invocation 暴露不安全的 effect\n- effect 应幂等且有 cleanup\n\n**React 版本与性能演进**\n- React 16.8（2019）：引入 Hooks，Fiber 架构重构完成\n- React 17（2020）：事件委托从 document 改为 root DOM，为并发铺路\n- React 18（2022-03）：`createRoot` 启用 Concurrent Rendering，automatic batching 扩展到所有场景（setTimeout/Promise/原生事件），`useTransition`/`useDeferredValue` 提供并发控制能力\n- React 19（2024）：Server Components GA，`use()` hook，React Compiler 自动 memo\n- 性能关键：automatic batching 减少不必要渲染，concurrent rendering 让高优先级更新（输入）打断低优先级更新（数据加载），Suspense + concurrent 模式支持流式 SSR\n\n**追问边界**\n- useMemo 稳定计算结果引用，useCallback 稳定函数引用，两者配合 React.memo 减少子组件不必要的重渲染\n- useContext 值变化导致所有消费者重渲染，大 context 需拆分\n- useRef 不触发重渲染，适合存 DOM 引用或跨渲染周期持有最新值",
       "followUpQuestions": [
         {
-          "question": "useEffect 和 useLayoutEffect 有什么区别？",
-          "answer": "useLayoutEffect 在 DOM 变更后、浏览器绘制前同步执行，适合读取布局；useEffect 在绘制后异步执行，更不阻塞渲染。"
+          "question": "为什么 Hooks 不能在条件语句中调用？",
+          "answer": "Hooks 靠调用顺序在链表中定位状态槽位。如果某次渲染跳过一个 useState 调用，后续所有 Hook 的指针都会向后偏移一位，读到错误的状态。这会导致状态错乱、effect 绑定到错误的 cleanup，且这种 bug 在开发中很难复现。"
         },
         {
-          "question": "为什么依赖数组不能随便省略？",
-          "answer": "依赖数组描述 effect 捕获了哪些外部值，漏写会导致使用旧闭包，多写不稳定引用会导致重复执行。"
+          "question": "useEffect 的依赖数组省略或写空数组分别意味着什么？",
+          "answer": "省略依赖数组意味着每次渲染后都执行 effect，等价于没有优化。空数组 `[]` 表示只在 mount 时执行一次、cleanup 在 unmount 时执行——但如果 effect 内部读取了外部变量，这些值被闭包捕获后不会更新，形成 stale closure。正确做法是把 effect 依赖的所有外部值都声明在数组中。"
+        },
+        {
+          "question": "React 18 的 automatic batching 和之前的批量更新有什么区别？",
+          "answer": "React 17 只在 React 事件处理函数和生命周期中批量更新，setTimeout/Promise/原生事件中的多次 setState 会各自触发渲染。React 18 把批量范围扩展到所有场景（包括 setTimeout、Promise、原生事件），默认启用 automatic batching，同一轮事件循环中的所有 setState 合并到一次渲染。需要退出批量时用 `flushSync`。"
+        },
+        {
+          "question": "useMemo 和 useCallback 什么时候该用、什么时候不该用？",
+          "answer": "useMemo 用于避免昂贵计算的重复执行（大列表过滤/排序），useCallback 用于稳定函数引用配合 React.memo 减少子组件重渲染。不应该无差别使用——每次渲染都执行的简单计算不需要 useMemo（增加内存和比较开销），没有传递给 memo 组件的回调不需要 useCallback。Hook 本身的调用和依赖比较也有成本。"
         }
       ]
     },
@@ -107,67 +137,79 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "Hooks为什么必须在函数顶层调用（链表顺序）",
-        "useState的更新机制和批量更新",
-        "useEffect的执行时机和cleanup机制",
-        "闭包陷阱的原因和解决方案",
-        "useMemo和useCallback的区别和使用场景"
+        "能解释 Hooks 为什么必须按固定顺序调用，以及链表指针错位会导致什么问题",
+        "能描述 useState 的更新队列机制和 React 18 automatic batching",
+        "能区分 useEffect 与 useLayoutEffect 的执行时机和适用场景",
+        "能解释 stale closure 的成因，并给出函数式更新、useRef、正确依赖数组三种解法",
+        "能说明 useRef 的两种用途：DOM 引用和跨渲染周期持有最新值",
+        "能描述并发模式下 render 阶段可中断的含义，以及 effect 为什么要幂等且有 cleanup",
+        "能说明 useMemo 和 useCallback 的适用场景和过度使用的代价"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "frontend.react.topic-react-hooks.recall.1",
-      "prompt": "请解释 React Hooks 为什么必须按固定顺序调用，以及 useState/useEffect 的底层思路。",
+      "prompt": "请解释 React Hooks 为什么必须按固定顺序调用，以及 Fiber 上的 Hook 链表是如何工作的。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
       "id": "frontend.react.topic-react-hooks.recall.2",
-      "prompt": "Hooks 中 stale closure 是什么？如何避免？",
+      "prompt": "useState 的 setState 是同步还是异步的？更新队列是如何工作的？React 18 的 automatic batching 有什么变化？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
       "id": "frontend.react.topic-react-hooks.recall.3",
-      "prompt": "useEffect和useLayoutEffect有什么区别？",
+      "prompt": "请解释 stale closure（闭包陷阱）的成因，并给出至少两种解决方案。",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
+      "id": "frontend.react.topic-react-hooks.recall.4",
+      "prompt": "useEffect 和 useLayoutEffect 有什么区别？各自的执行时机和适用场景是什么？",
       "mode": "text",
       "expectedMinutes": 2,
       "difficulty": 4
     },
     {
-      "id": "frontend.react.topic-react-hooks.recall.4",
-      "prompt": "请手写一个简化版 useState/useEffect 的 Hook 链表模型，说明为什么 Hooks 不能条件调用。",
+      "id": "frontend.react.topic-react-hooks.recall.5",
+      "prompt": "请手写一个简化版 useState 实现，包括链表挂载、更新队列遍历和 dispatch 机制。",
       "mode": "code",
       "expectedMinutes": 10,
       "difficulty": 4
     },
     {
-      "id": "frontend.react.topic-react-hooks.recall.5",
-      "prompt": "请手写一个 useDebounce Hook，并说明依赖数组、清理函数和 stale closure 如何处理。",
-      "mode": "code",
-      "expectedMinutes": 8,
+      "id": "frontend.react.topic-react-hooks.recall.6",
+      "prompt": "在 setInterval 回调中读取 state 会遇到什么问题？如何正确处理？",
+      "mode": "text",
+      "expectedMinutes": 3,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "固定调用顺序",
-      "Fiber Hook 链表",
-      "useState 更新队列",
-      "useEffect 提交阶段"
+      "能解释 Hooks 链表存储和固定调用顺序约束",
+      "能描述 useState 的更新队列（环形链表）和 dispatch 机制",
+      "能区分 useEffect 与 useLayoutEffect 的执行时机",
+      "能解释 stale closure 的成因及函数式更新、useRef、依赖数组三种解法"
     ],
     "goodToHave": [
-      "stale closure",
-      "useLayoutEffect",
-      "能说明「函数式更新」在「React Hooks 原理」里的触发条件、收益和失效边界"
+      "能说明 React 18 automatic batching 的变化",
+      "能解释并发模式下 render 阶段可中断对 effect 设计的影响",
+      "能说明 useRef 的两种用途和与 useState 的区别",
+      "能区分 useMemo 和 useCallback 的适用场景和过度使用代价"
     ],
     "commonMistakes": [
-      "在条件里调用 Hook",
-      "把依赖数组当优化开关",
-      "忽略 effect 清理函数"
+      "在条件语句或循环中调用 Hook，导致链表指针错位",
+      "把依赖数组当优化开关随意省略，导致 stale closure",
+      "useEffect 中缺少 cleanup 函数导致订阅/定时器泄漏",
+      "无差别使用 useMemo/useCallback，忽略本身的开销",
+      "混淆 useEffect 和 useLayoutEffect 的执行时机"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -180,6 +222,6 @@
     "frontend.react.topic-react-core-fiber"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能围绕「React Hooks 原理」说清固定调用顺序、Fiber Hook 链表，并放到前端工程场景中解释关键流程、边界条件和出错后的处理思路。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察是否能围绕 Hooks 链表存储、调用顺序约束、useState 更新队列、useEffect 执行时机和闭包陷阱，结合并发模式和工程实践完整解释 Hooks 原理及常见问题的排查思路。",
+  "updatedAt": "2026-06-22"
 }

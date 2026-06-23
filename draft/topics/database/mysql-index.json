@@ -4,30 +4,45 @@
   "category": "mysql-core",
   "group": "mysql-core",
   "title": "MySQL 索引原理",
-  "summary": "理解 B+ 树、聚簇索引、二级索引、回表、覆盖索引和联合索引最左前缀。",
+  "summary": "理解 InnoDB B+ 树如何把索引查询变成 2-3 次磁盘页访问；区分聚簇索引（整行）与二级索引（主键）的叶子节点差异；解释回表的随机 IO 成本和覆盖索引如何消除回表；掌握联合索引的逐级排序、最左前缀与范围条件截断规则；说明 ICP 如何在索引层减少回表、优化器如何选择索引或全表扫描。",
   "tags": [
     "数据库",
     "MySQL",
     "mysql-core"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 30,
+  "estimatedMinutes": 27,
   "order": 10,
   "recommendWeight": 90,
   "status": "draft",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察是否能把 B+ 树、聚簇索引、二级索引、回表、覆盖索引和联合索引排序规则串成一条查询路径。",
+  "interviewerFocus": "考察能否从 B+ 树结构出发，串起聚簇索引与二级索引的叶子节点差异、回表的随机 IO 成本、覆盖索引与 ICP 两种减少回表的机制、联合索引逐级排序和范围截断规则，最终能用 EXPLAIN 工具验证和排查索引问题。",
   "learningCards": [
     {
       "type": "explain",
-      "title": "B+ 树索引用有序结构减少随机 IO",
-      "content": "InnoDB 的索引不是简单目录，而是一棵为磁盘页（默认 16KB）访问优化的 B+ 树。非叶子节点只存键值和子页指针，做导航用；叶子节点存有序数据，且同层叶子通过双向链表连接，天然支持范围扫描。\n\n关键机制：\n- B+ 树高度低：千万级数据通常 3 层（根页常驻 buffer pool，只需 2 次磁盘 IO）\n- 聚簇索引按主键组织整行数据，每张 InnoDB 表只有一个；主键查询直接命中叶子节点拿到整行\n- 二级索引叶子节点保存主键值而非整行，命中后如果需要非索引列，要拿主键回到聚簇索引查整行——这就是回表\n- 联合索引 `(a,b,c)` 先按 a 排，相同 a 内按 b 排，相同 a,b 内按 c 排；等值条件能连续定位，范围条件之后的列无法继续用于索引精确定位\n\n容易答错的边界：\n- 索引越多写入成本越高：每次 INSERT/UPDATE/DELETE 要维护所有相关 B+ 树，还可能触发页分裂\n- 对索引列做函数运算、隐式类型转换（如 varchar 列用数字查）、前导模糊匹配（`LIKE '%abc'`）会让索引失效\n- 优化器可能因为二级索引选择性差、回表代价高而选择全表扫描，`EXPLAIN` 的 `rows` 列会体现估算行数"
+      "title": "B+ 树结构把索引查询变成少量磁盘页访问",
+      "content": "InnoDB 的索引是按磁盘页（默认 16KB）优化的 B+ 树，而不是内存中的红黑树或跳表。它的设计动机是：数据库查询的瓶颈是磁盘随机 IO，索引的每一层只对应一次页读取，因此树的高度必须尽量低。\n\nB+ 树有两层节点分工明确：\n- **非叶子节点**（也叫内部节点）只存键值和子页指针，作用是导航——通过比较键值决定往哪个子页走。因为每条记录很小（键值 + 指针约 12-16 字节），一个 16KB 的页能容纳上千条导航项，所以两三层就能索引上亿行。\n- **叶子节点**保存实际数据或主键值（取决于索引类型），同层叶子通过双向链表连接，这让范围扫描（`BETWEEN`、`ORDER BY`）不需要回溯到上层，直接沿链表顺序读。\n\n千万级表通常高度为 3：根页常驻 Buffer Pool，实际磁盘 IO 只需 2 次（一次到二级节点定位叶子页，一次读叶子页）。这是 B+ 树比 B 树更适合磁盘场景的根本原因——B 树的内部节点也存数据，导致每页能容纳的导航项更少，树更高、IO 更多。"
     },
     {
       "type": "explain",
-      "title": "回表、覆盖索引和联合索引要一起讲",
-      "content": "面试里讲索引，最好用一次查询路径解释：优化器先选择可用索引，沿 B+ 树定位到叶子节点；如果二级索引已经包含查询需要的列，就是覆盖索引，可以直接返回；如果还需要其他列，就根据叶子节点里的主键值回到聚簇索引，这就是回表。\n\n联合索引的难点是“有序”的范围。`(a,b,c)` 先按 a 排，再在相同 a 内按 b 排，再在相同 a,b 内按 c 排。因此 `a=? and b=?` 能连续定位，`a range` 后面的 b、c 通常不能继续用于精确定位。设计索引时要结合等值条件、范围条件、排序分组、选择性和写入频率，而不是看到 where 字段就全部建索引。"
+      "title": "聚簇索引和二级索引的区别在叶子节点",
+      "content": "每张 InnoDB 表都有一棵聚簇索引（Clustered Index），它的叶子节点直接存储完整的行数据。如果定义了主键，主键就是聚簇索引；如果没有主键，InnoDB 会选择一个非空唯一索引；如果都没有，会生成一个隐藏的 6 字节 rowid。**一张表只有一个聚簇索引**，因为行数据只能按一种顺序物理组织。\n\n二级索引（Secondary Index）是除聚簇索引以外的其他索引。它的叶子节点保存的不是整行，而是**该索引定义的列值加上主键值**。这意味着：通过二级索引定位到叶子节点后，你拿到的只是索引列的值和主键值，如果查询还需要其他列，就必须拿着主键值回到聚簇索引再查一次——这个过程叫**回表**。\n\n回表的代价在于：二级索引叶子节点中的主键值是按索引列排序的，而不是按主键排序的，所以回到聚簇索引时，每个主键对应的行可能分布在不同的页上，产生随机 IO。如果回表行数很多（比如几万行），随机 IO 累积起来可能比全表扫描还慢。这就是为什么优化器有时会放弃使用索引而选择全表扫描。"
+    },
+    {
+      "type": "explain",
+      "title": "覆盖索引和 ICP 是减少回表的两种机制",
+      "content": "**覆盖索引**（Covering Index）是指查询需要的所有列都在某个索引中。此时从索引叶子节点就能拿到全部数据，不需要回表。`EXPLAIN` 的 Extra 列会显示 `Using index`。例如索引 `(user_id, status, created_at)` 上执行 `SELECT user_id, status, created_at FROM orders WHERE user_id = 7`，三列全在索引中，直接返回。\n\n覆盖索引省去回表的随机 IO，但代价是索引更宽（每个叶子节点存更多列），写入维护成本也更高。设计时要权衡查询频率和写入频率。\n\n**索引条件下推 ICP**（Index Condition Pushdown，MySQL 5.6 引入）解决的是另一个问题：当 WHERE 条件中有一部分列在索引中、另一部分不在时，传统做法是把所有匹配行都回表后再在 Server 层过滤。ICP 的改进是把索引列上的过滤条件下推到存储引擎层，在索引叶子节点上就先过滤一轮，减少回表的行数。`EXPLAIN` 的 Extra 显示 `Using index condition`。\n\nICP 有效的前提是：条件涉及的列在索引中，但又不完全满足最左前缀精确匹配。例如 `(user_id, status)` 索引上 `WHERE user_id = 7 AND status LIKE 'PA%'`，`LIKE 'PA%'` 不是等值匹配但可以用索引列过滤，ICP 在索引层先过滤 status 再回表。"
+    },
+    {
+      "type": "explain",
+      "title": "联合索引的排序规则决定了能用哪些列",
+      "content": "联合索引 `(a, b, c)` 的叶子节点按 a 排序，a 相同时按 b 排序，a 和 b 都相同时按 c 排序。这是逐级排序，不是三列分别排序。理解这一点是理解「最左前缀」的基础。\n\n**最左前缀原则**：查询条件必须从索引最左边的列开始连续匹配，才能利用索引的有序性定位。`WHERE a = 1 AND b = 2` 能连续定位 a=1 内 b=2 的范围；但 `WHERE b = 2` 跳过了 a，b 的值分散在整个索引中，无法利用有序性。\n\n**范围条件截断**：当某一列使用了范围条件（`>`、`<`、`BETWEEN`、`LIKE 'xx%'`），该列之后的索引列无法继续用于精确定位。例如 `WHERE a = 1 AND b > 5 AND c = 10`：a 等值匹配走索引，b 范围匹配也走索引，但 b 的范围结果中 c 不是有序的，所以 c 无法用于索引精确定位。不过如果 c 是索引列，ICP 可以在索引层过滤 c，减少回表。\n\n`key_len` 字段可以验证实际用了索引的几列：bigint 占 8 字节，utf8mb4 的 varchar(n) 占 4*n+2 字节（需要存长度），加上 nullable 的 1 字节。如果 key_len 只有 8，说明只用了第一列。"
+    },
+    {
+      "type": "explain",
+      "title": "优化器选择索引还是全表扫描靠成本估算",
+      "content": "优化器不是「看到索引就用」，而是基于成本模型估算：使用索引 + 回表的总 IO 和 CPU 成本，与全表扫描的成本比较，选更小的。\n\n会放弃索引的常见场景：\n- **选择性差**：索引列的基数（Cardinality）很低，比如 `gender` 只有 M/F 两个值，用索引命中一半数据再回表，还不如直接全表扫描\n- **回表行数多**：二级索引命中了大量行，每一行都要随机 IO 回到聚簇索引，累积代价超过顺序读全表\n- **隐式类型转换**：varchar 列用数字查询（`WHERE phone = 13800000000`），MySQL 会对列做函数转换（等价于 `CAST(phone AS DECIMAL)`），索引失效\n- **函数运算**：`WHERE YEAR(created_at) = 2025` 对列做函数，无法用索引的有序性\n- **前导模糊匹配**：`LIKE '%abc'` 无法利用索引有序性，只能全索引扫描\n\n`EXPLAIN` 是判断索引是否生效的核心工具：`type` 列 ALL 是全表扫描、ref/range 是索引扫描；`key` 列显示实际使用的索引；`rows` 列是估算扫描行数；`Extra` 列显示 Using index（覆盖）、Using index condition（ICP）、Using filesort（额外排序）、Using temporary（临时表）。"
     },
     {
       "type": "diagram",
@@ -79,98 +94,143 @@
     },
     {
       "type": "compareTable",
-      "title": "索引概念边界",
+      "title": "聚簇索引 vs 二级索引 vs 覆盖索引",
       "columns": [
-        "考点",
-        "机制含义",
-        "面试要点",
-        "常见误区"
+        "索引类型",
+        "叶子节点存储",
+        "查询是否需要回表",
+        "EXPLAIN 标识",
+        "适用场景"
       ],
       "rows": [
         [
           "聚簇索引",
-          "叶子节点保存整行数据，按主键组织",
-          "主键查询直接命中整行，无需回表",
-          "把主键索引和二级索引混为一谈，以为所有索引都存整行"
+          "完整行数据",
+          "不需要（本身就是整行）",
+          "key 通常是 PRIMARY",
+          "主键查询、范围扫描"
         ],
         [
           "二级索引",
-          "叶子节点保存主键值而非整行",
-          "命中后可能需要回表，回表是随机 IO",
-          "以为命中索引一定最快，忽略回表代价和选择性"
+          "索引列值 + 主键值",
+          "命中非索引列时需要回表",
+          "key 显示索引名",
+          "非主键的等值/范围查询"
         ],
         [
           "覆盖索引",
-          "索引包含查询所需全部列",
-          "Extra 显示 Using index，避免回表",
-          "为了覆盖无限加列，导致索引膨胀和写入变慢"
-        ],
-        [
-          "联合索引",
-          "多列按定义顺序逐级排序",
-          "最左前缀 + 范围条件截断 + 排序优化",
-          "只背最左前缀口诀，不看范围条件对后续列的影响"
-        ],
-        [
-          "索引下推 ICP",
-          "WHERE 条件下推到存储引擎层在索引上过滤",
-          "Extra 显示 Using index condition，减少回表",
-          "以为 ICP 能让所有 WHERE 条件都走索引，实际只对索引列有效"
+          "索引列值 + 主键值（查询列全在索引中）",
+          "不需要（Extra: Using index）",
+          "Extra: Using index",
+          "高频查询需要的列能被索引完全覆盖"
         ]
       ]
     },
     {
-      "type": "code",
-      "title": "联合索引和覆盖索引示例",
-      "language": "sql",
-      "content": "CREATE INDEX idx_user_status_time ON orders(user_id, status, created_at);\n\nEXPLAIN SELECT user_id, status, created_at\nFROM orders\nWHERE user_id = 7 AND status = 'PAID'\nORDER BY created_at DESC\nLIMIT 20;",
-      "highlights": [
-        {
-          "line": 1,
-          "note": "这里建立 user_id、status、created_at 联合索引，使等值过滤和排序尽量沿同一棵 B+Tree 完成。"
-        }
+      "type": "compareTable",
+      "title": "索引优化机制对比",
+      "columns": [
+        "机制",
+        "作用",
+        "生效条件",
+        "EXPLAIN 标识",
+        "代价"
+      ],
+      "rows": [
+        [
+          "覆盖索引",
+          "避免回表",
+          "查询列全在索引中",
+          "Extra: Using index",
+          "索引更宽，写入维护成本高"
+        ],
+        [
+          "ICP 索引下推",
+          "减少回表行数",
+          "索引列条件可下推到存储引擎层",
+          "Extra: Using index condition",
+          "仅对索引列有效，不能覆盖非索引列过滤"
+        ],
+        [
+          "联合索引最左前缀",
+          "利用索引有序性定位",
+          "条件从最左列开始连续匹配",
+          "key_len 反映用了几列",
+          "索引列越多，维护成本越高"
+        ],
+        [
+          "索引跳跃扫描",
+          "MySQL 8.0+ 跳过前导列",
+          "前导列基数低且被跳过",
+          "type: range + index skip scan",
+          "优化器自动判断，非所有场景适用"
+        ]
       ]
     },
     {
       "type": "code",
       "title": "联合索引、覆盖索引与 EXPLAIN 解读示例",
       "language": "sql",
-      "content": "-- 联合索引：等值过滤 + 排序沿同一棵 B+Tree 完成\nCREATE INDEX idx_user_status_time ON orders(user_id, status, created_at);\n\n-- 覆盖索引：查询列全在索引中，Extra 应显示 Using index\nEXPLAIN SELECT user_id, status, created_at\nFROM orders\nWHERE user_id = 7 AND status = 'PAID'\nORDER BY created_at DESC\nLIMIT 20;\n\n-- ICP 场景：b LIKE 无法精确匹配但可下推过滤\n-- Extra 应显示 Using index condition\nEXPLAIN SELECT * FROM orders\nWHERE user_id = 7 AND status LIKE 'PA%';\n\n-- key_len 计算：user_id bigint=8, status varchar(20) utf8mb4=82\n-- 若 key_len=8 说明只用 user_id；key_len=90 说明两列都用上\nEXPLAIN SELECT * FROM orders\nWHERE user_id = 7 AND status = 'PAID'\nAND created_at > '2025-01-01';",
+      "content": "-- 联合索引：等值过滤 + 排序沿同一棵 B+Tree 完成\nCREATE INDEX idx_user_status_time ON orders(user_id, status, created_at);\n\n-- 覆盖索引：查询列全在索引中，Extra 应显示 Using index\nEXPLAIN SELECT user_id, status, created_at\nFROM orders\nWHERE user_id = 7 AND status = 'PAID'\nORDER BY created_at DESC\nLIMIT 20;\n\n-- ICP 场景：status LIKE 无法精确匹配但可下推过滤\n-- Extra 应显示 Using index condition\nEXPLAIN SELECT * FROM orders\nWHERE user_id = 7 AND status LIKE 'PA%';\n\n-- key_len 计算验证：user_id bigint=8, status varchar(20) utf8mb4=82\n-- key_len=90 说明 user_id 和 status 两列都用上索引\nEXPLAIN SELECT * FROM orders\nWHERE user_id = 7 AND status = 'PAID'\nAND created_at > '2025-01-01';",
       "highlights": [
         {
           "line": 2,
-          "note": "建立 user_id、status、created_at 联合索引，使等值过滤和排序尽量沿同一棵 B+Tree 完成，避免 filesort。"
+          "note": "建立 user_id、status、created_at 联合索引，等值过滤和排序尽量沿同一棵 B+Tree 完成，避免 filesort。"
         },
         {
           "line": 6,
-          "note": "查询列 user_id、status、created_at 全部在索引中，触发覆盖索引，Extra 显示 Using index，无需回表。"
+          "note": "查询列 user_id、status、created_at 全在索引中，触发覆盖索引，Extra 显示 Using index，无需回表。"
         },
         {
           "line": 12,
-          "note": "SELECT * 需要非索引列，无法覆盖；status LIKE 'PA%' 不满足最左前缀精确匹配但可下推，Extra 显示 Using index condition。"
+          "note": "SELECT * 需要非索引列，无法覆盖；status LIKE 'PA%' 不满足最左前缀精确匹配但可下推到索引层过滤，Extra 显示 Using index condition。"
         },
         {
           "line": 17,
-          "note": "created_at 是范围条件，key_len 应为 90（bigint 8 + varchar(20) 82），说明 user_id 和 status 用上索引，created_at 用于范围扫描但不计入 key_len 精确匹配。"
+          "note": "created_at > '2025-01-01' 是范围条件，key_len=90（bigint 8 + varchar(20)*4+2=82）说明 user_id 和 status 用上索引精确匹配，created_at 用于范围扫描但不计入 key_len。"
+        }
+      ]
+    },
+    {
+      "type": "code",
+      "title": "索引失效场景与 EXPLAIN 验证",
+      "language": "sql",
+      "content": "-- 场景 1：隐式类型转换导致索引失效\n-- phone 是 varchar 列，用数字查询会触发 CAST，索引失效\nEXPLAIN SELECT * FROM users WHERE phone = 13800000000;\n-- 修复：用字符串查询\nEXPLAIN SELECT * FROM users WHERE phone = '13800000000';\n\n-- 场景 2：函数运算导致索引失效\nEXPLAIN SELECT * FROM orders WHERE YEAR(created_at) = 2025;\n-- 修复：改为范围条件\nEXPLAIN SELECT * FROM orders\nWHERE created_at >= '2025-01-01' AND created_at < '2026-01-01';\n\n-- 场景 3：前导模糊匹配导致索引失效\nEXPLAIN SELECT * FROM products WHERE name LIKE '%abc';\n-- 后缀模糊匹配可以走索引\nEXPLAIN SELECT * FROM products WHERE name LIKE 'abc%';",
+      "highlights": [
+        {
+          "line": 2,
+          "note": "varchar 列用数字查询，MySQL 对列做 CAST 转换，等价于函数运算，索引失效。"
+        },
+        {
+          "line": 7,
+          "note": "对索引列做 YEAR() 函数，无法利用 B+ 树有序性定位，改为范围条件可走索引。"
+        },
+        {
+          "line": 12,
+          "note": "前导模糊 LIKE '%abc' 无法利用索引有序性；后缀模糊 LIKE 'abc%' 可以走索引范围扫描。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "MySQL 索引我会从 B+ 树结构出发，串起聚簇/二级索引、回表、ICP 和联合索引排序规则。\n\n**30 秒结论**：InnoDB 用 B+ 树组织索引，聚簇索引叶子存整行、二级索引叶子存主键；二级索引查询可能需要回表，覆盖索引和 ICP 是两种减少回表的关键优化；联合索引按字段顺序排序，最左前缀和范围条件决定能用到的列。\n\n**机制要点**：\n1. B+ 树非叶子节点只做导航，叶子节点有序且双向链表连接，千万级数据通常 3 层，2 次磁盘 IO 即可定位\n2. 优化器根据统计信息估算成本选择索引，`EXPLAIN` 的 type、key、key_len、rows、Extra 是判断执行路径的核心字段\n3. ICP（MySQL 5.6+）把 WHERE 中索引列条件下推到存储引擎层过滤，Extra 显示 `Using index condition`，减少回表次数\n4. 覆盖索引让查询列全在索引中，Extra 显示 `Using index`，完全避免回表\n5. 联合索引 `(a,b,c)` 逐级排序，等值条件连续定位，范围条件之后的列无法继续精确匹配\n\n**边界与追问应对**：\n- 索引不是越多越好：每个索引增加写入维护成本和页分裂风险，索引列过多还会导致单页行数减少、树变高\n- 命中索引不一定快：如果回表行数多、选择性差，优化器可能选全表扫描，看 `EXPLAIN` 的 rows 和 type 判断\n- 线上排查慢查询：先 EXPLAIN 看 type 是否 ALL、Extra 是否 Using filesort/Using temporary、rows 是否远超预期，再决定加索引还是改写 SQL",
+      "content": "MySQL 索引我会从 B+ 树结构出发，串起聚簇索引与二级索引的叶子差异、回表成本、覆盖索引和 ICP 优化、联合索引排序规则。\n\n**30 秒结论**：InnoDB 用 B+ 树组织索引，非叶子节点导航、叶子节点有序且双向链表连接，千万级表通常 3 层只需 2 次磁盘 IO。聚簇索引叶子存整行，二级索引叶子存索引列 + 主键，命中非索引列需要回表（随机 IO）。覆盖索引和 ICP 是两种减少回表的机制；联合索引按字段顺序逐级排序，等值条件连续匹配、范围条件截断后续列。\n\n**机制主线**：\n1. B+ 树为什么适合磁盘：每层一次页读取，非叶子节点只存导航项，叶子节点有序双向链表支持范围扫描\n2. 聚簇索引 vs 二级索引：叶子节点存整行 vs 存索引列 + 主键，一张表只有一个聚簇索引\n3. 回表成本：二级索引按索引列排序，主键值不连续，回表是随机 IO；行数多时优化器可能选全表扫描\n4. 覆盖索引：查询列全在索引中，Extra 显示 Using index，完全避免回表\n5. ICP（MySQL 5.6+）：索引列条件下推到存储引擎层过滤，Extra 显示 Using index condition，减少回表行数\n6. 联合索引排序：逐级排序，最左前缀连续匹配，范围条件截断后续列，key_len 验证实际用了几列\n7. 优化器成本决策：选择性、回表代价、隐式类型转换、函数运算都会影响索引选择\n\n**追问边界**：\n- 索引越多写入成本越高：每个索引是独立 B+ 树，INSERT/UPDATE/DELETE 要维护所有索引，还可能触发页分裂\n- EXPLAIN 是排查工具：type（ALL/ref/range）、key、key_len、rows、Extra 是核心字段\n- MySQL 8.0 索引跳跃扫描：前导列基数低时可跳过，但不是所有场景都适用",
       "followUpQuestions": [
         {
-          "question": "线上一条查询突然变慢，你怀疑是索引没生效，怎么排查？",
-          "answer": "第一步 EXPLAIN 看 type 是否退化成 ALL、key 是否为 NULL、rows 是否远超预期。第二步检查是否有隐式类型转换（如 varchar 列用数字查）、函数运算、前导模糊匹配导致索引失效。第三步看 Extra 是否出现 Using filesort 或 Using temporary，判断是否需要调整索引或改写 SQL。第四步检查统计信息是否过期（ANALYZE TABLE），优化器基于采样估算可能选错索引。"
+          "question": "线上一条查询突然变慢，你怀疑索引没生效，怎么排查？",
+          "answer": "第一步 EXPLAIN 看 type 是否退化成 ALL、key 是否为 NULL、rows 是否远超预期。第二步检查是否有隐式类型转换（如 varchar 列用数字查）、函数运算、前导模糊匹配导致索引失效。第三步看 Extra 是否出现 Using filesort 或 Using temporary，判断是否需要调整索引或改写 SQL。第四步用 `ANALYZE TABLE` 刷新统计信息，优化器基于采样估算可能选错索引。"
         },
         {
           "question": "索引下推（ICP）具体在什么场景下有效，什么场景下无效？",
-          "answer": "ICP 对联合索引中不满足最左前缀精确匹配但能用索引列做过滤的条件有效，比如 `(a,b)` 上 `WHERE a=? AND b LIKE '%xx%'`，LIKE 无法精确匹配但可在索引层先过滤 b 再回表。ICP 无效的场景：条件不涉及索引列（无法在索引层判断）、查询本身就是覆盖索引（不需要回表，下推无意义）、条件是 JOIN 的 ON 子句中驱动表的过滤（部分版本限制）。Extra 列出现 Using index condition 即表示 ICP 生效。"
+          "answer": "ICP 有效：联合索引中不满足最左前缀精确匹配但索引列可做过滤的条件，如 `(a,b)` 上 `WHERE a=? AND b LIKE '%xx%'`，LIKE 无法精确匹配但可在索引层先过滤 b 再回表。ICP 无效：条件不涉及索引列（无法在索引层判断）、查询本身就是覆盖索引（不需要回表，下推无意义）。Extra 出现 Using index condition 表示 ICP 生效。"
         },
         {
-          "question": "联合索引 (a,b,c)，下面哪些查询能用索引？`WHERE a=? AND c=?`、`WHERE b=? AND c=?`、`WHERE a=? AND b>? AND c=?`",
-          "answer": "第一个 `a=? AND c=?`：a 走索引精确匹配，c 无法直接用索引定位（中间跳过 b），但如果 c 是索引列且开启了 ICP，可以在索引层过滤 c。第二个 `b=? AND c=?`：不满足最左前缀，无法使用该联合索引（除非有 index merge 或优化器选择其他索引）。第三个 `a=? AND b>? AND c=?`：a 等值匹配走索引，b 范围匹配走索引，但 b 是范围条件后 c 无法继续用于索引精确定位，同样 ICP 可能在索引层过滤 c。key_len 能反映实际用到几列。"
+          "question": "联合索引 (a,b,c)，`WHERE a=? AND c=?`、`WHERE b=? AND c=?`、`WHERE a=? AND b>? AND c=?` 分别能用到索引的哪些列？",
+          "answer": "`a=? AND c=?`：a 走索引精确匹配，c 跳过 b 无法直接用索引精确定位，但 ICP 可能在索引层过滤 c。`b=? AND c=?`：不满足最左前缀，无法使用该联合索引（除非有其他索引或 index merge）。`a=? AND b>? AND c=?`：a 等值走索引，b 范围走索引，但范围之后 c 无法用于精确匹配，ICP 可能过滤 c。key_len 能验证实际用到几列。"
+        },
+        {
+          "question": "为什么有时候优化器会选择全表扫描而不是使用索引？",
+          "answer": "优化器基于成本估算决策：当索引选择性差（如 gender 列只有两个值，命中一半数据）、回表行数很多（每一行都是随机 IO）、或者统计信息过期导致估算偏差时，使用索引 + 回表的总成本可能超过顺序读全表。EXPLAIN 的 type=ALL 和 rows 接近表总行数说明走了全表扫描。"
         }
       ]
     },
@@ -178,27 +238,28 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "B+ 树非叶子节点导航、叶子节点有序双向链表的结构与磁盘页关系",
-        "聚簇索引叶子保存整行、二级索引叶子保存主键值的区别",
-        "回表是按主键到聚簇索引的随机 IO，覆盖索引如何避免回表",
-        "ICP 索引下推如何减少回表次数，Extra 中 Using index condition 的含义",
-        "联合索引逐级排序规则，等值/范围条件对索引列使用的影响",
-        "EXPLAIN 中 type、key、key_len、rows、Extra 各字段的含义和判断方法",
-        "索引设计要结合选择性、查询模式、排序分组和写入频率做取舍"
+        "B+ 树非叶子节点导航、叶子节点有序双向链表的结构，为什么适合磁盘场景",
+        "聚簇索引叶子存整行、二级索引叶子存索引列 + 主键的区别，一张表为什么只有一个聚簇索引",
+        "回表是按主键到聚簇索引的随机 IO，行数多时优化器可能放弃索引",
+        "覆盖索引如何完全避免回表，EXPLAIN 的 Using index 标识",
+        "ICP 如何在索引层减少回表行数，Using index condition 的含义",
+        "联合索引逐级排序规则，等值条件连续匹配、范围条件截断后续列的原理",
+        "EXPLAIN 的 type、key、key_len、rows、Extra 各字段含义和判断方法",
+        "索引设计要权衡查询频率、选择性、排序分组需求和写入维护成本"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "database.mysql-core.mysql-index.recall.1",
-      "prompt": "请讲清楚 InnoDB 一次二级索引查询从定位到回表的过程。",
+      "prompt": "请讲清楚 InnoDB 一次二级索引查询从定位叶子节点到回表的完整过程，以及回表为什么是随机 IO。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "database.mysql-core.mysql-index.recall.2",
-      "prompt": "联合索引最左前缀为什么成立？范围条件会带来什么影响？",
+      "prompt": "联合索引 (a,b,c) 的排序规则是什么？为什么最左前缀成立？范围条件会带来什么影响？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -209,31 +270,47 @@
       "mode": "text",
       "expectedMinutes": 5,
       "difficulty": 4
+    },
+    {
+      "id": "database.mysql-core.mysql-index.recall.4",
+      "prompt": "覆盖索引和索引下推（ICP）分别解决什么问题？它们在什么场景下有效，什么场景下无效？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "database.mysql-core.mysql-index.recall.5",
+      "prompt": "为什么优化器有时候会放弃索引而选择全表扫描？举出至少三种导致索引失效的场景。",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
     }
   ],
   "rubric": {
     "mustHave": [
-      "B+ 树有序结构",
-      "聚簇索引叶子保存整行",
-      "二级索引叶子保存主键",
-      "能说明「回表」在「MySQL 索引原理」里的作用和判断标准"
+      "能解释 B+ 树非叶子节点导航、叶子节点有序双向链表的结构与磁盘页访问的关系",
+      "能区分聚簇索引叶子存整行和二级索引叶子存索引列 + 主键的差异",
+      "能说明回表是按主键到聚簇索引的随机 IO，以及行数多时优化器可能放弃索引",
+      "能解释联合索引逐级排序规则和范围条件截断后续列的原理"
     ],
     "goodToHave": [
-      "选择性和基数",
-      "页分裂和写入成本",
-      "索引下推和覆盖索引取舍"
+      "能说明覆盖索引如何避免回表和 Using index 标识",
+      "能解释 ICP 索引下推的生效条件和 Using index condition",
+      "能用 key_len 验证联合索引实际用了几列",
+      "能说明索引失效的常见场景（隐式类型转换、函数运算、前导模糊匹配）"
     ],
     "commonMistakes": [
-      "索引越多越好",
-      "命中索引就一定快",
-      "只背最左前缀不解释排序结构"
+      "以为索引越多查询越快，忽略写入维护成本和页分裂",
+      "以为命中索引就一定比全表扫描快，忽略回表随机 IO 和选择性",
+      "只背最左前缀口诀，不能解释逐级排序的底层结构",
+      "不理解范围条件截断，以为 (a,b,c) 上 a>1 AND c=3 能用 b 和 c 精确定位"
     ],
     "scoreWeights": {
-      "coverage": 30,
-      "accuracy": 25,
+      "coverage": 25,
+      "accuracy": 30,
       "interviewExpression": 20,
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

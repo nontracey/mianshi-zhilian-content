@@ -4,7 +4,7 @@
   "category": "tcp-udp",
   "group": "tcp-udp",
   "title": "TCP 可靠传输机制",
-  "summary": "理解 TCP 用字节序号、累积 ACK、接收缓冲、RTO/Karn、快速重传、SACK 与流控/拥塞窗口构建可靠传输闭环，能解释丢包、乱序、重复、损坏四类异常如何被发现与修复。",
+  "summary": "TCP 可靠传输由字节序号、累积 ACK、接收缓冲、RTO/Karn、快速重传、SACK 与流控/拥塞窗口组成闭环，分别应对丢包、乱序、重复、损坏四类异常；关键设计取舍在于 RTO 动态估算与 Karn 消歧、dup-ACK 阈值过滤乱序、SACK 在高 BDP 链路上减少无效重传、以及 Nagle 与延迟 ACK 的互锁风险。",
   "tags": [
     "TCP",
     "可靠传输",
@@ -13,27 +13,42 @@
     "SACK"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 22,
+  "estimatedMinutes": 32,
   "order": 30,
   "recommendWeight": 90,
   "learningCards": [
     {
       "type": "explain",
-      "title": "字节流编号 + 累积 ACK：TCP 凭什么算可靠",
-      "content": "## 可靠的四个目标\nTCP 的可靠不是“一定送到”，而是“要么按序、不重、不损坏地交付给应用，要么在持续失败后让连接报错”。它要同时处理四类异常：丢包靠 RTO/快速重传恢复，乱序靠接收缓冲等待缺口，重复靠序号去重，损坏靠首部+伪首部+数据校验和发现后丢弃。\n\n## 字节流编号与累积 ACK\nTCP 把应用写入的数据看成连续字节流，每个字节都有 32 位序号；连接建立时的 ISN 由实现按 RFC 6528 思路生成，用来降低旧连接报文混入新连接的概率。报文头里的 seq 是本段第一个字节的序号，ack 是“接收方下一个期望收到的字节序号”，也就是累积 ACK：发 ack=1001 等价于“1000 之前我都收齐了”。\n\n累积 ACK 的好处是 ACK 丢一两个不会立即触发重传——只要后面更大的 ACK 到达就把前面一起确认掉了；代价是它只能表达最左侧缺口，不能告诉发送方“我已经收到了后面的乱序区间”。SACK 不是按序交付机制，它是接收方给发送方的缺口地图，让发送方少重传已经收到的乱序数据。\n\n## 校验和只发现损坏，不负责恢复\nTCP 校验和覆盖伪首部 + TCP 头 + 数据，能发现传输中位翻转或长度错误，校验失败的报文会被丢弃，不发 RST、不发 NAK。真正的恢复仍然依赖“发送方等不到 ACK 或看到重复 ACK → 重传”这条主线，所以校验和是可靠闭环里的检测环节，不是独立恢复机制。"
+      "title": "字节流编号 + 累积 ACK：TCP 可靠性的基石",
+      "content": "TCP 把应用数据视为连续字节流，每个字节都有 32 位序号。连接建立时的 ISN 由实现按 RFC 6528 的思路随机生成，降低旧连接残余报文混入新连接的概率。报文头里的 seq 是本段第一个字节的序号，ack 是「接收方下一个期望收到的字节序号」——这就是累积 ACK 的语义。\n\n累积 ACK 意味着发送 ack=1001 等价于「序号 1000 之前（含）我都收齐了」。ACK 丢失一两个不会立即触发重传：只要后续更大的 ACK 到达，前面的数据就被一并确认。代价是它只能表达最左侧缺口——窗口内多段丢失时，发送方只知道「哪个字节之前我还缺」，不知道后面的乱序区间已经收到了什么。SACK 正是为弥补这个信息缺口而设计。\n\n接收缓冲是可靠性的另一块拼图：乱序到达的段先暂存在缓冲区，等缺口段补齐后才能按序交付给应用层。序号去重则处理重复报文——接收方用序号判断该段是否已确认过，重复的直接丢弃。校验和覆盖伪首部 + TCP 头 + 数据，能发现传输中的位翻转或长度错误，失败的报文被静默丢弃（不发 RST、不发 NAK），真正的恢复仍依赖重传机制。所以校验和是闭环里的检测环节，不是独立恢复手段。"
     },
     {
       "type": "explain",
-      "title": "RTO/Karn + 快速重传 + SACK：丢包到底怎么补",
-      "content": "## RTO 怎么算（RFC 6298）\n发送方为未确认数据维护重传定时器 RTO。RTO 不是固定值，而是基于 RTT 测量动态估算：\n\n- 第一次测量：SRTT=R，RTTVAR=R/2，RTO=SRTT+max(G, 4·RTTVAR)\n- 后续测量：RTTVAR=(1-β)·RTTVAR+β·|SRTT-RTT_sample|，β=1/4；SRTT=(1-α)·SRTT+α·RTT_sample，α=1/8\n- RTO=SRTT+max(G, 4·RTTVAR)；RFC 6298 要求计算值小于 1s 时向上取到 1s，实现可以更保守，具体 Linux 行为以当前内核为准\n\nRTO 触发后会重传并指数退避。RFC 6298 允许实现设置最大 RTO，但最大值至少应为 60s；Linux 的 `tcp_retries2` 默认 15，对应文档里的理论下界约 924.6s，实际断开点取决于 RTO 演进和相关 sysctl。\n\n## Karn 算法：重传过的段不能轻易更新 RTT\nKarn 规则解决一个歧义：如果一个段重传过，后来收到 ACK，你不知道这个 ACK 对应原始段还是重传段，RTT 估算会被污染。所以没有 TCP timestamp 等可消歧信息时，重传段不参与 SRTT 更新；RTO 退避后的保守值会保留，直到收到未重传数据的 ACK 再重新估算。这条规则让 RTO 在持续丢包场景下不被误降。\n\n## 快速重传：用重复 ACK 提前发现缺口\n当中间某段丢失但后续段到达时，接收方不能推进累积 ACK，只能反复回同一个 ACK 指向缺口序号。发送方收到 3 个 duplicate ACK（RFC 5681）通常可以判断不是轻微乱序，而是真有缺口，于是不等 RTO 到期就重传缺口段。快速恢复会按拥塞控制算法降低发送速率；在 Reno/NewReno 语境里常说把窗口降到约一半，而 RTO 超时通常更重，会回到慢启动。\n\n## SACK：让发送方知道哪些“岛”已收到\n纯累积 ACK 在一个窗口内多段丢失时，只能告诉发送方最左侧缺口。SACK（RFC 2018，TCP 选项 kind=5）在 ACK 里附加已收到的 (left, right) 区间，让发送方维护 scoreboard，只重传缺口而不是盲目重发所有后续数据。受 TCP 选项空间限制，一个 ACK 常见能携带 3-4 个 SACK block；Linux `tcp_sack` 默认开启，高 BDP + 多丢包链路关闭 SACK 会明显放大恢复成本。\n\n## 延迟 ACK 与 Nagle 的相互作用\n接收方可能延迟 ACK 来减少 ACK 流量，RFC 5681 要求 ACK 至少覆盖每两个 full-sized segment 且延迟不能超过 0.5s；很多系统的实际延迟窗口更短，但不是跨平台固定常数。发送方的 Nagle 算法会在有未确认小包时暂缓继续发送小包。两者叠加时，写一点、等响应、再写一点的交互式协议可能出现百毫秒级卡顿。处理思路是抓包确认小包与 ACK 间隔，再在发起小包的一侧设置 TCP_NODELAY；Linux 的 TCP_QUICKACK 可临时催 ACK，但不是粘性开关。"
+      "title": "RTO 估算、Karn 算法与指数退避",
+      "content": "发送方为每个未确认的最老数据维护重传定时器 RTO。RTO 不是固定值，而是基于 RTT 测量动态估算，公式来自 RFC 6298：\n\n首次测量：SRTT = R，RTTVAR = R/2，RTO = SRTT + max(G, 4·RTTVAR)\n后续测量：RTTVAR = (1-β)·RTTVAR + β·|SRTT - RTT_sample|（β = 1/4）；SRTT = (1-α)·SRTT + α·RTT_sample（α = 1/8）；RTO = SRTT + max(G, 4·RTTVAR)\n\nRFC 6298 要求计算值小于 1 秒时向上取到 1 秒。实现可以更保守，但不应比这更激进。RTO 触发后重传最老未确认数据，RTO 值翻倍——这就是指数退避。RFC 6298 允许实现设置最大 RTO，但至少应为 60 秒。Linux 的 `tcp_retries2` 默认 15，控制的是重传次数上限而非固定秒数；实际断开时间取决于 RTO 演进过程，理论下界约 924.6 秒，但真实行为与 sysctl 配置和内核版本相关，不要背固定数字。\n\nKarn 算法解决一个关键歧义：如果一个段被重传过，收到的 ACK 你分不清是对原始段还是重传段的确认——用它更新 RTT 会污染估算，RTO 可能在持续丢包下被错误拉低，导致更频繁的无效重传。所以没有 TCP timestamp 等消歧机制时，重传段的 ACK 不参与 SRTT/RTTVAR 更新。退避后的保守 RTO 会保留，直到收到未重传数据的 ACK 才重新估算。这个规则让 RTO 在丢包场景下保持保守。"
+    },
+    {
+      "type": "explain",
+      "title": "快速重传：用重复 ACK 提前暴露缺口",
+      "content": "当中间某段丢失但后续段正常到达时，接收方无法推进累积 ACK——缺口后面的数据都暂存接收缓冲，但 ACK 只能指向缺口起始序号。每收到一个乱序段，接收方都会重发一次相同的 ACK（duplicate ACK）。\n\n发送方收到 3 个 duplicate ACK（RFC 5681）后判断这不太可能是轻微乱序，而是真有缺口，于是不等 RTO 到期就重传缺口段。阈值选 3 是在及时修复和避免误判之间取平衡：网络中后发段先到是常见的轻微乱序，会产生 1-2 个 dup-ACK 但缺口段很快到达；设为 1 或 2 会制造大量无谓重传和拥塞降速。设太高又会退化成等 RTO。\n\n快速重传后进入快速恢复：在 Reno/NewReno 语境下，窗口通常降到约一半（具体取决于拥塞控制算法的实现）；而 RTO 超时被认为更严重的拥塞信号，通常直接回到慢启动、窗口降到 1 MSS。现代 Linux 还有 RACK（RFC 8985）和 TLP（尾丢包探测）作为补充：RACK 基于时间戳和 ACK/SACK 进展判断丢包，对尾丢包、小窗口等 dup-ACK 不足的场景更友好；TLP 在无进展时主动发探测段触发 ACK，避免等完整 RTO。"
+    },
+    {
+      "type": "explain",
+      "title": "SACK：让发送方知道哪些乱序「岛」已收到",
+      "content": "纯累积 ACK 在一个窗口内多段丢失时，只能告诉发送方最左侧缺口在哪。发送方被迫要么重传缺口后所有数据（浪费带宽），要么每收到新 ACK 只补一个缺口（恢复慢，每个缺口至少多等一个 RTT）。\n\nSACK（RFC 2018，TCP 选项 kind=5）在 ACK 报文里附加已收到的 (left, right) 区间，让发送方维护一个 scoreboard：标记哪些字节范围已被确认，只重传真实缺口。受 TCP 选项空间限制（最多 40 字节，减去 timestamp 等其他选项占用），一个 ACK 通常能携带 3-4 个 SACK block，每个 block 占 8 字节。\n\n高 BDP（带宽×延迟）+ 多丢包的链路上 SACK 价值最大：窗口大意味着窗口内可能同时有多个缺口，没有 SACK 就得逐个缺口逐 RTT 恢复，吞吐会塌。Linux `tcp_sack` 默认开启，关闭通常只应在排查老防火墙或中间盒兼容问题时作为临时动作。高 BDP + 多丢包链路关闭 SACK 后恢复成本会明显放大。"
+    },
+    {
+      "type": "explain",
+      "title": "延迟 ACK 与 Nagle 的互锁：交互式小包卡顿",
+      "content": "接收方可能延迟 ACK 来减少纯 ACK 报文的流量开销。RFC 5681 要求 ACK 至少覆盖每两个 full-sized segment，且延迟不超过 0.5 秒；实际系统中延迟窗口更短（Linux 约 40ms），但不是跨平台固定常数，排查时要以抓包实测为准。\n\n发送方的 Nagle 算法会在有未确认小包时暂缓继续发送小包，等到 ACK 到达或攒够一个 MSS 再发。两者叠加就可能形成互锁：发送方发了一个小包，等 ACK 才敢发下一个；接收方又在延迟 ACK，等更多数据或超时才回；双方互相等待，出现百毫秒级卡顿。\n\n典型症状是 SSH 输入一格字符卡 200ms、Redis 单连接 pipeline 延迟抖动。抓包特征是：小包发出后 ACK 稳定晚到一个延迟窗口（不同系统实测不同），期间没有新数据上路。处理思路：在发起小包的一侧设置 TCP_NODELAY 关闭 Nagle；Linux 上可以临时用 TCP_QUICKACK 催 ACK，但它不是粘性开关，应用每次 recv 后可能需要重新设置，不适合当长期协议设计。延迟 ACK 和 Nagle 的配合行为在不同系统上有差异，排查结论要基于抓包。"
     },
     {
       "type": "diagram",
       "title": "丢包恢复闭环：累积 ACK、dup-ACK、RTO 与 SACK scoreboard",
       "format": "svg",
       "content": "assets/diagrams/network-tcp-reliable-recovery.svg",
-      "caption": "用一个 seg2 丢失的时间线展示：累积 ACK 为什么停在缺口、dup-ACK 如何触发快速重传、SACK 如何告诉发送方哪些乱序区间已收到。",
-      "fallback": "发送方发 seg1..seg5，seg2 丢失。接收方收到 seg3..seg5 后不能推进 ACK，只能持续回 ACK=seg2.start，并用 SACK 标出已收到的 seg3..seg5。发送方收到 3 个 dup-ACK 可快速重传 seg2；如果一直没有 ACK 进展则等 RTO 到期重传并指数退避。",
+      "caption": "用 seg2 丢失的时间线展示：累积 ACK 为什么停在缺口、dup-ACK 如何触发快速重传、SACK 如何告诉发送方哪些乱序区间已收到、RTO 超时作为兜底。",
+      "fallback": "发送方发 seg1..seg5，seg2 丢失。接收方收到 seg3..seg5 后不能推进 ACK，只能持续回 ACK=seg2.start，并用 SACK 标出已收到的 seg3..seg5。发送方收到 3 个 dup-ACK 触发快速重传 seg2；如果 ACK 无进展则等 RTO 到期重传并指数退避。SACK scoreboard 让发送方只补缺口而不盲目重发。",
       "sources": [
         {
           "kind": "svg",
@@ -51,41 +66,49 @@
     },
     {
       "type": "compareTable",
-      "title": "三种重传策略 + 与 UDP 的差异",
-      "content": "| 维度 | 超时重传 | 快速重传 | SACK 辅助恢复 | UDP |\n| --- | --- | --- | --- | --- |\n| 触发条件 | RTO 到期仍无 ACK 进展 | 通常 3 个 duplicate ACK 指向同一缺口 | ACK 携带已收到的乱序区间 | 传输层不重传，丢包由应用层处理 |\n| 等待时延 | 至少等一个动态 RTO | 通常省掉一个 RTO，接近 ACK 反馈时间 | 与 ACK/快速重传配合，不单独触发发送 | 0（直接交给应用语义） |\n| 拥塞窗口反应 | 通常视为更重拥塞，回慢启动并指数退避 RTO | 进入快速恢复，窗口按算法降低 | 不直接决定 cwnd，只减少无效重传 | 无 TCP cwnd，应用/QUIC 自己控制 |\n| 重传范围 | 重传最左侧未确认数据，后续恢复较慢 | 先补第一个缺口 | 根据 scoreboard 只补真实缺口 | 不适用 |\n| 适用场景 | 严重丢包、尾丢包、ACK 断流 | 偶发中间段丢失且后续段仍到达 | 高 BDP、批量丢包、窗口里有多个缺口 | 实时音视频、DNS、QUIC 等自定义可靠性 |\n| 主要代价 | 延迟与吞吐冲击最大 | 可能误判乱序，且仍要降速 | TCP 选项占用 8-40 字节，依赖双方协商 | 应用要自己处理顺序、重传、拥塞与超时 |"
+      "title": "三种重传策略与 UDP 对比",
+      "content": "| 维度 | 超时重传 | 快速重传 | SACK 辅助恢复 | UDP |\n| --- | --- | --- | --- | --- |\n| 触发条件 | RTO 到期仍无 ACK 进展 | 通常 3 个 duplicate ACK 指向同一缺口 | ACK 携带已收到的乱序区间，配合快速重传或 RTO | 传输层不重传，丢包由应用层或 QUIC 处理 |\n| 等待时延 | 至少等一个动态 RTO（首次≥1s），退避后指数增长 | 通常省掉一个 RTO，接近 ACK 反馈时间 | 不单独触发发送，只减少无效重传次数 | 0（应用自定义） |\n| 拥塞窗口反应 | 更严重的拥塞信号：回慢启动，cwnd 降为 1 MSS | 进入快速恢复，cwnd 按算法降低（Reno 约半） | 不直接决定 cwnd，只减少盲目重传 | 无 cwnd，应用/QUIC 自己控制 |\n| 重传范围 | 重传最老未确认段，后续恢复较慢 | 先补第一个缺口 | 根据 scoreboard 只补真实缺口 | 不适用 |\n| 适用场景 | 严重丢包、尾丢包、ACK 断流 | 偶发中间段丢失且后续段仍到达 | 高 BDP、批量丢包、窗口内多个缺口 | 实时音视频、DNS、QUIC 等自定义可靠性 |\n| 主要代价 | 延迟与吞吐冲击最大 | 可能误判乱序（阈值 3 已大幅降低概率），仍要降速 | TCP 选项 8-40 字节，依赖双方协商开启 | 应用自己处理顺序、重传、拥塞、超时 |"
     },
     {
       "type": "code",
-      "title": "RTO 估算 + dup-ACK/SACK 决策（可运行单文件模拟）",
+      "title": "RTO 估算 + dup-ACK/SACK 决策模拟",
       "language": "java",
-      "content": "import java.util.ArrayList;\nimport java.util.List;\n\nclass TcpReliableDemo {\n    static final class Segment {\n        final long seq;\n        boolean retransmitted;\n\n        Segment(long seq) { this.seq = seq; }\n        void markRetransmitted() { retransmitted = true; }\n    }\n\n    static final class SackBlocks {\n        final List<long[]> blocks = new ArrayList<>();\n\n        static SackBlocks empty() { return new SackBlocks(); }\n\n        static SackBlocks of(long... bounds) {\n            SackBlocks sack = new SackBlocks();\n            for (int i = 0; i + 1 < bounds.length; i += 2) {\n                sack.blocks.add(new long[] { bounds[i], bounds[i + 1] });\n            }\n            return sack;\n        }\n\n        boolean covers(long seq) {\n            for (long[] block : blocks) {\n                if (seq >= block[0] && seq < block[1]) return true;\n            }\n            return false;\n        }\n    }\n\n    static final class Sender {\n        long srtt = -1;\n        long rttvar = 0;\n        long rto = 1000;\n        int dupAckCount = 0;\n        long highestAck = 0;\n        int cwndMss = 10;\n        boolean inFastRecovery = false;\n        final List<String> events = new ArrayList<>();\n\n        void onRttSample(long rttMs, boolean wasRetransmitted) {\n            if (wasRetransmitted) {\n                events.add(\"skip retransmitted RTT sample (Karn)\");\n                return;\n            }\n            if (srtt < 0) {\n                srtt = rttMs;\n                rttvar = rttMs / 2;\n            } else {\n                long oldSrtt = srtt;\n                rttvar = (3 * rttvar + Math.abs(oldSrtt - rttMs)) / 4;\n                srtt = (7 * srtt + rttMs) / 8;\n            }\n            rto = Math.max(1000, srtt + 4 * rttvar);\n            events.add(\"rto=\" + rto + \"ms\");\n        }\n\n        void onAck(long ackNum, SackBlocks sack) {\n            if (ackNum > highestAck) {\n                highestAck = ackNum;\n                dupAckCount = 0;\n                if (inFastRecovery) exitFastRecovery();\n                events.add(\"advance ack to \" + ackNum);\n                return;\n            }\n            if (ackNum == highestAck) {\n                dupAckCount++;\n                events.add(\"dupAck=\" + dupAckCount + \" for gap \" + ackNum);\n                if (dupAckCount == 3 && !inFastRecovery) {\n                    retransmit(ackNum, sack, \"fast retransmit\");\n                    cwndMss = Math.max(2, cwndMss / 2);\n                    inFastRecovery = true;\n                }\n            }\n        }\n\n        void onRtoTimeout(Segment seg) {\n            retransmit(seg.seq, SackBlocks.empty(), \"RTO timeout\");\n            cwndMss = 1;\n            rto = Math.min(rto * 2, 60_000);\n            seg.markRetransmitted();\n            events.add(\"backoff rto=\" + rto + \"ms, cwnd=\" + cwndMss + \" MSS\");\n        }\n\n        void retransmit(long seq, SackBlocks sack, String reason) {\n            if (sack != null && sack.covers(seq)) {\n                events.add(\"skip already SACKed seq=\" + seq);\n            } else {\n                events.add(reason + \": retransmit seq=\" + seq);\n            }\n        }\n\n        void exitFastRecovery() {\n            inFastRecovery = false;\n            events.add(\"exit fast recovery\");\n        }\n    }\n\n    public static void main(String[] args) {\n        Sender sender = new Sender();\n        sender.onRttSample(80, false);\n        sender.onAck(1200, SackBlocks.empty());\n        SackBlocks sack = SackBlocks.of(1400, 1600, 1600, 1800);\n        sender.onAck(1200, sack);\n        sender.onAck(1200, sack);\n        sender.onAck(1200, sack);\n        sender.onRttSample(90, true);\n        sender.onRtoTimeout(new Segment(1800));\n        sender.events.forEach(System.out::println);\n    }\n}",
+      "content": "import java.util.ArrayList;\nimport java.util.List;\n\nclass TcpReliableDemo {\n    static final class Segment {\n        final long seq;\n        boolean retransmitted;\n        Segment(long seq) { this.seq = seq; }\n        void markRetransmitted() { retransmitted = true; }\n    }\n\n    static final class SackBlocks {\n        final List<long[]> blocks = new ArrayList<>();\n        static SackBlocks empty() { return new SackBlocks(); }\n        static SackBlocks of(long... bounds) {\n            SackBlocks sack = new SackBlocks();\n            for (int i = 0; i + 1 < bounds.length; i += 2)\n                sack.blocks.add(new long[]{bounds[i], bounds[i + 1]});\n            return sack;\n        }\n        boolean covers(long seq) {\n            for (long[] b : blocks)\n                if (seq >= b[0] && seq < b[1]) return true;\n            return false;\n        }\n    }\n\n    static final class Sender {\n        long srtt = -1, rttvar = 0, rto = 1000;\n        int dupAckCount = 0, cwndMss = 10;\n        long highestAck = 0;\n        boolean inFastRecovery = false;\n        final List<String> events = new ArrayList<>();\n\n        void onRttSample(long rttMs, boolean wasRetransmitted) {\n            if (wasRetransmitted) {\n                // Karn 规则：重传段的 ACK 不更新 RTT，避免歧义\n                events.add(\"skip retransmitted RTT sample (Karn)\");\n                return;\n            }\n            if (srtt < 0) {\n                srtt = rttMs;\n                rttvar = rttMs / 2;\n            } else {\n                long oldSrtt = srtt;\n                rttvar = (3 * rttvar + Math.abs(oldSrtt - rttMs)) / 4;  // β=1/4\n                srtt = (7 * srtt + rttMs) / 8;                           // α=1/8\n            }\n            rto = Math.max(1000, srtt + 4 * rttvar);  // RFC 6298 下限 1s\n            events.add(\"rto=\" + rto + \"ms (srtt=\" + srtt + \", rttvar=\" + rttvar + \")\");\n        }\n\n        void onAck(long ackNum, SackBlocks sack) {\n            if (ackNum > highestAck) {\n                highestAck = ackNum;\n                dupAckCount = 0;\n                if (inFastRecovery) { inFastRecovery = false; events.add(\"exit fast recovery\"); }\n                events.add(\"advance ack to \" + ackNum);\n                return;\n            }\n            if (ackNum == highestAck) {\n                dupAckCount++;\n                events.add(\"dupAck=\" + dupAckCount + \" for gap \" + ackNum);\n                if (dupAckCount == 3 && !inFastRecovery) {\n                    // 第 3 个 dup-ACK 触发快速重传，cwnd 降约一半\n                    retransmit(ackNum, sack, \"fast retransmit\");\n                    cwndMss = Math.max(2, cwndMss / 2);\n                    inFastRecovery = true;\n                    events.add(\"enter fast recovery, cwnd=\" + cwndMss + \" MSS\");\n                }\n            }\n        }\n\n        void onRtoTimeout(Segment seg) {\n            retransmit(seg.seq, SackBlocks.empty(), \"RTO timeout\");\n            cwndMss = 1;                             // RTO 超时回到慢启动\n            rto = Math.min(rto * 2, 60_000);         // 指数退避，上限 60s\n            seg.markRetransmitted();\n            events.add(\"backoff rto=\" + rto + \"ms, cwnd=\" + cwndMss + \" MSS\");\n        }\n\n        void retransmit(long seq, SackBlocks sack, String reason) {\n            if (sack != null && sack.covers(seq)) {\n                events.add(\"skip already SACKed seq=\" + seq);\n            } else {\n                events.add(reason + \": retransmit seq=\" + seq);\n            }\n        }\n    }\n\n    public static void main(String[] args) {\n        Sender sender = new Sender();\n        sender.onRttSample(80, false);                          // 首次 RTT 采样\n        sender.onAck(1200, SackBlocks.empty());                 // 正常 ACK 推进\n        SackBlocks sack = SackBlocks.of(1400, 1600, 1600, 1800); // SACK 两个区间\n        sender.onAck(1200, sack);   // dup-ACK #1\n        sender.onAck(1200, sack);   // dup-ACK #2\n        sender.onAck(1200, sack);   // dup-ACK #3 → 触发快速重传\n        sender.onRttSample(90, true);                            // Karn：跳过重传样本\n        sender.onRtoTimeout(new Segment(1800));                  // RTO 超时 → 指数退避\n        sender.events.forEach(System.out::println);\n    }\n}",
       "highlights": [
         {
-          "line": 45,
-          "note": "RTO 估算只在未重传样本上更新；重传样本走 Karn 规则跳过，避免 ACK 归属歧义污染 RTT。"
+          "line": 36,
+          "note": "Karn 规则：重传段的 ACK 不更新 SRTT/RTTVAR，避免 RTT 被错误拉低。"
         },
         {
-          "line": 72,
-          "note": "第 3 个 duplicate ACK 触发快速重传；SACK block 只用来避免重传已收到区间，不是单独的拥塞信号。"
+          "line": 53,
+          "note": "第 3 个 dup-ACK 触发快速重传，cwnd 降约一半进入快速恢复。"
+        },
+        {
+          "line": 65,
+          "note": "RTO 超时回慢启动（cwnd=1），RTO 翻倍指数退避。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
-      "title": "30 秒结论 + 机制主线 + 边界追问",
-      "content": "30 秒结论：TCP 的可靠性是“字节序号 + 累积 ACK + 重传”撑起来的闭环——发送方按字节编号发送，接收方用 ACK 反馈下一个期望字节；丢包通过 RTO 或 duplicate ACK 触发重传，乱序先放接收缓冲等待缺口，重复靠序号丢弃，损坏靠校验和发现后丢弃再等重传。SACK、Karn、RACK/TLP、延迟 ACK、Nagle 都是在这条主线上做优化或权衡。\n\n机制主线：\n\n- 序号 + 累积 ACK：seq 定位字节边界，ACK 表示下一个期望字节，只推进连续前缀\n- 接收缓冲：乱序段可以先缓存，但只有缺口补齐后才能按序交付给应用\n- RTO + Karn：基于 SRTT 和 RTTVAR 估算 RTO；无消歧信息时，重传段不更新 RTT；RTO 后指数退避并按拥塞控制保守降速\n- 快速重传 + 快速恢复：3 个 dup-ACK 提前暴露缺口，通常省掉一个 RTO；窗口如何降取决于拥塞控制算法，Reno/NewReno 语境下常说降到约一半\n- SACK：ACK 选项携带已收到区间，让发送方用 scoreboard 只补真实缺口\n- 流控（rwnd）和拥塞控制（cwnd）共同决定可发送窗口，实际可发量受二者共同限制\n\n典型边界追问：为什么 dup-ACK 阈值是 3 而不是 1/2（过滤轻微乱序）；SSH/Redis 百毫秒卡顿怎么排查（抓包看小包、延迟 ACK 与 Nagle 互锁，再评估 TCP_NODELAY/TCP_QUICKACK）；Linux 长时间断网后多久应用感知（看 `tcp_retries2`、RTO 退避和业务超时，不要只背一个固定秒数）；UDP 上要做可靠传输怎么办（应用层或 QUIC 自己做序号、ACK、重传和拥塞控制，QUIC 的 packet number 不会像 TCP 序号那样在重传时复用）。",
+      "title": "面试回答思路",
+      "content": "**30 秒结论**\nTCP 可靠传输 = 字节序号定位 + 累积 ACK 反馈 + 重传修复。丢包靠 RTO/dup-ACK 触发重传，乱序靠接收缓冲等缺口，重复靠序号去重，损坏靠校验和丢弃后等重传。SACK 减少无效重传，Karn 防止 RTT 估算被污染，流控 rwnd 和拥塞 cwnd 共同限速。\n\n**机制主线**\n- 序号 + 累积 ACK：seq 定位字节边界，ACK = 下一个期望字节，只推进连续前缀\n- 接收缓冲：乱序段暂存，缺口补齐后按序交付\n- RTO + Karn：SRTT/RTTVAR 指数移动平均估算 RTO，≥1s 下限；重传段不更新 RTT 避免歧义；RTO 后指数退避\n- 快速重传 + 快速恢复：3 个 dup-ACK 提前暴露缺口，省一个 RTO；窗口降速（Reno 约半）；RTO 超时更重，回慢启动\n- SACK：ACK 选项携带已收区间，发送方 scoreboard 只补真实缺口，高 BDP 多丢包链路价值最大\n- 流控 + 拥塞：可发量 = min(rwnd, cwnd)，两个窗口共同限制发送速率\n\n**边界追问落点**\n- dup-ACK 阈值为什么是 3：过滤轻微乱序，太低误判，太高退化成等 RTO\n- SSH/Redis 百毫秒卡顿：Nagle + 延迟 ACK 互锁，抓包看小包与 ACK 间隔，TCP_NODELAY 关 Nagle\n- 断网多久应用感知：看 tcp_retries2 和 RTO 退避过程，不是固定秒数\n- 高 BDP 关 SACK 后吞吐塌：窗口大 + 多缺口，没有 SACK 得逐 RTT 逐缺口恢复\n- UDP 上做可靠传输：应用层或 QUIC 自己做序号、ACK、重传和拥塞控制",
       "followUpQuestions": [
         {
-          "question": "为什么快速重传的阈值是 3 个重复 ACK，不是 1 个或 2 个",
-          "answer": "网络里会有轻微乱序：后发的段先到时，接收方会因为左侧缺口发出 1-2 个 duplicate ACK，但缺口段稍后可能到达。RFC 5681 使用 3 个 duplicate ACK 作为快速重传门槛，是在及时修复和避免乱序误判之间取平衡：阈值太低会制造无谓重传和降速，阈值太高又会退化成等 RTO。现代 Linux 还有 RACK/TLP 作为补充，基于时间和 ACK/SACK 进展识别尾丢包、小窗口丢包等 dup-ACK 不足的场景。"
+          "question": "为什么快速重传的阈值是 3 个 dup-ACK，不是 1 或 2？",
+          "answer": "网络中后发段先到是常见轻微乱序，会产生 1-2 个 dup-ACK 但缺口段很快到达。设为 1 或 2 会频繁误判乱序为丢包，触发不必要的重传和拥塞降速。RFC 5681 用 3 作为门槛，在及时修复和避免误判之间取平衡。现代 Linux 还有 RACK/TLP 补充基于时间的丢包检测，对尾丢包等 dup-ACK 不足的场景更友好。"
         },
         {
-          "question": "线上 SSH 输入百毫秒级卡顿、Redis 单连接 QPS 上不去，你怎么定位",
-          "answer": "典型是 Nagle + 延迟 ACK 互锁：发送方有未确认小包时暂缓继续发小包，接收方又为了减少 ACK 流量延迟回复，形成对锁。抓包看小包发出后 ACK 是否稳定晚到一段时间，期间应用层又没有新数据上路；不同系统的延迟 ACK 不是固定 200ms，所以要以抓包为准。处理优先关掉发起小包那一侧的 Nagle（TCP_NODELAY），必要时在 Linux 上短暂使用 TCP_QUICKACK 催 ACK；QUICKACK 不是粘性开关，不能当长期协议设计。"
+          "question": "SACK 关闭后在什么链路上影响最大？为什么？",
+          "answer": "高 BDP（卫星链路、跨国长距、大窗口）+ 多丢包的链路。窗口大意味着窗口内可能同时有多个缺口，没有 SACK 时发送方只知道最左侧缺口，只能一个缺口一个 RTT 地恢复，或者盲目重传缺口后面所有数据。SACK 让发送方一次知道所有已收区间，只补真实缺口，恢复速度快得多。"
         },
         {
-          "question": "SACK 解决了什么问题？关闭 SACK 在什么链路上影响最大",
-          "answer": "纯累积 ACK 在一个窗口内丢多段时，只能告诉发送方最早缺口在哪，发送方很难一次性知道后面哪些乱序段已到达，恢复会变成一个 RTT 一个缺口或产生多余重传。SACK 在 ACK 选项里带 3-4 个常见的 (left,right) 区间（每个区间 8 字节，受 TCP 选项 40 字节上限约束），告诉发送方这些岛已经收到，发送方维护 scoreboard 后只补真实缺口。高 BDP（卫星、跨国、大窗口）+ 多丢包链路影响最大；Linux `tcp_sack` 默认开，关闭通常只应是排查老防火墙/中间盒兼容问题的临时动作。"
+          "question": "SSH 输入一格字符卡 200ms，怎么定位和解决？",
+          "answer": "典型是 Nagle + 延迟 ACK 互锁。发送方发了小包后有未确认数据，Nagle 暂缓后续小包；接收方又在延迟 ACK，双方互相等待。抓包特征：小包发出后 ACK 稳定晚到一个延迟窗口（Linux 约 40ms，不同系统实测不同），期间无新数据上路。解决：在发送小包的一侧设 TCP_NODELAY 关 Nagle；Linux 上可临时用 TCP_QUICKACK 催 ACK（非粘性开关，需每次 recv 后重设）。"
+        },
+        {
+          "question": "Karn 算法不遵守会怎样？",
+          "answer": "重传段的 ACK 看起来 RTT 很大（从原始发送到重传后 ACK 到达），但实际上你不知道 ACK 对应的是原始段还是重传段。如果用这个歧义样本更新 SRTT，会导致 RTTVAR 被拉大、RTO 被拉高——这在 RTT 突然变小时更危险，因为 RTO 可能被错误拉低（如果重传段 RTT 意外短），导致更频繁的无效重传。Karn 规则跳过重传样本，让 RTO 在丢包期间保持保守。"
         }
       ]
     },
@@ -93,27 +116,27 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释累积 ACK 的语义(下一个期望字节)，并说明接收缓冲、序号去重、按序交付如何配合",
-        "能写出 RTO 公式(SRTT + max(G, 4·RTTVAR)、RFC 6298 的 1s 下限)以及指数退避，并说出 Linux tcp_retries2 的作用",
-        "能说明 Karn 算法为什么禁止用重传段更新 RTT，以及它如何避免 RTO 被错误降低",
-        "能区分超时重传与快速重传的触发条件、拥塞控制反应和等待时延",
-        "能解释 SACK 选项的内容(常见 3-4 段已收区间)以及它相对纯累积 ACK 的优势场景",
-        "能说出 Nagle + 延迟 ACK 互锁的现象、抓包特征和 TCP_NODELAY/TCP_QUICKACK 的边界",
-        "能对比 TCP 的可靠传输和 UDP(无重传，需要应用层或 QUIC 自己做)"
+        "能解释累积 ACK 的语义（下一个期望字节），以及接收缓冲、序号去重、校验和如何配合实现可靠交付",
+        "能写出 RTO 公式 SRTT + max(G, 4·RTTVAR) 及指数退避，并说出 RFC 6298 的 1s 下限和 Linux tcp_retries2 的作用",
+        "能说明 Karn 算法为什么禁止用重传段更新 RTT，以及不遵守会导致 RTO 估算被污染",
+        "能区分超时重传与快速重传的触发条件、拥塞控制反应（慢启动 vs 快速恢复）和等待时延",
+        "能解释 SACK 选项的内容（3-4 个已收区间 block）以及高 BDP 多丢包链路关闭 SACK 后恢复变慢的原因",
+        "能说明 Nagle + 延迟 ACK 互锁的现象、抓包特征和 TCP_NODELAY/TCP_QUICKACK 的对策",
+        "能对比 TCP 可靠传输与 UDP（无重传，应用层或 QUIC 自己做）的差异"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "network.tcp-udp.topic-tcp-reliable.recall.1",
-      "prompt": "TCP 用哪几套机制分别应对“丢包、乱序、重复、损坏”这四类异常？给出每套机制的触发条件和恢复手段。",
+      "prompt": "TCP 用哪几套机制分别应对「丢包、乱序、重复、损坏」这四类异常？给出每套机制的触发条件和恢复手段。",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
     },
     {
       "id": "network.tcp-udp.topic-tcp-reliable.recall.2",
-      "prompt": "RTO 怎么算？为什么 Karn 算法规定重传过的段不能用来更新 RTT？如果不遵守会发生什么？",
+      "prompt": "RTO 怎么算？Karn 算法为什么禁止用重传段更新 RTT？如果不遵守会导致什么问题？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 3
@@ -135,10 +158,10 @@
   ],
   "rubric": {
     "mustHave": [
-      "字节流编号 + 累积 ACK 的语义(下一个期望字节)以及接收缓冲如何保证按序交付",
+      "字节流编号 + 累积 ACK 的语义（下一个期望字节）以及接收缓冲如何保证按序交付",
       "RTO = SRTT + max(G, 4·RTTVAR) + 指数退避，以及 Karn 算法禁止用不可消歧的重传段更新 RTT",
       "快速重传的 3 dup-ACK 触发阈值、快速恢复降速，与超时重传回慢启动的对比",
-      "SACK 选项的作用：让发送方维护已收到区间，只补真实缺口",
+      "SACK 选项的作用：让发送方维护已收到区间，只补真实缺口，高 BDP 多丢包链路价值最大",
       "校验和只发现损坏不负责恢复，丢弃后由重传机制兜底"
     ],
     "goodToHave": [
@@ -149,11 +172,11 @@
       "RACK 基于时间戳触发重传，对尾丢包和小窗口比 dup-ACK 更友好"
     ],
     "commonMistakes": [
-      "把校验和当成可靠传输的独立机制，忽略它必须配合重传才有效",
+      "把校验和当成可靠传输的独立恢复机制，忽略它必须配合重传才有效",
       "说快速重传等同于超时重传，分不清快速恢复降速和 RTO 后回慢启动的差别",
       "把 SACK 说成按序交付机制，或不知道纯累积 ACK 在多段丢包时只能暴露最左侧缺口",
       "把 dup-ACK 阈值说成 1 或 2，忽略网络轻微乱序需要靠 3 这个阈值过滤",
-      "讨论 SSH/Redis 卡顿时只想到 RTT 大，没想到 Nagle 和 delayed ACK 的相互作用，也不抓包验证具体延迟",
+      "讨论 SSH/Redis 卡顿时只想到 RTT 大，没想到 Nagle 和 delayed ACK 的相互作用，也不抓包验证",
       "用重传段的 ACK 去更新 RTT，导致 RTO 在持续丢包下被错误降低"
     ],
     "scoreWeights": {
@@ -163,11 +186,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "network.tcp-udp.topic-tcp-handshake"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "重点看候选人能否把字节序号、累积ACK、接收缓冲、RTO/Karn、快速重传、SACK、流控/拥塞这条主线串起来,并能用线上现象(交互式小包卡顿、SACK 关闭后多丢包恢复变慢、tcp_retries2 与业务超时共同影响断网感知)证明对机制边界的理解。"
+  "interviewerFocus": "重点看候选人能否把字节序号、累积 ACK、接收缓冲、RTO/Karn、快速重传、SACK、流控/拥塞这条主线串起来，并能用线上现象（交互式小包卡顿、SACK 关闭后多丢包恢复变慢、tcp_retries2 与业务超时共同影响断网感知）证明对机制边界的理解。"
 }

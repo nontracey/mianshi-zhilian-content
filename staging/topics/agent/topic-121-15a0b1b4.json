@@ -4,26 +4,26 @@
   "category": "embedding-retrieval",
   "group": "rag",
   "title": "向量数据库核心能力对比",
-  "summary": "对比 Flat、HNSW、IVF/PQ、pgvector、Milvus、Pinecone、Weaviate 等向量能力时，重点看索引取舍、过滤能力、更新成本、运维模型和评估指标。",
+  "summary": "对比向量数据库时，核心是理解索引类型（Flat/IVF/HNSW/PQ）在召回率、延迟、内存和构建成本之间的取舍，以及 metadata filter 执行时机、混合检索、增量更新、运维模型如何共同影响生产 RAG 的召回质量。",
   "tags": [
     "Agent",
     "向量数据库",
     "选型"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 25,
   "order": 20,
   "recommendWeight": 78,
   "learningCards": [
     {
       "type": "explain",
-      "title": "向量数据库核心能力对比：向量数据库的职责、常见索引",
-      "content": "## 向量数据库的职责\n向量数据库负责存储 embedding，并根据相似度快速找出候选文档。RAG 系统里它通常承担第一阶段召回，后面还会接 rerank、过滤和答案生成。\n\n## 常见索引\nFlat 精度最高但成本高；IVF 通过聚类缩小搜索范围；HNSW 用图结构在召回率和延迟之间取得较好平衡。不同数据库只是实现细节不同，核心取舍都是召回率、延迟、内存和构建成本。\n\n## 指标\n不要只看 QPS。向量检索还要看 recall@k、p95/p99 延迟、索引构建时间、增量更新成本和过滤条件下的召回稳定性。\n\n## 为什么需要混合检索\n纯向量检索擅长语义相似，但对精确关键词、编号、错误码、代码符号不一定稳定。BM25 或关键词检索可以补足精确匹配能力，因此生产 RAG 常用 hybrid retrieval。\n\n## Metadata Filter\n企业知识库通常要按租户、权限、时间、类型或业务线过滤。过滤发生在召回前、召回中还是召回后，会影响性能和召回质量。"
+      "title": "向量数据库在 RAG 里的位置和索引取舍",
+      "content": "向量数据库在 RAG 里负责第一阶段召回：把用户 query 的 embedding 和文档 embedding 做相似度比较，返回 topK 候选。后面通常还有 reranker 精排、metadata 过滤或业务规则过滤、最后才进 LLM 生成。所以选型不是选“最强的向量库”，而是让召回阶段的精度、延迟和成本匹配整条链路的预算。\n\n**Flat（暴力搜索）**\n逐一计算 query 到所有向量的距离，recall@k 接近 100%，延迟和数据量线性增长。适合小规模（几万到十几万）做基线，或者作为评估其他索引召回率的 ground truth。生产里直接用 Flat 扫几百万向量基本不可接受。\n\n**IVF（倒排文件索引）**\n先把所有向量做 k-means 聚类，每个聚类一个倒排桶。搜索时只扫描 nprobe 个最近的桶，延迟从 O(N) 降到 O(N/nprobe)，但聚类边界附近的向量容易被漏掉。nprobe 越大召回越高、延迟越高。IVF 的问题是高维向量聚类质量下降（维度灾难），百万级数据以上单机内存可能不够。\n\n**PQ（乘积量化）**\n把高维向量切成子空间分别量化，用码本压缩存储，大幅降低内存占用。IVF+PQ 组合可以支撑亿级向量的内存搜索，但量化损失会拉低召回率，需要配合 rerank 补偿。构建码本需要训练数据，增量更新成本较高（新数据分布变化大时码本可能失效）。\n\n**HNSW（分层可导航小世界图）**\n构建多层图，高层做粗粒度跳转，底层做精细搜索。在线查询时从高层入口点出发，贪心地往更近的邻居跳，直到收敛。HNSW 在大多数 benchmark 上召回率和延迟的平衡最好，但内存开销大（每个向量要存邻居指针），构建时间长，不支持高效的删除和更新（删除是软标记，频繁更新后图退化需要重建）。\n\n**核心取舍**：Flat 追求精度不计成本；IVF/PQ 用精度换内存和规模；HNSW 用内存换召回和延迟。没有“最佳索引”，只有匹配数据规模、QPS、内存预算和更新频率的索引。"
     },
     {
       "type": "explain",
-      "title": "向量数据库核心能力对比：Rerank、选型维度",
-      "content": "## Rerank\n第一阶段向量库负责快速找候选，reranker 负责更精细排序。面试里可以强调“两阶段检索”比单纯调大 topK 更可控。\n\n## 选型维度\n小规模、强一致场景可以优先选易运维方案；大规模、高并发场景要关注分片、压缩、冷热分层、备份恢复和多租户隔离。不要只按“哪个数据库最强”回答。\n\n## 调优路径\n先固定数据集和评测问题，再调 embedding 模型、chunk 粒度、索引参数、topK、过滤条件和 rerank。线上问题要分清是检索没召回、排序错了，还是生成阶段没用对上下文。\n\n## 常见故障\n新增文档未入索引、embedding 版本不一致、metadata 过滤过严、topK 太小、chunk 过碎或过长，都会让答案看起来像“模型不会”。"
+      "title": "Metadata Filter、混合检索和增量更新",
+      "content": "**Metadata Filter 执行时机**\n企业场景几乎都要按租户、权限、时间、文档类型或业务线过滤。过滤时机直接影响召回质量：\n- **后过滤（Post-filter）**：先按向量召回 topK，再过滤 metadata。问题是最终返回数量可能不足 topK，极端情况下全部被过滤掉，用户看到空结果。\n- **前过滤（Pre-filter）**：先过滤出候选集，再做向量搜索。召回率有保障，但候选集可能很大导致扫描慢，或者候选集太小导致向量搜索精度不够。\n- **内过滤（In-filter / 索引内过滤）**：索引结构本身支持过滤，比如 Milvus 的分区裁剪、Qdrant 的 payload index、Weaviate 的倒排索引。理想方案，但不同数据库实现成熟度不同，复杂组合查询时性能下降明显。\n\n**混合检索（Hybrid Retrieval）**\n纯向量检索对精确关键词、编号、错误码、代码符号、人名缩写容易漏召回或误召回。生产 RAG 通常做 dense retrieval（向量）+ sparse retrieval（BM25/关键词）的融合，融合方式包括 RRF（Reciprocal Rank Fusion）、加权 score 线性组合、或者两路分别召回 topN 再合并去重。Milvus 2.4+ 原生支持 sparse vector，Elasticsearch 8.x 的 kNN search 可以和 BM25 在同一查询里混合评分，pgvector 需要自己拼 SQL 联合检索。\n\n**增量更新成本**\nHNSW 删除是软标记，频繁删除后图碎片化，recall 下降，需要定期 rebuild。IVF 的聚类中心固定，新数据如果分布偏移大，需要重新训练聚类（重建索引）。PQ 码本同理。Flat 和 IVFFlat 的更新成本相对低（追加即可，reindex 可以后台做）。选型时如果文档是高频增量写入（比如实时日志、流式数据），要重点评估索引的写入吞吐和重建窗口。"
     },
     {
       "type": "diagram",
@@ -45,37 +45,54 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 对比项 | Milvus | Pinecone | ChromaDB | pgvector |\n| --- | --- | --- | --- | --- |\n| 类型 | 分布式 | 云服务 | 嵌入式 | PostgreSQL扩展 |\n| 索引支持 | HNSW/IVF/Flat | 自研 | Flat/HNSW | IVFFlat/HNSW |\n| 部署方式 | 自部署/云 | 全托管 | 嵌入应用 | 复用现有PG |\n| 扩展性 | 高，分布式架构 | 高，自动扩展 | 低，单机 | 中等，依赖PG |\n| 成本 | 中等，需要运维 | 按量付费 | 免费开源 | 复用现有PG |\n| 混合检索 | 支持向量+标量 | 支持 | 有限 | 支持SQL+向量 |\n| 适用场景 | 高性能生产环境 | 免运维快速上线 | 原型开发、小规模 | 已有PG的项目 |"
+      "title": "索引类型取舍对比",
+      "content": "| 索引 | 召回率 | 查询延迟 | 内存占用 | 构建时间 | 增量更新 | 适合规模 |\n| --- | --- | --- | --- | --- | --- | --- |\n| Flat | 最高（~100%） | O(N)，随数据量线性增长 | 每向量原始大小 | 无需构建 | 追加即生效 | 几万~十几万 |\n| IVFFlat | 高，取决于 nprobe | O(N/nprobe) | 每向量原始大小 | 需要聚类训练 | 追加到桶，分布偏移需重建 | 几十万~百万 |\n| IVF+PQ | 中等，量化有损失 | O(N/nprobe)，计算更轻 | 压缩后远小于原始 | 需要训练码本和聚类 | 码本固定，新分布需重训 | 百万~亿级 |\n| HNSW | 很高（>95%常见） | 低，图导航效率高 | 高（邻居指针开销） | 长，需建多层图 | 删除软标记，频繁更新后退化 | 几十万~千万 |"
+    },
+    {
+      "type": "compareTable",
+      "title": "主流向量数据库对比",
+      "content": "| 对比项 | Milvus | Qdrant | Pinecone | pgvector | Weaviate |\n| --- | --- | --- | --- | --- | --- |\n| 类型 | 分布式向量库 | 向量库（单机/集群） | 全托管云服务 | PostgreSQL 扩展 | 向量库（单机/集群） |\n| 索引支持 | HNSW/IVF/Flat/DiskANN | HNSW | 自研 | IVFFlat/HNSW | HNSW |\n| 部署方式 | 自部署/Zilliz Cloud | 自部署/Qdrant Cloud | 仅托管 | 复用已有 PG | 自部署/Weaviate Cloud |\n| 混合检索 | sparse vector + scalar filter | payload index + sparse | metadata filter + 向量 | SQL + 向量联合查询 | BM25 + 向量融合 |\n| Metadata Filter | 分区 + 表达式过滤 | payload index，支持组合 | 内置 filter | SQL WHERE 条件 | 倒排索引 + filter |\n| 扩展性 | 高，分布式分片 | 中等，集群版支持水平扩展 | 自动扩缩容 | 依赖 PG 扩展能力 | 中等，集群版支持扩展 |\n| 适用场景 | 大规模生产、需要丰富索引 | 中大规模、需要灵活 payload | 免运维快速上线 | 已有 PG 体系、事务强一致 | 语义搜索、混合检索 |\n| 运维成本 | 高，依赖 etv/MinIO 等 | 中等 | 低，托管 | 低，复用 PG | 中等 |"
     },
     {
       "type": "code",
-      "title": "代码/伪代码抓手",
-      "content": "# Milvus创建集合\nfrom pymilvus import Collection, FieldSchema, CollectionSchema, DataType\n\nfields = [\n    FieldSchema(\"id\", DataType.INT64, is_primary=True),\n    FieldSchema(\"embedding\", DataType.FLOAT_VECTOR, dim=768)\n]\nschema = CollectionSchema(fields)\ncollection = Collection(\"docs\", schema)\n\n# 创建HNSW索引\nindex_params = {\"metric_type\": \"COSINE\", \"index_type\": \"HNSW\", \"params\": {\"M\": 16, \"efConstruction\": 200}}\ncollection.create_index(\"embedding\", index_params)",
+      "title": "Milvus HNSW 索引创建与带过滤查询",
       "language": "python",
+      "content": "from pymilvus import (\n    Collection, FieldSchema, CollectionSchema,\n    DataType, connections\n)\n\nconnections.connect(\"default\", host=\"localhost\", port=\"19530\")\n\nfields = [\n    FieldSchema(\"id\", DataType.INT64, is_primary=True, auto_id=True),\n    FieldSchema(\"text\", DataType.VARCHAR, max_length=2048),\n    FieldSchema(\"tenant\", DataType.VARCHAR, max_length=64),\n    FieldSchema(\"embedding\", DataType.FLOAT_VECTOR, dim=768),\n]\nschema = CollectionSchema(fields, description=\"RAG documents\")\ncollection = Collection(\"rag_docs\", schema)\n\n# 创建 HNSW 索引\nindex_params = {\n    \"metric_type\": \"COSINE\",\n    \"index_type\": \"HNSW\",\n    \"params\": {\"M\": 16, \"efConstruction\": 200},\n}\ncollection.create_index(\"embedding\", index_params)\n\ncollection.load()\n\n# 带 tenant 过滤的向量检索\nresults = collection.search(\n    data=[query_embedding],  # 768 维 query 向量\n    anns_field=\"embedding\",\n    param={\"metric_type\": \"COSINE\", \"params\": {\"ef\": 64}},\n    limit=10,\n    expr='tenant == \"acme_corp\"',  # metadata 过滤\n    output_fields=[\"text\", \"tenant\"],\n)",
       "highlights": [
         {
-          "line": 13,
-          "note": "这一行真正创建 embedding 字段的 HNSW 索引，M 和 efConstruction 会影响召回、内存和构建成本。"
+          "line": 19,
+          "note": "M=16 每个节点的邻居数，efConstruction=200 建索引时的搜索宽度，二者越大召回越高但构建越慢、内存越大。"
+        },
+        {
+          "line": 27,
+          "note": "ef=64 是在线查询时的搜索宽度，越大召回越高但延迟越大，需要和 M 配合调。"
+        },
+        {
+          "line": 28,
+          "note": "expr 参数做 metadata 过滤，Milvus 在索引层面支持过滤，避免后过滤漏召回。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**问题1：向量数据库有哪些索引算法？它们有什么区别？**\n\n机制要点：\n- 向量数据库主要有三种索引算法：Flat是暴力搜索，逐一计算所有向量的距离，召回最高但延迟随数据量线性增长，适合作为小规模或评估基线；IVF是倒排文件索引，先将向量聚类，搜索时只查相关聚类，召回与延迟取决于聚类质量和 nprobe，适合内存/规模受限场景；HNSW是分层可导航小世界图，构建多层图结构，搜索时逐层跳转，通常能在召回与延迟间取得较好平衡，但内存和构建成本更高。\n- **问题2：项目中应该如何选择向量数据库？**\n- 选择向量数据库需要考虑四个因素：一是性能需求，高并发场景选Milvus，低延迟场景选HNSW索引；二是成本预算，预算充足选Pinecone免运维，预算有限选ChromaDB开源；三是运维能力，有运维团队选Milvus自部署，无运维能力选Pinecone全托管；四是现有基础设施，已有PostgreSQL的项目可以考虑pgvector。在生产实践中，因为需要高性能和可扩展性，选择了Milvus。\n- **问题3：什么是召回率？它和延迟有什么关系？**\n- 召回率是检索系统返回相关文档的比例，100%召回意味着所有相关文档都被返回。召回率和延迟通常存在权衡关系：Flat 可作为最高召回基线但延迟线性增长；IVF 通过分桶减少扫描范围；HNSW 用图导航降低在线搜索成本。具体召回和延迟必须用业务数据评估。选择依据是业务对精度的要求：如果必须返回所有相关文档，选Flat；如果可以接受少量遗漏，选HNSW获得更低延迟。",
+      "content": "**结论**：向量数据库选型不是选“最强品牌”，而是匹配索引取舍、过滤能力、更新频率、运维模型到业务场景。\n\n**索引类型取舍**\n- Flat：暴力搜索，召回最高但延迟随数据量线性增长，适合小规模基线或评估其他索引的 recall ground truth\n- IVF：聚类分桶，只扫描 nprobe 个桶，延迟从 O(N) 降到 O(N/nprobe)；高维向量聚类质量下降，大规模需结合 PQ 压缩\n- IVF+PQ：分桶+量化压缩，支撑亿级向量内存搜索，但量化损失拉低召回，需配合 rerank 补偿\n- HNSW：分层图导航，召回率和延迟平衡最好，但内存开销大（邻居指针）、构建时间长、频繁删除更新后图退化需重建\n\n**Metadata Filter 三种时机**\n- 后过滤：先召回 topK 再过滤，极端情况过滤后空结果\n- 前过滤：先过滤候选再向量搜索，候选集太小时向量搜索精度不够\n- 索引内过滤：引擎在索引层面裁剪（Milvus 分区、Qdrant payload index、Weaviate 倒排索引），理想但复杂查询性能下降\n\n**混合检索**\n- 纯向量对精确关键词、编号、代码符号不稳定\n- 生产 RAG 常用 dense+sparse 融合：RRF、加权 score 组合、分别召回合并去重\n- Milvus 2.4+ 原生 sparse vector，ES 8.x kNN+BM25 同查询混合评分，pgvector 需自己拼 SQL\n\n**选型维度**\n- 数据规模和 QPS：决定索引类型和是否需要分布式\n- 过滤复杂度：决定是否需要 metadata index 或分区裁剪\n- 增量更新频率：HNSW 频繁删除退化，PQ 码本需重训，Flat/IVFFlat 追加成本低\n- 运维模型：自部署（Milvus/Qdrant/Weaviate）需关注 etcd/MinIO 依赖和扩缩容；托管（Pinecone/Zilliz Cloud）关注成本和供应商锁定\n- 已有基础设施：已有 PG 体系优先 pgvector，已有 ES 体系优先 ES kNN\n\n**评估方法**\n- 用真实 embedding、真实查询集、真实过滤条件压测\n- 看 Recall@K、nDCG、P95/P99 延迟、过滤后召回率、写入吞吐、索引构建时间、内存/磁盘成本\n- 不要只跑随机向量 benchmark，语义检索的真实分布和随机向量差距很大\n\n**常见故障**\n- 新增文档未入索引（异步索引构建延迟）\n- embedding 模型版本不一致导致新旧向量不在同一空间\n- metadata 过滤条件写错或过严，导致召回为空\n- topK 太小 + 后过滤 = 最终结果不足\n- chunk 过碎或过长导致召回的上下文不可用",
       "followUpQuestions": [
         {
-          "question": "评估向量数据库不能只看什么？",
-          "answer": "不能只看 QPS 或是否支持 HNSW。要结合 Recall@K、P95/P99、过滤条件、索引构建时间、内存/磁盘成本、冷热数据、租户隔离、备份恢复和运维复杂度。"
+          "question": "评估向量数据库为什么不能只看 QPS？",
+          "answer": "QPS 只反映吞吐，不反映召回质量。向量检索要同时看 Recall@K（多少相关文档被召回）、过滤后召回率（metadata filter 后是否还有足够结果）、P95/P99 延迟（尾延迟影响用户体验）、索引构建时间（影响增量更新窗口）、内存和磁盘成本。只看 QPS 容易选到高吞吐但召回率低的方案。"
         },
         {
-          "question": "Milvus、pgvector、Elasticsearch 各适合什么场景？",
-          "answer": "Milvus 更偏大规模向量检索和独立向量库；pgvector 适合已有 PostgreSQL 体系、规模中等、事务和结构化过滤强的场景；Elasticsearch/OpenSearch 适合关键词与向量混合检索、日志/文档检索体系复用。"
+          "question": "HNSW 频繁删除后为什么要 rebuild？",
+          "answer": "HNSW 删除是软标记（标记为已删除但不从图中移除），搜索时跳过标记节点。频繁删除后图中大量死节点，邻居关系退化，搜索路径变长，召回率下降且延迟升高。rebuild 是重新构建整张图，恢复图结构质量。所以高频更新场景要评估 rebuild 窗口对业务的影响。"
         },
         {
-          "question": "向量库选型怎么做 POC？",
-          "answer": "用真实 embedding、真实过滤条件和标注查询集压测。看 Recall@K、nDCG、P95 延迟、写入/更新、索引构建、过滤后空结果率、成本和运维复杂度，而不是只跑随机向量 benchmark。"
+          "question": "pgvector 和独立向量数据库相比有什么取舍？",
+          "answer": "pgvector 的优势是复用已有 PostgreSQL 体系，SQL+向量联合查询方便，事务一致性强，运维成本低。劣势是索引类型有限（主要 IVFFlat 和 HNSW），大规模向量检索性能不如 Milvus/Qdrant 等专用引擎，扩展性依赖 PG 本身的分片能力。适合已有 PG 体系、数据规模中等（百万级以下）、需要强结构化过滤的场景。"
+        },
+        {
+          "question": "POC 选型时容易踩什么坑？",
+          "answer": "用随机向量 benchmark 跑出来的结果和真实语义检索差距很大——随机向量分布均匀，真实语义向量有聚类和长尾分布。要用真实 embedding 模型生成的真实文档向量、真实查询集、真实 metadata filter 条件做 POC，同时测增量写入后的索引状态（HNSW 退化、IVF 分布偏移）。"
         }
       ]
     },
@@ -83,34 +100,48 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能准确描述Flat、IVF、HNSW三种索引算法的区别",
-        "能分析召回率与延迟的权衡关系",
-        "能比较主流向量数据库的特点和适用场景",
-        "能说明向量数据库选型的考虑因素",
-        "能讨论混合检索的支持情况",
-        "能用具体数据说明索引算法的性能差异",
-        "能用项目经验说明向量数据库选型决策"
+        "能描述 Flat、IVF、IVF+PQ、HNSW 四种索引在召回率、延迟、内存、构建时间和增量更新上的取舍",
+        "能解释 metadata filter 三种执行时机（前/后/索引内）对召回质量的影响",
+        "能说明混合检索（dense+sparse）的融合方式和适用场景",
+        "能比较 Milvus、Qdrant、Pinecone、pgvector、Weaviate 的索引支持、过滤能力、运维模型和适用边界",
+        "能用真实查询集、真实过滤条件和 Recall@K/P95 评估向量数据库而不是只看 QPS",
+        "能识别 HNSW 删除退化、PQ 码本失效、embedding 版本不一致等常见生产故障",
+        "能把向量数据库选型放进 RAG 架构的召回→rerank→生成链路中思考"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "agent.embedding-retrieval.topic-121-15a0b1b4.recall.1",
-      "prompt": "请讲一下 向量数据库核心能力对比 的核心机制、适用场景和常见误区。",
+      "prompt": "请对比 Flat、IVF、IVF+PQ、HNSW 四种向量索引在召回率、延迟、内存、构建时间和增量更新上的取舍。",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "agent.embedding-retrieval.topic-121-15a0b1b4.recall.2",
-      "prompt": "如果面试官问你\"项目中应该如何选择向量数据库\"，你会怎么回答？",
+      "prompt": "项目中需要按租户和时间范围做 metadata filter，你会选择前过滤、后过滤还是索引内过滤？为什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
     },
     {
       "id": "agent.embedding-retrieval.topic-121-15a0b1b4.recall.3",
-      "prompt": "向量数据库核心能力对比 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "如果面试官问\"Milvus、pgvector、Elasticsearch 各适合什么场景\"，你怎么回答？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.embedding-retrieval.topic-121-15a0b1b4.recall.4",
+      "prompt": "RAG 系统线上出现「用户的问题明明文档里有，但召回结果为空」，你会怎么排查？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 3
+    },
+    {
+      "id": "agent.embedding-retrieval.topic-121-15a0b1b4.recall.5",
+      "prompt": "向量数据库选型 POC 时，用随机向量 benchmark 和用真实语义向量压测的结果会有什么差异？为什么？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
@@ -118,20 +149,21 @@
   ],
   "rubric": {
     "mustHave": [
-      "能按规模、召回、延迟、过滤、更新、成本和运维比较向量数据库",
-      "能说明 Milvus/pgvector/Elasticsearch 或 OpenSearch 等方案的典型边界",
-      "能解释索引类型、metadata filter、混合检索和重排对选型的影响",
-      "能用真实查询集、真实过滤条件和 Recall@K/P95 成本压测"
+      "能按索引类型（Flat/IVF/PQ/HNSW）说清召回率、延迟、内存、构建时间和增量更新的取舍",
+      "能解释 metadata filter 三种执行时机（前/后/索引内）对召回质量的影响",
+      "能比较 Milvus、Qdrant、pgvector、Pinecone 等方案的索引支持、过滤能力、运维模型和适用边界",
+      "能说明混合检索（dense+sparse）的融合方式和适用场景"
     ],
     "goodToHave": [
-      "能说明多租户隔离、备份恢复、冷热数据和扩容迁移要求",
-      "能把向量库选型放进 RAG 架构的召回与评估链路",
-      "能识别随机向量 benchmark 与真实语义检索的差距"
+      "能说明 HNSW 删除退化、PQ 码本失效、embedding 版本不一致等常见生产故障",
+      "能把向量数据库选型放进 RAG 架构的召回→rerank→生成链路中思考",
+      "能解释 POC 用随机向量 benchmark 和真实语义向量的差距"
     ],
     "commonMistakes": [
-      "只按是否支持向量检索选型",
-      "只看 QPS，不看召回和过滤后结果质量",
-      "忽略已有数据库体系、团队运维能力和数据治理要求"
+      "只按是否支持向量检索选型，不看索引类型、过滤能力和增量更新成本",
+      "只看 QPS 不看 Recall@K、过滤后召回率和尾延迟",
+      "用随机向量 benchmark 代替真实语义检索 POC",
+      "忽略已有数据库体系、团队运维能力和 metadata filter 实现成熟度"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -140,11 +172,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18",
+  "updatedAt": "2026-06-22",
   "prerequisites": [
     "agent.embedding-retrieval.embedding-similarity"
   ],
   "status": "staging",
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「向量数据库核心能力对比」说清索引算法对比、主流数据库对比，并放到Agent/RAG/LLM 工程场景中解释关键流程、边界条件和出错后的处理思路。"
+  "interviewerFocus": "考察能否围绕向量数据库核心能力对比说清索引算法取舍、metadata filter 执行时机、混合检索、主流数据库选型边界，并放到 RAG 工程场景中解释召回质量问题的排查思路。"
 }

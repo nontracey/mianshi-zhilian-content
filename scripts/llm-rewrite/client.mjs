@@ -53,27 +53,61 @@ export async function callChat({ model, messages }) {
 // 从模型回复里提取 JSON 对象（容忍 ```json 围栏 / 前后多余文字 / 常见坏转义）。
 export function extractJson(text) {
   let s = String(text).trim();
+  // 优先找外层 JSON 对象（最外层的 { }），避免被内部的 markdown 围栏误导
+  const outerStart = s.indexOf("{");
+  const outerEnd = s.lastIndexOf("}");
+  if (outerStart >= 0 && outerEnd > outerStart) {
+    const candidate = s.slice(outerStart, outerEnd + 1);
+    try { return JSON.parse(candidate); } catch {}
+    try { return JSON.parse(repairJson(candidate)); } catch {}
+  }
+  // 备选：围栏内的 JSON（模型有时只返回 ```json ... ```）
   const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence) s = fence[1].trim();
-  const start = s.indexOf("{");
-  const end = s.lastIndexOf("}");
-  if (start >= 0 && end > start) s = s.slice(start, end + 1);
-  try {
-    return JSON.parse(s);
-  } catch (e1) {
-    try {
-      return JSON.parse(repairJson(s));
-    } catch {
-      const err = new Error(`JSON 解析失败：${e1.message}`);
-      err.jsonParse = true; // 标记为可 re-roll 重试的失败
-      throw err;
+  if (fence) {
+    const inner = fence[1].trim();
+    const fStart = inner.indexOf("{");
+    const fEnd = inner.lastIndexOf("}");
+    if (fStart >= 0 && fEnd > fStart) {
+      const fc = inner.slice(fStart, fEnd + 1);
+      try { return JSON.parse(fc); } catch {}
+      try { return JSON.parse(repairJson(fc)); } catch {}
     }
   }
+  const err = new Error("JSON 解析失败：未找到合法 JSON 对象");
+  err.jsonParse = true;
+  throw err;
 }
 
-// 修常见的 LLM 坏 JSON：非法反斜杠转义、对象/数组尾随逗号。其余结构性错误交给上层 re-roll 重试。
+// 修常见的 LLM 坏 JSON：非法反斜杠转义、尾随逗号、字符串内未转义双引号（推理模型常见）。
 function repairJson(s) {
-  return s
+  // 1) 基础修复
+  let r = s
     .replace(/\\(?!["\\/bfnrtu])/g, "\\\\") // \ 后面不是合法转义字符 → 补成 \\
     .replace(/,\s*([}\]])/g, "$1"); // 去掉 } ] 前的多余逗号
+  // 2) 修复字符串内的未转义双引号（MiMo 等推理模型用 "" 做中文强调）
+  r = fixUnescapedQuotes(r);
+  return r;
+}
+
+function fixUnescapedQuotes(s) {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (esc) { out += c; esc = false; continue; }
+    if (c === "\\") { out += c; esc = true; continue; }
+    if (c !== '"') { out += c; continue; }
+    if (!inStr) { inStr = true; out += c; continue; }
+    // 在字符串内部遇到 "——判断是字符串结尾还是内容里的引号
+    let j = i + 1;
+    while (j < s.length && s[j] === " ") j++;
+    const next = s[j];
+    if (next === "," || next === "}" || next === "]" || next === ":" || next === undefined) {
+      inStr = false; out += c; // 真正的字符串结尾
+    } else {
+      out += '\\"'; // 内容里的引号，转义
+    }
+  }
+  return out;
 }

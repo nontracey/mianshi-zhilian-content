@@ -4,7 +4,7 @@
   "category": "realtime",
   "group": "realtime",
   "title": "Flink 状态与 Checkpoint",
-  "summary": "理解 Keyed/Operator State、RocksDB 状态后端、Chandy-Lamport barrier 对齐与非对齐快照、savepoint 与 checkpoint 的差别。",
+  "summary": "讲清 Keyed/Operator State 两套状态的分片与重分配机制、Chandy-Lamport barrier 对齐与非对齐快照的一致性保证和代价、RocksDB 增量 checkpoint 基于 SST 不可变的原理及其写放大/文件膨胀/TTL 清理三个坑、savepoint 与 checkpoint 在触发格式生命周期上的工程差别。",
   "tags": [
     "数据工程",
     "Flink",
@@ -13,28 +13,28 @@
     "状态后端"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 35,
+  "estimatedMinutes": 29,
   "order": 90,
   "recommendWeight": 85,
   "status": "staging",
   "prerequisites": [],
   "interviewFrequency": "high",
-  "interviewerFocus": "重点看候选人能否解释 barrier 对齐如何实现一致性快照、RocksDB 增量 checkpoint 的写放大来源，以及反压和大状态导致 checkpoint 超时时的具体定位手段。",
+  "interviewerFocus": "重点看候选人能否解释 barrier 对齐如何实现一致性快照、RocksDB 增量 checkpoint 的 SST 不可变原理和写放大来源，以及反压和大状态导致 checkpoint 超时时的具体定位手段。",
   "learningCards": [
     {
       "type": "explain",
       "title": "Keyed State 与 Operator State 为什么要分两套",
-      "content": "Flink 的有状态流任务把中间结果分成两类：Keyed State 跟 keyBy 之后的 key 绑定，每条记录路由到对应 key 的状态分片，常见 API 是 ValueState、ListState、MapState、ReducingState、AggregatingState；Operator State 跟算子实例（subtask）绑定，没有 key 概念，典型用法是 Kafka source 保存每个分区的 offset，或 sink 保存正在写出的小批数据。\n\n分两套是因为这两类状态在并行度变化时的重分配规则完全不同。Keyed State 走 KeyGroup 机制：作业把 key 空间预先切成 maxParallelism 个 KeyGroup（默认 128，可配），重启或扩缩容时按 KeyGroup 整体迁移到新 subtask，单个 key 永远只属于一个 KeyGroup，因此本地状态可以原地访问、不需要全局协调。Operator State 没有 key，要靠 CheckpointedFunction 接口或 ListCheckpointed 提供两种重分配策略：even-split（把 list 元素均匀切给新 subtask）和 union（每个 subtask 拿到全部 list，自己挑用）。Kafka source 用 union，是因为新 subtask 启动时要看到所有分区 offset 才能决定接管哪些。\n\n实践上 Keyed State 占绝大多数业务场景：窗口聚合、CEP、去重 bloom、维表 join 缓存。判断要不要用 Operator State 的标准很简单——状态是否跟 key 无关、是否需要在算子启动时做全局视角的初始化。"
+      "content": "Flink 的有状态算子把状态分成 Keyed State 和 Operator State 两类，根源是它们在并行度变化时的重分配逻辑完全不同，必须用不同机制管理。\n\n**Keyed State** 绑定在 keyBy 之后的 key 上。Flink 把整个 key 空间预先切成 maxParallelism 个 KeyGroup（默认 128，可在 `StreamExecutionEnvironment.setMaxParallelism()` 配置），每个 KeyGroup 是一段连续的 key hash 范围。某个 subtask 负责哪些 KeyGroup 由 `keyGroup % parallelism` 决定。扩缩容时，KeyGroup 整体迁移，单个 key 永远只属于一个 KeyGroup，因此算子可以在本地原地读写状态、不需要跨 subtask 协调。这是 Keyed State 支撑高吞吐本地访问的关键——路由代价只是一次取模。常见 API 有 ValueState、ListState、MapState、ReducingState、AggregatingState。\n\n**Operator State** 绑定在算子实例（subtask）上，没有 key 概念。重分配通过 `CheckpointedFunction.snapshotState()` 和 `initializeState()` 手动控制，两种策略：even-split 把 list 元素均匀切给新 subtask（适合 ArrayListState）；union 让每个 subtask 拿到全部 list 再自行决定用哪些（Kafka source 用这个，因为新 subtask 启动时要看到所有分区 offset 才能决定接管哪些分区）。\n\n判断用哪套的标准：状态是否跟 key 无关、是否需要算子启动时做全局初始化。业务聚合、窗口、CEP、去重 bloom 都是 Keyed State；source offset、sink buffer 是 Operator State。"
     },
     {
       "type": "explain",
-      "title": "Chandy-Lamport barrier 与对齐 / 非对齐 checkpoint",
-      "content": "Flink 的精确一次语义靠 Chandy-Lamport 异步 barrier snapshot 算法实现。JobManager 的 CheckpointCoordinator 周期触发（execution.checkpointing.interval），向所有 source 注入带 checkpoint id 的 barrier；barrier 跟着数据流向下游推进，每个算子收到 barrier 时对当前状态做异步快照并把句柄汇报给 coordinator，全部 subtask 完成后 coordinator 把这次 checkpoint 标记为 completed 并写入 _metadata。\n\n关键在多输入算子怎么处理 barrier：\n- 对齐 checkpoint（默认）：算子从某条输入收到 barrier n 后，把这条输入暂存，继续消费其他输入直到所有输入的 barrier n 都到齐，再统一做快照。这段暂存时间就是 alignment time，barrier 之前的数据都进入快照、barrier 之后的数据都不进入，从而保证一致性。代价是反压时下游 barrier 推不动，alignment time 暴涨，checkpoint 直接超时。\n- 非对齐 checkpoint（1.11+，execution.checkpointing.unaligned=true）：算子收到第一个 barrier n 就立刻把它转发到所有输出、立刻开始快照，同时把已经在 input/output buffer 里、但还没处理的「inflight 数据」也写进快照。恢复时这些 inflight 数据会先回放再继续消费。优点是 checkpoint 不再被反压卡住，缺点是 state size 变大、不能与 rescaling 同时使用、对存储吞吐要求更高。\n\n生产经验：默认开对齐 checkpoint，发现 alignment time 经常超过 checkpoint timeout（默认 10 分钟）的 30% 时再切非对齐，并配合 execution.checkpointing.aligned-checkpoint-timeout 做自动降级。"
+      "title": "Chandy-Lamport barrier 与对齐/非对齐 checkpoint",
+      "content": "Flink 的精确一次语义靠 Chandy-Lamport 异步 barrier snapshot 实现。整个流程：\n\n1. **注入 barrier**：JobManager 的 CheckpointCoordinator 按 `execution.checkpointing.interval`（默认不开启，必须显式设值）周期触发，向所有 source subtask 注入带 checkpoint id 的 barrier 消息。\n2. **barrier 随数据推进**：barrier 和普通数据一样走算子链的网络 shuffle，barrier n 的位置代表「n 之前的数据都已进入快照」。\n3. **多输入算子处理 barrier**：这是核心。\n\n**对齐 checkpoint**（默认模式）：算子从某条输入通道收到 barrier n 后，把该通道暂缓（后续到来的数据缓存进 input buffer），继续消费其他通道。等所有输入通道的 barrier n 都到齐，算子统一做状态快照，再把 barrier n 转发到输出，然后恢复消费被暂缓的通道。这个「等齐」的时间叫 alignment time。一致性保证是：快照里的状态恰好包含 barrier n 之前所有数据的效果，barrier n 之后的数据被排除。\n\n代价：反压时下游处理慢，barrier 推不动，alignment time 暴涨，checkpoint 直接超时（默认 10 分钟）。这是对齐 checkpoint 最常见的线上问题。\n\n**非对齐 checkpoint**（Flink 1.11+，`execution.checkpointing.unaligned=true`）：算子收到第一个 barrier n 就立刻转发到所有输出通道、立刻开始快照，同时把已经进入 input/output buffer 但还没处理的「inflight 数据」也写进快照。恢复时先回放这些 inflight 数据再继续消费。优点是 checkpoint duration 不再受反压影响；代价是 state size 变大（inflight 数据被存两次）、不能与 rescaling 同时启用、对存储吞吐要求更高。\n\n**工程建议**：默认开对齐 checkpoint；当 alignment time 经常超过 checkpoint timeout 的 30% 时切非对齐，或用 `execution.checkpointing.aligned-checkpoint-timeout` 做自动降级（先等对齐 N 秒，超时则切非对齐）。"
     },
     {
       "type": "explain",
-      "title": "RocksDB 状态后端的增量 checkpoint 与写放大",
-      "content": "Flink 当前推荐的状态后端是 EmbeddedRocksDBStateBackend（旧 HashMapStateBackend 只适合状态能完全装进 JVM 堆的小作业）。RocksDB 把状态以 LSM-Tree 形式存在 TaskManager 本地磁盘，读写都要走序列化，单点访问比堆内慢一个数量级，但能支撑 TB 级状态。\n\n增量 checkpoint（state.backend.incremental=true，1.13+ 默认开启）的核心是：RocksDB 的 SST 文件一旦生成就是不可变的，每次 checkpoint 只把上次之后新增的 SST 文件上传到 DFS（HDFS / S3 / OSS），已上传的 SST 通过引用计数共享。这让单次 checkpoint 上传量从「全量状态」降到「增量 delta」，TB 级状态的 checkpoint duration 从十几分钟降到分钟级。\n\n但增量 checkpoint 带来三个坑：\n1. 写放大：LSM compaction 会把旧 SST 重写成新 SST，新文件需要重新上传，业务写入量小但 checkpoint 上传量大，表现为 checkpoint size 远大于实际 state size。\n2. 文件数量爆炸：长期运行会累积大量小 SST，恢复时下载文件数巨大，TaskManager 启动慢；要靠 state.backend.rocksdb.compaction.level.use-dynamic-size 和合理的 compaction 配置控制。\n3. 状态清理依赖 TTL + compaction filter：Flink 的 StateTtlConfig 只在访问时惰性清理，真正释放磁盘要等 RocksDB compaction，配置 cleanupInRocksdbCompactFilter 才会在 compaction 时主动过滤过期 key。\n\n排查 RocksDB checkpoint 慢的指标顺序是 checkpoint async duration > rocksdb.num-files-at-level0 > compaction pending bytes > 本地磁盘 IO util > DFS 上传带宽。"
+      "title": "RocksDB 状态后端：增量 checkpoint、写放大与 TTL 清理",
+      "content": "Flink 推荐的大状态后端是 `EmbeddedRocksDBStateBackend`（旧 `HashMapStateBackend` 只适合状态能完全装进 JVM 堆的小作业）。RocksDB 把状态存成本地磁盘的 LSM-Tree，读写都走 Flink 的 state serializer，单点访问比堆内慢一个数量级，但能支撑 TB 级状态且不受 GC 影响。\n\n**增量 checkpoint 的原理**：RocksDB 的 SST 文件一旦生成就是不可变的（immutable）。每次 checkpoint 时，RocksDB 把本次新增和变更的 SST 文件列出来，Flink 只把这批文件上传到 DFS（HDFS/S3/OSS），已上传的 SST 通过引用计数共享、不重复上传。这让单次 checkpoint 上传量从「全量状态」降到「增量 delta」，TB 级状态的 checkpoint duration 从十几分钟降到分钟级。Flink 1.13+ 默认开启增量 checkpoint。\n\n**三个工程坑**：\n\n1. **写放大**：LSM-Tree 的 compaction 会把多层 SST 合并重写成新 SST，这些新文件需要重新上传。表现是 checkpoint upload size 远大于实际 state delta size，甚至 checkpoint size 远大于 state size。排查时对比 checkpoint size 与 rocksdb.live-sst-file-size。\n2. **文件数量膨胀**：长期运行、写入量大时累积大量小 SST 文件，恢复时需要下载的文件数巨大，TaskManager 冷启动慢。靠合理的 compaction 参数（`level0-file-num-compaction-trigger`、`max-size-ratio`）和 `state.backend.rocksdb.compaction.level.use-dynamic-size` 控制。\n3. **TTL 清理依赖 compaction filter**：`StateTtlConfig` 默认是 lazy cleanup——只在下次访问那个 key 时才判断是否过期、清理，没被访问的冷 key 永远不会被释放。要主动释放磁盘，必须显式开 `cleanupInRocksdbCompactFilter()`，让 RocksDB compaction 时调用 Flink 的 filter 过滤过期 key。TTL 还要注意 `updateType`（OnCreateAndWrite 还是 OnReadAndWrite）和 `stateVisibility`（NeverReturnExpired 还是 ReturnExpiredIfNotCleanedUp）的配合。\n\n**排查 checkpoint 慢的指标顺序**：checkpoint async duration → alignment time → rocksdb.num-files-at-level0 → compaction pending bytes → 本地磁盘 IO util → DFS 上传带宽。"
     },
     {
       "type": "diagram",
@@ -57,60 +57,24 @@
     {
       "type": "compareTable",
       "title": "savepoint 与 checkpoint 的工程差别",
-      "columns": [
-        "维度",
-        "Checkpoint",
-        "Savepoint"
-      ],
-      "rows": [
-        [
-          "触发方式",
-          "JobManager 按 interval 自动触发",
-          "用户通过 flink savepoint / REST 手动触发"
-        ],
-        [
-          "存储格式",
-          "默认增量、绑定 state backend 内部格式（如 RocksDB SST）",
-          "标准化二进制格式（独立于 state backend），可跨版本和 backend 恢复"
-        ],
-        [
-          "生命周期",
-          "Flink 管理，默认作业取消时删除（externalized 才保留）",
-          "用户管理，必须显式删除"
-        ],
-        [
-          "典型用途",
-          "故障自动恢复、JobManager failover",
-          "版本升级、修改算子拓扑、迁移 state backend、A/B 切换"
-        ],
-        [
-          "兼容性",
-          "强绑定当前作业的 operator id 和 state schema",
-          "通过 uid() 显式绑定算子，支持 schema evolution（POJO/Avro）"
-        ],
-        [
-          "耗时",
-          "增量 checkpoint 通常分钟级",
-          "总是全量，TB 级状态可能几十分钟"
-        ]
-      ]
+      "content": "| 维度 | Checkpoint | Savepoint |\n| --- | --- | --- |\n| 触发方式 | JobManager 按 interval 自动触发 | 用户通过 `flink savepoint` 或 REST API 手动触发 |\n| 存储格式 | 绑定 state backend 内部格式（如 RocksDB SST 引用） | 标准化二进制格式（Canonical Format），独立于 state backend |\n| 是否增量 | 默认增量（RocksDB backend） | 总是全量，TB 级状态可能耗时几十分钟 |\n| 生命周期 | Flink 管理，作业取消时默认删除（`externalizedCheckpointCleanup` 可保留） | 用户管理，必须显式删除 |\n| 典型用途 | 故障自动恢复、JobManager failover | Flink 版本升级、修改算子拓扑、迁移 state backend、A/B 切换 |\n| 兼容性 | 强绑定当前作业拓扑和 operator id | 通过 `uid()` 显式绑定算子，支持 schema evolution（POJO/Avro） |\n| 与 rescaling | 对齐 checkpoint 支持 rescaling | 支持 rescaling（配合 `--allowNonRestoredState`） |"
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "30 秒结论：Flink 用 Chandy-Lamport barrier 算法在数据流里插入 checkpoint barrier，下游算子收齐 barrier 后对状态做异步快照写到 DFS，从而在不停流的前提下拿到全局一致的状态，配合 RocksDB 增量 checkpoint 支撑 TB 级状态，savepoint 则是用户手动触发的标准化全量快照、用于升级迁移。\n\n机制主线：\n- 状态分两类。Keyed State 按 KeyGroup 分片，扩缩容按 KeyGroup 重分配；Operator State 按 subtask 绑定，靠 even-split 或 union 重分配，Kafka source offset 是典型 union 用法。\n- 一致性快照靠 barrier 对齐。多输入算子收到第一个 barrier n 后暂存这条输入，等所有 barrier n 到齐再快照，alignment time 就是这个等待时间。反压会让 alignment time 暴涨，可以切非对齐 checkpoint，把 inflight 数据也写进快照。\n- RocksDB + 增量 checkpoint 是大状态首选。SST 不可变让增量上传成为可能，但 LSM compaction 会带来写放大、文件数膨胀和 TTL 清理依赖 compaction filter 的问题。\n- Savepoint 与 checkpoint 的差别是触发方式、格式和生命周期：checkpoint 自动触发、绑定 backend 格式、Flink 管理；savepoint 手动触发、标准化格式、用户管理，升级时通过算子 uid 保证恢复。\n\n边界提醒：状态 schema 变更要用 POJO/Avro serializer 才支持 evolution；非对齐 checkpoint 不能与 rescaling 同时启用；exactly-once sink（Kafka 2PC）要求 checkpoint 完成后才提交事务，checkpoint 间隔直接决定端到端延迟。",
+      "content": "**30 秒结论**：Flink 用 Chandy-Lamport barrier 在数据流中插入一致性标记，下游算子收齐 barrier 后对状态做异步快照写到 DFS，不停流即获得全局一致的状态；RocksDB 增量 checkpoint 让 TB 级状态的 checkpoint 从全量降到增量 delta；savepoint 是用户手动触发的标准化全量快照，用于升级迁移。\n\n**机制主线**\n- **状态分两类**。Keyed State 按 KeyGroup 分片，key hash 取模决定归属，扩缩容按 KeyGroup 整体迁移；Operator State 按 subtask 绑定，靠 even-split 或 union 重分配，Kafka source offset 是典型的 union 用法。\n- **一致性快照靠 barrier 对齐**。多输入算子收到 barrier n 后暂缓该通道、等所有通道 barrier n 到齐再快照。alignment time 是等齐时间，反压会让它暴涨、导致 checkpoint 超时。非对齐 checkpoint 让算子收到第一个 barrier 就立刻快照，把 inflight 数据也写进快照，代价是 state size 变大且不能与 rescaling 同时启用。\n- **RocksDB + 增量 checkpoint**是大状态首选。SST 不可变让增量上传成为可能，但 LSM compaction 带来写放大（checkpoint size 远大于 state delta）、文件膨胀（恢复慢）、TTL 惰性清理（必须开 compaction filter）三个坑。\n- **Savepoint vs Checkpoint**：checkpoint 自动触发、绑定 backend 格式、Flink 管理；savepoint 手动触发、标准化格式、用户管理。升级时必须给有状态算子显式设 `.uid()`，用 stop-with-savepoint 拿干净快照，新版本用 `-s <path>` 恢复。\n\n**边界提醒**\n- 状态 schema 变更要用 POJO/Avro serializer 才支持 evolution，Kryo 改字段会反序列化失败。\n- 非对齐 checkpoint 不能与 rescaling 同时启用。\n- exactly-once sink（Kafka 2PC）要求 checkpoint 完成后才提交事务，checkpoint 间隔直接决定端到端延迟。",
       "followUpQuestions": [
         {
           "question": "checkpoint duration 从 30 秒涨到 8 分钟、快超时了，怎么定位？",
-          "answer": "按 sync duration 和 async duration 拆。sync 长说明状态快照本身慢，看 RocksDB num-files-at-level0、compaction pending bytes 是不是 compaction 卡住；async 长就细分 alignment time 和 upload 时间——alignment time 占大头说明反压，去看 backpressure 指标和上游 subtask 的 busy 时间，必要时切非对齐 checkpoint；upload 长就看 DFS 带宽、S3 限流和 incremental checkpoint size 是不是被 LSM compaction 放大。最后再看是不是某个 key 倾斜导致单 subtask 状态远大于其他，可以在 Flink Web UI 的 subtask 视角看 state size 分布。"
+          "answer": "先拆 sync duration 和 async duration。sync 长说明状态序列化/写入本身慢，看 RocksDB num-files-at-level0、compaction pending bytes 是否 compaction 卡住。async 长再拆 alignment time 和 upload time：alignment time 占大头说明反压导致 barrier 推不动，去看 backpressure 指标和上游 subtask 的 busy 比例，必要时切非对齐 checkpoint；upload 长就看 DFS 带宽、S3 限流、incremental checkpoint upload size 是否被 LSM compaction 放大。最后在 Flink Web UI subtask 视角看 state size 分布，排查 key 倾斜导致单 subtask 状态远大于其他。"
         },
         {
           "question": "升级 Flink 版本时，怎么用 savepoint 保证状态不丢、还能改算子拓扑？",
-          "answer": "三步走。第一，给所有有状态算子显式调 .uid('xxx')，不要依赖框架自动生成的 hash，否则改拓扑后恢复会找不到状态。第二，停作业前用 flink stop --savepointPath 触发 stop-with-savepoint，拿到一个干净的全量快照，避免 cancel 时 inflight 数据丢失。第三，新版本启动时 flink run -s <savepoint> --allowNonRestoredState（如果删了某些算子）。POJO/Avro state 可以做字段增删，Kryo 序列化的状态改 schema 会失败，所以生产里尽量用 POJO 或 Avro。"
+          "answer": "三步。第一，给所有有状态算子显式调 `.uid(\"xxx\")`，不依赖框架自动生成的 hash，否则改拓扑后 operator id 变了恢复会找不到状态。第二，停作业前用 `flink stop <jobId> --savepointPath <dir>` 触发 stop-with-savepoint（不是 cancel），拿到一个 inflight 数据已清空的干净快照。第三，新版本启动时 `flink run -s <savepointPath> --allowNonRestoredState`（如果删了某些算子）。POJO/Avro state 支持字段增删的 schema evolution，Kryo 序列化的 state 改字段会反序列化失败，生产里尽量用 POJO 或 Avro。"
         },
         {
           "question": "状态一直涨，磁盘快满了，TTL 设了为什么没生效？",
-          "answer": "Flink 的 StateTtlConfig 默认是 lazy cleanup——只在下次访问那个 key 时才判断是否过期并清理，没访问的冷 key 永远不会被清。要主动释放磁盘，必须显式开 cleanupInRocksdbCompactFilter()，让 RocksDB compaction 时调用 Flink 的 filter 过滤过期 key；或者开 cleanupFullSnapshot() 让 checkpoint 时全量过滤（仅 HashMapStateBackend 有效）。另外 RocksDB 的实际磁盘释放还要等 compaction 真正发生，可以手动触发 compaction 或调 level0 file num threshold 加快。如果是窗口状态膨胀，更可能是水位线推不动导致窗口不触发，得先看 watermark。"
+          "answer": "Flink 的 `StateTtlConfig` 默认是 lazy cleanup——只在下次访问那个 key 时才判断是否过期并清理，没被访问的冷 key 永远不会被释放。要主动释放磁盘，必须显式开 `cleanupInRocksdbCompactFilter()`，让 RocksDB compaction 时调用 Flink 的 filter 过滤过期 key；`cleanupFullSnapshot()` 仅对 HashMapStateBackend 有效，RocksDB 下没用。RocksDB 实际磁盘释放还要等 compaction 真正跑完，可以手动触发 compaction 或调低 level0 file num threshold 加速。另外 TTL 的 `updateType` 默认是 OnCreateAndWrite，如果业务是 read-only 命中也要续期，得切 OnReadAndWrite。如果是窗口状态膨胀，更可能是水位线推不动导致窗口不触发，先看 watermark。"
         }
       ]
     },
@@ -118,10 +82,13 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能讲 Keyed State 走 KeyGroup 重分配、Operator State 走 even-split / union 重分配的差别",
-        "能说明 barrier 对齐如何实现一致性快照，以及非对齐 checkpoint 把 inflight 数据写进快照的取舍",
-        "能解释 RocksDB 增量 checkpoint 的原理（SST 不可变 + 引用计数）和写放大、文件膨胀、TTL 清理三个坑",
-        "能区分 checkpoint 与 savepoint 在触发方式、存储格式、生命周期、用途上的差别",
+        "能讲清 Keyed State 按 KeyGroup 分片重分配、Operator State 按 even-split / union 重分配的差别和各自的典型用法",
+        "能说明 barrier 对齐如何实现一致性快照，alignment time 与反压的因果关系",
+        "能讲清非对齐 checkpoint 把 inflight 数据写进快照的机制和三个代价（state size、不能 rescaling、存储吞吐）",
+        "能解释 RocksDB 增量 checkpoint 基于 SST 不可变 + 引用计数的原理",
+        "能解释 LSM compaction 写放大如何导致 checkpoint size 远大于 state size",
+        "能区分 checkpoint 与 savepoint 在触发方式、存储格式、生命周期、跨版本恢复上的差别",
+        "能讲清 StateTtlConfig lazy cleanup 的问题和 cleanupInRocksdbCompactFilter 的作用",
         "能按 sync/async duration、alignment time、RocksDB compaction、DFS 上传四个维度排查 checkpoint 慢"
       ]
     }
@@ -147,29 +114,43 @@
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
+    },
+    {
+      "id": "data-engineering.realtime.flink-state-checkpoint.recall.4",
+      "prompt": "checkpoint 持续超时，alignment time 很高，你有哪些手段？分别的副作用是什么？",
+      "mode": "text",
+      "expectedMinutes": 5,
+      "difficulty": 4
+    },
+    {
+      "id": "data-engineering.realtime.flink-state-checkpoint.recall.5",
+      "prompt": "状态 TTL 设了但磁盘没释放，compaction filter 和 lazy cleanup 的区别是什么？生产上怎么配置才能真正释放空间？",
+      "mode": "text",
+      "expectedMinutes": 4,
+      "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "Keyed State 与 Operator State 的差别，以及 KeyGroup / even-split / union 三种重分配策略",
-      "Chandy-Lamport barrier 算法和对齐 checkpoint 的等齐语义",
-      "非对齐 checkpoint 把 inflight 数据写进快照的核心机制和适用场景",
-      "RocksDB 增量 checkpoint 基于 SST 不可变 + 引用计数的实现原理",
-      "savepoint 与 checkpoint 在触发方式、存储格式、生命周期、跨版本恢复上的差别"
+      "能区分 Keyed State（KeyGroup 分片）和 Operator State（even-split/union）的重分配机制",
+      "能准确描述 barrier 对齐算法：注入→推进→暂存→等齐→快照→转发，以及 alignment time 的含义",
+      "能讲清非对齐 checkpoint 把 inflight 数据写进快照的核心机制和三个代价",
+      "能解释 RocksDB 增量 checkpoint 基于 SST 不可变 + 引用计数的实现原理",
+      "能区分 checkpoint 与 savepoint 在触发方式、存储格式、生命周期、跨版本恢复上的差别"
     ],
     "goodToHave": [
-      "能讲清楚 alignment time 暴涨的因果链：反压 → barrier 推不动 → alignment time 增大 → checkpoint 超时",
-      "能解释 LSM compaction 写放大如何让 checkpoint size 远大于 state size",
-      "能说出 StateTtlConfig 的 lazy cleanup 和 cleanupInRocksdbCompactFilter 的差别",
-      "能讲算子 uid() 在 savepoint 升级时的作用和 allowNonRestoredState 的使用场景",
-      "了解 exactly-once sink（Kafka 2PC）与 checkpoint interval 共同决定端到端延迟"
+      "能讲清 alignment time 暴涨的因果链：反压→barrier 推不动→alignment time 增大→checkpoint 超时",
+      "能解释 LSM compaction 写放大如何让 checkpoint upload size 远大于 state delta size",
+      "能说明 StateTtlConfig 的 lazy cleanup 与 cleanupInRocksdbCompactFilter 的差别和配置方法",
+      "能讲清算子 `.uid()` 在 savepoint 升级时的作用和 `--allowNonRestoredState` 的使用场景",
+      "能说明 exactly-once sink（Kafka 2PC）与 checkpoint interval 共同决定端到端延迟"
     ],
     "commonMistakes": [
       "把 checkpoint 当成定时全量备份，说不清 barrier 如何保证一致性",
       "把 savepoint 和 checkpoint 当成同一个东西，不知道升级要用 savepoint + uid",
-      "只会说 RocksDB「适合大状态」，不知道增量 checkpoint 和 LSM 写放大",
-      "checkpoint 超时只调大 timeout 或缩小 interval，不看 alignment time 和反压",
-      "状态 TTL 设了就以为磁盘会自动释放，忽略 compaction filter 的开关"
+      "只会说 RocksDB「适合大状态」，不知道增量 checkpoint 的 SST 不可变原理和 LSM 写放大",
+      "checkpoint 超时只调大 timeout 或缩小 interval，不看 alignment time 和反压根因",
+      "状态 TTL 设了就以为磁盘会自动释放，不知道 lazy cleanup 需要访问才清理、必须开 compaction filter"
     ],
     "scoreWeights": {
       "coverage": 30,
@@ -178,5 +159,5 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }

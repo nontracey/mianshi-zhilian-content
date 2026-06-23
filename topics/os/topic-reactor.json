@@ -4,7 +4,7 @@
   "category": "io-model",
   "group": "io-model",
   "title": "Reactor 模式",
-  "summary": "理解 Reactor 的 readiness 事件分发、单/多线程/主从模型、慢 handler 风险、Netty/Nginx/Redis 落地，以及它和 Proactor completion 语义的边界。",
+  "summary": "理解 Reactor 模式如何用 readiness 事件分发（IO 多路复用返回 fd 可读/可写，应用侧仍要 read/write）替代每连接一线程；单/多线程/主从三种形态各自解决了什么瓶颈、引入了什么复杂性；Netty Boss/Worker、Nginx worker 进程、Redis 事件循环的真实差异；Reactor 与 Proactor completion 语义的边界（epoll/kqueue vs IOCP vs io_uring）；以及用 event loop lag、ready backlog、worker 队列、accept 分布和 P99 做线上验证。",
   "tags": [
     "操作系统",
     "Reactor",
@@ -12,24 +12,29 @@
     "Netty"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 28,
+  "estimatedMinutes": 33,
   "order": 30,
   "recommendWeight": 88,
   "learningCards": [
     {
       "type": "explain",
-      "title": "Reactor 模式：它解决什么、三种形态（逐步解决瓶颈）",
-      "content": "## 它解决什么\nReactor 是基于事件驱动的网络编程模式：用一个或多个事件循环线程，通过 IO 多路复用（Linux 常见 epoll，BSD/macOS 常见 kqueue，跨平台库会封装 select/poll/epoll/kqueue）等待大量 fd 的 readiness。哪个 fd 可读/可写，就把事件分发给对应 Handler。核心是把“等待和分发 IO 事件”和“执行业务逻辑”拆开，避免一个连接一个线程的 C10K 瓶颈。\n\n## 三种形态（逐步解决瓶颈）\n- **单 Reactor 单线程**：一个事件循环包揽 accept、read/write、业务处理。简单、无锁，但慢 handler 会卡住全部连接，只适合 Redis 早期这种命令极快、内存型、可控的场景。\n- **单 Reactor 多线程**：Reactor 线程负责 accept 和 IO readiness 分发，慢业务丢给 worker pool。它解决业务阻塞 IO 的问题，但所有连接的 readiness 和回写仍集中在一个 Reactor 上，fd 数和事件量上来后会成为单点。\n- **主从 Reactor**：Main Reactor 专注 accept，新连接分给多个 Sub Reactor；每个 Sub Reactor 负责一组连接的读写，慢业务再交给 worker。它能利用多核，但要处理连接分配、负载均衡、跨线程唤醒、背压和关闭生命周期。"
+      "title": "Reactor 解决什么问题：从每连接一线程到事件驱动",
+      "content": "传统阻塞 IO 模型为每个连接分配一个线程，线程阻塞在 read/write 上等待数据。连接数上来后，线程数爆炸，内核调度和内存开销成为瓶颈——这就是 C10K 问题的根源。\n\nReactor 的核心思想是用一个或少量事件循环线程，通过 IO 多路复用（Linux 上 epoll、BSD/macOS 上 kqueue、跨平台库封装 select/poll/epoll/kqueue）同时监听大量 fd。当某个 fd 变为可读或可写，多路复用返回 ready fd 列表，事件循环按 fd 找到对应的 Handler，由 Handler 调用 read/write 完成实际数据搬运。\n\n关键词是 **readiness 语义**：系统通知你「这个 fd 准备好了，你可以读/写了」，但真正把数据从内核缓冲区搬到用户空间（或反向写入）这一步，仍由应用代码自己完成。这和 Proactor 的 completion 语义（系统替你搬完数据后通知「操作完成了」）形成根本区别。\n\nReactor 的价值不只是少用线程。更重要的是把「等待 IO 事件」和「执行业务逻辑」变成两个可独立优化的阶段：IO 线程只负责事件分发，保持轻量和低延迟；慢业务可以 offload 到 worker 线程池，两者互不干扰。"
     },
     {
       "type": "explain",
-      "title": "Reactor 模式：主流框架怎么用",
-      "content": "## 主流框架怎么用\n- **Netty**：`BossGroup` 接新连接，`WorkerGroup` 处理已连接 channel 的 IO 事件，Pipeline 中的 Handler 运行在哪个线程要看绑定的 EventLoop 和是否显式 offload。耗时业务不应直接堵在 IO EventLoop 上。\n- **Nginx**：Master 管理 worker；worker 进程各自跑事件循环处理连接。历史上用 accept_mutex 减少惊群，新内核和配置也可利用 `SO_REUSEPORT` 分散 accept 压力。Nginx 的 worker 是进程模型，不等同于 Netty 的线程组。\n- **Redis**：核心命令执行长期保持单线程事件循环，避免共享数据结构加锁；Redis 6 起网络读写可多线程辅助，但命令执行仍主要单线程，因此不能简单说“Redis 变成多线程 Reactor”。"
+      "title": "三种 Reactor 形态：逐步解决瓶颈",
+      "content": "**单 Reactor 单线程**\n\n一个 event loop 包揽所有事：accept 新连接、等待 fd readiness、调用 read/write、执行业务逻辑。优点是简单、无锁、没有线程切换开销。致命问题是慢 handler——只要有一个请求的业务逻辑耗时（比如查数据库、调 RPC），整个事件循环被堵住，所有连接的 IO 事件都得不到及时处理。\n\nRedis 早期选择这个模型，是因为它的命令几乎都是纯内存操作、执行时间在微秒级，单线程 event loop 一气呵成反而避免了锁和上下文切换开销。但普通业务服务无法照搬，因为业务链路里往往有 DB、RPC、磁盘等慢操作。\n\n**单 Reactor 多线程**\n\n把业务逻辑从 event loop 里拆出来丢给 worker 线程池。IO 线程只负责 readiness 分发，worker 线程负责执行慢业务。这样慢 handler 不再堵 IO loop。\n\n新瓶颈是 readiness 分发本身仍然集中在一个 Reactor 线程上。fd 数和事件量上来后，单个 Reactor 的 epoll_wait 返回量、事件分发和回写都可能成为瓶颈。所有连接的 read/write 也都在这个线程完成，多核利用不充分。\n\n**主从 Reactor（Main-Sub Reactor）**\n\nMain Reactor 只负责 accept 新连接，然后把连接分给多个 Sub Reactor，每个 Sub Reactor 各自负责一组连接的 IO readiness 和 read/write。慢业务再由 Sub Reactor 交给 worker 线程池。\n\n这解决了单 Reactor 的分发瓶颈，但引入新复杂性：连接分配策略（round-robin、least-connections、一致性哈希）、跨线程唤醒（Sub Reactor 线程在阻塞 select 时如何被新连接唤醒）、连接关闭时的生命周期协调（谁负责清理、怎么避免 use-after-free）、以及背压（下游处理不过来时怎么反压上游 accept）。"
     },
     {
       "type": "explain",
-      "title": "Reactor 模式：Reactor vs Proactor（高频对比）",
-      "content": "## Reactor vs Proactor\n- **Reactor 是 readiness 语义**：它通知“fd 可读/可写了”，应用还要自己调用 `read/write` 把数据搬到用户态或写回内核缓冲区。epoll/kqueue/select 都是典型基础。\n- **Proactor 是 completion 语义**：应用提交异步读写请求，内核或运行时完成数据搬运后通知“操作完成”，回调拿到结果。Windows IOCP 是典型 Proactor；Linux io_uring 提供 completion 风格接口，但不同操作是否真正异步、是否需要线程池或 fallback，要看内核版本、文件类型和配置。\n- 一句话：Reactor 通知“能读了”，Proactor 通知“读完了”。工程上更重要的是看 event loop lag、ready backlog、worker 队列、慢 handler、连接错误率和 P99，而不是只背模式名。"
+      "title": "主流框架的真实落地：Netty、Nginx、Redis",
+      "content": "**Netty 的 Boss/Worker 模型**\n\n`EventLoopGroup bossGroup` 负责 accept 新连接，`EventLoopGroup workerGroup` 负责已连接 channel 的 IO 事件。每个 EventLoop 绑定一个线程，一个 EventLoop 负责多个 channel。新连接注册到 workerGroup 中某个 EventLoop 后，该连接后续所有 IO 事件都在这个 EventLoop 线程里处理。\n\n关键陷阱：Pipeline 中的 Handler 运行在哪个线程，取决于 Handler 绑定的 EventLoop 以及是否有显式的业务线程池 offload。如果把耗时业务直接写在 IO Handler 里，效果等同于单 Reactor 慢 handler——整个 EventLoop 被堵住。正确做法是用 `DefaultEventExecutorGroup` 或自定义线程池显式 offload。\n\n**Nginx 的进程模型**\n\nMaster 进程管理 worker 进程，每个 worker 独立运行一个事件循环处理连接。历史上用 accept_mutex 避免惊群（多个 worker 同时被 accept 唤醒但只有一个能 accept 成功），新版本可用 `SO_REUSEPORT` 让内核在 socket 层面分发 accept，减少锁竞争。\n\nNginx 是多进程模型，worker 之间内存隔离、互不干扰，崩溃不影响其他 worker。这和 Netty 的多线程模型（线程共享进程内存）本质不同。不能把 Nginx worker 进程简单等同于 Netty 的 WorkerGroup 线程。\n\n**Redis 的演变**\n\nRedis 核心命令执行长期保持单线程事件循环，避免共享数据结构加锁——这是它选择单 Reactor 单线程的根本原因。Redis 6.0 引入多线程 IO（networking.c 的 I/O threads），但仅用于网络读写（read/write 系统调用），命令解析和执行仍然单线程。所以不能说「Redis 变成了多线程 Reactor」，它的命令执行路径本质上还是单线程的。"
+    },
+    {
+      "type": "explain",
+      "title": "Reactor vs Proactor：readiness 还是 completion",
+      "content": "**Reactor：readiness 语义**\n\n应用注册 fd 到多路复用器（epoll_ctl/kqueue），然后阻塞等待（epoll_wait/kevent）。当 fd 变为可读/可写，多路复用器返回 ready fd 列表。应用拿到通知后，自己调用 read/write 完成数据搬运。epoll、kqueue、select、poll 都是 readiness 模型的基础。\n\n**Proactor：completion 语义**\n\n应用提交一个异步读写请求（指定缓冲区、偏移、长度），然后继续做别的事。内核或运行时在后台完成数据搬运后，通过完成队列或回调通知应用「操作完成了」，应用直接处理结果。Windows IOCP 是最成熟的 Proactor 实现。\n\n**Linux io_uring 的位置**\n\nio_uring 提供了 completion 风格的提交队列（SQ）和完成队列（CQE）接口，理论上是 Proactor 模型。但实际行为取决于操作类型、内核版本和文件类型：对 socket 和 pipe，io_uring 可以真正做到异步；对普通文件，早期版本可能用内部线程池模拟异步（fallback），并非真正内核级异步。所以不能一概而论说「io_uring 就是 Proactor」。\n\n工程实践上，选择 Reactor 还是 Proactor 不只是背模式名称。更关键的是：事件循环是否被慢 handler 堵住、ready backlog 是否堆积、worker 队列是否过长、跨线程唤醒是否有遗漏、P99 延迟是否符合预期。"
     },
     {
       "type": "diagram",
@@ -51,49 +56,53 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 模型 | IO 事件等待 | 业务执行 | 优点 | 主要风险 |\n| --- | --- | --- | --- | --- |\n| 单 Reactor 单线程 | 一个 event loop 等所有 fd | 同一线程执行 handler | 简单、无锁、上下文少 | 慢 handler 阻塞所有连接 |\n| 单 Reactor 多线程 | 一个 event loop 分发 ready fd | worker pool 执行业务 | 业务不堵 IO loop | 单 Reactor 仍可能成为 readiness 分发瓶颈 |\n| 主从 Reactor | Main accept，多个 Sub Reactor 分片 IO | worker pool 或业务线程池 | 利用多核、连接分片、吞吐更高 | 连接分配、跨线程唤醒、背压和关闭生命周期更复杂 |\n| Proactor | 提交异步操作，等待 completion | 回调/完成队列处理结果 | 应用不再自己做第二阶段 read/write | 依赖内核/运行时异步能力，fallback 和调试更复杂 |"
+      "title": "三种 Reactor 形态与 Proactor 对比",
+      "content": "| 模型 | 谁做 IO 等待 | 谁执行业务 | 多核利用 | 关键风险 |\n| --- | --- | --- | --- | --- |\n| 单 Reactor 单线程 | 一个 event loop 等所有 fd | 同一线程 | 差，单核 | 慢 handler 堵住全部连接 |\n| 单 Reactor 多线程 | 一个 event loop | worker pool | 中，worker 多核 | readiness 分发仍是单点瓶颈 |\n| 主从 Reactor | Main accept + 多个 Sub 各等各的 fd | worker pool | 好，Sub 并行 | 连接分配、跨线程唤醒、关闭生命周期复杂 |\n| Proactor | 内核异步执行数据搬运 | 回调/完成队列 | 好 | 依赖内核异步能力，fallback 和调试复杂 |\n\n| 框架/系统 | Reactor 形态 | Accept | IO 事件处理 | 业务执行 | 特殊点 |\n| --- | --- | --- | --- | --- | --- |\n| Netty | 主从 Reactor | BossGroup EventLoop | WorkerGroup EventLoop | Pipeline Handler（可 offload） | Handler 运行线程取决于 EventLoop 绑定和 pipeline 配置 |\n| Nginx | 多进程事件循环 | worker 进程（accept_mutex 或 SO_REUSEPORT） | worker 进程事件循环 | worker 进程内 | 进程隔离，不等同 Netty 线程模型 |\n| Redis 6+ | 单 Reactor + 辅助 IO 线程 | 主线程事件循环 | IO 线程辅助 read/write | 主线程单线程执行命令 | 命令执行仍单线程，不是多线程 Reactor |"
     },
     {
       "type": "code",
-      "title": "Python 可运行：selectors 实现最小 Reactor 事件循环",
-      "content": "import selectors\nimport socket\n\nselector = selectors.DefaultSelector()\nserver, client = socket.socketpair()\nserver.setblocking(False)\nclient.setblocking(False)\nreceived = []\n\n\ndef on_read(sock):\n    data = sock.recv(1024)\n    if not data:\n        selector.unregister(sock)\n        sock.close()\n        return\n    received.append(data.decode())\n    sock.sendall(b\"echo:\" + data)\n\n\nselector.register(server, selectors.EVENT_READ, on_read)\nclient.sendall(b\"ping\")\n\nwhile not received:\n    events = selector.select(timeout=1.0)\n    if not events:\n        raise TimeoutError(\"reactor loop did not observe readiness\")\n    for key, mask in events:\n        handler = key.data\n        handler(key.fileobj)\n\nreply = client.recv(1024).decode()\nprint(\"handler received:\", received[0])\nprint(\"client reply:\", reply)\n\nselector.unregister(server)\nserver.close()\nclient.close()\n\nassert received == [\"ping\"]\nassert reply == \"echo:ping\"",
+      "title": "Python 可运行代码：selectors 实现最小 Reactor 事件循环",
+      "content": "import selectors\nimport socket\n\nselector = selectors.DefaultSelector()\nserver, client = socket.socketpair()\nserver.setblocking(False)\nclient.setblocking(False)\nreceived = []\n\n\ndef on_read(sock):\n    \"\"\"Reactor 中的 Handler：fd ready 后由应用侧 read/write，这是 readiness 语义\"\"\"\n    data = sock.recv(1024)\n    if not data:\n        selector.unregister(sock)\n        sock.close()\n        return\n    received.append(data.decode())\n    sock.sendall(b\"echo:\" + data)\n\n\n# 注册 fd 与 handler 的映射：Reactor 只负责等待和分发\nselector.register(server, selectors.EVENT_READ, on_read)\n\n# 模拟客户端发送\nclient.sendall(b\"ping\")\n\n# 最小 Reactor 主循环：select 等待 readiness → 分发给 handler\nwhile not received:\n    events = selector.select(timeout=1.0)\n    if not events:\n        raise TimeoutError(\"reactor loop did not observe readiness\")\n    for key, mask in events:\n        handler = key.data  # 取出注册时绑定的 handler\n        handler(key.fileobj)  # 调用 handler，handler 内部 read/write\n\nreply = client.recv(1024).decode()\nprint(\"handler received:\", received[0])\nprint(\"client reply:\", reply)\n\n# 清理\nselector.unregister(server)\nserver.close()\nclient.close()\n\nassert received == [\"ping\"]\nassert reply == \"echo:ping\"",
       "language": "python",
       "highlights": [
         {
           "line": 4,
-          "note": "DefaultSelector 会在不同系统上选择合适的多路复用实现，例如 epoll、kqueue 或 poll。"
+          "note": "DefaultSelector 在 Linux 上选 epoll、macOS 上选 kqueue、Windows 上选 select，跨平台抽象多路复用。"
         },
         {
           "line": 11,
-          "note": "Handler 在 fd ready 后主动 recv/send，体现 Reactor 是 readiness 语义，不是 completion 语义。"
+          "note": "Handler 在 fd ready 后自己调 recv/send：这是 readiness 语义，不是 completion 语义——应用侧搬运数据。"
         },
         {
-          "line": 20,
-          "note": "注册 fd 与 handler 的映射，Reactor 只负责等待和分发，不应该在这里做慢业务。"
+          "line": 21,
+          "note": "注册 fd 和 handler 的映射。Reactor 只负责等待和分发，handler 里不应做慢业务。"
         },
         {
-          "line": 23,
-          "note": "事件循环 select 到 ready fd 后取出 handler 并调用，这就是最小 Reactor 主循环。"
+          "line": 25,
+          "note": "事件循环主循环：select 返回 ready fd 后取出 handler 并调用，这就是 Reactor 的核心。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "**30 秒结论**\nReactor 是 readiness 事件分发模型：事件循环用 epoll/kqueue/select 等等待大量 fd，哪个 fd 可读/可写，就把事件分发给对应 Handler；Handler 再自己 read/write。它的价值是少量线程管理大量连接，但前提是 IO 线程不能被慢业务堵住。\n\n**架构拆解**\n1. 单 Reactor 单线程最简单，accept、read/write、业务都在一个 loop，适合 Redis 这类命令短、内存型场景；普通业务如果有 DB/RPC/CPU 计算，会拖慢所有连接。\n2. 单 Reactor 多线程把慢业务 offload 到 worker pool，IO loop 更轻，但 readiness 分发仍集中在一个 Reactor。\n3. 主从 Reactor 用 Main accept，新连接分配给多个 Sub Reactor，各自负责一组连接的 IO，再按需交给 worker；Netty 的 BossGroup/WorkerGroup 类似这个分工，但 Handler 是否 offload 要看 pipeline 配置。\n4. Nginx 是 master/worker 多进程事件循环，worker 各自处理连接；accept_mutex 或 SO_REUSEPORT 解决 accept 分散和惊群问题，不能把它简单等同于 Netty 线程组。\n\n**Reactor vs Proactor**\nReactor 通知“能读了”，应用线程还要 read；Proactor 通知“读完了”，回调拿 completion 结果。Windows IOCP 是典型 Proactor；Linux io_uring 提供 completion 风格，但不同操作是否真正异步要看内核和文件类型。\n\n**线上验证**\n看 event loop lag、ready backlog、worker 队列、慢 handler、accept 分布、P99 延迟和连接错误率；如果 IO 线程 CPU 不高但延迟高，往往要查 worker 队列、下游 RPC、锁和回压。",
+      "content": "**30 秒结论**\nReactor 是 readiness 事件分发模型：事件循环用 epoll/kqueue 等等待大量 fd，哪个 fd 可读/可写就把事件分发给对应 Handler，Handler 再自己 read/write。它的价值是少量线程管理大量连接，但前提是 IO 线程不能被慢业务堵住。\n\n**架构拆解：三种形态的瓶颈迁移**\n- **单 Reactor 单线程**：一个 event loop 包揽 accept、IO、业务。简单无锁，但慢 handler 堵住所有连接。Redis 用这个模型能工作，是因为命令微秒级、纯内存操作，单线程避免了锁竞争。普通业务有 DB/RPC，无法照搬。\n- **单 Reactor 多线程**：IO loop 分发事件，慢业务丢给 worker pool。IO loop 不再被堵，但 readiness 分发本身仍是单点瓶颈，fd 多了可能扛不住。\n- **主从 Reactor**：Main accept + 多个 Sub Reactor 分片 IO + worker pool。利用多核、吞吐高，但连接分配、跨线程唤醒、关闭生命周期、背压都更复杂。\n\n**Netty/Nginx/Redis 的真实差异**\n- **Netty**：BossGroup = Main Reactor（accept），WorkerGroup = Sub Reactor（IO 事件）。Handler 运行线程取决于 EventLoop 绑定，慢业务必须显式 offload，否则堵住 EventLoop。\n- **Nginx**：master/worker 多进程事件循环。accept_mutex 或 SO_REUSEPORT 解决惊群。进程隔离，不是 Netty 那种线程共享内存模型。\n- **Redis 6+**：核心命令仍单线程事件循环执行。IO 线程只辅助网络 read/write，不是「多线程 Reactor」。\n\n**Reactor vs Proactor**\nReactor 通知「能读了」，应用自己 read；Proactor 通知「读完了」，回调拿结果。Linux 原生 aio 对网络支持有限，所以 Linux 主流是 Reactor（epoll）；Windows IOCP 是典型 Proactor。io_uring 提供 completion 风格接口，但 socket 异步是真的，文件 IO 早期版本可能用内部线程池 fallback。\n\n**线上验证指标**\nevent loop lag（事件循环一次迭代耗时）、ready backlog（epoll_wait 返回但还没处理的事件数）、worker 队列长度和任务耗时、accept 分布（各 worker/sub 接到的连接是否均匀）、P99 延迟、连接错误率。如果 IO 线程 CPU 不高但延迟高，多半是 worker 队列积压、下游 RPC 慢或锁竞争。",
       "followUpQuestions": [
         {
           "question": "单 Reactor 单线程模型，为什么 Redis 用它能那么快，而一般业务服务器不能照搬？",
-          "answer": "Redis 的命令几乎都是纯内存操作、执行极快（微秒级），单线程 Reactor 里‘读事件→执行命令→写回’一气呵成，没有锁竞争、没有上下文切换，反而把多线程的同步开销省了，所以单线程也能几十万 QPS。普通业务服务器不行是因为业务处理往往包含 DB 查询、RPC、磁盘 IO 等慢操作，单线程模型里一个慢请求会把整个事件循环堵住、拖垮所有连接。所以业务服务通常用主从 Reactor，把慢业务丢到 Worker 线程池，让 IO 线程始终轻量、不被业务阻塞。"
+          "answer": "Redis 的命令几乎都是纯内存操作，执行时间微秒级，单线程 event loop 里「读事件→执行命令→写回」一气呵成，没有锁竞争、没有线程切换，反而把多线程同步开销全省了，单线程也能几十万 QPS。普通业务服务器的业务链路包含 DB 查询、RPC 调用、磁盘 IO 等慢操作，单 Reactor 里一个慢请求会堵住整个事件循环，拖垮所有连接。所以业务服务通常用主从 Reactor，把慢业务 offload 到 worker 线程池，让 IO 线程始终轻量不被业务阻塞。"
         },
         {
           "question": "Reactor 和 Proactor 的本质区别是什么？为什么 Linux 上主流是 Reactor？",
-          "answer": "区别在于‘谁来搬数据’。Reactor 基于 IO 多路复用，是同步的：它只通知你‘这个 fd 可读了’，真正把数据从内核读到用户缓冲区还得你自己调 read。Proactor 基于真正的异步 IO：你发起读操作后内核把数据读好放进你给的缓冲区、再通知你，你直接处理结果，连读都不用自己做。一句话：Reactor 通知‘能读了’，Proactor 通知‘读完了’。Linux 上主流是 Reactor，因为 Linux 原生异步 IO（aio）长期对网络支持不完善，而 epoll 非常成熟高效；Windows 的 IOCP 才是典型 Proactor，Linux 要到 io_uring 普及后才有像样的 Proactor 选项。"
+          "answer": "本质区别在于谁来搬数据。Reactor 基于 IO 多路复用（epoll/kqueue），是 readiness 语义：它通知你「fd 可读了」，但从内核缓冲区读到用户空间这步你得自己做 read。Proactor 是 completion 语义：你提交异步读请求，内核把数据搬到你给的缓冲区后通知「读完了」，你直接处理结果。Linux 上主流是 Reactor，因为 Linux 原生异步 IO（aio）长期对网络 socket 支持不完善，而 epoll 成熟高效；Windows 的 IOCP 才是典型 Proactor。io_uring 补上了这块，但不同操作类型和内核版本下行为有差异。"
         },
         {
-          "question": "Reactor 模式 在真实项目里怎么做取舍和验证？",
-          "answer": "先确认瓶颈在 IO 事件循环、业务 worker 还是下游依赖。指标上看 event loop lag、ready backlog、accept 分布、worker 队列长度、任务执行耗时、P99 延迟和连接错误率；trace 上看慢 handler、阻塞调用、锁等待和跨线程唤醒。修复可能是业务 offload、增加 Sub Reactor、拆 worker 池、限流背压或隔离慢下游，验证要看延迟和 backlog 是否同步下降。"
+          "question": "Netty 里把业务逻辑直接写在 ChannelHandler 里会有什么问题？怎么解决？",
+          "answer": "Netty 的 ChannelHandler 默认运行在绑定该 Channel 的 EventLoop 线程上。如果 handler 里做耗时操作（DB 查询、RPC 调用、复杂计算），EventLoop 线程被堵住，该 EventLoop 上所有 Channel 的 IO 事件都无法及时处理，效果等同于单 Reactor 的慢 handler。解决办法是用 `DefaultEventExecutorGroup` 或自定义线程池显式 offload 业务 handler，让 IO EventLoop 始终只做事件分发和快速 read/write。"
+        },
+        {
+          "question": "主从 Reactor 模型引入了哪些单 Reactor 不存在的复杂性？",
+          "answer": "四点：(1) 连接分配策略——新连接怎么分给 Sub Reactor，round-robin 可能不均匀，least-connections 需要维护计数；(2) 跨线程唤醒——Sub Reactor 阻塞在 epoll_wait 时新连接来了，需要 pipe/eventfd 写入唤醒它，否则新连接延迟处理；(3) 关闭生命周期——连接在 Sub Reactor 线程被关闭，但其他线程可能持有引用，需要同步机制避免 use-after-free；(4) 背压——下游处理不过来时怎么反压上游 accept 或 read，避免内存堆积。"
         }
       ]
     },
@@ -101,65 +110,73 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "能解释 Reactor 的 readiness 语义：fd 就绪后应用侧仍要 read/write",
-        "能区分单 Reactor、单 Reactor 多线程、主从 Reactor 的瓶颈迁移",
-        "能说明 Main Reactor、Sub Reactor、Worker 的职责和跨线程风险",
-        "能解释 Netty Boss/Worker、Nginx worker、Redis 事件循环的差异",
-        "能说明 Reactor 和 Proactor 的 completion 语义区别",
-        "能说清慢 handler、worker 队列、event loop lag、背压如何影响 P99",
-        "能用指标验证 Reactor 设计是否真的解决了容量瓶颈"
+        "能解释 Reactor 的 readiness 语义：多路复用通知 fd 就绪后应用侧仍要 read/write",
+        "能区分单 Reactor 单线程、单 Reactor 多线程、主从 Reactor 各自解决的瓶颈和引入的复杂性",
+        "能说明 Main Reactor、Sub Reactor、Worker 的职责分工和跨线程风险（唤醒、关闭、背压）",
+        "能解释 Netty Boss/Worker 与 Reactor 分工的对应关系，以及 Handler offload 的必要性",
+        "能区分 Nginx 多进程事件循环与 Netty 多线程模型的差异（进程隔离 vs 线程共享内存）",
+        "能说明 Redis 6+ IO 多线程只辅助 read/write、命令执行仍单线程的事实",
+        "能解释 Reactor vs Proactor 的 readiness/completion 区别和 io_uring 的位置",
+        "能用 event loop lag、ready backlog、worker 队列、accept 分布、P99 延迟验证 Reactor 设计是否解决了容量瓶颈"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "os.io-model.topic-reactor.recall.1",
-      "prompt": "请说明 Reactor 模式中 Reactor、Acceptor、Handler 分别负责什么。",
+      "prompt": "请完整解释 Reactor 模式的工作原理：它基于什么语义、事件循环做什么、Handler 做什么、为什么能解决 C10K？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
       "id": "os.io-model.topic-reactor.recall.2",
-      "prompt": "Netty 的 BossGroup 和 WorkerGroup 分别对应 Reactor 的哪个角色？",
+      "prompt": "单 Reactor 单线程、单 Reactor 多线程、主从 Reactor 三种形态各自解决了什么瓶颈、又引入了什么新问题？",
       "mode": "text",
-      "expectedMinutes": 3,
+      "expectedMinutes": 5,
       "difficulty": 4
     },
     {
       "id": "os.io-model.topic-reactor.recall.3",
-      "prompt": "Reactor 模式 和相邻概念或常见替代方案有什么关键区别？",
+      "prompt": "Netty 的 BossGroup 和 WorkerGroup 分别对应 Reactor 的哪个角色？如果把耗时业务直接写在 ChannelHandler 里会怎样？",
       "mode": "text",
       "expectedMinutes": 4,
       "difficulty": 4
     },
     {
-      "id": "os.io-model.topic-reactor.recall.scenario",
-      "prompt": "生产环境里 Reactor 模式 出现延迟升高、结果异常或边界条件被触发时，你会怎样定位、权衡和验证修复效果？",
+      "id": "os.io-model.topic-reactor.recall.4",
+      "prompt": "Reactor 和 Proactor 的本质区别是什么？io_uring 算哪个模型？为什么 Linux 上主流是 Reactor？",
       "mode": "text",
       "expectedMinutes": 4,
+      "difficulty": 4
+    },
+    {
+      "id": "os.io-model.topic-reactor.recall.5",
+      "prompt": "生产环境用 Reactor 模型的服务出现 P99 延迟升高，但 CPU 和内存都不高。你会怎么排查？需要看哪些指标？最终可能调什么？",
+      "mode": "text",
+      "expectedMinutes": 5,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "Reactor readiness 语义和 IO/业务分离的核心思想",
-      "单 Reactor、单 Reactor 多线程、主从 Reactor 的职责和瓶颈",
-      "Netty BossGroup/WorkerGroup 与 Reactor 分工的对应关系",
-      "Nginx worker 事件循环、accept_mutex/SO_REUSEPORT 与 Netty 线程模型的差异"
+      "Reactor 的 readiness 语义：IO 多路复用返回 ready fd，应用侧仍要 read/write",
+      "单 Reactor、单 Reactor 多线程、主从 Reactor 三种形态的职责分工和瓶颈迁移",
+      "Netty BossGroup/WorkerGroup 与 Main/Sub Reactor 的对应关系，以及 Handler offload 的必要性",
+      "event loop lag、ready backlog、worker 队列、accept 分布、P99 等线上验证指标"
     ],
     "goodToHave": [
-      "Redis 单线程命令执行与 Redis 6 网络 IO 多线程的边界",
-      "Netty Handler Pipeline、EventLoop 绑定和业务 offload 风险",
-      "event loop lag、ready backlog、worker 队列、accept 分布、P99 等验证指标",
-      "Reactor 与 Proactor、io_uring completion 语义的边界"
+      "Redis 6+ IO 多线程只辅助 read/write、命令执行仍单线程的边界",
+      "Nginx 多进程事件循环（accept_mutex/SO_REUSEPORT）与 Netty 多线程模型的差异",
+      "主从 Reactor 的跨线程唤醒、连接关闭生命周期、背压等工程复杂性",
+      "Reactor vs Proactor 和 io_uring completion 语义的区别，以及 io_uring 不同操作的异步行为差异"
     ],
     "commonMistakes": [
-      "把 Reactor 说成异步 IO，忽略应用侧仍要 read/write",
-      "认为把业务丢线程池就一定快，不看 worker 队列和背压",
-      "把 Nginx worker 进程模型简单等同于 Netty Boss/Worker 线程组",
-      "只背单/多/主从名词，说不出慢 handler、accept 分布、跨线程唤醒和关闭生命周期",
-      "把 io_uring 一概说成 Proactor 或零拷贝，忽略操作类型和 fallback"
+      "把 Reactor 说成「异步 IO」，忽略应用侧仍要自己 read/write",
+      "认为把业务丢到线程池就一定快，不看 worker 队列积压和背压",
+      "把 Nginx worker 进程模型简单等同于 Netty 的 Boss/Worker 线程组",
+      "只背单/多/主从名词，说不出慢 handler、跨线程唤醒、accept 分布和关闭生命周期",
+      "把 io_uring 一概说成 Proactor 或零拷贝，忽略不同操作类型和内核版本下的 fallback 行为"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -168,11 +185,11 @@
       "depth": 25
     }
   },
-  "updatedAt": "2026-06-19",
+  "updatedAt": "2026-06-22",
   "status": "production",
   "prerequisites": [
     "os.io-model.topic-select-poll-epoll"
   ],
   "interviewFrequency": "medium",
-  "interviewerFocus": "考察是否能围绕「Reactor 模式」说清 readiness 事件分发、Handler read/write、单/多线程/主从 Reactor 的瓶颈迁移、Netty/Nginx/Redis 的真实差异、Reactor vs Proactor/io_uring completion 边界，并能用 event loop lag、ready backlog、worker 队列、accept 分布和 P99 指标验证问题。"
+  "interviewerFocus": "考察能否围绕 Reactor 模式说清 readiness 事件分发语义、单/多线程/主从三种形态的瓶颈迁移和工程复杂性、Netty/Nginx/Redis 的真实落地差异、Reactor vs Proactor/io_uring 的 completion 边界，并能用 event loop lag、ready backlog、worker 队列、accept 分布和 P99 做线上验证和排查。"
 }

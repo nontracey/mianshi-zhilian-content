@@ -4,7 +4,7 @@
   "category": "ef-core",
   "group": "ef-core",
   "title": "EF Core 性能优化",
-  "summary": "讲清 EF Core 性能优化的核心：N+1 与 Include/投影、AsNoTracking、批量 ExecuteUpdate/Delete、字段裁剪，以及先用 SQL 日志定位的方法。",
+  "summary": "讲清 EF Core 性能优化的核心：N+1 问题的产生机制与三种解法（Include/投影/拆分查询）的适用边界、AsNoTracking 为何更快（跳过 ChangeTracker 快照与 Identity Resolution）、EF Core 7+ ExecuteUpdate/Delete 绕过实体加载直接生成单条 SQL、投影裁剪与分页、编译查询省去表达式树翻译、以及先用 SQL 日志定位再选择手段的排查方法论。",
   "tags": [
     ".NET",
     "EF Core",
@@ -14,25 +14,40 @@
     "批量操作"
   ],
   "difficulty": 4,
-  "estimatedMinutes": 45,
+  "estimatedMinutes": 48,
   "order": 20,
   "recommendWeight": 90,
   "status": "staging",
   "learningCards": [
     {
       "type": "explain",
-      "title": "EF Core 性能优化：N+1 问题、AsNoTracking",
-      "content": "EF Core 性能优化是生产环境应用的关键，理解常见性能问题和优化技巧至关重要。\n## N+1 问题\n\nN+1 问题是 ORM 框架最常见的性能问题：\n```csharp\n// 问题代码：产生 N+1 查询\nvar users = await _context.Users.ToListAsync();\nforeach (var user in users)\n{\n    // 每次循环都会查询一次数据库\n    var orders = await _context.Orders\n        .Where(o => o.UserId == user.Id)\n        .ToListAsync();\n}\n```\n\n**解决方案 1：Eager Loading（预先加载）**\n```csharp\nvar users = await _context.Users\n    .Include(u => u.Orders)  // 一次查询加载关联数据\n    .ToListAsync();\n```\n\n**解决方案 2：投影**\n```csharp\nvar userDtos = await _context.Users\n    .Select(u => new UserDto\n    {\n        Id = u.Id,\n        Name = u.Name,\n        OrderCount = u.Orders.Count\n    })\n    .ToListAsync();\n```\n\n**解决方案 3：批量查询**\n```csharp\nvar userIds = users.Select(u => u.Id).ToList();\nvar orders = await _context.Orders\n    .Where(o => userIds.Contains(o.UserId))\n    .ToListAsync();\n```\n\n## AsNoTracking\n\n对于只读查询，使用 AsNoTracking 减少开销：\n```csharp\nvar users = await _context.Users\n    .AsNoTracking()\n    .Where(u => u.IsActive)\n    .ToListAsync();\n```\n\n**优点**：\n- 不跟踪实体变化\n- 内存占用更少\n- 查询速度更快\n\n**适用场景**：\n- 只读查询\n- 报表生成\n- 数据导出\n\n## 变更跟踪优化\n\n**手动跟踪**：\n```csharp\nvar user = new User { Id = 1, Name = \"Updated\" };\n_context.Entry(user).State = EntityState.Modified;\nawait _context.SaveChangesAsync();\n```\n\n**批量更新（EF Core 7+）**：\n```csharp\nawait _context.Users\n    .Where(u => !u.IsActive)\n    .ExecuteUpdateAsync(s => s\n        .SetProperty(u => u.IsDeleted, true)\n        .SetProperty(u => u.DeletedAt, DateTime.UtcNow));\n```\n\n**批量删除（EF Core 7+）**：\n```csharp\nawait _context.Users\n    .Where(u => u.IsDeleted)\n    .ExecuteDeleteAsync();\n```"
+      "title": "N+1 的产生机制：懒加载导航属性如何变成 N 条额外 SQL",
+      "content": "N+1 问题的本质是：先用一条 SQL 查出 N 条主记录（如 100 个 User），然后遍历每条记录时触发其导航属性的延迟加载（lazy loading）或显式 `_context.Entry(user).Collection(u => u.Orders).LoadAsync()`，为每条记录再发一条查询关联数据的 SQL。最终发出 1 + N 条查询。\n\n问题不在 EF Core 本身——它忠实地执行了你写的代码逻辑。问题在于开发者没有意识到 `user.Orders` 的访问触发了一次数据库往返。如果 N=100，总查询次数是 101 次；如果再嵌套一层一对多（如 Order → OrderItems），就是 1 + N + N*M 次，随数据量线性甚至乘积增长。\n\nEF Core 默认不启用懒加载（需手动安装 Microsoft.EntityFrameworkCore.Proxies 并在配置中调用 `UseLazyLoadingProxies()`），但即使不启用，很多新手代码会用显式 Load 或手动遍历 ID 再查询，效果一样。排查线索：SQL 日志中出现大量 `WHERE UserId = @p0` 的重复结构查询。"
     },
     {
       "type": "explain",
-      "title": "EF Core 性能优化：查询优化技巧、批量操作优化",
-      "content": "## 查询优化技巧\n\n**1. 使用投影**：\n```csharp\n// 不推荐：加载整个实体\nvar users = await _context.Users.ToListAsync();\n\n// 推荐：只查询需要的字段\nvar userDtos = await _context.Users\n    .Select(u => new { u.Id, u.Name })\n    .ToListAsync();\n```\n\n**2. 分页查询**：\n```csharp\nvar pagedUsers = await _context.Users\n    .OrderBy(u => u.Id)\n    .Skip((page - 1) * pageSize)\n    .Take(pageSize)\n    .ToListAsync();\n```\n\n**3. 使用 Any 而非 Count**：\n```csharp\n// 不推荐\nif (await _context.Users.CountAsync(u => u.IsActive) > 0)\n\n// 推荐\nif (await _context.Users.AnyAsync(u => u.IsActive))\n```\n\n**4. 编译查询**：\n```csharp\nprivate static readonly Func<AppDbContext, int, User> GetUserById =\n    EF.CompileQuery((AppDbContext context, int id) =>\n        context.Users.FirstOrDefault(u => u.Id == id));\n\nvar user = GetUserById(_context, 1);\n```\n\n## 批量操作优化\n\n**批量插入**：\n```csharp\n// 使用 AddRange\nawait _context.Users.AddRangeAsync(users);\nawait _context.SaveChangesAsync();\n\n// 使用 EFCore.BulkExtensions（第三方库）\nawait _context.BulkInsertAsync(users);\n```\n\n**批量更新**：\n```csharp\n// EF Core 7+ ExecuteUpdate\nawait _context.Users\n    .Where(u => u.CreatedAt < DateTime.UtcNow.AddDays(-30))\n    .ExecuteUpdateAsync(s => s\n        .SetProperty(u => u.IsActive, false));\n\n// 使用第三方库\nawait _context.BulkUpdateAsync(users);\n```\n\n## 读写分离\n\n```csharp\n// 配置多个 DbContext\nservices.AddDbContext<ReadDbContext>(options =>\n    options.UseSqlServer(readConnectionString));\n\nservices.AddDbContext<WriteDbContext>(options =>\n    options.UseSqlServer(writeConnectionString));\n\n// 使用\npublic class UserService\n{\n    private readonly ReadDbContext _readContext;\n    private readonly WriteDbContext _writeContext;\n\n    public async Task<User> GetUserAsync(int id)\n    {\n        return await _readContext.Users.FindAsync(id);\n    }\n\n    public async Task UpdateUserAsync(User user)\n    {\n        _writeContext.Users.Update(user);\n        await _writeContext.SaveChangesAsync();\n    }\n}\n```"
+      "title": "解决 N+1 的三种手段：Include、投影、拆分查询的取舍",
+      "content": "**Include / ThenInclude（Eager Loading）**\n在主查询上通过 `.Include(u => u.Orders)` 一次性 JOIN 查出关联数据，生成一条带 LEFT JOIN 或 CROSS JOIN 的 SQL。EF Core 内部通过 ChangeTracker 的 Identity Resolution（同一主键的实体只实例化一次）在内存中正确组装对象图。\n\n优点：拿到完整实体对象，可继续跟踪和修改。\n\n坑：多层一对多 Include（如 User → Orders → OrderItems）会产生笛卡尔积——假设某 User 有 5 个 Order、每个 Order 有 10 个 OrderItems，SQL 结果集会有 1 + 5 + 50 = 56 行，但 Include 三层实际可能产生更多重复列。这叫「单查询 Include 的笛卡尔积爆炸」。当关联数据量大时，大量重复数据在网络和内存中传输，性能反而不如拆分查询。\n\n**投影（Select → DTO/匿名类型）**\n用 `.Select(u => new UserDto { ... })` 只取需要的字段，数据库只返回实际使用的列，省掉 ChangeTracker 开销和不必要的数据传输。\n\n优点：数据量最小、最快、可聚合（Count、Sum 等直接在 SQL 层完成）。\n\n缺点：拿到的是 DTO 或匿名类型，不是实体，无法跟踪和 SaveChanges。适合只读展示。\n\n**拆分查询（AsSplitQuery）**\n在 Include 后追加 `.AsSplitQuery()`，EF Core 会把一条 JOIN 查询拆成多条独立查询（主表一条 + 每个 Include 层一条），在客户端内存中组装对象图。避免笛卡尔积，但多了几次数据库往返。\n\n适用场景：多层一对多 Include 导致结果集行数爆炸时。代价：多次往返 + 不能保证跨查询的一致性快照（在 Snapshot 隔离级别下可能读到不同时刻的数据）。\n\n**选择原则**：只读展示 → 投影；需要完整实体后续操作 → Include；Include 多层一对多导致数据爆炸 → AsSplitQuery。"
     },
     {
       "type": "explain",
-      "title": "EF Core 性能优化：查询分析、性能监控",
-      "content": "## 查询分析\n\n**启用日志**：\n```csharp\noptions.UseSqlServer(connectionString)\n    .LogTo(Console.WriteLine, LogLevel.Information)\n    .EnableSensitiveDataLogging();\n```\n\n**使用 MiniProfiler**：\n```csharp\nbuilder.Services.AddMiniProfiler(options =>\n{\n    options.RouteBasePath = \"/profiler\";\n}).AddEntityFramework();\n```\n\n## 性能监控\n\n**用 Application Insights 追踪 EF 查询耗时**：\n```csharp\nbuilder.Services.AddApplicationInsightsTelemetry();\n```\n\n**自定义计时**：\n```csharp\nvar stopwatch = Stopwatch.StartNew();\nvar users = await _context.Users.ToListAsync();\nstopwatch.Stop();\n_logger.LogInformation($\"查询耗时: {stopwatch.ElapsedMilliseconds}ms\");\n```\n\n## 最佳实践总结\n\n1. **避免 N+1**：使用 Include 或投影\n2. **只读查询用 AsNoTracking**\n3. **只查询需要的字段**\n4. **使用分页避免大量数据**\n5. **批量操作使用批量 API**\n6. **编译高频查询**\n7. **监控慢查询**\n8. **合理使用索引**"
+      "title": "AsNoTracking 为何更快：跳过 ChangeTracker 的快照与 Identity Resolution",
+      "content": "EF Core 的 ChangeTracker 在查询结果返回时做两件事：\n\n1. **快照（Snapshot）**：对每个实体的所有属性值做一份拷贝，保存在 DbContext 内部。SaveChanges 时对比当前值与快照，只生成有变化的列的 UPDATE 语句。这个拷贝操作在实体数量大时有明显的 CPU 和内存开销。\n\n2. **Identity Resolution（同一性解析）**：同一 DbContext 实例内，相同主键的实体只实例化一次。如果你通过 Include 加载 User 和它的 Orders，两个不同的 Order 引用同一个 User 导航属性时，EF 确保它们指向同一个 C# 对象。这需要维护一个内部字典做主键查重。\n\n`AsNoTracking()` 告诉 EF Core 跳过这两步：不做快照拷贝、不维护 Identity Resolution 字典、实体对象直接返回不入 ChangeTracker。对于只读查询，这两个机制是纯粹的浪费。\n\n效果：查询返回大量实体时（如列表接口、报表导出），AsNoTracking 的内存占用和 CPU 时间显著更低。实测中，10 万条记录的查询，AsNoTracking 可比默认跟踪模式快 30%-50%（取决于实体列数和字段大小）。\n\n注意事项：AsNoTracking 的实体如果在同一个 DbContext 实例内被多次查询返回，每次都是独立对象（不共享引用）。如果后续想修改并保存，需要手动 `Attach` 或切换回跟踪模式。"
+    },
+    {
+      "type": "explain",
+      "title": "EF Core 7+ ExecuteUpdate/Delete：绕过实体加载的直接 SQL 执行",
+      "content": "EF Core 7 引入的 `ExecuteUpdate` 和 `ExecuteDelete` 是真正的服务端批量操作：\n\n```csharp\n// 批量更新：生成一条 UPDATE ... SET ... WHERE ...\nawait context.Users\n    .Where(u => !u.IsActive)\n    .ExecuteUpdateAsync(s => s\n        .SetProperty(u => u.IsDeleted, true)\n        .SetProperty(u => u.DeletedAt, DateTime.UtcNow));\n\n// 批量删除：生成一条 DELETE ... WHERE ...\nawait context.Users\n    .Where(u => u.IsDeleted)\n    .ExecuteDeleteAsync();\n```\n\n与传统方式（查出实体 → 修改属性 → SaveChanges）的根本区别：\n\n- **不加载实体到内存**：不需要先 SELECT 再 UPDATE，直接在数据库端执行\n- **不触发 ChangeTracker**：不会实例化任何 C# 对象\n- **一条 SQL 搞定**：网络往返一次，无论匹配多少行\n- **不触发 SaveChanges 拦截器和审计**：因为不走 ChangeTracker 管道，Interceptor、Domain Event 等 SaveChanges 相关的钩子不会触发\n\n**重要边界**：\n1. ExecuteUpdate 的 SetProperty 只支持映射到数据库列的属性赋值，不能调用 C# 方法或计算\n2. 不触发实体生命周期事件（如 SavingChanges、SavedChanges）——如果有审计字段（UpdatedAt、UpdatedBy）需要在 SQL 中手动设\n3. 在事务中使用时语义与普通 SQL 一致，但绕过了乐观并发检查（除非手动加 WHERE 条件做版本比对）\n4. EF Core 8 进一步支持了 ExecuteUpdate 中的复杂 SET 表达式（如 `s => s.SetProperty(u => u.Score, u => u.Score + 10)`）"
+    },
+    {
+      "type": "explain",
+      "title": "投影裁剪、分页、Any vs Count：查询层面的细节优化",
+      "content": "**投影裁剪**：`Select(u => new { u.Id, u.Name })` 让 EF Core 生成 `SELECT [u].[Id], [u].[Name]`，而不是 `SELECT *`。好处是：①减少网络传输量（尤其实体有大字段/大文本列时效果显著）；②如果投影后的列全在索引覆盖范围内，数据库可能走 Index Only Scan 而不回表。\n\n**分页**：`OrderBy().Skip().Take()` 生成 `OFFSET @p0 ROWS FETCH NEXT @p1 ROWS ONLY`（SQL Server）。注意 Skip 前必须有 OrderBy，否则 EF Core 会抛异常或生成不确定顺序的分页。深分页（Skip 100000）在数据库端仍需扫描并跳过前 100000 行，性能差。大数据量分页考虑 keyset pagination（WHERE Id > lastId）。\n\n**Any vs Count**：`AnyAsync()` 生成 `SELECT CASE WHEN EXISTS(...) THEN 1 ELSE 0 END`，数据库找到第一条匹配行就返回。`CountAsync(u => u.IsActive) > 0` 生成 `SELECT COUNT(*) ...`，数据库必须扫描所有匹配行计数。当匹配行多时，Any 快得多。\n\n**编译查询**：`EF.CompileQuery` 把 LINQ 表达式树预编译成缓存的查询计划，省去每次调用时的表达式树解析和 SQL 生成。适合高频固定模式查询（如根据 ID 查单条）。但编译查询不支持动态条件组合，灵活性差。EF Core 8+ 内部对普通查询的编译缓存已大幅改进，编译查询的性能优势缩小，但仍有微弱优势。"
+    },
+    {
+      "type": "explain",
+      "title": "排查方法论：先看 SQL 日志再选手段",
+      "content": "EF Core 性能优化的第一步不是调代码，是看生成了什么 SQL。\n\n**工具链**：\n1. **EF Core 日志**：`options.LogTo(Console.WriteLine, LogLevel.Information)` 或接入 ILogger，看实际生成的 SQL 语句和执行次数\n2. **MiniProfiler + EF Core 集成**：在页面上直接展示每步查询的 SQL、耗时和参数，开发环境最方便\n3. **数据库端 Profiler**：SQL Server Profiler / pg_stat_statements / MySQL slow query log，看数据库实际执行计划和耗时\n4. **Application Insights / OpenTelemetry**：生产环境追踪 EF 查询的 span 和耗时分布\n\n**排查步骤（按优先级）**：\n1. **数查询次数**：一个接口发了多少条 SQL？如果远超预期（如列表接口发了几十上百条），大概率是 N+1，优先用 Include/投影合并\n2. **看单条 SQL 内容**：是否有 SELECT *？是否缺少 WHERE 条件？拿到数据库 EXPLAIN 看执行计划——全表扫描、缺索引、Key Lookup 是常见根因\n3. **看数据量**：是否没分页拉了整表？是否 Include 太多导致笛卡尔积？大结果集是否缺 AsNoTracking？\n4. **看写入模式**：是否逐条 SaveChanges？是否查出再改再存？考虑批量 API\n\n先定位瓶颈再选手段，不要凭直觉「加索引」「加缓存」。"
     },
     {
       "type": "diagram",
@@ -54,38 +69,62 @@
     },
     {
       "type": "compareTable",
-      "title": "对比与边界",
-      "content": "| 维度 | Include (Eager Loading) | 投影 (Select) | AsNoTracking |\n| --- | --- | --- | --- |\n| 加载方式 | 一次查询加载关联数据 | 只查询需要的字段 | 不跟踪实体变化 |\n| 内存占用 | 高（加载完整实体） | 低（只加载部分字段） | 中 |\n| 适用场景 | 需要关联数据 | 只需要部分字段 | 只读查询 |\n| 性能 | 好（避免 N+1） | 最好 | 好 |\n| 可修改性 | 可以修改实体 | 返回匿名类型/DTO | 不能修改 |"
+      "title": "Include、投影、拆分查询：N+1 三种解法的取舍",
+      "content": "| 维度 | Include (Eager Loading) | 投影 (Select → DTO) | AsSplitQuery |\n| --- | --- | --- | --- |\n| 生成 SQL | 一条 JOIN 查询 | 一条 SELECT 指定列 | 多条独立查询（主表 + 每个 Include 层一条）\n| ChangeTracker | 实体入跟踪 | 不入跟踪（DTO） | 实体入跟踪\n| 数据量 | 可能有笛卡尔积重复行 | 最小，只取需要的列 | 每次结果集无笛卡尔积\n| 适用场景 | 需要完整实体后续修改 | 只读展示/聚合统计 | 多层一对多 Include 导致数据爆炸\n| 并发一致性 | 单条 SQL 原子快照 | 单条 SQL 原子快照 | 多条 SQL 可能读到不同时刻数据\n| Identity Resolution | 同一主键共享对象 | 不涉及 | 同一主键共享对象"
     },
     {
       "type": "compareTable",
-      "title": "维度对比",
-      "content": "| 维度 | 逐条操作 | 批量操作 (ExecuteUpdate/Delete) |\n| --- | --- | --- |\n| 执行方式 | 逐条生成 SQL | 生成一条 SQL |\n| 性能 | 慢（大量 SQL） | 快（一条 SQL） |\n| 网络开销 | 高 | 低 |\n| 适用场景 | 复杂业务逻辑 | 简单批量操作 |\n| 事务支持 | 自动 | 需要手动管理 |\n| EF Core 版本 | 所有版本 | 7.0+ |"
+      "title": "传统逐条操作 vs ExecuteUpdate/ExecuteDelete",
+      "content": "| 维度 | 传统方式（查出 → 改 → SaveChanges） | ExecuteUpdate/ExecuteDelete（EF Core 7+） |\n| --- | --- | --- |\n| 内存占用 | 高，需实例化所有实体对象 | 低，不加载实体到内存\n| SQL 语句数 | N 条 SELECT + N 条 UPDATE/DELETE | 1 条 UPDATE/DELETE\n| ChangeTracker 参与 | 是，触发快照和审计 | 否，绕过 ChangeTracker 管道\n| SaveChanges 拦截器 | 触发 | 不触发\n| 乐观并发检查 | 自动（如果配置了并发标记） | 需手动在 WHERE 中加入版本条件\n| 审计字段（UpdatedAt） | 自动（如果在 SaveChanges 拦截器中处理） | 需在 SetProperty 中手动设置\n| EF Core 版本 | 所有版本 | 7.0+（复杂 SET 表达式 8.0+）"
     },
     {
       "type": "code",
-      "title": "代码示例",
-      "content": "using System;\nusing System.Collections.Generic;\nusing System.Diagnostics;\nusing System.Linq;\nusing System.Threading.Tasks;\nusing Microsoft.EntityFrameworkCore;\nusing Microsoft.Extensions.Logging;\n\nnamespace EFCorePerformanceDemo\n{\n    public class User\n    {\n        public int Id { get; set; }\n        public string Name { get; set; }\n        public string Email { get; set; }\n        public bool IsActive { get; set; } = true;\n        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;\n        public ICollection<Order> Orders { get; set; } = new List<Order>();\n    }\n\n    public class Order\n    {\n        public int Id { get; set; }\n        public string ProductName { get; set; }\n        public decimal Price { get; set; }\n        public int Quantity { get; set; }\n        public DateTime OrderDate { get; set; } = DateTime.UtcNow;\n        public int UserId { get; set; }\n        public User User { get; set; }\n    }\n\n    public class PerformanceDbContext : DbContext\n    {\n        public DbSet<User> Users { get; set; }\n        public DbSet<Order> Orders { get; set; }\n\n        public PerformanceDbContext(DbContextOptions<PerformanceDbContext> options)\n            : base(options) { }\n\n        protected override void OnModelCreating(ModelBuilder modelBuilder)\n        {\n            modelBuilder.Entity<User>(entity =>\n            {\n                entity.HasIndex(e => e.Email).IsUnique();\n                entity.HasIndex(e => e.IsActive);\n                entity.HasIndex(e => e.CreatedAt);\n            });\n\n            modelBuilder.Entity<Order>(entity =>\n            {\n                entity.HasIndex(e => e.UserId);\n                entity.HasIndex(e => e.OrderDate);\n            });\n        }\n    }\n\n    // 性能优化示例\n    public class OptimizedQueries\n    {\n        private readonly PerformanceDbContext _context;\n        private readonly ILogger<OptimizedQueries> _logger;\n\n        public OptimizedQueries(\n            PerformanceDbContext context,\n            ILogger<OptimizedQueries> logger)\n        {\n            _context = context;\n            _logger = logger;\n        }\n\n        // N+1 问题示例\n        public async Task<List<User>> GetUsersWithOrders_NPlus1()\n        {\n            // 问题代码：产生 N+1 查询\n            var users = await _context.Users.ToListAsync();\n            foreach (var user in users)\n            {\n                // 每次循环都会查询一次数据库\n                user.Orders = await _context.Orders\n                    .Where(o => o.UserId == user.Id)\n                    .ToListAsync();\n            }\n            return users;\n        }\n\n        // 解决 N+1：使用 Include\n        public async Task<List<User>> GetUsersWithOrders_Include()\n        {\n            return await _context.Users\n                .Include(u => u.Orders)\n                .ToListAsync();\n        }\n\n        // 解决 N+1：使用投影\n        public async Task<List<UserDto>> GetUsersWithOrders_Projection()\n        {\n            return await _context.Users\n                .Select(u => new UserDto\n                {\n                    Id = u.Id,\n                    Name = u.Name,\n                    OrderCount = u.Orders.Count,\n                    TotalSpent = u.Orders.Sum(o => o.Price * o.Quantity)\n                })\n                .ToListAsync();\n        }\n\n        // AsNoTracking 示例\n        public async Task<List<User>> GetActiveUsers_NoTracking()\n        {\n            return await _context.Users\n                .AsNoTracking()\n                .Where(u => u.IsActive)\n                .ToListAsync();\n        }\n\n        // 分页查询\n        public async Task<List<User>> GetUsersPaged(int page, int pageSize)\n        {\n            return await _context.Users\n                .AsNoTracking()\n                .OrderBy(u => u.Id)\n                .Skip((page - 1) * pageSize)\n                .Take(pageSize)\n                .ToListAsync();\n        }\n\n        // 编译查询\n        private static readonly Func<PerformanceDbContext, int, User> GetUserById =\n            EF.CompileQuery((PerformanceDbContext context, int id) =>\n                context.Users\n                    .AsNoTracking()\n                    .FirstOrDefault(u => u.Id == id));\n\n        public User GetUserById_Compiled(int id)\n        {\n            return GetUserById(_context, id);\n        }\n\n        // 批量更新（EF Core 7+）\n        public async Task DeactivateOldUsers(int days)\n        {\n            var cutoffDate = DateTime.UtcNow.AddDays(-days);\n\n            await _context.Users\n                .Where(u => u.CreatedAt < cutoffDate && u.IsActive)\n                .ExecuteUpdateAsync(s => s\n                    .SetProperty(u => u.IsActive, false));\n        }\n\n        // 批量删除（EF Core 7+）\n        public async Task DeleteInactiveUsers()\n        {\n            await _context.Users\n                .Where(u => !u.IsActive)\n                .ExecuteDeleteAsync();\n        }\n\n        // 批量插入\n        public async Task BulkInsertUsers(List<User> users)\n        {\n            // 使用 AddRange\n            await _context.Users.AddRangeAsync(users);\n            await _context.SaveChangesAsync();\n        }\n\n        // 使用 Any 而非 Count\n        public async Task<bool> HasActiveUsers()\n        {\n            // 推荐\n            return await _context.Users.AnyAsync(u => u.IsActive);\n\n            // 不推荐\n            // return await _context.Users.CountAsync(u => u.IsActive) > 0;\n        }\n\n        // 查询性能监控\n        public async Task<List<User>> GetUsersWithMonitoring()\n        {\n            var stopwatch = Stopwatch.StartNew();\n\n            var users = await _context.Users\n                .AsNoTracking()\n                .Where(u => u.IsActive)\n                .ToListAsync();\n\n            stopwatch.Stop();\n            _logger.LogInformation($\"查询用户耗时: {stopwatch.ElapsedMilliseconds}ms，\" +\n                                   $\"返回 {users.Count} 条记录\");\n\n            return users;\n        }\n\n        // 编译查询\n        private static readonly Func<PerformanceDbContext, IAsyncEnumerable<User>> GetActiveUsers =\n            EF.CompileAsyncQuery((PerformanceDbContext context) =>\n                context.Users.Where(u => u.IsActive));\n\n        public async Task<List<User>> GetActiveUsers_Compiled()\n        {\n            var users = new List<User>();\n            await foreach (var user in GetActiveUsers(_context))\n            {\n                users.Add(user);\n            }\n            return users;\n        }\n    }\n\n    public class UserDto\n    {\n        public int Id { get; set; }\n        public string Name { get; set; }\n        public int OrderCount { get; set; }\n        public decimal TotalSpent { get; set; }\n    }\n\n    // 读写分离示例\n    public class ReadWriteSeparationExample\n    {\n        private readonly PerformanceDbContext _readContext;\n        private readonly PerformanceDbContext _writeContext;\n\n        public ReadWriteSeparationExample(\n            [FromKeyedServices(\"Read\")] PerformanceDbContext readContext,\n            [FromKeyedServices(\"Write\")] PerformanceDbContext writeContext)\n        {\n            _readContext = readContext;\n            _writeContext = writeContext;\n        }\n\n        public async Task<User> GetUserAsync(int id)\n        {\n            // 从读库查询\n            return await _readContext.Users\n                .AsNoTracking()\n                .FirstOrDefaultAsync(u => u.Id == id);\n        }\n\n        public async Task UpdateUserAsync(User user)\n        {\n            // 写入主库\n            _writeContext.Users.Update(user);\n            await _writeContext.SaveChangesAsync();\n        }\n    }\n\n    // 配置服务\n    public static class PerformanceServiceCollectionExtensions\n    {\n        public static IServiceCollection AddPerformanceDbContext(\n            this IServiceCollection services,\n            string readConnectionString,\n            string writeConnectionString)\n        {\n            // 读库\n            services.AddDbContext<PerformanceDbContext>(\n                options => options\n                    .UseSqlServer(readConnectionString)\n                    .UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking),\n                contextLifetime: ServiceLifetime.Scoped,\n                optionsLifetime: ServiceLifetime.Singleton);\n\n            // 写库\n            services.AddKeyedDbContext<PerformanceDbContext>(\"Write\",\n                options => options\n                    .UseSqlServer(writeConnectionString)\n                    .LogTo(Console.WriteLine, LogLevel.Information));\n\n            return services;\n        }\n    }\n}",
       "language": "csharp",
+      "title": "可运行代码：N+1 演示、AsNoTracking 效果、ExecuteUpdate 批量操作",
+      "content": "using System;\nusing System.Collections.Generic;\nusing System.Diagnostics;\nusing System.Linq;\nusing System.Threading.Tasks;\nusing Microsoft.EntityFrameworkCore;\nusing Microsoft.Extensions.Logging;\n\nnamespace EFCorePerformanceDemo\n{\n    // ===== 实体定义 =====\n    public class User\n    {\n        public int Id { get; set; }\n        public string Name { get; set; } = string.Empty;\n        public string Email { get; set; } = string.Empty;\n        public bool IsActive { get; set; } = true;\n        public bool IsDeleted { get; set; }\n        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;\n        public DateTime? DeletedAt { get; set; }\n        public ICollection<Order> Orders { get; set; } = new List<Order>();\n    }\n\n    public class Order\n    {\n        public int Id { get; set; }\n        public string ProductName { get; set; } = string.Empty;\n        public decimal Price { get; set; }\n        public int Quantity { get; set; }\n        public DateTime OrderDate { get; set; } = DateTime.UtcNow;\n        public int UserId { get; set; }\n        public User User { get; set; } = null!;\n    }\n\n    public class UserDto\n    {\n        public int Id { get; set; }\n        public string Name { get; set; } = string.Empty;\n        public int OrderCount { get; set; }\n        public decimal TotalSpent { get; set; }\n    }\n\n    // ===== DbContext =====\n    public class AppDbContext : DbContext\n    {\n        public DbSet<User> Users => Set<User>();\n        public DbSet<Order> Orders => Set<Order>();\n\n        public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }\n\n        protected override void OnModelCreating(ModelBuilder modelBuilder)\n        {\n            modelBuilder.Entity<User>(e =>\n            {\n                e.HasIndex(u => u.Email).IsUnique();\n                e.HasIndex(u => u.IsActive);\n            });\n            modelBuilder.Entity<Order>(e =>\n            {\n                e.HasIndex(o => o.UserId);\n            });\n        }\n    }\n\n    public static class Demos\n    {\n        /// <summary>\n        /// Demo 1: N+1 问题 vs Include vs 投影\n        /// </summary>\n        public static async Task NPlus1Demo(AppDbContext db, ILogger logger)\n        {\n            // --- N+1: 遍历时触发懒加载或手动查询 ---\n            var sw = Stopwatch.StartNew();\n            var users = await db.Users.AsNoTracking().ToListAsync();\n            foreach (var user in users)\n            {\n                // 每次循环发一条 SQL: SELECT ... FROM Orders WHERE UserId = @p0\n                user.Orders = await db.Orders\n                    .Where(o => o.UserId == user.Id)\n                    .ToListAsync();\n            }\n            sw.Stop();\n            logger.LogInformation(\"N+1 方式: {Count} 用户, {Ms}ms, {Queries} 条查询\",\n                users.Count, sw.ElapsedMilliseconds, users.Count + 1);\n\n            // --- Include: 一条 JOIN 搞定 ---\n            sw.Restart();\n            var usersWithOrders = await db.Users\n                .AsNoTracking()\n                .Include(u => u.Orders)\n                .ToListAsync();\n            sw.Stop();\n            logger.LogInformation(\"Include 方式: {Count} 用户, {Ms}ms, 1 条查询\",\n                usersWithOrders.Count, sw.ElapsedMilliseconds);\n\n            // --- 投影: 只取需要的字段 ---\n            sw.Restart();\n            var dtos = await db.Users\n                .Select(u => new UserDto\n                {\n                    Id = u.Id,\n                    Name = u.Name,\n                    OrderCount = u.Orders.Count,\n                    TotalSpent = u.Orders.Sum(o => o.Price * o.Quantity)\n                })\n                .ToListAsync();\n            sw.Stop();\n            logger.LogInformation(\"投影方式: {Count} 用户, {Ms}ms, 1 条查询, 无 ChangeTracker 开销\",\n                dtos.Count, sw.ElapsedMilliseconds);\n        }\n\n        /// <summary>\n        /// Demo 2: AsNoTracking vs 默认跟踪 的内存差异\n        /// </summary>\n        public static async Task TrackingOverheadDemo(AppDbContext db, ILogger logger)\n        {\n            // 默认跟踪: 每个实体做快照 + 入 Identity Resolution 字典\n            var sw = Stopwatch.StartNew();\n            var tracked = await db.Users\n                .Where(u => u.IsActive)\n                .ToListAsync();\n            sw.Stop();\n            logger.LogInformation(\"跟踪模式: {Count} 条, {Ms}ms (含快照和 Identity Resolution)\",\n                tracked.Count, sw.ElapsedMilliseconds);\n\n            // AsNoTracking: 跳过快照和 Identity Resolution\n            db.ChangeTracker.Clear(); // 清除之前的跟踪\n            sw.Restart();\n            var noTracking = await db.Users\n                .AsNoTracking()\n                .Where(u => u.IsActive)\n                .ToListAsync();\n            sw.Stop();\n            logger.LogInformation(\"NoTracking: {Count} 条, {Ms}ms (无快照开销)\",\n                noTracking.Count, sw.ElapsedMilliseconds);\n        }\n\n        /// <summary>\n        /// Demo 3: EF Core 7+ ExecuteUpdate/ExecuteDelete 批量操作\n        /// </summary>\n        public static async Task BulkOperationsDemo(AppDbContext db, ILogger logger)\n        {\n            var cutoff = DateTime.UtcNow.AddDays(-30);\n\n            // 传统方式: 查出实体 → 逐条修改 → SaveChanges (N 条 UPDATE)\n            // var oldUsers = await db.Users.Where(u => u.CreatedAt < cutoff && u.IsActive).ToListAsync();\n            // oldUsers.ForEach(u => u.IsActive = false);\n            // await db.SaveChangesAsync(); // 生成 N 条 UPDATE 语句\n\n            // EF Core 7+: 一条 UPDATE 搞定\n            var sw = Stopwatch.StartNew();\n            int affected = await db.Users\n                .Where(u => u.CreatedAt < cutoff && u.IsActive)\n                .ExecuteUpdateAsync(s => s\n                    .SetProperty(u => u.IsActive, false));\n            sw.Stop();\n            logger.LogInformation(\"ExecuteUpdate: 影响 {Affected} 行, {Ms}ms, 1 条 SQL\",\n                affected, sw.ElapsedMilliseconds);\n\n            // 批量删除: 一条 DELETE\n            sw.Restart();\n            int deleted = await db.Users\n                .Where(u => !u.IsActive && u.IsDeleted)\n                .ExecuteDeleteAsync();\n            sw.Stop();\n            logger.LogInformation(\"ExecuteDelete: 删除 {Deleted} 行, {Ms}ms, 1 条 SQL\",\n                deleted, sw.ElapsedMilliseconds);\n        }\n\n        /// <summary>\n        /// Demo 4: Any vs Count\n        /// </summary>\n        public static async Task AnyVsCountDemo(AppDbContext db)\n        {\n            // Any: EXISTS → 找到第一条就返回\n            bool hasActive = await db.Users.AnyAsync(u => u.IsActive);\n\n            // Count: COUNT(*) → 必须扫描所有匹配行\n            // bool hasActiveBad = await db.Users.CountAsync(u => u.IsActive) > 0;\n\n            Console.WriteLine($\"Has active users: {hasActive}\");\n        }\n    }\n}",
       "highlights": [
         {
-          "line": 76,
-          "note": "「foreach (var user in users)」 是这段示例的主遍历；它决定处理顺序和成本上界，说明「EF Core 性能优化」时要补上每轮维护的状态。"
+          "line": 85,
+          "note": "N+1 的核心：foreach 循环内对每条 user 查询 Orders，N 条额外 SQL。"
+        },
+        {
+          "line": 100,
+          "note": "Include 一条 JOIN 解决 N+1，拿到完整实体可继续跟踪。"
+        },
+        {
+          "line": 109,
+          "note": "投影只取需要的字段，数据库端聚合 Count/Sum，无 ChangeTracker 开销。"
+        },
+        {
+          "line": 141,
+          "note": "ExecuteUpdate 直接生成一条 UPDATE 语句，不加载实体到内存，不触发 ChangeTracker。"
+        },
+        {
+          "line": 150,
+          "note": "ExecuteDelete 一条 DELETE 语句，比逐条查出再 Remove 再 SaveChanges 快几个数量级。"
         }
       ]
     },
     {
       "type": "interviewAnswer",
       "title": "面试回答思路",
-      "content": "结论：EF Core 性能优化的重心是「少查、查对、不跟踪」。最高频的是 N+1 问题、AsNoTracking 和批量操作。\n\n核心几点：\n\n1. N+1 问题：查 N 条主记录后、遍历时每条又懒加载一次关联，发出 1 加 N 条 SQL。解决：用 Include 或 ThenInclude 预先加载、或用 Select 投影只查需要的字段一次拿出。\n2. AsNoTracking：只读查询关掉变更跟踪，不建快照、省内存更快，报表和列表展示应默认用。\n3. 批量操作：EF Core 7+ 的 ExecuteUpdate 和 ExecuteDelete 直接生成一条 UPDATE/DELETE，不用把实体查出来再逐条 SaveChanges，海量更新性能差几个数量级。\n4. 只查需要的字段：用 Select 投影成 DTO，避免 SELECT *；分页用 Skip/Take；判断存在用 Any 而不是 Count 大于 0。\n\n边界和坑。① Include 太多会产生笛卡尔积爆炸（一对多多层 Include 行数相乘），可改用拆分查询 AsSplitQuery。② 高频固定查询可以用编译查询 EF.CompileQuery 省掉每次表达式树翻译。③ 优化前先开 SQL 日志或 MiniProfiler 看实际生成的语句和次数，别凭感觉，很多「慢」其实是 N+1 或全表扫描、不是 EF 本身慢。",
+      "content": "**一句话结论**\nEF Core 性能优化的重心是「少查、查对、不跟踪」——最高频的坑是 N+1 问题，最直接的收益来自 AsNoTracking 和批量 API。\n\n**核心要点（按优先级）**\n\n1. **N+1 问题**：查 N 条主记录后遍历时每条又发一条关联查询，总查询 1+N 条。解决三选一：Include（JOIN 一次性加载，适合需要完整实体时）、投影 Select→DTO（只取需要字段，只读场景最优）、AsSplitQuery（多层一对多时避免笛卡尔积，代价是多次往返）。\n\n2. **AsNoTracking**：只读查询关掉 ChangeTracker 的快照拷贝和 Identity Resolution，内存更少、CPU 更低。列表接口、报表导出应默认使用。\n\n3. **ExecuteUpdate/ExecuteDelete（EF Core 7+）**：不加载实体直接在数据库端执行，一条 SQL 搞定批量操作，比查出再改再 SaveChanges 快几个数量级。注意：不触发 SaveChanges 拦截器和审计，乐观并发需手动处理。\n\n4. **查询细节**：投影裁剪 SELECT *；分页用 Skip/Take（深分页考虑 keyset）；判断存在用 Any 而非 Count。\n\n5. **排查方法**：先开 SQL 日志（或 MiniProfiler）看实际 SQL——数查询次数定位 N+1，看执行计划定位缺索引/全表扫描，看数据量定位缺分页/缺 AsNoTracking。先定位再优化，不凭感觉。",
       "followUpQuestions": [
         {
-          "question": "线上一个列表接口越来越慢，怀疑是 EF 的问题，你的排查步骤是什么？",
-          "answer": "第一步开 EF 的 SQL 日志（或 MiniProfiler、SQL Server Profiler）看这个接口实际发了多少条、什么 SQL——大多数「EF 慢」其实是发现发了几十上百条相似小查询，那就是 N+1，用 Include 或投影合并。第二步看单条 SQL 慢不慢：拿到 SQL 去数据库 EXPLAIN，看有没有全表扫描、缺索引、SELECT * 拉了大字段。第三步看是不是没分页把整表拉下来，或没 AsNoTracking 在大结果集上白白做变更跟踪。排查顺序就是「查询次数 → 单条查询计划 → 数据量与跟踪开销」，每步都有日志或计划支撑、不靠猜。"
+          "question": "线上列表接口越来越慢，怀疑 EF Core 的问题，排查步骤？",
+          "answer": "第一步开 EF SQL 日志或 MiniProfiler，看这个接口实际发了多少条 SQL——如果发了几十上百条结构相似的小查询（WHERE UserId = @p0），就是 N+1，用 Include 或投影合并。第二步看单条 SQL 内容，拿到数据库 EXPLAIN 看执行计划，检查是否有全表扫描、缺索引、SELECT * 拉了大字段。第三步看数据量——是否没分页拉了整表，或 Include 太多导致笛卡尔积、大结果集缺 AsNoTracking。排查顺序：查询次数 → 单条执行计划 → 数据量与跟踪开销。"
         },
         {
-          "question": "Include 预加载和投影都能解决 N+1，它们有什么取舍？什么时候用拆分查询？",
-          "answer": "Include 把关联实体一起 JOIN 查出来，拿到的是完整实体、能继续改和跟踪，但一对多多层 Include 会让结果行数相乘（笛卡尔积爆炸），把大量重复数据传回来。投影（Select 成 DTO）只取需要的字段、数据量最小、最快，但拿到的是 DTO 对象、不能跟踪保存。取舍：只读展示优先投影；需要加载完整对象图后续操作用 Include。当 Include 多个一对多导致数据爆炸时，用 AsSplitQuery 让 EF 拆成多条查询分别拿、再在内存拼，避免笛卡尔积，代价是多几次往返。"
+          "question": "Include 和投影都能解决 N+1，什么时候用哪个？AsSplitQuery 什么时候用？",
+          "answer": "Include 拿到完整实体对象、能继续跟踪和修改，适合后续需要操作实体图的场景。投影只取需要字段、数据量最小最快、可在 SQL 层聚合，但拿到的是 DTO 不能跟踪保存——只读展示优先投影。当 Include 多层一对多（如 User→Orders→OrderItems）导致结果集行数笛卡尔积爆炸时，追加 AsSplitQuery 让 EF 拆成多条独立查询分别拿、客户端内存组装，避免数据爆炸，代价是多次往返且跨查询不保证一致快照。"
+        },
+        {
+          "question": "ExecuteUpdate 和传统查出再改再 SaveChanges 有什么本质区别？有什么要注意的？",
+          "answer": "本质区别：ExecuteUpdate 直接在数据库端生成一条 UPDATE 语句，不加载任何实体到内存，不触发 ChangeTracker、快照、Identity Resolution、SaveChanges 拦截器和域事件。适合简单条件的批量操作。注意：①不触发审计拦截器，UpdatedAt 等字段需在 SetProperty 中手动设；②绕过乐观并发检查，需要手动在 WHERE 中加版本条件；③SetProperty 只支持映射到列的属性赋值，不能调用 C# 方法；④EF Core 8 支持复杂 SET 表达式（如 u.Score + 10）。"
+        },
+        {
+          "question": "EF Core 中哪些场景必须用 AsNoTracking？不用会有什么影响？",
+          "answer": "没有「必须」，但高并发只读查询（列表接口、报表导出、缓存预热）强烈建议用。不用的话 ChangeTracker 对每条返回实体做快照拷贝和 Identity Resolution 字典维护，实体列越多、数据量越大，CPU 和内存开销越明显。实测 10 万条记录查询可差 30%-50%。但要注意：AsNoTracking 的实体如果在同 DbContext 被多次查出是独立对象（不共享引用），不能直接修改后 SaveChanges。"
         }
       ]
     },
@@ -93,54 +132,64 @@
       "type": "checklist",
       "title": "学完后应能说清楚",
       "items": [
-        "N+1 问题的产生原因和解决方案",
-        "AsNoTracking 的使用场景和原理",
-        "EF Core 7+ 批量操作 API 的使用",
-        "查询优化的常用技巧",
-        "读写分离的实现方式",
-        "如何监控和分析查询性能"
+        "N+1 问题的产生机制（遍历导航属性触发额外 SQL）和三种解法的适用边界",
+        "AsNoTracking 跳过了 ChangeTracker 的哪些步骤（快照 + Identity Resolution），为何更快",
+        "Include 多层一对多的笛卡尔积爆炸问题和 AsSplitQuery 的取舍",
+        "EF Core 7+ ExecuteUpdate/ExecuteDelete 如何绕过实体加载直接生成单条 SQL",
+        "投影裁剪、Any vs Count、编译查询各自优化的是什么",
+        "先用 SQL 日志定位瓶颈（查询次数→执行计划→数据量）再选优化手段的排查方法论"
       ]
     }
   ],
   "recallPrompts": [
     {
       "id": "dotnet.ef-core.performance-optimization.recall.1",
-      "prompt": "什么是 N+1 问题？有哪些解决方案，并说明关键机制和边界条件。",
+      "prompt": "什么是 N+1 问题？Include、投影查询和拆分查询分别怎么解决，各有什么代价和适用场景？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
       "id": "dotnet.ef-core.performance-optimization.recall.2",
-      "prompt": "AsNoTracking 的作用是什么？在什么场景下应该使用它？",
+      "prompt": "AsNoTracking 为什么能提升查询性能？它跳过了哪些内部机制？什么场景下不该用？",
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 4
     },
     {
       "id": "dotnet.ef-core.performance-optimization.recall.3",
-      "prompt": "N+1 查询是怎么产生的？Include、投影查询和拆分查询分别怎么解决、各有什么代价？",
+      "prompt": "EF Core 7+ 的 ExecuteUpdate 和传统查出再改再 SaveChanges 有什么本质区别？有什么限制和需要注意的？",
       "mode": "text",
       "expectedMinutes": 3,
+      "difficulty": 4
+    },
+    {
+      "id": "dotnet.ef-core.performance-optimization.recall.4",
+      "prompt": "线上一个 EF Core 接口越来越慢，你的排查思路是什么？每步看什么指标或日志？",
+      "mode": "text",
+      "expectedMinutes": 4,
       "difficulty": 4
     }
   ],
   "rubric": {
     "mustHave": [
-      "能解释 N+1 问题及 Include/投影解决",
-      "能说明 AsNoTracking 为何更快、适用只读",
-      "能说出 EF Core 7+ 批量 ExecuteUpdate/ExecuteDelete 的优势",
-      "能列出投影、分页、Any vs Count 等查询优化"
+      "能解释 N+1 的产生机制（遍历导航属性触发额外 SQL）和三种解法（Include/投影/AsSplitQuery）的适用边界",
+      "能说明 AsNoTracking 跳过 ChangeTracker 快照和 Identity Resolution 为何更快",
+      "能说出 EF Core 7+ ExecuteUpdate/Delete 绕过实体加载直接生成单条 SQL 的机制",
+      "能列出投影裁剪、分页、Any vs Count 等查询细节优化"
     ],
     "goodToHave": [
-      "能指出多层 Include 的笛卡尔积爆炸及 AsSplitQuery",
-      "能说明编译查询省去表达式树翻译",
-      "能用 SQL 日志/MiniProfiler 定位慢查询"
+      "能解释 Include 多层一对多的笛卡尔积爆炸和 AsSplitQuery 的取舍（多次往返 vs 数据量）",
+      "能说明编译查询省去表达式树翻译的原理及适用场景",
+      "能区分 ExecuteUpdate 不触发 SaveChanges 拦截器/审计/乐观并发检查的边界",
+      "能用 SQL 日志/MiniProfiler/EXPLAIN 按查询次数→执行计划→数据量三步定位"
     ],
     "commonMistakes": [
-      "遍历导航属性引发 N+1",
-      "只读查询不用 AsNoTracking",
-      "海量更新逐条查出再 SaveChanges 而非批量 API"
+      "遍历导航属性触发 N+1 而不自知",
+      "只读查询不用 AsNoTracking，白白做快照拷贝",
+      "海量更新逐条查出再 SaveChanges 而非用 ExecuteUpdate",
+      "Include 多层一对多不考虑笛卡尔积爆炸，结果集膨胀",
+      "以为 ExecuteUpdate 会触发 SaveChanges 拦截器和乐观并发检查"
     ],
     "scoreWeights": {
       "coverage": 25,
@@ -153,6 +202,6 @@
     "dotnet.ef-core.basics"
   ],
   "interviewFrequency": "high",
-  "interviewerFocus": "考察能否定位并解决 N+1、说清 AsNoTracking 和批量 API、用投影/分页优化，并知道笛卡尔积爆炸、拆分查询和靠 SQL 日志定位。",
-  "updatedAt": "2026-06-18"
+  "interviewerFocus": "考察能否从 N+1 产生机制、三种解法取舍、AsNoTracking 内部原理、ExecuteUpdate 绕过 ChangeTracker 的机制与边界、查询细节优化、以及先看 SQL 日志再选手段的排查方法论，完整且有层次地回答。",
+  "updatedAt": "2026-06-23"
 }

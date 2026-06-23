@@ -4,14 +4,14 @@
   "category": "creational",
   "group": "creational",
   "title": "单例模式",
-  "summary": "确保一个类在同一 ClassLoader 范围内只有一个实例并提供全局访问点，核心难点是何时创建（饿汉/懒汉）与多线程下如何只建一个（DCL+volatile / 静态内部类 / 枚举）。",
+  "summary": "确保一个类在同一 ClassLoader 范围内只有一个实例并提供全局访问点，核心难点是何时创建（饿汉/懒汉）与多线程下如何只建一个（DCL+volatile / 静态内部类 / 枚举），以及防反射/序列化破坏的机制差异和 Spring 容器级单例的本质区别。",
   "tags": [
     "设计模式",
     "创建型模式",
     "单例模式"
   ],
   "difficulty": 3,
-  "estimatedMinutes": 20,
+  "estimatedMinutes": 33,
   "order": 10,
   "recommendWeight": 95,
   "status": "staging",
@@ -25,6 +25,11 @@
       "type": "explain",
       "title": "选型、防反射/序列化与 Spring 单例的区别",
       "content": "**怎么选**：创建开销小且一定会用→饿汉式；要懒加载且写法清爽→静态内部类；要绝对防破坏→枚举；DCL 实际项目少用，更多是面试用来考 volatile 与指令重排。\n\n**普通写法会被破坏的两条路径**：\n- 反射破坏：`Constructor<X> c = X.class.getDeclaredConstructor(); c.setAccessible(true); c.newInstance();` 能绕过 `private` 造出第二个实例。防御只能在构造函数里手动检查\"`INSTANCE != null` 就抛异常\"——但攻击者也能反射改回 null。\n- 序列化破坏：`ObjectInputStream.readObject()` 通过 native 的 `allocateNewObject` 绕过构造函数直接造新对象。防御要在类里写 `private Object readResolve() { return INSTANCE; }`，反序列化最后一步会调用它替换返回值。\n- **枚举对这两种攻击天然免疫**：JVM 在 `Constructor.newInstance` 里硬编码了\"枚举类型直接抛异常\"，序列化协议也专门为枚举设计成\"只写枚举名、按名字反查\"。这是它\"最安全\"的根本原因，不是约定俗成。\n\n**和 Spring 单例的区别（高频混淆点）**：Spring 的\"单例 Bean\"是**容器级**单例——Bean 本身是普通 POJO，能被 `new` 出多个；唯一性由 `DefaultSingletonBeanRegistry` 用 `ConcurrentHashMap<String, Object> singletonObjects` 缓存保证，作用域是\"一个 ApplicationContext 内一个\"。GoF 单例是**类级**单例——通过私有构造把\"一个 JVM 一个\"写死在类内部，跟容器无关。所以同一个 Bean 类，在两个 ApplicationContext 里能有两个实例，这是 Spring 单例和 GoF 单例的本质差异。\n\n**何时别用**：单例是全局可变状态，会隐藏依赖（调用方看不出依赖）、难以单元测试（无法 mock，要靠 PowerMock 或重构成可注入接口）；分布式环境下\"单例\"只在单 JVM 范围成立，跨节点不唯一，需要 ZooKeeper/Redis 选主或分布式锁来兜底。"
+    },
+    {
+      "type": "explain",
+      "title": "ClassLoader 对唯一范围的影响与测试困境",
+      "content": "GoF 单例保证的\"同一 JVM 内唯一\"其实有隐含前提：**同一个 ClassLoader**。同一个类被不同 ClassLoader 加载时，JVM 认为它们是两个不同的类，各自 `<clinit>` 独立执行，会各生成一份实例。这在 Web 容器（Tomcat 每个 webapp 有自己的 ClassLoader）、热部署（devtools 重建 ClassLoader）、OSGi 等场景真实存在。所以严格来说，单例的唯一范围是\"同一 ClassLoader + 同一 JVM\"，不是整个 JVM。\n\n单例让测试变困难的根本原因是**依赖不可替换**。`getInstance()` 是静态方法调用，调用方和单例实现硬绑定，单元测试中无法注入 mock 或 stub。常见解法：(1) 把单例包装成可注入的 Service/Provider 接口，测试时注入假实现；(2) 用 Setter 注入替代构造器硬编码；(3) 借助 Spring 等容器管理生命周期，测试时用 `@MockBean` 替换。PowerMock 能通过自定义 ClassLoader 拦截静态方法，但会严重拖慢测试且与新版 JUnit/Mockito 兼容性差，不推荐作为首选方案。"
     },
     {
       "type": "diagram",
@@ -117,6 +122,10 @@
         {
           "question": "枚举单例为什么能防住反射和序列化攻击，而其他写法不行？",
           "answer": "反射方面：Constructor.newInstance 源码里硬编码了 if (clazz.isEnum() || (clazz.getModifiers() & Modifier.ENUM) != 0) 直接抛 IllegalArgumentException(\"Cannot reflectively create enum objects\")，JVM 层面禁止反射创建枚举；普通单例的私有构造则能被 setAccessible(true) 调用造新对象，唯一防御是构造里手动判断\"INSTANCE 不为 null 就抛异常\"，但仍可被攻击者反射置 null 绕过。序列化方面：枚举的序列化协议被 ObjectOutputStream 特殊处理，只写枚举类名 + 枚举常量名（writeEnum），反序列化时按名字调 Enum.valueOf 返回已存在实例，不会调构造；普通单例反序列化通过 native 的 allocateNewObject 绕过构造造新对象，必须实现 private Object readResolve() { return INSTANCE; }，反序列化最后一步会调用它替换返回值才能防住。"
+        },
+        {
+          "question": "如果应用里用了热部署或 Tomcat 多 webapp，单例还能保证唯一吗？",
+          "answer": "不能保证全局唯一。热部署（如 Spring Boot devtools）会创建新的 RestartClassLoader 来重新加载应用类，新旧 ClassLoader 各自加载的同名类是 JVM 层面不同的 Class 对象，各自的静态变量独立，所以会有两份单例实例并存（旧的等 ClassLoader 被 GC 才回收）。Tomcat 每个 webapp 有独立的 ClassLoader，同一份类库在不同 webapp 里各有一份，单例各自独立。OSGi 的 Bundle ClassLoader 也是同理。解决思路：如果需要跨 ClassLoader 唯一，要把实例存到共享的 ClassLoader（如 parent）或外部存储（如文件、注册表），而不是依赖静态字段。"
         }
       ]
     },
@@ -130,7 +139,8 @@
         "枚举如何在 JVM 源码层面天然防反射（newInstance 抛异常）和防序列化（按名查表）",
         "普通单例防序列化要写 readResolve()，防反射要在构造里判 INSTANCE != null",
         "Spring 单例 Bean（容器级，ConcurrentHashMap 缓存）和 GoF 单例（类级）的本质区别",
-        "JDK 中典型单例：Runtime.getRuntime()；同时能说明 Calendar.getInstance() 是工厂方法，不是单例"
+        "JDK 中典型单例：Runtime.getRuntime()；同时能说明 Calendar.getInstance() 是工厂方法，不是单例",
+        "ClassLoader 对单例唯一范围的影响：不同 ClassLoader 加载同名类会有两份实例"
       ]
     }
   ],
@@ -155,6 +165,13 @@
       "mode": "text",
       "expectedMinutes": 3,
       "difficulty": 3
+    },
+    {
+      "id": "design-pattern.creational.topic-dan-li-mo-shi.recall.4",
+      "prompt": "Spring 单例 Bean 和 GoF 单例模式是一回事吗？如果同一个 Bean 类注册到两个 ApplicationContext，会出现几个实例？如果被不同 ClassLoader 加载呢？",
+      "mode": "text",
+      "expectedMinutes": 3,
+      "difficulty": 3
     }
   ],
   "rubric": {
@@ -168,13 +185,14 @@
       "静态内部类 Holder 利用 JVM 类加载锁实现懒加载 + 无锁的细节",
       "Spring 单例 Bean（容器级，ConcurrentHashMap 缓存）和 GoF 单例（类级）的区别",
       "普通单例防序列化破坏需写 readResolve()、防反射需构造里判 INSTANCE 非空",
-      "JDK 中典型单例：Runtime.getRuntime()、Desktop.getDesktop()；并能识别 Calendar.getInstance() 是工厂方法而非单例"
+      "ClassLoader 对单例唯一范围的影响，不同 ClassLoader 加载同名类会有两份实例"
     ],
     "commonMistakes": [
       "DCL 漏写 volatile，无法解释\"对象引用非空但字段未初始化\"的半成品现象",
       "把 Spring 单例 Bean 等同于 GoF 单例，分不清容器级与类级",
       "只说\"枚举最安全\"但讲不出 Constructor.newInstance 源码里对枚举的特殊处理",
-      "忽略普通单例需要 readResolve 防序列化、构造里判空防反射两条防御"
+      "忽略普通单例需要 readResolve 防序列化、构造里判空防反射两条防御",
+      "误以为单例在整个 JVM 范围内唯一，忽略 ClassLoader 隔离场景（Tomcat/热部署/OSGi）"
     ],
     "scoreWeights": {
       "coverage": 35,
@@ -188,5 +206,5 @@
   ],
   "interviewFrequency": "high",
   "interviewerFocus": "重点听候选人能否把五种写法放在\"何时创建 + 多线程下如何只建一个\"两条主线下取舍，并讲清 DCL 的 volatile 防的是 new 三步重排、枚举防反射防序列化的 JVM 源码级机制；进一步追问 Spring 单例 Bean 与 GoF 单例的容器级 vs 类级差异，以及 ClassLoader 对唯一范围的影响。",
-  "updatedAt": "2026-06-18"
+  "updatedAt": "2026-06-22"
 }
