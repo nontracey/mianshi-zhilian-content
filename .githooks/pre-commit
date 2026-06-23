@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-# 快速确定性门禁(秒级,无 LLM 调用)：只对“你这次要提交的 topic”把关，
+# 快速确定性门禁(秒级,无 LLM 调用)：只对"你这次要提交的 topic"把关，
 # 不对历史存量连坐(仓库里现存 <90 或未清理的篇不会阻断你提交别的文件)。
 #   - 每篇暂存 topic：JSON 必须可解析；确定性质量分必须 ≥90。
 # 全量 schema/质量校验(npm run validate / quality:audit)仍由 CI 兜底。
@@ -16,18 +16,49 @@ else
   echo "[pre-commit] 无暂存 topic，跳过质量门禁"
 fi
 
-# 自动更新 contentVersion 到今天日期
+# 按阶段粒度更新 contentVersion + topic.updatedAt
 today=$(date +%Y.%m.%d)
-cv=$(node -e "console.log(JSON.parse(require('fs').readFileSync('manifest.json','utf8')).contentVersion)")
-if [ "$cv" != "$today" ]; then
-  echo "[pre-commit] contentVersion $cv -> $today"
-  for manifest in manifest.json staging-manifest.json draft-manifest.json; do
+today_iso=$(date +%Y-%m-%d)
+changed_files=$(git diff --cached --name-only --diff-filter=ACM || true)
+
+has_topics=$(echo "$changed_files" | grep -c '^topics/.*\.json$' || true)
+has_staging=$(echo "$changed_files" | grep -c '^staging/topics/.*\.json$' || true)
+has_draft=$(echo "$changed_files" | grep -c '^draft/topics/.*\.json$' || true)
+
+# 更新改动 topic 的 updatedAt
+for f in $(echo "$changed_files" | grep -E '^(topics|staging/topics|draft/topics)/.*\.json$' || true); do
+  node -e "
+    const fs = require('fs');
+    const m = JSON.parse(fs.readFileSync('$f','utf8'));
+    m.updatedAt = '$today_iso';
+    fs.writeFileSync('$f', JSON.stringify(m, null, 2) + '\n');
+  "
+  git add "$f"
+done
+
+# 只更新有改动的阶段对应的 manifest
+update_manifest() {
+  local manifest="$1"
+  local cv
+  cv=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$manifest','utf8')).contentVersion)")
+  if [ "$cv" != "$today" ]; then
+    echo "[pre-commit] $manifest contentVersion $cv -> $today"
     node -e "
       const m = JSON.parse(require('fs').readFileSync('$manifest','utf8'));
       m.contentVersion = '$today';
-      m.updatedAt = '$(date +%Y-%m-%d)';
+      m.updatedAt = '$today_iso';
       require('fs').writeFileSync('$manifest', JSON.stringify(m, null, 2) + '\n');
     "
     git add "$manifest"
-  done
+  fi
+}
+
+if [ "$has_topics" -gt 0 ]; then
+  update_manifest "manifest.json"
+fi
+if [ "$has_staging" -gt 0 ]; then
+  update_manifest "staging-manifest.json"
+fi
+if [ "$has_draft" -gt 0 ]; then
+  update_manifest "draft-manifest.json"
 fi
